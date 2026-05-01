@@ -130,6 +130,8 @@ dependencies = [
  "bookforge-llm",
  "bookforge-store",
  "clap",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

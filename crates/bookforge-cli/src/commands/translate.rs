@@ -9,11 +9,14 @@ use bookforge_llm::{
     LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
     SegmentTranslation, TranslationRunConfig, translate_segments,
 };
-use bookforge_store::JobStore;
+use bookforge_store::{CreateJob, JobRecord, JobStore};
 use clap::Args;
 use std::path::PathBuf;
 
-use crate::{LanguageArgs, ProviderArgs, default_output_path};
+use crate::{
+    LanguageArgs, ProviderArgs, default_output_path,
+    report::{ReportInput, write_report},
+};
 
 #[derive(Debug, Args)]
 pub struct TranslateArgs {
@@ -76,13 +79,16 @@ async fn run_mock_translation(input: &PathBuf, config: &TranslationConfig) -> Re
         .unwrap_or_else(|| "mock-prefix-target".to_string());
     let prompt_version = "v1";
     let store = JobStore::open_default()?;
-    let job = store.create_job(
+    let job = store.create_job(CreateJob {
         input,
-        config.source_language.as_deref(),
-        &config.target_language,
-        "mock",
-        &model,
-    )?;
+        output: &config.output,
+        source_lang: config.source_language.as_deref(),
+        target_lang: &config.target_language,
+        provider: "mock",
+        model: &model,
+        base_url: None,
+        api_key_env: None,
+    })?;
     println!("Job: {}", job.id);
     store.insert_segments(&job.id, &segments, prompt_version, "mock", &model)?;
     let run_config = TranslationRunConfig {
@@ -104,12 +110,12 @@ async fn run_mock_translation(input: &PathBuf, config: &TranslationConfig) -> Re
         save_translation_result(&store, &job.id, translation, "mock", &model, prompt_version)?;
     }
     mark_job_finished(&store, &job.id, &translations)?;
-    print_summary_and_rebuild(&book, &segments, &translations, config)?;
+    print_summary_rebuild_and_report(&store, &job, &book, &segments, &translations, config)?;
 
     Ok(())
 }
 
-fn mock_mode(model: &str) -> MockMode {
+pub(crate) fn mock_mode(model: &str) -> MockMode {
     match model {
         "mock-identity" => MockMode::Identity,
         "mock-uppercase" => MockMode::Uppercase,
@@ -148,13 +154,16 @@ async fn run_openai_compatible_translation(
     let segments = build_segments(&book, &SegmentationConfig::default())?;
     let prompt_version = "v1";
     let store = JobStore::open_default()?;
-    let job = store.create_job(
+    let job = store.create_job(CreateJob {
         input,
-        config.source_language.as_deref(),
-        &config.target_language,
-        &config.provider,
-        &model,
-    )?;
+        output: &config.output,
+        source_lang: config.source_language.as_deref(),
+        target_lang: &config.target_language,
+        provider: &config.provider,
+        model: &model,
+        base_url: Some(&provider_config.base_url),
+        api_key_env: Some(&provider_config.api_key_env),
+    })?;
     println!("Job: {}", job.id);
     store.insert_segments(&job.id, &segments, prompt_version, &config.provider, &model)?;
     let run_config = TranslationRunConfig {
@@ -183,12 +192,12 @@ async fn run_openai_compatible_translation(
         )?;
     }
     mark_job_finished(&store, &job.id, &translations)?;
-    print_summary_and_rebuild(&book, &segments, &translations, config)?;
+    print_summary_rebuild_and_report(&store, &job, &book, &segments, &translations, config)?;
 
     Ok(())
 }
 
-async fn translate_with_scheduler_guard<P>(
+pub(crate) async fn translate_with_scheduler_guard<P>(
     provider: P,
     store: &JobStore,
     job_id: &str,
@@ -222,7 +231,7 @@ fn mark_all_segments_failed(
     Ok(())
 }
 
-fn save_translation_result(
+pub(crate) fn save_translation_result(
     store: &JobStore,
     job_id: &str,
     translation: &SegmentTranslation,
@@ -236,6 +245,7 @@ fn save_translation_result(
             job_id,
             &translation.segment_id.0,
             &joined,
+            &translation.blocks,
             provider,
             model,
             prompt_version,
@@ -246,6 +256,7 @@ fn save_translation_result(
             job_id,
             &translation.segment_id.0,
             &joined,
+            &translation.blocks,
             provider,
             model,
             prompt_version,
@@ -264,7 +275,7 @@ fn save_translation_result(
     Ok(())
 }
 
-fn mark_job_finished(
+pub(crate) fn mark_job_finished(
     store: &JobStore,
     job_id: &str,
     translations: &[SegmentTranslation],
@@ -287,49 +298,48 @@ fn mark_job_finished(
     Ok(())
 }
 
-fn block_translations(translations: &[SegmentTranslation]) -> Vec<BlockTranslation> {
+pub(crate) fn block_translations(translations: &[SegmentTranslation]) -> Vec<BlockTranslation> {
     translations
         .iter()
         .flat_map(|translation| translation.blocks.iter().cloned())
         .collect()
 }
 
-fn print_summary_and_rebuild(
+pub(crate) fn print_summary_rebuild_and_report(
+    store: &JobStore,
+    job: &JobRecord,
     book: &bookforge_core::ir::Book,
     segments: &[bookforge_core::segment::Segment],
     translations: &[SegmentTranslation],
     config: &TranslationConfig,
 ) -> Result<()> {
-    let succeeded = translations
-        .iter()
-        .filter(|translation| translation.status == SegmentStatus::Succeeded)
-        .count();
-    let needs_review = translations
-        .iter()
-        .filter(|translation| translation.status == SegmentStatus::NeedsReview)
-        .count();
-    let failed = translations
-        .iter()
-        .filter(|translation| translation.status == SegmentStatus::Failed)
-        .count();
-    let input_tokens = translations
-        .iter()
-        .filter_map(|translation| translation.input_tokens)
-        .sum::<u64>();
-    let output_tokens = translations
-        .iter()
-        .filter_map(|translation| translation.output_tokens)
-        .sum::<u64>();
-
     let block_translations = block_translations(translations);
     rebuild_epub(book, &block_translations, &config.output)?;
+    let summary = store
+        .summary(&job.id)?
+        .ok_or_else(|| anyhow::anyhow!("job '{}' was not found after translation", job.id))?;
+    let segment_records = store.segment_records(&job.id)?;
+    let report = write_report(ReportInput {
+        job,
+        summary: &summary,
+        segments,
+        segment_records: &segment_records,
+        translations,
+        output: &config.output,
+    })?;
 
-    println!("Translated: {}/{} segments", succeeded, segments.len());
-    println!("Needs review: {needs_review}");
-    println!("Failed: {failed}");
-    println!("Input tokens: {input_tokens}");
-    println!("Output tokens: {output_tokens}");
+    println!(
+        "Translated: {}/{} segments",
+        summary.succeeded, summary.total_segments
+    );
+    println!("Cached: {}", summary.cached);
+    println!("Retried: {}", summary.retried);
+    println!("Needs review: {}", summary.needs_review);
+    println!("Failed: {}", summary.failed);
+    println!("Input tokens: {}", summary.input_tokens);
+    println!("Output tokens: {}", summary.output_tokens);
     println!("Output: {}", config.output.display());
+    println!("Report: {}", report.markdown.display());
 
     Ok(())
 }
@@ -354,13 +364,16 @@ mod tests {
 
         let store = JobStore::open(&db_path).expect("store should open");
         let job = store
-            .create_job(
-                &input_path,
-                Some("English"),
-                "Italian",
-                "mock",
-                "mock-prefix",
-            )
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+            })
             .expect("job should be created");
         let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
         store

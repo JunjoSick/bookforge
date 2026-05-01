@@ -5,7 +5,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use bookforge_core::{Result as CoreResult, segment::Segment};
+use bookforge_core::{
+    Result as CoreResult,
+    segment::{BlockTranslation, Segment},
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
@@ -30,11 +33,15 @@ pub struct JobStore {
 #[derive(Debug, Clone)]
 pub struct JobRecord {
     pub id: String,
+    pub input_path: PathBuf,
+    pub output_path: PathBuf,
     pub input_hash: String,
     pub source_lang: Option<String>,
     pub target_lang: String,
     pub provider: String,
     pub model: String,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
     pub status: String,
 }
 
@@ -47,8 +54,37 @@ pub struct JobSummary {
     pub failed: usize,
     pub needs_review: usize,
     pub retry_pending: usize,
+    pub cached: usize,
+    pub retried: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CreateJob<'a> {
+    pub input: &'a Path,
+    pub output: &'a Path,
+    pub source_lang: Option<&'a str>,
+    pub target_lang: &'a str,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub base_url: Option<&'a str>,
+    pub api_key_env: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentRecord {
+    pub id: String,
+    pub status: String,
+    pub attempts: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBlockTranslation {
+    pub segment_id: String,
+    pub block_id: String,
+    pub text: String,
 }
 
 impl JobStore {
@@ -68,31 +104,43 @@ impl JobStore {
         Ok(store)
     }
 
-    pub fn create_job(
-        &self,
-        input: &Path,
-        source_lang: Option<&str>,
-        target_lang: &str,
-        provider: &str,
-        model: &str,
-    ) -> Result<JobRecord> {
-        let input_hash = file_hash(input)?;
+    pub fn create_job(&self, request: CreateJob<'_>) -> Result<JobRecord> {
+        let input_hash = file_hash(request.input)?;
         let id = format!("job_{}_{}", unix_timestamp_nanos(), &input_hash[..12]);
         let now = timestamp_string();
+        let input_path = request.input.to_path_buf();
+        let output_path = request.output.to_path_buf();
         let conn = self.conn.borrow();
         conn.execute(
-            "INSERT INTO jobs (id, input_hash, source_lang, target_lang, provider, model, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7)",
-            params![id, input_hash, source_lang, target_lang, provider, model, now],
+            "INSERT INTO jobs
+             (id, input_path, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'running', ?11, ?11)",
+            params![
+                id,
+                input_path.to_string_lossy(),
+                output_path.to_string_lossy(),
+                input_hash,
+                request.source_lang,
+                request.target_lang,
+                request.provider,
+                request.model,
+                request.base_url,
+                request.api_key_env,
+                now,
+            ],
         )?;
 
         Ok(JobRecord {
             id,
+            input_path,
+            output_path,
             input_hash,
-            source_lang: source_lang.map(ToOwned::to_owned),
-            target_lang: target_lang.to_string(),
-            provider: provider.to_string(),
-            model: model.to_string(),
+            source_lang: request.source_lang.map(ToOwned::to_owned),
+            target_lang: request.target_lang.to_string(),
+            provider: request.provider.to_string(),
+            model: request.model.to_string(),
+            base_url: request.base_url.map(ToOwned::to_owned),
+            api_key_env: request.api_key_env.map(ToOwned::to_owned),
             status: "running".to_string(),
         })
     }
@@ -133,6 +181,7 @@ impl JobStore {
         job_id: &str,
         segment_id: &str,
         translated_text: &str,
+        blocks: &[BlockTranslation],
         provider: &str,
         model: &str,
         prompt_version: &str,
@@ -157,6 +206,7 @@ impl JobStore {
                     now
                 ],
             )?;
+            replace_block_translations(&conn, job_id, segment_id, blocks)?;
             conn.execute(
                 "UPDATE segments
                  SET status = 'succeeded', attempts = attempts + 1, input_tokens = ?1, output_tokens = ?2, translated_hash = ?3, error = NULL
@@ -179,6 +229,7 @@ impl JobStore {
         job_id: &str,
         segment_id: &str,
         preserved_text: &str,
+        blocks: &[BlockTranslation],
         provider: &str,
         model: &str,
         prompt_version: &str,
@@ -202,6 +253,7 @@ impl JobStore {
                     now
                 ],
             )?;
+            replace_block_translations(&conn, job_id, segment_id, blocks)?;
             conn.execute(
                 "UPDATE segments
                  SET status = 'needs_review', attempts = attempts + 1, translated_hash = ?1, error = ?2
@@ -236,17 +288,22 @@ impl JobStore {
     pub fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>> {
         let conn = self.conn.borrow();
         conn.query_row(
-            "SELECT id, input_hash, source_lang, target_lang, provider, model, status FROM jobs WHERE id = ?1",
+            "SELECT id, input_path, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, status
+             FROM jobs WHERE id = ?1",
             params![job_id],
             |row| {
                 Ok(JobRecord {
                     id: row.get(0)?,
-                    input_hash: row.get(1)?,
-                    source_lang: row.get(2)?,
-                    target_lang: row.get(3)?,
-                    provider: row.get(4)?,
-                    model: row.get(5)?,
-                    status: row.get(6)?,
+                    input_path: PathBuf::from(row.get::<_, String>(1)?),
+                    output_path: PathBuf::from(row.get::<_, String>(2)?),
+                    input_hash: row.get(3)?,
+                    source_lang: row.get(4)?,
+                    target_lang: row.get(5)?,
+                    provider: row.get(6)?,
+                    model: row.get(7)?,
+                    base_url: row.get(8)?,
+                    api_key_env: row.get(9)?,
+                    status: row.get(10)?,
                 })
             },
         )
@@ -289,9 +346,16 @@ impl JobStore {
                 "failed" => summary.failed += count,
                 "needs_review" => summary.needs_review += count,
                 "retry_pending" => summary.retry_pending += count,
+                "skipped_cached" => summary.cached += count,
                 _ => {}
             }
         }
+
+        summary.retried = conn.query_row(
+            "SELECT COUNT(*) FROM segments WHERE job_id = ?1 AND attempts > 1",
+            params![job_id],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
 
         Ok(Some(summary))
     }
@@ -313,6 +377,52 @@ impl JobStore {
         Ok(count)
     }
 
+    pub fn pending_segment_ids(&self, job_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM segments
+             WHERE job_id = ?1 AND status IN ('queued', 'retry_pending')
+             ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(params![job_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn segment_records(&self, job_id: &str) -> Result<Vec<SegmentRecord>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT id, status, attempts, error FROM segments WHERE job_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(params![job_id], |row| {
+            Ok(SegmentRecord {
+                id: row.get(0)?,
+                status: row.get(1)?,
+                attempts: row.get::<_, i64>(2)? as usize,
+                error: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_block_translations(&self, job_id: &str) -> Result<Vec<StoredBlockTranslation>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT segment_id, block_id, translated_text
+             FROM translation_blocks WHERE job_id = ?1 ORDER BY segment_id, block_id",
+        )?;
+        let rows = stmt.query_map(params![job_id], |row| {
+            Ok(StoredBlockTranslation {
+                segment_id: row.get(0)?,
+                block_id: row.get(1)?,
+                text: row.get(2)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.borrow();
         if table_exists(&conn, "translations")?
@@ -321,6 +431,7 @@ impl JobStore {
             conn.execute_batch(
                 "
                 DROP TABLE IF EXISTS qa_findings;
+                DROP TABLE IF EXISTS translation_blocks;
                 DROP TABLE IF EXISTS translations;
                 DROP TABLE IF EXISTS segments;
                 DROP TABLE IF EXISTS jobs;
@@ -332,11 +443,15 @@ impl JobStore {
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS jobs (
               id TEXT PRIMARY KEY,
+              input_path TEXT NOT NULL DEFAULT '',
+              output_path TEXT NOT NULL DEFAULT '',
               input_hash TEXT NOT NULL,
               source_lang TEXT,
               target_lang TEXT NOT NULL,
               provider TEXT NOT NULL,
               model TEXT NOT NULL,
+              base_url TEXT,
+              api_key_env TEXT,
               status TEXT NOT NULL,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
@@ -374,6 +489,15 @@ impl JobStore {
               FOREIGN KEY(job_id, segment_id) REFERENCES segments(job_id, id)
             );
 
+            CREATE TABLE IF NOT EXISTS translation_blocks (
+              segment_id TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              block_id TEXT NOT NULL,
+              translated_text TEXT NOT NULL,
+              PRIMARY KEY (job_id, segment_id, block_id),
+              FOREIGN KEY(job_id, segment_id) REFERENCES segments(job_id, id)
+            );
+
             CREATE TABLE IF NOT EXISTS qa_findings (
               id TEXT PRIMARY KEY,
               segment_id TEXT NOT NULL,
@@ -385,6 +509,10 @@ impl JobStore {
             );
             ",
         )?;
+        ensure_column(&conn, "jobs", "input_path", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "jobs", "output_path", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "jobs", "base_url", "TEXT")?;
+        ensure_column(&conn, "jobs", "api_key_env", "TEXT")?;
         Ok(())
     }
 
@@ -415,6 +543,46 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::R
         }
     }
     Ok(false)
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> rusqlite::Result<()> {
+    if !table_has_column(conn, table, column)? {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_block_translations(
+    conn: &Connection,
+    job_id: &str,
+    segment_id: &str,
+    blocks: &[BlockTranslation],
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM translation_blocks WHERE job_id = ?1 AND segment_id = ?2",
+        params![job_id, segment_id],
+    )?;
+    for block in blocks {
+        conn.execute(
+            "INSERT INTO translation_blocks (segment_id, job_id, block_id, translated_text)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                segment_id,
+                job_id,
+                block.block_id.0.as_str(),
+                block.text.as_str()
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -480,13 +648,16 @@ mod tests {
 
         let store = JobStore::open(&db_path).expect("store should open");
         let job = store
-            .create_job(
-                &input_path,
-                Some("English"),
-                "Italian",
-                "mock",
-                "mock-prefix",
-            )
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+            })
             .expect("job should be created");
         let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
         store
@@ -498,6 +669,10 @@ mod tests {
                 &job.id,
                 "seg_a",
                 "Tradotto",
+                &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "Tradotto".to_string(),
+                }],
                 "mock",
                 "mock-prefix",
                 "v1",
@@ -518,6 +693,11 @@ mod tests {
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.input_tokens, 11);
         assert_eq!(summary.output_tokens, 7);
+        let blocks = store
+            .load_block_translations(&job.id)
+            .expect("block translations should load");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "Tradotto");
 
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(input_path);

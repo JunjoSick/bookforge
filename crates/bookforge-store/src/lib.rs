@@ -2,4 +2,7 @@ pub mod artifacts;
 pub mod db;
 pub mod migrations;
 
-pub use db::{JobRecord, JobStore, JobSummary, RetryScope, StoreError};
+pub use db::{
+    CreateJob, JobRecord, JobStore, JobSummary, RetryScope, SegmentRecord, StoreError,
+    StoredBlockTranslation,
+};
