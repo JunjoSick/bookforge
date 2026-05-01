@@ -421,6 +421,10 @@ pub struct OpenAiCompatibleProvider {
 impl OpenAiCompatibleProvider {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate()
             .timeout(std::time::Duration::from_secs(config.timeout_seconds))
             .build()?;
         Ok(Self { config, client })
@@ -461,7 +465,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             body["response_format"] = json!({"type": "json_object"});
         }
 
-        let max_attempts = 4usize;
+        let max_attempts = 6usize;
         let mut raw = None;
         let mut last_error = None;
         for attempt in 0..max_attempts {
@@ -568,7 +572,7 @@ fn is_retryable_status(status: u16) -> bool {
 }
 
 fn is_retryable_http_error(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect() || error.is_request()
+    error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() || error.is_decode()
 }
 
 fn attempt_limit_for_http_error(error: &reqwest::Error, max_attempts: usize) -> usize {
@@ -577,9 +581,12 @@ fn attempt_limit_for_http_error(error: &reqwest::Error, max_attempts: usize) -> 
 
 fn backoff_delay(attempt: usize) -> Duration {
     let millis = match attempt {
-        0 => 250,
-        1 => 500,
-        _ => 1_000,
+        0 => 500,
+        1 => 1000,
+        2 => 3000,
+        3 => 8000,
+        4 => 20_000,
+        _ => 40_000,
     };
     Duration::from_millis(millis)
 }
