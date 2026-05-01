@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bookforge_core::{
     scheduler::SchedulerConfig,
-    segment::{Segment, SegmentId},
+    segment::{Segment, SegmentId, SegmentStatus},
 };
 use serde::Deserialize;
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -28,6 +28,8 @@ pub struct SegmentTranslation {
     pub ordinal: usize,
     pub checksum: String,
     pub text: String,
+    pub status: SegmentStatus,
+    pub error: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
 }
@@ -95,16 +97,28 @@ where
     for _attempt in 0..attempts {
         match request_translation(provider.as_ref(), &segment, &config).await {
             Ok(translation) => return Ok(translation),
-            Err(error) => last_error = Some(error),
+            Err(error) if is_validator_error(&error) => last_error = Some(error),
+            Err(error) => return Err(error),
         }
     }
 
-    Err(last_error.unwrap_or_else(|| {
-        LlmError::Provider(format!(
-            "segment '{}' exhausted retries without an error",
+    let error = last_error.unwrap_or_else(|| {
+        LlmError::InvalidResponse(format!(
+            "segment '{}' exhausted validation retries without an error",
             segment.id.0
         ))
-    }))
+    });
+
+    Ok(SegmentTranslation {
+        segment_id: segment.id.clone(),
+        ordinal: segment.ordinal,
+        checksum: segment.checksum.clone(),
+        text: segment.source.text.clone(),
+        status: SegmentStatus::NeedsReview,
+        error: Some(error.to_string()),
+        input_tokens: None,
+        output_tokens: None,
+    })
 }
 
 async fn request_translation<P>(
@@ -139,14 +153,45 @@ where
         )));
     }
 
+    validate_translation(segment, &parsed.translation)?;
+
     Ok(SegmentTranslation {
         segment_id: segment.id.clone(),
         ordinal: segment.ordinal,
         checksum: segment.checksum.clone(),
         text: parsed.translation,
+        status: SegmentStatus::Succeeded,
+        error: None,
         input_tokens: response.input_tokens,
         output_tokens: response.output_tokens,
     })
+}
+
+fn is_validator_error(error: &LlmError) -> bool {
+    matches!(error, LlmError::InvalidResponse(_) | LlmError::Json(_))
+}
+
+fn validate_translation(segment: &Segment, translation: &str) -> Result<()> {
+    for span in &segment.constraints.preserve_spans {
+        if !translation.contains(span) {
+            return Err(LlmError::InvalidResponse(format!(
+                "protected span missing from segment '{}': {}",
+                segment.id.0, span
+            )));
+        }
+    }
+
+    for marker in &segment.constraints.preserve_markers {
+        let occurrences = translation.matches(marker).count();
+        if occurrences != 1 {
+            return Err(LlmError::InvalidResponse(format!(
+                "marker '{}' appears {} times in segment '{}'",
+                marker, occurrences, segment.id.0
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn render_plain_system_prompt(config: &TranslationRunConfig) -> String {
@@ -180,20 +225,47 @@ mod tests {
         assert_eq!(translations[0].segment_id.0, "seg_a");
         assert_eq!(translations[1].segment_id.0, "seg_b");
         assert_eq!(translations[0].text, "[Italian] First");
+        assert_eq!(translations[0].status, SegmentStatus::Succeeded);
     }
 
     #[tokio::test]
-    async fn scheduler_rejects_invalid_segment_id_response() {
+    async fn validator_failure_becomes_needs_review() {
         let segments = vec![segment("seg_a", 0, "First")];
-        let error = translate_segments(
+        let translations = translate_segments(
             MockProvider::new(MockMode::WrongSegmentId, "Italian"),
             &segments,
             &config(),
         )
         .await
-        .expect_err("wrong segment id should fail validation");
+        .expect("validator failure should preserve source after retries");
 
-        assert!(error.to_string().contains("segment id mismatch"));
+        assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
+        assert_eq!(translations[0].text, "First");
+        assert!(
+            translations[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("segment id mismatch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_span_failure_becomes_needs_review() {
+        let mut segment = segment("seg_a", 0, "Visit https://example.com");
+        segment
+            .constraints
+            .preserve_spans
+            .push("https://example.com".to_string());
+        let translations = translate_segments(
+            MockProvider::new(MockMode::Uppercase, "Italian"),
+            &[segment],
+            &config(),
+        )
+        .await
+        .expect("protected span validation should preserve source after retries");
+
+        assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
+        assert_eq!(translations[0].text, "Visit https://example.com");
     }
 
     fn config() -> TranslationRunConfig {

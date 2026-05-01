@@ -2,7 +2,7 @@ use anyhow::Result;
 use bookforge_core::{
     config::{SegmentationConfig, TranslationConfig},
     scheduler::SchedulerConfig,
-    segment::build_segments,
+    segment::{SegmentStatus, build_segments},
 };
 use bookforge_epub::read_epub;
 use bookforge_llm::{
@@ -98,7 +98,7 @@ async fn run_mock_translation(input: &PathBuf, config: &TranslationConfig) -> Re
             max_retries: 3,
         },
     };
-    let provider = MockProvider::new(MockMode::PrefixTarget, &config.target_language);
+    let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     let translations = match translate_segments(provider, &segments, &run_config).await {
         Ok(translations) => translations,
         Err(error) => {
@@ -109,18 +109,9 @@ async fn run_mock_translation(input: &PathBuf, config: &TranslationConfig) -> Re
         }
     };
     for translation in &translations {
-        store.save_translation(
-            &job.id,
-            &translation.segment_id.0,
-            &translation.text,
-            "mock",
-            &model,
-            prompt_version,
-            translation.input_tokens,
-            translation.output_tokens,
-        )?;
+        save_translation_result(&store, &job.id, translation, "mock", &model, prompt_version)?;
     }
-    store.mark_job_complete(&job.id)?;
+    mark_job_finished(&store, &job.id, &translations)?;
     let input_tokens = translations
         .iter()
         .filter_map(|translation| translation.input_tokens)
@@ -129,20 +120,35 @@ async fn run_mock_translation(input: &PathBuf, config: &TranslationConfig) -> Re
         .iter()
         .filter_map(|translation| translation.output_tokens)
         .sum::<u64>();
+    let succeeded = translations
+        .iter()
+        .filter(|translation| translation.status == SegmentStatus::Succeeded)
+        .count();
+    let needs_review = translations
+        .iter()
+        .filter(|translation| translation.status == SegmentStatus::NeedsReview)
+        .count();
 
     fs::copy(input, &config.output)?;
 
-    println!(
-        "Translated: {}/{} segments",
-        translations.len(),
-        segments.len()
-    );
+    println!("Translated: {}/{} segments", succeeded, segments.len());
+    println!("Needs review: {needs_review}");
     println!("Input tokens: {input_tokens}");
     println!("Output tokens: {output_tokens}");
     println!("Output: {}", config.output.display());
     println!("Mock mode copied the source EPUB; DOM patching arrives in Milestone 9.");
 
     Ok(())
+}
+
+fn mock_mode(model: &str) -> MockMode {
+    match model {
+        "mock-identity" => MockMode::Identity,
+        "mock-uppercase" => MockMode::Uppercase,
+        "mock-malformed-json" => MockMode::MalformedJson,
+        "mock-wrong-segment-id" => MockMode::WrongSegmentId,
+        _ => MockMode::PrefixTarget,
+    }
 }
 
 async fn run_openai_compatible_translation(
@@ -206,18 +212,16 @@ async fn run_openai_compatible_translation(
     };
 
     for translation in &translations {
-        store.save_translation(
+        save_translation_result(
+            &store,
             &job.id,
-            &translation.segment_id.0,
-            &translation.text,
+            translation,
             &config.provider,
             &model,
             prompt_version,
-            translation.input_tokens,
-            translation.output_tokens,
         )?;
     }
-    store.mark_job_complete(&job.id)?;
+    mark_job_finished(&store, &job.id, &translations)?;
     fs::copy(input, &config.output)?;
 
     println!(
@@ -228,5 +232,58 @@ async fn run_openai_compatible_translation(
     println!("Output: {}", config.output.display());
     println!("OpenAI-compatible translation is stored; DOM patching arrives in Milestone 9.");
 
+    Ok(())
+}
+
+fn save_translation_result(
+    store: &JobStore,
+    job_id: &str,
+    translation: &bookforge_llm::SegmentTranslation,
+    provider: &str,
+    model: &str,
+    prompt_version: &str,
+) -> Result<()> {
+    match translation.status {
+        SegmentStatus::Succeeded => store.save_translation(
+            job_id,
+            &translation.segment_id.0,
+            &translation.text,
+            provider,
+            model,
+            prompt_version,
+            translation.input_tokens,
+            translation.output_tokens,
+        )?,
+        SegmentStatus::NeedsReview => store.save_needs_review(
+            job_id,
+            &translation.segment_id.0,
+            &translation.text,
+            provider,
+            model,
+            prompt_version,
+            translation
+                .error
+                .as_deref()
+                .unwrap_or("translation requires review"),
+        )?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn mark_job_finished(
+    store: &JobStore,
+    job_id: &str,
+    translations: &[bookforge_llm::SegmentTranslation],
+) -> Result<()> {
+    if translations
+        .iter()
+        .any(|translation| translation.status == SegmentStatus::NeedsReview)
+    {
+        store.mark_job_needs_review(job_id)?;
+        return Ok(());
+    }
+
+    store.mark_job_complete(job_id)?;
     Ok(())
 }

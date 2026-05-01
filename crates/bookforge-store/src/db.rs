@@ -170,8 +170,49 @@ impl JobStore {
         Ok(())
     }
 
+    pub fn save_needs_review(
+        &self,
+        job_id: &str,
+        segment_id: &str,
+        preserved_text: &str,
+        provider: &str,
+        model: &str,
+        prompt_version: &str,
+        error: &str,
+    ) -> Result<()> {
+        let now = timestamp_string();
+        let translated_hash = stable_hash(preserved_text);
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO translations
+             (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                segment_id,
+                job_id,
+                preserved_text,
+                provider,
+                model,
+                prompt_version,
+                now
+            ],
+        )?;
+        conn.execute(
+            "UPDATE segments
+             SET status = 'needs_review', attempts = attempts + 1, translated_hash = ?1, error = ?2
+             WHERE job_id = ?3 AND id = ?4",
+            params![translated_hash, error, job_id, segment_id],
+        )?;
+        self.touch_job(job_id, "needs_review")?;
+        Ok(())
+    }
+
     pub fn mark_job_complete(&self, job_id: &str) -> Result<()> {
         self.touch_job(job_id, "succeeded")
+    }
+
+    pub fn mark_job_needs_review(&self, job_id: &str) -> Result<()> {
+        self.touch_job(job_id, "needs_review")
     }
 
     pub fn mark_segment_failed(&self, job_id: &str, segment_id: &str, error: &str) -> Result<()> {
