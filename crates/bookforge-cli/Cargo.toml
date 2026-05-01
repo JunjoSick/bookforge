@@ -15,6 +15,7 @@ anyhow.workspace = true
 bookforge-core = { path = "../bookforge-core" }
 bookforge-epub = { path = "../bookforge-epub" }
 bookforge-llm = { path = "../bookforge-llm" }
+bookforge-store = { path = "../bookforge-store" }
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

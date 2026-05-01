@@ -56,18 +56,18 @@ struct LanguageArgs {
 }
 
 #[derive(Debug, Clone, clap::Args)]
-struct ProviderArgs {
+pub(crate) struct ProviderArgs {
     #[arg(long, default_value = "deepseek")]
-    provider: String,
+    pub(crate) provider: String,
 
     #[arg(long)]
-    model: Option<String>,
+    pub(crate) model: Option<String>,
 
     #[arg(long)]
-    base_url: Option<String>,
+    pub(crate) base_url: Option<String>,
 
     #[arg(long)]
-    api_key_env: Option<String>,
+    pub(crate) api_key_env: Option<String>,
 }
 
 fn default_output_path(input: &std::path::Path, target: &str) -> PathBuf {
