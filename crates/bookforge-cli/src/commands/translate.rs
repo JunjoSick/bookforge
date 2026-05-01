@@ -5,16 +5,21 @@ use bookforge_core::{
     segment::{BlockTranslation, Segment, SegmentStatus, build_segments},
 };
 use bookforge_epub::{read_epub, rebuild_epub};
+#[cfg(test)]
+use bookforge_llm::translate_segments;
 use bookforge_llm::{
-    LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
-    QaSegmentReview, SegmentTranslation, TranslationRunConfig, qa_segments, translate_segments,
+    LlmError, LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig,
+    OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation, TranslationRunConfig,
+    qa_segments, translate_segments_with_callback,
 };
-use bookforge_store::{CreateJob, JobRecord, JobStore, SaveNeedsReview, SaveTranslation};
+use bookforge_store::{
+    CreateJob, JobRecord, JobStore, SaveCachedTranslation, SaveNeedsReview, SaveTranslation,
+};
 use clap::Args;
 use std::path::PathBuf;
 
 use crate::{
-    LanguageArgs, ProviderArgs,
+    LanguageArgs, ProviderArgs, QaMode,
     cost::estimate_cost_usd,
     default_output_path,
     report::{ReportInput, write_report},
@@ -35,6 +40,9 @@ pub struct TranslateArgs {
 
     #[arg(long)]
     pub out: Option<PathBuf>,
+
+    #[arg(long, value_enum, default_value_t = QaMode::Off)]
+    pub qa: QaMode,
 }
 
 pub async fn run(args: TranslateArgs) -> Result<()> {
@@ -57,9 +65,9 @@ pub async fn run(args: TranslateArgs) -> Result<()> {
     println!("Concurrency: {}", config.concurrency);
 
     match config.provider.as_str() {
-        "mock" => run_mock_translation(&args.input, &config).await?,
-        "deepseek" | "openai-compatible" => {
-            run_openai_compatible_translation(&args.input, &config, &args.provider).await?
+        "mock" => run_mock_translation(&args.input, &config, args.qa).await?,
+        "deepseek" | "openrouter" | "openai-compatible" => {
+            run_openai_compatible_translation(&args.input, &config, &args.provider, args.qa).await?
         }
         _ => {
             println!(
@@ -72,7 +80,11 @@ pub async fn run(args: TranslateArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_mock_translation(input: &PathBuf, config: &TranslationConfig) -> Result<()> {
+async fn run_mock_translation(
+    input: &PathBuf,
+    config: &TranslationConfig,
+    qa_mode: QaMode,
+) -> Result<()> {
     let book = read_epub(input)?;
     let segments = build_segments(&book, &SegmentationConfig::default())?;
     let model = config
@@ -106,13 +118,36 @@ async fn run_mock_translation(input: &PathBuf, config: &TranslationConfig) -> Re
         },
     };
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
-    let translations =
-        translate_with_scheduler_guard(provider.clone(), &store, &job.id, &segments, &run_config)
-            .await?;
-    let qa_reviews = qa_segments(provider, &segments, &translations, &run_config).await;
-    for translation in &translations {
-        save_translation_result(&store, &job.id, translation, "mock", &model, prompt_version)?;
-    }
+    let mut translations = apply_cached_translations(
+        &segments,
+        CacheContext {
+            store: &store,
+            job_id: &job.id,
+            prompt_version,
+            provider: "mock",
+            model: &model,
+            source_lang: config.source_language.as_deref(),
+            target_lang: &config.target_language,
+        },
+    )?;
+    let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
+    let fresh_translations = translate_and_checkpoint(
+        provider.clone(),
+        &pending_segments,
+        &run_config,
+        CheckpointContext {
+            store: &store,
+            job_id: &job.id,
+            provider: "mock",
+            model: &model,
+            prompt_version,
+        },
+    )
+    .await?;
+    translations.extend(fresh_translations);
+    translations.sort_by_key(|translation| translation.ordinal);
+    let qa_reviews =
+        qa_reviews_for_mode(provider, &segments, &translations, &run_config, qa_mode).await;
     mark_job_finished(&store, &job.id, &translations)?;
     print_summary_rebuild_and_report(
         &store,
@@ -141,9 +176,28 @@ async fn run_openai_compatible_translation(
     input: &PathBuf,
     config: &TranslationConfig,
     provider_args: &crate::ProviderArgs,
+    qa_mode: QaMode,
 ) -> Result<()> {
     let provider_config = if config.provider == "deepseek" {
-        OpenAiCompatibleConfig::deepseek(config.model.clone())
+        let mut config = OpenAiCompatibleConfig::deepseek(config.model.clone());
+        config.timeout_seconds = provider_args.timeout_seconds;
+        config
+    } else if config.provider == "openrouter" {
+        OpenAiCompatibleConfig {
+            base_url: provider_args
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
+            api_key_env: provider_args
+                .api_key_env
+                .clone()
+                .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string()),
+            model: config
+                .model
+                .clone()
+                .unwrap_or_else(|| "openrouter/auto".to_string()),
+            timeout_seconds: provider_args.timeout_seconds,
+        }
     } else {
         OpenAiCompatibleConfig {
             base_url: provider_args.base_url.clone().ok_or_else(|| {
@@ -157,7 +211,7 @@ async fn run_openai_compatible_translation(
                 .model
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("--model is required for openai-compatible"))?,
-            timeout_seconds: 120,
+            timeout_seconds: provider_args.timeout_seconds,
         }
     };
     let provider = OpenAiCompatibleProvider::new(provider_config.clone())?;
@@ -190,21 +244,36 @@ async fn run_openai_compatible_translation(
             max_retries: 3,
         },
     };
-    let translations =
-        translate_with_scheduler_guard(provider.clone(), &store, &job.id, &segments, &run_config)
-            .await?;
-    let qa_reviews = qa_segments(provider, &segments, &translations, &run_config).await;
-
-    for translation in &translations {
-        save_translation_result(
-            &store,
-            &job.id,
-            translation,
-            &config.provider,
-            &model,
+    let mut translations = apply_cached_translations(
+        &segments,
+        CacheContext {
+            store: &store,
+            job_id: &job.id,
             prompt_version,
-        )?;
-    }
+            provider: &config.provider,
+            model: &model,
+            source_lang: config.source_language.as_deref(),
+            target_lang: &config.target_language,
+        },
+    )?;
+    let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
+    let fresh_translations = translate_and_checkpoint(
+        provider.clone(),
+        &pending_segments,
+        &run_config,
+        CheckpointContext {
+            store: &store,
+            job_id: &job.id,
+            provider: &config.provider,
+            model: &model,
+            prompt_version,
+        },
+    )
+    .await?;
+    translations.extend(fresh_translations);
+    translations.sort_by_key(|translation| translation.ordinal);
+    let qa_reviews =
+        qa_reviews_for_mode(provider, &segments, &translations, &run_config, qa_mode).await;
     mark_job_finished(&store, &job.id, &translations)?;
     print_summary_rebuild_and_report(
         &store,
@@ -219,6 +288,7 @@ async fn run_openai_compatible_translation(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn translate_with_scheduler_guard<P>(
     provider: P,
     store: &JobStore,
@@ -239,6 +309,165 @@ where
             Err(anyhow::anyhow!(message))
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CheckpointContext<'a> {
+    pub store: &'a JobStore,
+    pub job_id: &'a str,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub prompt_version: &'a str,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CacheContext<'a> {
+    pub store: &'a JobStore,
+    pub job_id: &'a str,
+    pub prompt_version: &'a str,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub source_lang: Option<&'a str>,
+    pub target_lang: &'a str,
+}
+
+pub(crate) async fn translate_and_checkpoint<P>(
+    provider: P,
+    segments: &[Segment],
+    config: &TranslationRunConfig,
+    checkpoint: CheckpointContext<'_>,
+) -> Result<Vec<SegmentTranslation>>
+where
+    P: LlmProvider,
+{
+    match translate_segments_with_callback(provider, segments, config, |translation| {
+        save_translation_result(
+            checkpoint.store,
+            checkpoint.job_id,
+            translation,
+            checkpoint.provider,
+            checkpoint.model,
+            checkpoint.prompt_version,
+        )
+        .map_err(|err| LlmError::Provider(format!("checkpoint save failed: {err}")))
+    })
+    .await
+    {
+        Ok(translations) => Ok(translations),
+        Err(error) => {
+            let message = format!(
+                "translation scheduler failed before producing per-segment results: {error}"
+            );
+            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            Err(anyhow::anyhow!(message))
+        }
+    }
+}
+
+pub(crate) fn apply_cached_translations(
+    segments: &[Segment],
+    cache: CacheContext<'_>,
+) -> Result<Vec<SegmentTranslation>> {
+    let mut cached = Vec::new();
+    for segment in segments {
+        let Some(hit) = cache.store.find_cached_translation(
+            segment,
+            cache.prompt_version,
+            cache.provider,
+            cache.model,
+            cache.source_lang,
+            cache.target_lang,
+        )?
+        else {
+            continue;
+        };
+        cache.store.save_cached_translation(SaveCachedTranslation {
+            job_id: cache.job_id,
+            segment_id: &segment.id.0,
+            translated_text: &hit.translated_text,
+            blocks: &hit.blocks,
+            provider: cache.provider,
+            model: cache.model,
+            prompt_version: cache.prompt_version,
+        })?;
+        cached.push(SegmentTranslation {
+            segment_id: segment.id.clone(),
+            ordinal: segment.ordinal,
+            block_ids: segment.block_ids.clone(),
+            blocks: hit.blocks,
+            checksum: segment.checksum.clone(),
+            status: SegmentStatus::SkippedCached,
+            template: "cached".to_string(),
+            error: None,
+            input_tokens: None,
+            output_tokens: None,
+        });
+    }
+    Ok(cached)
+}
+
+pub(crate) fn pending_segments_for_job(
+    store: &JobStore,
+    job_id: &str,
+    segments: &[Segment],
+) -> Result<Vec<Segment>> {
+    let pending_ids = store.pending_segment_ids(job_id)?;
+    let pending = pending_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    Ok(segments
+        .iter()
+        .filter(|segment| pending.contains(segment.id.0.as_str()))
+        .cloned()
+        .collect())
+}
+
+pub(crate) async fn qa_reviews_for_mode<P>(
+    provider: P,
+    segments: &[Segment],
+    translations: &[SegmentTranslation],
+    config: &TranslationRunConfig,
+    qa_mode: QaMode,
+) -> Vec<QaSegmentReview>
+where
+    P: LlmProvider,
+{
+    match qa_mode {
+        QaMode::Off => Vec::new(),
+        QaMode::All => qa_segments(provider, segments, translations, config).await,
+        QaMode::Suspicious => {
+            let candidates = suspicious_qa_candidates(segments, translations);
+            qa_segments(provider, segments, &candidates, config).await
+        }
+    }
+}
+
+fn suspicious_qa_candidates(
+    segments: &[Segment],
+    translations: &[SegmentTranslation],
+) -> Vec<SegmentTranslation> {
+    let by_segment = segments
+        .iter()
+        .map(|segment| (segment.id.0.as_str(), segment))
+        .collect::<std::collections::HashMap<_, _>>();
+    translations
+        .iter()
+        .filter(|translation| translation.status == SegmentStatus::Succeeded)
+        .filter(|translation| {
+            let Some(segment) = by_segment.get(translation.segment_id.0.as_str()) else {
+                return false;
+            };
+            let source_len = segment.source.text.chars().count().max(1);
+            let translated_len = translation.joined_text().chars().count();
+            let ratio = translated_len as f64 / source_len as f64;
+            !(0.5..=2.2).contains(&ratio)
+                || translation.template == "translate_run_preserving"
+                || segment.constraints.preserve_spans.len() >= 4
+                || !segment.constraints.preserve_markers.is_empty()
+        })
+        .cloned()
+        .collect()
 }
 
 fn mark_all_segments_failed(

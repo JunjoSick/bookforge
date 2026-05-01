@@ -3,7 +3,7 @@ mod cost;
 mod report;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use commands::{estimate, inspect, resume, retry, translate, validate};
 use std::path::PathBuf;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -70,6 +70,16 @@ pub(crate) struct ProviderArgs {
 
     #[arg(long)]
     pub(crate) api_key_env: Option<String>,
+
+    #[arg(long, default_value_t = 120)]
+    pub(crate) timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum QaMode {
+    Off,
+    Suspicious,
+    All,
 }
 
 fn default_output_path(input: &std::path::Path, target: &str) -> PathBuf {

@@ -43,7 +43,16 @@ pub struct SegmentTranslation {
 pub struct QaSegmentReview {
     pub segment_id: SegmentId,
     pub verdict: String,
-    pub issues: Vec<String>,
+    pub issues: Vec<QaIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QaIssue {
+    pub severity: String,
+    pub kind: String,
+    pub message: String,
+    pub source_excerpt: Option<String>,
+    pub translation_excerpt: Option<String>,
 }
 
 impl SegmentTranslation {
@@ -128,6 +137,19 @@ pub async fn translate_segments<P>(
 where
     P: LlmProvider,
 {
+    translate_segments_with_callback(provider, segments, config, |_| Ok(())).await
+}
+
+pub async fn translate_segments_with_callback<P, F>(
+    provider: P,
+    segments: &[Segment],
+    config: &TranslationRunConfig,
+    mut on_translation: F,
+) -> Result<Vec<SegmentTranslation>>
+where
+    P: LlmProvider,
+    F: FnMut(&SegmentTranslation) -> Result<()>,
+{
     if config.scheduler.concurrency == 0 {
         return Err(LlmError::Provider(
             "scheduler concurrency must be greater than zero".to_string(),
@@ -140,17 +162,20 @@ where
     let mut tasks = JoinSet::new();
 
     for segment in segments.iter().cloned() {
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|err| LlmError::Provider(err.to_string()))?;
         let provider = provider.clone();
         let config = config.clone();
         let library = library.clone();
+        let semaphore = semaphore.clone();
 
         tasks.spawn(async move {
-            let _permit = permit;
+            let mode = select_mode(&segment);
+            let Ok(_permit) = semaphore.acquire_owned().await else {
+                return failed_translation(
+                    &segment,
+                    mode,
+                    "scheduler semaphore closed before segment could run".to_string(),
+                );
+            };
             translate_one(provider, library, segment, config).await
         });
     }
@@ -158,6 +183,7 @@ where
     let mut translations = Vec::with_capacity(segments.len());
     while let Some(result) = tasks.join_next().await {
         let translation = result.map_err(|err| LlmError::Provider(err.to_string()))?;
+        on_translation(&translation)?;
         translations.push(translation);
     }
 
@@ -193,7 +219,13 @@ where
             Err(error) => reviews.push(QaSegmentReview {
                 segment_id: translation.segment_id.clone(),
                 verdict: "warn".to_string(),
-                issues: vec![format!("QA pass failed: {error}")],
+                issues: vec![QaIssue {
+                    severity: "medium".to_string(),
+                    kind: "qa_request_failed".to_string(),
+                    message: format!("QA pass failed: {error}"),
+                    source_excerpt: None,
+                    translation_excerpt: None,
+                }],
             }),
         }
     }
@@ -205,7 +237,7 @@ where
 struct QaResponse {
     segment_id: String,
     verdict: String,
-    issues: Vec<Value>,
+    issues: Vec<QaIssue>,
 }
 
 async fn request_qa<P>(
@@ -248,14 +280,7 @@ where
     Ok(QaSegmentReview {
         segment_id: segment.id.clone(),
         verdict: parsed.verdict,
-        issues: parsed
-            .issues
-            .into_iter()
-            .map(|issue| match issue {
-                Value::String(text) => text,
-                other => other.to_string(),
-            })
-            .collect(),
+        issues: parsed.issues,
     })
 }
 
@@ -395,7 +420,7 @@ where
         user: rendered.user,
         response_format: ResponseFormat::Json,
         temperature,
-        max_output_tokens: None,
+        max_output_tokens: Some(max_output_tokens(segment, mode)),
         metadata: RequestMetadata {
             segment_id: Some(segment.id.0.clone()),
             block_ids: segment.block_ids.iter().map(|id| id.0.clone()).collect(),
@@ -421,6 +446,32 @@ where
         input_tokens: response.input_tokens,
         output_tokens: response.output_tokens,
     })
+}
+
+fn max_output_tokens(segment: &Segment, mode: TranslationMode) -> u32 {
+    let source_tokens = segment.source.token_estimate.max(1);
+    let block_overhead = segment.source.blocks.len().saturating_mul(128);
+    let marker_overhead = match mode {
+        TranslationMode::Plain => 128,
+        TranslationMode::MarkerSafe => segment
+            .constraints
+            .preserve_markers
+            .len()
+            .saturating_mul(24),
+        TranslationMode::RunPreserving => segment
+            .source
+            .blocks
+            .iter()
+            .map(|block| block.text_runs.len())
+            .sum::<usize>()
+            .saturating_mul(32),
+    };
+    let estimate = source_tokens
+        .saturating_mul(3)
+        .saturating_add(block_overhead)
+        .saturating_add(marker_overhead)
+        .max(512);
+    estimate.min(8_192) as u32
 }
 
 fn render_prompt(

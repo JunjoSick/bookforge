@@ -1,5 +1,10 @@
 /target/
 /.bookforge/
 /.codex
+/.claude/
+/test/
 *.tmp
 *.log
+*.env
+*.key
+key.txt

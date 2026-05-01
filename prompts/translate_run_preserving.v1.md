@@ -105,3 +105,5 @@ Return only valid JSON in this exact shape:
   ]
 }
 ```
+
+Before returning, verify internally that every run ID from the input appears exactly once.

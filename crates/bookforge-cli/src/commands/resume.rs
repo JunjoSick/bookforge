@@ -7,23 +7,27 @@ use anyhow::Result;
 use bookforge_core::{
     config::SegmentationConfig,
     scheduler::SchedulerConfig,
-    segment::{BlockTranslation, Segment, build_segments},
+    segment::{BlockTranslation, Segment, SegmentStatus, build_segments},
 };
 use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::{
-    MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, SegmentTranslation,
-    TranslationRunConfig, qa_segments,
+    MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, QaSegmentReview,
+    SegmentTranslation, TranslationRunConfig,
 };
 use bookforge_store::{JobRecord, JobStore, StoredBlockTranslation};
 use clap::Args;
 
 use crate::{
+    QaMode,
     cost::estimate_cost_usd,
     default_output_path,
     report::{ReportInput, write_report},
 };
 
-use super::translate::{mock_mode, save_translation_result, translate_with_scheduler_guard};
+use super::translate::{
+    CacheContext, CheckpointContext, apply_cached_translations, mock_mode,
+    pending_segments_for_job, qa_reviews_for_mode, translate_and_checkpoint,
+};
 
 #[derive(Debug, Args)]
 pub struct ResumeArgs {
@@ -31,6 +35,12 @@ pub struct ResumeArgs {
 
     #[arg(long, default_value_t = 4)]
     pub concurrency: usize,
+
+    #[arg(long, value_enum, default_value_t = QaMode::Off)]
+    pub qa: QaMode,
+
+    #[arg(long, default_value_t = 120)]
+    pub timeout_seconds: u64,
 }
 
 pub async fn run(args: ResumeArgs) -> Result<()> {
@@ -66,57 +76,78 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
         },
     };
 
-    let (translations, qa_reviews) = if pending_segments.is_empty() {
-        (Vec::new(), Vec::new())
+    let mut cached_translations = apply_cached_translations(
+        &pending_segments,
+        CacheContext {
+            store: &store,
+            job_id: &job.id,
+            prompt_version,
+            provider: &job.provider,
+            model: &job.model,
+            source_lang: job.source_lang.as_deref(),
+            target_lang: &job.target_lang,
+        },
+    )?;
+    let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
+
+    let fresh_translations = if pending_segments.is_empty() {
+        Vec::new()
     } else {
         match job.provider.as_str() {
             "mock" => {
                 let provider = MockProvider::new(mock_mode(&job.model), &job.target_lang);
-                let translations = translate_with_scheduler_guard(
+                translate_and_checkpoint(
                     provider.clone(),
-                    &store,
-                    &job.id,
                     &pending_segments,
                     &run_config,
+                    CheckpointContext {
+                        store: &store,
+                        job_id: &job.id,
+                        provider: &job.provider,
+                        model: &job.model,
+                        prompt_version,
+                    },
                 )
-                .await?;
-                let qa_reviews =
-                    qa_segments(provider, &pending_segments, &translations, &run_config).await;
-                (translations, qa_reviews)
+                .await?
             }
-            "deepseek" | "openai-compatible" => {
-                let provider_config = openai_compatible_config(&job)?;
+            "deepseek" | "openrouter" | "openai-compatible" => {
+                let provider_config = openai_compatible_config(&job, args.timeout_seconds)?;
                 let provider = OpenAiCompatibleProvider::new(provider_config)?;
-                let translations = translate_with_scheduler_guard(
+                translate_and_checkpoint(
                     provider.clone(),
-                    &store,
-                    &job.id,
                     &pending_segments,
                     &run_config,
+                    CheckpointContext {
+                        store: &store,
+                        job_id: &job.id,
+                        provider: &job.provider,
+                        model: &job.model,
+                        prompt_version,
+                    },
                 )
-                .await?;
-                let qa_reviews =
-                    qa_segments(provider, &pending_segments, &translations, &run_config).await;
-                (translations, qa_reviews)
+                .await?
             }
             provider => anyhow::bail!("cannot resume unsupported provider '{provider}'"),
         }
     };
 
-    for translation in &translations {
-        save_translation_result(
-            &store,
-            &job.id,
-            translation,
-            &job.provider,
-            &job.model,
-            prompt_version,
-        )?;
-    }
+    cached_translations.extend(fresh_translations);
+    cached_translations.sort_by_key(|translation| translation.ordinal);
     mark_job_from_summary(&store, &job.id)?;
 
     let stored_blocks = store.load_block_translations(&job.id)?;
-    let block_translations = rebuild_block_translations(&segments, &stored_blocks, &translations);
+    let translations = rebuild_segment_translations(&segments, &stored_blocks);
+    let qa_reviews = qa_after_resume(
+        &job,
+        &segments,
+        &translations,
+        &run_config,
+        args.qa,
+        args.timeout_seconds,
+    )
+    .await?;
+    let block_translations =
+        rebuild_block_translations(&segments, &stored_blocks, &cached_translations);
     rebuild_epub(&book, &block_translations, &output)?;
 
     let job = store
@@ -205,7 +236,10 @@ fn pending_segments(segments: &[Segment], pending_ids: &[String]) -> Result<Vec<
     Ok(found)
 }
 
-fn openai_compatible_config(job: &JobRecord) -> Result<OpenAiCompatibleConfig> {
+fn openai_compatible_config(
+    job: &JobRecord,
+    timeout_seconds: u64,
+) -> Result<OpenAiCompatibleConfig> {
     if job.provider == "deepseek" {
         let mut config = OpenAiCompatibleConfig::deepseek(Some(job.model.clone()));
         if let Some(base_url) = &job.base_url {
@@ -214,7 +248,23 @@ fn openai_compatible_config(job: &JobRecord) -> Result<OpenAiCompatibleConfig> {
         if let Some(api_key_env) = &job.api_key_env {
             config.api_key_env = api_key_env.clone();
         }
+        config.timeout_seconds = timeout_seconds;
         return Ok(config);
+    }
+
+    if job.provider == "openrouter" {
+        return Ok(OpenAiCompatibleConfig {
+            base_url: job
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
+            api_key_env: job
+                .api_key_env
+                .clone()
+                .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string()),
+            model: job.model.clone(),
+            timeout_seconds,
+        });
     }
 
     Ok(OpenAiCompatibleConfig {
@@ -229,7 +279,7 @@ fn openai_compatible_config(job: &JobRecord) -> Result<OpenAiCompatibleConfig> {
             .clone()
             .unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
         model: job.model.clone(),
-        timeout_seconds: 120,
+        timeout_seconds,
     })
 }
 
@@ -244,6 +294,28 @@ fn mark_job_from_summary(store: &JobStore, job_id: &str) -> Result<()> {
         store.mark_job_complete(job_id)?;
     }
     Ok(())
+}
+
+async fn qa_after_resume(
+    job: &JobRecord,
+    segments: &[Segment],
+    translations: &[SegmentTranslation],
+    config: &TranslationRunConfig,
+    qa_mode: QaMode,
+    timeout_seconds: u64,
+) -> Result<Vec<QaSegmentReview>> {
+    match job.provider.as_str() {
+        "mock" => {
+            let provider = MockProvider::new(mock_mode(&job.model), &job.target_lang);
+            Ok(qa_reviews_for_mode(provider, segments, translations, config, qa_mode).await)
+        }
+        "deepseek" | "openrouter" | "openai-compatible" => {
+            let provider_config = openai_compatible_config(job, timeout_seconds)?;
+            let provider = OpenAiCompatibleProvider::new(provider_config)?;
+            Ok(qa_reviews_for_mode(provider, segments, translations, config, qa_mode).await)
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 fn rebuild_block_translations(
@@ -274,4 +346,48 @@ fn rebuild_block_translations(
         }
     }
     blocks
+}
+
+fn rebuild_segment_translations(
+    segments: &[Segment],
+    stored: &[StoredBlockTranslation],
+) -> Vec<SegmentTranslation> {
+    let mut by_segment_block = HashMap::<(String, String), String>::new();
+    for translation in stored {
+        by_segment_block.insert(
+            (translation.segment_id.clone(), translation.block_id.clone()),
+            translation.text.clone(),
+        );
+    }
+
+    let mut translations = Vec::new();
+    for segment in segments {
+        let mut blocks = Vec::new();
+        for block in &segment.source.blocks {
+            if let Some(text) =
+                by_segment_block.get(&(segment.id.0.clone(), block.block_id.0.clone()))
+            {
+                blocks.push(BlockTranslation {
+                    block_id: block.block_id.clone(),
+                    text: text.clone(),
+                });
+            }
+        }
+        if !blocks.is_empty() {
+            translations.push(SegmentTranslation {
+                segment_id: segment.id.clone(),
+                ordinal: segment.ordinal,
+                block_ids: segment.block_ids.clone(),
+                blocks,
+                checksum: segment.checksum.clone(),
+                status: SegmentStatus::Succeeded,
+                template: "stored".to_string(),
+                error: None,
+                input_tokens: None,
+                output_tokens: None,
+            });
+        }
+    }
+
+    translations
 }

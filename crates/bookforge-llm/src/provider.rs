@@ -465,18 +465,46 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let mut raw = None;
         let mut last_error = None;
         for attempt in 0..max_attempts {
-            let response = self
+            let response = match self
                 .client
                 .post(&endpoint)
                 .bearer_auth(&api_key)
+                .header(reqwest::header::ACCEPT_ENCODING, "identity")
                 .json(&body)
                 .send()
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let retryable = is_retryable_http_error(&error);
+                    let attempt_limit = attempt_limit_for_http_error(&error, max_attempts);
+                    last_error = Some(LlmError::Http(error));
+                    if !retryable || attempt + 1 == attempt_limit {
+                        return Err(last_error.expect("set above"));
+                    }
+                    sleep(backoff_delay(attempt)).await;
+                    continue;
+                }
+            };
             let status = response.status();
 
             if status.is_success() {
-                raw = Some(response.json::<Value>().await?);
-                break;
+                match response.json::<Value>().await {
+                    Ok(value) => {
+                        raw = Some(value);
+                        break;
+                    }
+                    Err(error) => {
+                        let retryable = is_retryable_http_error(&error);
+                        let attempt_limit = attempt_limit_for_http_error(&error, max_attempts);
+                        last_error = Some(LlmError::Http(error));
+                        if !retryable || attempt + 1 == attempt_limit {
+                            return Err(last_error.expect("set above"));
+                        }
+                        sleep(backoff_delay(attempt)).await;
+                        continue;
+                    }
+                }
             }
 
             let status_code = status.as_u16();
@@ -537,6 +565,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
 fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
+}
+
+fn is_retryable_http_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request()
+}
+
+fn attempt_limit_for_http_error(error: &reqwest::Error, max_attempts: usize) -> usize {
+    if error.is_timeout() { 2 } else { max_attempts }
 }
 
 fn backoff_delay(attempt: usize) -> Duration {

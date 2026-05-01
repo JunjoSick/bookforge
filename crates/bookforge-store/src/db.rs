@@ -7,6 +7,7 @@ use std::{
 
 use bookforge_core::{
     Result as CoreResult,
+    ir::BlockId,
     segment::{BlockTranslation, Segment},
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -87,6 +88,12 @@ pub struct StoredBlockTranslation {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedTranslation {
+    pub translated_text: String,
+    pub blocks: Vec<BlockTranslation>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SaveTranslation<'a> {
     pub job_id: &'a str,
@@ -110,6 +117,17 @@ pub struct SaveNeedsReview<'a> {
     pub model: &'a str,
     pub prompt_version: &'a str,
     pub error: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SaveCachedTranslation<'a> {
+    pub job_id: &'a str,
+    pub segment_id: &'a str,
+    pub translated_text: &'a str,
+    pub blocks: &'a [BlockTranslation],
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub prompt_version: &'a str,
 }
 
 impl JobStore {
@@ -274,6 +292,37 @@ impl JobStore {
         Ok(())
     }
 
+    pub fn save_cached_translation(&self, request: SaveCachedTranslation<'_>) -> Result<()> {
+        let now = timestamp_string();
+        let translated_hash = stable_hash(request.translated_text);
+        {
+            let conn = self.conn.borrow();
+            conn.execute(
+                "INSERT OR REPLACE INTO translations
+                 (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    request.segment_id,
+                    request.job_id,
+                    request.translated_text,
+                    request.provider,
+                    request.model,
+                    request.prompt_version,
+                    now
+                ],
+            )?;
+            replace_block_translations(&conn, request.job_id, request.segment_id, request.blocks)?;
+            conn.execute(
+                "UPDATE segments
+                 SET status = 'skipped_cached', input_tokens = NULL, output_tokens = NULL, translated_hash = ?1, error = NULL
+                 WHERE job_id = ?2 AND id = ?3",
+                params![translated_hash, request.job_id, request.segment_id],
+            )?;
+        }
+        self.touch_job(request.job_id, "running")?;
+        Ok(())
+    }
+
     pub fn mark_job_complete(&self, job_id: &str) -> Result<()> {
         self.touch_job(job_id, "succeeded")
     }
@@ -430,6 +479,73 @@ impl JobStore {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn find_cached_translation(
+        &self,
+        segment: &Segment,
+        prompt_version: &str,
+        provider: &str,
+        model: &str,
+        source_lang: Option<&str>,
+        target_lang: &str,
+    ) -> Result<Option<CachedTranslation>> {
+        let conn = self.conn.borrow();
+        let cached = conn
+            .query_row(
+                "SELECT t.job_id, t.segment_id, t.translated_text
+                 FROM translations t
+                 JOIN segments s ON s.job_id = t.job_id AND s.id = t.segment_id
+                 JOIN jobs j ON j.id = t.job_id
+                 WHERE s.source_hash = ?1
+                   AND s.prompt_version = ?2
+                   AND s.provider = ?3
+                   AND s.model = ?4
+                   AND ((?5 IS NULL AND j.source_lang IS NULL) OR j.source_lang = ?5)
+                   AND j.target_lang = ?6
+                   AND s.status IN ('succeeded', 'skipped_cached')
+                 ORDER BY t.created_at DESC
+                 LIMIT 1",
+                params![
+                    segment.checksum,
+                    prompt_version,
+                    provider,
+                    model,
+                    source_lang,
+                    target_lang
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((job_id, segment_id, translated_text)) = cached else {
+            return Ok(None);
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT block_id, translated_text
+             FROM translation_blocks
+             WHERE job_id = ?1 AND segment_id = ?2
+             ORDER BY block_id",
+        )?;
+        let rows = stmt.query_map(params![job_id, segment_id], |row| {
+            Ok(BlockTranslation {
+                block_id: BlockId(row.get::<_, String>(0)?),
+                text: row.get(1)?,
+            })
+        })?;
+        let blocks = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(Some(CachedTranslation {
+            translated_text,
+            blocks,
+        }))
     }
 
     fn migrate(&self) -> Result<()> {

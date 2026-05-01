@@ -72,6 +72,9 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         let xhtml = read_archive_text(&mut archive, &href)?;
         let section_id = SectionId(format!("sec_{spine_index:06}"));
         let mut section_blocks = extract_blocks(&xhtml, &href, &section_id, blocks.len())?;
+        if section_blocks.is_empty() {
+            continue;
+        }
         let block_ids = section_blocks
             .iter()
             .map(|block| block.id.clone())
@@ -92,6 +95,12 @@ pub fn read_epub(path: &Path) -> Result<Book> {
     }
 
     link_sections(&mut sections);
+
+    if blocks.is_empty() {
+        return Err(BookforgeError::InvalidInput(
+            "EPUB contains no translatable blocks".to_string(),
+        ));
+    }
 
     Ok(Book {
         source_path: Some(path.to_path_buf()),
@@ -475,7 +484,7 @@ impl BlockBuilder {
 
 fn extract_blocks(
     xhtml: &str,
-    href: &str,
+    _href: &str,
     section_id: &SectionId,
     initial_block_count: usize,
 ) -> Result<Vec<Block>> {
@@ -560,12 +569,6 @@ fn extract_blocks(
             Event::Eof => break,
             _ => {}
         }
-    }
-
-    if blocks.is_empty() {
-        return Err(BookforgeError::InvalidInput(format!(
-            "XHTML spine resource '{href}' contains no translatable blocks"
-        )));
     }
 
     Ok(blocks)
@@ -782,12 +785,17 @@ fn protected_span_kind(value: &str) -> Option<ProtectedSpanKind> {
 }
 
 fn trim_token(raw: &str) -> &str {
-    raw.trim_matches(|ch: char| {
+    let trimmed = raw.trim_matches(|ch: char| {
         matches!(
             ch,
-            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '"' | '\''
         )
-    })
+    });
+    if trimmed.starts_with("[@") && trimmed.ends_with(']') {
+        trimmed
+    } else {
+        trimmed.trim_matches(|ch: char| matches!(ch, '[' | ']'))
+    }
 }
 
 fn looks_like_email(value: &str) -> bool {
@@ -799,18 +807,20 @@ fn looks_like_email(value: &str) -> bool {
 
 fn looks_like_citation(value: &str) -> bool {
     (value.starts_with('@') && value.len() > 1)
-        || (value.len() > 4
-            && value.contains(':')
-            && value.chars().any(|ch| ch.is_ascii_alphabetic()))
+        || (value.starts_with("[@") && value.ends_with(']') && value.len() > 3)
 }
 
 fn looks_like_filename(value: &str) -> bool {
     let Some((stem, ext)) = value.rsplit_once('.') else {
         return false;
     };
+    const COMMON_EXTENSIONS: &[&str] = &[
+        "azw", "css", "csv", "epub", "gif", "htm", "html", "jpeg", "jpg", "js", "json", "md",
+        "mobi", "ncx", "opf", "pdf", "png", "svg", "txt", "xhtml", "xml", "zip",
+    ];
+    let ext = ext.to_ascii_lowercase();
     !stem.is_empty()
-        && (2..=8).contains(&ext.len())
-        && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+        && COMMON_EXTENSIONS.contains(&ext.as_str())
         && stem
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '/' | '.'))
@@ -938,6 +948,25 @@ mod tests {
         assert!(texts.contains(&"file.txt"));
         assert!(texts.contains(&"#anchor"));
         assert!(texts.contains(&"12-14"));
+    }
+
+    #[test]
+    fn protected_spans_do_not_treat_sentence_fragments_as_filenames() {
+        let spans = detect_protected_spans(
+            "case.Fedor bow.At said:“The file.txt chapter.xhtml [@tolstoy1886] @note1",
+        );
+        let texts = spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!texts.contains(&"case.Fedor"));
+        assert!(!texts.contains(&"bow.At"));
+        assert!(!texts.contains(&"said:“The"));
+        assert!(texts.contains(&"file.txt"));
+        assert!(texts.contains(&"chapter.xhtml"));
+        assert!(texts.contains(&"[@tolstoy1886]"));
+        assert!(texts.contains(&"@note1"));
     }
 
     fn block_text(block: &Block) -> String {

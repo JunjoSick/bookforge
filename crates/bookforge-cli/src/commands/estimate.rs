@@ -52,6 +52,7 @@ fn default_model(provider: &str) -> &str {
     match provider {
         "mock" => "mock-prefix-target",
         "deepseek" => "deepseek-chat",
+        "openrouter" => "openrouter/auto",
         _ => "unknown",
     }
 }

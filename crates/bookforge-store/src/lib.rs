@@ -3,6 +3,7 @@ pub mod db;
 pub mod migrations;
 
 pub use db::{
-    CreateJob, JobRecord, JobStore, JobSummary, RetryScope, SaveNeedsReview, SaveTranslation,
-    SegmentRecord, StoreError, StoredBlockTranslation,
+    CachedTranslation, CreateJob, JobRecord, JobStore, JobSummary, RetryScope,
+    SaveCachedTranslation, SaveNeedsReview, SaveTranslation, SegmentRecord, StoreError,
+    StoredBlockTranslation,
 };

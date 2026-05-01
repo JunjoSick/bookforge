@@ -115,3 +115,11 @@ Return only valid JSON in this exact shape:
   ]
 }
 ```
+
+Before returning, verify internally that:
+
+- every input block ID appears once;
+- every required marker appears exactly once unless the input explicitly contains it multiple times;
+- no unknown marker appears;
+- no prose has been skipped;
+- no explanatory text is included outside JSON.

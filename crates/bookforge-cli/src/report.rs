@@ -150,7 +150,10 @@ fn qa_warnings(input: &ReportInput<'_>) -> Vec<QaWarning> {
         .collect::<BTreeMap<_, _>>();
 
     for translation in input.translations {
-        if translation.status != SegmentStatus::Succeeded {
+        if !matches!(
+            translation.status,
+            SegmentStatus::Succeeded | SegmentStatus::SkippedCached
+        ) {
             continue;
         }
         let Some(source) = source_by_segment.get(translation.segment_id.0.as_str()) else {
@@ -255,7 +258,22 @@ fn qa_warnings(input: &ReportInput<'_>) -> Vec<QaWarning> {
                     severity,
                     kind: "qa_review",
                     segment_id: Some(review.segment_id.0.clone()),
-                    message: issue.clone(),
+                    message: format!(
+                        "{} [{}]: {}{}{}",
+                        issue.severity,
+                        issue.kind,
+                        issue.message,
+                        issue
+                            .source_excerpt
+                            .as_ref()
+                            .map(|text| format!(" source={text:?}"))
+                            .unwrap_or_default(),
+                        issue
+                            .translation_excerpt
+                            .as_ref()
+                            .map(|text| format!(" translation={text:?}"))
+                            .unwrap_or_default()
+                    ),
                 });
             }
         }

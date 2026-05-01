@@ -30,7 +30,15 @@ The output must match this JSON shape exactly:
 {
   "segment_id": "...",
   "verdict": "pass",
-  "issues": []
+  "issues": [
+    {
+      "severity": "low",
+      "kind": "...",
+      "message": "...",
+      "source_excerpt": "...",
+      "translation_excerpt": "..."
+    }
+  ]
 }
 ```
 
@@ -77,5 +85,17 @@ Return only valid JSON in this exact shape:
   "segment_id": "{{segment_id}}",
   "verdict": "pass",
   "issues": []
+}
+```
+
+When issues are present, each issue must be an object with:
+
+```json
+{
+  "severity": "low | medium | high",
+  "kind": "omission | addition | mistranslation | tone | untranslated | terminology | reference | structure | other",
+  "message": "short actionable description",
+  "source_excerpt": "short source excerpt or null",
+  "translation_excerpt": "short translation excerpt or null"
 }
 ```
