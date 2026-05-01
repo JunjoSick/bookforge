@@ -1,0 +1,5 @@
+/target/
+/.bookforge/
+/.codex
+*.tmp
+*.log

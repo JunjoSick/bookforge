@@ -1,0 +1,1 @@
+pub const INITIAL_SCHEMA_VERSION: u32 = 1;
