@@ -6,9 +6,11 @@ use std::{
 
 use anyhow::Result;
 use bookforge_core::segment::{Segment, SegmentStatus};
-use bookforge_llm::SegmentTranslation;
+use bookforge_llm::{QaSegmentReview, SegmentTranslation};
 use bookforge_store::{JobRecord, JobSummary, SegmentRecord};
 use serde::Serialize;
+
+use crate::cost::estimate_cost_usd;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReportFiles {
@@ -23,6 +25,7 @@ pub(crate) struct ReportInput<'a> {
     pub segments: &'a [Segment],
     pub segment_records: &'a [SegmentRecord],
     pub translations: &'a [SegmentTranslation],
+    pub qa_reviews: &'a [QaSegmentReview],
     pub output: &'a Path,
 }
 
@@ -45,6 +48,7 @@ struct QaReport {
     input_tokens: u64,
     output_tokens: u64,
     estimated_cost: Option<f64>,
+    qa_reviewed_segments: usize,
     qa_warnings: Vec<QaWarning>,
 }
 
@@ -75,7 +79,13 @@ pub(crate) fn write_report(input: ReportInput<'_>) -> Result<ReportFiles> {
         retry_pending_segments: input.summary.retry_pending,
         input_tokens: input.summary.input_tokens,
         output_tokens: input.summary.output_tokens,
-        estimated_cost: None,
+        estimated_cost: estimate_cost_usd(
+            &input.job.provider,
+            &input.job.model,
+            input.summary.input_tokens,
+            input.summary.output_tokens,
+        ),
+        qa_reviewed_segments: input.qa_reviews.len(),
         qa_warnings: qa_warnings(&input),
     };
 
@@ -176,9 +186,149 @@ fn qa_warnings(input: &ReportInput<'_>) -> Vec<QaWarning> {
                 message: "translation is identical to the source text".to_string(),
             });
         }
+
+        if let Some(message) = missing_tokens_message("URL", &urls(source), &urls(&translated))
+            && seen.insert((translation.segment_id.0.clone(), "url_changed"))
+        {
+            warnings.push(QaWarning {
+                severity: "warning",
+                kind: "url_changed",
+                segment_id: Some(translation.segment_id.0.clone()),
+                message,
+            });
+        }
+
+        if let Some(message) =
+            missing_tokens_message("number", &numbers(source), &numbers(&translated))
+            && seen.insert((translation.segment_id.0.clone(), "number_changed"))
+        {
+            warnings.push(QaWarning {
+                severity: "warning",
+                kind: "number_changed",
+                segment_id: Some(translation.segment_id.0.clone()),
+                message,
+            });
+        }
+
+        if looks_like_model_commentary(&translated)
+            && seen.insert((translation.segment_id.0.clone(), "model_commentary"))
+        {
+            warnings.push(QaWarning {
+                severity: "warning",
+                kind: "model_commentary",
+                segment_id: Some(translation.segment_id.0.clone()),
+                message: "translation appears to include model commentary".to_string(),
+            });
+        }
+
+        if has_repetition(&translated)
+            && seen.insert((translation.segment_id.0.clone(), "repetition"))
+        {
+            warnings.push(QaWarning {
+                severity: "warning",
+                kind: "repetition",
+                segment_id: Some(translation.segment_id.0.clone()),
+                message: "translation contains suspicious repeated words".to_string(),
+            });
+        }
+    }
+
+    for review in input.qa_reviews {
+        if review.verdict == "pass" && review.issues.is_empty() {
+            continue;
+        }
+        let severity = if review.verdict == "fail" {
+            "error"
+        } else {
+            "warning"
+        };
+        if review.issues.is_empty() {
+            warnings.push(QaWarning {
+                severity,
+                kind: "qa_review",
+                segment_id: Some(review.segment_id.0.clone()),
+                message: format!("QA verdict: {}", review.verdict),
+            });
+        } else {
+            for issue in &review.issues {
+                warnings.push(QaWarning {
+                    severity,
+                    kind: "qa_review",
+                    segment_id: Some(review.segment_id.0.clone()),
+                    message: issue.clone(),
+                });
+            }
+        }
     }
 
     warnings
+}
+
+fn urls(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|token| {
+            let value = token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    ',' | ';' | ':' | '.' | '!' | '?' | ')' | ']' | '"' | '\''
+                )
+            });
+            (value.starts_with("http://") || value.starts_with("https://"))
+                .then(|| value.to_string())
+        })
+        .collect()
+}
+
+fn numbers(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|token| {
+            let value = token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+                )
+            });
+            let digits = value.chars().filter(|ch| ch.is_ascii_digit()).count();
+            (digits >= 2
+                && value.chars().all(|ch| {
+                    ch.is_ascii_digit()
+                        || matches!(ch, '.' | ',' | ':' | '/' | '-' | '+' | '%' | '$')
+                }))
+            .then(|| value.to_string())
+        })
+        .collect()
+}
+
+fn missing_tokens_message(label: &str, source: &[String], translated: &[String]) -> Option<String> {
+    let missing = source
+        .iter()
+        .filter(|token| !translated.contains(token))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!missing.is_empty()).then(|| format!("missing preserved {label}(s): {}", missing.join(", ")))
+}
+
+fn looks_like_model_commentary(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    lower.starts_with("here is ")
+        || lower.starts_with("here's ")
+        || lower.starts_with("certainly")
+        || lower.starts_with("translation:")
+        || lower.contains("as an ai")
+}
+
+fn has_repetition(text: &str) -> bool {
+    let words = text
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    words
+        .windows(4)
+        .any(|window| window[0] == window[1] && window[1] == window[2] && window[2] == window[3])
 }
 
 fn render_markdown(report: &QaReport) -> String {
@@ -212,7 +362,14 @@ fn render_markdown(report: &QaReport) -> String {
     ));
     output.push_str(&format!("- Input tokens: {}\n", report.input_tokens));
     output.push_str(&format!("- Output tokens: {}\n", report.output_tokens));
-    output.push_str("- Estimated cost: not available\n\n");
+    output.push_str(&format!(
+        "- QA reviewed segments: {}\n",
+        report.qa_reviewed_segments
+    ));
+    match report.estimated_cost {
+        Some(cost) => output.push_str(&format!("- Estimated cost: ${cost:.6}\n\n")),
+        None => output.push_str("- Estimated cost: not available\n\n"),
+    }
 
     output.push_str("## QA Warnings\n\n");
     if report.qa_warnings.is_empty() {

@@ -1,4 +1,5 @@
 mod commands;
+mod cost;
 mod report;
 
 use anyhow::Result;

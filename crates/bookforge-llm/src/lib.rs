@@ -8,4 +8,6 @@ pub use provider::{
     OpenAiCompatibleConfig, OpenAiCompatibleProvider, ProviderCapabilities, RequestMetadata,
     ResponseFormat,
 };
-pub use scheduler::{SegmentTranslation, TranslationRunConfig, translate_segments};
+pub use scheduler::{
+    QaSegmentReview, SegmentTranslation, TranslationRunConfig, qa_segments, translate_segments,
+};

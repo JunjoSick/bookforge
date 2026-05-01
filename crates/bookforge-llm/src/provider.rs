@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Instant;
+use tokio::time::{Duration, sleep};
 
 pub type Result<T> = std::result::Result<T, LlmError>;
 
@@ -17,6 +18,9 @@ pub enum LlmError {
 
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+
+    #[error("HTTP status {status}: {body}")]
+    HttpStatus { status: u16, body: String },
 }
 
 pub trait LlmProvider: Send + Sync + 'static {
@@ -157,6 +161,43 @@ impl LlmProvider for MockProvider {
                     "blocks": blocks,
                 }))?
             }
+            "translate_run_preserving" => {
+                let run_sources = extract_run_sources_from_json(&request.user, block_ids);
+                let blocks = block_ids
+                    .iter()
+                    .map(|block_id| {
+                        let runs = run_sources
+                            .get(block_id.as_str())
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(id, source)| {
+                                json!({
+                                    "id": id,
+                                    "text": transform_run_text(
+                                        self.mode,
+                                        &self.target_language,
+                                        &source,
+                                    ),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        json!({
+                            "block_id": block_id,
+                            "translated_runs": runs,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::to_string(&json!({
+                    "segment_id": response_segment_id,
+                    "blocks": blocks,
+                }))?
+            }
+            "qa_segment" => serde_json::to_string(&json!({
+                "segment_id": response_segment_id,
+                "verdict": "pass",
+                "issues": [],
+            }))?,
             _ => {
                 let source =
                     extract_plain_source(&request.user).unwrap_or_else(|| request.user.clone());
@@ -190,6 +231,14 @@ impl LlmProvider for MockProvider {
     }
 }
 
+fn transform_run_text(mode: MockMode, target_language: &str, source: &str) -> String {
+    if is_marker_token(source) {
+        source.to_string()
+    } else {
+        transform_text(mode, target_language, source)
+    }
+}
+
 fn transform_text(mode: MockMode, target_language: &str, source: &str) -> String {
     match mode {
         MockMode::Identity | MockMode::WrongSegmentId => source.to_string(),
@@ -197,6 +246,14 @@ fn transform_text(mode: MockMode, target_language: &str, source: &str) -> String
         MockMode::Uppercase => source.to_uppercase(),
         MockMode::MalformedJson => unreachable!("handled above"),
     }
+}
+
+fn is_marker_token(text: &str) -> bool {
+    let text = text.trim();
+    text == "</m>"
+        || text.starts_with("<m ")
+        || text.starts_with("<keep ")
+        || text.starts_with("<ref ")
 }
 
 /// Recover per-block source strings from a rendered marker-safe user prompt.
@@ -252,6 +309,70 @@ fn extract_block_sources_from_json<'a>(
             sources.insert(known.as_str(), text);
         }
     }
+    sources
+}
+
+fn extract_run_sources_from_json<'a>(
+    user_prompt: &str,
+    block_ids: &'a [String],
+) -> std::collections::BTreeMap<&'a str, Vec<(String, String)>> {
+    let mut sources = std::collections::BTreeMap::new();
+    let Some(marker) = user_prompt.find("Source blocks and runs:") else {
+        return sources;
+    };
+    let after = &user_prompt[marker..];
+    let Some(start) = after.find('[') else {
+        return sources;
+    };
+    let array_slice = &after[start..];
+    let mut depth = 0usize;
+    let mut end_index = None;
+    for (offset, ch) in array_slice.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end_index = Some(offset + ch.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end_index else {
+        return sources;
+    };
+    let array_text = &array_slice[..end];
+    let parsed: Vec<serde_json::Value> = match serde_json::from_str(array_text) {
+        Ok(value) => value,
+        Err(_) => return sources,
+    };
+
+    for entry in parsed {
+        let Some(block_id) = entry.get("block_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(known) = block_ids.iter().find(|known| known.as_str() == block_id) else {
+            continue;
+        };
+        let runs = entry
+            .get("runs")
+            .and_then(serde_json::Value::as_array)
+            .map(|runs| {
+                runs.iter()
+                    .filter_map(|run| {
+                        Some((
+                            run.get("id")?.as_str()?.to_string(),
+                            run.get("text")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        sources.insert(known.as_str(), runs);
+    }
+
     sources
 }
 
@@ -340,16 +461,42 @@ impl LlmProvider for OpenAiCompatibleProvider {
             body["response_format"] = json!({"type": "json_object"});
         }
 
-        let raw = self
-            .client
-            .post(endpoint)
-            .bearer_auth(api_key)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
+        let max_attempts = 4usize;
+        let mut raw = None;
+        let mut last_error = None;
+        for attempt in 0..max_attempts {
+            let response = self
+                .client
+                .post(&endpoint)
+                .bearer_auth(&api_key)
+                .json(&body)
+                .send()
+                .await?;
+            let status = response.status();
+
+            if status.is_success() {
+                raw = Some(response.json::<Value>().await?);
+                break;
+            }
+
+            let status_code = status.as_u16();
+            let body = response.text().await.unwrap_or_default();
+            last_error = Some(LlmError::HttpStatus {
+                status: status_code,
+                body,
+            });
+
+            if !is_retryable_status(status_code) || attempt + 1 == max_attempts {
+                return Err(last_error.expect("set above"));
+            }
+
+            sleep(backoff_delay(attempt)).await;
+        }
+        let raw = raw.ok_or_else(|| {
+            last_error.unwrap_or_else(|| {
+                LlmError::Provider("OpenAI-compatible request did not run".to_string())
+            })
+        })?;
 
         let content = raw
             .pointer("/choices/0/message/content")
@@ -386,6 +533,19 @@ impl LlmProvider for OpenAiCompatibleProvider {
             supports_usage_tokens: true,
         }
     }
+}
+
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
+
+fn backoff_delay(attempt: usize) -> Duration {
+    let millis = match attempt {
+        0 => 250,
+        1 => 500,
+        _ => 1_000,
+    };
+    Duration::from_millis(millis)
 }
 
 fn parse_finish_reason(value: &str) -> FinishReason {

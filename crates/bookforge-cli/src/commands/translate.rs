@@ -7,14 +7,16 @@ use bookforge_core::{
 use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::{
     LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
-    SegmentTranslation, TranslationRunConfig, translate_segments,
+    QaSegmentReview, SegmentTranslation, TranslationRunConfig, qa_segments, translate_segments,
 };
-use bookforge_store::{CreateJob, JobRecord, JobStore};
+use bookforge_store::{CreateJob, JobRecord, JobStore, SaveNeedsReview, SaveTranslation};
 use clap::Args;
 use std::path::PathBuf;
 
 use crate::{
-    LanguageArgs, ProviderArgs, default_output_path,
+    LanguageArgs, ProviderArgs,
+    cost::estimate_cost_usd,
+    default_output_path,
     report::{ReportInput, write_report},
 };
 
@@ -105,12 +107,22 @@ async fn run_mock_translation(input: &PathBuf, config: &TranslationConfig) -> Re
     };
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     let translations =
-        translate_with_scheduler_guard(provider, &store, &job.id, &segments, &run_config).await?;
+        translate_with_scheduler_guard(provider.clone(), &store, &job.id, &segments, &run_config)
+            .await?;
+    let qa_reviews = qa_segments(provider, &segments, &translations, &run_config).await;
     for translation in &translations {
         save_translation_result(&store, &job.id, translation, "mock", &model, prompt_version)?;
     }
     mark_job_finished(&store, &job.id, &translations)?;
-    print_summary_rebuild_and_report(&store, &job, &book, &segments, &translations, config)?;
+    print_summary_rebuild_and_report(
+        &store,
+        &job,
+        &book,
+        &segments,
+        &translations,
+        &qa_reviews,
+        config,
+    )?;
 
     Ok(())
 }
@@ -179,7 +191,9 @@ async fn run_openai_compatible_translation(
         },
     };
     let translations =
-        translate_with_scheduler_guard(provider, &store, &job.id, &segments, &run_config).await?;
+        translate_with_scheduler_guard(provider.clone(), &store, &job.id, &segments, &run_config)
+            .await?;
+    let qa_reviews = qa_segments(provider, &segments, &translations, &run_config).await;
 
     for translation in &translations {
         save_translation_result(
@@ -192,7 +206,15 @@ async fn run_openai_compatible_translation(
         )?;
     }
     mark_job_finished(&store, &job.id, &translations)?;
-    print_summary_rebuild_and_report(&store, &job, &book, &segments, &translations, config)?;
+    print_summary_rebuild_and_report(
+        &store,
+        &job,
+        &book,
+        &segments,
+        &translations,
+        &qa_reviews,
+        config,
+    )?;
 
     Ok(())
 }
@@ -241,30 +263,30 @@ pub(crate) fn save_translation_result(
 ) -> Result<()> {
     let joined = translation.joined_text();
     match translation.status {
-        SegmentStatus::Succeeded => store.save_translation(
+        SegmentStatus::Succeeded => store.save_translation(SaveTranslation {
             job_id,
-            &translation.segment_id.0,
-            &joined,
-            &translation.blocks,
+            segment_id: &translation.segment_id.0,
+            translated_text: &joined,
+            blocks: &translation.blocks,
             provider,
             model,
             prompt_version,
-            translation.input_tokens,
-            translation.output_tokens,
-        )?,
-        SegmentStatus::NeedsReview => store.save_needs_review(
+            input_tokens: translation.input_tokens,
+            output_tokens: translation.output_tokens,
+        })?,
+        SegmentStatus::NeedsReview => store.save_needs_review(SaveNeedsReview {
             job_id,
-            &translation.segment_id.0,
-            &joined,
-            &translation.blocks,
+            segment_id: &translation.segment_id.0,
+            preserved_text: &joined,
+            blocks: &translation.blocks,
             provider,
             model,
             prompt_version,
-            translation
+            error: translation
                 .error
                 .as_deref()
                 .unwrap_or("translation requires review"),
-        )?,
+        })?,
         SegmentStatus::Failed => store.mark_segment_failed(
             job_id,
             &translation.segment_id.0,
@@ -311,6 +333,7 @@ pub(crate) fn print_summary_rebuild_and_report(
     book: &bookforge_core::ir::Book,
     segments: &[bookforge_core::segment::Segment],
     translations: &[SegmentTranslation],
+    qa_reviews: &[QaSegmentReview],
     config: &TranslationConfig,
 ) -> Result<()> {
     let block_translations = block_translations(translations);
@@ -325,6 +348,7 @@ pub(crate) fn print_summary_rebuild_and_report(
         segments,
         segment_records: &segment_records,
         translations,
+        qa_reviews,
         output: &config.output,
     })?;
 
@@ -338,6 +362,14 @@ pub(crate) fn print_summary_rebuild_and_report(
     println!("Failed: {}", summary.failed);
     println!("Input tokens: {}", summary.input_tokens);
     println!("Output tokens: {}", summary.output_tokens);
+    if let Some(cost) = estimate_cost_usd(
+        &job.provider,
+        &job.model,
+        summary.input_tokens,
+        summary.output_tokens,
+    ) {
+        println!("Estimated cost: ${cost:.6}");
+    }
     println!("Output: {}", config.output.display());
     println!("Report: {}", report.markdown.display());
 
@@ -351,7 +383,7 @@ mod tests {
         ir::{BlockId, SectionId},
         segment::{
             SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
-            SegmentSource,
+            SegmentSource, SegmentTextRun,
         },
     };
     use std::{fs, time::SystemTime};
@@ -431,6 +463,10 @@ mod tests {
                     block_id,
                     kind: "paragraph".to_string(),
                     text: format!("Source {ordinal}"),
+                    text_runs: vec![SegmentTextRun {
+                        id: format!("r{ordinal}"),
+                        text: format!("Source {ordinal}"),
+                    }],
                     protected_spans: Vec::new(),
                 }],
                 token_estimate: 2,

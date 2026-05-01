@@ -12,12 +12,13 @@ use bookforge_core::{
 use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::{
     MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, SegmentTranslation,
-    TranslationRunConfig,
+    TranslationRunConfig, qa_segments,
 };
 use bookforge_store::{JobRecord, JobStore, StoredBlockTranslation};
 use clap::Args;
 
 use crate::{
+    cost::estimate_cost_usd,
     default_output_path,
     report::{ReportInput, write_report},
 };
@@ -65,31 +66,38 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
         },
     };
 
-    let translations = if pending_segments.is_empty() {
-        Vec::new()
+    let (translations, qa_reviews) = if pending_segments.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
         match job.provider.as_str() {
             "mock" => {
-                translate_with_scheduler_guard(
-                    MockProvider::new(mock_mode(&job.model), &job.target_lang),
+                let provider = MockProvider::new(mock_mode(&job.model), &job.target_lang);
+                let translations = translate_with_scheduler_guard(
+                    provider.clone(),
                     &store,
                     &job.id,
                     &pending_segments,
                     &run_config,
                 )
-                .await?
+                .await?;
+                let qa_reviews =
+                    qa_segments(provider, &pending_segments, &translations, &run_config).await;
+                (translations, qa_reviews)
             }
             "deepseek" | "openai-compatible" => {
                 let provider_config = openai_compatible_config(&job)?;
                 let provider = OpenAiCompatibleProvider::new(provider_config)?;
-                translate_with_scheduler_guard(
-                    provider,
+                let translations = translate_with_scheduler_guard(
+                    provider.clone(),
                     &store,
                     &job.id,
                     &pending_segments,
                     &run_config,
                 )
-                .await?
+                .await?;
+                let qa_reviews =
+                    qa_segments(provider, &pending_segments, &translations, &run_config).await;
+                (translations, qa_reviews)
             }
             provider => anyhow::bail!("cannot resume unsupported provider '{provider}'"),
         }
@@ -124,6 +132,7 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
         segments: &segments,
         segment_records: &segment_records,
         translations: &translations,
+        qa_reviews: &qa_reviews,
         output: &output,
     })?;
 
@@ -137,6 +146,14 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
     println!("Failed: {}", summary.failed);
     println!("Input tokens: {}", summary.input_tokens);
     println!("Output tokens: {}", summary.output_tokens);
+    if let Some(cost) = estimate_cost_usd(
+        &job.provider,
+        &job.model,
+        summary.input_tokens,
+        summary.output_tokens,
+    ) {
+        println!("Estimated cost: ${cost:.6}");
+    }
     println!("Output: {}", output.display());
     println!("Report: {}", report.markdown.display());
 

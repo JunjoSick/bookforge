@@ -87,6 +87,31 @@ pub struct StoredBlockTranslation {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SaveTranslation<'a> {
+    pub job_id: &'a str,
+    pub segment_id: &'a str,
+    pub translated_text: &'a str,
+    pub blocks: &'a [BlockTranslation],
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub prompt_version: &'a str,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SaveNeedsReview<'a> {
+    pub job_id: &'a str,
+    pub segment_id: &'a str,
+    pub preserved_text: &'a str,
+    pub blocks: &'a [BlockTranslation],
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub prompt_version: &'a str,
+    pub error: &'a str,
+}
+
 impl JobStore {
     pub fn open_default() -> Result<Self> {
         Self::open(".bookforge/jobs.sqlite")
@@ -176,20 +201,9 @@ impl JobStore {
         Ok(())
     }
 
-    pub fn save_translation(
-        &self,
-        job_id: &str,
-        segment_id: &str,
-        translated_text: &str,
-        blocks: &[BlockTranslation],
-        provider: &str,
-        model: &str,
-        prompt_version: &str,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-    ) -> Result<()> {
+    pub fn save_translation(&self, request: SaveTranslation<'_>) -> Result<()> {
         let now = timestamp_string();
-        let translated_hash = stable_hash(translated_text);
+        let translated_hash = stable_hash(request.translated_text);
         {
             let conn = self.conn.borrow();
             conn.execute(
@@ -197,46 +211,36 @@ impl JobStore {
                  (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
-                    segment_id,
-                    job_id,
-                    translated_text,
-                    provider,
-                    model,
-                    prompt_version,
+                    request.segment_id,
+                    request.job_id,
+                    request.translated_text,
+                    request.provider,
+                    request.model,
+                    request.prompt_version,
                     now
                 ],
             )?;
-            replace_block_translations(&conn, job_id, segment_id, blocks)?;
+            replace_block_translations(&conn, request.job_id, request.segment_id, request.blocks)?;
             conn.execute(
                 "UPDATE segments
                  SET status = 'succeeded', attempts = attempts + 1, input_tokens = ?1, output_tokens = ?2, translated_hash = ?3, error = NULL
                  WHERE job_id = ?4 AND id = ?5",
                 params![
-                    input_tokens.map(|value| value as i64),
-                    output_tokens.map(|value| value as i64),
+                    request.input_tokens.map(|value| value as i64),
+                    request.output_tokens.map(|value| value as i64),
                     translated_hash,
-                    job_id,
-                    segment_id,
+                    request.job_id,
+                    request.segment_id,
                 ],
             )?;
         }
-        self.touch_job(job_id, "running")?;
+        self.touch_job(request.job_id, "running")?;
         Ok(())
     }
 
-    pub fn save_needs_review(
-        &self,
-        job_id: &str,
-        segment_id: &str,
-        preserved_text: &str,
-        blocks: &[BlockTranslation],
-        provider: &str,
-        model: &str,
-        prompt_version: &str,
-        error: &str,
-    ) -> Result<()> {
+    pub fn save_needs_review(&self, request: SaveNeedsReview<'_>) -> Result<()> {
         let now = timestamp_string();
-        let translated_hash = stable_hash(preserved_text);
+        let translated_hash = stable_hash(request.preserved_text);
         {
             let conn = self.conn.borrow();
             conn.execute(
@@ -244,24 +248,29 @@ impl JobStore {
                  (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
-                    segment_id,
-                    job_id,
-                    preserved_text,
-                    provider,
-                    model,
-                    prompt_version,
+                    request.segment_id,
+                    request.job_id,
+                    request.preserved_text,
+                    request.provider,
+                    request.model,
+                    request.prompt_version,
                     now
                 ],
             )?;
-            replace_block_translations(&conn, job_id, segment_id, blocks)?;
+            replace_block_translations(&conn, request.job_id, request.segment_id, request.blocks)?;
             conn.execute(
                 "UPDATE segments
                  SET status = 'needs_review', attempts = attempts + 1, translated_hash = ?1, error = ?2
                  WHERE job_id = ?3 AND id = ?4",
-                params![translated_hash, error, job_id, segment_id],
+                params![
+                    translated_hash,
+                    request.error,
+                    request.job_id,
+                    request.segment_id
+                ],
             )?;
         }
-        self.touch_job(job_id, "needs_review")?;
+        self.touch_job(request.job_id, "needs_review")?;
         Ok(())
     }
 
@@ -428,15 +437,12 @@ impl JobStore {
         if table_exists(&conn, "translations")?
             && !table_has_column(&conn, "translations", "job_id")?
         {
-            conn.execute_batch(
-                "
-                DROP TABLE IF EXISTS qa_findings;
-                DROP TABLE IF EXISTS translation_blocks;
-                DROP TABLE IF EXISTS translations;
-                DROP TABLE IF EXISTS segments;
-                DROP TABLE IF EXISTS jobs;
-                ",
-            )?;
+            let suffix = unix_timestamp_nanos();
+            rename_table_if_exists(&conn, "qa_findings", suffix)?;
+            rename_table_if_exists(&conn, "translation_blocks", suffix)?;
+            rename_table_if_exists(&conn, "translations", suffix)?;
+            rename_table_if_exists(&conn, "segments", suffix)?;
+            rename_table_if_exists(&conn, "jobs", suffix)?;
         }
         conn.execute_batch(
             "
@@ -545,6 +551,16 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::R
     Ok(false)
 }
 
+fn rename_table_if_exists(conn: &Connection, table: &str, suffix: u128) -> rusqlite::Result<()> {
+    if table_exists(conn, table)? {
+        conn.execute(
+            &format!("ALTER TABLE {table} RENAME TO {table}_legacy_{suffix}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -636,7 +652,7 @@ mod tests {
         ir::{BlockId, SectionId},
         segment::{
             Segment, SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
-            SegmentSource,
+            SegmentSource, SegmentTextRun,
         },
     };
 
@@ -665,20 +681,20 @@ mod tests {
             .expect("segments should insert");
 
         store
-            .save_translation(
-                &job.id,
-                "seg_a",
-                "Tradotto",
-                &[BlockTranslation {
+            .save_translation(SaveTranslation {
+                job_id: &job.id,
+                segment_id: "seg_a",
+                translated_text: "Tradotto",
+                blocks: &[BlockTranslation {
                     block_id: BlockId("b_000000".to_string()),
                     text: "Tradotto".to_string(),
                 }],
-                "mock",
-                "mock-prefix",
-                "v1",
-                Some(11),
-                Some(7),
-            )
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                input_tokens: Some(11),
+                output_tokens: Some(7),
+            })
             .expect("translation should save");
         store
             .mark_segment_failed(&job.id, "seg_b", "provider unavailable")
@@ -716,6 +732,10 @@ mod tests {
                     block_id,
                     kind: "paragraph".to_string(),
                     text: format!("Source {ordinal}"),
+                    text_runs: vec![SegmentTextRun {
+                        id: format!("r{ordinal}"),
+                        text: format!("Source {ordinal}"),
+                    }],
                     protected_spans: Vec::new(),
                 }],
                 token_estimate: 2,

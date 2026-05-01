@@ -258,13 +258,12 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
                     }
                 }
             }
-            Event::End(element) => {
+            Event::End(element)
                 if current_text_element
                     .as_deref()
-                    .is_some_and(|name| name == local_name(element.name().as_ref()))
-                {
-                    current_text_element = None;
-                }
+                    .is_some_and(|name| name == local_name(element.name().as_ref())) =>
+            {
+                current_text_element = None;
             }
             Event::Eof => break,
             _ => {}
@@ -715,11 +714,11 @@ fn strip_marker_tokens(text: &str) -> String {
         output.push_str(&rest[..index]);
         let tag = &rest[index..];
 
-        if tag.starts_with("<m id=\"") || tag.starts_with("<ref id=\"") || tag.starts_with("</m>") {
-            if let Some(end) = tag.find('>') {
-                rest = &tag[end + 1..];
-                continue;
-            }
+        if (tag.starts_with("<m id=\"") || tag.starts_with("<ref id=\"") || tag.starts_with("</m>"))
+            && let Some(end) = tag.find('>')
+        {
+            rest = &tag[end + 1..];
+            continue;
         }
 
         output.push('<');
@@ -747,34 +746,91 @@ fn estimate_tokens(text: &str) -> usize {
 }
 
 fn detect_protected_spans(text: &str) -> Vec<ProtectedSpan> {
-    text.split_whitespace()
+    let mut spans = text
+        .split_whitespace()
         .filter_map(|raw| {
-            let value = raw.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']'
-                )
-            });
+            let value = trim_token(raw);
             protected_span_kind(value).map(|kind| ProtectedSpan {
                 kind,
                 text: value.to_string(),
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    spans.sort_by(|left, right| left.text.cmp(&right.text));
+    spans.dedup_by(|left, right| left.kind == right.kind && left.text == right.text);
+    spans
 }
 
 fn protected_span_kind(value: &str) -> Option<ProtectedSpanKind> {
-    if value.starts_with("http://") || value.starts_with("https://") {
+    if value.is_empty() {
+        None
+    } else if value.starts_with("http://") || value.starts_with("https://") {
         Some(ProtectedSpanKind::Url)
-    } else if value.contains('@') && value.contains('.') {
+    } else if value.starts_with('#') && value.len() > 1 {
+        Some(ProtectedSpanKind::InternalAnchor)
+    } else if looks_like_email(value) {
         Some(ProtectedSpanKind::Email)
-    } else if value.chars().all(|ch| ch.is_ascii_digit()) {
+    } else if looks_like_citation(value) {
+        Some(ProtectedSpanKind::Citation)
+    } else if looks_like_protected_number(value) {
         Some(ProtectedSpanKind::Number)
-    } else if value.contains('.') && !value.starts_with('.') && !value.ends_with('.') {
+    } else if looks_like_filename(value) {
         Some(ProtectedSpanKind::Filename)
     } else {
         None
     }
+}
+
+fn trim_token(raw: &str) -> &str {
+    raw.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    })
+}
+
+fn looks_like_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+}
+
+fn looks_like_citation(value: &str) -> bool {
+    (value.starts_with('@') && value.len() > 1)
+        || (value.len() > 4
+            && value.contains(':')
+            && value.chars().any(|ch| ch.is_ascii_alphabetic()))
+}
+
+fn looks_like_filename(value: &str) -> bool {
+    let Some((stem, ext)) = value.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && (2..=8).contains(&ext.len())
+        && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+        && stem
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '/' | '.'))
+}
+
+fn looks_like_protected_number(value: &str) -> bool {
+    let digit_count = value.chars().filter(|ch| ch.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return false;
+    }
+    if digit_count >= 2 {
+        return value.chars().all(|ch| {
+            ch.is_ascii_digit()
+                || matches!(
+                    ch,
+                    '.' | ',' | ':' | ';' | '/' | '-' | '+' | '%' | '$' | '\u{20ac}' | '\u{00a3}'
+                )
+        });
+    }
+    value.ends_with("st") || value.ends_with("nd") || value.ends_with("rd") || value.ends_with("th")
 }
 
 fn read_archive_text(archive: &mut ZipArchive<File>, path: &str) -> Result<String> {
@@ -865,6 +921,23 @@ mod tests {
         assert_eq!(block_text(&blocks[0]), "Line<ref id=\"r000004_000\"/>break");
         assert_eq!(blocks[0].inline_marks[0].id, "r000004_000");
         assert_eq!(blocks[0].inline_marks[0].kind, "br");
+    }
+
+    #[test]
+    fn protected_spans_do_not_overflag_single_digits() {
+        let spans = detect_protected_spans(
+            "Chapter 1 cites https://example.com, file.txt, #anchor, and pages 12-14.",
+        );
+        let texts = spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!texts.contains(&"1"));
+        assert!(texts.contains(&"https://example.com"));
+        assert!(texts.contains(&"file.txt"));
+        assert!(texts.contains(&"#anchor"));
+        assert!(texts.contains(&"12-14"));
     }
 
     fn block_text(block: &Block) -> String {

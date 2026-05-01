@@ -164,11 +164,16 @@ fn json_escape_inner(value: &str) -> String {
 const PLAIN_TEMPLATE_SOURCE: &str = include_str!("../../../prompts/translate_segment.v1.md");
 const MARKER_SAFE_TEMPLATE_SOURCE: &str =
     include_str!("../../../prompts/translate_marker_safe.v1.md");
+const RUN_PRESERVING_TEMPLATE_SOURCE: &str =
+    include_str!("../../../prompts/translate_run_preserving.v1.md");
+const QA_TEMPLATE_SOURCE: &str = include_str!("../../../prompts/qa_segment.v1.md");
 
 #[derive(Debug, Clone)]
 pub struct PromptLibrary {
     pub plain: PromptTemplate,
     pub marker_safe: PromptTemplate,
+    pub run_preserving: PromptTemplate,
+    pub qa: PromptTemplate,
 }
 
 impl PromptLibrary {
@@ -178,7 +183,20 @@ impl PromptLibrary {
         let marker_safe =
             PromptTemplate::parse("translate_marker_safe", "v1", MARKER_SAFE_TEMPLATE_SOURCE)
                 .expect("embedded marker-safe template must parse");
-        Self { plain, marker_safe }
+        let run_preserving = PromptTemplate::parse(
+            "translate_run_preserving",
+            "v1",
+            RUN_PRESERVING_TEMPLATE_SOURCE,
+        )
+        .expect("embedded run-preserving template must parse");
+        let qa = PromptTemplate::parse("qa_segment", "v1", QA_TEMPLATE_SOURCE)
+            .expect("embedded QA template must parse");
+        Self {
+            plain,
+            marker_safe,
+            run_preserving,
+            qa,
+        }
     }
 }
 
@@ -266,5 +284,14 @@ mod tests {
         assert!(library.plain.user.contains("{{segment_id}}"));
         assert_eq!(library.marker_safe.name, "translate_marker_safe");
         assert!(library.marker_safe.user.contains("{{source_blocks_json}}"));
+        assert_eq!(library.run_preserving.name, "translate_run_preserving");
+        assert!(
+            library
+                .run_preserving
+                .user
+                .contains("{{source_run_blocks_json}}")
+        );
+        assert_eq!(library.qa.name, "qa_segment");
+        assert!(library.qa.user.contains("{{translation_text}}"));
     }
 }

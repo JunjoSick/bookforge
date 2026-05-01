@@ -41,7 +41,14 @@ pub struct SegmentBlock {
     pub block_id: BlockId,
     pub kind: String,
     pub text: String,
+    pub text_runs: Vec<SegmentTextRun>,
     pub protected_spans: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentTextRun {
+    pub id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -190,6 +197,14 @@ fn push_segment(
                 block_id: block.id.clone(),
                 kind: block_kind_label(block.kind).to_string(),
                 text: block_text(block),
+                text_runs: block
+                    .text_runs
+                    .iter()
+                    .map(|run| SegmentTextRun {
+                        id: run.id.clone(),
+                        text: run.text.clone(),
+                    })
+                    .collect(),
                 protected_spans: spans,
             }
         })
@@ -270,12 +285,12 @@ fn apply_context(segments: &mut [Segment], context_tokens: usize) {
         .map(|segment| segment.source.text.clone())
         .collect::<Vec<_>>();
 
-    for index in 0..segments.len() {
-        segments[index].context.before = index
+    for (index, segment) in segments.iter_mut().enumerate() {
+        segment.context.before = index
             .checked_sub(1)
             .and_then(|previous| sources.get(previous))
             .map(|text| tail_words(text, context_tokens));
-        segments[index].context.after = sources
+        segment.context.after = sources
             .get(index + 1)
             .map(|text| head_words(text, context_tokens));
     }
