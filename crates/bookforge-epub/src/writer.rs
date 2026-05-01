@@ -391,10 +391,10 @@ fn collect_inline_templates(
             }
             Event::End(end) => {
                 let Some((id, start)) = stack.pop() else {
-                    return Err(BookforgeError::InvalidInput(
-                        "inline template stack underflow while collecting original events"
-                            .to_string(),
-                    ));
+                    return Err(BookforgeError::InvalidInput(format!(
+                        "inline template stack underflow in block '{}' at path {:?}. The EPUB may have unbalanced inline markup.",
+                        block.id.0, block.dom_path
+                    )));
                 };
                 templates.insert(
                     id,
@@ -430,7 +430,7 @@ fn push_marked_fragment(
         if let Some((tag_name, id, open_len)) = parse_paired_marker_open(tag) {
             if used.iter().any(|seen| seen == &id) {
                 return Err(BookforgeError::InvalidInput(format!(
-                    "inline marker '{id}' was duplicated"
+                    "translation contains a duplicate formatting marker '{id}'. The LLM copied the marker twice."
                 )));
             }
 
@@ -463,7 +463,7 @@ fn push_marked_fragment(
         } else if let Some((id, marker_len)) = parse_empty_marker(tag) {
             if used.iter().any(|seen| seen == &id) {
                 return Err(BookforgeError::InvalidInput(format!(
-                    "inline marker '{id}' was duplicated"
+                    "translation contains a duplicate formatting marker '{id}'. The LLM copied the marker twice."
                 )));
             }
 
@@ -509,7 +509,7 @@ fn parse_paired_marker_open(text: &str) -> Option<(&'static str, String, usize)>
         }
         let open_end = text.find('>')?;
         if text[..open_end].ends_with('/') {
-            continue;
+            return None;
         }
         let id = extract_marker_id(&text[..=open_end])?;
         return Some((tag_name, id, open_end + 1));
@@ -518,13 +518,18 @@ fn parse_paired_marker_open(text: &str) -> Option<(&'static str, String, usize)>
 }
 
 fn parse_empty_marker(text: &str) -> Option<(String, usize)> {
-    if !text.starts_with("<ref ") {
-        return None;
+    for tag_name in ["ref", "m", "keep"] {
+        if !text.starts_with(&format!("<{tag_name} ")) {
+            continue;
+        }
+        if let Some(end) = text.find("/>") {
+            let tag = &text[..end + 2];
+            if let Some(id) = extract_marker_id(tag) {
+                return Some((id, end + 2));
+            }
+        }
     }
-    let end = text.find("/>")?;
-    let tag = &text[..end + 2];
-    let id = extract_marker_id(tag)?;
-    Some((id, end + 2))
+    None
 }
 
 fn extract_marker_id(tag: &str) -> Option<String> {

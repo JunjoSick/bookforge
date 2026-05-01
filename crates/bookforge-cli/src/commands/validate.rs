@@ -86,5 +86,21 @@ fn validate_report(path: &PathBuf) -> Result<()> {
         anyhow::bail!("report contains retry-pending segments");
     }
 
+    let has_error = parsed
+        .get("qa_warnings")
+        .and_then(Value::as_array)
+        .map(|warnings| {
+            warnings.iter().any(|w| {
+                w.get("level")
+                    .and_then(Value::as_str)
+                    .map(|level| level == "error")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if has_error {
+        anyhow::bail!("report contains QA warning(s) with severity 'error'");
+    }
+
     Ok(())
 }

@@ -117,6 +117,8 @@ pub struct SaveNeedsReview<'a> {
     pub model: &'a str,
     pub prompt_version: &'a str,
     pub error: &'a str,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -278,9 +280,11 @@ impl JobStore {
             replace_block_translations(&conn, request.job_id, request.segment_id, request.blocks)?;
             conn.execute(
                 "UPDATE segments
-                 SET status = 'needs_review', attempts = attempts + 1, translated_hash = ?1, error = ?2
-                 WHERE job_id = ?3 AND id = ?4",
+                 SET status = 'needs_review', attempts = attempts + 1, input_tokens = ?1, output_tokens = ?2, translated_hash = ?3, error = ?4
+                 WHERE job_id = ?5 AND id = ?6",
                 params![
+                    request.input_tokens.map(|value| value as i64),
+                    request.output_tokens.map(|value| value as i64),
                     translated_hash,
                     request.error,
                     request.job_id,

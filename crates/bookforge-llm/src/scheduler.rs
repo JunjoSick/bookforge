@@ -170,10 +170,12 @@ where
         tasks.spawn(async move {
             let mode = select_mode(&segment);
             let Ok(_permit) = semaphore.acquire_owned().await else {
-                return failed_translation(
+                return failed_translation_with_tokens(
                     &segment,
                     mode,
                     "scheduler semaphore closed before segment could run".to_string(),
+                    None,
+                    None,
                 );
             };
             translate_one(provider, library, segment, config).await
@@ -326,10 +328,12 @@ where
     let mode = select_mode(&segment);
     let attempts = config.scheduler.max_attempts.max(1);
     let mut last_error: Option<LlmError> = None;
+    let mut accum_in: u64 = 0;
+    let mut accum_out: u64 = 0;
 
     for _ in 0..attempts {
         let retry_context = last_error.as_ref().map(ToString::to_string);
-        match request_translation(
+        let result = request_translation(
             provider.as_ref(),
             library.as_ref(),
             &segment,
@@ -337,18 +341,34 @@ where
             mode,
             retry_context.as_deref(),
         )
-        .await
-        {
-            Ok(translation) => return translation,
-            Err(error) if is_validator_error(&error) => last_error = Some(error),
-            Err(error) => return failed_translation(&segment, mode, error.to_string()),
+        .await;
+        match result {
+            Ok(translation) => {
+                let mut translation = translation;
+                accum_in += translation.input_tokens.unwrap_or(0);
+                accum_out += translation.output_tokens.unwrap_or(0);
+                translation.input_tokens = if accum_in > 0 { Some(accum_in) } else { None };
+                translation.output_tokens = if accum_out > 0 { Some(accum_out) } else { None };
+                return translation;
+            }
+            Err(error) => {
+                if is_validator_error(&error) {
+                    last_error = Some(error);
+                } else {
+                    let tokens_in = if accum_in > 0 { Some(accum_in) } else { None };
+                    let tokens_out = if accum_out > 0 { Some(accum_out) } else { None };
+                    return failed_translation_with_tokens(
+                        &segment, mode, error.to_string(), tokens_in, tokens_out,
+                    );
+                }
+            }
         }
     }
 
     let mut final_mode = mode;
     if mode == TranslationMode::MarkerSafe && has_structured_runs(&segment) {
         let retry_context = last_error.as_ref().map(ToString::to_string);
-        match request_translation(
+        let result = request_translation(
             provider.as_ref(),
             library.as_ref(),
             &segment,
@@ -356,27 +376,37 @@ where
             TranslationMode::RunPreserving,
             retry_context.as_deref(),
         )
-        .await
-        {
-            Ok(translation) => return translation,
-            Err(error) if is_validator_error(&error) => {
-                final_mode = TranslationMode::RunPreserving;
-                last_error = Some(error);
+        .await;
+        match result {
+            Ok(translation) => {
+                let mut translation = translation;
+                accum_in += translation.input_tokens.unwrap_or(0);
+                accum_out += translation.output_tokens.unwrap_or(0);
+                translation.input_tokens = if accum_in > 0 { Some(accum_in) } else { None };
+                translation.output_tokens = if accum_out > 0 { Some(accum_out) } else { None };
+                return translation;
             }
             Err(error) => {
-                return failed_translation(
-                    &segment,
-                    TranslationMode::RunPreserving,
-                    error.to_string(),
-                );
+                if is_validator_error(&error) {
+                    final_mode = TranslationMode::RunPreserving;
+                    last_error = Some(error);
+                } else {
+                    let tokens_in = if accum_in > 0 { Some(accum_in) } else { None };
+                    let tokens_out = if accum_out > 0 { Some(accum_out) } else { None };
+                    return failed_translation_with_tokens(
+                        &segment, TranslationMode::RunPreserving, error.to_string(), tokens_in, tokens_out,
+                    );
+                }
             }
         }
     }
 
+    let tokens_in = if accum_in > 0 { Some(accum_in) } else { None };
+    let tokens_out = if accum_out > 0 { Some(accum_out) } else { None };
     let error_message = last_error
         .map(|err| err.to_string())
         .unwrap_or_else(|| "exhausted validation retries".to_string());
-    needs_review_translation(&segment, final_mode, error_message)
+    needs_review_translation_with_tokens(&segment, final_mode, error_message, tokens_in, tokens_out)
 }
 
 fn select_mode(segment: &Segment) -> TranslationMode {
@@ -935,10 +965,12 @@ fn is_marker_token(text: &str) -> bool {
         || text.starts_with("<ref ")
 }
 
-fn needs_review_translation(
+fn needs_review_translation_with_tokens(
     segment: &Segment,
     mode: TranslationMode,
     error: String,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
 ) -> SegmentTranslation {
     SegmentTranslation {
         segment_id: segment.id.clone(),
@@ -949,15 +981,17 @@ fn needs_review_translation(
         status: SegmentStatus::NeedsReview,
         template: mode.template_name().to_string(),
         error: Some(error),
-        input_tokens: None,
-        output_tokens: None,
+        input_tokens,
+        output_tokens,
     }
 }
 
-fn failed_translation(
+fn failed_translation_with_tokens(
     segment: &Segment,
     mode: TranslationMode,
     error: String,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
 ) -> SegmentTranslation {
     SegmentTranslation {
         segment_id: segment.id.clone(),
@@ -968,8 +1002,8 @@ fn failed_translation(
         status: SegmentStatus::Failed,
         template: mode.template_name().to_string(),
         error: Some(error),
-        input_tokens: None,
-        output_tokens: None,
+        input_tokens,
+        output_tokens,
     }
 }
 

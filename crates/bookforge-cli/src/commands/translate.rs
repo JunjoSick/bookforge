@@ -519,6 +519,8 @@ pub(crate) fn save_translation_result(
                 .error
                 .as_deref()
                 .unwrap_or("translation requires review"),
+            input_tokens: translation.input_tokens,
+            output_tokens: translation.output_tokens,
         })?,
         SegmentStatus::Failed => store.mark_segment_failed(
             job_id,

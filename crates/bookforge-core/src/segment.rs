@@ -91,7 +91,6 @@ pub fn block_kind_label(kind: BlockKind) -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SegmentStatus {
     Queued,
-    InFlight,
     Succeeded,
     Failed,
     RetryPending,

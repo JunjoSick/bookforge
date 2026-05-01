@@ -87,6 +87,11 @@ fn default_output_path(input: &std::path::Path, target: &str) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("book");
-    let target = target.to_lowercase().replace(' ', "-");
+    let target = target
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let target = target.trim_matches('-');
     input.with_file_name(format!("{stem}.{target}.epub"))
 }
