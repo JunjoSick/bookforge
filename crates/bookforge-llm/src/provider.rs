@@ -53,6 +53,8 @@ pub enum ResponseFormat {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestMetadata {
     pub segment_id: Option<String>,
+    pub block_ids: Vec<String>,
+    pub prompt_template: Option<String>,
     pub prompt_version: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -126,23 +128,56 @@ impl LlmProvider for MockProvider {
         } else {
             segment_id
         };
-        let translation = match self.mode {
-            MockMode::Identity | MockMode::WrongSegmentId => request.user.clone(),
-            MockMode::PrefixTarget => format!("[{}] {}", self.target_language, request.user),
-            MockMode::Uppercase => request.user.to_uppercase(),
-            MockMode::MalformedJson => unreachable!("handled above"),
+        let template = request
+            .metadata
+            .prompt_template
+            .as_deref()
+            .unwrap_or("translate_segment");
+        let block_ids = &request.metadata.block_ids;
+
+        let content = match template {
+            "translate_marker_safe" => {
+                let block_sources = extract_block_sources_from_json(&request.user, block_ids);
+                let blocks = block_ids
+                    .iter()
+                    .map(|block_id| {
+                        let source = block_sources
+                            .get(block_id.as_str())
+                            .cloned()
+                            .unwrap_or_default();
+                        let translated = transform_text(self.mode, &self.target_language, &source);
+                        json!({
+                            "block_id": block_id,
+                            "translation": translated,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::to_string(&json!({
+                    "segment_id": response_segment_id,
+                    "blocks": blocks,
+                }))?
+            }
+            _ => {
+                let source =
+                    extract_plain_source(&request.user).unwrap_or_else(|| request.user.clone());
+                let translation = transform_text(self.mode, &self.target_language, &source);
+                serde_json::to_string(&json!({
+                    "segment_id": response_segment_id,
+                    "translation": translation,
+                }))?
+            }
         };
-        let content = serde_json::to_string(&json!({
-            "segment_id": response_segment_id,
-            "translation": translation,
-        }))?;
 
         Ok(CompletionResponse {
             input_tokens: Some(estimate_tokens(&request.user)),
             output_tokens: Some(estimate_tokens(&content)),
             finish_reason: FinishReason::Stop,
             provider_latency_ms: started.elapsed().as_millis() as u64,
-            raw: json!({"provider": "mock", "mode": format!("{:?}", self.mode)}),
+            raw: json!({
+                "provider": "mock",
+                "mode": format!("{:?}", self.mode),
+                "template": template,
+            }),
             content,
         })
     }
@@ -153,6 +188,84 @@ impl LlmProvider for MockProvider {
             supports_usage_tokens: true,
         }
     }
+}
+
+fn transform_text(mode: MockMode, target_language: &str, source: &str) -> String {
+    match mode {
+        MockMode::Identity | MockMode::WrongSegmentId => source.to_string(),
+        MockMode::PrefixTarget => format!("[{target_language}] {source}"),
+        MockMode::Uppercase => source.to_uppercase(),
+        MockMode::MalformedJson => unreachable!("handled above"),
+    }
+}
+
+/// Recover per-block source strings from a rendered marker-safe user prompt.
+/// The caller embeds blocks as a JSON array under `Source blocks:`; the mock
+/// parses it back so test translations transform the actual source text rather
+/// than the whole rendered prompt.
+fn extract_block_sources_from_json<'a>(
+    user_prompt: &str,
+    block_ids: &'a [String],
+) -> std::collections::BTreeMap<&'a str, String> {
+    let mut sources = std::collections::BTreeMap::new();
+    let Some(marker) = user_prompt.find("Source blocks:") else {
+        return sources;
+    };
+    let after = &user_prompt[marker..];
+    let Some(start) = after.find('[') else {
+        return sources;
+    };
+    let array_slice = &after[start..];
+    let mut depth = 0usize;
+    let mut end_index = None;
+    for (offset, ch) in array_slice.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end_index = Some(offset + ch.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end_index else {
+        return sources;
+    };
+    let array_text = &array_slice[..end];
+    let parsed: Vec<serde_json::Value> = match serde_json::from_str(array_text) {
+        Ok(value) => value,
+        Err(_) => return sources,
+    };
+    for entry in parsed {
+        let Some(block_id) = entry.get("block_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let text = entry
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if let Some(known) = block_ids.iter().find(|known| known.as_str() == block_id) {
+            sources.insert(known.as_str(), text);
+        }
+    }
+    sources
+}
+
+/// Recover the plain-mode source segment from a rendered prompt by reading
+/// the contents of the ` ```txt ... ``` ` block that follows `Source segment:`.
+fn extract_plain_source(user_prompt: &str) -> Option<String> {
+    let header = user_prompt.find("Source segment:")?;
+    let after_header = &user_prompt[header..];
+    let fence = after_header.find("```txt")?;
+    let after_fence = &after_header[fence + "```txt".len()..];
+    let body_start = after_fence.find('\n').map(|n| n + 1)?;
+    let body = &after_fence[body_start..];
+    let end = body.find("```")?;
+    Some(body[..end].trim_end_matches('\n').to_string())
 }
 
 fn estimate_tokens(text: &str) -> u64 {

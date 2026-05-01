@@ -3,13 +3,15 @@ use std::sync::Arc;
 use bookforge_core::{
     ir::BlockId,
     scheduler::SchedulerConfig,
-    segment::{Segment, SegmentId, SegmentStatus},
+    segment::{BlockTranslation, Segment, SegmentBlock, SegmentId, SegmentStatus},
 };
 use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::{sync::Semaphore, task::JoinSet};
 
-use crate::provider::{
-    CompletionRequest, LlmError, LlmProvider, RequestMetadata, ResponseFormat, Result,
+use crate::{
+    prompt::{PromptLibrary, PromptTemplate, Substitutions},
+    provider::{CompletionRequest, LlmError, LlmProvider, RequestMetadata, ResponseFormat, Result},
 };
 
 #[derive(Debug, Clone)]
@@ -28,17 +30,65 @@ pub struct SegmentTranslation {
     pub segment_id: SegmentId,
     pub ordinal: usize,
     pub block_ids: Vec<BlockId>,
+    pub blocks: Vec<BlockTranslation>,
     pub checksum: String,
-    pub text: String,
     pub status: SegmentStatus,
+    pub template: String,
     pub error: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
 }
 
+impl SegmentTranslation {
+    /// Joined translation text, derived by concatenating per-block translations
+    /// with a blank line between blocks. Convenience for callers that need a
+    /// single string (CLI summary, DB column).
+    pub fn joined_text(&self) -> String {
+        self.blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranslationMode {
+    Plain,
+    MarkerSafe,
+}
+
+impl TranslationMode {
+    fn template_name(self) -> &'static str {
+        match self {
+            Self::Plain => "translate_segment",
+            Self::MarkerSafe => "translate_marker_safe",
+        }
+    }
+
+    fn temperature_default(self) -> f32 {
+        match self {
+            Self::Plain => 0.2,
+            Self::MarkerSafe => 0.1,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PlainTranslationResponse {
     segment_id: String,
+    translation: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarkerSafeTranslationResponse {
+    segment_id: String,
+    blocks: Vec<MarkerSafeBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarkerSafeBlock {
+    block_id: String,
     translation: String,
 }
 
@@ -56,6 +106,7 @@ where
         ));
     }
 
+    let library = Arc::new(PromptLibrary::embedded());
     let provider = Arc::new(provider);
     let semaphore = Arc::new(Semaphore::new(config.scheduler.concurrency));
     let mut tasks = JoinSet::new();
@@ -68,16 +119,17 @@ where
             .map_err(|err| LlmError::Provider(err.to_string()))?;
         let provider = provider.clone();
         let config = config.clone();
+        let library = library.clone();
 
         tasks.spawn(async move {
             let _permit = permit;
-            translate_one(provider, segment, config).await
+            translate_one(provider, library, segment, config).await
         });
     }
 
     let mut translations = Vec::with_capacity(segments.len());
     while let Some(result) = tasks.join_next().await {
-        let translation = result.map_err(|err| LlmError::Provider(err.to_string()))??;
+        let translation = result.map_err(|err| LlmError::Provider(err.to_string()))?;
         translations.push(translation);
     }
 
@@ -87,96 +139,290 @@ where
 
 async fn translate_one<P>(
     provider: Arc<P>,
+    library: Arc<PromptLibrary>,
     segment: Segment,
     config: TranslationRunConfig,
-) -> Result<SegmentTranslation>
+) -> SegmentTranslation
 where
     P: LlmProvider,
 {
+    let mode = select_mode(&segment);
     let attempts = config.scheduler.max_retries.max(1);
-    let mut last_error = None;
+    let mut last_error: Option<LlmError> = None;
 
-    for _attempt in 0..attempts {
-        match request_translation(provider.as_ref(), &segment, &config).await {
-            Ok(translation) => return Ok(translation),
+    for _ in 0..attempts {
+        match request_translation(provider.as_ref(), library.as_ref(), &segment, &config, mode)
+            .await
+        {
+            Ok(translation) => return translation,
             Err(error) if is_validator_error(&error) => last_error = Some(error),
-            Err(error) => return Err(error),
+            Err(error) => return failed_translation(&segment, mode, error.to_string()),
         }
     }
 
-    let error = last_error.unwrap_or_else(|| {
-        LlmError::InvalidResponse(format!(
-            "segment '{}' exhausted validation retries without an error",
-            segment.id.0
-        ))
-    });
+    let error_message = last_error
+        .map(|err| err.to_string())
+        .unwrap_or_else(|| "exhausted validation retries".to_string());
+    needs_review_translation(&segment, mode, error_message)
+}
 
-    Ok(SegmentTranslation {
-        segment_id: segment.id.clone(),
-        ordinal: segment.ordinal,
-        block_ids: segment.block_ids.clone(),
-        checksum: segment.checksum.clone(),
-        text: segment.source.text.clone(),
-        status: SegmentStatus::NeedsReview,
-        error: Some(error.to_string()),
-        input_tokens: None,
-        output_tokens: None,
-    })
+fn select_mode(segment: &Segment) -> TranslationMode {
+    if segment.source.blocks.len() <= 1 && segment.constraints.preserve_markers.is_empty() {
+        TranslationMode::Plain
+    } else {
+        TranslationMode::MarkerSafe
+    }
 }
 
 async fn request_translation<P>(
     provider: &P,
+    library: &PromptLibrary,
     segment: &Segment,
     config: &TranslationRunConfig,
+    mode: TranslationMode,
 ) -> Result<SegmentTranslation>
 where
     P: LlmProvider,
 {
+    let template = match mode {
+        TranslationMode::Plain => &library.plain,
+        TranslationMode::MarkerSafe => &library.marker_safe,
+    };
+    let rendered = render_prompt(template, segment, config, mode)?;
+    let temperature = if config.temperature > 0.0 {
+        config.temperature
+    } else {
+        mode.temperature_default()
+    };
+
     let request = CompletionRequest {
-        system: render_plain_system_prompt(config),
-        user: segment.source.text.clone(),
+        system: rendered.system,
+        user: rendered.user,
         response_format: ResponseFormat::Json,
-        temperature: config.temperature,
+        temperature,
         max_output_tokens: None,
         metadata: RequestMetadata {
             segment_id: Some(segment.id.0.clone()),
-            prompt_version: Some(config.prompt_version.clone()),
+            block_ids: segment.block_ids.iter().map(|id| id.0.clone()).collect(),
+            prompt_template: Some(template.name.clone()),
+            prompt_version: Some(template.version.clone()),
             provider: Some(config.provider.clone()),
             model: Some(config.model.clone()),
             source_checksum: Some(segment.checksum.clone()),
         },
     };
     let response = provider.complete(request).await?;
-    let parsed: PlainTranslationResponse = serde_json::from_str(&response.content)?;
-
-    if parsed.segment_id != segment.id.0 {
-        return Err(LlmError::InvalidResponse(format!(
-            "segment id mismatch: expected '{}', got '{}'",
-            segment.id.0, parsed.segment_id
-        )));
-    }
-
-    validate_translation(segment, &parsed.translation)?;
+    let blocks = parse_and_validate(&response.content, segment, mode)?;
 
     Ok(SegmentTranslation {
         segment_id: segment.id.clone(),
         ordinal: segment.ordinal,
         block_ids: segment.block_ids.clone(),
+        blocks,
         checksum: segment.checksum.clone(),
-        text: parsed.translation,
         status: SegmentStatus::Succeeded,
+        template: template.name.clone(),
         error: None,
         input_tokens: response.input_tokens,
         output_tokens: response.output_tokens,
     })
 }
 
+fn render_prompt(
+    template: &PromptTemplate,
+    segment: &Segment,
+    config: &TranslationRunConfig,
+    mode: TranslationMode,
+) -> Result<crate::prompt::Rendered> {
+    let mut vars = Substitutions::new();
+    vars.string(
+        "source_language",
+        config.source_language.as_deref().unwrap_or("auto"),
+    )
+    .string("target_language", &config.target_language)
+    .string("segment_id", &segment.id.0)
+    .string(
+        "book_title",
+        segment.metadata.book_title.as_deref().unwrap_or(""),
+    )
+    .string(
+        "section_title",
+        segment.metadata.section_title.as_deref().unwrap_or(""),
+    )
+    .number("section_index", segment.metadata.section_index)
+    .number("segment_index", segment.metadata.segment_index_in_section)
+    .number(
+        "total_segments_in_section",
+        segment.metadata.total_segments_in_section.max(1),
+    )
+    .raw(
+        "context_before",
+        segment.context.before.clone().unwrap_or_default(),
+    )
+    .raw(
+        "context_after",
+        segment.context.after.clone().unwrap_or_default(),
+    )
+    .json("glossary_json", &Value::Array(Vec::new()))
+    .json(
+        "protected_spans_json",
+        &Value::Array(
+            segment
+                .constraints
+                .preserve_spans
+                .iter()
+                .map(|span| Value::String(span.clone()))
+                .collect(),
+        ),
+    );
+
+    match mode {
+        TranslationMode::Plain => {
+            vars.raw("source_text", &segment.source.text);
+        }
+        TranslationMode::MarkerSafe => {
+            vars.json(
+                "source_blocks_json",
+                &Value::Array(
+                    segment
+                        .source
+                        .blocks
+                        .iter()
+                        .map(segment_block_to_json)
+                        .collect(),
+                ),
+            )
+            .json(
+                "required_markers_json",
+                &Value::Array(
+                    segment
+                        .constraints
+                        .preserve_markers
+                        .iter()
+                        .map(|marker| Value::String(marker.clone()))
+                        .collect(),
+                ),
+            );
+        }
+    }
+
+    template
+        .render(&vars)
+        .map_err(|err| LlmError::Provider(format!("prompt render failed: {err}")))
+}
+
+fn segment_block_to_json(block: &SegmentBlock) -> Value {
+    json!({
+        "block_id": block.block_id.0,
+        "kind": block.kind,
+        "text": block.text,
+    })
+}
+
+fn parse_and_validate(
+    content: &str,
+    segment: &Segment,
+    mode: TranslationMode,
+) -> Result<Vec<BlockTranslation>> {
+    match mode {
+        TranslationMode::Plain => {
+            let parsed: PlainTranslationResponse = serde_json::from_str(content)?;
+            if parsed.segment_id != segment.id.0 {
+                return Err(LlmError::InvalidResponse(format!(
+                    "segment id mismatch: expected '{}', got '{}'",
+                    segment.id.0, parsed.segment_id
+                )));
+            }
+            let expected_spans: &[String] = segment
+                .source
+                .blocks
+                .first()
+                .map(|block| block.protected_spans.as_slice())
+                .unwrap_or(&[]);
+            validate_protected_spans(segment, expected_spans, &parsed.translation)?;
+            let block_id = segment
+                .block_ids
+                .first()
+                .cloned()
+                .unwrap_or_else(|| BlockId(format!("{}_block", segment.id.0)));
+            Ok(vec![BlockTranslation {
+                block_id,
+                text: parsed.translation,
+            }])
+        }
+        TranslationMode::MarkerSafe => {
+            let parsed: MarkerSafeTranslationResponse = serde_json::from_str(content)?;
+            if parsed.segment_id != segment.id.0 {
+                return Err(LlmError::InvalidResponse(format!(
+                    "segment id mismatch: expected '{}', got '{}'",
+                    segment.id.0, parsed.segment_id
+                )));
+            }
+
+            let expected_block_ids: Vec<&str> =
+                segment.block_ids.iter().map(|id| id.0.as_str()).collect();
+            if parsed.blocks.len() != expected_block_ids.len() {
+                return Err(LlmError::InvalidResponse(format!(
+                    "segment '{}' expected {} block translations, got {}",
+                    segment.id.0,
+                    expected_block_ids.len(),
+                    parsed.blocks.len()
+                )));
+            }
+
+            let mut by_id = std::collections::HashMap::with_capacity(parsed.blocks.len());
+            for block in parsed.blocks {
+                if by_id
+                    .insert(block.block_id.clone(), block.translation)
+                    .is_some()
+                {
+                    return Err(LlmError::InvalidResponse(format!(
+                        "segment '{}' returned duplicate block_id '{}'",
+                        segment.id.0, block.block_id
+                    )));
+                }
+            }
+
+            let mut translations = Vec::with_capacity(expected_block_ids.len());
+            for source_block in &segment.source.blocks {
+                let translation =
+                    by_id
+                        .remove(source_block.block_id.0.as_str())
+                        .ok_or_else(|| {
+                            LlmError::InvalidResponse(format!(
+                                "segment '{}' is missing translation for block '{}'",
+                                segment.id.0, source_block.block_id.0
+                            ))
+                        })?;
+                let expected_markers = marker_ids_in_text(&source_block.text);
+                validate_markers(segment, &expected_markers, &translation)?;
+                validate_protected_spans(segment, &source_block.protected_spans, &translation)?;
+                translations.push(BlockTranslation {
+                    block_id: source_block.block_id.clone(),
+                    text: translation,
+                });
+            }
+
+            if !by_id.is_empty() {
+                let extras: Vec<String> = by_id.into_keys().collect();
+                return Err(LlmError::InvalidResponse(format!(
+                    "segment '{}' returned unexpected block ids: {}",
+                    segment.id.0,
+                    extras.join(", ")
+                )));
+            }
+
+            Ok(translations)
+        }
+    }
+}
+
 fn is_validator_error(error: &LlmError) -> bool {
     matches!(error, LlmError::InvalidResponse(_) | LlmError::Json(_))
 }
 
-fn validate_translation(segment: &Segment, translation: &str) -> Result<()> {
-    for span in &segment.constraints.preserve_spans {
+fn validate_protected_spans(segment: &Segment, spans: &[String], translation: &str) -> Result<()> {
+    for span in spans {
         if !translation.contains(span) {
             return Err(LlmError::InvalidResponse(format!(
                 "protected span missing from segment '{}': {}",
@@ -184,13 +430,33 @@ fn validate_translation(segment: &Segment, translation: &str) -> Result<()> {
             )));
         }
     }
+    Ok(())
+}
 
-    for marker in &segment.constraints.preserve_markers {
-        let occurrences = translation.matches(marker).count();
-        if occurrences != 1 {
+fn validate_markers(segment: &Segment, expected: &[String], translation: &str) -> Result<()> {
+    let actual = marker_ids_in_text(translation);
+
+    for marker in expected {
+        let count = actual.iter().filter(|actual| *actual == marker).count();
+        if count == 0 {
             return Err(LlmError::InvalidResponse(format!(
-                "marker '{}' appears {} times in segment '{}'",
-                marker, occurrences, segment.id.0
+                "inline marker missing from segment '{}': {}",
+                segment.id.0, marker
+            )));
+        }
+        if count > 1 {
+            return Err(LlmError::InvalidResponse(format!(
+                "inline marker duplicated in segment '{}': {}",
+                segment.id.0, marker
+            )));
+        }
+    }
+
+    for marker in &actual {
+        if !expected.iter().any(|expected| expected == marker) {
+            return Err(LlmError::InvalidResponse(format!(
+                "unknown inline marker in segment '{}': {}",
+                segment.id.0, marker
             )));
         }
     }
@@ -198,78 +464,303 @@ fn validate_translation(segment: &Segment, translation: &str) -> Result<()> {
     Ok(())
 }
 
-fn render_plain_system_prompt(config: &TranslationRunConfig) -> String {
-    format!(
-        "Translate from {} to {}. Return only valid JSON matching {{\"segment_id\":\"...\",\"translation\":\"...\"}}.",
-        config.source_language.as_deref().unwrap_or("auto"),
-        config.target_language
-    )
+fn marker_ids_in_text(text: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = text;
+
+    while let Some(index) = rest.find('<') {
+        let tag = &rest[index..];
+        if (tag.starts_with("<m ") || tag.starts_with("<keep "))
+            && let Some(end) = tag.find('>')
+        {
+            if let Some(id) = extract_marker_id(&tag[..=end]) {
+                ids.push(id);
+            }
+            rest = &tag[end + 1..];
+        } else if tag.starts_with("<ref ") {
+            if let Some(end) = tag.find("/>") {
+                if let Some(id) = extract_marker_id(&tag[..end + 2]) {
+                    ids.push(id);
+                }
+                rest = &tag[end + 2..];
+            } else {
+                rest = &tag[1..];
+            }
+        } else {
+            rest = &tag[1..];
+        }
+    }
+
+    ids
+}
+
+fn extract_marker_id(tag: &str) -> Option<String> {
+    let id_offset = tag.find("id=")? + 3;
+    let quote = tag[id_offset..].chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value_start = id_offset + quote.len_utf8();
+    let value_end = tag[value_start..].find(quote)? + value_start;
+    Some(tag[value_start..value_end].to_string())
+}
+
+fn needs_review_translation(
+    segment: &Segment,
+    mode: TranslationMode,
+    error: String,
+) -> SegmentTranslation {
+    SegmentTranslation {
+        segment_id: segment.id.clone(),
+        ordinal: segment.ordinal,
+        block_ids: segment.block_ids.clone(),
+        blocks: source_fallback_blocks(segment),
+        checksum: segment.checksum.clone(),
+        status: SegmentStatus::NeedsReview,
+        template: mode.template_name().to_string(),
+        error: Some(error),
+        input_tokens: None,
+        output_tokens: None,
+    }
+}
+
+fn failed_translation(
+    segment: &Segment,
+    mode: TranslationMode,
+    error: String,
+) -> SegmentTranslation {
+    SegmentTranslation {
+        segment_id: segment.id.clone(),
+        ordinal: segment.ordinal,
+        block_ids: segment.block_ids.clone(),
+        blocks: source_fallback_blocks(segment),
+        checksum: segment.checksum.clone(),
+        status: SegmentStatus::Failed,
+        template: mode.template_name().to_string(),
+        error: Some(error),
+        input_tokens: None,
+        output_tokens: None,
+    }
+}
+
+fn source_fallback_blocks(segment: &Segment) -> Vec<BlockTranslation> {
+    if segment.source.blocks.is_empty() {
+        return segment
+            .block_ids
+            .iter()
+            .map(|block_id| BlockTranslation {
+                block_id: block_id.clone(),
+                text: segment.source.text.clone(),
+            })
+            .collect();
+    }
+    segment
+        .source
+        .blocks
+        .iter()
+        .map(|block| BlockTranslation {
+            block_id: block.block_id.clone(),
+            text: block.text.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use bookforge_core::segment::{Segment, SegmentConstraints, SegmentContext, SegmentSource};
+    use bookforge_core::{
+        ir::SectionId,
+        segment::{
+            Segment, SegmentBlock, SegmentConstraints, SegmentContext, SegmentMetadata,
+            SegmentSource,
+        },
+    };
 
     use super::*;
     use crate::provider::{MockMode, MockProvider};
 
     #[tokio::test]
-    async fn mock_scheduler_returns_ordered_translations() {
-        let segments = vec![segment("seg_b", 1, "Second"), segment("seg_a", 0, "First")];
-        let config = config();
+    async fn single_block_segment_uses_plain_mode_and_returns_translation() {
+        let segments = vec![segment("seg_a", 0, vec![("b0", "First")])];
 
         let translations = translate_segments(
             MockProvider::new(MockMode::PrefixTarget, "Italian"),
             &segments,
-            &config,
+            &config(),
+        )
+        .await
+        .expect("mock translation should succeed");
+
+        assert_eq!(translations.len(), 1);
+        assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+        assert_eq!(translations[0].template, "translate_segment");
+        assert_eq!(translations[0].blocks.len(), 1);
+        assert_eq!(translations[0].blocks[0].text, "[Italian] First");
+    }
+
+    #[tokio::test]
+    async fn multi_block_segment_uses_marker_safe_and_returns_per_block() {
+        let segments = vec![segment(
+            "seg_a",
+            0,
+            vec![("b0", "First paragraph."), ("b1", "Second paragraph.")],
+        )];
+
+        let translations = translate_segments(
+            MockProvider::new(MockMode::PrefixTarget, "Italian"),
+            &segments,
+            &config(),
+        )
+        .await
+        .expect("mock translation should succeed");
+
+        assert_eq!(translations[0].template, "translate_marker_safe");
+        assert_eq!(translations[0].blocks.len(), 2);
+        assert_eq!(translations[0].blocks[0].block_id.0, "b0");
+        assert_eq!(translations[0].blocks[0].text, "[Italian] First paragraph.");
+        assert_eq!(translations[0].blocks[1].block_id.0, "b1");
+        assert_eq!(
+            translations[0].blocks[1].text,
+            "[Italian] Second paragraph."
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_segments_complete_in_order() {
+        let segments = vec![
+            segment("seg_b", 1, vec![("b0", "Second")]),
+            segment("seg_a", 0, vec![("b0", "First")]),
+        ];
+
+        let translations = translate_segments(
+            MockProvider::new(MockMode::PrefixTarget, "Italian"),
+            &segments,
+            &config(),
         )
         .await
         .expect("mock translation should succeed");
 
         assert_eq!(translations[0].segment_id.0, "seg_a");
         assert_eq!(translations[1].segment_id.0, "seg_b");
-        assert_eq!(translations[0].text, "[Italian] First");
-        assert_eq!(translations[0].status, SegmentStatus::Succeeded);
     }
 
     #[tokio::test]
-    async fn validator_failure_becomes_needs_review() {
-        let segments = vec![segment("seg_a", 0, "First")];
+    async fn validator_failure_is_marked_needs_review() {
+        let segments = vec![segment("seg_a", 0, vec![("b0", "First")])];
+
         let translations = translate_segments(
             MockProvider::new(MockMode::WrongSegmentId, "Italian"),
             &segments,
             &config(),
         )
         .await
-        .expect("validator failure should preserve source after retries");
+        .expect("validator failure should not propagate");
 
         assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
-        assert_eq!(translations[0].text, "First");
+        assert_eq!(translations[0].blocks[0].text, "First");
         assert!(
             translations[0]
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("segment id mismatch"))
+                .is_some_and(|err| err.contains("segment id mismatch"))
         );
     }
 
     #[tokio::test]
-    async fn protected_span_failure_becomes_needs_review() {
-        let mut segment = segment("seg_a", 0, "Visit https://example.com");
+    async fn protected_span_failure_is_marked_needs_review() {
+        let mut segment = segment("seg_a", 0, vec![("b0", "Visit https://example.com")]);
+        segment.source.blocks[0]
+            .protected_spans
+            .push("https://example.com".to_string());
         segment
             .constraints
             .preserve_spans
             .push("https://example.com".to_string());
+
         let translations = translate_segments(
             MockProvider::new(MockMode::Uppercase, "Italian"),
             &[segment],
             &config(),
         )
         .await
-        .expect("protected span validation should preserve source after retries");
+        .expect("validation failure should not propagate");
 
         assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
-        assert_eq!(translations[0].text, "Visit https://example.com");
+        assert_eq!(translations[0].blocks[0].text, "Visit https://example.com");
+    }
+
+    #[tokio::test]
+    async fn protected_span_only_required_in_block_that_contains_it() {
+        // Block 0 has a span "1"; block 1 does not. The validator must not
+        // require "1" to appear in block 1's translation.
+        let mut segment = segment(
+            "seg_a",
+            0,
+            vec![("b0", "Chapter 1"), ("b1", "Hello world.")],
+        );
+        segment.source.blocks[0]
+            .protected_spans
+            .push("1".to_string());
+        segment.constraints.preserve_spans.push("1".to_string());
+
+        let translations = translate_segments(
+            MockProvider::new(MockMode::PrefixTarget, "Italian"),
+            &[segment],
+            &config(),
+        )
+        .await
+        .expect("scheduler should succeed");
+
+        assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+        assert_eq!(translations[0].blocks[0].text, "[Italian] Chapter 1");
+        assert_eq!(translations[0].blocks[1].text, "[Italian] Hello world.");
+    }
+
+    #[tokio::test]
+    async fn inline_marker_failure_is_marked_needs_review() {
+        let mut segment = segment(
+            "seg_a",
+            0,
+            vec![("b0", "Hello <m id=\"m000000_000\">world</m>!")],
+        );
+        segment
+            .constraints
+            .preserve_markers
+            .push("m000000_000".to_string());
+
+        let translations = translate_segments(
+            MockProvider::new(MockMode::Uppercase, "Italian"),
+            &[segment],
+            &config(),
+        )
+        .await
+        .expect("marker validation failure should not propagate");
+
+        assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
+        assert_eq!(
+            translations[0].blocks[0].text,
+            "Hello <m id=\"m000000_000\">world</m>!"
+        );
+        assert!(
+            translations[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("inline marker missing"))
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_json_response_is_marked_needs_review() {
+        let segments = vec![segment("seg_a", 0, vec![("b0", "First")])];
+        let translations = translate_segments(
+            MockProvider::new(MockMode::MalformedJson, "Italian"),
+            &segments,
+            &config(),
+        )
+        .await
+        .expect("malformed JSON should not propagate");
+
+        assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
+        assert!(translations[0].error.is_some());
     }
 
     fn config() -> TranslationRunConfig {
@@ -278,7 +769,7 @@ mod tests {
             target_language: "Italian".to_string(),
             provider: "mock".to_string(),
             model: "mock-prefix".to_string(),
-            prompt_version: "translate_segment.v1".to_string(),
+            prompt_version: "v1".to_string(),
             temperature: 0.2,
             scheduler: SchedulerConfig {
                 concurrency: 2,
@@ -287,17 +778,43 @@ mod tests {
         }
     }
 
-    fn segment(id: &str, ordinal: usize, text: &str) -> Segment {
+    fn segment(id: &str, ordinal: usize, blocks: Vec<(&str, &str)>) -> Segment {
+        let segment_blocks: Vec<SegmentBlock> = blocks
+            .iter()
+            .map(|(block_id, text)| SegmentBlock {
+                block_id: BlockId((*block_id).to_string()),
+                kind: "paragraph".to_string(),
+                text: (*text).to_string(),
+                protected_spans: Vec::new(),
+            })
+            .collect();
+        let block_ids = segment_blocks
+            .iter()
+            .map(|block| block.block_id.clone())
+            .collect::<Vec<_>>();
+        let source_text = segment_blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         Segment {
             id: SegmentId(id.to_string()),
-            section_id: bookforge_core::ir::SectionId("sec".to_string()),
+            section_id: SectionId("sec_000000".to_string()),
             ordinal,
-            block_ids: Vec::new(),
+            block_ids,
             source: SegmentSource {
-                text: text.to_string(),
-                token_estimate: 1,
+                text: source_text,
+                blocks: segment_blocks,
+                token_estimate: 4,
             },
             context: SegmentContext::default(),
+            metadata: SegmentMetadata {
+                book_title: Some("Test".to_string()),
+                section_title: Some("Chapter".to_string()),
+                section_index: 0,
+                segment_index_in_section: 0,
+                total_segments_in_section: 1,
+            },
             constraints: SegmentConstraints {
                 preserve_markers: Vec::new(),
                 preserve_spans: Vec::new(),

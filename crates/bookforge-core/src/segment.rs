@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     BookforgeError, Result,
     config::SegmentationConfig,
-    ir::{Block, BlockId, Book, SectionId},
+    ir::{Block, BlockId, BlockKind, Book, Section, SectionId},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +24,7 @@ pub struct Segment {
     pub block_ids: Vec<BlockId>,
     pub source: SegmentSource,
     pub context: SegmentContext,
+    pub metadata: SegmentMetadata,
     pub constraints: SegmentConstraints,
     pub checksum: String,
 }
@@ -31,7 +32,16 @@ pub struct Segment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentSource {
     pub text: String,
+    pub blocks: Vec<SegmentBlock>,
     pub token_estimate: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentBlock {
+    pub block_id: BlockId,
+    pub kind: String,
+    pub text: String,
+    pub protected_spans: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -41,10 +51,34 @@ pub struct SegmentContext {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SegmentMetadata {
+    pub book_title: Option<String>,
+    pub section_title: Option<String>,
+    pub section_index: usize,
+    pub segment_index_in_section: usize,
+    pub total_segments_in_section: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SegmentConstraints {
     pub preserve_markers: Vec<String>,
     pub preserve_spans: Vec<String>,
     pub max_tokens: usize,
+}
+
+pub fn block_kind_label(kind: BlockKind) -> &'static str {
+    match kind {
+        BlockKind::Heading(_) => "heading",
+        BlockKind::Paragraph => "paragraph",
+        BlockKind::ListItem => "list_item",
+        BlockKind::Quote => "quote",
+        BlockKind::TableCell => "table_cell",
+        BlockKind::TableRow => "table_row",
+        BlockKind::Footnote => "footnote",
+        BlockKind::Caption => "caption",
+        BlockKind::Code => "code",
+        BlockKind::Unknown => "unknown",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,7 +101,7 @@ pub fn build_segments(book: &Book, config: &SegmentationConfig) -> Result<Vec<Se
 
     let mut segments = Vec::new();
 
-    for section in &book.sections {
+    for (section_index, section) in book.sections.iter().enumerate() {
         let section_blocks = section
             .block_ids
             .iter()
@@ -86,6 +120,7 @@ pub fn build_segments(book: &Book, config: &SegmentationConfig) -> Result<Vec<Se
 
         let mut current = Vec::<&Block>::new();
         let mut current_tokens = 0usize;
+        let section_segments_start = segments.len();
 
         for block in section_blocks {
             let block_tokens = block.token_estimate.max(1);
@@ -94,7 +129,14 @@ pub fn build_segments(book: &Book, config: &SegmentationConfig) -> Result<Vec<Se
                 && !should_keep_with_previous(&current, block);
 
             if should_flush {
-                push_segment(&mut segments, &section.id, &current, config);
+                push_segment(
+                    &mut segments,
+                    book,
+                    section,
+                    section_index,
+                    &current,
+                    config,
+                );
                 current.clear();
                 current_tokens = 0;
             }
@@ -104,7 +146,20 @@ pub fn build_segments(book: &Book, config: &SegmentationConfig) -> Result<Vec<Se
         }
 
         if !current.is_empty() {
-            push_segment(&mut segments, &section.id, &current, config);
+            push_segment(
+                &mut segments,
+                book,
+                section,
+                section_index,
+                &current,
+                config,
+            );
+        }
+
+        let total_in_section = segments.len() - section_segments_start;
+        for (offset, segment) in segments[section_segments_start..].iter_mut().enumerate() {
+            segment.metadata.segment_index_in_section = offset;
+            segment.metadata.total_segments_in_section = total_in_section;
         }
     }
 
@@ -115,13 +170,33 @@ pub fn build_segments(book: &Book, config: &SegmentationConfig) -> Result<Vec<Se
 
 fn push_segment(
     segments: &mut Vec<Segment>,
-    section_id: &SectionId,
+    book: &Book,
+    section: &Section,
+    section_index: usize,
     blocks: &[&Block],
     config: &SegmentationConfig,
 ) {
-    let source_text = blocks
+    let segment_blocks = blocks
         .iter()
-        .map(|block| block_text(block))
+        .map(|block| {
+            let mut spans = block
+                .protected_spans
+                .iter()
+                .map(|span| span.text.clone())
+                .collect::<Vec<_>>();
+            spans.sort();
+            spans.dedup();
+            SegmentBlock {
+                block_id: block.id.clone(),
+                kind: block_kind_label(block.kind).to_string(),
+                text: block_text(block),
+                protected_spans: spans,
+            }
+        })
+        .collect::<Vec<_>>();
+    let source_text = segment_blocks
+        .iter()
+        .map(|block| block.text.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
     let checksum = stable_hash(&source_text);
@@ -132,7 +207,7 @@ fn push_segment(
         .unwrap_or("empty");
     let id = SegmentId(format!(
         "seg_{}_{}_{}",
-        section_id.0,
+        section.id.0,
         first_block,
         &checksum[..12]
     ));
@@ -156,16 +231,26 @@ fn push_segment(
         .map(|block| block.token_estimate.max(1))
         .sum::<usize>();
 
+    let metadata = SegmentMetadata {
+        book_title: book.metadata.title.clone(),
+        section_title: section.title.clone(),
+        section_index,
+        segment_index_in_section: 0,
+        total_segments_in_section: 0,
+    };
+
     segments.push(Segment {
         id,
-        section_id: section_id.clone(),
+        section_id: section.id.clone(),
         ordinal,
         block_ids: blocks.iter().map(|block| block.id.clone()).collect(),
         source: SegmentSource {
             text: source_text,
+            blocks: segment_blocks,
             token_estimate,
         },
         context: SegmentContext::default(),
+        metadata,
         constraints: SegmentConstraints {
             preserve_markers,
             preserve_spans,

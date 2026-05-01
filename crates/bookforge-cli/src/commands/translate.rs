@@ -6,8 +6,8 @@ use bookforge_core::{
 };
 use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::{
-    MockMode, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, TranslationRunConfig,
-    translate_segments,
+    MockMode, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, SegmentTranslation,
+    TranslationRunConfig, translate_segments,
 };
 use bookforge_store::JobStore;
 use clap::Args;
@@ -74,7 +74,7 @@ async fn run_mock_translation(input: &PathBuf, config: &TranslationConfig) -> Re
         .model
         .clone()
         .unwrap_or_else(|| "mock-prefix-target".to_string());
-    let prompt_version = "translate_segment.v1";
+    let prompt_version = "v1";
     let store = JobStore::open_default()?;
     let job = store.create_job(
         input,
@@ -111,31 +111,7 @@ async fn run_mock_translation(input: &PathBuf, config: &TranslationConfig) -> Re
         save_translation_result(&store, &job.id, translation, "mock", &model, prompt_version)?;
     }
     mark_job_finished(&store, &job.id, &translations)?;
-    let input_tokens = translations
-        .iter()
-        .filter_map(|translation| translation.input_tokens)
-        .sum::<u64>();
-    let output_tokens = translations
-        .iter()
-        .filter_map(|translation| translation.output_tokens)
-        .sum::<u64>();
-    let succeeded = translations
-        .iter()
-        .filter(|translation| translation.status == SegmentStatus::Succeeded)
-        .count();
-    let needs_review = translations
-        .iter()
-        .filter(|translation| translation.status == SegmentStatus::NeedsReview)
-        .count();
-
-    let block_translations = block_translations(&translations);
-    rebuild_epub(&book, &block_translations, &config.output)?;
-
-    println!("Translated: {}/{} segments", succeeded, segments.len());
-    println!("Needs review: {needs_review}");
-    println!("Input tokens: {input_tokens}");
-    println!("Output tokens: {output_tokens}");
-    println!("Output: {}", config.output.display());
+    print_summary_and_rebuild(&book, &segments, &translations, config)?;
 
     Ok(())
 }
@@ -177,7 +153,7 @@ async fn run_openai_compatible_translation(
     let model = provider.model().to_string();
     let book = read_epub(input)?;
     let segments = build_segments(&book, &SegmentationConfig::default())?;
-    let prompt_version = "translate_segment.v1";
+    let prompt_version = "v1";
     let store = JobStore::open_default()?;
     let job = store.create_job(
         input,
@@ -221,15 +197,7 @@ async fn run_openai_compatible_translation(
         )?;
     }
     mark_job_finished(&store, &job.id, &translations)?;
-    let block_translations = block_translations(&translations);
-    rebuild_epub(&book, &block_translations, &config.output)?;
-
-    println!(
-        "Translated: {}/{} segments",
-        translations.len(),
-        segments.len()
-    );
-    println!("Output: {}", config.output.display());
+    print_summary_and_rebuild(&book, &segments, &translations, config)?;
 
     Ok(())
 }
@@ -237,16 +205,17 @@ async fn run_openai_compatible_translation(
 fn save_translation_result(
     store: &JobStore,
     job_id: &str,
-    translation: &bookforge_llm::SegmentTranslation,
+    translation: &SegmentTranslation,
     provider: &str,
     model: &str,
     prompt_version: &str,
 ) -> Result<()> {
+    let joined = translation.joined_text();
     match translation.status {
         SegmentStatus::Succeeded => store.save_translation(
             job_id,
             &translation.segment_id.0,
-            &translation.text,
+            &joined,
             provider,
             model,
             prompt_version,
@@ -256,7 +225,7 @@ fn save_translation_result(
         SegmentStatus::NeedsReview => store.save_needs_review(
             job_id,
             &translation.segment_id.0,
-            &translation.text,
+            &joined,
             provider,
             model,
             prompt_version,
@@ -264,6 +233,11 @@ fn save_translation_result(
                 .error
                 .as_deref()
                 .unwrap_or("translation requires review"),
+        )?,
+        SegmentStatus::Failed => store.mark_segment_failed(
+            job_id,
+            &translation.segment_id.0,
+            translation.error.as_deref().unwrap_or("translation failed"),
         )?,
         _ => {}
     }
@@ -273,8 +247,15 @@ fn save_translation_result(
 fn mark_job_finished(
     store: &JobStore,
     job_id: &str,
-    translations: &[bookforge_llm::SegmentTranslation],
+    translations: &[SegmentTranslation],
 ) -> Result<()> {
+    if translations
+        .iter()
+        .any(|translation| translation.status == SegmentStatus::Failed)
+    {
+        store.mark_job_needs_review(job_id)?;
+        return Ok(());
+    }
     if translations
         .iter()
         .any(|translation| translation.status == SegmentStatus::NeedsReview)
@@ -282,41 +263,53 @@ fn mark_job_finished(
         store.mark_job_needs_review(job_id)?;
         return Ok(());
     }
-
     store.mark_job_complete(job_id)?;
     Ok(())
 }
 
-fn block_translations(translations: &[bookforge_llm::SegmentTranslation]) -> Vec<BlockTranslation> {
-    let mut blocks = Vec::new();
-    for translation in translations {
-        let parts = split_segment_translation(&translation.text, translation.block_ids.len());
-        for (block_id, text) in translation.block_ids.iter().cloned().zip(parts) {
-            blocks.push(BlockTranslation { block_id, text });
-        }
-    }
-    blocks
+fn block_translations(translations: &[SegmentTranslation]) -> Vec<BlockTranslation> {
+    translations
+        .iter()
+        .flat_map(|translation| translation.blocks.iter().cloned())
+        .collect()
 }
 
-fn split_segment_translation(text: &str, block_count: usize) -> Vec<String> {
-    if block_count == 0 {
-        return Vec::new();
-    }
+fn print_summary_and_rebuild(
+    book: &bookforge_core::ir::Book,
+    segments: &[bookforge_core::segment::Segment],
+    translations: &[SegmentTranslation],
+    config: &TranslationConfig,
+) -> Result<()> {
+    let succeeded = translations
+        .iter()
+        .filter(|translation| translation.status == SegmentStatus::Succeeded)
+        .count();
+    let needs_review = translations
+        .iter()
+        .filter(|translation| translation.status == SegmentStatus::NeedsReview)
+        .count();
+    let failed = translations
+        .iter()
+        .filter(|translation| translation.status == SegmentStatus::Failed)
+        .count();
+    let input_tokens = translations
+        .iter()
+        .filter_map(|translation| translation.input_tokens)
+        .sum::<u64>();
+    let output_tokens = translations
+        .iter()
+        .filter_map(|translation| translation.output_tokens)
+        .sum::<u64>();
 
-    if block_count == 1 {
-        return vec![text.to_string()];
-    }
+    let block_translations = block_translations(translations);
+    rebuild_epub(book, &block_translations, &config.output)?;
 
-    let mut parts = text
-        .split("\n\n")
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    if parts.len() < block_count {
-        parts.resize(block_count, String::new());
-    }
-    if parts.len() > block_count {
-        let remainder = parts.split_off(block_count - 1).join("\n\n");
-        parts.push(remainder);
-    }
-    parts
+    println!("Translated: {}/{} segments", succeeded, segments.len());
+    println!("Needs review: {needs_review}");
+    println!("Failed: {failed}");
+    println!("Input tokens: {input_tokens}");
+    println!("Output tokens: {output_tokens}");
+    println!("Output: {}", config.output.display());
+
+    Ok(())
 }

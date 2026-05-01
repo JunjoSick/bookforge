@@ -365,7 +365,113 @@ struct BlockBuilder {
     element_name: Vec<u8>,
     kind: BlockKind,
     dom_path: DomPath,
-    text: String,
+    ordinal: usize,
+    text_runs: Vec<TextRun>,
+    inline_marks: Vec<InlineMark>,
+    inline_stack: Vec<String>,
+    visible_text: String,
+    next_run: usize,
+    next_marker: usize,
+}
+
+impl BlockBuilder {
+    fn new(element_name: Vec<u8>, kind: BlockKind, dom_path: DomPath, ordinal: usize) -> Self {
+        Self {
+            element_name,
+            kind,
+            dom_path,
+            ordinal,
+            text_runs: Vec::new(),
+            inline_marks: Vec::new(),
+            inline_stack: Vec::new(),
+            visible_text: String::new(),
+            next_run: 0,
+            next_marker: 0,
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        let Some(mut text) = normalize_text_fragment(text) else {
+            return;
+        };
+
+        if self.visible_text.is_empty() {
+            text = text.trim_start().to_string();
+        }
+
+        if text.is_empty() {
+            return;
+        }
+
+        self.visible_text.push_str(&text);
+        self.push_run(text);
+    }
+
+    fn push_inline_start(&mut self, name: &[u8]) {
+        let id = marker_id(b"m", self.ordinal, self.next_marker);
+        self.next_marker += 1;
+        self.inline_marks.push(InlineMark {
+            id: id.clone(),
+            kind: String::from_utf8_lossy(name).into_owned(),
+        });
+        self.inline_stack.push(id.clone());
+        self.push_run(format!("<m id=\"{id}\">"));
+    }
+
+    fn push_inline_empty(&mut self, name: &[u8]) {
+        let id = marker_id(b"r", self.ordinal, self.next_marker);
+        self.next_marker += 1;
+        self.inline_marks.push(InlineMark {
+            id: id.clone(),
+            kind: String::from_utf8_lossy(name).into_owned(),
+        });
+        self.push_run(format!("<ref id=\"{id}\"/>"));
+    }
+
+    fn push_inline_end(&mut self) {
+        if self.inline_stack.pop().is_some() {
+            self.push_run("</m>".to_string());
+        }
+    }
+
+    fn finish(mut self, section_id: &SectionId) -> Option<Block> {
+        self.trim_trailing_text();
+        let visible_text = normalize_space(&self.visible_text);
+        if visible_text.is_empty() {
+            return None;
+        }
+
+        Some(build_block(
+            section_id,
+            self.ordinal,
+            self.kind,
+            self.dom_path,
+            self.text_runs,
+            self.inline_marks,
+            visible_text,
+        ))
+    }
+
+    fn push_run(&mut self, text: String) {
+        self.text_runs.push(TextRun {
+            id: format!("r{:06}_{:03}", self.ordinal, self.next_run),
+            text,
+        });
+        self.next_run += 1;
+    }
+
+    fn trim_trailing_text(&mut self) {
+        if let Some(run) = self
+            .text_runs
+            .iter_mut()
+            .rev()
+            .find(|run| !is_marker_token(&run.text))
+        {
+            run.text = run.text.trim_end().to_string();
+        }
+
+        self.text_runs.retain(|run| !run.text.is_empty());
+    }
 }
 
 fn extract_blocks(
@@ -375,7 +481,7 @@ fn extract_blocks(
     initial_block_count: usize,
 ) -> Result<Vec<Block>> {
     let mut reader = Reader::from_str(xhtml);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
 
     let mut element_stack = Vec::<ElementFrame>::new();
     let mut active_block: Option<BlockBuilder> = None;
@@ -390,26 +496,30 @@ fn extract_blocks(
                 if active_block.is_none()
                     && let Some(kind) = block_kind(&name, &element)?
                 {
-                    active_block = Some(BlockBuilder {
-                        element_name: name,
+                    active_block = Some(BlockBuilder::new(
+                        name,
                         kind,
-                        dom_path: DomPath(path),
-                        text: String::new(),
-                    });
+                        DomPath(path),
+                        initial_block_count + blocks.len(),
+                    ));
+                } else if let Some(block) = active_block.as_mut() {
+                    block.push_inline_start(&name);
                 }
             }
             Event::Empty(element) => {
                 let name = local_name(element.name().as_ref()).to_vec();
                 let path = next_child_path(&mut element_stack);
 
-                if active_block.is_none()
-                    && let Some(kind) = block_kind(&name, &element)?
-                {
+                if let Some(block) = active_block.as_mut() {
+                    block.push_inline_empty(&name);
+                } else if let Some(kind) = block_kind(&name, &element)? {
                     let block = build_block(
                         section_id,
                         initial_block_count + blocks.len(),
                         kind,
                         DomPath(path),
+                        Vec::new(),
+                        Vec::new(),
                         String::new(),
                     );
                     blocks.push(block);
@@ -420,7 +530,7 @@ fn extract_blocks(
                     let value = text
                         .decode()
                         .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-                    push_text(&mut block.text, value.trim());
+                    block.push_text(&value);
                 }
             }
             Event::CData(text) => {
@@ -428,7 +538,7 @@ fn extract_blocks(
                     let value = text
                         .decode()
                         .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-                    push_text(&mut block.text, value.trim());
+                    block.push_text(&value);
                 }
             }
             Event::End(element) => {
@@ -439,16 +549,11 @@ fn extract_blocks(
 
                 if should_finish {
                     let block = active_block.take().expect("checked above");
-                    let text = normalize_space(&block.text);
-                    if !text.is_empty() {
-                        blocks.push(build_block(
-                            section_id,
-                            initial_block_count + blocks.len(),
-                            block.kind,
-                            block.dom_path,
-                            text,
-                        ));
+                    if let Some(block) = block.finish(section_id) {
+                        blocks.push(block);
                     }
+                } else if let Some(block) = active_block.as_mut() {
+                    block.push_inline_end();
                 }
 
                 element_stack.pop();
@@ -525,13 +630,19 @@ fn build_block(
     ordinal: usize,
     kind: BlockKind,
     dom_path: DomPath,
-    text: String,
+    text_runs: Vec<TextRun>,
+    inline_marks: Vec<InlineMark>,
+    visible_text: String,
 ) -> Block {
-    let text_runs = vec![TextRun {
-        id: "r0".to_string(),
-        text: text.clone(),
-    }];
-    let protected_spans = detect_protected_spans(&text);
+    let text_runs = if text_runs.is_empty() {
+        vec![TextRun {
+            id: format!("r{ordinal:06}_000"),
+            text: visible_text.clone(),
+        }]
+    } else {
+        text_runs
+    };
+    let protected_spans = detect_protected_spans(&visible_text);
 
     Block {
         id: BlockId(format!("b_{ordinal:06}")),
@@ -539,9 +650,9 @@ fn build_block(
         kind,
         dom_path,
         text_runs,
-        inline_marks: Vec::<InlineMark>::new(),
+        inline_marks,
         protected_spans,
-        token_estimate: estimate_tokens(&text),
+        token_estimate: estimate_tokens(&visible_text),
     }
 }
 
@@ -549,10 +660,7 @@ fn first_heading(blocks: &[Block]) -> (Option<String>, Option<u8>) {
     blocks
         .iter()
         .find_map(|block| match block.kind {
-            BlockKind::Heading(level) => Some((
-                block.text_runs.first().map(|run| run.text.clone()),
-                Some(level),
-            )),
+            BlockKind::Heading(level) => Some((Some(block_visible_text(block)), Some(level))),
             _ => None,
         })
         .unwrap_or((None, None))
@@ -570,19 +678,67 @@ fn link_sections(sections: &mut [Section]) {
     }
 }
 
-fn push_text(output: &mut String, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-
-    if !output.is_empty() {
-        output.push(' ');
-    }
-    output.push_str(text);
-}
-
 fn normalize_space(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_text_fragment(text: &str) -> Option<String> {
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    let mut normalized = normalize_space(text);
+    if text.chars().next().is_some_and(char::is_whitespace) {
+        normalized.insert(0, ' ');
+    }
+    if text.chars().last().is_some_and(char::is_whitespace) {
+        normalized.push(' ');
+    }
+    Some(normalized)
+}
+
+fn block_visible_text(block: &Block) -> String {
+    let marked = block
+        .text_runs
+        .iter()
+        .map(|run| run.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    strip_marker_tokens(&marked)
+}
+
+fn strip_marker_tokens(text: &str) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+
+    while let Some(index) = rest.find('<') {
+        output.push_str(&rest[..index]);
+        let tag = &rest[index..];
+
+        if tag.starts_with("<m id=\"") || tag.starts_with("<ref id=\"") || tag.starts_with("</m>") {
+            if let Some(end) = tag.find('>') {
+                rest = &tag[end + 1..];
+                continue;
+            }
+        }
+
+        output.push('<');
+        rest = &tag[1..];
+    }
+
+    output.push_str(rest);
+    normalize_space(&output)
+}
+
+fn is_marker_token(text: &str) -> bool {
+    matches!(text, "</m>") || text.starts_with("<m id=\"") || text.starts_with("<ref id=\"")
+}
+
+fn marker_id(prefix: &[u8], block_ordinal: usize, marker_ordinal: usize) -> String {
+    format!(
+        "{}{block_ordinal:06}_{marker_ordinal:03}",
+        String::from_utf8_lossy(prefix)
+    )
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -667,4 +823,56 @@ fn normalize_epub_path(path: &str) -> String {
 
 fn local_name(name: &[u8]) -> &[u8] {
     name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_inline_marks_and_marker_text_runs() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            "<html><body><p>Hello <em>world</em>!</p></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 1);
+        let text = block_text(&blocks[0]);
+        assert_eq!(text, "Hello <m id=\"m000000_000\">world</m>!");
+        assert_eq!(blocks[0].inline_marks.len(), 1);
+        assert_eq!(blocks[0].inline_marks[0].id, "m000000_000");
+        assert_eq!(blocks[0].inline_marks[0].kind, "em");
+        assert_eq!(blocks[0].token_estimate, estimate_tokens("Hello world!"));
+    }
+
+    #[test]
+    fn extracts_empty_inline_marker() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            "<html><body><p>Line<br/>break</p></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            4,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].id.0, "b_000004");
+        assert_eq!(block_text(&blocks[0]), "Line<ref id=\"r000004_000\"/>break");
+        assert_eq!(blocks[0].inline_marks[0].id, "r000004_000");
+        assert_eq!(blocks[0].inline_marks[0].kind, "br");
+    }
+
+    fn block_text(block: &Block) -> String {
+        block
+            .text_runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    }
 }

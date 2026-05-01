@@ -152,6 +152,7 @@ version = "0.1.0"
 dependencies = [
  "bookforge-core",
  "quick-xml",
+ "tracing",
  "zip",
 ]
 
@@ -165,6 +166,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
