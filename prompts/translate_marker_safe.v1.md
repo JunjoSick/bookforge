@@ -33,6 +33,8 @@ Markers look like this:
 <keep id="k2"> ... </keep>
 ```
 
+Close tags are exactly `</m>` or `</keep>` — no spaces inside the tag. `<m id="m0">text</m>` is correct. `<m id="m0">text</ m>` is incorrect.
+
 The output must match this JSON shape exactly:
 
 ```json

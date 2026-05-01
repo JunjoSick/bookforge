@@ -7,6 +7,7 @@ pub struct TranslationConfig {
     pub provider: String,
     pub model: Option<String>,
     pub concurrency: usize,
+    pub max_attempts: usize,
     pub output: PathBuf,
 }
 

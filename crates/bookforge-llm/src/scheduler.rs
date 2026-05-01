@@ -11,7 +11,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 
 use crate::{
     prompt::{PromptLibrary, PromptTemplate, Substitutions},
-    provider::{CompletionRequest, LlmError, LlmProvider, RequestMetadata, ResponseFormat, Result},
+    provider::{CompletionRequest, FinishReason, LlmError, LlmProvider, RequestMetadata, ResponseFormat, Result},
 };
 
 #[derive(Debug, Clone)]
@@ -324,7 +324,7 @@ where
     P: LlmProvider,
 {
     let mode = select_mode(&segment);
-    let attempts = config.scheduler.max_retries.max(1);
+    let attempts = config.scheduler.max_attempts.max(1);
     let mut last_error: Option<LlmError> = None;
 
     for _ in 0..attempts {
@@ -432,6 +432,11 @@ where
         },
     };
     let response = provider.complete(request).await?;
+    if response.finish_reason == FinishReason::Length {
+        return Err(LlmError::InvalidResponse(
+            "output was truncated: max_output_tokens limit reached".to_string(),
+        ));
+    }
     let blocks = parse_and_validate(&response.content, segment, mode)?;
 
     Ok(SegmentTranslation {
@@ -924,7 +929,7 @@ fn extract_marker_id(tag: &str) -> Option<String> {
 
 fn is_marker_token(text: &str) -> bool {
     let text = text.trim();
-    text == "</m>"
+    text.starts_with("</m") && text.ends_with('>')
         || text.starts_with("<m ")
         || text.starts_with("<keep ")
         || text.starts_with("<ref ")
@@ -1228,7 +1233,7 @@ mod tests {
             .push("m000000_000".to_string());
 
         let mut config = config();
-        config.scheduler.max_retries = 1;
+        config.scheduler.max_attempts = 1;
         let translations = translate_segments(
             MockProvider::new(MockMode::Uppercase, "Italian"),
             &[segment],
@@ -1270,7 +1275,7 @@ mod tests {
             temperature: 0.2,
             scheduler: SchedulerConfig {
                 concurrency: 2,
-                max_retries: 1,
+                max_attempts: 1,
             },
         }
     }

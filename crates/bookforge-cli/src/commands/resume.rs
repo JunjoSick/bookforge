@@ -36,6 +36,9 @@ pub struct ResumeArgs {
     #[arg(long, default_value_t = 4)]
     pub concurrency: usize,
 
+    #[arg(long, default_value_t = 3)]
+    pub max_attempts: usize,
+
     #[arg(long, value_enum, default_value_t = QaMode::Off)]
     pub qa: QaMode,
 
@@ -72,7 +75,7 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
         temperature: 0.2,
         scheduler: SchedulerConfig {
             concurrency: args.concurrency,
-            max_retries: 3,
+            max_attempts: args.max_attempts,
         },
     };
 

@@ -323,11 +323,22 @@ enum InlineTemplate {
     Empty(Event<'static>),
 }
 
+fn normalize_marker_whitespace(text: &str) -> String {
+    text.replace("</ m>", "</m>")
+        .replace("</m >", "</m>")
+        .replace("</ m >", "</m>")
+        .replace("</ keep>", "</keep>")
+        .replace("</keep >", "</keep>")
+        .replace("</ keep >", "</keep>")
+}
+
 fn render_marked_translation(
     block: &Block,
     translation: &str,
     original_events: &[Event<'static>],
 ) -> Result<Vec<Event<'static>>> {
+    let normalized = normalize_marker_whitespace(translation);
+    let translation = normalized.as_str();
     let templates = collect_inline_templates(block, original_events)?;
     if templates.is_empty() {
         return Ok(vec![Event::Text(BytesText::new(translation).into_owned())]);

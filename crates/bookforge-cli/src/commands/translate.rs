@@ -38,6 +38,9 @@ pub struct TranslateArgs {
     #[arg(long, default_value_t = 4)]
     pub concurrency: usize,
 
+    #[arg(long, default_value_t = 3)]
+    pub max_attempts: usize,
+
     #[arg(long)]
     pub out: Option<PathBuf>,
 
@@ -55,6 +58,7 @@ pub async fn run(args: TranslateArgs) -> Result<()> {
         provider: args.provider.provider.clone(),
         model: args.provider.model.clone(),
         concurrency: args.concurrency,
+        max_attempts: args.max_attempts,
         output,
     };
 
@@ -114,7 +118,7 @@ async fn run_mock_translation(
         temperature: 0.2,
         scheduler: SchedulerConfig {
             concurrency: config.concurrency,
-            max_retries: 3,
+            max_attempts: config.max_attempts,
         },
     };
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
@@ -241,7 +245,7 @@ async fn run_openai_compatible_translation(
         temperature: 0.2,
         scheduler: SchedulerConfig {
             concurrency: config.concurrency,
-            max_retries: 3,
+            max_attempts: config.max_attempts,
         },
     };
     let mut translations = apply_cached_translations(
@@ -649,7 +653,7 @@ mod tests {
             temperature: 0.2,
             scheduler: SchedulerConfig {
                 concurrency: 0,
-                max_retries: 1,
+                max_attempts: 1,
             },
         };
 
