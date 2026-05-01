@@ -1,5 +1,9 @@
 use anyhow::Result;
-use bookforge_core::ir::{BlockKind, Book};
+use bookforge_core::{
+    config::SegmentationConfig,
+    ir::{BlockKind, Book},
+    segment::{Segment, build_segments},
+};
 use bookforge_epub::{inspect_epub, read_epub};
 use clap::Args;
 use std::collections::BTreeMap;
@@ -14,6 +18,9 @@ pub struct InspectArgs {
 
     #[arg(long)]
     pub segments: bool,
+
+    #[arg(long, default_value_t = 1_200)]
+    pub max_segment_tokens: usize,
 }
 
 pub async fn run(args: InspectArgs) -> Result<()> {
@@ -36,12 +43,21 @@ pub async fn run(args: InspectArgs) -> Result<()> {
     );
     println!("Resource count: {}", inspection.resource_count);
 
-    if args.structure {
-        print_structure(&read_epub(&args.input)?);
-    }
+    if args.structure || args.segments {
+        let book = read_epub(&args.input)?;
 
-    if args.segments {
-        println!("Segments: pending Milestone 4");
+        if args.structure {
+            print_structure(&book);
+        }
+
+        if args.segments {
+            let config = SegmentationConfig {
+                max_segment_tokens: args.max_segment_tokens,
+                ..SegmentationConfig::default()
+            };
+            let segments = build_segments(&book, &config)?;
+            print_segments(&segments);
+        }
     }
 
     Ok(())
@@ -83,5 +99,26 @@ fn block_kind_label(kind: BlockKind) -> &'static str {
         BlockKind::Caption => "caption",
         BlockKind::Code => "code",
         BlockKind::Unknown => "unknown",
+    }
+}
+
+fn print_segments(segments: &[Segment]) {
+    println!("Segment count: {}", segments.len());
+    for segment in segments {
+        let block_ids = segment
+            .block_ids
+            .iter()
+            .map(|block_id| block_id.0.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{} ordinal={} section={} blocks={} tokens={} checksum={}",
+            segment.id.0,
+            segment.ordinal,
+            segment.section_id.0,
+            block_ids,
+            segment.source.token_estimate,
+            &segment.checksum[..12]
+        );
     }
 }

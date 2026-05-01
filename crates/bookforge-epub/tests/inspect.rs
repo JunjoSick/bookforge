@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use bookforge_core::ir::BlockKind;
+use bookforge_core::{config::SegmentationConfig, ir::BlockKind, segment::build_segments};
 use bookforge_epub::{inspect_epub, read_epub};
 
 #[test]
@@ -36,6 +36,35 @@ fn builds_basic_ir_from_minimal_epub() {
         "Hello from a minimal EPUB fixture."
     );
     assert!(book.blocks.iter().all(|block| block.token_estimate > 0));
+}
+
+#[test]
+fn builds_stable_segments_from_minimal_epub() {
+    let fixture = create_minimal_epub();
+    let book = read_epub(&fixture).expect("fixture should parse into IR");
+    let config = SegmentationConfig {
+        max_segment_tokens: 1_200,
+        context_tokens: 8,
+    };
+
+    let first = build_segments(&book, &config).expect("segments should build");
+    let second = build_segments(&book, &config).expect("segments should be repeatable");
+
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].id, second[0].id);
+    assert_eq!(first[0].checksum, second[0].checksum);
+    assert_eq!(first[0].section_id.0, "sec_000000");
+    assert_eq!(first[0].block_ids.len(), 2);
+    assert!(first[0].source.text.contains("Chapter 1"));
+    assert!(
+        first[0]
+            .source
+            .text
+            .contains("Hello from a minimal EPUB fixture.")
+    );
+    assert!(first[0].source.token_estimate > 0);
+    assert!(first[0].context.before.is_none());
+    assert!(first[0].context.after.is_none());
 }
 
 fn create_minimal_epub() -> PathBuf {

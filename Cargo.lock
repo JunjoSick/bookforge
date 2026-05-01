@@ -121,6 +121,7 @@ version = "0.1.0"
 dependencies = [
  "quick-xml",
  "serde",
+ "sha2",
  "thiserror",
  "zip",
 ]
