@@ -109,6 +109,7 @@ dependencies = [
  "anyhow",
  "bookforge-core",
  "bookforge-epub",
+ "bookforge-llm",
  "clap",
  "tokio",
  "tracing",
@@ -139,8 +140,11 @@ dependencies = [
 name = "bookforge-llm"
 version = "0.1.0"
 dependencies = [
+ "bookforge-core",
  "serde",
  "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
