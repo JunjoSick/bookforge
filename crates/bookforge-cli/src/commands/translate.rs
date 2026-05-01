@@ -2,12 +2,12 @@ use anyhow::Result;
 use bookforge_core::{
     config::{SegmentationConfig, TranslationConfig},
     scheduler::SchedulerConfig,
-    segment::{BlockTranslation, SegmentStatus, build_segments},
+    segment::{BlockTranslation, Segment, SegmentStatus, build_segments},
 };
 use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::{
-    MockMode, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, SegmentTranslation,
-    TranslationRunConfig, translate_segments,
+    LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
+    SegmentTranslation, TranslationRunConfig, translate_segments,
 };
 use bookforge_store::JobStore;
 use clap::Args;
@@ -98,15 +98,8 @@ async fn run_mock_translation(input: &PathBuf, config: &TranslationConfig) -> Re
         },
     };
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
-    let translations = match translate_segments(provider, &segments, &run_config).await {
-        Ok(translations) => translations,
-        Err(error) => {
-            for segment in &segments {
-                store.mark_segment_failed(&job.id, &segment.id.0, &error.to_string())?;
-            }
-            return Err(error.into());
-        }
-    };
+    let translations =
+        translate_with_scheduler_guard(provider, &store, &job.id, &segments, &run_config).await?;
     for translation in &translations {
         save_translation_result(&store, &job.id, translation, "mock", &model, prompt_version)?;
     }
@@ -176,15 +169,8 @@ async fn run_openai_compatible_translation(
             max_retries: 3,
         },
     };
-    let translations = match translate_segments(provider, &segments, &run_config).await {
-        Ok(translations) => translations,
-        Err(error) => {
-            for segment in &segments {
-                store.mark_segment_failed(&job.id, &segment.id.0, &error.to_string())?;
-            }
-            return Err(error.into());
-        }
-    };
+    let translations =
+        translate_with_scheduler_guard(provider, &store, &job.id, &segments, &run_config).await?;
 
     for translation in &translations {
         save_translation_result(
@@ -199,6 +185,40 @@ async fn run_openai_compatible_translation(
     mark_job_finished(&store, &job.id, &translations)?;
     print_summary_and_rebuild(&book, &segments, &translations, config)?;
 
+    Ok(())
+}
+
+async fn translate_with_scheduler_guard<P>(
+    provider: P,
+    store: &JobStore,
+    job_id: &str,
+    segments: &[Segment],
+    config: &TranslationRunConfig,
+) -> Result<Vec<SegmentTranslation>>
+where
+    P: LlmProvider,
+{
+    match translate_segments(provider, segments, config).await {
+        Ok(translations) => Ok(translations),
+        Err(error) => {
+            let message = format!(
+                "translation scheduler failed before producing per-segment results: {error}"
+            );
+            mark_all_segments_failed(store, job_id, segments, &message)?;
+            Err(anyhow::anyhow!(message))
+        }
+    }
+}
+
+fn mark_all_segments_failed(
+    store: &JobStore,
+    job_id: &str,
+    segments: &[Segment],
+    error: &str,
+) -> Result<()> {
+    for segment in segments {
+        store.mark_segment_failed(job_id, &segment.id.0, error)?;
+    }
     Ok(())
 }
 
@@ -312,4 +332,111 @@ fn print_summary_and_rebuild(
     println!("Output: {}", config.output.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bookforge_core::{
+        ir::{BlockId, SectionId},
+        segment::{
+            SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
+            SegmentSource,
+        },
+    };
+    use std::{fs, time::SystemTime};
+
+    #[tokio::test]
+    async fn scheduler_guard_marks_all_segments_failed_only_on_run_level_error() {
+        let db_path = temp_path("jobs.sqlite");
+        let input_path = temp_path("input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(
+                &input_path,
+                Some("English"),
+                "Italian",
+                "mock",
+                "mock-prefix",
+            )
+            .expect("job should be created");
+        let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
+        store
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix")
+            .expect("segments should insert");
+        let config = TranslationRunConfig {
+            source_language: Some("English".to_string()),
+            target_language: "Italian".to_string(),
+            provider: "mock".to_string(),
+            model: "mock-prefix".to_string(),
+            prompt_version: "v1".to_string(),
+            temperature: 0.2,
+            scheduler: SchedulerConfig {
+                concurrency: 0,
+                max_retries: 1,
+            },
+        };
+
+        let error = translate_with_scheduler_guard(
+            MockProvider::new(MockMode::PrefixTarget, "Italian"),
+            &store,
+            &job.id,
+            &segments,
+            &config,
+        )
+        .await
+        .expect_err("zero concurrency is a scheduler-level error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("before producing per-segment results")
+        );
+        let summary = store
+            .summary(&job.id)
+            .expect("summary should load")
+            .expect("job should exist");
+        assert_eq!(summary.failed, 2);
+        assert_eq!(summary.succeeded, 0);
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    fn segment(id: &str, ordinal: usize) -> Segment {
+        let block_id = BlockId(format!("b_{ordinal:06}"));
+        Segment {
+            id: SegmentId(id.to_string()),
+            section_id: SectionId("sec_000000".to_string()),
+            ordinal,
+            block_ids: vec![block_id.clone()],
+            source: SegmentSource {
+                text: format!("Source {ordinal}"),
+                blocks: vec![SegmentBlock {
+                    block_id,
+                    kind: "paragraph".to_string(),
+                    text: format!("Source {ordinal}"),
+                    protected_spans: Vec::new(),
+                }],
+                token_estimate: 2,
+            },
+            context: SegmentContext::default(),
+            metadata: SegmentMetadata::default(),
+            constraints: SegmentConstraints::default(),
+            checksum: format!("checksum_{ordinal}"),
+        }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bookforge-cli-test-{}-{nanos}-{name}",
+            std::process::id()
+        ))
+    }
 }

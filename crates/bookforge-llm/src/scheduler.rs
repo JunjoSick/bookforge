@@ -576,7 +576,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::provider::{MockMode, MockProvider};
+    use crate::provider::{
+        CompletionRequest, CompletionResponse, MockMode, MockProvider, ProviderCapabilities,
+    };
 
     #[tokio::test]
     async fn single_block_segment_uses_plain_mode_and_returns_translation() {
@@ -716,6 +718,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_failure_is_segment_failed_not_run_error() {
+        let segments = vec![segment("seg_a", 0, vec![("b0", "First")])];
+
+        let translations = translate_segments(FailingProvider, &segments, &config())
+            .await
+            .expect("provider failure should be isolated to the segment");
+
+        assert_eq!(translations.len(), 1);
+        assert_eq!(translations[0].status, SegmentStatus::Failed);
+        assert!(
+            translations[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("provider offline"))
+        );
+    }
+
+    #[tokio::test]
     async fn inline_marker_failure_is_marked_needs_review() {
         let mut segment = segment(
             "seg_a",
@@ -821,6 +841,22 @@ mod tests {
                 max_tokens: 100,
             },
             checksum: id.to_string(),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FailingProvider;
+
+    impl LlmProvider for FailingProvider {
+        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+            Err(LlmError::Provider("provider offline".to_string()))
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: false,
+            }
         }
     }
 }

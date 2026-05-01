@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -22,9 +23,8 @@ pub enum StoreError {
     Core(#[from] bookforge_core::BookforgeError),
 }
 
-#[derive(Debug, Clone)]
 pub struct JobStore {
-    path: PathBuf,
+    conn: RefCell<Connection>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +61,9 @@ impl JobStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let store = Self { path };
+        let store = Self {
+            conn: RefCell::new(Connection::open(path)?),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -77,7 +79,7 @@ impl JobStore {
         let input_hash = file_hash(input)?;
         let id = format!("job_{}_{}", unix_timestamp_nanos(), &input_hash[..12]);
         let now = timestamp_string();
-        let conn = self.connect()?;
+        let conn = self.conn.borrow();
         conn.execute(
             "INSERT INTO jobs (id, input_hash, source_lang, target_lang, provider, model, status, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7)",
@@ -103,7 +105,7 @@ impl JobStore {
         provider: &str,
         model: &str,
     ) -> Result<()> {
-        let mut conn = self.connect()?;
+        let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
         for segment in segments {
             tx.execute(
@@ -139,33 +141,35 @@ impl JobStore {
     ) -> Result<()> {
         let now = timestamp_string();
         let translated_hash = stable_hash(translated_text);
-        let conn = self.connect()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO translations
-             (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                segment_id,
-                job_id,
-                translated_text,
-                provider,
-                model,
-                prompt_version,
-                now
-            ],
-        )?;
-        conn.execute(
-            "UPDATE segments
-             SET status = 'succeeded', attempts = attempts + 1, input_tokens = ?1, output_tokens = ?2, translated_hash = ?3, error = NULL
-             WHERE job_id = ?4 AND id = ?5",
-            params![
-                input_tokens.map(|value| value as i64),
-                output_tokens.map(|value| value as i64),
-                translated_hash,
-                job_id,
-                segment_id,
-            ],
-        )?;
+        {
+            let conn = self.conn.borrow();
+            conn.execute(
+                "INSERT OR REPLACE INTO translations
+                 (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    segment_id,
+                    job_id,
+                    translated_text,
+                    provider,
+                    model,
+                    prompt_version,
+                    now
+                ],
+            )?;
+            conn.execute(
+                "UPDATE segments
+                 SET status = 'succeeded', attempts = attempts + 1, input_tokens = ?1, output_tokens = ?2, translated_hash = ?3, error = NULL
+                 WHERE job_id = ?4 AND id = ?5",
+                params![
+                    input_tokens.map(|value| value as i64),
+                    output_tokens.map(|value| value as i64),
+                    translated_hash,
+                    job_id,
+                    segment_id,
+                ],
+            )?;
+        }
         self.touch_job(job_id, "running")?;
         Ok(())
     }
@@ -182,27 +186,29 @@ impl JobStore {
     ) -> Result<()> {
         let now = timestamp_string();
         let translated_hash = stable_hash(preserved_text);
-        let conn = self.connect()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO translations
-             (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                segment_id,
-                job_id,
-                preserved_text,
-                provider,
-                model,
-                prompt_version,
-                now
-            ],
-        )?;
-        conn.execute(
-            "UPDATE segments
-             SET status = 'needs_review', attempts = attempts + 1, translated_hash = ?1, error = ?2
-             WHERE job_id = ?3 AND id = ?4",
-            params![translated_hash, error, job_id, segment_id],
-        )?;
+        {
+            let conn = self.conn.borrow();
+            conn.execute(
+                "INSERT OR REPLACE INTO translations
+                 (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    segment_id,
+                    job_id,
+                    preserved_text,
+                    provider,
+                    model,
+                    prompt_version,
+                    now
+                ],
+            )?;
+            conn.execute(
+                "UPDATE segments
+                 SET status = 'needs_review', attempts = attempts + 1, translated_hash = ?1, error = ?2
+                 WHERE job_id = ?3 AND id = ?4",
+                params![translated_hash, error, job_id, segment_id],
+            )?;
+        }
         self.touch_job(job_id, "needs_review")?;
         Ok(())
     }
@@ -216,41 +222,43 @@ impl JobStore {
     }
 
     pub fn mark_segment_failed(&self, job_id: &str, segment_id: &str, error: &str) -> Result<()> {
-        let conn = self.connect()?;
-        conn.execute(
-            "UPDATE segments SET status = 'failed', attempts = attempts + 1, error = ?1 WHERE job_id = ?2 AND id = ?3",
-            params![error, job_id, segment_id],
-        )?;
+        {
+            let conn = self.conn.borrow();
+            conn.execute(
+                "UPDATE segments SET status = 'failed', attempts = attempts + 1, error = ?1 WHERE job_id = ?2 AND id = ?3",
+                params![error, job_id, segment_id],
+            )?;
+        }
         self.touch_job(job_id, "failed")?;
         Ok(())
     }
 
     pub fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>> {
-        self.connect()?
-            .query_row(
-                "SELECT id, input_hash, source_lang, target_lang, provider, model, status FROM jobs WHERE id = ?1",
-                params![job_id],
-                |row| {
-                    Ok(JobRecord {
-                        id: row.get(0)?,
-                        input_hash: row.get(1)?,
-                        source_lang: row.get(2)?,
-                        target_lang: row.get(3)?,
-                        provider: row.get(4)?,
-                        model: row.get(5)?,
-                        status: row.get(6)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(StoreError::from)
+        let conn = self.conn.borrow();
+        conn.query_row(
+            "SELECT id, input_hash, source_lang, target_lang, provider, model, status FROM jobs WHERE id = ?1",
+            params![job_id],
+            |row| {
+                Ok(JobRecord {
+                    id: row.get(0)?,
+                    input_hash: row.get(1)?,
+                    source_lang: row.get(2)?,
+                    target_lang: row.get(3)?,
+                    provider: row.get(4)?,
+                    model: row.get(5)?,
+                    status: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
     }
 
     pub fn summary(&self, job_id: &str) -> Result<Option<JobSummary>> {
         let Some(job) = self.get_job(job_id)? else {
             return Ok(None);
         };
-        let conn = self.connect()?;
+        let conn = self.conn.borrow();
         let mut summary = JobSummary {
             id: job.id,
             status: job.status,
@@ -297,13 +305,16 @@ impl JobStore {
         let sql = format!(
             "UPDATE segments SET status = 'retry_pending', error = NULL WHERE job_id = ?1 AND {where_status}"
         );
-        let count = self.connect()?.execute(&sql, params![job_id])?;
+        let count = {
+            let conn = self.conn.borrow();
+            conn.execute(&sql, params![job_id])?
+        };
         self.touch_job(job_id, "retry_pending")?;
         Ok(count)
     }
 
     fn migrate(&self) -> Result<()> {
-        let conn = self.connect()?;
+        let conn = self.conn.borrow();
         if table_exists(&conn, "translations")?
             && !table_has_column(&conn, "translations", "job_id")?
         {
@@ -377,12 +388,9 @@ impl JobStore {
         Ok(())
     }
 
-    fn connect(&self) -> rusqlite::Result<Connection> {
-        Connection::open(&self.path)
-    }
-
     fn touch_job(&self, job_id: &str, status: &str) -> Result<()> {
-        self.connect()?.execute(
+        let conn = self.conn.borrow();
+        conn.execute(
             "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![status, timestamp_string(), job_id],
         )?;
@@ -451,4 +459,99 @@ fn unix_timestamp_nanos() -> u128 {
 
 fn timestamp_string() -> String {
     unix_timestamp().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bookforge_core::{
+        ir::{BlockId, SectionId},
+        segment::{
+            Segment, SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
+            SegmentSource,
+        },
+    };
+
+    #[test]
+    fn store_reuses_connection_across_job_operations() {
+        let db_path = temp_path("jobs.sqlite");
+        let input_path = temp_path("input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(
+                &input_path,
+                Some("English"),
+                "Italian",
+                "mock",
+                "mock-prefix",
+            )
+            .expect("job should be created");
+        let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
+        store
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix")
+            .expect("segments should insert");
+
+        store
+            .save_translation(
+                &job.id,
+                "seg_a",
+                "Tradotto",
+                "mock",
+                "mock-prefix",
+                "v1",
+                Some(11),
+                Some(7),
+            )
+            .expect("translation should save");
+        store
+            .mark_segment_failed(&job.id, "seg_b", "provider unavailable")
+            .expect("segment should be marked failed");
+
+        let summary = store
+            .summary(&job.id)
+            .expect("summary should load")
+            .expect("job should exist");
+        assert_eq!(summary.total_segments, 2);
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.input_tokens, 11);
+        assert_eq!(summary.output_tokens, 7);
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    fn segment(id: &str, ordinal: usize) -> Segment {
+        let block_id = BlockId(format!("b_{ordinal:06}"));
+        Segment {
+            id: SegmentId(id.to_string()),
+            section_id: SectionId("sec_000000".to_string()),
+            ordinal,
+            block_ids: vec![block_id.clone()],
+            source: SegmentSource {
+                text: format!("Source {ordinal}"),
+                blocks: vec![SegmentBlock {
+                    block_id,
+                    kind: "paragraph".to_string(),
+                    text: format!("Source {ordinal}"),
+                    protected_spans: Vec::new(),
+                }],
+                token_estimate: 2,
+            },
+            context: SegmentContext::default(),
+            metadata: SegmentMetadata::default(),
+            constraints: SegmentConstraints::default(),
+            checksum: format!("checksum_{ordinal}"),
+        }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bookforge-store-test-{}-{}-{name}",
+            std::process::id(),
+            unix_timestamp_nanos()
+        ))
+    }
 }
