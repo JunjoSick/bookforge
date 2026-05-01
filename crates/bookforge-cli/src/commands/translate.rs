@@ -2,16 +2,15 @@ use anyhow::Result;
 use bookforge_core::{
     config::{SegmentationConfig, TranslationConfig},
     scheduler::SchedulerConfig,
-    segment::{SegmentStatus, build_segments},
+    segment::{BlockTranslation, SegmentStatus, build_segments},
 };
-use bookforge_epub::read_epub;
+use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::{
     MockMode, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, TranslationRunConfig,
     translate_segments,
 };
 use bookforge_store::JobStore;
 use clap::Args;
-use std::fs;
 use std::path::PathBuf;
 
 use crate::{LanguageArgs, ProviderArgs, default_output_path};
@@ -129,14 +128,14 @@ async fn run_mock_translation(input: &PathBuf, config: &TranslationConfig) -> Re
         .filter(|translation| translation.status == SegmentStatus::NeedsReview)
         .count();
 
-    fs::copy(input, &config.output)?;
+    let block_translations = block_translations(&translations);
+    rebuild_epub(&book, &block_translations, &config.output)?;
 
     println!("Translated: {}/{} segments", succeeded, segments.len());
     println!("Needs review: {needs_review}");
     println!("Input tokens: {input_tokens}");
     println!("Output tokens: {output_tokens}");
     println!("Output: {}", config.output.display());
-    println!("Mock mode copied the source EPUB; DOM patching arrives in Milestone 9.");
 
     Ok(())
 }
@@ -222,7 +221,8 @@ async fn run_openai_compatible_translation(
         )?;
     }
     mark_job_finished(&store, &job.id, &translations)?;
-    fs::copy(input, &config.output)?;
+    let block_translations = block_translations(&translations);
+    rebuild_epub(&book, &block_translations, &config.output)?;
 
     println!(
         "Translated: {}/{} segments",
@@ -230,7 +230,6 @@ async fn run_openai_compatible_translation(
         segments.len()
     );
     println!("Output: {}", config.output.display());
-    println!("OpenAI-compatible translation is stored; DOM patching arrives in Milestone 9.");
 
     Ok(())
 }
@@ -286,4 +285,38 @@ fn mark_job_finished(
 
     store.mark_job_complete(job_id)?;
     Ok(())
+}
+
+fn block_translations(translations: &[bookforge_llm::SegmentTranslation]) -> Vec<BlockTranslation> {
+    let mut blocks = Vec::new();
+    for translation in translations {
+        let parts = split_segment_translation(&translation.text, translation.block_ids.len());
+        for (block_id, text) in translation.block_ids.iter().cloned().zip(parts) {
+            blocks.push(BlockTranslation { block_id, text });
+        }
+    }
+    blocks
+}
+
+fn split_segment_translation(text: &str, block_count: usize) -> Vec<String> {
+    if block_count == 0 {
+        return Vec::new();
+    }
+
+    if block_count == 1 {
+        return vec![text.to_string()];
+    }
+
+    let mut parts = text
+        .split("\n\n")
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if parts.len() < block_count {
+        parts.resize(block_count, String::new());
+    }
+    if parts.len() > block_count {
+        let remainder = parts.split_off(block_count - 1).join("\n\n");
+        parts.push(remainder);
+    }
+    parts
 }

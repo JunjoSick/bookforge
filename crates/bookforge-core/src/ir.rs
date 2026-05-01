@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -11,6 +13,7 @@ pub struct BlockId(pub String);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Book {
+    pub source_path: Option<PathBuf>,
     pub id: BookId,
     pub format: BookFormat,
     pub metadata: Metadata,

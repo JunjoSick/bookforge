@@ -94,6 +94,7 @@ pub fn read_epub(path: &Path) -> Result<Book> {
     link_sections(&mut sections);
 
     Ok(Book {
+        source_path: Some(path.to_path_buf()),
         id: BookId(package_path),
         format: BookFormat::Epub,
         metadata: package.metadata,

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use bookforge_core::{
+    ir::BlockId,
     scheduler::SchedulerConfig,
     segment::{Segment, SegmentId, SegmentStatus},
 };
@@ -26,6 +27,7 @@ pub struct TranslationRunConfig {
 pub struct SegmentTranslation {
     pub segment_id: SegmentId,
     pub ordinal: usize,
+    pub block_ids: Vec<BlockId>,
     pub checksum: String,
     pub text: String,
     pub status: SegmentStatus,
@@ -112,6 +114,7 @@ where
     Ok(SegmentTranslation {
         segment_id: segment.id.clone(),
         ordinal: segment.ordinal,
+        block_ids: segment.block_ids.clone(),
         checksum: segment.checksum.clone(),
         text: segment.source.text.clone(),
         status: SegmentStatus::NeedsReview,
@@ -158,6 +161,7 @@ where
     Ok(SegmentTranslation {
         segment_id: segment.id.clone(),
         ordinal: segment.ordinal,
+        block_ids: segment.block_ids.clone(),
         checksum: segment.checksum.clone(),
         text: parsed.translation,
         status: SegmentStatus::Succeeded,

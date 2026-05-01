@@ -7,6 +7,12 @@ use crate::{
     ir::{Block, BlockId, Book, SectionId},
 };
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockTranslation {
+    pub block_id: BlockId,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SegmentId(pub String);
 
@@ -273,6 +279,7 @@ mod tests {
         let section_b = SectionId("sec_000001".to_string());
 
         Book {
+            source_path: None,
             id: BookId("test".to_string()),
             format: BookFormat::Epub,
             metadata: Metadata::default(),

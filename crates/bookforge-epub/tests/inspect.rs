@@ -1,7 +1,16 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
-use bookforge_core::{config::SegmentationConfig, ir::BlockKind, segment::build_segments};
-use bookforge_epub::{inspect_epub, read_epub};
+use bookforge_core::{
+    config::SegmentationConfig,
+    ir::{BlockId, BlockKind},
+    segment::{BlockTranslation, build_segments},
+};
+use bookforge_epub::{inspect_epub, read_epub, rebuild_epub};
+use zip::ZipArchive;
 
 #[test]
 fn inspects_minimal_epub() {
@@ -65,6 +74,48 @@ fn builds_stable_segments_from_minimal_epub() {
     assert!(first[0].source.token_estimate > 0);
     assert!(first[0].context.before.is_none());
     assert!(first[0].context.after.is_none());
+}
+
+#[test]
+fn rebuilds_epub_with_patched_xhtml_and_preserved_resources() {
+    let fixture = create_minimal_epub();
+    let book = read_epub(&fixture).expect("fixture should parse into IR");
+    let output =
+        std::env::temp_dir().join(format!("bookforge-rebuilt-{}.epub", std::process::id()));
+    let _ = std::fs::remove_file(&output);
+
+    rebuild_epub(
+        &book,
+        &[
+            BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "Capitolo 1".to_string(),
+            },
+            BlockTranslation {
+                block_id: BlockId("b_000001".to_string()),
+                text: "Ciao da un EPUB minimo.".to_string(),
+            },
+        ],
+        &output,
+    )
+    .expect("EPUB should rebuild");
+
+    let inspection = inspect_epub(&output).expect("rebuilt EPUB should inspect");
+    assert_eq!(inspection.spine_count, 1);
+    assert_eq!(inspection.manifest_count, 3);
+
+    let mut archive = ZipArchive::new(File::open(&output).expect("rebuilt EPUB should exist"))
+        .expect("rebuilt EPUB should be a zip");
+    let mut chapter = String::new();
+    archive
+        .by_name("OEBPS/chapter1.xhtml")
+        .expect("chapter should be present")
+        .read_to_string(&mut chapter)
+        .expect("chapter should be UTF-8");
+
+    assert!(chapter.contains("Capitolo 1"));
+    assert!(chapter.contains("Ciao da un EPUB minimo."));
+    assert!(chapter.contains("style.css"));
 }
 
 fn create_minimal_epub() -> PathBuf {
