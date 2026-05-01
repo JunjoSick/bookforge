@@ -7,7 +7,10 @@ use std::{
 
 use bookforge_core::{
     BookforgeError, Result,
-    ir::{Book, BookFormat, BookId, Metadata, Resource, SpineItem},
+    ir::{
+        Block, BlockId, BlockKind, Book, BookFormat, BookId, DomPath, InlineMark, Metadata,
+        ProtectedSpan, ProtectedSpanKind, Resource, Section, SectionId, SpineItem, TextRun,
+    },
 };
 use quick_xml::{
     Reader,
@@ -41,7 +44,54 @@ pub fn read_epub(path: &Path) -> Result<Book> {
     validate_mimetype(&mut archive)?;
     let package_path = locate_package(&mut archive)?;
     let package_xml = read_archive_text(&mut archive, &package_path)?;
-    let package = parse_package(&package_xml)?;
+    let mut package = parse_package(&package_xml)?;
+    let package_dir = package_base_dir(&package_path);
+    let manifest_by_id = package
+        .manifest
+        .iter()
+        .map(|item| (item.id.as_str(), item))
+        .collect::<HashMap<_, _>>();
+    let mut sections = Vec::new();
+    let mut blocks = Vec::new();
+
+    for (spine_index, spine_item) in package.spine.iter_mut().enumerate() {
+        let Some(resource) = manifest_by_id.get(spine_item.idref.as_str()) else {
+            return Err(BookforgeError::InvalidInput(format!(
+                "spine item references missing manifest id '{}'",
+                spine_item.idref
+            )));
+        };
+
+        let href = join_epub_path(&package_dir, &resource.href);
+        spine_item.href = Some(href.clone());
+
+        if !is_xhtml_media_type(&resource.media_type) {
+            continue;
+        }
+
+        let xhtml = read_archive_text(&mut archive, &href)?;
+        let section_id = SectionId(format!("sec_{spine_index:06}"));
+        let mut section_blocks = extract_blocks(&xhtml, &href, &section_id, blocks.len())?;
+        let block_ids = section_blocks
+            .iter()
+            .map(|block| block.id.clone())
+            .collect::<Vec<_>>();
+        let (title, heading_level) = first_heading(&section_blocks);
+
+        sections.push(Section {
+            id: section_id,
+            href,
+            spine_index,
+            title,
+            heading_level,
+            block_ids,
+            prev: None,
+            next: None,
+        });
+        blocks.append(&mut section_blocks);
+    }
+
+    link_sections(&mut sections);
 
     Ok(Book {
         id: BookId(package_path),
@@ -49,8 +99,8 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         metadata: package.metadata,
         manifest: package.manifest,
         spine: package.spine,
-        sections: Vec::new(),
-        blocks: Vec::new(),
+        sections,
+        blocks,
     })
 }
 
@@ -301,6 +351,273 @@ fn attr_value(
     }
 
     Ok(None)
+}
+
+#[derive(Debug)]
+struct ElementFrame {
+    path: Vec<usize>,
+    child_count: usize,
+}
+
+#[derive(Debug)]
+struct BlockBuilder {
+    element_name: Vec<u8>,
+    kind: BlockKind,
+    dom_path: DomPath,
+    text: String,
+}
+
+fn extract_blocks(
+    xhtml: &str,
+    href: &str,
+    section_id: &SectionId,
+    initial_block_count: usize,
+) -> Result<Vec<Block>> {
+    let mut reader = Reader::from_str(xhtml);
+    reader.config_mut().trim_text(true);
+
+    let mut element_stack = Vec::<ElementFrame>::new();
+    let mut active_block: Option<BlockBuilder> = None;
+    let mut blocks = Vec::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) => {
+                let name = local_name(element.name().as_ref()).to_vec();
+                let path = enter_element(&mut element_stack, &name);
+
+                if active_block.is_none()
+                    && let Some(kind) = block_kind(&name, &element)?
+                {
+                    active_block = Some(BlockBuilder {
+                        element_name: name,
+                        kind,
+                        dom_path: DomPath(path),
+                        text: String::new(),
+                    });
+                }
+            }
+            Event::Empty(element) => {
+                let name = local_name(element.name().as_ref()).to_vec();
+                let path = next_child_path(&mut element_stack);
+
+                if active_block.is_none()
+                    && let Some(kind) = block_kind(&name, &element)?
+                {
+                    let block = build_block(
+                        section_id,
+                        initial_block_count + blocks.len(),
+                        kind,
+                        DomPath(path),
+                        String::new(),
+                    );
+                    blocks.push(block);
+                }
+            }
+            Event::Text(text) => {
+                if let Some(block) = active_block.as_mut() {
+                    let value = text
+                        .decode()
+                        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                    push_text(&mut block.text, value.trim());
+                }
+            }
+            Event::CData(text) => {
+                if let Some(block) = active_block.as_mut() {
+                    let value = text
+                        .decode()
+                        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                    push_text(&mut block.text, value.trim());
+                }
+            }
+            Event::End(element) => {
+                let name = local_name(element.name().as_ref()).to_vec();
+                let should_finish = active_block
+                    .as_ref()
+                    .is_some_and(|block| block.element_name == name);
+
+                if should_finish {
+                    let block = active_block.take().expect("checked above");
+                    let text = normalize_space(&block.text);
+                    if !text.is_empty() {
+                        blocks.push(build_block(
+                            section_id,
+                            initial_block_count + blocks.len(),
+                            block.kind,
+                            block.dom_path,
+                            text,
+                        ));
+                    }
+                }
+
+                element_stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    if blocks.is_empty() {
+        return Err(BookforgeError::InvalidInput(format!(
+            "XHTML spine resource '{href}' contains no translatable blocks"
+        )));
+    }
+
+    Ok(blocks)
+}
+
+fn enter_element(stack: &mut Vec<ElementFrame>, _name: &[u8]) -> Vec<usize> {
+    let path = next_child_path(stack);
+    stack.push(ElementFrame {
+        path: path.clone(),
+        child_count: 0,
+    });
+    path
+}
+
+fn next_child_path(stack: &mut [ElementFrame]) -> Vec<usize> {
+    let Some(parent) = stack.last_mut() else {
+        return vec![0];
+    };
+    let child_index = parent.child_count;
+    parent.child_count += 1;
+    let mut path = parent.path.clone();
+    path.push(child_index);
+    path
+}
+
+fn block_kind(name: &[u8], element: &BytesStart<'_>) -> Result<Option<BlockKind>> {
+    Ok(match name {
+        b"h1" => Some(BlockKind::Heading(1)),
+        b"h2" => Some(BlockKind::Heading(2)),
+        b"h3" => Some(BlockKind::Heading(3)),
+        b"h4" => Some(BlockKind::Heading(4)),
+        b"h5" => Some(BlockKind::Heading(5)),
+        b"h6" => Some(BlockKind::Heading(6)),
+        b"p" => Some(BlockKind::Paragraph),
+        b"li" => Some(BlockKind::ListItem),
+        b"blockquote" => Some(BlockKind::Quote),
+        b"td" | b"th" => Some(BlockKind::TableCell),
+        b"tr" => Some(BlockKind::TableRow),
+        b"figcaption" | b"caption" => Some(BlockKind::Caption),
+        b"pre" | b"code" => Some(BlockKind::Code),
+        b"aside" if has_epub_type(element, b"footnote")? => Some(BlockKind::Footnote),
+        _ => None,
+    })
+}
+
+fn has_epub_type(element: &BytesStart<'_>, expected: &[u8]) -> Result<bool> {
+    for attr in element.attributes() {
+        let attr = attr.map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+        if local_name(attr.key.as_ref()) == b"type" {
+            let value = attr.unescape_value()?.into_owned();
+            return Ok(value
+                .split_ascii_whitespace()
+                .any(|item| item.as_bytes() == expected));
+        }
+    }
+    Ok(false)
+}
+
+fn build_block(
+    section_id: &SectionId,
+    ordinal: usize,
+    kind: BlockKind,
+    dom_path: DomPath,
+    text: String,
+) -> Block {
+    let text_runs = vec![TextRun {
+        id: "r0".to_string(),
+        text: text.clone(),
+    }];
+    let protected_spans = detect_protected_spans(&text);
+
+    Block {
+        id: BlockId(format!("b_{ordinal:06}")),
+        section_id: section_id.clone(),
+        kind,
+        dom_path,
+        text_runs,
+        inline_marks: Vec::<InlineMark>::new(),
+        protected_spans,
+        token_estimate: estimate_tokens(&text),
+    }
+}
+
+fn first_heading(blocks: &[Block]) -> (Option<String>, Option<u8>) {
+    blocks
+        .iter()
+        .find_map(|block| match block.kind {
+            BlockKind::Heading(level) => Some((
+                block.text_runs.first().map(|run| run.text.clone()),
+                Some(level),
+            )),
+            _ => None,
+        })
+        .unwrap_or((None, None))
+}
+
+fn link_sections(sections: &mut [Section]) {
+    let ids = sections
+        .iter()
+        .map(|section| section.id.clone())
+        .collect::<Vec<_>>();
+
+    for (index, section) in sections.iter_mut().enumerate() {
+        section.prev = index.checked_sub(1).and_then(|prev| ids.get(prev).cloned());
+        section.next = ids.get(index + 1).cloned();
+    }
+}
+
+fn push_text(output: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+
+    if !output.is_empty() {
+        output.push(' ');
+    }
+    output.push_str(text);
+}
+
+fn normalize_space(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn estimate_tokens(text: &str) -> usize {
+    let words = text.split_whitespace().count();
+    words.saturating_mul(4).div_ceil(3).max(1)
+}
+
+fn detect_protected_spans(text: &str) -> Vec<ProtectedSpan> {
+    text.split_whitespace()
+        .filter_map(|raw| {
+            let value = raw.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']'
+                )
+            });
+            protected_span_kind(value).map(|kind| ProtectedSpan {
+                kind,
+                text: value.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn protected_span_kind(value: &str) -> Option<ProtectedSpanKind> {
+    if value.starts_with("http://") || value.starts_with("https://") {
+        Some(ProtectedSpanKind::Url)
+    } else if value.contains('@') && value.contains('.') {
+        Some(ProtectedSpanKind::Email)
+    } else if value.chars().all(|ch| ch.is_ascii_digit()) {
+        Some(ProtectedSpanKind::Number)
+    } else if value.contains('.') && !value.starts_with('.') && !value.ends_with('.') {
+        Some(ProtectedSpanKind::Filename)
+    } else {
+        None
+    }
 }
 
 fn read_archive_text(archive: &mut ZipArchive<File>, path: &str) -> Result<String> {

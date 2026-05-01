@@ -1,10 +1,7 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::path::{Path, PathBuf};
 
-use bookforge_epub::inspect_epub;
+use bookforge_core::ir::BlockKind;
+use bookforge_epub::{inspect_epub, read_epub};
 
 #[test]
 fn inspects_minimal_epub() {
@@ -24,24 +21,28 @@ fn inspects_minimal_epub() {
     assert_eq!(inspection.resource_count, 1);
 }
 
+#[test]
+fn builds_basic_ir_from_minimal_epub() {
+    let fixture = create_minimal_epub();
+    let book = read_epub(&fixture).expect("fixture should parse into IR");
+
+    assert_eq!(book.sections.len(), 1);
+    assert_eq!(book.blocks.len(), 2);
+    assert_eq!(book.sections[0].title.as_deref(), Some("Chapter 1"));
+    assert_eq!(book.blocks[0].kind, BlockKind::Heading(1));
+    assert_eq!(book.blocks[1].kind, BlockKind::Paragraph);
+    assert_eq!(
+        book.blocks[1].text_runs[0].text,
+        "Hello from a minimal EPUB fixture."
+    );
+    assert!(book.blocks.iter().all(|block| block.token_estimate > 0));
+}
+
 fn create_minimal_epub() -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_dir = manifest_dir
         .parent()
         .and_then(Path::parent)
         .expect("crate should be under workspace/crates/bookforge-epub");
-    let source_dir = workspace_dir.join("tests/fixtures/minimal-epub-src");
-    let output = workspace_dir.join("tests/fixtures/minimal.epub");
-    let _ = fs::remove_file(&output);
-
-    let status = Command::new("bsdtar")
-        .current_dir(&source_dir)
-        .args(["--format", "zip", "-cf"])
-        .arg(&output)
-        .args(["mimetype", "META-INF", "OEBPS"])
-        .status()
-        .expect("bsdtar should be available to create test EPUB");
-
-    assert!(status.success(), "bsdtar failed to create minimal.epub");
-    output
+    workspace_dir.join("tests/fixtures/minimal.epub")
 }

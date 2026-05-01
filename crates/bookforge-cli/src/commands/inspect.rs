@@ -1,6 +1,8 @@
 use anyhow::Result;
-use bookforge_epub::inspect_epub;
+use bookforge_core::ir::{BlockKind, Book};
+use bookforge_epub::{inspect_epub, read_epub};
 use clap::Args;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Args)]
@@ -35,7 +37,7 @@ pub async fn run(args: InspectArgs) -> Result<()> {
     println!("Resource count: {}", inspection.resource_count);
 
     if args.structure {
-        println!("Structure: pending Milestone 3");
+        print_structure(&read_epub(&args.input)?);
     }
 
     if args.segments {
@@ -47,4 +49,39 @@ pub async fn run(args: InspectArgs) -> Result<()> {
 
 fn status(value: bool) -> &'static str {
     if value { "present" } else { "missing" }
+}
+
+fn print_structure(book: &Book) {
+    let mut counts = BTreeMap::<&'static str, usize>::new();
+    let total_tokens = book
+        .blocks
+        .iter()
+        .map(|block| {
+            *counts.entry(block_kind_label(block.kind)).or_default() += 1;
+            block.token_estimate
+        })
+        .sum::<usize>();
+
+    println!("Section count: {}", book.sections.len());
+    println!("Block count: {}", book.blocks.len());
+    println!("Block count by kind:");
+    for (kind, count) in counts {
+        println!("  {kind}: {count}");
+    }
+    println!("Estimated token count: {total_tokens}");
+}
+
+fn block_kind_label(kind: BlockKind) -> &'static str {
+    match kind {
+        BlockKind::Heading(_) => "heading",
+        BlockKind::Paragraph => "paragraph",
+        BlockKind::ListItem => "list_item",
+        BlockKind::Quote => "quote",
+        BlockKind::TableCell => "table_cell",
+        BlockKind::TableRow => "table_row",
+        BlockKind::Footnote => "footnote",
+        BlockKind::Caption => "caption",
+        BlockKind::Code => "code",
+        BlockKind::Unknown => "unknown",
+    }
 }
