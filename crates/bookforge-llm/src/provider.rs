@@ -421,10 +421,6 @@ pub struct OpenAiCompatibleProvider {
 impl OpenAiCompatibleProvider {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .no_gzip()
-            .no_brotli()
-            .no_zstd()
-            .no_deflate()
             .timeout(std::time::Duration::from_secs(config.timeout_seconds))
             .build()?;
         Ok(Self { config, client })

@@ -84,6 +84,14 @@ impl Substitutions {
         self
     }
 
+    /// Insert a JSON value as compact (single-line) output, without
+    /// pretty-printing. Use for batch prompts to reduce token usage.
+    pub fn json_compact<T: Serialize>(&mut self, name: impl Into<String>, value: &T) -> &mut Self {
+        let printed = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+        self.inner.insert(name.into(), printed);
+        self
+    }
+
     /// Insert a raw, already-escaped string verbatim. Use when the caller has
     /// already prepared the substitution.
     pub fn raw(&mut self, name: impl Into<String>, value: impl Into<String>) -> &mut Self {
@@ -168,12 +176,33 @@ const RUN_PRESERVING_TEMPLATE_SOURCE: &str =
     include_str!("../../../prompts/translate_run_preserving.v1.md");
 const QA_TEMPLATE_SOURCE: &str = include_str!("../../../prompts/qa_segment.v1.md");
 
+const BATCH_PLAIN_TEMPLATE_SOURCE: &str =
+    include_str!("../../../prompts/translate_batch_plain.v1.md");
+const BATCH_MARKER_SAFE_TEMPLATE_SOURCE: &str =
+    include_str!("../../../prompts/translate_batch_marker_safe.v1.md");
+const BATCH_RUN_PRESERVING_TEMPLATE_SOURCE: &str =
+    include_str!("../../../prompts/translate_batch_run_preserving.v1.md");
+const BATCH_REPAIR_TEMPLATE_SOURCE: &str =
+    include_str!("../../../prompts/translate_batch_repair.v1.md");
+const QA_BATCH_TEMPLATE_SOURCE: &str = include_str!("../../../prompts/qa_batch.v1.md");
+const DOUBLE_CHECK_BATCH_TEMPLATE_SOURCE: &str =
+    include_str!("../../../prompts/double_check_batch.v1.md");
+const CORRECT_BATCH_TEMPLATE_SOURCE: &str =
+    include_str!("../../../prompts/correct_batch.v1.md");
+
 #[derive(Debug, Clone)]
 pub struct PromptLibrary {
     pub plain: PromptTemplate,
     pub marker_safe: PromptTemplate,
     pub run_preserving: PromptTemplate,
     pub qa: PromptTemplate,
+    pub batch_plain: PromptTemplate,
+    pub batch_marker_safe: PromptTemplate,
+    pub batch_run_preserving: PromptTemplate,
+    pub batch_repair: PromptTemplate,
+    pub qa_batch: PromptTemplate,
+    pub double_check_batch: PromptTemplate,
+    pub correct_batch: PromptTemplate,
 }
 
 impl PromptLibrary {
@@ -191,11 +220,59 @@ impl PromptLibrary {
         .expect("embedded run-preserving template must parse");
         let qa = PromptTemplate::parse("qa_segment", "v1", QA_TEMPLATE_SOURCE)
             .expect("embedded QA template must parse");
+
+        let batch_plain = PromptTemplate::parse(
+            "translate_batch_plain",
+            "v1",
+            BATCH_PLAIN_TEMPLATE_SOURCE,
+        )
+        .expect("embedded batch plain template must parse");
+        let batch_marker_safe = PromptTemplate::parse(
+            "translate_batch_marker_safe",
+            "v1",
+            BATCH_MARKER_SAFE_TEMPLATE_SOURCE,
+        )
+        .expect("embedded batch marker-safe template must parse");
+        let batch_run_preserving = PromptTemplate::parse(
+            "translate_batch_run_preserving",
+            "v1",
+            BATCH_RUN_PRESERVING_TEMPLATE_SOURCE,
+        )
+        .expect("embedded batch run-preserving template must parse");
+        let batch_repair = PromptTemplate::parse(
+            "translate_batch_repair",
+            "v1",
+            BATCH_REPAIR_TEMPLATE_SOURCE,
+        )
+        .expect("embedded batch repair template must parse");
+        let qa_batch =
+            PromptTemplate::parse("qa_batch", "v1", QA_BATCH_TEMPLATE_SOURCE)
+                .expect("embedded QA batch template must parse");
+        let double_check_batch = PromptTemplate::parse(
+            "double_check_batch",
+            "v1",
+            DOUBLE_CHECK_BATCH_TEMPLATE_SOURCE,
+        )
+        .expect("embedded double-check batch template must parse");
+        let correct_batch = PromptTemplate::parse(
+            "correct_batch",
+            "v1",
+            CORRECT_BATCH_TEMPLATE_SOURCE,
+        )
+        .expect("embedded correct batch template must parse");
+
         Self {
             plain,
             marker_safe,
             run_preserving,
             qa,
+            batch_plain,
+            batch_marker_safe,
+            batch_run_preserving,
+            batch_repair,
+            qa_batch,
+            double_check_batch,
+            correct_batch,
         }
     }
 }
@@ -276,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_library_loads_both_templates() {
+    fn embedded_library_loads_all_templates() {
         let library = PromptLibrary::embedded();
         assert_eq!(library.plain.name, "translate_segment");
         assert_eq!(library.plain.version, "v1");
@@ -293,5 +370,19 @@ mod tests {
         );
         assert_eq!(library.qa.name, "qa_segment");
         assert!(library.qa.user.contains("{{translation_text}}"));
+
+        assert_eq!(library.batch_plain.name, "translate_batch_plain");
+        assert!(library.batch_plain.user.contains("{{items_json}}"));
+        assert_eq!(library.batch_marker_safe.name, "translate_batch_marker_safe");
+        assert!(library.batch_marker_safe.user.contains("{{items_json}}"));
+        assert_eq!(
+            library.batch_run_preserving.name,
+            "translate_batch_run_preserving"
+        );
+        assert_eq!(library.batch_repair.name, "translate_batch_repair");
+        assert!(library.batch_repair.user.contains("{{errors_json}}"));
+        assert_eq!(library.qa_batch.name, "qa_batch");
+        assert_eq!(library.double_check_batch.name, "double_check_batch");
+        assert_eq!(library.correct_batch.name, "correct_batch");
     }
 }

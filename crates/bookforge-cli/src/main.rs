@@ -23,10 +23,11 @@ struct Cli {
 enum Command {
     Inspect(inspect::InspectArgs),
     Estimate(estimate::EstimateArgs),
-    Translate(translate::TranslateArgs),
+    Translate(Box<translate::TranslateArgs>),
     Resume(resume::ResumeArgs),
     Retry(retry::RetryArgs),
     Validate(validate::ValidateArgs),
+    Benchmark(Box<translate::BenchmarkArgs>),
 }
 
 #[tokio::main]
@@ -36,10 +37,11 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Inspect(args) => inspect::run(args).await,
         Command::Estimate(args) => estimate::run(args).await,
-        Command::Translate(args) => translate::run(args).await,
+        Command::Translate(args) => translate::run(*args).await,
         Command::Resume(args) => resume::run(args).await,
         Command::Retry(args) => retry::run(args).await,
         Command::Validate(args) => validate::run(args).await,
+        Command::Benchmark(args) => translate::run_benchmark(*args).await,
     }
 }
 

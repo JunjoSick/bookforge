@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-bookforge-core = { path = "../bookforge-core" }
+bookforge-core = { path = "../bookforge-core", features = ["cli"] }
 bookforge-epub = { path = "../bookforge-epub" }
 bookforge-llm = { path = "../bookforge-llm" }
 bookforge-store = { path = "../bookforge-store" }

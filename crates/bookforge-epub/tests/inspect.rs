@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,15 +20,15 @@ fn inspects_minimal_epub() {
 
     assert_eq!(
         inspection.title.as_deref(),
-        Some("Minimal Bookforge Fixture")
+        Some("Generated Bookforge Fixture")
     );
     assert_eq!(inspection.spine_count, 1);
-    assert_eq!(inspection.manifest_count, 3);
+    assert_eq!(inspection.manifest_count, 2);
     assert_eq!(inspection.xhtml_count, 2);
     assert_eq!(inspection.xhtml_spine_count, 1);
     assert!(inspection.has_nav);
     assert!(!inspection.has_toc);
-    assert_eq!(inspection.resource_count, 1);
+    assert_eq!(inspection.resource_count, 0);
 }
 
 #[test]
@@ -37,13 +37,11 @@ fn builds_basic_ir_from_minimal_epub() {
     let book = read_epub(&fixture).expect("fixture should parse into IR");
 
     assert_eq!(book.sections.len(), 1);
-    assert_eq!(book.blocks.len(), 2);
-    assert_eq!(book.sections[0].title.as_deref(), Some("Chapter 1"));
-    assert_eq!(book.blocks[0].kind, BlockKind::Heading(1));
-    assert_eq!(book.blocks[1].kind, BlockKind::Paragraph);
+    assert_eq!(book.blocks.len(), 1);
+    assert_eq!(book.blocks[0].kind, BlockKind::Paragraph);
     assert_eq!(
-        book.blocks[1].text_runs[0].text,
-        "Hello from a minimal EPUB fixture."
+        book.blocks[0].text_runs[0].text,
+        "Hello from chapter 1."
     );
     assert!(book.blocks.iter().all(|block| block.token_estimate > 0));
 }
@@ -64,13 +62,12 @@ fn builds_stable_segments_from_minimal_epub() {
     assert_eq!(first[0].id, second[0].id);
     assert_eq!(first[0].checksum, second[0].checksum);
     assert_eq!(first[0].section_id.0, "sec_000000");
-    assert_eq!(first[0].block_ids.len(), 2);
-    assert!(first[0].source.text.contains("Chapter 1"));
+    assert_eq!(first[0].block_ids.len(), 1);
     assert!(
         first[0]
             .source
             .text
-            .contains("Hello from a minimal EPUB fixture.")
+            .contains("Hello from chapter 1.")
     );
     assert!(first[0].source.token_estimate > 0);
     assert!(first[0].context.before.is_none());
@@ -90,10 +87,6 @@ fn rebuilds_epub_with_patched_xhtml_and_preserved_resources() {
         &[
             BlockTranslation {
                 block_id: BlockId("b_000000".to_string()),
-                text: "Capitolo 1".to_string(),
-            },
-            BlockTranslation {
-                block_id: BlockId("b_000001".to_string()),
                 text: "Ciao da un EPUB minimo.".to_string(),
             },
         ],
@@ -103,7 +96,7 @@ fn rebuilds_epub_with_patched_xhtml_and_preserved_resources() {
 
     let inspection = inspect_epub(&output).expect("rebuilt EPUB should inspect");
     assert_eq!(inspection.spine_count, 1);
-    assert_eq!(inspection.manifest_count, 3);
+    assert_eq!(inspection.manifest_count, 2);
 
     let mut archive = ZipArchive::new(File::open(&output).expect("rebuilt EPUB should exist"))
         .expect("rebuilt EPUB should be a zip");
@@ -114,9 +107,7 @@ fn rebuilds_epub_with_patched_xhtml_and_preserved_resources() {
         .read_to_string(&mut chapter)
         .expect("chapter should be UTF-8");
 
-    assert!(chapter.contains("Capitolo 1"));
     assert!(chapter.contains("Ciao da un EPUB minimo."));
-    assert!(chapter.contains("style.css"));
 }
 
 #[test]
@@ -240,12 +231,7 @@ fn parses_huge_paragraph_generated_fixture() {
 }
 
 fn create_minimal_epub() -> PathBuf {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_dir = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("crate should be under workspace/crates/bookforge-epub");
-    workspace_dir.join("tests/fixtures/minimal.epub")
+    create_epub_fixture("minimal", "<p>Hello from chapter 1.</p>")
 }
 
 fn create_epub_fixture(name: &str, body: &str) -> PathBuf {

@@ -12,3 +12,7 @@ thiserror.workspace = true
 quick-xml.workspace = true
 sha2.workspace = true
 zip.workspace = true
+clap = { workspace = true, optional = true }
+
+[features]
+cli = ["dep:clap"]

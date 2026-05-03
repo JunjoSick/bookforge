@@ -141,6 +141,7 @@ dependencies = [
 name = "bookforge-core"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "quick-xml",
  "serde",
  "sha2",

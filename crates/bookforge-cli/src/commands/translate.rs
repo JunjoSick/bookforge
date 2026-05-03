@@ -1,6 +1,9 @@
 use anyhow::Result;
 use bookforge_core::{
-    config::{SegmentationConfig, TranslationConfig},
+    config::{
+        DoubleCheckMode, FallbackScope, ResolvedRunSettings,
+        TranslationConfig, TranslationProfile,
+    },
     scheduler::SchedulerConfig,
     segment::{BlockTranslation, Segment, SegmentStatus, build_segments},
 };
@@ -10,7 +13,8 @@ use bookforge_llm::translate_segments;
 use bookforge_llm::{
     LlmError, LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig,
     OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation, TranslationRunConfig,
-    qa_segments, translate_segments_with_callback,
+    build_translation_batches, qa_segments, run_double_check, translate_batches_with_callback,
+    translate_segments_with_callback,
 };
 use bookforge_store::{
     CreateJob, JobRecord, JobStore, SaveCachedTranslation, SaveNeedsReview, SaveTranslation,
@@ -19,7 +23,7 @@ use clap::Args;
 use std::path::PathBuf;
 
 use crate::{
-    LanguageArgs, ProviderArgs, QaMode,
+    LanguageArgs, ProviderArgs as CliProviderArgs, QaMode,
     cost::estimate_cost_usd,
     default_output_path,
     report::{ReportInput, write_report},
@@ -33,7 +37,34 @@ pub struct TranslateArgs {
     pub language: LanguageArgs,
 
     #[command(flatten)]
-    pub provider: ProviderArgs,
+    pub provider: CliProviderArgs,
+
+    #[arg(long, value_enum, default_value_t = TranslationProfile::Balanced)]
+    pub profile: TranslationProfile,
+
+    #[arg(long)]
+    pub max_segment_tokens: Option<usize>,
+
+    #[arg(long)]
+    pub context_tokens: Option<usize>,
+
+    #[arg(long)]
+    pub batch_target_tokens: Option<usize>,
+
+    #[arg(long)]
+    pub batch_max_items: Option<usize>,
+
+    #[arg(long)]
+    pub compact_prompts: Option<bool>,
+
+    #[arg(long)]
+    pub retry_failed_only: Option<bool>,
+
+    #[arg(long)]
+    pub adaptive_concurrency: Option<bool>,
+
+    #[arg(long)]
+    pub turbo_text_only: bool,
 
     #[arg(long, default_value_t = 4)]
     pub concurrency: usize,
@@ -42,23 +73,167 @@ pub struct TranslateArgs {
     pub max_attempts: usize,
 
     #[arg(long)]
+    pub provider_max_attempts: Option<usize>,
+
+    #[arg(long)]
+    pub validation_max_attempts: Option<usize>,
+
+    #[arg(long)]
     pub out: Option<PathBuf>,
 
     #[arg(long, value_enum, default_value_t = QaMode::Off)]
     pub qa: QaMode,
+
+    #[arg(long, default_value_t = 8)]
+    pub qa_concurrency: usize,
+
+    #[arg(long)]
+    pub qa_batch_target_tokens: Option<usize>,
+
+    #[arg(long)]
+    pub qa_model: Option<String>,
+
+    #[arg(long)]
+    pub qa_provider: Option<String>,
+
+    #[arg(long)]
+    pub qa_base_url: Option<String>,
+
+    #[arg(long)]
+    pub qa_api_key_env: Option<String>,
+
+    #[arg(long, value_enum, default_value_t = DoubleCheckMode::Off)]
+    pub double_check: DoubleCheckMode,
+
+    #[arg(long)]
+    pub double_check_model: Option<String>,
+
+    #[arg(long)]
+    pub double_check_provider: Option<String>,
+
+    #[arg(long)]
+    pub double_check_base_url: Option<String>,
+
+    #[arg(long)]
+    pub double_check_api_key_env: Option<String>,
+
+    #[arg(long, default_value_t = 4)]
+    pub double_check_concurrency: usize,
+
+    #[arg(long)]
+    pub double_check_batch_target_tokens: Option<usize>,
+
+    #[arg(long, default_value_t = false)]
+    pub auto_correct: bool,
+
+    #[arg(long, default_value_t = 1)]
+    pub correction_rounds: usize,
+
+    #[arg(long)]
+    pub fallback_provider: Option<String>,
+
+    #[arg(long)]
+    pub fallback_model: Option<String>,
+
+    #[arg(long)]
+    pub fallback_base_url: Option<String>,
+
+    #[arg(long)]
+    pub fallback_api_key_env: Option<String>,
+
+    #[arg(long, value_enum, default_value_t = FallbackScope::Failed)]
+    pub fallback_only: FallbackScope,
+}
+
+fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
+    let effective_profile = if args.turbo_text_only
+        && !matches!(args.profile, TranslationProfile::TurboTextOnly)
+    {
+        TranslationProfile::TurboTextOnly
+    } else {
+        args.profile
+    };
+
+    let mut settings = effective_profile.resolve();
+
+    if let Some(v) = args.max_segment_tokens {
+        settings.segmentation.max_segment_tokens = v;
+    }
+    if let Some(v) = args.context_tokens {
+        settings.segmentation.context_tokens = v;
+    }
+    if let Some(v) = args.batch_target_tokens {
+        settings.batch.target_tokens = v;
+    }
+    if let Some(v) = args.batch_max_items {
+        settings.batch.max_items = v;
+    }
+    if let Some(v) = args.compact_prompts {
+        settings.compact_prompts = v;
+    }
+    if let Some(v) = args.retry_failed_only {
+        settings.retry_failed_only = v;
+    }
+    if let Some(v) = args.adaptive_concurrency {
+        settings.adaptive_concurrency = v;
+    }
+
+    settings.scheduler.concurrency = args.concurrency;
+    settings.scheduler.max_attempts = args.max_attempts;
+
+    if let Some(v) = args.provider_max_attempts {
+        settings.provider.provider_max_attempts = v;
+    }
+    if let Some(v) = args.validation_max_attempts {
+        settings.provider.validation_max_attempts = v;
+    }
+    settings.provider.timeout_seconds = args.provider.timeout_seconds;
+
+    settings.qa.concurrency = args.qa_concurrency;
+    if let Some(v) = args.qa_batch_target_tokens {
+        settings.qa.batch_target_tokens = v;
+    }
+    settings.qa.model = args.qa_model.clone();
+    settings.qa.provider = args.qa_provider.clone();
+    settings.qa.base_url = args.qa_base_url.clone();
+    settings.qa.api_key_env = args.qa_api_key_env.clone();
+
+    settings.double_check.mode = args.double_check;
+    settings.double_check.model = args.double_check_model.clone();
+    settings.double_check.provider = args.double_check_provider.clone();
+    settings.double_check.base_url = args.double_check_base_url.clone();
+    settings.double_check.api_key_env = args.double_check_api_key_env.clone();
+    settings.double_check.concurrency = args.double_check_concurrency;
+    if let Some(v) = args.double_check_batch_target_tokens {
+        settings.double_check.batch_target_tokens = v;
+    }
+    settings.double_check.auto_correct = args.auto_correct;
+    settings.double_check.correction_rounds = args.correction_rounds;
+
+    if settings.double_check.mode != DoubleCheckMode::Off
+        && settings.double_check.model.is_none()
+    {
+        eprintln!(
+            "--double-check requires --double-check-model unless a default double-check model is configured"
+        );
+    }
+
+    settings
 }
 
 pub async fn run(args: TranslateArgs) -> Result<()> {
+    let settings = resolve_settings(&args);
     let output = args
         .out
+        .clone()
         .unwrap_or_else(|| default_output_path(&args.input, &args.language.target));
     let config = TranslationConfig {
-        source_language: args.language.source,
-        target_language: args.language.target,
+        source_language: args.language.source.clone(),
+        target_language: args.language.target.clone(),
         provider: args.provider.provider.clone(),
         model: args.provider.model.clone(),
-        concurrency: args.concurrency,
-        max_attempts: args.max_attempts,
+        concurrency: settings.scheduler.concurrency,
+        max_attempts: settings.scheduler.max_attempts,
         output,
     };
 
@@ -66,12 +241,20 @@ pub async fn run(args: TranslateArgs) -> Result<()> {
     println!("Output: {}", config.output.display());
     println!("Target: {}", config.target_language);
     println!("Provider: {}", config.provider);
+    println!("Profile: {:?}", args.profile);
     println!("Concurrency: {}", config.concurrency);
+    println!("Batch enabled: {}", settings.batch.enabled);
+
+    if settings.batch.enabled {
+        println!("Batch target tokens: {}", settings.batch.target_tokens);
+        println!("Batch max items: {}", settings.batch.max_items);
+    }
 
     match config.provider.as_str() {
-        "mock" => run_mock_translation(&args.input, &config, args.qa).await?,
+        "mock" => run_mock_translation(&args.input, &config, &args.provider, &args, &settings).await?,
         "deepseek" | "openrouter" | "openai-compatible" => {
-            run_openai_compatible_translation(&args.input, &config, &args.provider, args.qa).await?
+            run_openai_compatible_translation(&args.input, &config, &args.provider, &args, &settings)
+                .await?
         }
         _ => {
             println!(
@@ -87,10 +270,12 @@ pub async fn run(args: TranslateArgs) -> Result<()> {
 async fn run_mock_translation(
     input: &PathBuf,
     config: &TranslationConfig,
-    qa_mode: QaMode,
+    _provider_args: &CliProviderArgs,
+    _cli_args: &TranslateArgs,
+    settings: &ResolvedRunSettings,
 ) -> Result<()> {
     let book = read_epub(input)?;
-    let segments = build_segments(&book, &SegmentationConfig::default())?;
+    let segments = build_segments(&book, &settings.segmentation)?;
     let model = config
         .model
         .clone()
@@ -116,10 +301,7 @@ async fn run_mock_translation(
         model: model.clone(),
         prompt_version: prompt_version.to_string(),
         temperature: 0.2,
-        scheduler: SchedulerConfig {
-            concurrency: config.concurrency,
-            max_attempts: config.max_attempts,
-        },
+        scheduler: settings.scheduler.clone(),
     };
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     let mut translations = apply_cached_translations(
@@ -151,7 +333,7 @@ async fn run_mock_translation(
     translations.extend(fresh_translations);
     translations.sort_by_key(|translation| translation.ordinal);
     let qa_reviews =
-        qa_reviews_for_mode(provider, &segments, &translations, &run_config, qa_mode).await;
+        qa_reviews_for_mode(provider, &segments, &translations, &run_config, _cli_args.qa).await;
     mark_job_finished(&store, &job.id, &translations)?;
     print_summary_rebuild_and_report(
         &store,
@@ -179,49 +361,23 @@ pub(crate) fn mock_mode(model: &str) -> MockMode {
 async fn run_openai_compatible_translation(
     input: &PathBuf,
     config: &TranslationConfig,
-    provider_args: &crate::ProviderArgs,
-    qa_mode: QaMode,
+    provider_args: &CliProviderArgs,
+    cli_args: &TranslateArgs,
+    settings: &ResolvedRunSettings,
 ) -> Result<()> {
-    let provider_config = if config.provider == "deepseek" {
-        let mut config = OpenAiCompatibleConfig::deepseek(config.model.clone());
-        config.timeout_seconds = provider_args.timeout_seconds;
-        config
-    } else if config.provider == "openrouter" {
-        OpenAiCompatibleConfig {
-            base_url: provider_args
-                .base_url
-                .clone()
-                .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
-            api_key_env: provider_args
-                .api_key_env
-                .clone()
-                .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string()),
-            model: config
-                .model
-                .clone()
-                .unwrap_or_else(|| "openrouter/auto".to_string()),
-            timeout_seconds: provider_args.timeout_seconds,
-        }
-    } else {
-        OpenAiCompatibleConfig {
-            base_url: provider_args.base_url.clone().ok_or_else(|| {
-                anyhow::anyhow!("--base-url is required for --provider openai-compatible")
-            })?,
-            api_key_env: provider_args
-                .api_key_env
-                .clone()
-                .unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
-            model: config
-                .model
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("--model is required for openai-compatible"))?,
-            timeout_seconds: provider_args.timeout_seconds,
-        }
+    let provider_config = OpenAiCompatibleConfig {
+        base_url: resolve_base_url(config, provider_args)?,
+        api_key_env: resolve_api_key_env(config, provider_args),
+        model: config
+            .model
+            .clone()
+            .unwrap_or_else(|| "openrouter/auto".to_string()),
+        timeout_seconds: settings.provider.timeout_seconds,
     };
     let provider = OpenAiCompatibleProvider::new(provider_config.clone())?;
     let model = provider.model().to_string();
     let book = read_epub(input)?;
-    let segments = build_segments(&book, &SegmentationConfig::default())?;
+    let segments = build_segments(&book, &settings.segmentation)?;
     let prompt_version = "v1";
     let store = JobStore::open_default()?;
     let job = store.create_job(CreateJob {
@@ -243,51 +399,410 @@ async fn run_openai_compatible_translation(
         model: model.clone(),
         prompt_version: prompt_version.to_string(),
         temperature: 0.2,
+        scheduler: settings.scheduler.clone(),
+    };
+
+    if settings.batch.enabled {
+        let batch_run_config = TranslationRunConfig {
+            source_language: run_config.source_language.clone(),
+            target_language: run_config.target_language.clone(),
+            provider: run_config.provider.clone(),
+            model: run_config.model.clone(),
+            prompt_version: "batch_v1".to_string(),
+            temperature: run_config.temperature,
+            scheduler: SchedulerConfig {
+                concurrency: run_config.scheduler.concurrency,
+                max_attempts: settings.provider.provider_max_attempts,
+            },
+        };
+        store.insert_segments(&job.id, &segments, "batch_v1", &config.provider, &model)?;
+        let mut translations = apply_cached_translations(
+            &segments,
+            CacheContext {
+                store: &store,
+                job_id: &job.id,
+                prompt_version: "batch_v1",
+                provider: &config.provider,
+                model: &model,
+                source_lang: config.source_language.as_deref(),
+                target_lang: &config.target_language,
+            },
+        )?;
+        let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
+        let fresh_translations = translate_and_checkpoint_batch(
+            provider.clone(),
+            &pending_segments,
+            &batch_run_config,
+            settings,
+            CheckpointContext {
+                store: &store,
+                job_id: &job.id,
+                provider: &config.provider,
+                model: &model,
+                prompt_version: "batch_v1",
+            },
+        )
+        .await?;
+        translations.extend(fresh_translations);
+        translations.sort_by_key(|translation| translation.ordinal);
+        let qa_reviews =
+            qa_reviews_for_mode(provider.clone(), &segments, &translations, &run_config, cli_args.qa)
+                .await;
+        translations = run_fallback_pass(
+            &provider,
+            cli_args,
+            &segments,
+            translations,
+            &store,
+            &job.id,
+            "batch_v1",
+            settings,
+        ).await?;
+        run_double_check_pass(
+            &provider,
+            cli_args,
+            &segments,
+            &translations,
+            &run_config,
+            settings,
+        ).await?;
+        mark_job_finished(&store, &job.id, &translations)?;
+        print_summary_rebuild_and_report(
+            &store,
+            &job,
+            &book,
+            &segments,
+            &translations,
+            &qa_reviews,
+            config,
+        )?;
+    } else {
+        let mut translations = apply_cached_translations(
+            &segments,
+            CacheContext {
+                store: &store,
+                job_id: &job.id,
+                prompt_version,
+                provider: &config.provider,
+                model: &model,
+                source_lang: config.source_language.as_deref(),
+                target_lang: &config.target_language,
+            },
+        )?;
+        let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
+        let fresh_translations = translate_and_checkpoint(
+            provider.clone(),
+            &pending_segments,
+            &run_config,
+            CheckpointContext {
+                store: &store,
+                job_id: &job.id,
+                provider: &config.provider,
+                model: &model,
+                prompt_version,
+            },
+        )
+        .await?;
+        translations.extend(fresh_translations);
+        translations.sort_by_key(|translation| translation.ordinal);
+        let qa_reviews =
+            qa_reviews_for_mode(provider.clone(), &segments, &translations, &run_config, cli_args.qa)
+                .await;
+        translations = run_fallback_pass(
+            &provider,
+            cli_args,
+            &segments,
+            translations,
+            &store,
+            &job.id,
+            prompt_version,
+            settings,
+        ).await?;
+        run_double_check_pass(
+            &provider,
+            cli_args,
+            &segments,
+            &translations,
+            &run_config,
+            settings,
+        ).await?;
+        mark_job_finished(&store, &job.id, &translations)?;
+        print_summary_rebuild_and_report(
+            &store,
+            &job,
+            &book,
+            &segments,
+            &translations,
+            &qa_reviews,
+            config,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn resolve_base_url(config: &TranslationConfig, provider_args: &CliProviderArgs) -> Result<String> {
+    if config.provider == "deepseek" {
+        Ok(provider_args
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string()))
+    } else if config.provider == "openrouter" {
+        Ok(provider_args
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()))
+    } else {
+        provider_args.base_url.clone().ok_or_else(|| {
+            anyhow::anyhow!("--base-url is required for --provider openai-compatible")
+        })
+    }
+}
+
+fn resolve_api_key_env(config: &TranslationConfig, provider_args: &CliProviderArgs) -> String {
+    if config.provider == "deepseek" {
+        provider_args
+            .api_key_env
+            .clone()
+            .unwrap_or_else(|| "DEEPSEEK_API_KEY".to_string())
+    } else if config.provider == "openrouter" {
+        provider_args
+            .api_key_env
+            .clone()
+            .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string())
+    } else {
+        provider_args
+            .api_key_env
+            .clone()
+            .unwrap_or_else(|| "OPENAI_API_KEY".to_string())
+    }
+}
+
+async fn translate_and_checkpoint_batch<P>(
+    provider: P,
+    segments: &[Segment],
+    config: &TranslationRunConfig,
+    settings: &ResolvedRunSettings,
+    checkpoint: CheckpointContext<'_>,
+) -> Result<Vec<SegmentTranslation>>
+where
+    P: LlmProvider,
+{
+    let batches = build_translation_batches(
+        segments,
+        &settings.batch,
+        settings.profile,
+    );
+
+    if batches.is_empty() {
+        return translate_and_checkpoint(provider, segments, config, checkpoint).await;
+    }
+
+    println!("Batches: {}", batches.len());
+
+    match translate_batches_with_callback(provider, batches, config, |translation| {
+        save_translation_result(
+            checkpoint.store,
+            checkpoint.job_id,
+            translation,
+            checkpoint.provider,
+            checkpoint.model,
+            checkpoint.prompt_version,
+        )
+        .map_err(|err| LlmError::Provider(format!("checkpoint save failed: {err}")))
+    })
+    .await
+    {
+        Ok(translations) => Ok(translations),
+        Err(error) => {
+            let message = format!(
+                "batch translation failed: {error}"
+            );
+            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            Err(anyhow::anyhow!(message))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_fallback_pass(
+    primary_provider: &OpenAiCompatibleProvider,
+    cli_args: &TranslateArgs,
+    segments: &[Segment],
+    mut translations: Vec<SegmentTranslation>,
+    store: &JobStore,
+    job_id: &str,
+    prompt_version: &str,
+    settings: &ResolvedRunSettings,
+) -> Result<Vec<SegmentTranslation>> {
+    if cli_args.fallback_provider.is_none() && cli_args.fallback_model.is_none() {
+        return Ok(translations);
+    }
+
+    let provider_str = cli_args
+        .fallback_provider
+        .as_deref()
+        .unwrap_or("openrouter");
+    let model_str = cli_args
+        .fallback_model
+        .as_deref()
+        .unwrap_or(primary_provider.model());
+
+    let fallback_config = OpenAiCompatibleConfig {
+        base_url: cli_args.fallback_base_url.clone().unwrap_or_else(|| {
+            if provider_str == "deepseek" {
+                "https://api.deepseek.com/v1".to_string()
+            } else {
+                "https://openrouter.ai/api/v1".to_string()
+            }
+        }),
+        api_key_env: cli_args.fallback_api_key_env.clone().unwrap_or_else(|| {
+            if provider_str == "deepseek" {
+                "DEEPSEEK_API_KEY".to_string()
+            } else {
+                "OPENROUTER_API_KEY".to_string()
+            }
+        }),
+        model: model_str.to_string(),
+        timeout_seconds: settings.provider.timeout_seconds,
+    };
+
+    let fallback = OpenAiCompatibleProvider::new(fallback_config)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let fallback_model = fallback.model().to_string();
+
+    let candidates: Vec<Segment> = segments
+        .iter()
+        .filter(|s| {
+            let t = translations
+                .iter()
+                .find(|t| t.segment_id.0 == s.id.0);
+            match t {
+                Some(t) => match cli_args.fallback_only {
+                    FallbackScope::Failed => t.status == SegmentStatus::Failed,
+                    FallbackScope::NeedsReview => t.status == SegmentStatus::NeedsReview,
+                    FallbackScope::FailedAndNeedsReview => {
+                        t.status == SegmentStatus::Failed
+                            || t.status == SegmentStatus::NeedsReview
+                    }
+                },
+                None => false,
+            }
+        })
+        .cloned()
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(translations);
+    }
+
+    println!(
+        "Fallback: retrying {} segments with {}/{}",
+        candidates.len(),
+        provider_str,
+        fallback_model
+    );
+
+    let run_config = TranslationRunConfig {
+        source_language: None,
+        target_language: String::new(),
+        provider: provider_str.to_string(),
+        model: fallback_model.clone(),
+        prompt_version: prompt_version.to_string(),
+        temperature: 0.2,
         scheduler: SchedulerConfig {
-            concurrency: config.concurrency,
-            max_attempts: config.max_attempts,
+            concurrency: 1,
+            max_attempts: settings.provider.provider_max_attempts,
         },
     };
-    let mut translations = apply_cached_translations(
-        &segments,
-        CacheContext {
-            store: &store,
-            job_id: &job.id,
-            prompt_version,
-            provider: &config.provider,
-            model: &model,
-            source_lang: config.source_language.as_deref(),
-            target_lang: &config.target_language,
-        },
-    )?;
-    let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
-    let fresh_translations = translate_and_checkpoint(
-        provider.clone(),
-        &pending_segments,
+
+    let checkpoint = CheckpointContext {
+        store,
+        job_id,
+        provider: provider_str,
+        model: &fallback_model,
+        prompt_version,
+    };
+
+    let fresh = translate_and_checkpoint(
+        fallback,
+        &candidates,
         &run_config,
-        CheckpointContext {
-            store: &store,
-            job_id: &job.id,
-            provider: &config.provider,
-            model: &model,
-            prompt_version,
-        },
+        checkpoint,
     )
     .await?;
-    translations.extend(fresh_translations);
-    translations.sort_by_key(|translation| translation.ordinal);
-    let qa_reviews =
-        qa_reviews_for_mode(provider, &segments, &translations, &run_config, qa_mode).await;
-    mark_job_finished(&store, &job.id, &translations)?;
-    print_summary_rebuild_and_report(
-        &store,
-        &job,
-        &book,
-        &segments,
-        &translations,
-        &qa_reviews,
+
+    for ft in &fresh {
+        if let Some(existing) = translations
+            .iter_mut()
+            .find(|t| t.segment_id.0 == ft.segment_id.0)
+        {
+            *existing = ft.clone();
+        }
+    }
+
+    Ok(translations)
+}
+
+async fn run_double_check_pass(
+    provider: &OpenAiCompatibleProvider,
+    cli_args: &TranslateArgs,
+    segments: &[Segment],
+    translations: &[SegmentTranslation],
+    config: &TranslationRunConfig,
+    settings: &ResolvedRunSettings,
+) -> Result<()> {
+    if settings.double_check.mode == DoubleCheckMode::Off {
+        return Ok(());
+    }
+
+    let dc_provider = if cli_args.double_check_provider.is_some()
+        || cli_args.double_check_model.is_some()
+    {
+        let dc_config = OpenAiCompatibleConfig {
+            base_url: cli_args.double_check_base_url.clone().unwrap_or_else(|| {
+                "https://openrouter.ai/api/v1".to_string()
+            }),
+            api_key_env: cli_args.double_check_api_key_env.clone().unwrap_or_else(|| {
+                "OPENROUTER_API_KEY".to_string()
+            }),
+            model: cli_args
+                .double_check_model
+                .clone()
+                .unwrap_or_else(|| provider.model().to_string()),
+            timeout_seconds: settings.provider.timeout_seconds,
+        };
+        OpenAiCompatibleProvider::new(dc_config)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        provider.clone()
+    };
+
+    println!("Double-check: auditing translations...");
+    let corrections = run_double_check(
+        dc_provider,
+        segments,
+        translations,
         config,
-    )?;
+        &settings.double_check,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("double-check failed: {e}"))?;
+
+    let applied = corrections
+        .iter()
+        .filter(|c| matches!(c.status, bookforge_llm::CorrectionStatus::Applied))
+        .count();
+    let rejected = corrections
+        .iter()
+        .filter(|c| matches!(c.status, bookforge_llm::CorrectionStatus::RejectedValidationFailed(_)))
+        .count();
+    let unresolved = corrections
+        .iter()
+        .filter(|c| matches!(c.status, bookforge_llm::CorrectionStatus::Unresolved))
+        .count();
+
+    println!("  Corrections: {applied} applied, {rejected} rejected, {unresolved} unresolved");
 
     Ok(())
 }
@@ -566,7 +1081,7 @@ pub(crate) fn print_summary_rebuild_and_report(
     store: &JobStore,
     job: &JobRecord,
     book: &bookforge_core::ir::Book,
-    segments: &[bookforge_core::segment::Segment],
+    segments: &[Segment],
     translations: &[SegmentTranslation],
     qa_reviews: &[QaSegmentReview],
     config: &TranslationConfig,
@@ -609,6 +1124,169 @@ pub(crate) fn print_summary_rebuild_and_report(
     println!("Report: {}", report.markdown.display());
 
     Ok(())
+}
+
+#[derive(Debug, Args)]
+pub struct BenchmarkArgs {
+    #[command(flatten)]
+    pub provider: CliProviderArgs,
+
+    #[arg(long, default_value_t = 5)]
+    pub samples: usize,
+
+    #[arg(long, default_value_t = 1000)]
+    pub tokens: usize,
+
+    #[arg(long, default_value_t = 1)]
+    pub concurrency: usize,
+}
+
+pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
+    let pigeon = "Sunt piger, et volare nequeunt. Sed cum cibus apparet, mirabiliter currunt.";
+    let provider_config = OpenAiCompatibleConfig {
+        base_url: args
+            .provider
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
+        api_key_env: args
+            .provider
+            .api_key_env
+            .clone()
+            .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string()),
+        model: args
+            .provider
+            .model
+            .clone()
+            .unwrap_or_else(|| "openrouter/auto".to_string()),
+        timeout_seconds: args.provider.timeout_seconds,
+    };
+
+    let provider = OpenAiCompatibleProvider::new(provider_config.clone())?;
+    let model = provider.model().to_string();
+
+    println!("Benchmarking {} / {}", provider_config.base_url, model);
+    println!("Samples: {}, Tokens: {}, Concurrency: {}", args.samples, args.tokens, args.concurrency);
+    println!();
+
+    let mut latencies = Vec::with_capacity(args.samples);
+    let mut success_count = 0usize;
+    let mut failure_count = 0usize;
+    let mut ratelimit_count = 0usize;
+    let mut timeout_count = 0usize;
+    let mut total_output_tokens = 0u64;
+    let mut _total_input_tokens = 0u64;
+
+    for i in 0..args.samples {
+        let request = bookforge_llm::CompletionRequest {
+            system: "You are a translator. Return JSON only: {\"translation\":\"...\"}".to_string(),
+            user: format!(
+                "Translate: {{\"text\":\"{}\"}} Return JSON.",
+                pigeon
+            ),
+            response_format: bookforge_llm::ResponseFormat::Json,
+            temperature: 0.2,
+            max_output_tokens: Some(args.tokens as u32),
+            metadata: Default::default(),
+        };
+
+        print!("  [{}/{}] ", i + 1, args.samples);
+        match provider.complete(request).await {
+            Ok(resp) => {
+                latencies.push(resp.provider_latency_ms);
+                success_count += 1;
+                total_output_tokens += resp.output_tokens.unwrap_or(0);
+                _total_input_tokens += resp.input_tokens.unwrap_or(0);
+                let tok_sec = if resp.provider_latency_ms > 0 {
+                    resp.output_tokens.unwrap_or(0) as f64 / (resp.provider_latency_ms as f64 / 1000.0)
+                } else {
+                    0.0
+                };
+                println!("OK {}ms finish={:?} in={:?} out={:?} ~{tok_sec:.0}tok/s",
+                    resp.provider_latency_ms, resp.finish_reason,
+                    resp.input_tokens, resp.output_tokens);
+            }
+            Err(e) => {
+                failure_count += 1;
+                let kind = classify_error(&e);
+                match kind {
+                    "rate_limit" => ratelimit_count += 1,
+                    "timeout" => timeout_count += 1,
+                    _ => {}
+                }
+                println!("FAIL [{kind}] {e}");
+            }
+        }
+    }
+
+    println!();
+    println!("Results:");
+    println!("  Success: {} / {}", success_count, args.samples);
+    println!("  Failed:  {}", failure_count);
+
+    if !latencies.is_empty() {
+        latencies.sort();
+        let p50 = percentile(&latencies, 50);
+        let p95 = percentile(&latencies, 95);
+        let avg = latencies.iter().sum::<u64>() as f64 / latencies.len() as f64;
+        let avg_tok_sec = if avg > 0.0 {
+            total_output_tokens as f64 / (avg * latencies.len() as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        println!("  p50 latency: {}ms", p50);
+        println!("  p95 latency: {}ms", p95);
+        println!("  avg latency:  {:.0}ms", avg);
+        println!("  avg output:   {:.0} tok/s", avg_tok_sec);
+    }
+
+    println!("  429 count:    {}", ratelimit_count);
+    println!("  timeout count: {}", timeout_count);
+
+    if !latencies.is_empty() {
+        let p50 = percentile(&latencies, 50);
+        let recommendation = if ratelimit_count > 0 || p50 > 120_000 {
+            ("free-tier", 1usize, 300u64)
+        } else if p50 < 15_000 && ratelimit_count == 0 {
+            ("fastest", 32usize, 120u64)
+        } else {
+            ("balanced", 16usize, 120u64)
+        };
+        println!();
+        println!("Recommendation:");
+        println!("  profile:     {}", recommendation.0);
+        println!("  concurrency: {}", recommendation.1);
+        println!("  timeout:     {}s", recommendation.2);
+    }
+
+    Ok(())
+}
+
+fn classify_error(e: &LlmError) -> &'static str {
+    match e {
+        LlmError::Http(http_err) => {
+            if http_err.is_timeout() {
+                "timeout"
+            } else {
+                "http"
+            }
+        }
+        LlmError::HttpStatus { status, .. } if *status == 429 => "rate_limit",
+        LlmError::HttpStatus { status, .. } if (500..600).contains(status) => "server",
+        LlmError::HttpStatus { .. } => "client",
+        LlmError::Provider(_) => "provider",
+        LlmError::InvalidResponse(_) => "invalid_response",
+        LlmError::Json(_) => "json",
+    }
+}
+
+fn percentile(data: &[u64], pct: usize) -> u64 {
+    if data.is_empty() {
+        return 0;
+    }
+    let idx = ((pct as f64 / 100.0) * (data.len() - 1) as f64).round() as usize;
+    data[idx.min(data.len() - 1)]
 }
 
 #[cfg(test)]
