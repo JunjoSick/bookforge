@@ -462,6 +462,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         }
 
         let max_attempts = 6usize;
+        let body_len = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
         let mut raw = None;
         let mut last_error = None;
         for attempt in 0..max_attempts {
@@ -476,6 +477,22 @@ impl LlmProvider for OpenAiCompatibleProvider {
             {
                 Ok(response) => response,
                 Err(error) => {
+                    let kind = if error.is_timeout() {
+                        "timeout"
+                    } else if error.is_connect() {
+                        "connect"
+                    } else if error.is_decode() {
+                        "decode"
+                    } else if error.is_body() {
+                        "body"
+                    } else {
+                        "other"
+                    };
+                    eprintln!(
+                        "provider: attempt {}/{} [{kind}] body={body_len}bytes: {error}",
+                        attempt + 1,
+                        max_attempts,
+                    );
                     let retryable = is_retryable_http_error(&error);
                     let attempt_limit = attempt_limit_for_http_error(&error, max_attempts);
                     last_error = Some(LlmError::Http(error));

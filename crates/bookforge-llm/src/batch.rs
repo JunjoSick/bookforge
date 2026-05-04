@@ -963,4 +963,108 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].items.len(), 2);
     }
-}
+
+    #[test]
+    fn parses_valid_batch_response() {
+        let seg1 = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+        let seg2 = make_segment("seg2", vec![plain_block("Goodbye")], vec![]);
+        let config = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&[seg1, seg2], &config, TranslationProfile::Balanced);
+        let batch = &batches[0];
+        let id1 = &batch.items[0].item_id;
+        let id2 = &batch.items[1].item_id;
+
+        let response = serde_json::json!({
+            "items": [
+                {"id": id1, "translation": "Ciao mondo"},
+                {"id": id2, "translation": "Addio mondo"},
+            ]
+        })
+        .to_string();
+
+        let result = parse_batch_response(batch, &response).expect("parse");
+        assert_eq!(result.translations.len(), 2);
+        assert_eq!(result.failures.len(), 0);
+    }
+
+    #[test]
+    fn detects_missing_items_in_batch_response() {
+        let seg1 = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+        let seg2 = make_segment("seg2", vec![plain_block("Goodbye")], vec![]);
+        let config = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&[seg1, seg2], &config, TranslationProfile::Balanced);
+        let batch = &batches[0];
+        let id1 = &batch.items[0].item_id;
+
+        let response = serde_json::json!({
+            "items": [
+                {"id": id1, "translation": "Ciao mondo"},
+            ]
+        })
+        .to_string();
+
+        let result = parse_batch_response(batch, &response).expect("parse");
+        assert_eq!(result.translations.len(), 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].error.contains("missing"));
+    }
+
+    #[test]
+    fn detects_duplicate_ids_in_batch_response() {
+        let seg1 = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+        let config = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&[seg1], &config, TranslationProfile::Balanced);
+        let batch = &batches[0];
+        let id1 = &batch.items[0].item_id;
+
+        let response = serde_json::json!({
+            "items": [
+                {"id": id1, "translation": "Ciao mondo"},
+                {"id": id1, "translation": "Duplicato"},
+            ]
+        })
+        .to_string();
+
+        let result = parse_batch_response(batch, &response).expect("parse");
+        assert_eq!(result.translations.len(), 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].error.contains("duplicate"));
+    }
+
+    #[test]
+    fn splits_batch_in_half() {
+        let seg1 = make_segment("seg1", vec![plain_block("A")], vec![]);
+        let seg2 = make_segment("seg2", vec![plain_block("B")], vec![]);
+        let seg3 = make_segment("seg3", vec![plain_block("C")], vec![]);
+        let seg4 = make_segment("seg4", vec![plain_block("D")], vec![]);
+        let config = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&[seg1, seg2, seg3, seg4], &config, TranslationProfile::Balanced);
+        let split = split_batch(&batches[0]);
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].items.len(), 2);
+        assert_eq!(split[1].items.len(), 2);
+    }}

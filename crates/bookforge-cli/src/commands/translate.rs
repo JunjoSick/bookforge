@@ -884,17 +884,34 @@ pub(crate) fn apply_cached_translations(
     segments: &[Segment],
     cache: CacheContext<'_>,
 ) -> Result<Vec<SegmentTranslation>> {
+    let alt_version = match cache.prompt_version {
+        "batch_v1" => Some("v1"),
+        "v1" => Some("batch_v1"),
+        _ => None,
+    };
+
     let mut cached = Vec::new();
     for segment in segments {
-        let Some(hit) = cache.store.find_cached_translation(
+        let hit = cache.store.find_cached_translation(
             segment,
             cache.prompt_version,
             cache.provider,
             cache.model,
             cache.source_lang,
             cache.target_lang,
-        )?
-        else {
+        )?;
+        let hit = if hit.is_some() {
+            hit
+        } else if let Some(alt) = alt_version {
+            cache.store.find_cached_translation(
+                segment, alt, cache.provider, cache.model,
+                cache.source_lang, cache.target_lang,
+            )?
+        } else {
+            None
+        };
+
+        let Some(hit) = hit else {
             continue;
         };
         cache.store.save_cached_translation(SaveCachedTranslation {
