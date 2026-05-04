@@ -13,7 +13,14 @@ use crate::{
     AdaptiveLimiter, CompletionRequest, FinishReason, LlmError, LlmProvider, PromptLibrary,
     RequestMetadata, ResponseFormat, SegmentTranslation, Substitutions, TelemetryLog,
     TranslationRunConfig,
+    concurrency::AdaptivePermit,
 };
+
+#[allow(dead_code)]
+enum BatchPermit {
+    Adaptive(AdaptivePermit),
+    Fixed(tokio::sync::OwnedSemaphorePermit),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BatchMode {
@@ -562,9 +569,13 @@ where
     let mut pending: Vec<TranslationBatch> = batches;
     let max_rounds = 3usize;
 
-    let semaphore = match limiter.as_ref() {
-        Some(l) => l.semaphore(),
-        None => Arc::new(Semaphore::new(concurrency)),
+    // Fixed-concurrency semaphore is only used when the adaptive limiter is
+    // not configured. The adaptive path acquires through limiter.acquire(),
+    // which returns an AdaptivePermit that participates in the burn counter.
+    let fixed_semaphore = if limiter.is_none() {
+        Some(Arc::new(Semaphore::new(concurrency)))
+    } else {
+        None
     };
 
     for _round in 0..max_rounds {
@@ -578,15 +589,35 @@ where
             let provider = provider.clone();
             let library = library.clone();
             let config = config.clone();
-            let semaphore = semaphore.clone();
             let telemetry = telemetry.clone();
             let limiter = limiter.clone();
+            let fixed_semaphore = fixed_semaphore.clone();
 
             tasks.spawn(async move {
-                let Ok(_permit) = semaphore.acquire_owned().await else {
-                    return (batch, Err(LlmError::Provider(
-                        "scheduler semaphore closed".to_string(),
-                    )));
+                let _permit: BatchPermit = match (&limiter, &fixed_semaphore) {
+                    (Some(l), _) => match l.acquire().await {
+                        Ok(p) => BatchPermit::Adaptive(p),
+                        Err(_) => {
+                            return (
+                                batch,
+                                Err(LlmError::Provider(
+                                    "scheduler semaphore closed".to_string(),
+                                )),
+                            );
+                        }
+                    },
+                    (None, Some(sem)) => match sem.clone().acquire_owned().await {
+                        Ok(p) => BatchPermit::Fixed(p),
+                        Err(_) => {
+                            return (
+                                batch,
+                                Err(LlmError::Provider(
+                                    "scheduler semaphore closed".to_string(),
+                                )),
+                            );
+                        }
+                    },
+                    (None, None) => unreachable!("either limiter or fixed_semaphore is set"),
                 };
                 let started = std::time::Instant::now();
                 let result = translate_one_batch(provider, library, batch.clone(), &config).await;
