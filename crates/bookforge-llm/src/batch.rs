@@ -86,14 +86,13 @@ pub fn build_translation_batches(
         let chars: Vec<char> = text.chars().collect();
         let mut i = 0;
         while i < chars.len() {
-            if chars[i] == '<' && i + 1 < chars.len() && chars[i + 1] != '/' {
-                let rest: String = chars[i..].iter().take(20).collect();
-                if rest.contains('>') {
-                    let end = chars[i..].iter().position(|&c| c == '>').unwrap_or(0);
-                    i += end + 1;
-                    out.push(' ');
-                    continue;
-                }
+            if chars[i] == '<'
+                && i + 1 < chars.len()
+                && let Some(end) = chars[i..].iter().position(|&c| c == '>')
+            {
+                i += end + 1;
+                out.push(' ');
+                continue;
             }
             out.push(chars[i]);
             i += 1;
