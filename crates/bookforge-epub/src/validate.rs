@@ -162,42 +162,16 @@ fn validate_xhtml_content(
 }
 
 fn has_broken_xml(content: &str) -> bool {
-    let mut stack: Vec<String> = Vec::new();
-    let chars: Vec<char> = content.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '<' && i + 1 < chars.len() {
-            if chars[i + 1] == '/' {
-                let close_end = chars[i..].iter().position(|&c| c == '>');
-                if let Some(end) = close_end {
-                    let tag: String = chars[i + 2..i + end].iter().collect();
-                    let tag = tag.split_whitespace().next().unwrap_or("").trim().to_string();
-                    if stack.is_empty() || stack.last() != Some(&tag) {
-                        return true;
-                    }
-                    stack.pop();
-                    i += end + 1;
-                    continue;
-                }
-            } else if chars[i + 1] != '?' && chars[i + 1] != '!' {
-                let end = chars[i..].iter().position(|&c| c == '>');
-                if let Some(end_pos) = end {
-                    let rest: String = chars[i..i + end_pos + 1].iter().collect();
-                    if !rest.contains("/>") {
-                        let tag: String = chars[i + 1..i + end_pos].iter().collect();
-                        let tag = tag.split_whitespace().next().unwrap_or("").trim().to_string();
-                        if !tag.is_empty() {
-                            stack.push(tag);
-                        }
-                    }
-                    i += end_pos + 1;
-                    continue;
-                }
-            }
+    use quick_xml::{Reader, events::Event};
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(false);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) => return false,
+            Ok(_) => continue,
+            Err(_) => return true,
         }
-        i += 1;
     }
-    !stack.is_empty()
 }
 
 pub fn validate_block_translations(
@@ -253,13 +227,32 @@ pub fn validate_block_translations(
 mod tests {
     use super::*;
     #[test]
-    fn detects_broken_xml_nesting() {
+    fn rejects_broken_xml() {
         assert!(has_broken_xml("<p><b>text</p></b>"));
     }
 
     #[test]
     fn accepts_well_formed_xml() {
         assert!(!has_broken_xml("<p>Hello <b>world</b></p>"));
+    }
+
+    #[test]
+    fn accepts_self_closing_tags_with_attributes() {
+        assert!(!has_broken_xml(
+            r#"<root><img src="a.png" alt="x"/><br/></root>"#,
+        ));
+    }
+
+    #[test]
+    fn accepts_namespaced_xhtml() {
+        let xhtml = r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><p epub:type="chapter">x</p></body></html>"#;
+        assert!(!has_broken_xml(xhtml));
+    }
+
+    #[test]
+    fn accepts_comments_and_processing_instructions() {
+        let xml = "<?xml version=\"1.0\"?><!-- a comment --><root><a/></root>";
+        assert!(!has_broken_xml(xml));
     }
 
     #[test]
