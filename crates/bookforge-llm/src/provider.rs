@@ -456,11 +456,16 @@ impl Clone for OpenAiCompatibleProvider {
 
 impl OpenAiCompatibleProvider {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .http1_only()
-            .timeout(std::time::Duration::from_secs(config.timeout_seconds))
-            .build()?;
         let is_reasoning = model_name_is_reasoning(&config.model);
+        let effective_timeout = if is_reasoning {
+            config.timeout_seconds.max(300)
+        } else {
+            config.timeout_seconds
+        };
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(effective_timeout))
+            .build()?;
         Ok(Self {
             config,
             client,
@@ -575,13 +580,11 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         break;
                     }
                     Err(error) => {
-                        let preview = String::from_utf8_lossy(
-                            if response_bytes.len() > 500 {
-                                &response_bytes[..500]
-                            } else {
-                                &response_bytes
-                            },
-                        );
+                        let preview = String::from_utf8_lossy(if response_bytes.len() > 500 {
+                            &response_bytes[..500]
+                        } else {
+                            &response_bytes
+                        });
                         eprintln!(
                             "provider: attempt {}/{} json parse failed ({status:#}): {error}\n  body: {preview}",
                             attempt + 1,

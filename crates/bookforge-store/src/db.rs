@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -558,22 +559,25 @@ impl JobStore {
         })?;
         let blocks = rows.collect::<std::result::Result<Vec<_>, _>>()?;
 
-        // Exact block-ID compatibility: the cached row's blocks must match
-        // the current segment's block_ids (set-equal). We compare sorted
-        // sets because translation_blocks is stored ORDER BY block_id and
-        // segment.block_ids preserves source order; either way, both must
-        // contain the same identifiers for the cache to apply cleanly.
-        let mut expected: Vec<&str> = segment.block_ids.iter().map(|id| id.0.as_str()).collect();
-        let mut actual: Vec<&str> = blocks.iter().map(|b| b.block_id.0.as_str()).collect();
-        expected.sort_unstable();
-        actual.sort_unstable();
-        if expected != actual {
+        let mut by_id = blocks
+            .into_iter()
+            .map(|block| (block.block_id.0.clone(), block))
+            .collect::<HashMap<_, _>>();
+
+        let mut ordered = Vec::with_capacity(segment.block_ids.len());
+        for id in &segment.block_ids {
+            let Some(block) = by_id.remove(&id.0) else {
+                return Ok(None);
+            };
+            ordered.push(block);
+        }
+        if !by_id.is_empty() {
             return Ok(None);
         }
 
         Ok(Some(CachedTranslation {
             translated_text,
-            blocks,
+            blocks: ordered,
         }))
     }
 

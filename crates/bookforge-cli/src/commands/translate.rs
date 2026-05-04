@@ -28,6 +28,23 @@ use crate::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
+async fn finalize_writer<T>(
+    translation_result: Result<T, anyhow::Error>,
+    tx: UnboundedSender<CheckpointCommand>,
+    writer: CheckpointWriter,
+) -> Result<T> {
+    drop(tx);
+    let writer_result = writer.shutdown().await;
+    match (translation_result, writer_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(writer_err)) => Err(writer_err),
+        (Err(translation_err), Ok(())) => Err(translation_err),
+        (Err(translation_err), Err(writer_err)) => Err(anyhow::anyhow!(
+            "{translation_err}; additionally checkpoint writer failed: {writer_err}"
+        )),
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct TranslateArgs {
     pub input: PathBuf,
@@ -343,7 +360,7 @@ async fn run_mock_translation(
     let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
     let writer = CheckpointWriter::spawn(store.path().to_path_buf());
     let tx = writer.sender();
-    let fresh_translations = translate_and_checkpoint(
+    let translation_result = translate_and_checkpoint(
         provider.clone(),
         &pending_segments,
         &run_config,
@@ -356,9 +373,8 @@ async fn run_mock_translation(
             tx: &tx,
         },
     )
-    .await?;
-    drop(tx);
-    writer.shutdown().await?;
+    .await;
+    let fresh_translations = finalize_writer(translation_result, tx, writer).await?;
     translations.extend(fresh_translations);
     translations.sort_by_key(|translation| translation.ordinal);
     let qa_reviews = qa_reviews_for_mode(
@@ -423,7 +439,11 @@ async fn run_openai_compatible_translation(
     let model = provider.model().to_string();
     let book = read_epub(input)?;
     let segments = build_segments(&book, &settings.segmentation)?;
-    let prompt_version = "v1";
+    let run_prompt_version = if settings.batch.enabled {
+        "batch_v1"
+    } else {
+        "v1"
+    };
     let store = JobStore::open_default()?;
     let job = store.create_job(CreateJob {
         input,
@@ -436,27 +456,27 @@ async fn run_openai_compatible_translation(
         api_key_env: Some(&provider_config.api_key_env),
     })?;
     println!("Job: {}", job.id);
-    let cache_namespace_v1 = compute_cache_namespace(
+    let cache_namespace = compute_cache_namespace(
         settings.segmentation.max_segment_tokens,
         settings.segmentation.context_tokens,
         &format!("{:?}", settings.profile),
         settings.batch.enabled,
-        prompt_version,
+        run_prompt_version,
     );
     store.insert_segments(
         &job.id,
         &segments,
-        prompt_version,
+        run_prompt_version,
         &config.provider,
         &model,
-        &cache_namespace_v1,
+        &cache_namespace,
     )?;
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
         target_language: config.target_language.clone(),
         provider: config.provider.clone(),
         model: model.clone(),
-        prompt_version: prompt_version.to_string(),
+        prompt_version: run_prompt_version.to_string(),
         temperature: 0.2,
         scheduler: settings.scheduler.clone(),
         profile: settings.profile,
@@ -468,7 +488,7 @@ async fn run_openai_compatible_translation(
             target_language: run_config.target_language.clone(),
             provider: run_config.provider.clone(),
             model: run_config.model.clone(),
-            prompt_version: "batch_v1".to_string(),
+            prompt_version: run_prompt_version.to_string(),
             temperature: run_config.temperature,
             scheduler: SchedulerConfig {
                 concurrency: run_config.scheduler.concurrency,
@@ -476,38 +496,23 @@ async fn run_openai_compatible_translation(
             },
             profile: settings.profile,
         };
-        let cache_namespace_batch = compute_cache_namespace(
-            settings.segmentation.max_segment_tokens,
-            settings.segmentation.context_tokens,
-            &format!("{:?}", settings.profile),
-            settings.batch.enabled,
-            "batch_v1",
-        );
-        store.insert_segments(
-            &job.id,
-            &segments,
-            "batch_v1",
-            &config.provider,
-            &model,
-            &cache_namespace_batch,
-        )?;
         let mut translations = apply_cached_translations(
             &segments,
             CacheContext {
                 store: &store,
                 job_id: &job.id,
-                prompt_version: "batch_v1",
+                prompt_version: run_prompt_version,
                 provider: &config.provider,
                 model: &model,
                 source_lang: config.source_language.as_deref(),
                 target_lang: &config.target_language,
-                cache_namespace: &cache_namespace_batch,
+                cache_namespace: &cache_namespace,
             },
         )?;
         let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
         let writer = CheckpointWriter::spawn(store.path().to_path_buf());
         let tx = writer.sender();
-        let fresh_translations = translate_and_checkpoint_batch(
+        let translation_result = translate_and_checkpoint_batch(
             provider.clone(),
             &pending_segments,
             &batch_run_config,
@@ -517,13 +522,12 @@ async fn run_openai_compatible_translation(
                 job_id: &job.id,
                 provider: &config.provider,
                 model: &model,
-                prompt_version: "batch_v1",
+                prompt_version: run_prompt_version,
                 tx: &tx,
             },
         )
-        .await?;
-        drop(tx);
-        writer.shutdown().await?;
+        .await;
+        let fresh_translations = finalize_writer(translation_result, tx, writer).await?;
         translations.extend(fresh_translations);
         translations.sort_by_key(|translation| translation.ordinal);
         let qa_reviews = qa_reviews_for_mode(
@@ -541,7 +545,7 @@ async fn run_openai_compatible_translation(
             translations,
             &store,
             &job.id,
-            "batch_v1",
+            run_prompt_version,
             settings,
         )
         .await?;
@@ -570,18 +574,18 @@ async fn run_openai_compatible_translation(
             CacheContext {
                 store: &store,
                 job_id: &job.id,
-                prompt_version,
+                prompt_version: run_prompt_version,
                 provider: &config.provider,
                 model: &model,
                 source_lang: config.source_language.as_deref(),
                 target_lang: &config.target_language,
-                cache_namespace: &cache_namespace_v1,
+                cache_namespace: &cache_namespace,
             },
         )?;
         let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
         let writer = CheckpointWriter::spawn(store.path().to_path_buf());
         let tx = writer.sender();
-        let fresh_translations = translate_and_checkpoint(
+        let translation_result = translate_and_checkpoint(
             provider.clone(),
             &pending_segments,
             &run_config,
@@ -590,13 +594,12 @@ async fn run_openai_compatible_translation(
                 job_id: &job.id,
                 provider: &config.provider,
                 model: &model,
-                prompt_version,
+                prompt_version: run_prompt_version,
                 tx: &tx,
             },
         )
-        .await?;
-        drop(tx);
-        writer.shutdown().await?;
+        .await;
+        let fresh_translations = finalize_writer(translation_result, tx, writer).await?;
         translations.extend(fresh_translations);
         translations.sort_by_key(|translation| translation.ordinal);
         let qa_reviews = qa_reviews_for_mode(
@@ -614,7 +617,7 @@ async fn run_openai_compatible_translation(
             translations,
             &store,
             &job.id,
-            prompt_version,
+            run_prompt_version,
             settings,
         )
         .await?;
@@ -834,9 +837,9 @@ async fn run_fallback_pass(
         tx: &tx,
     };
 
-    let fresh = translate_and_checkpoint(fallback, &candidates, &run_config, checkpoint).await?;
-    drop(tx);
-    writer.shutdown().await?;
+    let translation_result =
+        translate_and_checkpoint(fallback, &candidates, &run_config, checkpoint).await;
+    let fresh = finalize_writer(translation_result, tx, writer).await?;
 
     for ft in &fresh {
         if let Some(existing) = translations

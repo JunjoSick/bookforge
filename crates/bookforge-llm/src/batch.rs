@@ -618,7 +618,11 @@ where
                     profile: format!("{:?}", config.profile),
                     items: batch.items.len(),
                     estimated_input_tokens: batch.token_estimate,
-                    max_output_tokens: Some(batch_max_output_tokens(&batch, config.profile, is_reasoning)),
+                    max_output_tokens: Some(batch_max_output_tokens(
+                        &batch,
+                        config.profile,
+                        is_reasoning,
+                    )),
                     input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
                     output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
                     latency_ms,
@@ -716,31 +720,57 @@ where
 
     let mut segment_translations: HashMap<String, SegmentTranslation> = HashMap::new();
 
-    let ordinal_by_segment: HashMap<&str, usize> = segments
-        .iter()
-        .map(|s| (s.id.0.as_str(), s.ordinal))
-        .collect();
+    let segments_by_id: HashMap<&str, &Segment> =
+        segments.iter().map(|s| (s.id.0.as_str(), s)).collect();
+
+    let make_entry = |seg_id: &str,
+                      status: SegmentStatus,
+                      error: Option<String>,
+                      input_tokens: Option<u64>,
+                      output_tokens: Option<u64>|
+     -> SegmentTranslation {
+        if let Some(seg) = segments_by_id.get(seg_id) {
+            SegmentTranslation {
+                segment_id: SegmentId(seg_id.to_string()),
+                ordinal: seg.ordinal,
+                block_ids: seg.block_ids.clone(),
+                blocks: Vec::new(),
+                checksum: seg.checksum.clone(),
+                status,
+                template: "batch".to_string(),
+                error,
+                input_tokens,
+                output_tokens,
+            }
+        } else {
+            SegmentTranslation {
+                segment_id: SegmentId(seg_id.to_string()),
+                ordinal: 0,
+                block_ids: Vec::new(),
+                blocks: Vec::new(),
+                checksum: String::new(),
+                status,
+                template: "batch".to_string(),
+                error,
+                input_tokens,
+                output_tokens,
+            }
+        }
+    };
 
     for batch_result in &all_results {
         for translation in &batch_result.translations {
             let seg_id = translation.segment_id.0.clone();
-            let ordinal = ordinal_by_segment
-                .get(seg_id.as_str())
-                .copied()
-                .unwrap_or(0);
             let entry = segment_translations
                 .entry(seg_id.clone())
-                .or_insert_with(|| SegmentTranslation {
-                    segment_id: SegmentId(seg_id.clone()),
-                    ordinal,
-                    block_ids: Vec::new(),
-                    blocks: Vec::new(),
-                    checksum: String::new(),
-                    status: SegmentStatus::Succeeded,
-                    template: "batch".to_string(),
-                    error: None,
-                    input_tokens: Some(batch_result.input_tokens.unwrap_or(0)),
-                    output_tokens: Some(batch_result.output_tokens.unwrap_or(0)),
+                .or_insert_with(|| {
+                    make_entry(
+                        &seg_id,
+                        SegmentStatus::Succeeded,
+                        None,
+                        Some(batch_result.input_tokens.unwrap_or(0)),
+                        Some(batch_result.output_tokens.unwrap_or(0)),
+                    )
                 });
             if let Some(source_item) = all_items.get(&translation.item_id) {
                 entry.blocks.push(BlockTranslation {
@@ -759,17 +789,14 @@ where
             let seg_id = failure.segment_id.0.clone();
             segment_translations
                 .entry(seg_id.clone())
-                .or_insert_with(|| SegmentTranslation {
-                    segment_id: SegmentId(seg_id),
-                    ordinal: 0,
-                    block_ids: Vec::new(),
-                    blocks: Vec::new(),
-                    checksum: String::new(),
-                    status: SegmentStatus::NeedsReview,
-                    template: "batch".to_string(),
-                    error: Some(failure.error.clone()),
-                    input_tokens: None,
-                    output_tokens: None,
+                .or_insert_with(|| {
+                    make_entry(
+                        &seg_id,
+                        SegmentStatus::NeedsReview,
+                        Some(failure.error.clone()),
+                        None,
+                        None,
+                    )
                 });
         }
     }
@@ -832,13 +859,20 @@ where
                     user: rendered.user,
                     response_format: ResponseFormat::Json,
                     temperature: 0.1,
-                    max_output_tokens: Some(batch_max_output_tokens(&repair_batch, config.profile, provider.is_reasoning())),
+                    max_output_tokens: Some(batch_max_output_tokens(
+                        &repair_batch,
+                        config.profile,
+                        provider.is_reasoning(),
+                    )),
                     metadata: RequestMetadata::default(),
                 })
                 .await
             {
                 if let Ok(repaired) = parse_batch_response(&repair_batch, &response.content) {
                     for translation in repaired.translations {
+                        let Some(source_item) = all_items.get(&translation.item_id) else {
+                            continue;
+                        };
                         if let Some(existing) =
                             segment_translations.get_mut(&translation.segment_id.0)
                         {
@@ -847,9 +881,14 @@ where
                             if let Some(block) = existing
                                 .blocks
                                 .iter_mut()
-                                .find(|b| b.block_id.0 == translation.item_id)
+                                .find(|b| b.block_id == source_item.block_id)
                             {
                                 block.text = translation.text;
+                            } else {
+                                existing.blocks.push(BlockTranslation {
+                                    block_id: source_item.block_id.clone(),
+                                    text: translation.text,
+                                });
                             }
                         }
                     }
@@ -866,7 +905,11 @@ where
     Ok(translations)
 }
 
-fn batch_max_output_tokens(batch: &TranslationBatch, profile: TranslationProfile, reasoning: bool) -> u32 {
+fn batch_max_output_tokens(
+    batch: &TranslationBatch,
+    profile: TranslationProfile,
+    reasoning: bool,
+) -> u32 {
     let base_multiplier = match batch.mode {
         BatchMode::Plain => 3,
         BatchMode::MarkerSafe => 4,
