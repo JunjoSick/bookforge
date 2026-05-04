@@ -1,14 +1,13 @@
+use crate::{
+    CompletionRequest, LlmError, LlmProvider, PromptLibrary, PromptTemplate, QaIssue,
+    QaSegmentReview, RequestMetadata, ResponseFormat, SegmentTranslation, TranslationRunConfig,
+};
 use bookforge_core::{
     config::QaRunConfig,
     segment::{Segment, SegmentStatus},
 };
-use crate::{
-    PromptLibrary, PromptTemplate, QaIssue, QaSegmentReview, SegmentTranslation,
-    TranslationRunConfig, CompletionRequest, LlmError, LlmProvider, RequestMetadata,
-    ResponseFormat,
-};
-use std::sync::Arc;
 use serde::Deserialize;
+use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -131,14 +130,22 @@ where
     use crate::Substitutions;
     let mut vars = Substitutions::new();
     vars.string("segment_id", &segment.id.0)
-        .string("source_language", config.source_language.as_deref().unwrap_or("the source language"))
+        .string(
+            "source_language",
+            config
+                .source_language
+                .as_deref()
+                .unwrap_or("the source language"),
+        )
         .string("target_language", &config.target_language)
         .string("source_text", &segment.source.text)
         .string("translation_text", translation.joined_text())
         .json("required_markers", &segment.constraints.preserve_markers)
         .json("protected_spans", &segment.constraints.preserve_spans);
 
-    let rendered = template.render(&vars).map_err(|e| LlmError::Provider(e.to_string()))?;
+    let rendered = template
+        .render(&vars)
+        .map_err(|e| LlmError::Provider(e.to_string()))?;
     let response = provider
         .complete(CompletionRequest {
             system: rendered.system,

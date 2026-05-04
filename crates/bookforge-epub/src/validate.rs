@@ -87,7 +87,13 @@ pub fn validate_translated_epub(
                 {
                     let mut content = String::new();
                     if entry.read_to_string(&mut content).is_ok() {
-                        validate_xhtml_content(&mut report, name, &content, segments, block_translations);
+                        validate_xhtml_content(
+                            &mut report,
+                            name,
+                            &content,
+                            segments,
+                            block_translations,
+                        );
                     }
                 }
             }
@@ -121,7 +127,10 @@ fn validate_xhtml_content(
 
     for segment in segments {
         for block in &segment.source.blocks {
-            let translated = by_block_id.get(block.block_id.0.as_str()).copied().unwrap_or(&block.text);
+            let translated = by_block_id
+                .get(block.block_id.0.as_str())
+                .copied()
+                .unwrap_or(&block.text);
 
             for marker in &segment.constraints.preserve_markers {
                 if block.text.contains(marker) && !translated.contains(marker) {
@@ -130,7 +139,10 @@ fn validate_xhtml_content(
                         kind: "missing_marker".to_string(),
                         href: Some(href.to_string()),
                         block_id: Some(block.block_id.0.clone()),
-                        message: format!("Required marker '{marker}' missing in translation of block {}", block.block_id.0),
+                        message: format!(
+                            "Required marker '{marker}' missing in translation of block {}",
+                            block.block_id.0
+                        ),
                     });
                 }
             }
@@ -142,7 +154,10 @@ fn validate_xhtml_content(
                         kind: "missing_protected_span".to_string(),
                         href: Some(href.to_string()),
                         block_id: Some(block.block_id.0.clone()),
-                        message: format!("Protected span '{}' may be missing in block {}", span, block.block_id.0),
+                        message: format!(
+                            "Protected span '{}' may be missing in block {}",
+                            span, block.block_id.0
+                        ),
                     });
                 }
             }
@@ -186,7 +201,10 @@ pub fn validate_block_translations(
 
     for segment in segments {
         for block in &segment.source.blocks {
-            let translated = by_block_id.get(block.block_id.0.as_str()).copied().unwrap_or(&block.text);
+            let translated = by_block_id
+                .get(block.block_id.0.as_str())
+                .copied()
+                .unwrap_or(&block.text);
 
             if block.text.is_empty() && translated.is_empty() {
                 continue;
@@ -257,11 +275,11 @@ mod tests {
 
     #[test]
     fn detects_empty_translation() {
+        use bookforge_core::ir::SectionId;
         use bookforge_core::segment::{
             Segment, SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
             SegmentSource, SegmentTextRun,
         };
-        use bookforge_core::ir::SectionId;
 
         let block_id = bookforge_core::ir::BlockId("b_01".to_string());
         let segment = Segment {

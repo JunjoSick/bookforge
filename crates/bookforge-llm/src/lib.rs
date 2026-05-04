@@ -8,9 +8,9 @@ pub mod scheduler;
 pub mod telemetry;
 
 pub use batch::{
-    BatchItemFailure, BatchItemTranslation, BatchMode, BatchTranslationResult,
-    TranslationBatch, TranslationBatchItem, build_translation_batches, collect_repair_items,
-    parse_batch_response, split_batch, translate_batches_with_callback,
+    BatchItemFailure, BatchItemTranslation, BatchMode, BatchTranslationResult, TranslationBatch,
+    TranslationBatchItem, build_translation_batches, collect_repair_items, parse_batch_response,
+    split_batch, translate_batches_with_callback,
 };
 pub use concurrency::AdaptiveLimiter;
 pub use double_check::{

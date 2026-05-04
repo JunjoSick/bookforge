@@ -12,8 +12,7 @@ use tokio::task::JoinSet;
 use crate::{
     AdaptiveLimiter, CompletionRequest, FinishReason, LlmError, LlmProvider, PromptLibrary,
     RequestMetadata, ResponseFormat, SegmentTranslation, Substitutions, TelemetryLog,
-    TranslationRunConfig,
-    concurrency::AdaptivePermit,
+    TranslationRunConfig, concurrency::AdaptivePermit,
 };
 
 #[allow(dead_code)]
@@ -142,10 +141,7 @@ pub fn build_translation_batches(
     group_batches(items, config)
 }
 
-fn group_batches(
-    items: Vec<TranslationBatchItem>,
-    config: &BatchConfig,
-) -> Vec<TranslationBatch> {
+fn group_batches(items: Vec<TranslationBatchItem>, config: &BatchConfig) -> Vec<TranslationBatch> {
     let mut mode_groups: HashMap<BatchMode, Vec<TranslationBatchItem>> = HashMap::new();
     for item in items {
         mode_groups.entry(item.mode()).or_default().push(item);
@@ -156,7 +152,10 @@ fn group_batches(
     let mut batch_ordinal = 0usize;
 
     for (mode, group_items) in mode_groups {
-        let token_limit = target_tokens.get(&mode).copied().unwrap_or(config.target_tokens);
+        let token_limit = target_tokens
+            .get(&mode)
+            .copied()
+            .unwrap_or(config.target_tokens);
         let max_items = config.max_items;
 
         let mut current: Vec<TranslationBatchItem> = Vec::new();
@@ -164,8 +163,8 @@ fn group_batches(
 
         for item in group_items {
             let item_tokens = token_estimate(&item.source_text);
-            let would_exceed_tokens = !current.is_empty()
-                && current_tokens + item_tokens > token_limit;
+            let would_exceed_tokens =
+                !current.is_empty() && current_tokens + item_tokens > token_limit;
             let would_exceed_items = max_items > 0 && current.len() >= max_items;
 
             if would_exceed_tokens || would_exceed_items {
@@ -220,14 +219,8 @@ fn make_batch(
 fn mode_target_tokens(base: usize) -> HashMap<BatchMode, usize> {
     let mut map = HashMap::new();
     map.insert(BatchMode::Plain, base);
-    map.insert(
-        BatchMode::MarkerSafe,
-        base.min(10_000),
-    );
-    map.insert(
-        BatchMode::RunPreserving,
-        base.min(4_000),
-    );
+    map.insert(BatchMode::MarkerSafe, base.min(10_000));
+    map.insert(BatchMode::RunPreserving, base.min(4_000));
     map.insert(BatchMode::TurboTextOnly, base);
     map
 }
@@ -327,9 +320,7 @@ fn parse_text_batch_response(
             continue;
         };
 
-        if item.translation.is_empty()
-            && !request_item.source_text.is_empty()
-        {
+        if item.translation.is_empty() && !request_item.source_text.is_empty() {
             failures.push(BatchItemFailure {
                 item_id: item.id.clone(),
                 segment_id: request_item.segment_id.clone(),
@@ -490,7 +481,7 @@ fn parse_run_batch_response(
 fn is_transient(err: &LlmError) -> bool {
     match err {
         LlmError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
-        LlmError::Http(e) => e.is_timeout() || e.is_connect(),
+        LlmError::Http(e) => e.is_timeout() || e.is_connect() || e.is_decode() || e.is_body(),
         _ => false,
     }
 }
@@ -600,9 +591,7 @@ where
                         Err(_) => {
                             return (
                                 batch,
-                                Err(LlmError::Provider(
-                                    "scheduler semaphore closed".to_string(),
-                                )),
+                                Err(LlmError::Provider("scheduler semaphore closed".to_string())),
                             );
                         }
                     },
@@ -611,15 +600,14 @@ where
                         Err(_) => {
                             return (
                                 batch,
-                                Err(LlmError::Provider(
-                                    "scheduler semaphore closed".to_string(),
-                                )),
+                                Err(LlmError::Provider("scheduler semaphore closed".to_string())),
                             );
                         }
                     },
                     (None, None) => unreachable!("either limiter or fixed_semaphore is set"),
                 };
                 let started = std::time::Instant::now();
+                let is_reasoning = provider.is_reasoning();
                 let result = translate_one_batch(provider, library, batch.clone(), &config).await;
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let metric = ProviderRequestMetric {
@@ -630,12 +618,16 @@ where
                     profile: format!("{:?}", config.profile),
                     items: batch.items.len(),
                     estimated_input_tokens: batch.token_estimate,
-                    max_output_tokens: Some(batch_max_output_tokens(&batch, config.profile)),
+                    max_output_tokens: Some(batch_max_output_tokens(&batch, config.profile, is_reasoning)),
                     input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
                     output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
                     latency_ms,
                     finish_reason: None,
-                    status: if result.is_ok() { "ok".into() } else { "error".into() },
+                    status: if result.is_ok() {
+                        "ok".into()
+                    } else {
+                        "error".into()
+                    },
                     status_code: None,
                     retry_count: 0,
                     backoff_ms: 0,
@@ -684,11 +676,15 @@ where
                     all_results.push(BatchTranslationResult {
                         batch_id: batch.id.clone(),
                         translations: Vec::new(),
-                        failures: batch.items.iter().map(|item| BatchItemFailure {
-                            item_id: item.item_id.clone(),
-                            segment_id: item.segment_id.clone(),
-                            error: format!("{error}"),
-                        }).collect(),
+                        failures: batch
+                            .items
+                            .iter()
+                            .map(|item| BatchItemFailure {
+                                item_id: item.item_id.clone(),
+                                segment_id: item.segment_id.clone(),
+                                error: format!("{error}"),
+                            })
+                            .collect(),
                         input_tokens: None,
                         output_tokens: None,
                     });
@@ -704,11 +700,15 @@ where
         all_results.push(BatchTranslationResult {
             batch_id: batch.id.clone(),
             translations: Vec::new(),
-            failures: batch.items.iter().map(|item| BatchItemFailure {
-                item_id: item.item_id.clone(),
-                segment_id: item.segment_id.clone(),
-                error: "batch exhausted retries".to_string(),
-            }).collect(),
+            failures: batch
+                .items
+                .iter()
+                .map(|item| BatchItemFailure {
+                    item_id: item.item_id.clone(),
+                    segment_id: item.segment_id.clone(),
+                    error: "batch exhausted retries".to_string(),
+                })
+                .collect(),
             input_tokens: None,
             output_tokens: None,
         });
@@ -779,7 +779,9 @@ where
         .flat_map(|r| &r.failures)
         .filter(|f| f.segment_id.0 != "unknown")
         .filter_map(|f| {
-            all_items.get(f.item_id.as_str()).map(|item| (f.clone(), (*item).clone()))
+            all_items
+                .get(f.item_id.as_str())
+                .map(|item| (f.clone(), (*item).clone()))
         })
         .collect();
 
@@ -789,7 +791,10 @@ where
             ordinal: 999,
             mode: BatchMode::Plain,
             items: repair_items.iter().map(|(_, item)| item.clone()).collect(),
-            token_estimate: repair_items.iter().map(|(_, item)| token_estimate(&item.source_text)).sum(),
+            token_estimate: repair_items
+                .iter()
+                .map(|(_, item)| token_estimate(&item.source_text))
+                .sum(),
         };
 
         let items_json: Vec<serde_json::Value> = repair_items
@@ -810,25 +815,40 @@ where
             .collect();
 
         let mut vars = Substitutions::new();
-        vars.raw("items_json", serde_json::to_string(&items_json).unwrap_or_default())
-            .raw("errors_json", serde_json::to_string(&errors_json).unwrap_or_default());
+        vars.raw(
+            "items_json",
+            serde_json::to_string(&items_json).unwrap_or_default(),
+        )
+        .raw(
+            "errors_json",
+            serde_json::to_string(&errors_json).unwrap_or_default(),
+        );
 
         #[allow(clippy::collapsible_if)]
         if let Ok(rendered) = library.batch_repair.render(&vars) {
-            if let Ok(response) = provider.complete(CompletionRequest {
-                system: rendered.system,
-                user: rendered.user,
-                response_format: ResponseFormat::Json,
-                temperature: 0.1,
-                max_output_tokens: Some(batch_max_output_tokens(&repair_batch, config.profile)),
-                metadata: RequestMetadata::default(),
-            }).await {
+            if let Ok(response) = provider
+                .complete(CompletionRequest {
+                    system: rendered.system,
+                    user: rendered.user,
+                    response_format: ResponseFormat::Json,
+                    temperature: 0.1,
+                    max_output_tokens: Some(batch_max_output_tokens(&repair_batch, config.profile, provider.is_reasoning())),
+                    metadata: RequestMetadata::default(),
+                })
+                .await
+            {
                 if let Ok(repaired) = parse_batch_response(&repair_batch, &response.content) {
                     for translation in repaired.translations {
-                        if let Some(existing) = segment_translations.get_mut(&translation.segment_id.0) {
+                        if let Some(existing) =
+                            segment_translations.get_mut(&translation.segment_id.0)
+                        {
                             existing.status = SegmentStatus::Succeeded;
                             existing.error = None;
-                            if let Some(block) = existing.blocks.iter_mut().find(|b| b.block_id.0 == translation.item_id) {
+                            if let Some(block) = existing
+                                .blocks
+                                .iter_mut()
+                                .find(|b| b.block_id.0 == translation.item_id)
+                            {
                                 block.text = translation.text;
                             }
                         }
@@ -846,15 +866,27 @@ where
     Ok(translations)
 }
 
-fn batch_max_output_tokens(batch: &TranslationBatch, profile: TranslationProfile) -> u32 {
-    let multiplier = match batch.mode {
+fn batch_max_output_tokens(batch: &TranslationBatch, profile: TranslationProfile, reasoning: bool) -> u32 {
+    let base_multiplier = match batch.mode {
         BatchMode::Plain => 3,
         BatchMode::MarkerSafe => 4,
         BatchMode::RunPreserving => 5,
         BatchMode::TurboTextOnly => 2,
     };
+    let multiplier = if reasoning {
+        // Reasoning models burn most of their token budget on chain-of-thought,
+        // leaving much less for actual output. Use a conservative 3× multiplier
+        // on top of the base to give enough headroom.
+        base_multiplier * 3
+    } else {
+        base_multiplier
+    };
     let estimate = batch.token_estimate as u32 * multiplier;
-    let max = if profile == TranslationProfile::FreeTier { 4_096 } else { 16_384 };
+    let max = if profile == TranslationProfile::FreeTier {
+        if reasoning { 8_192 } else { 4_096 }
+    } else {
+        if reasoning { 32_768 } else { 16_384 }
+    };
     estimate.clamp(512, max)
 }
 
@@ -872,15 +904,21 @@ async fn translate_one_batch(
     };
 
     let mut vars = Substitutions::new();
-    vars.string("source_language", config.source_language.as_deref().unwrap_or("the source language"))
-        .string("target_language", &config.target_language)
-        .raw("items_json", items_json);
+    vars.string(
+        "source_language",
+        config
+            .source_language
+            .as_deref()
+            .unwrap_or("the source language"),
+    )
+    .string("target_language", &config.target_language)
+    .raw("items_json", items_json);
 
     let rendered = template
         .render(&vars)
         .map_err(|e| LlmError::Provider(e.to_string()))?;
 
-    let max_tokens = batch_max_output_tokens(&batch, config.profile);
+    let max_tokens = batch_max_output_tokens(&batch, config.profile, provider.is_reasoning());
 
     let response = provider
         .complete(CompletionRequest {
@@ -909,8 +947,8 @@ async fn translate_one_batch(
                 ));
             }
 
-            let mut result = parse_batch_response(&batch, &resp.content)
-                .map_err(LlmError::InvalidResponse)?;
+            let mut result =
+                parse_batch_response(&batch, &resp.content).map_err(LlmError::InvalidResponse)?;
             result.input_tokens = resp.input_tokens;
             result.output_tokens = resp.output_tokens;
             Ok(result)
@@ -953,7 +991,10 @@ fn render_batch_items(batch: &TranslationBatch) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bookforge_core::segment::{SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata, SegmentSource, SegmentTextRun};
+    use bookforge_core::segment::{
+        SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
+        SegmentSource, SegmentTextRun,
+    };
 
     fn make_segment(id: &str, blocks: Vec<SegmentBlock>, markers: Vec<String>) -> Segment {
         Segment {
@@ -962,7 +1003,11 @@ mod tests {
             ordinal: 0,
             block_ids: blocks.iter().map(|b| b.block_id.clone()).collect(),
             source: SegmentSource {
-                text: blocks.iter().map(|b| b.text.clone()).collect::<Vec<_>>().join("\n"),
+                text: blocks
+                    .iter()
+                    .map(|b| b.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 blocks,
                 token_estimate: 50,
             },
@@ -1000,7 +1045,8 @@ mod tests {
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
-        let batches = build_translation_batches(&[seg1, seg2], &config, TranslationProfile::Balanced);
+        let batches =
+            build_translation_batches(&[seg1, seg2], &config, TranslationProfile::Balanced);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].items.len(), 2);
     }
@@ -1016,7 +1062,8 @@ mod tests {
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
-        let batches = build_translation_batches(&[seg1, seg2], &config, TranslationProfile::Balanced);
+        let batches =
+            build_translation_batches(&[seg1, seg2], &config, TranslationProfile::Balanced);
         let batch = &batches[0];
         let id1 = &batch.items[0].item_id;
         let id2 = &batch.items[1].item_id;
@@ -1045,7 +1092,8 @@ mod tests {
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
-        let batches = build_translation_batches(&[seg1, seg2], &config, TranslationProfile::Balanced);
+        let batches =
+            build_translation_batches(&[seg1, seg2], &config, TranslationProfile::Balanced);
         let batch = &batches[0];
         let id1 = &batch.items[0].item_id;
 
@@ -1103,7 +1151,11 @@ mod tests {
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
-        let batches = build_translation_batches(&[seg1, seg2, seg3, seg4], &config, TranslationProfile::Balanced);
+        let batches = build_translation_batches(
+            &[seg1, seg2, seg3, seg4],
+            &config,
+            TranslationProfile::Balanced,
+        );
         let split = split_batch(&batches[0]);
         assert_eq!(split.len(), 2);
         assert_eq!(split[0].items.len(), 2);
@@ -1135,8 +1187,16 @@ mod tests {
     }
 
     impl LlmProviderTrait for StubProvider {
-        async fn complete(&self, _request: CompletionRequest) -> ProviderResult<CompletionResponse> {
-            let behavior = self.behavior.lock().unwrap().take().expect("stub used twice");
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> ProviderResult<CompletionResponse> {
+            let behavior = self
+                .behavior
+                .lock()
+                .unwrap()
+                .take()
+                .expect("stub used twice");
             match behavior {
                 StubBehavior::FinishLength => Ok(CompletionResponse {
                     content: "{\"items\":[]}".to_string(),
@@ -1250,8 +1310,7 @@ mod tests {
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
-        let batches =
-            build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+        let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
         assert_eq!(batches.len(), 1);
         let item_ids: Vec<(String, String)> = batches[0]
             .items

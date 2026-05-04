@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
 
@@ -30,6 +31,13 @@ pub trait LlmProvider: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<CompletionResponse>> + Send;
 
     fn capabilities(&self) -> ProviderCapabilities;
+
+    /// Whether this provider/model is a reasoning (chain-of-thought) model
+    /// that consumes part of the `max_tokens` budget for internal reasoning.
+    /// Defaults to `false`.
+    fn is_reasoning(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +81,19 @@ pub struct CompletionResponse {
     pub finish_reason: FinishReason,
     pub provider_latency_ms: u64,
     pub raw: serde_json::Value,
+}
+
+impl CompletionResponse {
+    /// Returns `true` when the API returned `reasoning_content` in any choice,
+    /// indicating the model is a reasoning / chain-of-thought model that consumes
+    /// part of the `max_tokens` budget for internal reasoning.
+    pub fn is_reasoning_response(&self) -> bool {
+        self.raw
+            .pointer("/choices/0/message/reasoning_content")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,18 +435,35 @@ impl OpenAiCompatibleConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OpenAiCompatibleProvider {
     config: OpenAiCompatibleConfig,
     client: reqwest::Client,
+    reasoning_detected: AtomicBool,
+}
+
+impl Clone for OpenAiCompatibleProvider {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            client: self.client.clone(),
+            reasoning_detected: AtomicBool::new(self.reasoning_detected.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl OpenAiCompatibleProvider {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
+            .http1_only()
             .timeout(std::time::Duration::from_secs(config.timeout_seconds))
             .build()?;
-        Ok(Self { config, client })
+        let is_reasoning = model_name_is_reasoning(&config.model);
+        Ok(Self {
+            config,
+            client,
+            reasoning_detected: AtomicBool::new(is_reasoning),
+        })
     }
 
     pub fn model(&self) -> &str {
@@ -472,7 +510,6 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 .client
                 .post(&endpoint)
                 .bearer_auth(&api_key)
-                .header(reqwest::header::ACCEPT_ENCODING, "identity")
                 .json(&body)
                 .send()
                 .await
@@ -508,17 +545,46 @@ impl LlmProvider for OpenAiCompatibleProvider {
             let status = response.status();
 
             if status.is_success() {
-                match response.json::<Value>().await {
-                    Ok(value) => {
-                        raw = Some(value);
-                        break;
-                    }
+                let response_bytes = match response.bytes().await {
+                    Ok(b) => b,
                     Err(error) => {
+                        eprintln!(
+                            "provider: attempt {}/{} body read failed (status={status:#}): {error}",
+                            attempt + 1,
+                            max_attempts,
+                        );
                         let retryable = is_retryable_http_error(&error);
                         let attempt_limit = attempt_limit_for_http_error(&error, max_attempts);
                         last_error = Some(LlmError::Http(error));
                         if !retryable || attempt + 1 == attempt_limit {
                             return Err(last_error.expect("set above"));
+                        }
+                        sleep(backoff_delay(attempt)).await;
+                        continue;
+                    }
+                };
+                match serde_json::from_slice::<Value>(&response_bytes) {
+                    Ok(value) => {
+                        raw = Some(value);
+                        break;
+                    }
+                    Err(error) => {
+                        let preview = String::from_utf8_lossy(
+                            if response_bytes.len() > 500 {
+                                &response_bytes[..500]
+                            } else {
+                                &response_bytes
+                            },
+                        );
+                        eprintln!(
+                            "provider: attempt {}/{} json parse failed ({status:#}): {error}\n  body: {preview}",
+                            attempt + 1,
+                            max_attempts,
+                        );
+                        if attempt + 1 == max_attempts {
+                            return Err(LlmError::InvalidResponse(format!(
+                                "JSON parse failed after {max_attempts} attempts: {error}"
+                            )));
                         }
                         sleep(backoff_delay(attempt)).await;
                         continue;
@@ -565,6 +631,17 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .pointer("/usage/completion_tokens")
             .and_then(Value::as_u64);
 
+        // Detect reasoning models from their first response so subsequent
+        // requests can use a higher max_output_tokens budget.
+        let has_reasoning = raw
+            .pointer("/choices/0/message/reasoning_content")
+            .and_then(Value::as_str)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if has_reasoning {
+            self.reasoning_detected.store(true, Ordering::Relaxed);
+        }
+
         Ok(CompletionResponse {
             content,
             input_tokens,
@@ -573,6 +650,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
             provider_latency_ms: started.elapsed().as_millis() as u64,
             raw,
         })
+    }
+
+    fn is_reasoning(&self) -> bool {
+        self.reasoning_detected.load(Ordering::Relaxed)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -595,7 +676,11 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 }
 
 fn is_retryable_http_error(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() || error.is_decode()
+    error.is_timeout()
+        || error.is_connect()
+        || error.is_request()
+        || error.is_body()
+        || error.is_decode()
 }
 
 fn attempt_limit_for_http_error(error: &reqwest::Error, max_attempts: usize) -> usize {
@@ -626,4 +711,16 @@ fn parse_finish_reason(value: &str) -> FinishReason {
         "tool_calls" => FinishReason::ToolCalls,
         _ => FinishReason::Unknown,
     }
+}
+
+/// Heuristic to detect reasoning / chain-of-thought models by name.
+/// These models consume part of the `max_tokens` budget for internal reasoning
+/// and thus need a higher output token allowance.
+fn model_name_is_reasoning(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    lower.contains("reasoner")
+        || lower.contains("v4-flash")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
 }

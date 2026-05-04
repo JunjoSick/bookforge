@@ -29,6 +29,7 @@ pub enum StoreError {
 
 pub struct JobStore {
     conn: RefCell<Connection>,
+    path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -143,10 +144,15 @@ impl JobStore {
             fs::create_dir_all(parent)?;
         }
         let store = Self {
-            conn: RefCell::new(Connection::open(path)?),
+            conn: RefCell::new(Connection::open(&path)?),
+            path,
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn create_job(&self, request: CreateJob<'_>) -> Result<JobRecord> {
@@ -487,6 +493,7 @@ impl JobStore {
             .map_err(StoreError::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn find_cached_translation(
         &self,
         segment: &Segment,
@@ -936,7 +943,14 @@ mod tests {
         seg.block_ids = block_ids.iter().map(|id| BlockId(id.to_string())).collect();
 
         store
-            .insert_segments(&job.id, &[seg.clone()], "v1", "mock", "mock-prefix", cache_namespace)
+            .insert_segments(
+                &job.id,
+                &[seg.clone()],
+                "v1",
+                "mock",
+                "mock-prefix",
+                cache_namespace,
+            )
             .expect("segments should insert");
         store
             .save_translation(SaveTranslation {
@@ -963,12 +977,28 @@ mod tests {
             build_seeded_store_with_translation(&db_path, "ns_one", &["b_000000"]);
 
         let hit = store
-            .find_cached_translation(&seg, "v1", "mock", "mock-prefix", Some("English"), "Italian", "ns_one")
+            .find_cached_translation(
+                &seg,
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_one",
+            )
             .expect("query ok");
         assert!(hit.is_some(), "matching namespace should hit");
 
         let miss = store
-            .find_cached_translation(&seg, "v1", "mock", "mock-prefix", Some("English"), "Italian", "ns_two")
+            .find_cached_translation(
+                &seg,
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_two",
+            )
             .expect("query ok");
         assert!(miss.is_none(), "different namespace must not hit");
 
@@ -985,9 +1015,20 @@ mod tests {
         seg.block_ids = vec![BlockId("b_999999".to_string())];
 
         let miss = store
-            .find_cached_translation(&seg, "v1", "mock", "mock-prefix", Some("English"), "Italian", "ns_x")
+            .find_cached_translation(
+                &seg,
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_x",
+            )
             .expect("query ok");
-        assert!(miss.is_none(), "mismatched block_ids must reject the cached row");
+        assert!(
+            miss.is_none(),
+            "mismatched block_ids must reject the cached row"
+        );
 
         let _ = fs::remove_file(db_path);
     }
@@ -996,13 +1037,23 @@ mod tests {
     fn old_empty_cache_namespace_rows_do_not_match_new_runs() {
         let db_path = temp_path("legacy_ns.sqlite");
         // Simulate a row migrated from an older schema with the default empty namespace.
-        let (store, _job, seg) =
-            build_seeded_store_with_translation(&db_path, "", &["b_000000"]);
+        let (store, _job, seg) = build_seeded_store_with_translation(&db_path, "", &["b_000000"]);
 
         let miss = store
-            .find_cached_translation(&seg, "v1", "mock", "mock-prefix", Some("English"), "Italian", "real_ns")
+            .find_cached_translation(
+                &seg,
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "real_ns",
+            )
             .expect("query ok");
-        assert!(miss.is_none(), "legacy empty-namespace row must not satisfy a real namespace lookup");
+        assert!(
+            miss.is_none(),
+            "legacy empty-namespace row must not satisfy a real namespace lookup"
+        );
 
         let _ = fs::remove_file(db_path);
     }

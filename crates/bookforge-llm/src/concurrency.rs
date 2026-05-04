@@ -1,6 +1,6 @@
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
@@ -29,10 +29,8 @@ impl Drop for AdaptivePermit {
             })
             .is_ok();
 
-        if claimed {
-            if let Some(permit) = self.permit.take() {
-                permit.forget();
-            }
+        if claimed && let Some(permit) = self.permit.take() {
+            permit.forget();
         }
     }
 }

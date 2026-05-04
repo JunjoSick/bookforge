@@ -20,6 +20,7 @@ use clap::Args;
 
 use crate::{
     QaMode,
+    checkpoint::CheckpointWriter,
     cost::estimate_cost_usd,
     default_output_path,
     report::{ReportInput, write_report},
@@ -109,7 +110,9 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
     let fresh_translations = if pending_segments.is_empty() {
         Vec::new()
     } else {
-        match job.provider.as_str() {
+        let writer = CheckpointWriter::spawn(store.path().to_path_buf());
+        let tx = writer.sender();
+        let result = match job.provider.as_str() {
             "mock" => {
                 let provider = MockProvider::new(mock_mode(&job.model), &job.target_lang);
                 translate_and_checkpoint(
@@ -122,9 +125,10 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
                         provider: &job.provider,
                         model: &job.model,
                         prompt_version,
+                        tx: &tx,
                     },
                 )
-                .await?
+                .await
             }
             "deepseek" | "openrouter" | "openai-compatible" => {
                 let provider_config = openai_compatible_config(&job, args.timeout_seconds, 6)?;
@@ -139,12 +143,16 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
                         provider: &job.provider,
                         model: &job.model,
                         prompt_version,
+                        tx: &tx,
                     },
                 )
-                .await?
+                .await
             }
             provider => anyhow::bail!("cannot resume unsupported provider '{provider}'"),
-        }
+        };
+        drop(tx);
+        writer.shutdown().await?;
+        result?
     };
 
     cached_translations.extend(fresh_translations);

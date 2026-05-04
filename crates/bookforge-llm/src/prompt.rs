@@ -187,8 +187,7 @@ const BATCH_REPAIR_TEMPLATE_SOURCE: &str =
 const QA_BATCH_TEMPLATE_SOURCE: &str = include_str!("../../../prompts/qa_batch.v1.md");
 const DOUBLE_CHECK_BATCH_TEMPLATE_SOURCE: &str =
     include_str!("../../../prompts/double_check_batch.v1.md");
-const CORRECT_BATCH_TEMPLATE_SOURCE: &str =
-    include_str!("../../../prompts/correct_batch.v1.md");
+const CORRECT_BATCH_TEMPLATE_SOURCE: &str = include_str!("../../../prompts/correct_batch.v1.md");
 
 #[derive(Debug, Clone)]
 pub struct PromptLibrary {
@@ -221,12 +220,9 @@ impl PromptLibrary {
         let qa = PromptTemplate::parse("qa_segment", "v1", QA_TEMPLATE_SOURCE)
             .expect("embedded QA template must parse");
 
-        let batch_plain = PromptTemplate::parse(
-            "translate_batch_plain",
-            "v1",
-            BATCH_PLAIN_TEMPLATE_SOURCE,
-        )
-        .expect("embedded batch plain template must parse");
+        let batch_plain =
+            PromptTemplate::parse("translate_batch_plain", "v1", BATCH_PLAIN_TEMPLATE_SOURCE)
+                .expect("embedded batch plain template must parse");
         let batch_marker_safe = PromptTemplate::parse(
             "translate_batch_marker_safe",
             "v1",
@@ -239,27 +235,20 @@ impl PromptLibrary {
             BATCH_RUN_PRESERVING_TEMPLATE_SOURCE,
         )
         .expect("embedded batch run-preserving template must parse");
-        let batch_repair = PromptTemplate::parse(
-            "translate_batch_repair",
-            "v1",
-            BATCH_REPAIR_TEMPLATE_SOURCE,
-        )
-        .expect("embedded batch repair template must parse");
-        let qa_batch =
-            PromptTemplate::parse("qa_batch", "v1", QA_BATCH_TEMPLATE_SOURCE)
-                .expect("embedded QA batch template must parse");
+        let batch_repair =
+            PromptTemplate::parse("translate_batch_repair", "v1", BATCH_REPAIR_TEMPLATE_SOURCE)
+                .expect("embedded batch repair template must parse");
+        let qa_batch = PromptTemplate::parse("qa_batch", "v1", QA_BATCH_TEMPLATE_SOURCE)
+            .expect("embedded QA batch template must parse");
         let double_check_batch = PromptTemplate::parse(
             "double_check_batch",
             "v1",
             DOUBLE_CHECK_BATCH_TEMPLATE_SOURCE,
         )
         .expect("embedded double-check batch template must parse");
-        let correct_batch = PromptTemplate::parse(
-            "correct_batch",
-            "v1",
-            CORRECT_BATCH_TEMPLATE_SOURCE,
-        )
-        .expect("embedded correct batch template must parse");
+        let correct_batch =
+            PromptTemplate::parse("correct_batch", "v1", CORRECT_BATCH_TEMPLATE_SOURCE)
+                .expect("embedded correct batch template must parse");
 
         Self {
             plain,
@@ -373,7 +362,10 @@ mod tests {
 
         assert_eq!(library.batch_plain.name, "translate_batch_plain");
         assert!(library.batch_plain.user.contains("{{items_json}}"));
-        assert_eq!(library.batch_marker_safe.name, "translate_batch_marker_safe");
+        assert_eq!(
+            library.batch_marker_safe.name,
+            "translate_batch_marker_safe"
+        );
         assert!(library.batch_marker_safe.user.contains("{{items_json}}"));
         assert_eq!(
             library.batch_run_preserving.name,

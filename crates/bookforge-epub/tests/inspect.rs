@@ -39,10 +39,7 @@ fn builds_basic_ir_from_minimal_epub() {
     assert_eq!(book.sections.len(), 1);
     assert_eq!(book.blocks.len(), 1);
     assert_eq!(book.blocks[0].kind, BlockKind::Paragraph);
-    assert_eq!(
-        book.blocks[0].text_runs[0].text,
-        "Hello from chapter 1."
-    );
+    assert_eq!(book.blocks[0].text_runs[0].text, "Hello from chapter 1.");
     assert!(book.blocks.iter().all(|block| block.token_estimate > 0));
 }
 
@@ -63,12 +60,7 @@ fn builds_stable_segments_from_minimal_epub() {
     assert_eq!(first[0].checksum, second[0].checksum);
     assert_eq!(first[0].section_id.0, "sec_000000");
     assert_eq!(first[0].block_ids.len(), 1);
-    assert!(
-        first[0]
-            .source
-            .text
-            .contains("Hello from chapter 1.")
-    );
+    assert!(first[0].source.text.contains("Hello from chapter 1."));
     assert!(first[0].source.token_estimate > 0);
     assert!(first[0].context.before.is_none());
     assert!(first[0].context.after.is_none());
@@ -84,12 +76,10 @@ fn rebuilds_epub_with_patched_xhtml_and_preserved_resources() {
 
     rebuild_epub(
         &book,
-        &[
-            BlockTranslation {
-                block_id: BlockId("b_000000".to_string()),
-                text: "Ciao da un EPUB minimo.".to_string(),
-            },
-        ],
+        &[BlockTranslation {
+            block_id: BlockId("b_000000".to_string()),
+            text: "Ciao da un EPUB minimo.".to_string(),
+        }],
         &output,
     )
     .expect("EPUB should rebuild");

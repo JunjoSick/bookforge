@@ -1,8 +1,7 @@
 use anyhow::Result;
 use bookforge_core::{
     config::{
-        DoubleCheckMode, FallbackScope, ResolvedRunSettings,
-        TranslationConfig, TranslationProfile,
+        DoubleCheckMode, FallbackScope, ResolvedRunSettings, TranslationConfig, TranslationProfile,
     },
     scheduler::SchedulerConfig,
     segment::{BlockTranslation, Segment, SegmentStatus, build_segments, compute_cache_namespace},
@@ -14,21 +13,20 @@ use bookforge_llm::{
     AdaptiveLimiter, LlmError, LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig,
     OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation, TelemetryLog,
     TranslationRunConfig, build_translation_batches, qa_segments, run_double_check,
-    telemetry_summary, translate_batches_with_callback,
-    translate_segments_with_callback,
+    telemetry_summary, translate_batches_with_callback, translate_segments_with_callback,
 };
-use bookforge_store::{
-    CreateJob, JobRecord, JobStore, SaveCachedTranslation, SaveNeedsReview, SaveTranslation,
-};
+use bookforge_store::{CreateJob, JobRecord, JobStore, SaveCachedTranslation};
 use clap::Args;
 use std::path::PathBuf;
 
 use crate::{
     LanguageArgs, ProviderArgs as CliProviderArgs, QaMode,
+    checkpoint::{CheckpointCommand, CheckpointWriter},
     cost::estimate_cost_usd,
     default_output_path,
     report::{ReportInput, write_report},
 };
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Args)]
 pub struct TranslateArgs {
@@ -147,13 +145,12 @@ pub struct TranslateArgs {
 }
 
 fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
-    let effective_profile = if args.turbo_text_only
-        && !matches!(args.profile, TranslationProfile::TurboTextOnly)
-    {
-        TranslationProfile::TurboTextOnly
-    } else {
-        args.profile
-    };
+    let effective_profile =
+        if args.turbo_text_only && !matches!(args.profile, TranslationProfile::TurboTextOnly) {
+            TranslationProfile::TurboTextOnly
+        } else {
+            args.profile
+        };
 
     let mut settings = effective_profile.resolve();
 
@@ -211,9 +208,7 @@ fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
     settings.double_check.auto_correct = args.auto_correct;
     settings.double_check.correction_rounds = args.correction_rounds;
 
-    if settings.double_check.mode != DoubleCheckMode::Off
-        && settings.double_check.model.is_none()
-    {
+    if settings.double_check.mode != DoubleCheckMode::Off && settings.double_check.model.is_none() {
         eprintln!(
             "--double-check requires --double-check-model unless a default double-check model is configured"
         );
@@ -252,10 +247,18 @@ pub async fn run(args: TranslateArgs) -> Result<()> {
     }
 
     match config.provider.as_str() {
-        "mock" => run_mock_translation(&args.input, &config, &args.provider, &args, &settings).await?,
+        "mock" => {
+            run_mock_translation(&args.input, &config, &args.provider, &args, &settings).await?
+        }
         "deepseek" | "openrouter" | "openai-compatible" => {
-            run_openai_compatible_translation(&args.input, &config, &args.provider, &args, &settings)
-                .await?
+            run_openai_compatible_translation(
+                &args.input,
+                &config,
+                &args.provider,
+                &args,
+                &settings,
+            )
+            .await?
         }
         _ => {
             println!(
@@ -301,7 +304,14 @@ async fn run_mock_translation(
         settings.batch.enabled,
         prompt_version,
     );
-    store.insert_segments(&job.id, &segments, prompt_version, "mock", &model, &cache_namespace)?;
+    store.insert_segments(
+        &job.id,
+        &segments,
+        prompt_version,
+        "mock",
+        &model,
+        &cache_namespace,
+    )?;
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
         target_language: config.target_language.clone(),
@@ -327,6 +337,8 @@ async fn run_mock_translation(
         },
     )?;
     let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
+    let writer = CheckpointWriter::spawn(store.path().to_path_buf());
+    let tx = writer.sender();
     let fresh_translations = translate_and_checkpoint(
         provider.clone(),
         &pending_segments,
@@ -337,13 +349,22 @@ async fn run_mock_translation(
             provider: "mock",
             model: &model,
             prompt_version,
+            tx: &tx,
         },
     )
     .await?;
+    drop(tx);
+    writer.shutdown().await?;
     translations.extend(fresh_translations);
     translations.sort_by_key(|translation| translation.ordinal);
-    let qa_reviews =
-        qa_reviews_for_mode(provider, &segments, &translations, &run_config, _cli_args.qa).await;
+    let qa_reviews = qa_reviews_for_mode(
+        provider,
+        &segments,
+        &translations,
+        &run_config,
+        _cli_args.qa,
+    )
+    .await;
     mark_job_finished(&store, &job.id, &translations)?;
     print_summary_rebuild_and_report(
         &store,
@@ -386,7 +407,9 @@ async fn run_openai_compatible_translation(
         Ok(cfg) => cfg,
         Err(e) => {
             if config.provider == "openai-compatible" {
-                return Err(anyhow::anyhow!("--base-url is required for --provider openai-compatible"));
+                return Err(anyhow::anyhow!(
+                    "--base-url is required for --provider openai-compatible"
+                ));
             }
             return Err(e);
         }
@@ -415,7 +438,14 @@ async fn run_openai_compatible_translation(
         settings.batch.enabled,
         prompt_version,
     );
-    store.insert_segments(&job.id, &segments, prompt_version, &config.provider, &model, &cache_namespace_v1)?;
+    store.insert_segments(
+        &job.id,
+        &segments,
+        prompt_version,
+        &config.provider,
+        &model,
+        &cache_namespace_v1,
+    )?;
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
         target_language: config.target_language.clone(),
@@ -448,7 +478,14 @@ async fn run_openai_compatible_translation(
             settings.batch.enabled,
             "batch_v1",
         );
-        store.insert_segments(&job.id, &segments, "batch_v1", &config.provider, &model, &cache_namespace_batch)?;
+        store.insert_segments(
+            &job.id,
+            &segments,
+            "batch_v1",
+            &config.provider,
+            &model,
+            &cache_namespace_batch,
+        )?;
         let mut translations = apply_cached_translations(
             &segments,
             CacheContext {
@@ -463,6 +500,8 @@ async fn run_openai_compatible_translation(
             },
         )?;
         let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
+        let writer = CheckpointWriter::spawn(store.path().to_path_buf());
+        let tx = writer.sender();
         let fresh_translations = translate_and_checkpoint_batch(
             provider.clone(),
             &pending_segments,
@@ -474,14 +513,22 @@ async fn run_openai_compatible_translation(
                 provider: &config.provider,
                 model: &model,
                 prompt_version: "batch_v1",
+                tx: &tx,
             },
         )
         .await?;
+        drop(tx);
+        writer.shutdown().await?;
         translations.extend(fresh_translations);
         translations.sort_by_key(|translation| translation.ordinal);
-        let qa_reviews =
-            qa_reviews_for_mode(provider.clone(), &segments, &translations, &run_config, cli_args.qa)
-                .await;
+        let qa_reviews = qa_reviews_for_mode(
+            provider.clone(),
+            &segments,
+            &translations,
+            &run_config,
+            cli_args.qa,
+        )
+        .await;
         translations = run_fallback_pass(
             &provider,
             cli_args,
@@ -491,7 +538,8 @@ async fn run_openai_compatible_translation(
             &job.id,
             "batch_v1",
             settings,
-        ).await?;
+        )
+        .await?;
         run_double_check_pass(
             &provider,
             cli_args,
@@ -499,7 +547,8 @@ async fn run_openai_compatible_translation(
             &translations,
             &run_config,
             settings,
-        ).await?;
+        )
+        .await?;
         mark_job_finished(&store, &job.id, &translations)?;
         print_summary_rebuild_and_report(
             &store,
@@ -525,6 +574,8 @@ async fn run_openai_compatible_translation(
             },
         )?;
         let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
+        let writer = CheckpointWriter::spawn(store.path().to_path_buf());
+        let tx = writer.sender();
         let fresh_translations = translate_and_checkpoint(
             provider.clone(),
             &pending_segments,
@@ -535,14 +586,22 @@ async fn run_openai_compatible_translation(
                 provider: &config.provider,
                 model: &model,
                 prompt_version,
+                tx: &tx,
             },
         )
         .await?;
+        drop(tx);
+        writer.shutdown().await?;
         translations.extend(fresh_translations);
         translations.sort_by_key(|translation| translation.ordinal);
-        let qa_reviews =
-            qa_reviews_for_mode(provider.clone(), &segments, &translations, &run_config, cli_args.qa)
-                .await;
+        let qa_reviews = qa_reviews_for_mode(
+            provider.clone(),
+            &segments,
+            &translations,
+            &run_config,
+            cli_args.qa,
+        )
+        .await;
         translations = run_fallback_pass(
             &provider,
             cli_args,
@@ -552,7 +611,8 @@ async fn run_openai_compatible_translation(
             &job.id,
             prompt_version,
             settings,
-        ).await?;
+        )
+        .await?;
         run_double_check_pass(
             &provider,
             cli_args,
@@ -560,7 +620,8 @@ async fn run_openai_compatible_translation(
             &translations,
             &run_config,
             settings,
-        ).await?;
+        )
+        .await?;
         mark_job_finished(&store, &job.id, &translations)?;
         print_summary_rebuild_and_report(
             &store,
@@ -585,15 +646,34 @@ fn provider_config(
     provider_max_attempts: usize,
 ) -> Result<OpenAiCompatibleConfig> {
     let (default_url, default_key_env, default_model) = match provider {
-        "deepseek" => ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat"),
-        "openrouter" => ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openrouter/auto"),
-        _ => return Err(anyhow::anyhow!("--base-url is required for --provider {provider}")),
+        "deepseek" => (
+            "https://api.deepseek.com/v1",
+            "DEEPSEEK_API_KEY",
+            "deepseek-chat",
+        ),
+        "openrouter" => (
+            "https://openrouter.ai/api/v1",
+            "OPENROUTER_API_KEY",
+            "openrouter/auto",
+        ),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "--base-url is required for --provider {provider}"
+            ));
+        }
     };
 
     Ok(OpenAiCompatibleConfig {
-        base_url: base_url.map(String::from).unwrap_or_else(|| default_url.to_string()),
-        api_key_env: api_key_env.map(String::from).unwrap_or_else(|| default_key_env.to_string()),
-        model: model.or(Some(default_model)).map(String::from).unwrap_or_else(|| default_model.to_string()),
+        base_url: base_url
+            .map(String::from)
+            .unwrap_or_else(|| default_url.to_string()),
+        api_key_env: api_key_env
+            .map(String::from)
+            .unwrap_or_else(|| default_key_env.to_string()),
+        model: model
+            .or(Some(default_model))
+            .map(String::from)
+            .unwrap_or_else(|| default_model.to_string()),
         timeout_seconds,
         provider_max_attempts: provider_max_attempts.max(1),
     })
@@ -609,11 +689,7 @@ async fn translate_and_checkpoint_batch<P>(
 where
     P: LlmProvider,
 {
-    let batches = build_translation_batches(
-        segments,
-        &settings.batch,
-        settings.profile,
-    );
+    let batches = build_translation_batches(segments, &settings.batch, settings.profile);
 
     if batches.is_empty() {
         return translate_and_checkpoint(provider, segments, config, checkpoint).await;
@@ -633,17 +709,15 @@ where
         None
     };
 
-    match translate_batches_with_callback(provider, batches, segments, config, telemetry.clone(), limiter, |translation| {
-        save_translation_result(
-            checkpoint.store,
-            checkpoint.job_id,
-            translation,
-            checkpoint.provider,
-            checkpoint.model,
-            checkpoint.prompt_version,
-        )
-        .map_err(|err| LlmError::Provider(format!("checkpoint save failed: {err}")))
-    })
+    match translate_batches_with_callback(
+        provider,
+        batches,
+        segments,
+        config,
+        telemetry.clone(),
+        limiter,
+        |translation| send_checkpoint(checkpoint.tx, checkpoint, translation),
+    )
     .await
     {
         Ok(translations) => {
@@ -654,9 +728,7 @@ where
             Ok(translations)
         }
         Err(error) => {
-            let message = format!(
-                "batch translation failed: {error}"
-            );
+            let message = format!("batch translation failed: {error}");
             mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
             Err(anyhow::anyhow!(message))
         }
@@ -696,23 +768,20 @@ async fn run_fallback_pass(
         settings.provider.provider_max_attempts,
     )?;
 
-    let fallback = OpenAiCompatibleProvider::new(fallback_config)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let fallback =
+        OpenAiCompatibleProvider::new(fallback_config).map_err(|e| anyhow::anyhow!("{e}"))?;
     let fallback_model = fallback.model().to_string();
 
     let candidates: Vec<Segment> = segments
         .iter()
         .filter(|s| {
-            let t = translations
-                .iter()
-                .find(|t| t.segment_id.0 == s.id.0);
+            let t = translations.iter().find(|t| t.segment_id.0 == s.id.0);
             match t {
                 Some(t) => match cli_args.fallback_only {
                     FallbackScope::Failed => t.status == SegmentStatus::Failed,
                     FallbackScope::NeedsReview => t.status == SegmentStatus::NeedsReview,
                     FallbackScope::FailedAndNeedsReview => {
-                        t.status == SegmentStatus::Failed
-                            || t.status == SegmentStatus::NeedsReview
+                        t.status == SegmentStatus::Failed || t.status == SegmentStatus::NeedsReview
                     }
                 },
                 None => false,
@@ -746,21 +815,20 @@ async fn run_fallback_pass(
         profile: settings.profile,
     };
 
+    let writer = CheckpointWriter::spawn(store.path().to_path_buf());
+    let tx = writer.sender();
     let checkpoint = CheckpointContext {
         store,
         job_id,
         provider: provider_str,
         model: &fallback_model,
         prompt_version,
+        tx: &tx,
     };
 
-    let fresh = translate_and_checkpoint(
-        fallback,
-        &candidates,
-        &run_config,
-        checkpoint,
-    )
-    .await?;
+    let fresh = translate_and_checkpoint(fallback, &candidates, &run_config, checkpoint).await?;
+    drop(tx);
+    writer.shutdown().await?;
 
     for ft in &fresh {
         if let Some(existing) = translations
@@ -786,23 +854,24 @@ async fn run_double_check_pass(
         return Ok(());
     }
 
-    let dc_provider = if cli_args.double_check_provider.is_some()
-        || cli_args.double_check_model.is_some()
-    {
-        let provider_str = cli_args.double_check_provider.as_deref().unwrap_or("openrouter");
-        let dc_config = provider_config(
-            provider_str,
-            cli_args.double_check_model.as_deref(),
-            cli_args.double_check_base_url.as_deref(),
-            cli_args.double_check_api_key_env.as_deref(),
-            settings.provider.timeout_seconds,
-            settings.provider.provider_max_attempts,
-        )?;
-        OpenAiCompatibleProvider::new(dc_config)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-    } else {
-        provider.clone()
-    };
+    let dc_provider =
+        if cli_args.double_check_provider.is_some() || cli_args.double_check_model.is_some() {
+            let provider_str = cli_args
+                .double_check_provider
+                .as_deref()
+                .unwrap_or("openrouter");
+            let dc_config = provider_config(
+                provider_str,
+                cli_args.double_check_model.as_deref(),
+                cli_args.double_check_base_url.as_deref(),
+                cli_args.double_check_api_key_env.as_deref(),
+                settings.provider.timeout_seconds,
+                settings.provider.provider_max_attempts,
+            )?;
+            OpenAiCompatibleProvider::new(dc_config).map_err(|e| anyhow::anyhow!("{e}"))?
+        } else {
+            provider.clone()
+        };
 
     println!("Double-check: auditing translations...");
     let corrections = run_double_check(
@@ -821,7 +890,12 @@ async fn run_double_check_pass(
         .count();
     let rejected = corrections
         .iter()
-        .filter(|c| matches!(c.status, bookforge_llm::CorrectionStatus::RejectedValidationFailed(_)))
+        .filter(|c| {
+            matches!(
+                c.status,
+                bookforge_llm::CorrectionStatus::RejectedValidationFailed(_)
+            )
+        })
         .count();
     let unresolved = corrections
         .iter()
@@ -863,6 +937,9 @@ pub(crate) struct CheckpointContext<'a> {
     pub provider: &'a str,
     pub model: &'a str,
     pub prompt_version: &'a str,
+    /// Sender to the SQLite writer actor. Per-segment checkpoint writes
+    /// go through this channel so the async hot path never blocks on disk.
+    pub tx: &'a UnboundedSender<CheckpointCommand>,
 }
 
 #[derive(Clone, Copy)]
@@ -887,15 +964,7 @@ where
     P: LlmProvider,
 {
     match translate_segments_with_callback(provider, segments, config, |translation| {
-        save_translation_result(
-            checkpoint.store,
-            checkpoint.job_id,
-            translation,
-            checkpoint.provider,
-            checkpoint.model,
-            checkpoint.prompt_version,
-        )
-        .map_err(|err| LlmError::Provider(format!("checkpoint save failed: {err}")))
+        send_checkpoint(checkpoint.tx, checkpoint, translation)
     })
     .await
     {
@@ -1033,50 +1102,21 @@ fn mark_all_segments_failed(
     Ok(())
 }
 
-pub(crate) fn save_translation_result(
-    store: &JobStore,
-    job_id: &str,
+fn send_checkpoint(
+    tx: &UnboundedSender<CheckpointCommand>,
+    ctx: CheckpointContext<'_>,
     translation: &SegmentTranslation,
-    provider: &str,
-    model: &str,
-    prompt_version: &str,
-) -> Result<()> {
-    let joined = translation.joined_text();
-    match translation.status {
-        SegmentStatus::Succeeded => store.save_translation(SaveTranslation {
-            job_id,
-            segment_id: &translation.segment_id.0,
-            translated_text: &joined,
-            blocks: &translation.blocks,
-            provider,
-            model,
-            prompt_version,
-            input_tokens: translation.input_tokens,
-            output_tokens: translation.output_tokens,
-        })?,
-        SegmentStatus::NeedsReview => store.save_needs_review(SaveNeedsReview {
-            job_id,
-            segment_id: &translation.segment_id.0,
-            preserved_text: &joined,
-            blocks: &translation.blocks,
-            provider,
-            model,
-            prompt_version,
-            error: translation
-                .error
-                .as_deref()
-                .unwrap_or("translation requires review"),
-            input_tokens: translation.input_tokens,
-            output_tokens: translation.output_tokens,
-        })?,
-        SegmentStatus::Failed => store.mark_segment_failed(
-            job_id,
-            &translation.segment_id.0,
-            translation.error.as_deref().unwrap_or("translation failed"),
-        )?,
-        _ => {}
-    }
-    Ok(())
+) -> std::result::Result<(), LlmError> {
+    tx.send(CheckpointCommand::SaveTranslation {
+        job_id: ctx.job_id.to_string(),
+        translation: Box::new(translation.clone()),
+        provider: ctx.provider.to_string(),
+        model: ctx.model.to_string(),
+        prompt_version: ctx.prompt_version.to_string(),
+    })
+    .map_err(|_| {
+        LlmError::Provider("checkpoint queue closed; checkpoint writer may have failed".to_string())
+    })
 }
 
 pub(crate) fn mark_job_finished(
@@ -1199,7 +1239,10 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
     let model = provider.model().to_string();
 
     println!("Benchmarking {} / {}", provider_config.base_url, model);
-    println!("Samples: {}, Tokens: {}, Concurrency: {}", args.samples, args.tokens, args.concurrency);
+    println!(
+        "Samples: {}, Tokens: {}, Concurrency: {}",
+        args.samples, args.tokens, args.concurrency
+    );
     println!();
 
     let mut latencies = Vec::with_capacity(args.samples);
@@ -1213,10 +1256,7 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
     for i in 0..args.samples {
         let request = bookforge_llm::CompletionRequest {
             system: "You are a translator. Return JSON only: {\"translation\":\"...\"}".to_string(),
-            user: format!(
-                "Translate: {{\"text\":\"{}\"}} Return JSON.",
-                pigeon
-            ),
+            user: format!("Translate: {{\"text\":\"{}\"}} Return JSON.", pigeon),
             response_format: bookforge_llm::ResponseFormat::Json,
             temperature: 0.2,
             max_output_tokens: Some(args.tokens as u32),
@@ -1231,13 +1271,18 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
                 total_output_tokens += resp.output_tokens.unwrap_or(0);
                 _total_input_tokens += resp.input_tokens.unwrap_or(0);
                 let tok_sec = if resp.provider_latency_ms > 0 {
-                    resp.output_tokens.unwrap_or(0) as f64 / (resp.provider_latency_ms as f64 / 1000.0)
+                    resp.output_tokens.unwrap_or(0) as f64
+                        / (resp.provider_latency_ms as f64 / 1000.0)
                 } else {
                     0.0
                 };
-                println!("OK {}ms finish={:?} in={:?} out={:?} ~{tok_sec:.0}tok/s",
-                    resp.provider_latency_ms, resp.finish_reason,
-                    resp.input_tokens, resp.output_tokens);
+                println!(
+                    "OK {}ms finish={:?} in={:?} out={:?} ~{tok_sec:.0}tok/s",
+                    resp.provider_latency_ms,
+                    resp.finish_reason,
+                    resp.input_tokens,
+                    resp.output_tokens
+                );
             }
             Err(e) => {
                 failure_count += 1;

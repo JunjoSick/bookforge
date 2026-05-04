@@ -1,5 +1,5 @@
-use std::sync::Mutex;
 use bookforge_core::config::ProviderRequestMetric;
+use std::sync::Mutex;
 
 pub struct TelemetryLog {
     entries: Mutex<Vec<ProviderRequestMetric>>,
@@ -43,10 +43,7 @@ pub fn telemetry_summary(entries: &[ProviderRequestMetric]) -> String {
         .iter()
         .filter(|e| e.status_code == Some(429))
         .count();
-    let timed_out = entries
-        .iter()
-        .filter(|e| e.status == "timeout")
-        .count();
+    let timed_out = entries.iter().filter(|e| e.status == "timeout").count();
     let total_input_tokens: u64 = entries.iter().filter_map(|e| e.input_tokens).sum();
     let total_output_tokens: u64 = entries.iter().filter_map(|e| e.output_tokens).sum();
 

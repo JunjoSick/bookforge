@@ -12,7 +12,10 @@ use tokio::{sync::Semaphore, task::JoinSet};
 
 use crate::{
     prompt::{PromptLibrary, PromptTemplate, Substitutions},
-    provider::{CompletionRequest, FinishReason, LlmError, LlmProvider, RequestMetadata, ResponseFormat, Result},
+    provider::{
+        CompletionRequest, FinishReason, LlmError, LlmProvider, RequestMetadata, ResponseFormat,
+        Result,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -360,7 +363,11 @@ where
                     let tokens_in = if accum_in > 0 { Some(accum_in) } else { None };
                     let tokens_out = if accum_out > 0 { Some(accum_out) } else { None };
                     return failed_translation_with_tokens(
-                        &segment, mode, error.to_string(), tokens_in, tokens_out,
+                        &segment,
+                        mode,
+                        error.to_string(),
+                        tokens_in,
+                        tokens_out,
                     );
                 }
             }
@@ -396,7 +403,11 @@ where
                     let tokens_in = if accum_in > 0 { Some(accum_in) } else { None };
                     let tokens_out = if accum_out > 0 { Some(accum_out) } else { None };
                     return failed_translation_with_tokens(
-                        &segment, TranslationMode::RunPreserving, error.to_string(), tokens_in, tokens_out,
+                        &segment,
+                        TranslationMode::RunPreserving,
+                        error.to_string(),
+                        tokens_in,
+                        tokens_out,
                     );
                 }
             }
@@ -452,7 +463,7 @@ where
         user: rendered.user,
         response_format: ResponseFormat::Json,
         temperature,
-        max_output_tokens: Some(max_output_tokens(segment, mode)),
+        max_output_tokens: Some(max_output_tokens(segment, mode, provider.is_reasoning())),
         metadata: RequestMetadata {
             segment_id: Some(segment.id.0.clone()),
             block_ids: segment.block_ids.iter().map(|id| id.0.clone()).collect(),
@@ -485,7 +496,7 @@ where
     })
 }
 
-fn max_output_tokens(segment: &Segment, mode: TranslationMode) -> u32 {
+fn max_output_tokens(segment: &Segment, mode: TranslationMode, reasoning: bool) -> u32 {
     let source_tokens = segment.source.token_estimate.max(1);
     let block_overhead = segment.source.blocks.len().saturating_mul(128);
     let marker_overhead = match mode {
@@ -503,12 +514,14 @@ fn max_output_tokens(segment: &Segment, mode: TranslationMode) -> u32 {
             .sum::<usize>()
             .saturating_mul(32),
     };
+    let source_multiplier: usize = if reasoning { 8 } else { 3 };
+    let max_cap: usize = if reasoning { 32_768 } else { 8_192 };
     let estimate = source_tokens
-        .saturating_mul(3)
+        .saturating_mul(source_multiplier)
         .saturating_add(block_overhead)
         .saturating_add(marker_overhead)
         .max(512);
-    estimate.min(8_192) as u32
+    estimate.min(max_cap) as u32
 }
 
 fn render_prompt(

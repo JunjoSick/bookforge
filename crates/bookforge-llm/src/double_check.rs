@@ -6,8 +6,8 @@ use bookforge_core::{
 use serde::Deserialize;
 
 use crate::{
-    CompletionRequest, LlmError, LlmProvider, PromptLibrary, RequestMetadata,
-    ResponseFormat, SegmentTranslation, Substitutions, TranslationRunConfig,
+    CompletionRequest, LlmError, LlmProvider, PromptLibrary, RequestMetadata, ResponseFormat,
+    SegmentTranslation, Substitutions, TranslationRunConfig,
 };
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -142,14 +142,8 @@ where
 
     let mut all_issues = Vec::new();
     for chunk in &chunks {
-        let audit_result = run_audit_chunk(
-            &provider,
-            &library,
-            chunk,
-            config,
-            double_check_config,
-        )
-        .await?;
+        let audit_result =
+            run_audit_chunk(&provider, &library, chunk, config, double_check_config).await?;
         all_issues.extend(audit_result);
     }
 
@@ -174,13 +168,7 @@ where
 
     let mut records = Vec::new();
     for corr_chunk in correction_items.chunks(chunk_size.max(1)) {
-        let corr_results = run_correction_chunk(
-            &provider,
-            &library,
-            corr_chunk,
-            config,
-        )
-        .await?;
+        let corr_results = run_correction_chunk(&provider, &library, corr_chunk, config).await?;
 
         for result in corr_results {
             let valid = validate_correction(&result);
@@ -208,12 +196,23 @@ where
     P: LlmProvider,
 {
     let mut vars = Substitutions::new();
-    vars.string("source_language", config.source_language.as_deref().unwrap_or("the source language"))
-        .string("target_language", &config.target_language)
-        .string("double_check_mode", double_check_mode_str(double_check_config.mode))
-        .json_compact("items_json", &items);
+    vars.string(
+        "source_language",
+        config
+            .source_language
+            .as_deref()
+            .unwrap_or("the source language"),
+    )
+    .string("target_language", &config.target_language)
+    .string(
+        "double_check_mode",
+        double_check_mode_str(double_check_config.mode),
+    )
+    .json_compact("items_json", &items);
 
-    let rendered = library.double_check_batch.render(&vars)
+    let rendered = library
+        .double_check_batch
+        .render(&vars)
         .map_err(|e| LlmError::Provider(e.to_string()))?;
 
     let response = provider
@@ -230,10 +229,8 @@ where
     let parsed: DoubleCheckResponse = serde_json::from_str(&response.content)?;
 
     let mut corrections = Vec::new();
-    let item_map: std::collections::HashMap<&str, &DoubleCheckItem> = items
-        .iter()
-        .map(|item| (item.id.as_str(), item))
-        .collect();
+    let item_map: std::collections::HashMap<&str, &DoubleCheckItem> =
+        items.iter().map(|item| (item.id.as_str(), item)).collect();
 
     for result in &parsed.items {
         let Some(source_item) = item_map.get(result.id.as_str()) else {
@@ -308,12 +305,20 @@ where
         .collect();
 
     let mut vars = Substitutions::new();
-    vars.string("source_language", config.source_language.as_deref().unwrap_or("the source language"))
-        .string("target_language", &config.target_language)
-        .json_compact("items_json", &item_inputs)
-        .json_compact("issues_json", &issue_inputs);
+    vars.string(
+        "source_language",
+        config
+            .source_language
+            .as_deref()
+            .unwrap_or("the source language"),
+    )
+    .string("target_language", &config.target_language)
+    .json_compact("items_json", &item_inputs)
+    .json_compact("issues_json", &issue_inputs);
 
-    let rendered = library.correct_batch.render(&vars)
+    let rendered = library
+        .correct_batch
+        .render(&vars)
         .map_err(|e| LlmError::Provider(e.to_string()))?;
 
     let response = provider

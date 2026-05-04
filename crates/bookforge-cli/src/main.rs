@@ -1,3 +1,4 @@
+mod checkpoint;
 mod commands;
 mod cost;
 mod report;
