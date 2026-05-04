@@ -553,25 +553,23 @@ where
     let mut pending: Vec<TranslationBatch> = batches;
     let max_rounds = 3usize;
 
+    let semaphore = match limiter.as_ref() {
+        Some(l) => l.semaphore(),
+        None => Arc::new(Semaphore::new(concurrency)),
+    };
+
     for _round in 0..max_rounds {
         if pending.is_empty() {
             break;
         }
 
-        let active_concurrency = if let Some(ref l) = limiter {
-            l.current()
-        } else {
-            concurrency
-        };
-
-        let round_semaphore = Arc::new(Semaphore::new(active_concurrency));
         let mut tasks = JoinSet::new();
 
         for batch in pending.drain(..) {
             let provider = provider.clone();
             let library = library.clone();
             let config = config.clone();
-            let semaphore = round_semaphore.clone();
+            let semaphore = semaphore.clone();
             let telemetry = telemetry.clone();
             let limiter = limiter.clone();
 
