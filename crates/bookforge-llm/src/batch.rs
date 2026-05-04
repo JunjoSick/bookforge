@@ -10,8 +10,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::{
-    AdaptiveLimiter, CompletionRequest, LlmError, LlmProvider, PromptLibrary, RequestMetadata,
-    ResponseFormat, SegmentTranslation, Substitutions, TelemetryLog, TranslationRunConfig,
+    AdaptiveLimiter, CompletionRequest, FinishReason, LlmError, LlmProvider, PromptLibrary,
+    RequestMetadata, ResponseFormat, SegmentTranslation, Substitutions, TelemetryLog,
+    TranslationRunConfig,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -710,10 +711,17 @@ where
                     input_tokens: Some(batch_result.input_tokens.unwrap_or(0)),
                     output_tokens: Some(batch_result.output_tokens.unwrap_or(0)),
                 });
-            entry.blocks.push(BlockTranslation {
-                block_id: BlockId(translation.item_id.clone()),
-                text: translation.text.clone(),
-            });
+            if let Some(source_item) = all_items.get(&translation.item_id) {
+                entry.blocks.push(BlockTranslation {
+                    block_id: source_item.block_id.clone(),
+                    text: translation.text.clone(),
+                });
+            } else {
+                eprintln!(
+                    "batch translation item_id {} missing from all_items; skipping (internal state bug)",
+                    translation.item_id,
+                );
+            }
         }
 
         for failure in &batch_result.failures {
@@ -864,28 +872,16 @@ async fn translate_one_batch(
 
     match response {
         Ok(resp) => {
+            if resp.finish_reason == FinishReason::Length {
+                return Err(LlmError::InvalidResponse(
+                    "batch output was truncated: max_output_tokens limit reached".to_string(),
+                ));
+            }
+
             let mut result = parse_batch_response(&batch, &resp.content)
                 .map_err(LlmError::InvalidResponse)?;
             result.input_tokens = resp.input_tokens;
             result.output_tokens = resp.output_tokens;
-            Ok(result)
-        }
-        Err(LlmError::InvalidResponse(msg)) if msg.contains("truncated") => {
-            let result = BatchTranslationResult {
-                batch_id: batch.id.clone(),
-                translations: Vec::new(),
-                failures: batch
-                    .items
-                    .iter()
-                    .map(|item| BatchItemFailure {
-                        item_id: item.item_id.clone(),
-                        segment_id: item.segment_id.clone(),
-                        error: format!("batch output truncated: {msg}"),
-                    })
-                    .collect(),
-                input_tokens: None,
-                output_tokens: None,
-            };
             Ok(result)
         }
         Err(e) => Err(e),
@@ -1081,4 +1077,181 @@ mod tests {
         assert_eq!(split.len(), 2);
         assert_eq!(split[0].items.len(), 2);
         assert_eq!(split[1].items.len(), 2);
-    }}
+    }
+
+    use crate::provider::{
+        CompletionRequest, CompletionResponse, LlmProvider as LlmProviderTrait,
+        ProviderCapabilities, Result as ProviderResult,
+    };
+    use std::sync::Mutex;
+
+    enum StubBehavior {
+        FinishLength,
+        ErrInvalid(String),
+        ItemsFromBatch(Vec<(String, String)>),
+    }
+
+    struct StubProvider {
+        behavior: Mutex<Option<StubBehavior>>,
+    }
+
+    impl StubProvider {
+        fn new(behavior: StubBehavior) -> Self {
+            Self {
+                behavior: Mutex::new(Some(behavior)),
+            }
+        }
+    }
+
+    impl LlmProviderTrait for StubProvider {
+        async fn complete(&self, _request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+            let behavior = self.behavior.lock().unwrap().take().expect("stub used twice");
+            match behavior {
+                StubBehavior::FinishLength => Ok(CompletionResponse {
+                    content: "{\"items\":[]}".to_string(),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    finish_reason: FinishReason::Length,
+                    provider_latency_ms: 0,
+                    raw: serde_json::json!({}),
+                }),
+                StubBehavior::ErrInvalid(msg) => Err(LlmError::InvalidResponse(msg)),
+                StubBehavior::ItemsFromBatch(items) => {
+                    let json = serde_json::json!({
+                        "items": items
+                            .into_iter()
+                            .map(|(id, t)| serde_json::json!({"id": id, "translation": t}))
+                            .collect::<Vec<_>>(),
+                    });
+                    Ok(CompletionResponse {
+                        content: json.to_string(),
+                        input_tokens: Some(1),
+                        output_tokens: Some(1),
+                        finish_reason: FinishReason::Stop,
+                        provider_latency_ms: 0,
+                        raw: serde_json::json!({}),
+                    })
+                }
+            }
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    fn test_run_config() -> TranslationRunConfig {
+        TranslationRunConfig {
+            source_language: Some("English".to_string()),
+            target_language: "Italian".to_string(),
+            provider: "stub".to_string(),
+            model: "stub".to_string(),
+            prompt_version: "v1".to_string(),
+            temperature: 0.2,
+            scheduler: bookforge_core::scheduler::SchedulerConfig::default(),
+            profile: TranslationProfile::Balanced,
+        }
+    }
+
+    fn make_two_item_batch() -> TranslationBatch {
+        let seg1 = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+        let seg2 = make_segment("seg2", vec![plain_block("Goodbye")], vec![]);
+        let config = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        build_translation_batches(&[seg1, seg2], &config, TranslationProfile::Balanced)
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn batch_length_finish_reason_returns_invalid_response() {
+        let batch = make_two_item_batch();
+        let provider = Arc::new(StubProvider::new(StubBehavior::FinishLength));
+        let library = Arc::new(PromptLibrary::embedded());
+        let config = test_run_config();
+
+        let result = translate_one_batch(provider, library, batch, &config).await;
+        match result {
+            Err(LlmError::InvalidResponse(msg)) => {
+                assert!(msg.contains("truncated"), "unexpected msg: {msg}")
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_truncated_error_is_not_swallowed() {
+        let batch = make_two_item_batch();
+        let provider = Arc::new(StubProvider::new(StubBehavior::ErrInvalid(
+            "output was truncated".to_string(),
+        )));
+        let library = Arc::new(PromptLibrary::embedded());
+        let config = test_run_config();
+
+        let result = translate_one_batch(provider, library, batch, &config).await;
+        match result {
+            Err(LlmError::InvalidResponse(msg)) => {
+                assert!(msg.contains("truncated"), "unexpected msg: {msg}")
+            }
+            Ok(_) => panic!("truncated error must not be swallowed into Ok"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_translation_preserves_original_block_ids() {
+        let seg1 = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+        let seg2 = make_segment("seg2", vec![plain_block("Goodbye")], vec![]);
+        let segments = vec![seg1.clone(), seg2.clone()];
+        let cfg = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches =
+            build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+        assert_eq!(batches.len(), 1);
+        let item_ids: Vec<(String, String)> = batches[0]
+            .items
+            .iter()
+            .map(|i| (i.item_id.clone(), format!("[it] {}", i.source_text)))
+            .collect();
+
+        let provider = StubProvider::new(StubBehavior::ItemsFromBatch(item_ids));
+        let telemetry = Arc::new(TelemetryLog::new());
+        let config = test_run_config();
+        let translations = translate_batches_with_callback(
+            provider,
+            batches,
+            &segments,
+            &config,
+            telemetry,
+            None,
+            |_| Ok(()),
+        )
+        .await
+        .expect("translate");
+
+        assert_eq!(translations.len(), 2);
+        for translation in translations {
+            for block in &translation.blocks {
+                assert!(
+                    !block.block_id.0.contains(':'),
+                    "block_id leaked compound item id: {}",
+                    block.block_id.0,
+                );
+            }
+        }
+    }
+}
