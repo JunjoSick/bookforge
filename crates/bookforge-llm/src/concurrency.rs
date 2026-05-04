@@ -1,9 +1,8 @@
 use std::sync::{
     Arc, Mutex,
-    atomic::AtomicU64,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
 use bookforge_core::{ProgressEvent, ProgressSink};
@@ -14,8 +13,8 @@ pub struct AdaptiveLimiter {
     max: usize,
     semaphore: Arc<Semaphore>,
     permits_to_burn: Arc<AtomicUsize>,
-    last_grow: AtomicU64,
-    grow_interval_ms: u64,
+    last_grow: Mutex<Option<Instant>>,
+    grow_interval: Duration,
     progress: Option<Arc<dyn ProgressSink>>,
 }
 
@@ -61,8 +60,8 @@ impl AdaptiveLimiter {
             max,
             semaphore: Arc::new(Semaphore::new(min)),
             permits_to_burn: Arc::new(AtomicUsize::new(0)),
-            last_grow: AtomicU64::new(0),
-            grow_interval_ms: grow_interval.as_millis() as u64,
+            last_grow: Mutex::new(None),
+            grow_interval,
             progress,
         }
     }
@@ -80,18 +79,15 @@ impl AdaptiveLimiter {
     }
 
     pub fn on_success(&self) {
-        let now = now_ms();
-        let last = self.last_grow.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < self.grow_interval_ms {
-            return;
-        }
-        if self
-            .last_grow
-            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
+        let now = Instant::now();
+        let mut last = self.last_grow.lock().unwrap();
+        if let Some(prev) = *last
+            && now.duration_since(prev) < self.grow_interval
         {
             return;
         }
+        *last = Some(now);
+        drop(last);
         self.update(|c| c + 1);
     }
 
@@ -154,13 +150,11 @@ impl AdaptiveLimiter {
                 previous,
                 current: new,
                 reason: String::new(),
-                timestamp_ms: now_ms(),
+                timestamp_ms: bookforge_core::progress::now_ms(),
             });
         }
     }
 }
-
-use bookforge_core::progress::now_ms;
 
 #[cfg(test)]
 mod tests {

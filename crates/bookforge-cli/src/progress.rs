@@ -166,6 +166,7 @@ async fn render_progress_bars(
     let mut _checkpoint_flushed = 0usize;
     let mut last_render = Instant::now();
     let mut jsonl_file: Option<std::fs::File> = None;
+    let mut jsonl_failed = false;
 
     loop {
         // Receive with a short timeout so we can render periodically
@@ -268,15 +269,16 @@ async fn render_progress_bars(
             last_render = Instant::now();
         }
 
-        // Open JSONL file lazily when JobCreated arrives (first event with job_id)
-        if jsonl_file.is_none() {
-            if let Some(ref path) = jsonl_path {
-                if let Ok(f) = std::fs::File::create(path) {
-                    jsonl_file = Some(f);
+        // Open JSONL file lazily on first event; skip if we already tried and failed.
+        if jsonl_file.is_none() && !jsonl_failed
+            && let Some(ref path) = jsonl_path
+        {
+            match std::fs::File::create(path) {
+                Ok(f) => jsonl_file = Some(f),
+                Err(e) => {
+                    jsonl_failed = true;
+                    let _ = multi.println(format!("  [warn] cannot create JSONL log: {e}"));
                 }
-            } else {
-                // Auto-created JSONL is skipped for now
-                jsonl_file = Some(std::fs::File::create("/dev/null").unwrap());
             }
         }
     }
