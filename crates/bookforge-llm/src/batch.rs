@@ -542,8 +542,13 @@ where
 {
     let library = Arc::new(PromptLibrary::embedded());
     let provider = Arc::new(provider);
-
     let concurrency = config.scheduler.concurrency.max(1);
+
+    let all_items: HashMap<String, TranslationBatchItem> = batches
+        .iter()
+        .flat_map(|b| b.items.iter())
+        .map(|item| (item.item_id.clone(), item.clone()))
+        .collect();
 
     let mut all_results: Vec<BatchTranslationResult> = Vec::new();
     let mut pending: Vec<TranslationBatch> = batches;
@@ -713,6 +718,70 @@ where
                     input_tokens: None,
                     output_tokens: None,
                 });
+        }
+    }
+
+    let repair_items: Vec<(BatchItemFailure, TranslationBatchItem)> = all_results
+        .iter()
+        .flat_map(|r| &r.failures)
+        .filter(|f| f.segment_id.0 != "unknown")
+        .filter_map(|f| {
+            all_items.get(f.item_id.as_str()).map(|item| (f.clone(), (*item).clone()))
+        })
+        .collect();
+
+    if !repair_items.is_empty() {
+        let repair_batch = TranslationBatch {
+            id: "repair".to_string(),
+            ordinal: 999,
+            mode: BatchMode::Plain,
+            items: repair_items.iter().map(|(_, item)| item.clone()).collect(),
+            token_estimate: repair_items.iter().map(|(_, item)| token_estimate(&item.source_text)).sum(),
+        };
+
+        let items_json: Vec<serde_json::Value> = repair_items
+            .iter()
+            .map(|(_failure, item)| {
+                serde_json::json!({
+                    "id": item.item_id,
+                    "source_text": item.source_text,
+                    "required_markers": item.required_markers,
+                    "protected": item.protected_spans,
+                })
+            })
+            .collect();
+
+        let errors_json: Vec<serde_json::Value> = repair_items
+            .iter()
+            .map(|(failure, _)| serde_json::json!({"id": failure.item_id, "error": failure.error}))
+            .collect();
+
+        let mut vars = Substitutions::new();
+        vars.raw("items_json", serde_json::to_string(&items_json).unwrap_or_default())
+            .raw("errors_json", serde_json::to_string(&errors_json).unwrap_or_default());
+
+        #[allow(clippy::collapsible_if)]
+        if let Ok(rendered) = library.batch_repair.render(&vars) {
+            if let Ok(response) = provider.complete(CompletionRequest {
+                system: rendered.system,
+                user: rendered.user,
+                response_format: ResponseFormat::Json,
+                temperature: 0.1,
+                max_output_tokens: Some(batch_max_output_tokens(&repair_batch, config.profile)),
+                metadata: RequestMetadata::default(),
+            }).await {
+                if let Ok(repaired) = parse_batch_response(&repair_batch, &response.content) {
+                    for translation in repaired.translations {
+                        if let Some(existing) = segment_translations.get_mut(&translation.segment_id.0) {
+                            existing.status = SegmentStatus::Succeeded;
+                            existing.error = None;
+                            if let Some(block) = existing.blocks.iter_mut().find(|b| b.block_id.0 == translation.item_id) {
+                                block.text = translation.text;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
