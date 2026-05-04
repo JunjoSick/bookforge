@@ -197,14 +197,15 @@ impl JobStore {
         prompt_version: &str,
         provider: &str,
         model: &str,
+        cache_namespace: &str,
     ) -> Result<()> {
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
         for segment in segments {
             tx.execute(
                 "INSERT OR IGNORE INTO segments
-                 (id, job_id, section_id, ordinal, source_hash, prompt_version, provider, model, status, attempts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 0)",
+                 (id, job_id, section_id, ordinal, source_hash, prompt_version, provider, model, status, attempts, cache_namespace)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 0, ?9)",
                 params![
                     segment.id.0,
                     job_id,
@@ -214,6 +215,7 @@ impl JobStore {
                     prompt_version,
                     provider,
                     model,
+                    cache_namespace,
                 ],
             )?;
         }
@@ -493,6 +495,7 @@ impl JobStore {
         model: &str,
         source_lang: Option<&str>,
         target_lang: &str,
+        cache_namespace: &str,
     ) -> Result<Option<CachedTranslation>> {
         let conn = self.conn.borrow();
         let cached = conn
@@ -507,6 +510,7 @@ impl JobStore {
                    AND s.model = ?4
                    AND ((?5 IS NULL AND j.source_lang IS NULL) OR j.source_lang = ?5)
                    AND j.target_lang = ?6
+                   AND s.cache_namespace = ?7
                    AND s.status IN ('succeeded', 'skipped_cached')
                  ORDER BY t.created_at DESC
                  LIMIT 1",
@@ -516,7 +520,8 @@ impl JobStore {
                     provider,
                     model,
                     source_lang,
-                    target_lang
+                    target_lang,
+                    cache_namespace,
                 ],
                 |row| {
                     Ok((
@@ -545,6 +550,19 @@ impl JobStore {
             })
         })?;
         let blocks = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Exact block-ID compatibility: the cached row's blocks must match
+        // the current segment's block_ids (set-equal). We compare sorted
+        // sets because translation_blocks is stored ORDER BY block_id and
+        // segment.block_ids preserves source order; either way, both must
+        // contain the same identifiers for the cache to apply cleanly.
+        let mut expected: Vec<&str> = segment.block_ids.iter().map(|id| id.0.as_str()).collect();
+        let mut actual: Vec<&str> = blocks.iter().map(|b| b.block_id.0.as_str()).collect();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        if expected != actual {
+            return Ok(None);
+        }
 
         Ok(Some(CachedTranslation {
             translated_text,
@@ -639,6 +657,16 @@ impl JobStore {
         ensure_column(&conn, "jobs", "output_path", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "jobs", "base_url", "TEXT")?;
         ensure_column(&conn, "jobs", "api_key_env", "TEXT")?;
+        ensure_column(
+            &conn,
+            "segments",
+            "cache_namespace",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_segments_cache_lookup
+             ON segments(source_hash, cache_namespace, prompt_version, provider, model, status);",
+        )?;
         Ok(())
     }
 
@@ -797,7 +825,7 @@ mod tests {
             .expect("job should be created");
         let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
         store
-            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix")
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "test_ns")
             .expect("segments should insert");
 
         store
@@ -873,5 +901,109 @@ mod tests {
             std::process::id(),
             unix_timestamp_nanos()
         ))
+    }
+
+    fn build_seeded_store_with_translation(
+        db_path: &PathBuf,
+        cache_namespace: &str,
+        block_ids: &[&str],
+    ) -> (JobStore, JobRecord, Segment) {
+        let input_path = temp_path("input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+        let store = JobStore::open(db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+            })
+            .expect("job should be created");
+
+        let mut seg = segment("seg_a", 0);
+        let blocks: Vec<BlockTranslation> = block_ids
+            .iter()
+            .map(|id| BlockTranslation {
+                block_id: BlockId(id.to_string()),
+                text: format!("Tradotto {id}"),
+            })
+            .collect();
+        seg.block_ids = block_ids.iter().map(|id| BlockId(id.to_string())).collect();
+
+        store
+            .insert_segments(&job.id, &[seg.clone()], "v1", "mock", "mock-prefix", cache_namespace)
+            .expect("segments should insert");
+        store
+            .save_translation(SaveTranslation {
+                job_id: &job.id,
+                segment_id: "seg_a",
+                translated_text: "Tradotto",
+                blocks: &blocks,
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                input_tokens: Some(11),
+                output_tokens: Some(7),
+            })
+            .expect("translation should save");
+
+        let _ = fs::remove_file(input_path);
+        (store, job, seg)
+    }
+
+    #[test]
+    fn cached_translation_requires_matching_cache_namespace() {
+        let db_path = temp_path("ns_match.sqlite");
+        let (store, _job, seg) =
+            build_seeded_store_with_translation(&db_path, "ns_one", &["b_000000"]);
+
+        let hit = store
+            .find_cached_translation(&seg, "v1", "mock", "mock-prefix", Some("English"), "Italian", "ns_one")
+            .expect("query ok");
+        assert!(hit.is_some(), "matching namespace should hit");
+
+        let miss = store
+            .find_cached_translation(&seg, "v1", "mock", "mock-prefix", Some("English"), "Italian", "ns_two")
+            .expect("query ok");
+        assert!(miss.is_none(), "different namespace must not hit");
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn cached_translation_rejects_mismatched_block_ids() {
+        let db_path = temp_path("blockid_match.sqlite");
+        let (store, _job, mut seg) =
+            build_seeded_store_with_translation(&db_path, "ns_x", &["b_000000"]);
+
+        // Caller's segment now expects different block IDs than what was stored.
+        seg.block_ids = vec![BlockId("b_999999".to_string())];
+
+        let miss = store
+            .find_cached_translation(&seg, "v1", "mock", "mock-prefix", Some("English"), "Italian", "ns_x")
+            .expect("query ok");
+        assert!(miss.is_none(), "mismatched block_ids must reject the cached row");
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn old_empty_cache_namespace_rows_do_not_match_new_runs() {
+        let db_path = temp_path("legacy_ns.sqlite");
+        // Simulate a row migrated from an older schema with the default empty namespace.
+        let (store, _job, seg) =
+            build_seeded_store_with_translation(&db_path, "", &["b_000000"]);
+
+        let miss = store
+            .find_cached_translation(&seg, "v1", "mock", "mock-prefix", Some("English"), "Italian", "real_ns")
+            .expect("query ok");
+        assert!(miss.is_none(), "legacy empty-namespace row must not satisfy a real namespace lookup");
+
+        let _ = fs::remove_file(db_path);
     }
 }

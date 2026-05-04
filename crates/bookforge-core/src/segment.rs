@@ -7,6 +7,40 @@ use crate::{
     ir::{Block, BlockId, BlockKind, Book, Section, SectionId},
 };
 
+/// Bumped when the cache key derivation changes incompatibly.
+pub const CACHE_KEY_SCHEMA_VERSION: u32 = 1;
+/// Bumped when Segment / SegmentBlock layout changes incompatibly.
+pub const SEGMENT_SCHEMA_VERSION: u32 = 1;
+/// Bumped when inline marker extraction (m/keep/ref) changes incompatibly.
+pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 1;
+
+/// Compute a cache namespace that scopes lookups to a single set of
+/// schema and segmentation parameters. Cached rows from a different
+/// namespace are not eligible for reuse.
+pub fn compute_cache_namespace(
+    max_segment_tokens: usize,
+    context_tokens: usize,
+    profile: &str,
+    batch_enabled: bool,
+    prompt_version: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(CACHE_KEY_SCHEMA_VERSION.to_le_bytes());
+    hasher.update(SEGMENT_SCHEMA_VERSION.to_le_bytes());
+    hasher.update(INLINE_MARKER_SCHEMA_VERSION.to_le_bytes());
+    hasher.update((max_segment_tokens as u64).to_le_bytes());
+    hasher.update((context_tokens as u64).to_le_bytes());
+    hasher.update(profile.as_bytes());
+    hasher.update([batch_enabled as u8]);
+    hasher.update(prompt_version.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockTranslation {
     pub block_id: BlockId,
@@ -371,6 +405,20 @@ mod tests {
         };
 
         assert!(build_segments(&book, &config).is_err());
+    }
+
+    #[test]
+    fn cache_namespace_changes_when_segmentation_settings_change() {
+        let a = compute_cache_namespace(1200, 160, "Balanced", false, "v1");
+        let b = compute_cache_namespace(1201, 160, "Balanced", false, "v1");
+        let c = compute_cache_namespace(1200, 160, "Balanced", true, "v1");
+        let d = compute_cache_namespace(1200, 160, "Balanced", false, "batch_v1");
+        let e = compute_cache_namespace(1200, 160, "Balanced", false, "v1");
+
+        assert_ne!(a, b, "max_segment_tokens must affect namespace");
+        assert_ne!(a, c, "batch_enabled must affect namespace");
+        assert_ne!(a, d, "prompt_version must affect namespace");
+        assert_eq!(a, e, "namespace is deterministic for identical inputs");
     }
 
     fn book_with_two_sections() -> Book {

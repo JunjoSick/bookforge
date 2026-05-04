@@ -5,7 +5,7 @@ use bookforge_core::{
         TranslationConfig, TranslationProfile,
     },
     scheduler::SchedulerConfig,
-    segment::{BlockTranslation, Segment, SegmentStatus, build_segments},
+    segment::{BlockTranslation, Segment, SegmentStatus, build_segments, compute_cache_namespace},
 };
 use bookforge_epub::{read_epub, rebuild_epub};
 #[cfg(test)]
@@ -294,7 +294,14 @@ async fn run_mock_translation(
         api_key_env: None,
     })?;
     println!("Job: {}", job.id);
-    store.insert_segments(&job.id, &segments, prompt_version, "mock", &model)?;
+    let cache_namespace = compute_cache_namespace(
+        settings.segmentation.max_segment_tokens,
+        settings.segmentation.context_tokens,
+        &format!("{:?}", settings.profile),
+        settings.batch.enabled,
+        prompt_version,
+    );
+    store.insert_segments(&job.id, &segments, prompt_version, "mock", &model, &cache_namespace)?;
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
         target_language: config.target_language.clone(),
@@ -316,6 +323,7 @@ async fn run_mock_translation(
             model: &model,
             source_lang: config.source_language.as_deref(),
             target_lang: &config.target_language,
+            cache_namespace: &cache_namespace,
         },
     )?;
     let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
@@ -400,7 +408,14 @@ async fn run_openai_compatible_translation(
         api_key_env: Some(&provider_config.api_key_env),
     })?;
     println!("Job: {}", job.id);
-    store.insert_segments(&job.id, &segments, prompt_version, &config.provider, &model)?;
+    let cache_namespace_v1 = compute_cache_namespace(
+        settings.segmentation.max_segment_tokens,
+        settings.segmentation.context_tokens,
+        &format!("{:?}", settings.profile),
+        settings.batch.enabled,
+        prompt_version,
+    );
+    store.insert_segments(&job.id, &segments, prompt_version, &config.provider, &model, &cache_namespace_v1)?;
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
         target_language: config.target_language.clone(),
@@ -426,7 +441,14 @@ async fn run_openai_compatible_translation(
             },
             profile: settings.profile,
         };
-        store.insert_segments(&job.id, &segments, "batch_v1", &config.provider, &model)?;
+        let cache_namespace_batch = compute_cache_namespace(
+            settings.segmentation.max_segment_tokens,
+            settings.segmentation.context_tokens,
+            &format!("{:?}", settings.profile),
+            settings.batch.enabled,
+            "batch_v1",
+        );
+        store.insert_segments(&job.id, &segments, "batch_v1", &config.provider, &model, &cache_namespace_batch)?;
         let mut translations = apply_cached_translations(
             &segments,
             CacheContext {
@@ -437,6 +459,7 @@ async fn run_openai_compatible_translation(
                 model: &model,
                 source_lang: config.source_language.as_deref(),
                 target_lang: &config.target_language,
+                cache_namespace: &cache_namespace_batch,
             },
         )?;
         let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
@@ -498,6 +521,7 @@ async fn run_openai_compatible_translation(
                 model: &model,
                 source_lang: config.source_language.as_deref(),
                 target_lang: &config.target_language,
+                cache_namespace: &cache_namespace_v1,
             },
         )?;
         let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
@@ -850,6 +874,7 @@ pub(crate) struct CacheContext<'a> {
     pub model: &'a str,
     pub source_lang: Option<&'a str>,
     pub target_lang: &'a str,
+    pub cache_namespace: &'a str,
 }
 
 pub(crate) async fn translate_and_checkpoint<P>(
@@ -889,12 +914,9 @@ pub(crate) fn apply_cached_translations(
     segments: &[Segment],
     cache: CacheContext<'_>,
 ) -> Result<Vec<SegmentTranslation>> {
-    let alt_version = match cache.prompt_version {
-        "batch_v1" => Some("v1"),
-        "v1" => Some("batch_v1"),
-        _ => None,
-    };
-
+    // Cross prompt-version fallback was removed: namespace + exact
+    // block-ID compatibility now gates reuse, so a stale "batch_v1" hit
+    // on a "v1" run would be unsafe even with matching block IDs.
     let mut cached = Vec::new();
     for segment in segments {
         let hit = cache.store.find_cached_translation(
@@ -904,17 +926,8 @@ pub(crate) fn apply_cached_translations(
             cache.model,
             cache.source_lang,
             cache.target_lang,
+            cache.cache_namespace,
         )?;
-        let hit = if hit.is_some() {
-            hit
-        } else if let Some(alt) = alt_version {
-            cache.store.find_cached_translation(
-                segment, alt, cache.provider, cache.model,
-                cache.source_lang, cache.target_lang,
-            )?
-        } else {
-            None
-        };
 
         let Some(hit) = hit else {
             continue;
@@ -1342,7 +1355,7 @@ mod tests {
             .expect("job should be created");
         let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
         store
-            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix")
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "test_ns")
             .expect("segments should insert");
         let config = TranslationRunConfig {
             source_language: Some("English".to_string()),

@@ -8,7 +8,7 @@ use bookforge_core::{
     config::SegmentationConfig,
     config::TranslationProfile,
     scheduler::SchedulerConfig,
-    segment::{BlockTranslation, Segment, SegmentStatus, build_segments},
+    segment::{BlockTranslation, Segment, SegmentStatus, build_segments, compute_cache_namespace},
 };
 use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::{
@@ -81,6 +81,16 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
         profile: TranslationProfile::Balanced,
     };
 
+    // Resume currently rebuilds segments from defaults; namespace must
+    // match what insert_segments stored on the original run.
+    let segmentation = SegmentationConfig::default();
+    let cache_namespace = compute_cache_namespace(
+        segmentation.max_segment_tokens,
+        segmentation.context_tokens,
+        &format!("{:?}", run_config.profile),
+        false,
+        prompt_version,
+    );
     let mut cached_translations = apply_cached_translations(
         &pending_segments,
         CacheContext {
@@ -91,6 +101,7 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
             model: &job.model,
             source_lang: job.source_lang.as_deref(),
             target_lang: &job.target_lang,
+            cache_namespace: &cache_namespace,
         },
     )?;
     let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
