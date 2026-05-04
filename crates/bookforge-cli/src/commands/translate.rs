@@ -301,6 +301,28 @@ pub async fn run(
     let reporter = crate::progress::ProgressReporter::spawn(args.ui, args.progress_jsonl.clone());
     let progress_sink = reporter.sink();
 
+    // Warn if retry amplification is high
+    let retry_amplification = settings.provider.provider_max_attempts
+        * settings.scheduler.max_attempts
+        * settings.provider.validation_max_attempts;
+    if retry_amplification > 9 {
+        progress_sink.emit(bookforge_core::ProgressEvent::Warning {
+            kind: "retry_amplification".to_string(),
+            message: format!(
+                "high retry amplification: provider_max_attempts={}, scheduler_max_attempts={}, validation_max_attempts={} (total {} potential retries per segment)",
+                settings.provider.provider_max_attempts,
+                settings.scheduler.max_attempts,
+                settings.provider.validation_max_attempts,
+                retry_amplification
+            ),
+            timestamp_ms: bookforge_core::progress::now_ms(),
+        });
+        eprintln!(
+            "warn: high retry amplification ({} total potential retries per segment)",
+            retry_amplification
+        );
+    }
+
     let run_result = async {
         match config.provider.as_str() {
             "mock" => {

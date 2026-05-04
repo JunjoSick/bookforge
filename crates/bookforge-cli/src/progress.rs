@@ -214,8 +214,21 @@ async fn render_progress_bars(
                                 seg_bar.set_position(done_segments as u64);
                                 let elapsed = start.elapsed().as_secs_f64().max(0.1);
                                 let rate_per_min = done_segments as f64 / elapsed * 60.0;
+                                let remaining = total_segments.saturating_sub(done_segments);
+                                let eta_secs = if rate_per_min > 0.0 {
+                                    remaining as f64 / (rate_per_min / 60.0)
+                                } else {
+                                    0.0
+                                };
+                                let eta_str = if eta_secs > 3600.0 {
+                                    format!("{:.1}h", eta_secs / 3600.0)
+                                } else if eta_secs > 60.0 {
+                                    format!("{:.0}m", eta_secs / 60.0)
+                                } else {
+                                    format!("{:.0}s", eta_secs)
+                                };
                                 rate_bar.set_message(format!(
-                                    "{done_segments}/{total_segments} done, {rate_per_min:.1} seg/min"
+                                    "{done_segments}/{total_segments} done, {rate_per_min:.1} seg/min, ETA {eta_str}"
                                 ));
                             }
                             _ => {}
