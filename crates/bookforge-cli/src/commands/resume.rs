@@ -292,6 +292,7 @@ fn openai_compatible_config(
             model: job.model.clone(),
             timeout_seconds,
             provider_max_attempts,
+            thinking_disabled: false,
         });
     }
 
@@ -309,6 +310,7 @@ fn openai_compatible_config(
         model: job.model.clone(),
         timeout_seconds,
         provider_max_attempts,
+        thinking_disabled: false,
     })
 }
 

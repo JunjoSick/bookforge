@@ -421,6 +421,7 @@ pub struct OpenAiCompatibleConfig {
     pub model: String,
     pub timeout_seconds: u64,
     pub provider_max_attempts: usize,
+    pub thinking_disabled: bool,
 }
 
 impl OpenAiCompatibleConfig {
@@ -431,6 +432,7 @@ impl OpenAiCompatibleConfig {
             model: model.unwrap_or_else(|| "deepseek-chat".to_string()),
             timeout_seconds: 120,
             provider_max_attempts: 6,
+            thinking_disabled: false,
         }
     }
 }
@@ -495,6 +497,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
         if let Some(max_tokens) = request.max_output_tokens {
             body["max_tokens"] = json!(max_tokens);
+        }
+
+        if self.config.thinking_disabled {
+            body["thinking"] = json!({"type": "disabled"});
         }
 
         if request.response_format == ResponseFormat::Json {

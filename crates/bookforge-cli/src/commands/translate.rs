@@ -142,6 +142,9 @@ pub struct TranslateArgs {
 
     #[arg(long, value_enum, default_value_t = FallbackScope::Failed)]
     pub fallback_only: FallbackScope,
+
+    #[arg(long, default_value_t = false)]
+    pub no_thinking: bool,
 }
 
 fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
@@ -186,6 +189,7 @@ fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
         settings.provider.validation_max_attempts = v;
     }
     settings.provider.timeout_seconds = args.provider.timeout_seconds;
+    settings.provider.thinking_disabled = args.no_thinking;
 
     settings.qa.concurrency = args.qa_concurrency;
     if let Some(v) = args.qa_batch_target_tokens {
@@ -403,6 +407,7 @@ async fn run_openai_compatible_translation(
         provider_args.api_key_env.as_deref(),
         settings.provider.timeout_seconds,
         settings.provider.provider_max_attempts,
+        settings.provider.thinking_disabled,
     ) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -644,6 +649,7 @@ fn provider_config(
     api_key_env: Option<&str>,
     timeout_seconds: u64,
     provider_max_attempts: usize,
+    thinking_disabled: bool,
 ) -> Result<OpenAiCompatibleConfig> {
     let (default_url, default_key_env, default_model) = match provider {
         "deepseek" => (
@@ -676,6 +682,7 @@ fn provider_config(
             .unwrap_or_else(|| default_model.to_string()),
         timeout_seconds,
         provider_max_attempts: provider_max_attempts.max(1),
+        thinking_disabled,
     })
 }
 
@@ -766,6 +773,7 @@ async fn run_fallback_pass(
         cli_args.fallback_api_key_env.as_deref(),
         settings.provider.timeout_seconds,
         settings.provider.provider_max_attempts,
+        settings.provider.thinking_disabled,
     )?;
 
     let fallback =
@@ -867,6 +875,7 @@ async fn run_double_check_pass(
                 cli_args.double_check_api_key_env.as_deref(),
                 settings.provider.timeout_seconds,
                 settings.provider.provider_max_attempts,
+                settings.provider.thinking_disabled,
             )?;
             OpenAiCompatibleProvider::new(dc_config).map_err(|e| anyhow::anyhow!("{e}"))?
         } else {
@@ -1233,6 +1242,7 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
             .unwrap_or_else(|| "openrouter/auto".to_string()),
         timeout_seconds: args.provider.timeout_seconds,
         provider_max_attempts: 6,
+        thinking_disabled: false,
     };
 
     let provider = OpenAiCompatibleProvider::new(provider_config.clone())?;
@@ -1483,12 +1493,12 @@ mod tests {
 
     #[test]
     fn provider_config_sets_provider_max_attempts() {
-        let cfg = provider_config("openrouter", None, None, None, 120, 2)
+        let cfg = provider_config("openrouter", None, None, None, 120, 2, false)
             .expect("provider_config should build");
         assert_eq!(cfg.provider_max_attempts, 2);
 
         // Zero gets clamped to a minimum of 1.
-        let cfg = provider_config("openrouter", None, None, None, 120, 0)
+        let cfg = provider_config("openrouter", None, None, None, 120, 0, false)
             .expect("provider_config should build");
         assert_eq!(cfg.provider_max_attempts, 1);
     }

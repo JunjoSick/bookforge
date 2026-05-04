@@ -67,6 +67,7 @@ impl TranslationProfile {
                     validation_max_attempts: 3,
                     retry_after_policy: RetryAfterPolicy::JitteredExponential,
                     max_backoff_seconds: 60,
+                    thinking_disabled: false,
                 },
                 qa: QaRunConfig {
                     concurrency: 4,
@@ -114,6 +115,7 @@ impl TranslationProfile {
                     validation_max_attempts: 1,
                     retry_after_policy: RetryAfterPolicy::JitteredExponential,
                     max_backoff_seconds: 30,
+                    thinking_disabled: false,
                 },
                 qa: QaRunConfig {
                     concurrency: 8,
@@ -161,6 +163,7 @@ impl TranslationProfile {
                     validation_max_attempts: 1,
                     retry_after_policy: RetryAfterPolicy::JitteredExponential,
                     max_backoff_seconds: 10,
+                    thinking_disabled: false,
                 },
                 qa: QaRunConfig {
                     concurrency: 16,
@@ -208,6 +211,7 @@ impl TranslationProfile {
                     validation_max_attempts: 1,
                     retry_after_policy: RetryAfterPolicy::RespectHeader,
                     max_backoff_seconds: 90,
+                    thinking_disabled: false,
                 },
                 qa: QaRunConfig {
                     concurrency: 1,
@@ -255,6 +259,7 @@ impl TranslationProfile {
                     validation_max_attempts: 1,
                     retry_after_policy: RetryAfterPolicy::None,
                     max_backoff_seconds: 5,
+                    thinking_disabled: false,
                 },
                 qa: QaRunConfig {
                     concurrency: 16,
@@ -342,6 +347,7 @@ pub struct ProviderRuntimeConfig {
     pub validation_max_attempts: usize,
     pub retry_after_policy: RetryAfterPolicy,
     pub max_backoff_seconds: u64,
+    pub thinking_disabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
