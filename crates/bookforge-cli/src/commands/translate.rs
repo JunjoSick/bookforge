@@ -11,7 +11,7 @@ use bookforge_epub::{read_epub, rebuild_epub};
 #[cfg(test)]
 use bookforge_llm::translate_segments;
 use bookforge_llm::{
-    LlmError, LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig,
+    AdaptiveLimiter, LlmError, LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig,
     OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation, TelemetryLog,
     TranslationRunConfig, build_translation_batches, qa_segments, run_double_check,
     telemetry_summary, translate_batches_with_callback,
@@ -597,7 +597,16 @@ where
     use std::sync::Arc;
     let telemetry = Arc::new(TelemetryLog::new());
 
-    match translate_batches_with_callback(provider, batches, segments, config, telemetry.clone(), |translation| {
+    let limiter = if settings.adaptive_concurrency {
+        Some(Arc::new(AdaptiveLimiter::new(
+            settings.scheduler.concurrency.max(1),
+            (settings.scheduler.concurrency * 4).max(1),
+        )))
+    } else {
+        None
+    };
+
+    match translate_batches_with_callback(provider, batches, segments, config, telemetry.clone(), limiter, |translation| {
         save_translation_result(
             checkpoint.store,
             checkpoint.job_id,

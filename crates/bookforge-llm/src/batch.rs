@@ -10,8 +10,8 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::{
-    CompletionRequest, LlmError, LlmProvider, PromptLibrary, RequestMetadata, ResponseFormat,
-    SegmentTranslation, Substitutions, TelemetryLog, TranslationRunConfig,
+    AdaptiveLimiter, CompletionRequest, LlmError, LlmProvider, PromptLibrary, RequestMetadata,
+    ResponseFormat, SegmentTranslation, Substitutions, TelemetryLog, TranslationRunConfig,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,10 +73,32 @@ pub struct BatchItemFailure {
 pub fn build_translation_batches(
     segments: &[Segment],
     config: &BatchConfig,
-    _profile: TranslationProfile,
+    profile: TranslationProfile,
 ) -> Vec<TranslationBatch> {
     if !config.enabled {
         return Vec::new();
+    }
+
+    let turbo = profile == TranslationProfile::TurboTextOnly;
+
+    fn strip_markers(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '<' && i + 1 < chars.len() && chars[i + 1] != '/' {
+                let rest: String = chars[i..].iter().take(20).collect();
+                if rest.contains('>') {
+                    let end = chars[i..].iter().position(|&c| c == '>').unwrap_or(0);
+                    i += end + 1;
+                    out.push(' ');
+                    continue;
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
     }
 
     let mut items: Vec<TranslationBatchItem> = Vec::new();
@@ -84,16 +106,26 @@ pub fn build_translation_batches(
 
     for segment in segments {
         for block in &segment.source.blocks {
+            let (source_text, required_markers, protected_spans) = if turbo {
+                (strip_markers(&block.text), Vec::new(), Vec::new())
+            } else {
+                (
+                    block.text.clone(),
+                    segment.constraints.preserve_markers.clone(),
+                    block.protected_spans.clone(),
+                )
+            };
+
             items.push(TranslationBatchItem {
                 item_id: format!("{}:{}", segment.id.0, block.block_id.0),
                 segment_id: segment.id.clone(),
                 block_id: block.block_id.clone(),
                 ordinal,
                 kind: block.kind.clone(),
-                source_text: block.text.clone(),
+                source_text,
                 text_runs: block.text_runs.clone(),
-                protected_spans: block.protected_spans.clone(),
-                required_markers: segment.constraints.preserve_markers.clone(),
+                protected_spans,
+                required_markers,
                 checksum: segment.checksum.clone(),
             });
             ordinal += 1;
@@ -249,7 +281,7 @@ pub fn parse_batch_response(
 
     match batch.mode {
         BatchMode::Plain | BatchMode::MarkerSafe | BatchMode::TurboTextOnly => {
-            parse_text_batch_response(batch, content)
+            parse_text_batch_response(batch, content, batch.mode == BatchMode::TurboTextOnly)
         }
         BatchMode::RunPreserving => parse_run_batch_response(batch, content),
     }
@@ -258,6 +290,7 @@ pub fn parse_batch_response(
 fn parse_text_batch_response(
     batch: &TranslationBatch,
     content: &str,
+    turbo: bool,
 ) -> Result<BatchTranslationResult, String> {
     let parsed: BatchTextResponse =
         serde_json::from_str(content).map_err(|e| format!("invalid batch JSON: {e}"))?;
@@ -298,7 +331,7 @@ fn parse_text_batch_response(
             continue;
         }
 
-        if !request_item.required_markers.is_empty() {
+        if !turbo && !request_item.required_markers.is_empty() {
             let mut missing = Vec::new();
             for marker in &request_item.required_markers {
                 if !item.translation.contains(marker) {
@@ -315,14 +348,16 @@ fn parse_text_batch_response(
             }
         }
 
-        for span in &request_item.protected_spans {
-            if !item.translation.contains(span) {
-                failures.push(BatchItemFailure {
-                    item_id: item.id.clone(),
-                    segment_id: request_item.segment_id.clone(),
-                    error: format!("missing protected span: {span}"),
-                });
-                break;
+        if !turbo {
+            for span in &request_item.protected_spans {
+                if !item.translation.contains(span) {
+                    failures.push(BatchItemFailure {
+                        item_id: item.id.clone(),
+                        segment_id: request_item.segment_id.clone(),
+                        error: format!("missing protected span: {span}"),
+                    });
+                    break;
+                }
             }
         }
 
@@ -498,6 +533,7 @@ pub async fn translate_batches_with_callback<P, F>(
     segments: &[Segment],
     config: &TranslationRunConfig,
     telemetry: Arc<TelemetryLog>,
+    limiter: Option<Arc<AdaptiveLimiter>>,
     mut on_segment: F,
 ) -> Result<Vec<SegmentTranslation>, LlmError>
 where
@@ -506,7 +542,8 @@ where
 {
     let library = Arc::new(PromptLibrary::embedded());
     let provider = Arc::new(provider);
-    let semaphore = Arc::new(Semaphore::new(config.scheduler.concurrency.max(1)));
+
+    let concurrency = config.scheduler.concurrency.max(1);
 
     let mut all_results: Vec<BatchTranslationResult> = Vec::new();
     let mut pending: Vec<TranslationBatch> = batches;
@@ -517,14 +554,22 @@ where
             break;
         }
 
+        let active_concurrency = if let Some(ref l) = limiter {
+            l.current()
+        } else {
+            concurrency
+        };
+
+        let round_semaphore = Arc::new(Semaphore::new(active_concurrency));
         let mut tasks = JoinSet::new();
+
         for batch in pending.drain(..) {
             let provider = provider.clone();
             let library = library.clone();
             let config = config.clone();
-            let semaphore = semaphore.clone();
-
+            let semaphore = round_semaphore.clone();
             let telemetry = telemetry.clone();
+            let limiter = limiter.clone();
 
             tasks.spawn(async move {
                 let Ok(_permit) = semaphore.acquire_owned().await else {
@@ -555,6 +600,16 @@ where
                     error_kind: None,
                 };
                 telemetry.record(metric);
+
+                if let Some(ref l) = limiter {
+                    match &result {
+                        Ok(_) => l.on_success(),
+                        Err(LlmError::HttpStatus { status: 429, .. }) => l.on_rate_limit(),
+                        Err(LlmError::Http(e)) if e.is_timeout() => l.on_timeout(),
+                        _ => {}
+                    }
+                }
+
                 (batch, result)
             });
         }
