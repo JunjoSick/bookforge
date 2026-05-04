@@ -302,6 +302,7 @@ async fn run_mock_translation(
         prompt_version: prompt_version.to_string(),
         temperature: 0.2,
         scheduler: settings.scheduler.clone(),
+        profile: settings.profile,
     };
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     let mut translations = apply_cached_translations(
@@ -400,6 +401,7 @@ async fn run_openai_compatible_translation(
         prompt_version: prompt_version.to_string(),
         temperature: 0.2,
         scheduler: settings.scheduler.clone(),
+        profile: settings.profile,
     };
 
     if settings.batch.enabled {
@@ -414,6 +416,7 @@ async fn run_openai_compatible_translation(
                 concurrency: run_config.scheduler.concurrency,
                 max_attempts: settings.provider.provider_max_attempts,
             },
+            profile: settings.profile,
         };
         store.insert_segments(&job.id, &segments, "batch_v1", &config.provider, &model)?;
         let mut translations = apply_cached_translations(
@@ -600,7 +603,7 @@ where
 
     println!("Batches: {}", batches.len());
 
-    match translate_batches_with_callback(provider, batches, config, |translation| {
+    match translate_batches_with_callback(provider, batches, segments, config, |translation| {
         save_translation_result(
             checkpoint.store,
             checkpoint.job_id,
@@ -714,6 +717,7 @@ async fn run_fallback_pass(
             concurrency: 1,
             max_attempts: settings.provider.provider_max_attempts,
         },
+        profile: settings.profile,
     };
 
     let checkpoint = CheckpointContext {
@@ -1335,6 +1339,7 @@ mod tests {
                 concurrency: 0,
                 max_attempts: 1,
             },
+            profile: TranslationProfile::Balanced,
         };
 
         let error = translate_with_scheduler_guard(

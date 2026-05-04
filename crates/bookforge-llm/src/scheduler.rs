@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use bookforge_core::{
+    config::TranslationProfile,
     ir::BlockId,
     scheduler::SchedulerConfig,
     segment::{BlockTranslation, Segment, SegmentBlock, SegmentId, SegmentStatus},
@@ -23,6 +24,7 @@ pub struct TranslationRunConfig {
     pub prompt_version: String,
     pub temperature: f32,
     pub scheduler: SchedulerConfig,
+    pub profile: TranslationProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1311,6 +1313,7 @@ mod tests {
                 concurrency: 2,
                 max_attempts: 1,
             },
+            profile: TranslationProfile::Balanced,
         }
     }
 

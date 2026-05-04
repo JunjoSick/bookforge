@@ -6,6 +6,7 @@ use std::{
 use anyhow::Result;
 use bookforge_core::{
     config::SegmentationConfig,
+    config::TranslationProfile,
     scheduler::SchedulerConfig,
     segment::{BlockTranslation, Segment, SegmentStatus, build_segments},
 };
@@ -77,6 +78,7 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
             concurrency: args.concurrency,
             max_attempts: args.max_attempts,
         },
+        profile: TranslationProfile::Balanced,
     };
 
     let mut cached_translations = apply_cached_translations(

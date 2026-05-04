@@ -495,6 +495,7 @@ pub fn collect_repair_items(result: &BatchTranslationResult) -> Vec<TranslationB
 pub async fn translate_batches_with_callback<P, F>(
     provider: P,
     batches: Vec<TranslationBatch>,
+    segments: &[Segment],
     config: &TranslationRunConfig,
     mut on_segment: F,
 ) -> Result<Vec<SegmentTranslation>, LlmError>
@@ -544,14 +545,23 @@ where
 
     let mut segment_translations: HashMap<String, SegmentTranslation> = HashMap::new();
 
+    let ordinal_by_segment: HashMap<&str, usize> = segments
+        .iter()
+        .map(|s| (s.id.0.as_str(), s.ordinal))
+        .collect();
+
     for (_, batch_result) in &all_results {
         for translation in &batch_result.translations {
             let seg_id = translation.segment_id.0.clone();
+            let ordinal = ordinal_by_segment
+                .get(seg_id.as_str())
+                .copied()
+                .unwrap_or(0);
             let entry = segment_translations
                 .entry(seg_id.clone())
                 .or_insert_with(|| SegmentTranslation {
                     segment_id: SegmentId(seg_id.clone()),
-                    ordinal: 0,
+                    ordinal,
                     block_ids: Vec::new(),
                     blocks: Vec::new(),
                     checksum: String::new(),
@@ -594,6 +604,18 @@ where
     Ok(translations)
 }
 
+fn batch_max_output_tokens(batch: &TranslationBatch, profile: TranslationProfile) -> u32 {
+    let multiplier = match batch.mode {
+        BatchMode::Plain => 3,
+        BatchMode::MarkerSafe => 4,
+        BatchMode::RunPreserving => 5,
+        BatchMode::TurboTextOnly => 2,
+    };
+    let estimate = batch.token_estimate as u32 * multiplier;
+    let max = if profile == TranslationProfile::FreeTier { 4_096 } else { 16_384 };
+    estimate.clamp(512, max)
+}
+
 async fn translate_one_batch(
     provider: Arc<impl LlmProvider>,
     library: Arc<PromptLibrary>,
@@ -616,7 +638,7 @@ async fn translate_one_batch(
         .render(&vars)
         .map_err(|e| LlmError::Provider(e.to_string()))?;
 
-    let max_tokens = (batch.token_estimate as u32 * 5).clamp(1024, 16_384);
+    let max_tokens = batch_max_output_tokens(&batch, config.profile);
 
     let response = provider
         .complete(CompletionRequest {
