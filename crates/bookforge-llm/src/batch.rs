@@ -898,6 +898,30 @@ where
     }
 
     let mut translations: Vec<SegmentTranslation> = segment_translations.into_values().collect();
+
+    for translation in &mut translations {
+        let expected: std::collections::HashSet<&str> = translation
+            .block_ids
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect();
+        let actual: std::collections::HashSet<&str> = translation
+            .blocks
+            .iter()
+            .map(|block| block.block_id.0.as_str())
+            .collect();
+
+        if expected != actual {
+            let mut missing: Vec<&str> = expected.difference(&actual).copied().collect();
+            missing.sort_unstable();
+            translation.status = SegmentStatus::NeedsReview;
+            translation.error = Some(format!(
+                "batch translation missing block translations: {:?}",
+                missing
+            ));
+        }
+    }
+
     for translation in &mut translations {
         on_segment(translation)?;
     }
@@ -1386,5 +1410,108 @@ mod tests {
                 );
             }
         }
+    }
+
+    struct SequenceProvider {
+        responses: Mutex<Vec<String>>,
+    }
+
+    impl SequenceProvider {
+        fn new(responses: Vec<String>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().rev().collect()),
+            }
+        }
+    }
+
+    impl LlmProviderTrait for SequenceProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> ProviderResult<CompletionResponse> {
+            let next = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("SequenceProvider ran out of responses");
+            Ok(CompletionResponse {
+                content: next,
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 0,
+                raw: serde_json::json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_batch_failure_without_successful_repair_marks_segment_needs_review() {
+        let seg = make_segment(
+            "seg1",
+            vec![plain_block("Hello"), plain_block("World")],
+            vec![],
+        );
+        let segments = vec![seg.clone()];
+        let cfg = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+        assert_eq!(batches.len(), 1);
+        let first_item_id = batches[0].items[0].item_id.clone();
+        let missing_block_id = batches[0].items[1].block_id.0.clone();
+
+        let initial_response = serde_json::json!({
+            "items": [
+                {"id": first_item_id, "translation": "[it] Hello"},
+            ]
+        })
+        .to_string();
+        // Repair returns malformed JSON so parse_batch_response fails
+        // and the missing block stays unrepaired.
+        let repair_response = "{not valid json".to_string();
+
+        let provider = SequenceProvider::new(vec![initial_response, repair_response]);
+        let telemetry = Arc::new(TelemetryLog::new());
+        let config = test_run_config();
+        let translations = translate_batches_with_callback(
+            provider,
+            batches,
+            &segments,
+            &config,
+            telemetry,
+            None,
+            |_| Ok(()),
+        )
+        .await
+        .expect("translate");
+
+        assert_eq!(translations.len(), 1);
+        let translation = &translations[0];
+        assert_eq!(
+            translation.status,
+            SegmentStatus::NeedsReview,
+            "segment with missing block translation must not be saved as Succeeded",
+        );
+        let error = translation
+            .error
+            .as_ref()
+            .expect("missing-block segment must carry an error");
+        assert!(
+            error.contains(&missing_block_id),
+            "error must name missing block id {missing_block_id}, got: {error}",
+        );
     }
 }
