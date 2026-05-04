@@ -1,5 +1,5 @@
 use bookforge_core::{
-    config::{BatchConfig, TranslationProfile},
+    config::{BatchConfig, ProviderRequestMetric, TranslationProfile},
     ir::BlockId,
     segment::{BlockTranslation, Segment, SegmentId, SegmentStatus, SegmentTextRun},
 };
@@ -11,7 +11,7 @@ use tokio::task::JoinSet;
 
 use crate::{
     CompletionRequest, LlmError, LlmProvider, PromptLibrary, RequestMetadata, ResponseFormat,
-    SegmentTranslation, Substitutions, TranslationRunConfig,
+    SegmentTranslation, Substitutions, TelemetryLog, TranslationRunConfig,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -497,6 +497,7 @@ pub async fn translate_batches_with_callback<P, F>(
     batches: Vec<TranslationBatch>,
     segments: &[Segment],
     config: &TranslationRunConfig,
+    telemetry: Arc<TelemetryLog>,
     mut on_segment: F,
 ) -> Result<Vec<SegmentTranslation>, LlmError>
 where
@@ -506,41 +507,105 @@ where
     let library = Arc::new(PromptLibrary::embedded());
     let provider = Arc::new(provider);
     let semaphore = Arc::new(Semaphore::new(config.scheduler.concurrency.max(1)));
-    let mut tasks = JoinSet::new();
 
-    for batch in batches {
-        let provider = provider.clone();
-        let library = library.clone();
-        let config = config.clone();
-        let semaphore = semaphore.clone();
+    let mut all_results: Vec<BatchTranslationResult> = Vec::new();
+    let mut pending: Vec<TranslationBatch> = batches;
+    let max_rounds = 3usize;
 
-        tasks.spawn(async move {
-            let Ok(_permit) = semaphore.acquire_owned().await else {
-                return Err(LlmError::Provider(
-                    "scheduler semaphore closed before batch could run".to_string(),
-                ));
-            };
-            translate_one_batch(provider, library, batch, &config).await
-        });
-    }
+    for _round in 0..max_rounds {
+        if pending.is_empty() {
+            break;
+        }
 
-    let mut all_results: Vec<(usize, BatchTranslationResult)> = Vec::new();
-    let mut batch_errors = Vec::new();
+        let mut tasks = JoinSet::new();
+        for batch in pending.drain(..) {
+            let provider = provider.clone();
+            let library = library.clone();
+            let config = config.clone();
+            let semaphore = semaphore.clone();
 
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok(Ok(batch_result)) => {
-                all_results.push((all_results.len(), batch_result));
-            }
-            Ok(Err(error)) => {
-                eprintln!("batch failed: {error}");
-                batch_errors.push(format!("batch failed: {error}"));
-            }
-            Err(err) => {
-                eprintln!("batch task panicked: {err}");
-                batch_errors.push(format!("batch task panicked: {err}"));
+            let telemetry = telemetry.clone();
+
+            tasks.spawn(async move {
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    return (batch, Err(LlmError::Provider(
+                        "scheduler semaphore closed".to_string(),
+                    )));
+                };
+                let started = std::time::Instant::now();
+                let result = translate_one_batch(provider, library, batch.clone(), &config).await;
+                let latency_ms = started.elapsed().as_millis() as u64;
+                let metric = ProviderRequestMetric {
+                    request_id: format!("batch_{}", batch.id),
+                    batch_id: Some(batch.id.clone()),
+                    provider: config.provider.clone(),
+                    model: config.model.clone(),
+                    profile: format!("{:?}", config.profile),
+                    items: batch.items.len(),
+                    estimated_input_tokens: batch.token_estimate,
+                    max_output_tokens: Some(batch_max_output_tokens(&batch, config.profile)),
+                    input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
+                    output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
+                    latency_ms,
+                    finish_reason: None,
+                    status: if result.is_ok() { "ok".into() } else { "error".into() },
+                    status_code: None,
+                    retry_count: 0,
+                    backoff_ms: 0,
+                    error_kind: None,
+                };
+                telemetry.record(metric);
+                (batch, result)
+            });
+        }
+
+        while let Some(task_result) = tasks.join_next().await {
+            match task_result {
+                Ok((_batch, Ok(batch_result))) => {
+                    all_results.push(batch_result);
+                }
+                Ok((batch, Err(LlmError::InvalidResponse(_)))) if batch.items.len() > 1 => {
+                    eprintln!(
+                        "batch {} failed with invalid response, splitting into {} + {} items",
+                        batch.id,
+                        batch.items.len() / 2,
+                        batch.items.len() - batch.items.len() / 2,
+                    );
+                    pending.extend(split_batch(&batch));
+                }
+                Ok((batch, Err(error))) => {
+                    eprintln!("batch {} failed: {error}", batch.id);
+                    all_results.push(BatchTranslationResult {
+                        batch_id: batch.id.clone(),
+                        translations: Vec::new(),
+                        failures: batch.items.iter().map(|item| BatchItemFailure {
+                            item_id: item.item_id.clone(),
+                            segment_id: item.segment_id.clone(),
+                            error: format!("{error}"),
+                        }).collect(),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                }
+                Err(err) => {
+                    eprintln!("batch task panicked: {err}");
+                }
             }
         }
+    }
+
+    for batch in &pending {
+        all_results.push(BatchTranslationResult {
+            batch_id: batch.id.clone(),
+            translations: Vec::new(),
+            failures: batch.items.iter().map(|item| BatchItemFailure {
+                item_id: item.item_id.clone(),
+                segment_id: item.segment_id.clone(),
+                error: "batch exhausted retries after split".to_string(),
+            }).collect(),
+            input_tokens: None,
+            output_tokens: None,
+        });
     }
 
     let mut segment_translations: HashMap<String, SegmentTranslation> = HashMap::new();
@@ -550,7 +615,7 @@ where
         .map(|s| (s.id.0.as_str(), s.ordinal))
         .collect();
 
-    for (_, batch_result) in &all_results {
+    for batch_result in &all_results {
         for translation in &batch_result.translations {
             let seg_id = translation.segment_id.0.clone();
             let ordinal = ordinal_by_segment

@@ -12,8 +12,9 @@ use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::translate_segments;
 use bookforge_llm::{
     LlmError, LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig,
-    OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation, TranslationRunConfig,
-    build_translation_batches, qa_segments, run_double_check, translate_batches_with_callback,
+    OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation, TelemetryLog,
+    TranslationRunConfig, build_translation_batches, qa_segments, run_double_check,
+    telemetry_summary, translate_batches_with_callback,
     translate_segments_with_callback,
 };
 use bookforge_store::{
@@ -366,14 +367,20 @@ async fn run_openai_compatible_translation(
     cli_args: &TranslateArgs,
     settings: &ResolvedRunSettings,
 ) -> Result<()> {
-    let provider_config = OpenAiCompatibleConfig {
-        base_url: resolve_base_url(config, provider_args)?,
-        api_key_env: resolve_api_key_env(config, provider_args),
-        model: config
-            .model
-            .clone()
-            .unwrap_or_else(|| "openrouter/auto".to_string()),
-        timeout_seconds: settings.provider.timeout_seconds,
+    let provider_config = match provider_config(
+        &config.provider,
+        config.model.as_deref(),
+        provider_args.base_url.as_deref(),
+        provider_args.api_key_env.as_deref(),
+        settings.provider.timeout_seconds,
+    ) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            if config.provider == "openai-compatible" {
+                return Err(anyhow::anyhow!("--base-url is required for --provider openai-compatible"));
+            }
+            return Err(e);
+        }
     };
     let provider = OpenAiCompatibleProvider::new(provider_config.clone())?;
     let model = provider.model().to_string();
@@ -544,41 +551,25 @@ async fn run_openai_compatible_translation(
     Ok(())
 }
 
-fn resolve_base_url(config: &TranslationConfig, provider_args: &CliProviderArgs) -> Result<String> {
-    if config.provider == "deepseek" {
-        Ok(provider_args
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string()))
-    } else if config.provider == "openrouter" {
-        Ok(provider_args
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()))
-    } else {
-        provider_args.base_url.clone().ok_or_else(|| {
-            anyhow::anyhow!("--base-url is required for --provider openai-compatible")
-        })
-    }
-}
+fn provider_config(
+    provider: &str,
+    model: Option<&str>,
+    base_url: Option<&str>,
+    api_key_env: Option<&str>,
+    timeout_seconds: u64,
+) -> Result<OpenAiCompatibleConfig> {
+    let (default_url, default_key_env, default_model) = match provider {
+        "deepseek" => ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat"),
+        "openrouter" => ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openrouter/auto"),
+        _ => return Err(anyhow::anyhow!("--base-url is required for --provider {provider}")),
+    };
 
-fn resolve_api_key_env(config: &TranslationConfig, provider_args: &CliProviderArgs) -> String {
-    if config.provider == "deepseek" {
-        provider_args
-            .api_key_env
-            .clone()
-            .unwrap_or_else(|| "DEEPSEEK_API_KEY".to_string())
-    } else if config.provider == "openrouter" {
-        provider_args
-            .api_key_env
-            .clone()
-            .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string())
-    } else {
-        provider_args
-            .api_key_env
-            .clone()
-            .unwrap_or_else(|| "OPENAI_API_KEY".to_string())
-    }
+    Ok(OpenAiCompatibleConfig {
+        base_url: base_url.map(String::from).unwrap_or_else(|| default_url.to_string()),
+        api_key_env: api_key_env.map(String::from).unwrap_or_else(|| default_key_env.to_string()),
+        model: model.or(Some(default_model)).map(String::from).unwrap_or_else(|| default_model.to_string()),
+        timeout_seconds,
+    })
 }
 
 async fn translate_and_checkpoint_batch<P>(
@@ -603,7 +594,10 @@ where
 
     println!("Batches: {}", batches.len());
 
-    match translate_batches_with_callback(provider, batches, segments, config, |translation| {
+    use std::sync::Arc;
+    let telemetry = Arc::new(TelemetryLog::new());
+
+    match translate_batches_with_callback(provider, batches, segments, config, telemetry.clone(), |translation| {
         save_translation_result(
             checkpoint.store,
             checkpoint.job_id,
@@ -616,7 +610,13 @@ where
     })
     .await
     {
-        Ok(translations) => Ok(translations),
+        Ok(translations) => {
+            let snapshot = telemetry.snapshot();
+            if !snapshot.is_empty() {
+                println!("\n{}", telemetry_summary(&snapshot));
+            }
+            Ok(translations)
+        }
         Err(error) => {
             let message = format!(
                 "batch translation failed: {error}"
@@ -651,24 +651,13 @@ async fn run_fallback_pass(
         .as_deref()
         .unwrap_or(primary_provider.model());
 
-    let fallback_config = OpenAiCompatibleConfig {
-        base_url: cli_args.fallback_base_url.clone().unwrap_or_else(|| {
-            if provider_str == "deepseek" {
-                "https://api.deepseek.com/v1".to_string()
-            } else {
-                "https://openrouter.ai/api/v1".to_string()
-            }
-        }),
-        api_key_env: cli_args.fallback_api_key_env.clone().unwrap_or_else(|| {
-            if provider_str == "deepseek" {
-                "DEEPSEEK_API_KEY".to_string()
-            } else {
-                "OPENROUTER_API_KEY".to_string()
-            }
-        }),
-        model: model_str.to_string(),
-        timeout_seconds: settings.provider.timeout_seconds,
-    };
+    let fallback_config = provider_config(
+        provider_str,
+        Some(model_str),
+        cli_args.fallback_base_url.as_deref(),
+        cli_args.fallback_api_key_env.as_deref(),
+        settings.provider.timeout_seconds,
+    )?;
 
     let fallback = OpenAiCompatibleProvider::new(fallback_config)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -763,19 +752,14 @@ async fn run_double_check_pass(
     let dc_provider = if cli_args.double_check_provider.is_some()
         || cli_args.double_check_model.is_some()
     {
-        let dc_config = OpenAiCompatibleConfig {
-            base_url: cli_args.double_check_base_url.clone().unwrap_or_else(|| {
-                "https://openrouter.ai/api/v1".to_string()
-            }),
-            api_key_env: cli_args.double_check_api_key_env.clone().unwrap_or_else(|| {
-                "OPENROUTER_API_KEY".to_string()
-            }),
-            model: cli_args
-                .double_check_model
-                .clone()
-                .unwrap_or_else(|| provider.model().to_string()),
-            timeout_seconds: settings.provider.timeout_seconds,
-        };
+        let provider_str = cli_args.double_check_provider.as_deref().unwrap_or("openrouter");
+        let dc_config = provider_config(
+            provider_str,
+            cli_args.double_check_model.as_deref(),
+            cli_args.double_check_base_url.as_deref(),
+            cli_args.double_check_api_key_env.as_deref(),
+            settings.provider.timeout_seconds,
+        )?;
         OpenAiCompatibleProvider::new(dc_config)
             .map_err(|e| anyhow::anyhow!("{e}"))?
     } else {
