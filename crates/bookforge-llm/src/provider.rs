@@ -3,6 +3,9 @@ use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
+use tokio_util::sync::CancellationToken;
+
+use bookforge_core::{RetryAfterPolicy, marker::is_marker_token};
 
 pub type Result<T> = std::result::Result<T, LlmError>;
 
@@ -269,14 +272,6 @@ fn transform_text(mode: MockMode, target_language: &str, source: &str) -> String
     }
 }
 
-fn is_marker_token(text: &str) -> bool {
-    let text = text.trim();
-    text == "</m>"
-        || text.starts_with("<m ")
-        || text.starts_with("<keep ")
-        || text.starts_with("<ref ")
-}
-
 /// Recover per-block source strings from a rendered marker-safe user prompt.
 /// The caller embeds blocks as a JSON array under `Source blocks:`; the mock
 /// parses it back so test translations transform the actual source text rather
@@ -422,6 +417,10 @@ pub struct OpenAiCompatibleConfig {
     pub timeout_seconds: u64,
     pub provider_max_attempts: usize,
     pub thinking_disabled: bool,
+    pub retry_after_policy: RetryAfterPolicy,
+    pub max_backoff_seconds: u64,
+    pub max_idle_per_host: usize,
+    pub json_mode: bookforge_core::JsonMode,
 }
 
 impl OpenAiCompatibleConfig {
@@ -433,6 +432,10 @@ impl OpenAiCompatibleConfig {
             timeout_seconds: 120,
             provider_max_attempts: 6,
             thinking_disabled: false,
+            retry_after_policy: RetryAfterPolicy::JitteredExponential,
+            max_backoff_seconds: 60,
+            max_idle_per_host: 32,
+            json_mode: bookforge_core::JsonMode::Auto,
         }
     }
 }
@@ -442,6 +445,8 @@ pub struct OpenAiCompatibleProvider {
     config: OpenAiCompatibleConfig,
     client: reqwest::Client,
     reasoning_detected: AtomicBool,
+    response_format_supported: AtomicBool,
+    pub cancel_token: CancellationToken,
 }
 
 impl Clone for OpenAiCompatibleProvider {
@@ -450,12 +455,23 @@ impl Clone for OpenAiCompatibleProvider {
             config: self.config.clone(),
             client: self.client.clone(),
             reasoning_detected: AtomicBool::new(self.reasoning_detected.load(Ordering::Relaxed)),
+            response_format_supported: AtomicBool::new(
+                self.response_format_supported.load(Ordering::Relaxed),
+            ),
+            cancel_token: self.cancel_token.clone(),
         }
     }
 }
 
 impl OpenAiCompatibleProvider {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self> {
+        Self::new_with_cancel(config, CancellationToken::new())
+    }
+
+    pub fn new_with_cancel(
+        config: OpenAiCompatibleConfig,
+        cancel_token: CancellationToken,
+    ) -> Result<Self> {
         let is_reasoning = model_name_is_reasoning(&config.model);
         let effective_timeout = if is_reasoning {
             config.timeout_seconds.max(300)
@@ -463,13 +479,18 @@ impl OpenAiCompatibleProvider {
             config.timeout_seconds
         };
         let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(effective_timeout))
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(effective_timeout))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(config.max_idle_per_host)
+            .tcp_keepalive(Duration::from_secs(60))
             .build()?;
         Ok(Self {
             config,
             client,
             reasoning_detected: AtomicBool::new(is_reasoning),
+            response_format_supported: AtomicBool::new(true),
+            cancel_token,
         })
     }
 
@@ -508,23 +529,44 @@ impl LlmProvider for OpenAiCompatibleProvider {
             body["thinking"] = json!({"type": "disabled"});
         }
 
-        if request.response_format == ResponseFormat::Json {
+        let use_response_format = request.response_format == ResponseFormat::Json
+            && match self.config.json_mode {
+                bookforge_core::JsonMode::PromptOnly => false,
+                bookforge_core::JsonMode::ResponseFormat => true,
+                bookforge_core::JsonMode::Auto => {
+                    self.response_format_supported.load(Ordering::Relaxed)
+                }
+            };
+
+        if use_response_format {
             body["response_format"] = json!({"type": "json_object"});
         }
 
         let max_attempts = self.config.provider_max_attempts.max(1);
         let body_len = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
+        let max_backoff = Duration::from_secs(self.config.max_backoff_seconds);
+        let policy = self.config.retry_after_policy;
         let mut raw = None;
         let mut last_error = None;
+        let mut tried_response_format_fallback = false;
         for attempt in 0..max_attempts {
-            let response = match self
+            let send_future = self
                 .client
                 .post(&endpoint)
                 .bearer_auth(&api_key)
                 .json(&body)
-                .send()
-                .await
-            {
+                .send();
+
+            let response = tokio::select! {
+                result = send_future => result,
+                _ = self.cancel_token.cancelled() => {
+                    return Err(LlmError::Provider(
+                        "interrupted by user".to_string(),
+                    ));
+                }
+            };
+
+            let response = match response {
                 Ok(response) => response,
                 Err(error) => {
                     let kind = if error.is_timeout() {
@@ -549,7 +591,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     if !retryable || attempt + 1 == attempt_limit {
                         return Err(last_error.expect("set above"));
                     }
-                    sleep(backoff_delay(attempt)).await;
+                    let delay = retry_delay(policy, attempt, None, max_backoff);
+                    if let Some(d) = delay {
+                        sleep(d).await;
+                    }
                     continue;
                 }
             };
@@ -570,7 +615,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         if !retryable || attempt + 1 == attempt_limit {
                             return Err(last_error.expect("set above"));
                         }
-                        sleep(backoff_delay(attempt)).await;
+                        let delay = retry_delay(policy, attempt, None, max_backoff);
+                        if let Some(d) = delay {
+                            sleep(d).await;
+                        }
                         continue;
                     }
                 };
@@ -595,7 +643,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
                                 "JSON parse failed after {max_attempts} attempts: {error}"
                             )));
                         }
-                        sleep(backoff_delay(attempt)).await;
+                        let delay = retry_delay(policy, attempt, None, max_backoff);
+                        if let Some(d) = delay {
+                            sleep(d).await;
+                        }
                         continue;
                     }
                 }
@@ -603,17 +654,36 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
             let status_code = status.as_u16();
             let retry_after = parse_retry_after(response.headers());
-            let body = response.text().await.unwrap_or_default();
+            let response_body = response.text().await.unwrap_or_default();
+
+            // Auto-detect unsupported response_format: 400 with response_format
+            // enabled in Auto mode -> retry once without it and remember.
+            if status_code == 400
+                && self.config.json_mode == bookforge_core::JsonMode::Auto
+                && use_response_format
+                && !tried_response_format_fallback
+            {
+                eprintln!("provider: response_format unsupported (400), retrying without it");
+                self.response_format_supported
+                    .store(false, Ordering::Relaxed);
+                body.as_object_mut().map(|o| o.remove("response_format"));
+                tried_response_format_fallback = true;
+                continue;
+            }
+
             last_error = Some(LlmError::HttpStatus {
                 status: status_code,
-                body,
+                body: response_body,
             });
 
             if !is_retryable_status(status_code) || attempt + 1 == max_attempts {
                 return Err(last_error.expect("set above"));
             }
 
-            sleep(retry_after.unwrap_or_else(|| backoff_delay(attempt))).await;
+            let delay = retry_delay(policy, attempt, retry_after, max_backoff);
+            if let Some(d) = delay {
+                sleep(d).await;
+            }
         }
         let raw = raw.ok_or_else(|| {
             last_error.unwrap_or_else(|| {
@@ -700,16 +770,44 @@ fn attempt_limit_for_http_error(error: &reqwest::Error, max_attempts: usize) -> 
     }
 }
 
-fn backoff_delay(attempt: usize) -> Duration {
-    let millis = match attempt {
-        0 => 500,
-        1 => 1000,
-        2 => 3000,
-        3 => 8000,
-        4 => 20_000,
-        _ => 40_000,
-    };
-    Duration::from_millis(millis)
+fn exponential_delay(attempt: usize) -> Duration {
+    let millis: u64 = 500u64.saturating_mul(2u64.saturating_pow(attempt as u32));
+    Duration::from_millis(millis.min(60_000))
+}
+
+fn apply_jitter(base: Duration, attempt: usize) -> Duration {
+    let millis = base.as_millis() as u64;
+    if millis < 2 {
+        return base;
+    }
+    let spread = millis / 5;
+    let offset = (attempt as u64)
+        .wrapping_mul(1103515245)
+        .wrapping_add(12345)
+        % spread.max(1);
+    Duration::from_millis(millis.saturating_sub(spread / 2).saturating_add(offset))
+}
+
+fn retry_delay(
+    policy: RetryAfterPolicy,
+    attempt: usize,
+    retry_after: Option<Duration>,
+    max_backoff: Duration,
+) -> Option<Duration> {
+    match policy {
+        RetryAfterPolicy::None => None,
+
+        RetryAfterPolicy::RespectHeader => {
+            retry_after.or_else(|| Some(exponential_delay(attempt).min(max_backoff)))
+        }
+
+        RetryAfterPolicy::Fixed => Some(Duration::from_millis(750).min(max_backoff)),
+
+        RetryAfterPolicy::JitteredExponential => {
+            let base = exponential_delay(attempt).min(max_backoff);
+            Some(apply_jitter(base, attempt))
+        }
+    }
 }
 
 fn parse_finish_reason(value: &str) -> FinishReason {

@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bookforge_core::{
@@ -134,6 +134,77 @@ pub struct SaveCachedTranslation<'a> {
     pub prompt_version: &'a str,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CacheLookupRequest<'a> {
+    pub prompt_version: &'a str,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub source_lang: Option<&'a str>,
+    pub target_lang: &'a str,
+    pub cache_namespace: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageDoctor {
+    pub database_path: PathBuf,
+    pub database_exists: bool,
+    pub wal_present: bool,
+    pub shm_present: bool,
+    pub journal_mode: String,
+    pub integrity_check: String,
+    pub wal_sidecars_normal: bool,
+    pub note: String,
+}
+
+pub fn run_doctor(db_path: Option<PathBuf>) -> Result<StorageDoctor> {
+    let path = db_path.unwrap_or_else(|| PathBuf::from(".bookforge/jobs.sqlite"));
+    let database_exists = path.exists();
+    let wal_path = path.with_extension("sqlite-wal");
+    let shm_path = path.with_extension("sqlite-shm");
+    let wal_present = wal_path.exists();
+    let shm_present = shm_path.exists();
+
+    let (journal_mode, integrity_check, wal_sidecars_normal, note) = if database_exists {
+        let conn = Connection::open(&path)?;
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap_or_else(|_| "unknown".to_string());
+        let integrity_check: String = conn
+            .pragma_query_value(None, "integrity_check", |row| row.get(0))
+            .unwrap_or_else(|_| "error".to_string());
+        let _ = conn.pragma_update(None, "wal_checkpoint", "PASSIVE");
+
+        let wal_sidecars_normal = if wal_present || shm_present {
+            integrity_check == "ok"
+        } else {
+            true
+        };
+
+        let note = if wal_present || shm_present {
+            "WAL sidecar files are normal. SQLite will recover them automatically. \
+             Do not delete them manually while BookForge is running."
+                .to_string()
+        } else {
+            String::new()
+        };
+
+        (journal_mode, integrity_check, wal_sidecars_normal, note)
+    } else {
+        ("unknown".to_string(), String::new(), true, String::new())
+    };
+
+    Ok(StorageDoctor {
+        database_path: path,
+        database_exists,
+        wal_present,
+        shm_present,
+        journal_mode,
+        integrity_check,
+        wal_sidecars_normal,
+        note,
+    })
+}
+
 impl JobStore {
     pub fn open_default() -> Result<Self> {
         Self::open(".bookforge/jobs.sqlite")
@@ -144,8 +215,15 @@ impl JobStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let conn = Connection::open(&path)?;
+
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+
         let store = Self {
-            conn: RefCell::new(Connection::open(&path)?),
+            conn: RefCell::new(conn),
             path,
         };
         store.migrate()?;
@@ -342,6 +420,10 @@ impl JobStore {
 
     pub fn mark_job_needs_review(&self, job_id: &str) -> Result<()> {
         self.touch_job(job_id, "needs_review")
+    }
+
+    pub fn mark_job_interrupted(&self, job_id: &str) -> Result<()> {
+        self.touch_job(job_id, "interrupted")
     }
 
     pub fn mark_segment_failed(&self, job_id: &str, segment_id: &str, error: &str) -> Result<()> {
@@ -579,6 +661,131 @@ impl JobStore {
             translated_text,
             blocks: ordered,
         }))
+    }
+
+    pub fn find_cached_translations_batch(
+        &self,
+        segments: &[Segment],
+        request: CacheLookupRequest<'_>,
+    ) -> Result<HashMap<String, CachedTranslation>> {
+        let mut results = HashMap::new();
+        if segments.is_empty() {
+            return Ok(results);
+        }
+
+        const SQLITE_IN_CHUNK_SIZE: usize = 900;
+
+        for chunk in segments.chunks(SQLITE_IN_CHUNK_SIZE) {
+            let hashes: Vec<&str> = chunk.iter().map(|s| s.checksum.as_str()).collect();
+            let placeholders: Vec<String> =
+                (0..hashes.len()).map(|i| format!("?{}", i + 1)).collect();
+            let placeholders_sql = placeholders.join(", ");
+
+            let sql = format!(
+                "SELECT t.job_id, t.segment_id, t.translated_text, s.source_hash
+                 FROM translations t
+                 JOIN segments s ON s.job_id = t.job_id AND s.id = t.segment_id
+                 JOIN jobs j ON j.id = t.job_id
+                 WHERE s.source_hash IN ({placeholders_sql})
+                   AND s.prompt_version = ?{}
+                   AND s.provider = ?{}
+                   AND s.model = ?{}
+                   AND ((?{} IS NULL AND j.source_lang IS NULL) OR j.source_lang = ?{})
+                   AND j.target_lang = ?{}
+                   AND s.cache_namespace = ?{}
+                   AND s.status IN ('succeeded', 'skipped_cached')
+                 ORDER BY t.created_at DESC",
+                hashes.len() + 1,
+                hashes.len() + 2,
+                hashes.len() + 3,
+                hashes.len() + 4,
+                hashes.len() + 5,
+                hashes.len() + 6,
+                hashes.len() + 7,
+            );
+
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            for hash in &hashes {
+                params.push(Box::new(hash.to_string()));
+            }
+            params.push(Box::new(request.prompt_version.to_string()));
+            params.push(Box::new(request.provider.to_string()));
+            params.push(Box::new(request.model.to_string()));
+            params.push(Box::new(request.source_lang.map(|s| s.to_string())));
+            params.push(Box::new(request.source_lang.map(|s| s.to_string())));
+            params.push(Box::new(request.target_lang.to_string()));
+            params.push(Box::new(request.cache_namespace.to_string()));
+
+            let conn = self.conn.borrow();
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+
+            let mut hash_to_hit: HashMap<String, (String, String, String)> = HashMap::new();
+            for row in rows {
+                let (job_id, segment_id, translated_text, source_hash) = row?;
+                hash_to_hit
+                    .entry(source_hash)
+                    .or_insert((job_id, segment_id, translated_text));
+            }
+
+            for segment in chunk {
+                if let Some((job_id, segment_id, translated_text)) =
+                    hash_to_hit.get(&segment.checksum)
+                {
+                    let mut block_stmt = conn.prepare(
+                        "SELECT block_id, translated_text
+                         FROM translation_blocks
+                         WHERE job_id = ?1 AND segment_id = ?2
+                         ORDER BY block_id",
+                    )?;
+                    let block_rows = block_stmt.query_map(params![job_id, segment_id], |row| {
+                        Ok(BlockTranslation {
+                            block_id: BlockId(row.get::<_, String>(0)?),
+                            text: row.get(1)?,
+                        })
+                    })?;
+                    let blocks = block_rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+                    let mut by_id = blocks
+                        .into_iter()
+                        .map(|block| (block.block_id.0.clone(), block))
+                        .collect::<HashMap<_, _>>();
+
+                    let mut ordered = Vec::with_capacity(segment.block_ids.len());
+                    let mut valid = true;
+                    for id in &segment.block_ids {
+                        let Some(block) = by_id.remove(&id.0) else {
+                            valid = false;
+                            break;
+                        };
+                        ordered.push(block);
+                    }
+                    if !valid || !by_id.is_empty() {
+                        continue;
+                    }
+
+                    results.insert(
+                        segment.id.0.clone(),
+                        CachedTranslation {
+                            translated_text: translated_text.clone(),
+                            blocks: ordered,
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     fn migrate(&self) -> Result<()> {
@@ -1060,5 +1267,152 @@ mod tests {
         );
 
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn job_store_enables_wal_and_busy_timeout() {
+        let db_path = temp_path("wal_busy.sqlite");
+        let store = JobStore::open(&db_path).expect("store should open");
+
+        let conn = store.conn.borrow();
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("pragma journal_mode should succeed");
+        assert_eq!(
+            journal_mode.to_lowercase(),
+            "wal",
+            "WAL journal mode must be enabled"
+        );
+
+        let busy_timeout: i64 = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .expect("pragma busy_timeout should succeed");
+        assert!(
+            busy_timeout >= 5000,
+            "busy_timeout should be at least 5000ms, got {busy_timeout}"
+        );
+
+        let wal_path = db_path.with_extension("sqlite-wal");
+        let shm_path = db_path.with_extension("sqlite-shm");
+        // WAL/shm may or may not exist depending on transactions, but the
+        // journal_mode query confirms WAL is active.
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(wal_path);
+        let _ = fs::remove_file(shm_path);
+    }
+
+    #[test]
+    fn job_store_enables_foreign_keys_on_every_connection() {
+        let db_path = temp_path("fk.sqlite");
+        let store = JobStore::open(&db_path).expect("store should open");
+
+        let conn = store.conn.borrow();
+        let fk_enabled: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .expect("pragma foreign_keys should succeed");
+        assert_eq!(
+            fk_enabled, 1,
+            "foreign_keys pragma must be ON on every connection"
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn doctor_reports_wal_sidecars_as_normal_when_integrity_check_passes() {
+        let db_path = temp_path("doctor.sqlite");
+        let store = JobStore::open(&db_path).expect("store should open");
+
+        // Perform a write to trigger WAL sidecar creation.
+        let input_path = temp_path("input_doctor.epub");
+        fs::write(&input_path, b"epub bytes").expect("test epub");
+        let _job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("out_doctor.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+            })
+            .expect("job created");
+        drop(store);
+
+        let doctor = run_doctor(Some(db_path.clone())).expect("doctor should run");
+        assert!(doctor.database_exists, "database should exist");
+        assert_eq!(
+            doctor.journal_mode.to_lowercase(),
+            "wal",
+            "journal mode should be wal"
+        );
+        assert_eq!(doctor.integrity_check, "ok", "integrity check should pass");
+        assert!(
+            doctor.wal_sidecars_normal,
+            "wal sidecars should be reported as normal"
+        );
+
+        if doctor.wal_present || doctor.shm_present {
+            assert!(
+                !doctor.note.is_empty(),
+                "doctor must explain WAL sidecars when they are present"
+            );
+        }
+
+        let wal_path = db_path.with_extension("sqlite-wal");
+        let shm_path = db_path.with_extension("sqlite-shm");
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(input_path);
+        let _ = fs::remove_file(wal_path);
+        let _ = fs::remove_file(shm_path);
+    }
+
+    #[test]
+    fn checkpoint_writer_and_reader_do_not_immediately_busy_fail() {
+        let db_path = temp_path("concurrent.sqlite");
+        let input_path = temp_path("input_conc.epub");
+        fs::write(&input_path, b"epub bytes").expect("test epub");
+
+        // Open writer store first and create a job.
+        let store_w = JobStore::open(&db_path).expect("store_w open");
+        let job = store_w
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("out_conc.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+            })
+            .expect("job created");
+        store_w
+            .insert_segments(
+                &job.id,
+                &[segment("seg_conc", 0)],
+                "v1",
+                "mock",
+                "mock-prefix",
+                "ns",
+            )
+            .expect("segments inserted");
+
+        // Open a second reader store while the first is still active.
+        let store_r = JobStore::open(&db_path).expect("store_r open");
+        let summary = store_r
+            .summary(&job.id)
+            .expect("summary should load")
+            .expect("job should exist");
+        assert_eq!(summary.total_segments, 1);
+
+        let wal_path = db_path.with_extension("sqlite-wal");
+        let shm_path = db_path.with_extension("sqlite-shm");
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(input_path);
+        let _ = fs::remove_file(wal_path);
+        let _ = fs::remove_file(shm_path);
     }
 }

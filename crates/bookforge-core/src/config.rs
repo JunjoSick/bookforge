@@ -28,6 +28,21 @@ impl Default for SegmentationConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PromptVersion {
+    V1,
+    BatchV1,
+}
+
+impl PromptVersion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromptVersion::V1 => "v1",
+            PromptVersion::BatchV1 => "batch_v1",
+        }
+    }
+}
+
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TranslationProfile {
@@ -36,9 +51,21 @@ pub enum TranslationProfile {
     Fastest,
     FreeTier,
     TurboTextOnly,
+    V1Fast,
 }
 
 impl TranslationProfile {
+    pub fn namespace_str(self) -> &'static str {
+        match self {
+            TranslationProfile::Safe => "safe",
+            TranslationProfile::Balanced => "balanced",
+            TranslationProfile::Fastest => "fastest",
+            TranslationProfile::FreeTier => "free_tier",
+            TranslationProfile::TurboTextOnly => "turbo_text_only",
+            TranslationProfile::V1Fast => "v1_fast",
+        }
+    }
+
     pub fn resolve(self) -> ResolvedRunSettings {
         match self {
             Self::Safe => ResolvedRunSettings {
@@ -68,6 +95,10 @@ impl TranslationProfile {
                     retry_after_policy: RetryAfterPolicy::JitteredExponential,
                     max_backoff_seconds: 60,
                     thinking_disabled: false,
+                    model_context_tokens: None,
+                    max_output_tokens: None,
+                    batch_max_output_tokens: None,
+                    json_mode: JsonMode::Auto,
                 },
                 qa: QaRunConfig {
                     concurrency: 4,
@@ -116,6 +147,10 @@ impl TranslationProfile {
                     retry_after_policy: RetryAfterPolicy::JitteredExponential,
                     max_backoff_seconds: 30,
                     thinking_disabled: false,
+                    model_context_tokens: None,
+                    max_output_tokens: None,
+                    batch_max_output_tokens: None,
+                    json_mode: JsonMode::Auto,
                 },
                 qa: QaRunConfig {
                     concurrency: 8,
@@ -164,6 +199,10 @@ impl TranslationProfile {
                     retry_after_policy: RetryAfterPolicy::JitteredExponential,
                     max_backoff_seconds: 10,
                     thinking_disabled: false,
+                    model_context_tokens: None,
+                    max_output_tokens: None,
+                    batch_max_output_tokens: None,
+                    json_mode: JsonMode::Auto,
                 },
                 qa: QaRunConfig {
                     concurrency: 16,
@@ -212,6 +251,10 @@ impl TranslationProfile {
                     retry_after_policy: RetryAfterPolicy::RespectHeader,
                     max_backoff_seconds: 90,
                     thinking_disabled: false,
+                    model_context_tokens: None,
+                    max_output_tokens: None,
+                    batch_max_output_tokens: None,
+                    json_mode: JsonMode::Auto,
                 },
                 qa: QaRunConfig {
                     concurrency: 1,
@@ -260,6 +303,10 @@ impl TranslationProfile {
                     retry_after_policy: RetryAfterPolicy::None,
                     max_backoff_seconds: 5,
                     thinking_disabled: false,
+                    model_context_tokens: None,
+                    max_output_tokens: None,
+                    batch_max_output_tokens: None,
+                    json_mode: JsonMode::Auto,
                 },
                 qa: QaRunConfig {
                     concurrency: 16,
@@ -277,6 +324,58 @@ impl TranslationProfile {
                     api_key_env: None,
                     concurrency: 4,
                     batch_target_tokens: 16_000,
+                    auto_correct: false,
+                    correction_rounds: 1,
+                },
+            },
+            Self::V1Fast => ResolvedRunSettings {
+                profile: self,
+                segmentation: SegmentationConfig {
+                    max_segment_tokens: 12_000,
+                    context_tokens: 20,
+                },
+                batch: BatchConfig {
+                    enabled: true,
+                    target_tokens: 16_000,
+                    max_items: 128,
+                    split_on_json_failure: true,
+                    repair_invalid_items: true,
+                },
+                scheduler: SchedulerConfig {
+                    concurrency: 32,
+                    max_attempts: 1,
+                },
+                compact_prompts: true,
+                retry_failed_only: true,
+                adaptive_concurrency: true,
+                provider: ProviderRuntimeConfig {
+                    timeout_seconds: 120,
+                    provider_max_attempts: 1,
+                    validation_max_attempts: 1,
+                    retry_after_policy: RetryAfterPolicy::None,
+                    max_backoff_seconds: 5,
+                    thinking_disabled: true,
+                    model_context_tokens: None,
+                    max_output_tokens: None,
+                    batch_max_output_tokens: None,
+                    json_mode: JsonMode::Auto,
+                },
+                qa: QaRunConfig {
+                    concurrency: 4,
+                    batch_target_tokens: 4_000,
+                    model: None,
+                    provider: None,
+                    base_url: None,
+                    api_key_env: None,
+                },
+                double_check: DoubleCheckConfig {
+                    mode: DoubleCheckMode::Off,
+                    model: None,
+                    provider: None,
+                    base_url: None,
+                    api_key_env: None,
+                    concurrency: 4,
+                    batch_target_tokens: 8_000,
                     auto_correct: false,
                     correction_rounds: 1,
                 },
@@ -348,6 +447,101 @@ pub struct ProviderRuntimeConfig {
     pub retry_after_policy: RetryAfterPolicy,
     pub max_backoff_seconds: u64,
     pub thinking_disabled: bool,
+    pub model_context_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+    pub batch_max_output_tokens: Option<u32>,
+    pub json_mode: JsonMode,
+}
+
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum JsonMode {
+    Auto,
+    ResponseFormat,
+    PromptOnly,
+}
+
+pub fn cap_output_tokens(
+    computed: u32,
+    estimated_prompt_tokens: usize,
+    model_context_tokens: Option<u32>,
+    user_cap: Option<u32>,
+) -> u32 {
+    let mut out = computed;
+
+    if let Some(context) = model_context_tokens {
+        let prompt = estimated_prompt_tokens as u32;
+        let remaining = context.saturating_sub(prompt);
+        let safe_remaining = remaining.saturating_sub(256);
+        out = out.min(safe_remaining.max(512));
+    }
+
+    if let Some(cap) = user_cap {
+        out = out.min(cap);
+    }
+
+    out.max(256)
+}
+
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ProviderPreset {
+    Auto,
+    OpenRouterFree,
+    OpenRouterPaidFast,
+    DeepSeekFree,
+    DeepSeekPaid,
+    GeminiFlashLite,
+    Custom,
+}
+
+impl ProviderPreset {
+    pub fn resolve(self, custom: Option<ModelEndpoint>) -> ModelEndpoint {
+        match self {
+            ProviderPreset::Auto => ModelEndpoint {
+                provider: "deepseek".to_string(),
+                model: "deepseek-chat".to_string(),
+                base_url: Some("https://api.deepseek.com/v1".to_string()),
+                api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+            },
+            ProviderPreset::OpenRouterFree => ModelEndpoint {
+                provider: "openrouter".to_string(),
+                model: "google/gemini-2.5-flash-lite".to_string(),
+                base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+            },
+            ProviderPreset::OpenRouterPaidFast => ModelEndpoint {
+                provider: "openrouter".to_string(),
+                model: "google/gemini-2.5-flash".to_string(),
+                base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+            },
+            ProviderPreset::DeepSeekFree => ModelEndpoint {
+                provider: "deepseek".to_string(),
+                model: "deepseek-chat".to_string(),
+                base_url: Some("https://api.deepseek.com/v1".to_string()),
+                api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+            },
+            ProviderPreset::DeepSeekPaid => ModelEndpoint {
+                provider: "deepseek".to_string(),
+                model: "deepseek-reasoner".to_string(),
+                base_url: Some("https://api.deepseek.com/v1".to_string()),
+                api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+            },
+            ProviderPreset::GeminiFlashLite => ModelEndpoint {
+                provider: "openrouter".to_string(),
+                model: "google/gemini-2.5-flash-lite".to_string(),
+                base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+            },
+            ProviderPreset::Custom => custom.unwrap_or_else(|| ModelEndpoint {
+                provider: "deepseek".to_string(),
+                model: "deepseek-chat".to_string(),
+                base_url: Some("https://api.deepseek.com/v1".to_string()),
+                api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

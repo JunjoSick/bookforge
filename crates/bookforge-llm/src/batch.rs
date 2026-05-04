@@ -6,8 +6,7 @@ use bookforge_core::{
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
+use tokio::sync::{Mutex as TokioMutex, Semaphore, mpsc};
 
 use crate::{
     AdaptiveLimiter, CompletionRequest, FinishReason, LlmError, LlmProvider, PromptLibrary,
@@ -29,11 +28,18 @@ pub enum BatchMode {
     TurboTextOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BatchKind {
+    Translation,
+    Repair,
+}
+
 #[derive(Debug, Clone)]
 pub struct TranslationBatch {
     pub id: String,
     pub ordinal: usize,
     pub mode: BatchMode,
+    pub kind: BatchKind,
     pub items: Vec<TranslationBatchItem>,
     pub token_estimate: usize,
 }
@@ -75,6 +81,75 @@ pub struct BatchItemFailure {
     pub item_id: String,
     pub segment_id: SegmentId,
     pub error: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchSizer {
+    target_tokens: usize,
+    max_items: usize,
+    #[allow(dead_code)]
+    original_target_tokens: usize,
+    original_max_items: usize,
+}
+
+impl BatchSizer {
+    pub fn new(target_tokens: usize, max_items: usize) -> Self {
+        Self {
+            target_tokens,
+            max_items,
+            original_target_tokens: target_tokens,
+            original_max_items: max_items,
+        }
+    }
+
+    pub fn target_tokens(&self) -> usize {
+        self.target_tokens
+    }
+
+    pub fn max_items(&self) -> usize {
+        self.max_items
+    }
+
+    pub fn on_truncation(&mut self) {
+        let prev_target = self.target_tokens;
+        let prev_max = self.max_items;
+        self.target_tokens = ((self.target_tokens as f64) * 0.65) as usize;
+        self.max_items = ((self.max_items as f64) * 0.75) as usize;
+        self.clamp();
+        eprintln!(
+            "batch sizer: truncation → target {prev_target}→{}, max_items {prev_max}→{}",
+            self.target_tokens, self.max_items
+        );
+    }
+
+    pub fn on_invalid_json(&mut self) {
+        let prev_target = self.target_tokens;
+        let prev_max = self.max_items;
+        self.target_tokens = ((self.target_tokens as f64) * 0.75) as usize;
+        self.max_items = ((self.max_items as f64) * 0.85) as usize;
+        self.clamp();
+        eprintln!(
+            "batch sizer: invalid JSON → target {prev_target}→{}, max_items {prev_max}→{}",
+            self.target_tokens, self.max_items
+        );
+    }
+
+    pub fn on_p95_high(&mut self) {
+        self.target_tokens = ((self.target_tokens as f64) * 0.85) as usize;
+        self.clamp();
+    }
+
+    pub fn on_success(&mut self) {
+        self.target_tokens = ((self.target_tokens as f64) * 1.10) as usize;
+        self.clamp();
+    }
+
+    fn clamp(&mut self) {
+        // Per-mode clamp ranges: Plain/Turbo 4k..32k, MarkerSafe 2k..16k, RunPreserving 1k..8k
+        // Use a conservative general clamp; per-mode limits would need mode tracking.
+        self.target_tokens = self.target_tokens.clamp(1_000, 32_000);
+        self.max_items = self.max_items.clamp(1, self.original_max_items.max(128));
+    }
 }
 
 pub fn build_translation_batches(
@@ -211,6 +286,7 @@ fn make_batch(
         id,
         ordinal,
         mode,
+        kind: BatchKind::Translation,
         items,
         token_estimate,
     }
@@ -533,6 +609,7 @@ pub fn collect_repair_items(result: &BatchTranslationResult) -> Vec<TranslationB
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn translate_batches_with_callback<P, F>(
     provider: P,
     batches: Vec<TranslationBatch>,
@@ -540,6 +617,7 @@ pub async fn translate_batches_with_callback<P, F>(
     config: &TranslationRunConfig,
     telemetry: Arc<TelemetryLog>,
     limiter: Option<Arc<AdaptiveLimiter>>,
+    mut batch_sizer: Option<&mut BatchSizer>,
     mut on_segment: F,
 ) -> Result<Vec<SegmentTranslation>, LlmError>
 where
@@ -548,6 +626,7 @@ where
 {
     let library = Arc::new(PromptLibrary::embedded());
     let provider = Arc::new(provider);
+    let config = Arc::new(config.clone());
     let concurrency = config.scheduler.concurrency.max(1);
 
     let all_items: HashMap<String, TranslationBatchItem> = batches
@@ -560,55 +639,63 @@ where
     let mut pending: Vec<TranslationBatch> = batches;
     let max_rounds = 3usize;
 
-    // Fixed-concurrency semaphore is only used when the adaptive limiter is
-    // not configured. The adaptive path acquires through limiter.acquire(),
-    // which returns an AdaptivePermit that participates in the burn counter.
+    // Bounded work/result channels. Workers pull work after acquiring a
+    // permit, so the queue size just needs to handle brief bursts.
+    let queue_size = concurrency * 4;
+    let (work_tx, work_rx) = mpsc::channel::<TranslationBatch>(queue_size);
+    let (result_tx, mut result_rx) =
+        mpsc::channel::<(TranslationBatch, Result<BatchTranslationResult, LlmError>)>(queue_size);
+    let work_rx = Arc::new(TokioMutex::new(work_rx));
+
+    // Fixed-concurrency semaphore only used when no adaptive limiter is configured.
     let fixed_semaphore = if limiter.is_none() {
         Some(Arc::new(Semaphore::new(concurrency)))
     } else {
         None
     };
 
-    for _round in 0..max_rounds {
-        if pending.is_empty() {
-            break;
-        }
+    // Spawn persistent worker tasks.
+    let mut worker_handles = Vec::new();
+    for _ in 0..concurrency {
+        let provider = provider.clone();
+        let library = library.clone();
+        let config = config.clone();
+        let telemetry = telemetry.clone();
+        let limiter = limiter.clone();
+        let fixed_semaphore = fixed_semaphore.clone();
+        let work_rx = work_rx.clone();
+        let result_tx = result_tx.clone();
 
-        let mut tasks = JoinSet::new();
-
-        for batch in pending.drain(..) {
-            let provider = provider.clone();
-            let library = library.clone();
-            let config = config.clone();
-            let telemetry = telemetry.clone();
-            let limiter = limiter.clone();
-            let fixed_semaphore = fixed_semaphore.clone();
-
-            tasks.spawn(async move {
-                let _permit: BatchPermit = match (&limiter, &fixed_semaphore) {
+        let handle = tokio::spawn(async move {
+            loop {
+                // Acquire permit BEFORE pulling work (per addendum rule).
+                let permit = match (&limiter, &fixed_semaphore) {
                     (Some(l), _) => match l.acquire().await {
                         Ok(p) => BatchPermit::Adaptive(p),
-                        Err(_) => {
-                            return (
-                                batch,
-                                Err(LlmError::Provider("scheduler semaphore closed".to_string())),
-                            );
-                        }
+                        Err(_) => break,
                     },
                     (None, Some(sem)) => match sem.clone().acquire_owned().await {
                         Ok(p) => BatchPermit::Fixed(p),
-                        Err(_) => {
-                            return (
-                                batch,
-                                Err(LlmError::Provider("scheduler semaphore closed".to_string())),
-                            );
-                        }
+                        Err(_) => break,
                     },
-                    (None, None) => unreachable!("either limiter or fixed_semaphore is set"),
+                    (None, None) => unreachable!(),
                 };
+
+                // Pull work from the shared receiver.
+                let batch = {
+                    let mut rx = work_rx.lock().await;
+                    rx.recv().await
+                };
+                let Some(batch) = batch else {
+                    drop(permit);
+                    break;
+                };
+
                 let started = std::time::Instant::now();
                 let is_reasoning = provider.is_reasoning();
-                let result = translate_one_batch(provider, library, batch.clone(), &config).await;
+                let result =
+                    translate_one_batch(provider.clone(), library.clone(), batch.clone(), &config)
+                        .await;
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let metric = ProviderRequestMetric {
                     request_id: format!("batch_{}", batch.id),
@@ -618,9 +705,9 @@ where
                     profile: format!("{:?}", config.profile),
                     items: batch.items.len(),
                     estimated_input_tokens: batch.token_estimate,
-                    max_output_tokens: Some(batch_max_output_tokens(
+                    max_output_tokens: Some(capped_batch_max_output_tokens(
                         &batch,
-                        config.profile,
+                        &config,
                         is_reasoning,
                     )),
                     input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
@@ -653,16 +740,89 @@ where
                     }
                 }
 
-                (batch, result)
-            });
+                drop(permit);
+                let _ = result_tx.send((batch, result)).await;
+            }
+        });
+        worker_handles.push(handle);
+    }
+
+    for _round in 0..max_rounds {
+        if pending.is_empty() {
+            break;
         }
 
-        while let Some(task_result) = tasks.join_next().await {
-            match task_result {
-                Ok((_batch, Ok(batch_result))) => {
+        // Push batches to workers.
+        let mut pushed = 0usize;
+        for batch in pending.drain(..) {
+            if work_tx.send(batch).await.is_err() {
+                break; // Workers exited
+            }
+            pushed += 1;
+        }
+
+        // Collect results.
+        let mut collected = 0usize;
+        while collected < pushed {
+            let Some((batch, result)) = result_rx.recv().await else {
+                break;
+            };
+            collected += 1;
+
+            match result {
+                Ok(batch_result) => {
+                    if let Some(ref mut sizer) = batch_sizer {
+                        sizer.on_success();
+                    }
                     all_results.push(batch_result);
                 }
-                Ok((batch, Err(LlmError::InvalidResponse(_)))) if batch.items.len() > 1 => {
+                Err(LlmError::InvalidResponse(_)) if batch.kind == BatchKind::Repair => {
+                    eprintln!(
+                        "repair batch {} failed with invalid response; marking {} items NeedsReview",
+                        batch.id,
+                        batch.items.len(),
+                    );
+                    all_results.push(BatchTranslationResult {
+                        batch_id: batch.id.clone(),
+                        translations: Vec::new(),
+                        failures: batch
+                            .items
+                            .iter()
+                            .map(|item| BatchItemFailure {
+                                item_id: item.item_id.clone(),
+                                segment_id: item.segment_id.clone(),
+                                error: "repair batch invalid response".to_string(),
+                            })
+                            .collect(),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                }
+                Err(LlmError::InvalidResponse(_)) if batch.items.len() == 1 => {
+                    eprintln!(
+                        "single-item batch {} failed with invalid response; not splitting further",
+                        batch.id,
+                    );
+                    all_results.push(BatchTranslationResult {
+                        batch_id: batch.id.clone(),
+                        translations: Vec::new(),
+                        failures: batch
+                            .items
+                            .iter()
+                            .map(|item| BatchItemFailure {
+                                item_id: item.item_id.clone(),
+                                segment_id: item.segment_id.clone(),
+                                error: "single-item batch invalid response".to_string(),
+                            })
+                            .collect(),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                }
+                Err(LlmError::InvalidResponse(_)) if batch.items.len() > 1 => {
+                    if let Some(ref mut sizer) = batch_sizer {
+                        sizer.on_invalid_json();
+                    }
                     eprintln!(
                         "batch {} failed with invalid response, splitting into {} + {} items",
                         batch.id,
@@ -671,11 +831,15 @@ where
                     );
                     pending.extend(split_batch(&batch));
                 }
-                Ok((batch, Err(ref error))) if is_transient(error) => {
+                // Repair batches do not retry transient errors — repair is
+                // terminal cleanup. A single transient failure drops all
+                // repair items to NeedsReview rather than risking an
+                // infinite retry loop.
+                Err(ref error) if is_transient(error) && batch.kind == BatchKind::Translation => {
                     eprintln!("batch {} transient error, retrying: {error}", batch.id);
                     pending.push(batch);
                 }
-                Ok((batch, Err(error))) => {
+                Err(error) => {
                     eprintln!("batch {} failed: {error}", batch.id);
                     all_results.push(BatchTranslationResult {
                         batch_id: batch.id.clone(),
@@ -693,12 +857,17 @@ where
                         output_tokens: None,
                     });
                 }
-                Err(err) => {
-                    eprintln!("batch task panicked: {err}");
-                }
             }
         }
     }
+
+    // Signal workers to exit and wait for them.
+    drop(work_tx);
+    for handle in worker_handles {
+        let _ = handle.await;
+    }
+    // result_tx clones held by workers will all be dropped now,
+    // so result_rx will naturally close.
 
     for batch in &pending {
         all_results.push(BatchTranslationResult {
@@ -817,6 +986,7 @@ where
             id: "repair".to_string(),
             ordinal: 999,
             mode: BatchMode::Plain,
+            kind: BatchKind::Repair,
             items: repair_items.iter().map(|(_, item)| item.clone()).collect(),
             token_estimate: repair_items
                 .iter()
@@ -852,16 +1022,23 @@ where
         );
 
         #[allow(clippy::collapsible_if)]
-        if let Ok(rendered) = library.batch_repair.render(&vars) {
+        let repair_template = if config.compact_prompts {
+            &library.batch_repair_compact
+        } else {
+            &library.batch_repair
+        };
+        #[allow(clippy::collapsible_if)]
+        if let Ok(rendered) = repair_template.render(&vars) {
+            #[allow(clippy::collapsible_if)]
             if let Ok(response) = provider
                 .complete(CompletionRequest {
                     system: rendered.system,
                     user: rendered.user,
                     response_format: ResponseFormat::Json,
                     temperature: 0.1,
-                    max_output_tokens: Some(batch_max_output_tokens(
+                    max_output_tokens: Some(capped_batch_max_output_tokens(
                         &repair_batch,
-                        config.profile,
+                        &config,
                         provider.is_reasoning(),
                     )),
                     metadata: RequestMetadata::default(),
@@ -941,9 +1118,6 @@ fn batch_max_output_tokens(
         BatchMode::TurboTextOnly => 2,
     };
     let multiplier = if reasoning {
-        // Reasoning models burn most of their token budget on chain-of-thought,
-        // leaving much less for actual output. Use a conservative 3× multiplier
-        // on top of the base to give enough headroom.
         base_multiplier * 3
     } else {
         base_multiplier
@@ -957,6 +1131,21 @@ fn batch_max_output_tokens(
     estimate.clamp(512, max)
 }
 
+fn capped_batch_max_output_tokens(
+    batch: &TranslationBatch,
+    config: &TranslationRunConfig,
+    reasoning: bool,
+) -> u32 {
+    let computed = batch_max_output_tokens(batch, config.profile, reasoning);
+    let user_cap = config.batch_max_output_tokens.or(config.max_output_tokens);
+    bookforge_core::config::cap_output_tokens(
+        computed,
+        batch.token_estimate,
+        config.model_context_tokens,
+        user_cap,
+    )
+}
+
 async fn translate_one_batch(
     provider: Arc<impl LlmProvider>,
     library: Arc<PromptLibrary>,
@@ -964,10 +1153,18 @@ async fn translate_one_batch(
     config: &TranslationRunConfig,
 ) -> Result<BatchTranslationResult, LlmError> {
     let items_json = render_batch_items(&batch);
-    let template = match batch.mode {
-        BatchMode::Plain | BatchMode::TurboTextOnly => &library.batch_plain,
-        BatchMode::MarkerSafe => &library.batch_marker_safe,
-        BatchMode::RunPreserving => &library.batch_run_preserving,
+    let template = if config.compact_prompts {
+        match batch.mode {
+            BatchMode::Plain | BatchMode::TurboTextOnly => &library.batch_plain_compact,
+            BatchMode::MarkerSafe => &library.batch_marker_safe_compact,
+            BatchMode::RunPreserving => &library.batch_run_preserving_compact,
+        }
+    } else {
+        match batch.mode {
+            BatchMode::Plain | BatchMode::TurboTextOnly => &library.batch_plain,
+            BatchMode::MarkerSafe => &library.batch_marker_safe,
+            BatchMode::RunPreserving => &library.batch_run_preserving,
+        }
     };
 
     let mut vars = Substitutions::new();
@@ -985,7 +1182,7 @@ async fn translate_one_batch(
         .render(&vars)
         .map_err(|e| LlmError::Provider(e.to_string()))?;
 
-    let max_tokens = batch_max_output_tokens(&batch, config.profile, provider.is_reasoning());
+    let max_tokens = capped_batch_max_output_tokens(&batch, config, provider.is_reasoning());
 
     let response = provider
         .complete(CompletionRequest {
@@ -1311,6 +1508,10 @@ mod tests {
             temperature: 0.2,
             scheduler: bookforge_core::scheduler::SchedulerConfig::default(),
             profile: TranslationProfile::Balanced,
+            model_context_tokens: None,
+            max_output_tokens: None,
+            batch_max_output_tokens: None,
+            compact_prompts: false,
         }
     }
 
@@ -1394,6 +1595,7 @@ mod tests {
             &segments,
             &config,
             telemetry,
+            None,
             None,
             |_| Ok(()),
         )
@@ -1492,6 +1694,7 @@ mod tests {
             &segments,
             &config,
             telemetry,
+            None,
             None,
             |_| Ok(()),
         )

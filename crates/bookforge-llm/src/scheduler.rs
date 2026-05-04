@@ -28,6 +28,10 @@ pub struct TranslationRunConfig {
     pub temperature: f32,
     pub scheduler: SchedulerConfig,
     pub profile: TranslationProfile,
+    pub model_context_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+    pub batch_max_output_tokens: Option<u32>,
+    pub compact_prompts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +167,7 @@ where
 
     let library = Arc::new(PromptLibrary::embedded());
     let provider = Arc::new(provider);
+    let config = Arc::new(config.clone());
     let semaphore = Arc::new(Semaphore::new(config.scheduler.concurrency));
     let mut tasks = JoinSet::new();
 
@@ -183,7 +188,7 @@ where
                     None,
                 );
             };
-            translate_one(provider, library, segment, config).await
+            translate_one(provider, library, segment, &config).await
         });
     }
 
@@ -325,7 +330,7 @@ async fn translate_one<P>(
     provider: Arc<P>,
     library: Arc<PromptLibrary>,
     segment: Segment,
-    config: TranslationRunConfig,
+    config: &TranslationRunConfig,
 ) -> SegmentTranslation
 where
     P: LlmProvider,
@@ -342,7 +347,7 @@ where
             provider.as_ref(),
             library.as_ref(),
             &segment,
-            &config,
+            config,
             mode,
             retry_context.as_deref(),
         )
@@ -381,7 +386,7 @@ where
             provider.as_ref(),
             library.as_ref(),
             &segment,
-            &config,
+            config,
             TranslationMode::RunPreserving,
             retry_context.as_deref(),
         )
@@ -931,54 +936,7 @@ fn validate_markers(segment: &Segment, expected: &[String], translation: &str) -
     Ok(())
 }
 
-fn marker_ids_in_text(text: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let mut rest = text;
-
-    while let Some(index) = rest.find('<') {
-        let tag = &rest[index..];
-        if (tag.starts_with("<m ") || tag.starts_with("<keep "))
-            && let Some(end) = tag.find('>')
-        {
-            if let Some(id) = extract_marker_id(&tag[..=end]) {
-                ids.push(id);
-            }
-            rest = &tag[end + 1..];
-        } else if tag.starts_with("<ref ") {
-            if let Some(end) = tag.find("/>") {
-                if let Some(id) = extract_marker_id(&tag[..end + 2]) {
-                    ids.push(id);
-                }
-                rest = &tag[end + 2..];
-            } else {
-                rest = &tag[1..];
-            }
-        } else {
-            rest = &tag[1..];
-        }
-    }
-
-    ids
-}
-
-fn extract_marker_id(tag: &str) -> Option<String> {
-    let id_offset = tag.find("id=")? + 3;
-    let quote = tag[id_offset..].chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let value_start = id_offset + quote.len_utf8();
-    let value_end = tag[value_start..].find(quote)? + value_start;
-    Some(tag[value_start..value_end].to_string())
-}
-
-fn is_marker_token(text: &str) -> bool {
-    let text = text.trim();
-    text.starts_with("</m") && text.ends_with('>')
-        || text.starts_with("<m ")
-        || text.starts_with("<keep ")
-        || text.starts_with("<ref ")
-}
+use bookforge_core::marker::{is_marker_token, marker_ids_in_text};
 
 fn needs_review_translation_with_tokens(
     segment: &Segment,
@@ -1327,6 +1285,10 @@ mod tests {
                 max_attempts: 1,
             },
             profile: TranslationProfile::Balanced,
+            model_context_tokens: None,
+            max_output_tokens: None,
+            batch_max_output_tokens: None,
+            compact_prompts: false,
         }
     }
 
