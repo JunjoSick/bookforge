@@ -373,6 +373,7 @@ async fn run_openai_compatible_translation(
         provider_args.base_url.as_deref(),
         provider_args.api_key_env.as_deref(),
         settings.provider.timeout_seconds,
+        settings.provider.provider_max_attempts,
     ) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -557,6 +558,7 @@ fn provider_config(
     base_url: Option<&str>,
     api_key_env: Option<&str>,
     timeout_seconds: u64,
+    provider_max_attempts: usize,
 ) -> Result<OpenAiCompatibleConfig> {
     let (default_url, default_key_env, default_model) = match provider {
         "deepseek" => ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat"),
@@ -569,6 +571,7 @@ fn provider_config(
         api_key_env: api_key_env.map(String::from).unwrap_or_else(|| default_key_env.to_string()),
         model: model.or(Some(default_model)).map(String::from).unwrap_or_else(|| default_model.to_string()),
         timeout_seconds,
+        provider_max_attempts: provider_max_attempts.max(1),
     })
 }
 
@@ -666,6 +669,7 @@ async fn run_fallback_pass(
         cli_args.fallback_base_url.as_deref(),
         cli_args.fallback_api_key_env.as_deref(),
         settings.provider.timeout_seconds,
+        settings.provider.provider_max_attempts,
     )?;
 
     let fallback = OpenAiCompatibleProvider::new(fallback_config)
@@ -768,6 +772,7 @@ async fn run_double_check_pass(
             cli_args.double_check_base_url.as_deref(),
             cli_args.double_check_api_key_env.as_deref(),
             settings.provider.timeout_seconds,
+            settings.provider.provider_max_attempts,
         )?;
         OpenAiCompatibleProvider::new(dc_config)
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -1174,6 +1179,7 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
             .clone()
             .unwrap_or_else(|| "openrouter/auto".to_string()),
         timeout_seconds: args.provider.timeout_seconds,
+        provider_max_attempts: 6,
     };
 
     let provider = OpenAiCompatibleProvider::new(provider_config.clone())?;
@@ -1415,5 +1421,17 @@ mod tests {
             "bookforge-cli-test-{}-{nanos}-{name}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn provider_config_sets_provider_max_attempts() {
+        let cfg = provider_config("openrouter", None, None, None, 120, 2)
+            .expect("provider_config should build");
+        assert_eq!(cfg.provider_max_attempts, 2);
+
+        // Zero gets clamped to a minimum of 1.
+        let cfg = provider_config("openrouter", None, None, None, 120, 0)
+            .expect("provider_config should build");
+        assert_eq!(cfg.provider_max_attempts, 1);
     }
 }

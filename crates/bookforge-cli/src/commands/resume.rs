@@ -116,7 +116,7 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
                 .await?
             }
             "deepseek" | "openrouter" | "openai-compatible" => {
-                let provider_config = openai_compatible_config(&job, args.timeout_seconds)?;
+                let provider_config = openai_compatible_config(&job, args.timeout_seconds, 6)?;
                 let provider = OpenAiCompatibleProvider::new(provider_config)?;
                 translate_and_checkpoint(
                     provider.clone(),
@@ -244,7 +244,9 @@ fn pending_segments(segments: &[Segment], pending_ids: &[String]) -> Result<Vec<
 fn openai_compatible_config(
     job: &JobRecord,
     timeout_seconds: u64,
+    provider_max_attempts: usize,
 ) -> Result<OpenAiCompatibleConfig> {
+    let provider_max_attempts = provider_max_attempts.max(1);
     if job.provider == "deepseek" {
         let mut config = OpenAiCompatibleConfig::deepseek(Some(job.model.clone()));
         if let Some(base_url) = &job.base_url {
@@ -254,6 +256,7 @@ fn openai_compatible_config(
             config.api_key_env = api_key_env.clone();
         }
         config.timeout_seconds = timeout_seconds;
+        config.provider_max_attempts = provider_max_attempts;
         return Ok(config);
     }
 
@@ -269,6 +272,7 @@ fn openai_compatible_config(
                 .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string()),
             model: job.model.clone(),
             timeout_seconds,
+            provider_max_attempts,
         });
     }
 
@@ -285,6 +289,7 @@ fn openai_compatible_config(
             .unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
         model: job.model.clone(),
         timeout_seconds,
+        provider_max_attempts,
     })
 }
 
@@ -315,7 +320,7 @@ async fn qa_after_resume(
             Ok(qa_reviews_for_mode(provider, segments, translations, config, qa_mode).await)
         }
         "deepseek" | "openrouter" | "openai-compatible" => {
-            let provider_config = openai_compatible_config(job, timeout_seconds)?;
+            let provider_config = openai_compatible_config(job, timeout_seconds, 6)?;
             let provider = OpenAiCompatibleProvider::new(provider_config)?;
             Ok(qa_reviews_for_mode(provider, segments, translations, config, qa_mode).await)
         }

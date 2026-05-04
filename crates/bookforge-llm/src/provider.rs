@@ -399,6 +399,7 @@ pub struct OpenAiCompatibleConfig {
     pub api_key_env: String,
     pub model: String,
     pub timeout_seconds: u64,
+    pub provider_max_attempts: usize,
 }
 
 impl OpenAiCompatibleConfig {
@@ -408,6 +409,7 @@ impl OpenAiCompatibleConfig {
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             model: model.unwrap_or_else(|| "deepseek-chat".to_string()),
             timeout_seconds: 120,
+            provider_max_attempts: 6,
         }
     }
 }
@@ -461,7 +463,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             body["response_format"] = json!({"type": "json_object"});
         }
 
-        let max_attempts = 6usize;
+        let max_attempts = self.config.provider_max_attempts.max(1);
         let body_len = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
         let mut raw = None;
         let mut last_error = None;
@@ -597,7 +599,11 @@ fn is_retryable_http_error(error: &reqwest::Error) -> bool {
 }
 
 fn attempt_limit_for_http_error(error: &reqwest::Error, max_attempts: usize) -> usize {
-    if error.is_timeout() { 2 } else { max_attempts }
+    if error.is_timeout() {
+        max_attempts.min(2)
+    } else {
+        max_attempts
+    }
 }
 
 fn backoff_delay(attempt: usize) -> Duration {
