@@ -540,6 +540,12 @@ async fn run_openai_compatible_translation(
         api_key_env: Some(&provider_config.api_key_env),
     })?;
     println!("Job: {}", job.id);
+    progress.emit(bookforge_core::ProgressEvent::JobCreated {
+        job_id: job.id.clone(),
+        input_path: input.display().to_string(),
+        output_path: config.output.display().to_string(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
     let cache_namespace = compute_cache_namespace(
         settings.segmentation.max_segment_tokens,
         settings.segmentation.context_tokens,
@@ -625,6 +631,7 @@ async fn run_openai_compatible_translation(
                 prompt_version: run_prompt_version,
                 sender: &sender,
             },
+            progress.clone(),
         )
         .await;
         let fresh_translations = finalize_writer(translation_result, sender, writer).await?;
@@ -841,6 +848,7 @@ async fn translate_and_checkpoint_batch<P>(
     config: &TranslationRunConfig,
     settings: &ResolvedRunSettings,
     checkpoint: CheckpointContext<'_>,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
 ) -> Result<Vec<SegmentTranslation>>
 where
     P: LlmProvider,
@@ -877,6 +885,7 @@ where
         telemetry.clone(),
         limiter,
         Some(&mut batch_sizer),
+        progress,
         |_| Ok(()),
     )
     .await

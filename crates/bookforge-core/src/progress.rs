@@ -21,6 +21,8 @@ impl ProgressSink for NullProgressSink {
 pub enum ProgressEvent {
     JobCreated {
         job_id: String,
+        input_path: String,
+        output_path: String,
         timestamp_ms: u64,
     },
     StageStarted {
@@ -71,13 +73,30 @@ pub enum ProgressEvent {
     },
     RequestStarted {
         request_id: String,
-        segment_count: usize,
+        batch_id: Option<String>,
+        segment_id: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        prompt_template: Option<String>,
+        items: usize,
+        estimated_input_tokens: usize,
+        max_output_tokens: Option<u32>,
+        active_requests: usize,
+        target_concurrency: usize,
         timestamp_ms: u64,
     },
     RequestFinished {
         request_id: String,
+        batch_id: Option<String>,
+        segment_id: Option<String>,
         status: String,
         latency_ms: u64,
+        status_code: Option<u16>,
+        finish_reason: Option<String>,
+        retry_count: usize,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        error_kind: Option<String>,
         timestamp_ms: u64,
     },
     SegmentStarted {

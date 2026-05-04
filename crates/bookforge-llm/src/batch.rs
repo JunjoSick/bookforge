@@ -618,6 +618,7 @@ pub async fn translate_batches_with_callback<P, F>(
     telemetry: Arc<TelemetryLog>,
     limiter: Option<Arc<AdaptiveLimiter>>,
     mut batch_sizer: Option<&mut BatchSizer>,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
     mut on_segment: F,
 ) -> Result<Vec<SegmentTranslation>, LlmError>
 where
@@ -669,6 +670,7 @@ where
         let fixed_semaphore = fixed_semaphore.clone();
         let work_rx = work_rx.clone();
         let result_tx = result_tx.clone();
+        let progress = progress.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -697,10 +699,51 @@ where
 
                 let started = std::time::Instant::now();
                 let is_reasoning = provider.is_reasoning();
+
+                let request_id = format!("batch_{}", batch.id);
+                progress.emit(bookforge_core::ProgressEvent::RequestStarted {
+                    request_id: request_id.clone(),
+                    batch_id: Some(batch.id.clone()),
+                    segment_id: None,
+                    provider: Some(config.provider.clone()),
+                    model: Some(config.model.clone()),
+                    prompt_template: None,
+                    items: batch.items.len(),
+                    estimated_input_tokens: batch.token_estimate,
+                    max_output_tokens: Some(capped_batch_max_output_tokens(
+                        &batch,
+                        &config,
+                        is_reasoning,
+                    )),
+                    active_requests: 0,
+                    target_concurrency: config.scheduler.concurrency,
+                    timestamp_ms: bookforge_core::progress::now_ms(),
+                });
+
                 let result =
                     translate_one_batch(provider.clone(), library.clone(), batch.clone(), &config)
                         .await;
                 let latency_ms = started.elapsed().as_millis() as u64;
+
+                progress.emit(bookforge_core::ProgressEvent::RequestFinished {
+                    request_id,
+                    batch_id: Some(batch.id.clone()),
+                    segment_id: None,
+                    status: if result.is_ok() {
+                        "ok".into()
+                    } else {
+                        "error".into()
+                    },
+                    latency_ms,
+                    status_code: None,
+                    finish_reason: None,
+                    retry_count: 0,
+                    input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
+                    output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
+                    error_kind: result.as_ref().err().map(|e| format!("{e:?}")),
+                    timestamp_ms: bookforge_core::progress::now_ms(),
+                });
+
                 let metric = ProviderRequestMetric {
                     request_id: format!("batch_{}", batch.id),
                     batch_id: Some(batch.id.clone()),
@@ -1587,6 +1630,7 @@ mod tests {
             telemetry,
             None,
             None,
+            Arc::new(bookforge_core::NullProgressSink),
             |_| Ok(()),
         )
         .await
@@ -1686,6 +1730,7 @@ mod tests {
             telemetry,
             None,
             None,
+            Arc::new(bookforge_core::NullProgressSink),
             |_| Ok(()),
         )
         .await
