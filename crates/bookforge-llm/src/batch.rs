@@ -479,6 +479,14 @@ fn parse_run_batch_response(
     })
 }
 
+fn is_transient(err: &LlmError) -> bool {
+    match err {
+        LlmError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
+        LlmError::Http(e) => e.is_timeout() || e.is_connect(),
+        _ => false,
+    }
+}
+
 pub fn split_batch(batch: &TranslationBatch) -> Vec<TranslationBatch> {
     if batch.items.len() <= 1 {
         return vec![batch.clone()];
@@ -607,7 +615,12 @@ where
                     match &result {
                         Ok(_) => l.on_success(),
                         Err(LlmError::HttpStatus { status: 429, .. }) => l.on_rate_limit(),
-                        Err(LlmError::Http(e)) if e.is_timeout() => l.on_timeout(),
+                        Err(LlmError::HttpStatus { status, .. }) if *status >= 500 => {
+                            l.on_timeout()
+                        }
+                        Err(LlmError::Http(e)) if e.is_timeout() || e.is_connect() => {
+                            l.on_timeout()
+                        }
                         _ => {}
                     }
                 }
@@ -629,6 +642,10 @@ where
                         batch.items.len() - batch.items.len() / 2,
                     );
                     pending.extend(split_batch(&batch));
+                }
+                Ok((batch, Err(ref error))) if is_transient(error) => {
+                    eprintln!("batch {} transient error, retrying: {error}", batch.id);
+                    pending.push(batch);
                 }
                 Ok((batch, Err(error))) => {
                     eprintln!("batch {} failed: {error}", batch.id);
@@ -658,7 +675,7 @@ where
             failures: batch.items.iter().map(|item| BatchItemFailure {
                 item_id: item.item_id.clone(),
                 segment_id: item.segment_id.clone(),
-                error: "batch exhausted retries after split".to_string(),
+                error: "batch exhausted retries".to_string(),
             }).collect(),
             input_tokens: None,
             output_tokens: None,
