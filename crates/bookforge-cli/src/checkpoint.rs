@@ -76,13 +76,6 @@ impl CheckpointSender {
             }
         }
     }
-
-    pub fn blocking_send(&self, cmd: CheckpointCommand) -> std::result::Result<(), String> {
-        match self.tx.blocking_send(cmd) {
-            Ok(()) => Ok(()),
-            Err(_) => Err("checkpoint queue closed".to_string()),
-        }
-    }
 }
 
 pub struct CheckpointWriter {

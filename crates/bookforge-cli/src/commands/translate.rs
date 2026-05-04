@@ -301,32 +301,50 @@ pub async fn run(
     let reporter = crate::progress::ProgressReporter::spawn(args.ui, args.progress_jsonl.clone());
     let progress_sink = reporter.sink();
 
-    match config.provider.as_str() {
-        "mock" => {
-            run_mock_translation(&args.input, &config, &args.provider, &args, &settings).await?
-        }
-        "deepseek" | "openrouter" | "openai-compatible" => {
-            run_openai_compatible_translation(
-                &args.input,
-                &config,
-                &args.provider,
-                &args,
-                &settings,
-                &cancel_token,
-                progress_sink,
-            )
-            .await?
-        }
-        _ => {
-            println!(
-                "Translation provider '{}' is not implemented yet.",
-                config.provider
-            );
+    let run_result = async {
+        match config.provider.as_str() {
+            "mock" => {
+                run_mock_translation(&args.input, &config, &args.provider, &args, &settings).await
+            }
+            "deepseek" | "openrouter" | "openai-compatible" => {
+                run_openai_compatible_translation(
+                    &args.input,
+                    &config,
+                    &args.provider,
+                    &args,
+                    &settings,
+                    &cancel_token,
+                    progress_sink,
+                )
+                .await
+            }
+            _ => {
+                println!(
+                    "Translation provider '{}' is not implemented yet.",
+                    config.provider
+                );
+                Ok(())
+            }
         }
     }
+    .await;
 
-    reporter.shutdown().await?;
-    Ok(())
+    finalize_reporter(run_result, reporter).await
+}
+
+async fn finalize_reporter<T>(
+    result: Result<T, anyhow::Error>,
+    reporter: crate::progress::ProgressReporter,
+) -> Result<T> {
+    let reporter_result = reporter.shutdown().await;
+    match (result, reporter_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(e)) => Err(e),
+        (Err(e), Ok(())) => Err(e),
+        (Err(main_err), Err(progress_err)) => Err(anyhow::anyhow!(
+            "{main_err}; additionally progress reporter failed: {progress_err}"
+        )),
+    }
 }
 
 async fn run_mock_translation(
@@ -850,6 +868,7 @@ where
     let mut batch_sizer =
         bookforge_llm::BatchSizer::new(settings.batch.target_tokens, settings.batch.max_items);
 
+    let sender = checkpoint.sender.clone();
     match translate_batches_with_callback(
         provider,
         batches,
@@ -858,12 +877,7 @@ where
         telemetry.clone(),
         limiter,
         Some(&mut batch_sizer),
-        |translation| {
-            checkpoint
-                .sender
-                .blocking_send(make_checkpoint_command(&checkpoint, translation))
-                .map_err(LlmError::Provider)
-        },
+        |_| Ok(()),
     )
     .await
     {
@@ -871,6 +885,11 @@ where
             let snapshot = telemetry.snapshot();
             if !snapshot.is_empty() {
                 println!("\n{}", telemetry_summary(&snapshot));
+            }
+            for translation in &translations {
+                sender
+                    .send(make_checkpoint_command(&checkpoint, translation))
+                    .await?;
             }
             Ok(translations)
         }
@@ -1125,15 +1144,19 @@ pub(crate) async fn translate_and_checkpoint<P>(
 where
     P: LlmProvider,
 {
-    match translate_segments_with_callback(provider, segments, config, |translation| {
-        checkpoint
-            .sender
-            .blocking_send(make_checkpoint_command(&checkpoint, translation))
-            .map_err(LlmError::Provider)
-    })
-    .await
-    {
-        Ok(translations) => Ok(translations),
+    let sender = checkpoint.sender.clone();
+    let translations =
+        translate_segments_with_callback(provider, segments, config, |_| Ok(())).await;
+
+    match translations {
+        Ok(translations) => {
+            for translation in &translations {
+                sender
+                    .send(make_checkpoint_command(&checkpoint, translation))
+                    .await?;
+            }
+            Ok(translations)
+        }
         Err(error) => {
             let message = format!(
                 "translation scheduler failed before producing per-segment results: {error}"
@@ -1281,14 +1304,6 @@ fn make_checkpoint_command(
         model: ctx.model.to_string(),
         prompt_version: ctx.prompt_version.to_string(),
     }
-}
-
-async fn _send_checkpoint(
-    sender: &CheckpointSender,
-    ctx: &CheckpointContext<'_>,
-    translation: &SegmentTranslation,
-) -> std::result::Result<(), LlmError> {
-    sender.send(make_checkpoint_command(ctx, translation)).await
 }
 
 pub(crate) fn mark_job_finished(

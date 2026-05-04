@@ -4,7 +4,7 @@ use bookforge_core::{
     segment::{BlockTranslation, Segment, SegmentId, SegmentStatus, SegmentTextRun},
 };
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{Mutex as TokioMutex, Semaphore, mpsc};
 
@@ -641,10 +641,14 @@ where
 
     // Bounded work/result channels. Workers pull work after acquiring a
     // permit, so the queue size just needs to handle brief bursts.
+    // Result channel uses a large capacity to prevent deadlock from
+    // interleaved work dispatch and result collection.
     let queue_size = concurrency * 4;
     let (work_tx, work_rx) = mpsc::channel::<TranslationBatch>(queue_size);
-    let (result_tx, mut result_rx) =
-        mpsc::channel::<(TranslationBatch, Result<BatchTranslationResult, LlmError>)>(queue_size);
+    let (result_tx, mut result_rx) = mpsc::channel::<(
+        TranslationBatch,
+        Result<BatchTranslationResult, LlmError>,
+    )>(queue_size * 16);
     let work_rx = Arc::new(TokioMutex::new(work_rx));
 
     // Fixed-concurrency semaphore only used when no adaptive limiter is configured.
@@ -752,139 +756,125 @@ where
             break;
         }
 
-        // Push batches to workers.
-        let mut pushed = 0usize;
-        for batch in pending.drain(..) {
-            if work_tx.send(batch).await.is_err() {
-                break; // Workers exited
-            }
-            pushed += 1;
-        }
+        // Push batches to workers, draining results as needed to avoid
+        // deadlock from both bounded queues filling.
+        let mut pending_queue: VecDeque<TranslationBatch> = pending.drain(..).collect();
+        let mut in_flight = 0usize;
 
-        // Collect results.
-        let mut collected = 0usize;
-        while collected < pushed {
-            let Some((batch, result)) = result_rx.recv().await else {
-                break;
-            };
-            collected += 1;
-
-            match result {
-                Ok(batch_result) => {
-                    if let Some(ref mut sizer) = batch_sizer {
-                        sizer.on_success();
+        while !pending_queue.is_empty() || in_flight > 0 {
+            // Try to push work to channel
+            while let Some(batch) = pending_queue.front() {
+                match work_tx.try_send(batch.clone()) {
+                    Ok(()) => {
+                        pending_queue.pop_front();
+                        in_flight += 1;
                     }
-                    all_results.push(batch_result);
-                }
-                Err(LlmError::InvalidResponse(_)) if batch.kind == BatchKind::Repair => {
-                    eprintln!(
-                        "repair batch {} failed with invalid response; marking {} items NeedsReview",
-                        batch.id,
-                        batch.items.len(),
-                    );
-                    all_results.push(BatchTranslationResult {
-                        batch_id: batch.id.clone(),
-                        translations: Vec::new(),
-                        failures: batch
-                            .items
-                            .iter()
-                            .map(|item| BatchItemFailure {
-                                item_id: item.item_id.clone(),
-                                segment_id: item.segment_id.clone(),
-                                error: "repair batch invalid response".to_string(),
-                            })
-                            .collect(),
-                        input_tokens: None,
-                        output_tokens: None,
-                    });
-                }
-                Err(LlmError::InvalidResponse(_)) if batch.items.len() == 1 => {
-                    eprintln!(
-                        "single-item batch {} failed with invalid response; not splitting further",
-                        batch.id,
-                    );
-                    all_results.push(BatchTranslationResult {
-                        batch_id: batch.id.clone(),
-                        translations: Vec::new(),
-                        failures: batch
-                            .items
-                            .iter()
-                            .map(|item| BatchItemFailure {
-                                item_id: item.item_id.clone(),
-                                segment_id: item.segment_id.clone(),
-                                error: "single-item batch invalid response".to_string(),
-                            })
-                            .collect(),
-                        input_tokens: None,
-                        output_tokens: None,
-                    });
-                }
-                Err(LlmError::InvalidResponse(_)) if batch.items.len() > 1 => {
-                    if let Some(ref mut sizer) = batch_sizer {
-                        sizer.on_invalid_json();
+                    Err(mpsc::error::TrySendError::Full(_)) => break,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        pending_queue.clear();
+                        break;
                     }
-                    eprintln!(
-                        "batch {} failed with invalid response, splitting into {} + {} items",
-                        batch.id,
-                        batch.items.len() / 2,
-                        batch.items.len() - batch.items.len() / 2,
-                    );
-                    pending.extend(split_batch(&batch));
-                }
-                // Repair batches do not retry transient errors — repair is
-                // terminal cleanup. A single transient failure drops all
-                // repair items to NeedsReview rather than risking an
-                // infinite retry loop.
-                Err(ref error) if is_transient(error) && batch.kind == BatchKind::Translation => {
-                    eprintln!("batch {} transient error, retrying: {error}", batch.id);
-                    pending.push(batch);
-                }
-                Err(error) => {
-                    eprintln!("batch {} failed: {error}", batch.id);
-                    all_results.push(BatchTranslationResult {
-                        batch_id: batch.id.clone(),
-                        translations: Vec::new(),
-                        failures: batch
-                            .items
-                            .iter()
-                            .map(|item| BatchItemFailure {
-                                item_id: item.item_id.clone(),
-                                segment_id: item.segment_id.clone(),
-                                error: format!("{error}"),
-                            })
-                            .collect(),
-                        input_tokens: None,
-                        output_tokens: None,
-                    });
                 }
             }
+
+            // Drain a single result to free space in both channels
+            if in_flight > 0 {
+                let Some((batch, result)) = result_rx.recv().await else {
+                    break;
+                };
+                in_flight -= 1;
+
+                match result {
+                    Ok(batch_result) => {
+                        if let Some(ref mut sizer) = batch_sizer {
+                            sizer.on_success();
+                        }
+                        all_results.push(batch_result);
+                    }
+                    Err(LlmError::InvalidResponse(_)) if batch.kind == BatchKind::Repair => {
+                        eprintln!(
+                            "repair batch {} failed; marking {} items NeedsReview",
+                            batch.id,
+                            batch.items.len(),
+                        );
+                        all_results.push(BatchTranslationResult {
+                            batch_id: batch.id.clone(),
+                            translations: Vec::new(),
+                            failures: batch
+                                .items
+                                .iter()
+                                .map(|item| BatchItemFailure {
+                                    item_id: item.item_id.clone(),
+                                    segment_id: item.segment_id.clone(),
+                                    error: "repair batch invalid response".to_string(),
+                                })
+                                .collect(),
+                            input_tokens: None,
+                            output_tokens: None,
+                        });
+                    }
+                    Err(LlmError::InvalidResponse(_)) if batch.items.len() == 1 => {
+                        eprintln!(
+                            "single-item batch {} failed; not splitting further",
+                            batch.id,
+                        );
+                        all_results.push(BatchTranslationResult {
+                            batch_id: batch.id.clone(),
+                            translations: Vec::new(),
+                            failures: batch
+                                .items
+                                .iter()
+                                .map(|item| BatchItemFailure {
+                                    item_id: item.item_id.clone(),
+                                    segment_id: item.segment_id.clone(),
+                                    error: "single-item batch invalid response".to_string(),
+                                })
+                                .collect(),
+                            input_tokens: None,
+                            output_tokens: None,
+                        });
+                    }
+                    Err(LlmError::InvalidResponse(_)) if batch.items.len() > 1 => {
+                        if let Some(ref mut sizer) = batch_sizer {
+                            sizer.on_invalid_json();
+                        }
+                        eprintln!("batch {} failed with invalid response, splitting", batch.id);
+                        pending_queue.extend(split_batch(&batch));
+                    }
+                    Err(ref error)
+                        if is_transient(error) && batch.kind == BatchKind::Translation =>
+                    {
+                        eprintln!("batch {} transient error, retrying: {error}", batch.id);
+                        pending_queue.push_back(batch);
+                    }
+                    Err(error) => {
+                        eprintln!("batch {} failed: {error}", batch.id);
+                        all_results.push(BatchTranslationResult {
+                            batch_id: batch.id.clone(),
+                            translations: Vec::new(),
+                            failures: batch
+                                .items
+                                .iter()
+                                .map(|item| BatchItemFailure {
+                                    item_id: item.item_id.clone(),
+                                    segment_id: item.segment_id.clone(),
+                                    error: format!("{error}"),
+                                })
+                                .collect(),
+                            input_tokens: None,
+                            output_tokens: None,
+                        });
+                    }
+                }
+            }
         }
+        pending = pending_queue.into();
     }
 
     // Signal workers to exit and wait for them.
     drop(work_tx);
     for handle in worker_handles {
         let _ = handle.await;
-    }
-    // result_tx clones held by workers will all be dropped now,
-    // so result_rx will naturally close.
-
-    for batch in &pending {
-        all_results.push(BatchTranslationResult {
-            batch_id: batch.id.clone(),
-            translations: Vec::new(),
-            failures: batch
-                .items
-                .iter()
-                .map(|item| BatchItemFailure {
-                    item_id: item.item_id.clone(),
-                    segment_id: item.segment_id.clone(),
-                    error: "batch exhausted retries".to_string(),
-                })
-                .collect(),
-            input_tokens: None,
-            output_tokens: None,
-        });
     }
 
     let mut segment_translations: HashMap<String, SegmentTranslation> = HashMap::new();

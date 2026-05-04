@@ -1,5 +1,5 @@
 use std::{
-    io::Write,
+    io::{BufWriter, IsTerminal, Write},
     path::PathBuf,
     sync::{
         Arc,
@@ -92,15 +92,18 @@ async fn render_loop(
     jsonl_path: Option<PathBuf>,
     dropped: Arc<AtomicUsize>,
 ) -> Result<()> {
-    match ui_mode {
-        UiMode::Quiet => {
-            // Just drain events silently
-            while rx.recv().await.is_some() {}
-        }
+    let effective_mode = match ui_mode {
+        UiMode::Auto if std::io::stderr().is_terminal() => UiMode::Progress,
+        UiMode::Auto => UiMode::Quiet,
+        other => other,
+    };
+
+    match effective_mode {
+        UiMode::Quiet => while rx.recv().await.is_some() {},
         UiMode::Json => {
-            render_jsonl(&mut rx, jsonl_path, &dropped).await?;
+            render_jsonl_stdout(&mut rx).await?;
         }
-        UiMode::Auto | UiMode::Progress => {
+        UiMode::Progress | UiMode::Auto => {
             render_progress_bars(&mut rx, jsonl_path, &dropped).await?;
         }
     }
@@ -165,8 +168,9 @@ async fn render_progress_bars(
     let mut active_requests = 0usize;
     let mut _checkpoint_flushed = 0usize;
     let mut last_render = Instant::now();
-    let mut jsonl_file: Option<std::fs::File> = None;
+    let mut jsonl_writer: Option<BufWriter<std::fs::File>> = None;
     let mut jsonl_failed = false;
+    let mut jsonl_last_flush = Instant::now();
 
     loop {
         // Receive with a short timeout so we can render periodically
@@ -175,8 +179,14 @@ async fn render_progress_bars(
         match event {
             Ok(Some(event)) => {
                 // Write to JSONL if enabled
-                if let Some(ref mut f) = jsonl_file {
-                    let _ = writeln!(f, "{}", serde_json::to_string(&event).unwrap_or_default());
+                let is_critical = is_important_event(&event);
+                if let Some(ref mut w) = jsonl_writer {
+                    let _ = writeln!(w, "{}", serde_json::to_string(&event).unwrap_or_default());
+                    if is_critical || jsonl_last_flush.elapsed() > std::time::Duration::from_secs(2)
+                    {
+                        let _ = w.flush();
+                        jsonl_last_flush = Instant::now();
+                    }
                 }
 
                 match &event {
@@ -196,18 +206,21 @@ async fn render_progress_bars(
                         cached = *hits;
                         seg_bar.set_message(format!("{cached} cached"));
                     }
-                    ProgressEvent::SegmentFinished { status, .. }
-                        if status == "succeeded" || status == "skipped_cached" =>
-                    {
-                        done_segments += 1;
-                        seg_bar.set_position(done_segments as u64);
-                        let elapsed = start.elapsed().as_secs_f64().max(0.1);
-                        let rate = done_segments as f64 / elapsed;
-                        rate_bar.set_message(format!(
-                            "{done_segments}/{total_segments} done, {rate:.1} seg/min"
-                        ));
+                    ProgressEvent::SegmentFinished { status, .. } => {
+                        // Count all terminal statuses as completed
+                        match status.as_str() {
+                            "succeeded" | "skipped_cached" | "needs_review" | "failed" => {
+                                done_segments += 1;
+                                seg_bar.set_position(done_segments as u64);
+                                let elapsed = start.elapsed().as_secs_f64().max(0.1);
+                                let rate_per_min = done_segments as f64 / elapsed * 60.0;
+                                rate_bar.set_message(format!(
+                                    "{done_segments}/{total_segments} done, {rate_per_min:.1} seg/min"
+                                ));
+                            }
+                            _ => {}
+                        }
                     }
-                    ProgressEvent::SegmentFinished { .. } => {}
                     ProgressEvent::RequestStarted { .. } => {
                         active_requests += 1;
                         batch_bar.set_message(format!("{active_requests} active"));
@@ -270,11 +283,15 @@ async fn render_progress_bars(
         }
 
         // Open JSONL file lazily on first event; skip if we already tried and failed.
-        if jsonl_file.is_none() && !jsonl_failed
+        if jsonl_writer.is_none()
+            && !jsonl_failed
             && let Some(ref path) = jsonl_path
         {
             match std::fs::File::create(path) {
-                Ok(f) => jsonl_file = Some(f),
+                Ok(f) => {
+                    jsonl_writer = Some(BufWriter::new(f));
+                    jsonl_last_flush = Instant::now();
+                }
                 Err(e) => {
                     jsonl_failed = true;
                     let _ = multi.println(format!("  [warn] cannot create JSONL log: {e}"));
@@ -287,23 +304,23 @@ async fn render_progress_bars(
     Ok(())
 }
 
-async fn render_jsonl(
-    rx: &mut mpsc::Receiver<ProgressEvent>,
-    jsonl_path: Option<PathBuf>,
-    dropped: &Arc<AtomicUsize>,
-) -> Result<()> {
-    let path = jsonl_path.unwrap_or_else(|| PathBuf::from(".bookforge/events.jsonl"));
-    let mut file = std::fs::File::create(&path)?;
-
+async fn render_jsonl_stdout(rx: &mut mpsc::Receiver<ProgressEvent>) -> Result<()> {
     while let Some(event) = rx.recv().await {
         let line = serde_json::to_string(&event).unwrap_or_default();
-        writeln!(file, "{line}")?;
+        println!("{line}");
     }
-
-    let d = dropped.load(Ordering::Relaxed);
-    if d > 0 {
-        eprintln!("({d} progress events dropped)");
-    }
-
     Ok(())
+}
+
+fn is_important_event(event: &ProgressEvent) -> bool {
+    match event {
+        ProgressEvent::Error { .. }
+        | ProgressEvent::Warning { .. }
+        | ProgressEvent::BatchRepairFinished { .. }
+        | ProgressEvent::CheckpointFlushed { .. }
+        | ProgressEvent::TranslationFinished { .. }
+        | ProgressEvent::DroppedEvents { .. } => true,
+        ProgressEvent::RequestFinished { status, .. } => status != "ok",
+        _ => false,
+    }
 }

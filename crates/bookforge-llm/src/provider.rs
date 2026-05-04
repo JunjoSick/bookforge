@@ -549,7 +549,8 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let mut raw = None;
         let mut last_error = None;
         let mut tried_response_format_fallback = false;
-        for attempt in 0..max_attempts {
+        let mut attempt = 0usize;
+        while attempt < max_attempts {
             let send_future = self
                 .client
                 .post(&endpoint)
@@ -557,18 +558,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 .json(&body)
                 .send();
 
-            let response = tokio::select! {
-                result = send_future => result,
-                _ = self.cancel_token.cancelled() => {
-                    return Err(LlmError::Provider(
-                        "interrupted by user".to_string(),
-                    ));
-                }
-            };
-
-            let response = match response {
-                Ok(response) => response,
-                Err(error) => {
+            let response = match cancelable(&self.cancel_token, send_future).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(error)) => {
                     let kind = if error.is_timeout() {
                         "timeout"
                     } else if error.is_connect() {
@@ -588,22 +580,34 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     let retryable = is_retryable_http_error(&error);
                     let attempt_limit = attempt_limit_for_http_error(&error, max_attempts);
                     last_error = Some(LlmError::Http(error));
-                    if !retryable || attempt + 1 == attempt_limit {
+                    if !retryable {
                         return Err(last_error.expect("set above"));
                     }
-                    let delay = retry_delay(policy, attempt, None, max_backoff);
-                    if let Some(d) = delay {
-                        sleep(d).await;
+                    attempt += 1;
+                    if attempt >= attempt_limit {
+                        return Err(last_error.expect("set above"));
                     }
+                    apply_retry_delay(
+                        &self.cancel_token,
+                        policy,
+                        attempt - 1,
+                        None,
+                        max_backoff,
+                        last_error.take().expect("set above"),
+                    )
+                    .await?;
                     continue;
+                }
+                Err(_) => {
+                    return Err(LlmError::Provider("interrupted by user".to_string()));
                 }
             };
             let status = response.status();
 
             if status.is_success() {
-                let response_bytes = match response.bytes().await {
-                    Ok(b) => b,
-                    Err(error) => {
+                let response_bytes = match cancelable(&self.cancel_token, response.bytes()).await {
+                    Ok(Ok(b)) => b,
+                    Ok(Err(error)) => {
                         eprintln!(
                             "provider: attempt {}/{} body read failed (status={status:#}): {error}",
                             attempt + 1,
@@ -612,14 +616,26 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         let retryable = is_retryable_http_error(&error);
                         let attempt_limit = attempt_limit_for_http_error(&error, max_attempts);
                         last_error = Some(LlmError::Http(error));
-                        if !retryable || attempt + 1 == attempt_limit {
+                        if !retryable {
                             return Err(last_error.expect("set above"));
                         }
-                        let delay = retry_delay(policy, attempt, None, max_backoff);
-                        if let Some(d) = delay {
-                            sleep(d).await;
+                        attempt += 1;
+                        if attempt >= attempt_limit {
+                            return Err(last_error.expect("set above"));
                         }
+                        apply_retry_delay(
+                            &self.cancel_token,
+                            policy,
+                            attempt - 1,
+                            None,
+                            max_backoff,
+                            last_error.take().expect("set above"),
+                        )
+                        .await?;
                         continue;
+                    }
+                    Err(_) => {
+                        return Err(LlmError::Provider("interrupted by user".to_string()));
                     }
                 };
                 match serde_json::from_slice::<Value>(&response_bytes) {
@@ -638,15 +654,21 @@ impl LlmProvider for OpenAiCompatibleProvider {
                             attempt + 1,
                             max_attempts,
                         );
-                        if attempt + 1 == max_attempts {
+                        attempt += 1;
+                        if attempt >= max_attempts {
                             return Err(LlmError::InvalidResponse(format!(
                                 "JSON parse failed after {max_attempts} attempts: {error}"
                             )));
                         }
-                        let delay = retry_delay(policy, attempt, None, max_backoff);
-                        if let Some(d) = delay {
-                            sleep(d).await;
-                        }
+                        apply_retry_delay(
+                            &self.cancel_token,
+                            policy,
+                            attempt - 1,
+                            None,
+                            max_backoff,
+                            LlmError::InvalidResponse(format!("JSON parse failed: {error}")),
+                        )
+                        .await?;
                         continue;
                     }
                 }
@@ -654,10 +676,33 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
             let status_code = status.as_u16();
             let retry_after = parse_retry_after(response.headers());
-            let response_body = response.text().await.unwrap_or_default();
+            let response_body = match cancelable(&self.cancel_token, response.text()).await {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
+                    last_error = Some(LlmError::Http(e));
+                    attempt += 1;
+                    if attempt >= max_attempts {
+                        return Err(last_error.expect("set above"));
+                    }
+                    apply_retry_delay(
+                        &self.cancel_token,
+                        policy,
+                        attempt - 1,
+                        None,
+                        max_backoff,
+                        last_error.take().expect("set above"),
+                    )
+                    .await?;
+                    continue;
+                }
+                Err(_) => {
+                    return Err(LlmError::Provider("interrupted by user".to_string()));
+                }
+            };
 
             // Auto-detect unsupported response_format: 400 with response_format
-            // enabled in Auto mode -> retry once without it and remember.
+            // enabled in Auto mode -> retry once without it. Do NOT count
+            // this as a normal attempt.
             if status_code == 400
                 && self.config.json_mode == bookforge_core::JsonMode::Auto
                 && use_response_format
@@ -668,7 +713,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     .store(false, Ordering::Relaxed);
                 body.as_object_mut().map(|o| o.remove("response_format"));
                 tried_response_format_fallback = true;
-                continue;
+                continue; // Does not increment attempt
             }
 
             last_error = Some(LlmError::HttpStatus {
@@ -676,14 +721,23 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 body: response_body,
             });
 
-            if !is_retryable_status(status_code) || attempt + 1 == max_attempts {
+            if !is_retryable_status(status_code) {
+                return Err(last_error.expect("set above"));
+            }
+            attempt += 1;
+            if attempt >= max_attempts {
                 return Err(last_error.expect("set above"));
             }
 
-            let delay = retry_delay(policy, attempt, retry_after, max_backoff);
-            if let Some(d) = delay {
-                sleep(d).await;
-            }
+            apply_retry_delay(
+                &self.cancel_token,
+                policy,
+                attempt - 1,
+                retry_after,
+                max_backoff,
+                last_error.take().expect("set above"),
+            )
+            .await?;
         }
         let raw = raw.ok_or_else(|| {
             last_error.unwrap_or_else(|| {
@@ -740,6 +794,41 @@ impl LlmProvider for OpenAiCompatibleProvider {
             supports_json_response_format: true,
             supports_usage_tokens: true,
         }
+    }
+}
+
+async fn cancelable<T>(
+    token: &CancellationToken,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    tokio::select! {
+        value = fut => Ok(value),
+        _ = token.cancelled() => Err(LlmError::Provider(
+            "interrupted by user".to_string()
+        )),
+    }
+}
+
+async fn cancelable_sleep(token: &CancellationToken, duration: Duration) -> Result<()> {
+    tokio::select! {
+        _ = sleep(duration) => Ok(()),
+        _ = token.cancelled() => Err(LlmError::Provider(
+            "interrupted by user".to_string()
+        )),
+    }
+}
+
+async fn apply_retry_delay(
+    token: &CancellationToken,
+    policy: RetryAfterPolicy,
+    attempt: usize,
+    retry_after: Option<Duration>,
+    max_backoff: Duration,
+    error: LlmError,
+) -> Result<()> {
+    match retry_delay(policy, attempt, retry_after, max_backoff) {
+        Some(delay) => cancelable_sleep(token, delay).await,
+        None => Err(error),
     }
 }
 

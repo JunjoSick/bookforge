@@ -172,7 +172,7 @@ pub fn run_doctor(db_path: Option<PathBuf>) -> Result<StorageDoctor> {
         let integrity_check: String = conn
             .pragma_query_value(None, "integrity_check", |row| row.get(0))
             .unwrap_or_else(|_| "error".to_string());
-        let _ = conn.pragma_update(None, "wal_checkpoint", "PASSIVE");
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
 
         let wal_sidecars_normal = if wal_present || shm_present {
             integrity_check == "ok"
