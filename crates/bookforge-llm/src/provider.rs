@@ -525,6 +525,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             }
 
             let status_code = status.as_u16();
+            let retry_after = parse_retry_after(response.headers());
             let body = response.text().await.unwrap_or_default();
             last_error = Some(LlmError::HttpStatus {
                 status: status_code,
@@ -535,7 +536,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 return Err(last_error.expect("set above"));
             }
 
-            sleep(backoff_delay(attempt)).await;
+            sleep(retry_after.unwrap_or_else(|| backoff_delay(attempt))).await;
         }
         let raw = raw.ok_or_else(|| {
             last_error.unwrap_or_else(|| {
@@ -582,6 +583,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
 fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
+}
+
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    // Cap at 60s so a buggy or hostile server can't stall a request for hours.
+    Some(Duration::from_secs(secs.min(60)))
 }
 
 fn is_retryable_http_error(error: &reqwest::Error) -> bool {
