@@ -548,6 +548,7 @@ async fn run_openai_compatible_translation(
         settings.provider.retry_after_policy,
         settings.provider.max_backoff_seconds,
         settings.provider.max_idle_per_host,
+        settings.provider.json_mode,
     ) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -888,6 +889,7 @@ fn provider_config(
     retry_after_policy: bookforge_core::RetryAfterPolicy,
     max_backoff_seconds: u64,
     max_idle_per_host: usize,
+    json_mode: bookforge_core::JsonMode,
 ) -> Result<OpenAiCompatibleConfig> {
     let (default_url, default_key_env, default_model) = match provider {
         "deepseek" => (
@@ -924,7 +926,7 @@ fn provider_config(
         retry_after_policy,
         max_backoff_seconds,
         max_idle_per_host,
-        json_mode: bookforge_core::JsonMode::Auto,
+        json_mode,
     })
 }
 
@@ -1087,6 +1089,7 @@ async fn run_fallback_pass(
         settings.provider.retry_after_policy,
         settings.provider.max_backoff_seconds,
         settings.provider.max_idle_per_host,
+        settings.provider.json_mode,
     )?;
 
     let fallback = OpenAiCompatibleProvider::new_with_cancel(
@@ -1200,6 +1203,7 @@ async fn run_double_check_pass(
                 settings.provider.retry_after_policy,
                 settings.provider.max_backoff_seconds,
                 settings.provider.max_idle_per_host,
+                settings.provider.json_mode,
             )?;
             OpenAiCompatibleProvider::new_with_cancel(dc_config, cancel_token.clone())
                 .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -1901,6 +1905,7 @@ mod tests {
             RetryAfterPolicy::JitteredExponential,
             30,
             32,
+            bookforge_core::JsonMode::Auto,
         )
         .expect("provider_config should build");
         assert_eq!(cfg.provider_max_attempts, 2);
@@ -1916,9 +1921,30 @@ mod tests {
             RetryAfterPolicy::JitteredExponential,
             30,
             32,
+            bookforge_core::JsonMode::Auto,
         )
         .expect("provider_config should build");
         assert_eq!(cfg.provider_max_attempts, 1);
+    }
+
+    #[test]
+    fn provider_config_uses_resolved_json_mode() {
+        let cfg = provider_config(
+            "openrouter",
+            None,
+            None,
+            None,
+            120,
+            1,
+            true,
+            bookforge_core::RetryAfterPolicy::JitteredExponential,
+            15,
+            64,
+            bookforge_core::JsonMode::PromptOnly,
+        )
+        .expect("provider_config should build");
+
+        assert_eq!(cfg.json_mode, bookforge_core::JsonMode::PromptOnly);
     }
 
     fn translate_args_with_preset(
