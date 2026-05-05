@@ -34,7 +34,7 @@ pub(crate) fn token_prices(provider: &str, model: &str) -> Option<TokenPrices> {
                 input_per_million: 0.27,
                 output_per_million: 1.10,
             }),
-            "deepseek-v4-pro" | "deepseek-reasoner" => Some(TokenPrices {
+            "deepseek-reasoner" => Some(TokenPrices {
                 input_per_million: 0.55,
                 output_per_million: 2.19,
             }),

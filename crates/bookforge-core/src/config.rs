@@ -651,7 +651,7 @@ impl ProviderPreset {
             ProviderPreset::DeepSeekPaid => Some(ProviderPresetResolved {
                 endpoint: ModelEndpoint {
                     provider: "deepseek".to_string(),
-                    model: "deepseek-v4-pro".to_string(),
+                    model: "deepseek-v4-flash".to_string(),
                     base_url: Some("https://api.deepseek.com/v1".to_string()),
                     api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
                 },
@@ -668,7 +668,7 @@ impl ProviderPreset {
                     adaptive_batch_sizing: Some(true),
                     compact_prompts: Some(true),
                     adaptive_concurrency: Some(true),
-                    thinking_disabled: Some(true),
+                    thinking_disabled: Some(false),
                     json_mode: Some(JsonMode::Auto),
                     max_idle_per_host: Some(16),
                     ..Default::default()
