@@ -333,6 +333,8 @@ impl ProgressBars {
             }
             ProgressEvent::CacheScanFinished { hits, .. } => {
                 self.cached = *hits;
+                self.done_segments = *hits;
+                self.seg_bar.set_position(self.done_segments as u64);
                 self.seg_bar.set_message(format!("{} cached", self.cached));
             }
             ProgressEvent::SegmentFinished { status, .. } => match status.as_str() {

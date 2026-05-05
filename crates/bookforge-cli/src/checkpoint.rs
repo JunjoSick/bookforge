@@ -41,6 +41,19 @@ impl CheckpointCommand {
             CheckpointCommand::MarkFailed { segment_id, .. } => Some(segment_id.clone()),
         }
     }
+
+    fn segment_finished_event(&self) -> Option<ProgressEvent> {
+        let CheckpointCommand::SaveTranslation { translation, .. } = self else {
+            return None;
+        };
+        Some(ProgressEvent::SegmentFinished {
+            segment_id: translation.segment_id.0.clone(),
+            status: segment_status_str(translation.status).to_string(),
+            input_tokens: translation.input_tokens,
+            output_tokens: translation.output_tokens,
+            timestamp_ms: now_ms(),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -59,6 +72,7 @@ impl CheckpointSender {
         cmd: CheckpointCommand,
     ) -> std::result::Result<(), bookforge_llm::LlmError> {
         let queued = self.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
+        let segment_finished = cmd.segment_finished_event();
 
         match self.tx.send(cmd).await {
             Ok(()) => {
@@ -66,6 +80,9 @@ impl CheckpointSender {
                     queued,
                     timestamp_ms: now_ms(),
                 });
+                if let Some(event) = segment_finished {
+                    self.progress.emit(event);
+                }
                 Ok(())
             }
             Err(_) => {
@@ -75,6 +92,17 @@ impl CheckpointSender {
                 ))
             }
         }
+    }
+}
+
+fn segment_status_str(status: SegmentStatus) -> &'static str {
+    match status {
+        SegmentStatus::Queued => "queued",
+        SegmentStatus::Succeeded => "succeeded",
+        SegmentStatus::Failed => "failed",
+        SegmentStatus::RetryPending => "retry_pending",
+        SegmentStatus::NeedsReview => "needs_review",
+        SegmentStatus::SkippedCached => "skipped_cached",
     }
 }
 

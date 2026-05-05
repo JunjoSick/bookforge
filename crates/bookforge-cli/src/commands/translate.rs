@@ -180,6 +180,26 @@ pub struct TranslateArgs {
 
     #[arg(long)]
     pub progress_jsonl: Option<PathBuf>,
+
+    #[arg(long, value_enum)]
+    pub provider_preset: Option<bookforge_core::ProviderPreset>,
+}
+
+fn apply_provider_preset(
+    explicit: &CliProviderArgs,
+    preset: Option<bookforge_core::ProviderPreset>,
+) -> CliProviderArgs {
+    let Some(p) = preset else {
+        return explicit.clone();
+    };
+    let endpoint = p.resolve(None);
+    CliProviderArgs {
+        provider: endpoint.provider,
+        model: explicit.model.clone().or(Some(endpoint.model)),
+        base_url: explicit.base_url.clone().or(endpoint.base_url),
+        api_key_env: explicit.api_key_env.clone().or(endpoint.api_key_env),
+        timeout_seconds: explicit.timeout_seconds,
+    }
 }
 
 fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
@@ -271,6 +291,10 @@ pub async fn run(
     cancel_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let settings = resolve_settings(&args);
+
+    // Apply provider preset if specified (before explicit CLI overrides)
+    let effective_provider = apply_provider_preset(&args.provider, args.provider_preset);
+
     let output = args
         .out
         .clone()
@@ -278,8 +302,8 @@ pub async fn run(
     let config = TranslationConfig {
         source_language: args.language.source.clone(),
         target_language: args.language.target.clone(),
-        provider: args.provider.provider.clone(),
-        model: args.provider.model.clone(),
+        provider: effective_provider.provider.clone(),
+        model: effective_provider.model.clone(),
         concurrency: settings.scheduler.concurrency,
         max_attempts: settings.scheduler.max_attempts,
         output,
@@ -326,13 +350,14 @@ pub async fn run(
     let run_result = async {
         match config.provider.as_str() {
             "mock" => {
-                run_mock_translation(&args.input, &config, &args.provider, &args, &settings).await
+                run_mock_translation(&args.input, &config, &effective_provider, &args, &settings)
+                    .await
             }
             "deepseek" | "openrouter" | "openai-compatible" => {
                 run_openai_compatible_translation(
                     &args.input,
                     &config,
-                    &args.provider,
+                    &effective_provider,
                     &args,
                     &settings,
                     &cancel_token,

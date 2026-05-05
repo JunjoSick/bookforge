@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use bookforge_core::{RetryAfterPolicy, marker::is_marker_token};
 
@@ -572,7 +573,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     } else {
                         "other"
                     };
-                    eprintln!(
+                    warn!(
                         "provider: attempt {}/{} [{kind}] body={body_len}bytes: {error}",
                         attempt + 1,
                         max_attempts,
@@ -608,7 +609,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 let response_bytes = match cancelable(&self.cancel_token, response.bytes()).await {
                     Ok(Ok(b)) => b,
                     Ok(Err(error)) => {
-                        eprintln!(
+                        warn!(
                             "provider: attempt {}/{} body read failed (status={status:#}): {error}",
                             attempt + 1,
                             max_attempts,
@@ -649,7 +650,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         } else {
                             &response_bytes
                         });
-                        eprintln!(
+                        warn!(
                             "provider: attempt {}/{} json parse failed ({status:#}): {error}\n  body: {preview}",
                             attempt + 1,
                             max_attempts,
@@ -708,7 +709,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 && use_response_format
                 && !tried_response_format_fallback
             {
-                eprintln!("provider: response_format unsupported (400), retrying without it");
+                warn!("provider: response_format unsupported (400), retrying without it");
                 self.response_format_supported
                     .store(false, Ordering::Relaxed);
                 body.as_object_mut().map(|o| o.remove("response_format"));
@@ -989,5 +990,109 @@ mod tests {
 
         let result = cancelable_sleep(&token, Duration::from_secs(3600)).await;
         assert!(result.is_err(), "cancelled token must abort sleep");
+    }
+
+    /// Verify that json_mode_auto_fallback retries without response_format
+    /// when the server returns 400, and does NOT consume a provider attempt.
+    #[tokio::test]
+    async fn json_mode_auto_fallback_works_with_one_provider_attempt() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // We need to override reading of the API key env var.
+        // Use a well-known env var name; the actual value is unused by
+        // the test server, but the provider MUST be able to read it.
+        unsafe { std::env::set_var("BOOKFORGE_TEST_JSON_FALLBACK_KEY", "test") };
+
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count_clone = request_count.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        // Server: returns 400 on first request (simulating unsupported
+        // response_format), then 200 with valid JSON on second request.
+        let server_handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let cnt = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Read the request so the client doesn't stall
+                let mut buf = vec![0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+
+                if cnt == 0 {
+                    // First attempt: 400 — unsupported response_format
+                    let body = br#"{"error":{"message":"response_format is not supported"}}"#;
+                    let header = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                } else {
+                    // Second attempt: 200 OK with valid translation
+                    let body = br#"{"choices":[{"message":{"content":"{\"translation\":\"Ciao\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                }
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let config = OpenAiCompatibleConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            api_key_env: "BOOKFORGE_TEST_JSON_FALLBACK_KEY".to_string(),
+            model: "test-model".to_string(),
+            timeout_seconds: 10,
+            provider_max_attempts: 1,
+            thinking_disabled: true,
+            retry_after_policy: RetryAfterPolicy::None,
+            max_backoff_seconds: 30,
+            max_idle_per_host: 32,
+            json_mode: bookforge_core::JsonMode::Auto,
+        };
+
+        let provider = OpenAiCompatibleProvider::new(config).unwrap();
+        let request = CompletionRequest {
+            system: "translate".to_string(),
+            user: "hello".to_string(),
+            response_format: ResponseFormat::Json,
+            temperature: 0.2,
+            max_output_tokens: Some(256),
+            metadata: RequestMetadata::default(),
+        };
+
+        let result = provider.complete(request).await;
+
+        // Server should have received 2 requests (first 400, second 200)
+        let received = request_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            received, 2,
+            "expected 2 requests for 400 fallback + successful retry, got {received}"
+        );
+
+        // The single attempt should succeed after fallback
+        assert!(
+            result.is_ok(),
+            "json_mode_auto_fallback should succeed: {:?}",
+            result.err()
+        );
+
+        // response_format_supported should be set to false after 400
+        assert!(
+            !provider
+                .response_format_supported
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "response_format_supported should be false after 400 fallback"
+        );
+
+        server_handle.abort();
     }
 }

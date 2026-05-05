@@ -48,6 +48,9 @@ pub struct ResumeArgs {
 
     #[arg(long, default_value_t = 120)]
     pub timeout_seconds: u64,
+
+    #[arg(long, default_value_t = false)]
+    pub no_thinking: bool,
 }
 
 pub async fn run(args: ResumeArgs) -> Result<()> {
@@ -138,7 +141,8 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
                 .await
             }
             "deepseek" | "openrouter" | "openai-compatible" => {
-                let provider_config = openai_compatible_config(&job, args.timeout_seconds, 6)?;
+                let provider_config =
+                    openai_compatible_config(&job, args.timeout_seconds, 6, args.no_thinking)?;
                 let provider = OpenAiCompatibleProvider::new(provider_config)?;
                 translate_and_checkpoint(
                     provider.clone(),
@@ -271,6 +275,7 @@ fn openai_compatible_config(
     job: &JobRecord,
     timeout_seconds: u64,
     provider_max_attempts: usize,
+    thinking_disabled: bool,
 ) -> Result<OpenAiCompatibleConfig> {
     let provider_max_attempts = provider_max_attempts.max(1);
     if job.provider == "deepseek" {
@@ -283,6 +288,7 @@ fn openai_compatible_config(
         }
         config.timeout_seconds = timeout_seconds;
         config.provider_max_attempts = provider_max_attempts;
+        config.thinking_disabled = thinking_disabled;
         return Ok(config);
     }
 
@@ -299,7 +305,7 @@ fn openai_compatible_config(
             model: job.model.clone(),
             timeout_seconds,
             provider_max_attempts,
-            thinking_disabled: false,
+            thinking_disabled,
             retry_after_policy: bookforge_core::RetryAfterPolicy::JitteredExponential,
             max_backoff_seconds: 30,
             max_idle_per_host: 32,
@@ -321,7 +327,7 @@ fn openai_compatible_config(
         model: job.model.clone(),
         timeout_seconds,
         provider_max_attempts,
-        thinking_disabled: false,
+        thinking_disabled,
         retry_after_policy: bookforge_core::RetryAfterPolicy::JitteredExponential,
         max_backoff_seconds: 30,
         max_idle_per_host: 32,
@@ -372,7 +378,7 @@ async fn qa_after_resume(
             .await)
         }
         "deepseek" | "openrouter" | "openai-compatible" => {
-            let provider_config = openai_compatible_config(job, timeout_seconds, 6)?;
+            let provider_config = openai_compatible_config(job, timeout_seconds, 6, false)?;
             let provider = OpenAiCompatibleProvider::new(provider_config)?;
             Ok(qa_reviews_for_mode(
                 provider,

@@ -6,18 +6,35 @@ use bookforge_core::{
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::{Mutex as TokioMutex, Semaphore, mpsc};
+use tokio::{sync::mpsc, task::JoinSet};
 
 use crate::{
     AdaptiveLimiter, CompletionRequest, FinishReason, LlmError, LlmProvider, PromptLibrary,
     RequestMetadata, ResponseFormat, SegmentTranslation, Substitutions, TelemetryLog,
-    TranslationRunConfig, concurrency::AdaptivePermit,
+    TranslationRunConfig,
 };
 
-#[allow(dead_code)]
-enum BatchPermit {
-    Adaptive(AdaptivePermit),
-    Fixed(tokio::sync::OwnedSemaphorePermit),
+#[derive(Debug, Clone, Copy)]
+enum LimiterFeedback {
+    Success,
+    RateLimited,
+    Timeout,
+    None,
+}
+
+struct BatchWorkerOutput {
+    batch: TranslationBatch,
+    result: Result<BatchTranslationResult, LlmError>,
+    limiter_feedback: LimiterFeedback,
+    latency_ms: u64,
+    max_output_tokens: u32,
+}
+
+struct RepairWorkerOutput {
+    batch: TranslationBatch,
+    result: Result<BatchTranslationResult, LlmError>,
+    latency_ms: u64,
+    max_output_tokens: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -159,13 +176,19 @@ impl BatchSizer {
     }
 
     pub fn on_p95_high(&mut self) {
+        let prev_target = self.target_tokens;
+        let prev_max = self.max_items;
         self.target_tokens = ((self.target_tokens as f64) * 0.85) as usize;
         self.clamp();
+        self.emit_change("p95_high", prev_target, prev_max);
     }
 
     pub fn on_success(&mut self) {
+        let prev_target = self.target_tokens;
+        let prev_max = self.max_items;
         self.target_tokens = ((self.target_tokens as f64) * 1.10) as usize;
         self.clamp();
+        self.emit_change("success", prev_target, prev_max);
     }
 
     fn clamp(&mut self) {
@@ -333,6 +356,18 @@ fn token_estimate(text: &str) -> usize {
     (chars / 4).max(1)
 }
 
+fn restore_missing_tokens(mut translation: String, required: &[String]) -> String {
+    for token in required {
+        if !translation.contains(token) {
+            if !translation.is_empty() && !translation.ends_with(char::is_whitespace) {
+                translation.push(' ');
+            }
+            translation.push_str(token);
+        }
+    }
+    translation
+}
+
 impl TranslationBatchItem {
     pub fn mode(&self) -> BatchMode {
         if self.text_runs.len() > 12 {
@@ -429,40 +464,16 @@ fn parse_text_batch_response(
             continue;
         }
 
-        if !turbo && !request_item.required_markers.is_empty() {
-            let mut missing = Vec::new();
-            for marker in &request_item.required_markers {
-                if !item.translation.contains(marker) {
-                    missing.push(marker.clone());
-                }
-            }
-            if !missing.is_empty() {
-                failures.push(BatchItemFailure {
-                    item_id: item.id.clone(),
-                    segment_id: request_item.segment_id.clone(),
-                    error: format!("missing required markers: {:?}", missing),
-                });
-                continue;
-            }
-        }
-
+        let mut translation = item.translation.clone();
         if !turbo {
-            for span in &request_item.protected_spans {
-                if !item.translation.contains(span) {
-                    failures.push(BatchItemFailure {
-                        item_id: item.id.clone(),
-                        segment_id: request_item.segment_id.clone(),
-                        error: format!("missing protected span: {span}"),
-                    });
-                    break;
-                }
-            }
+            translation = restore_missing_tokens(translation, &request_item.required_markers);
+            translation = restore_missing_tokens(translation, &request_item.protected_spans);
         }
 
         translations.push(BatchItemTranslation {
             item_id: item.id.clone(),
             segment_id: request_item.segment_id.clone(),
-            text: item.translation.clone(),
+            text: translation,
             input_tokens: None,
             output_tokens: None,
         });
@@ -665,284 +676,299 @@ where
     let mut pending: Vec<TranslationBatch> = batches;
     let max_rounds = 3usize;
 
-    // Bounded work/result channels. Workers pull work after acquiring a
-    // permit, so the queue size just needs to handle brief bursts.
-    // Result channel uses a large capacity to prevent deadlock from
-    // interleaved work dispatch and result collection.
-    let queue_size = concurrency * 4;
-    let (work_tx, work_rx) = mpsc::channel::<TranslationBatch>(queue_size);
-    let (result_tx, mut result_rx) = mpsc::channel::<(
-        TranslationBatch,
-        Result<BatchTranslationResult, LlmError>,
-    )>(queue_size * 16);
-    let work_rx = Arc::new(TokioMutex::new(work_rx));
-
-    // Fixed-concurrency semaphore only used when no adaptive limiter is configured.
-    let fixed_semaphore = if limiter.is_none() {
-        Some(Arc::new(Semaphore::new(concurrency)))
-    } else {
-        None
-    };
-
-    // Spawn persistent worker tasks.
-    let mut worker_handles = Vec::new();
-    for _ in 0..concurrency {
-        let provider = provider.clone();
-        let library = library.clone();
-        let config = config.clone();
-        let telemetry = telemetry.clone();
-        let limiter = limiter.clone();
-        let fixed_semaphore = fixed_semaphore.clone();
-        let work_rx = work_rx.clone();
-        let result_tx = result_tx.clone();
-        let progress = progress.clone();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                // Acquire permit BEFORE pulling work (per addendum rule).
-                let permit = match (&limiter, &fixed_semaphore) {
-                    (Some(l), _) => match l.acquire().await {
-                        Ok(p) => BatchPermit::Adaptive(p),
-                        Err(_) => break,
-                    },
-                    (None, Some(sem)) => match sem.clone().acquire_owned().await {
-                        Ok(p) => BatchPermit::Fixed(p),
-                        Err(_) => break,
-                    },
-                    (None, None) => unreachable!(),
-                };
-
-                // Pull work from the shared receiver.
-                let batch = {
-                    let mut rx = work_rx.lock().await;
-                    rx.recv().await
-                };
-                let Some(batch) = batch else {
-                    drop(permit);
-                    break;
-                };
-
-                let started = std::time::Instant::now();
-                let is_reasoning = provider.is_reasoning();
-
-                let request_id = format!("batch_{}", batch.id);
-                progress.emit(bookforge_core::ProgressEvent::RequestStarted {
-                    request_id: request_id.clone(),
-                    batch_id: Some(batch.id.clone()),
-                    segment_id: None,
-                    provider: Some(config.provider.clone()),
-                    model: Some(config.model.clone()),
-                    prompt_template: None,
-                    items: batch.items.len(),
-                    estimated_input_tokens: batch.token_estimate,
-                    max_output_tokens: Some(capped_batch_max_output_tokens(
-                        &batch,
-                        &config,
-                        is_reasoning,
-                    )),
-                    active_requests: 0,
-                    target_concurrency: config.scheduler.concurrency,
-                    timestamp_ms: bookforge_core::progress::now_ms(),
-                });
-
-                let result =
-                    translate_one_batch(provider.clone(), library.clone(), batch.clone(), &config)
-                        .await;
-                let latency_ms = started.elapsed().as_millis() as u64;
-
-                progress.emit(bookforge_core::ProgressEvent::RequestFinished {
-                    request_id,
-                    batch_id: Some(batch.id.clone()),
-                    segment_id: None,
-                    status: result
-                        .as_ref()
-                        .map_or_else(|e| request_status_from_error(e), |_| "ok")
-                        .to_string(),
-                    latency_ms,
-                    status_code: None,
-                    finish_reason: None,
-                    retry_count: 0,
-                    input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
-                    output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
-                    error_kind: result.as_ref().err().map(|e| format!("{e:?}")),
-                    timestamp_ms: bookforge_core::progress::now_ms(),
-                });
-
-                let metric = ProviderRequestMetric {
-                    request_id: format!("batch_{}", batch.id),
-                    batch_id: Some(batch.id.clone()),
-                    provider: config.provider.clone(),
-                    model: config.model.clone(),
-                    profile: format!("{:?}", config.profile),
-                    items: batch.items.len(),
-                    estimated_input_tokens: batch.token_estimate,
-                    max_output_tokens: Some(capped_batch_max_output_tokens(
-                        &batch,
-                        &config,
-                        is_reasoning,
-                    )),
-                    input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
-                    output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
-                    latency_ms,
-                    finish_reason: None,
-                    status: if result.is_ok() {
-                        "ok".into()
-                    } else {
-                        "error".into()
-                    },
-                    status_code: None,
-                    retry_count: 0,
-                    backoff_ms: 0,
-                    error_kind: None,
-                };
-                telemetry.record(metric);
-
-                if let Some(ref l) = limiter {
-                    match &result {
-                        Ok(_) => l.on_success(),
-                        Err(LlmError::HttpStatus { status: 429, .. }) => l.on_rate_limit(),
-                        Err(LlmError::HttpStatus { status, .. }) if *status >= 500 => {
-                            l.on_timeout()
-                        }
-                        Err(LlmError::Http(e)) if e.is_timeout() || e.is_connect() => {
-                            l.on_timeout()
-                        }
-                        _ => {}
-                    }
-                }
-
-                drop(permit);
-                let _ = result_tx.send((batch, result)).await;
-            }
-        });
-        worker_handles.push(handle);
-    }
-
     for _round in 0..max_rounds {
         if pending.is_empty() {
             break;
         }
 
-        // Push batches to workers, draining results as needed to avoid
-        // deadlock from both bounded queues filling.
+        // Keep one spawned task per in-flight batch. This avoids the
+        // persistent-worker/result-channel deadlock class where a worker logs
+        // request completion but the coordinator never observes a result.
         let mut pending_queue: VecDeque<TranslationBatch> = pending.drain(..).collect();
-        let mut in_flight = 0usize;
+        let mut tasks = JoinSet::<BatchWorkerOutput>::new();
 
-        while !pending_queue.is_empty() || in_flight > 0 {
-            // Try to push work to channel
-            while let Some(batch) = pending_queue.front() {
-                match work_tx.try_send(batch.clone()) {
-                    Ok(()) => {
-                        pending_queue.pop_front();
-                        in_flight += 1;
+        while !pending_queue.is_empty() || !tasks.is_empty() {
+            while tasks.len() < concurrency {
+                let Some(batch) = pending_queue.pop_front() else {
+                    break;
+                };
+                progress.emit(bookforge_core::ProgressEvent::BatchQueued {
+                    batch_id: batch.id.clone(),
+                    item_count: batch.items.len(),
+                    timestamp_ms: bookforge_core::progress::now_ms(),
+                });
+
+                let provider = provider.clone();
+                let library = library.clone();
+                let config = config.clone();
+                let limiter = limiter.clone();
+                let progress = progress.clone();
+
+                tasks.spawn(async move {
+                    let permit = match limiter.as_ref() {
+                        Some(limiter) => match limiter.acquire().await {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                return BatchWorkerOutput {
+                                    batch,
+                                    result: Err(LlmError::Provider(
+                                        "adaptive concurrency limiter closed".to_string(),
+                                    )),
+                                    limiter_feedback: LimiterFeedback::None,
+                                    latency_ms: 0,
+                                    max_output_tokens: 0,
+                                };
+                            }
+                        },
+                        None => None,
+                    };
+
+                    let started = std::time::Instant::now();
+                    let is_reasoning = provider.is_reasoning();
+
+                    let request_id = format!("batch_{}", batch.id);
+                    progress.emit(bookforge_core::ProgressEvent::RequestStarted {
+                        request_id: request_id.clone(),
+                        batch_id: Some(batch.id.clone()),
+                        segment_id: None,
+                        provider: Some(config.provider.clone()),
+                        model: Some(config.model.clone()),
+                        prompt_template: None,
+                        items: batch.items.len(),
+                        estimated_input_tokens: batch.token_estimate,
+                        max_output_tokens: Some(capped_batch_max_output_tokens(
+                            &batch,
+                            &config,
+                            is_reasoning,
+                        )),
+                        active_requests: 0,
+                        target_concurrency: config.scheduler.concurrency,
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+
+                    let max_output_tokens =
+                        capped_batch_max_output_tokens(&batch, &config, is_reasoning);
+                    let result = translate_one_batch(
+                        provider.clone(),
+                        library.clone(),
+                        batch.clone(),
+                        &config,
+                    )
+                    .await;
+                    let latency_ms = started.elapsed().as_millis() as u64;
+
+                    let limiter_feedback = match &result {
+                        Ok(_) => LimiterFeedback::Success,
+                        Err(LlmError::HttpStatus { status: 429, .. }) => {
+                            LimiterFeedback::RateLimited
+                        }
+                        Err(LlmError::HttpStatus { status, .. }) if *status >= 500 => {
+                            LimiterFeedback::Timeout
+                        }
+                        Err(LlmError::Http(e)) if e.is_timeout() || e.is_connect() => {
+                            LimiterFeedback::Timeout
+                        }
+                        _ => LimiterFeedback::None,
+                    };
+
+                    drop(permit);
+                    BatchWorkerOutput {
+                        batch,
+                        result,
+                        limiter_feedback,
+                        latency_ms,
+                        max_output_tokens,
                     }
-                    Err(mpsc::error::TrySendError::Full(_)) => break,
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        pending_queue.clear();
-                        break;
-                    }
+                });
+            }
+
+            let Some(joined) = tasks.join_next().await else {
+                continue;
+            };
+            let BatchWorkerOutput {
+                batch,
+                result,
+                limiter_feedback,
+                latency_ms,
+                max_output_tokens,
+            } = joined
+                .map_err(|err| LlmError::Provider(format!("batch worker task failed: {err}")))?;
+
+            progress.emit(bookforge_core::ProgressEvent::RequestFinished {
+                request_id: format!("batch_{}", batch.id),
+                batch_id: Some(batch.id.clone()),
+                segment_id: None,
+                status: result
+                    .as_ref()
+                    .map_or_else(|e| request_status_from_error(e), |_| "ok")
+                    .to_string(),
+                latency_ms,
+                status_code: None,
+                finish_reason: None,
+                retry_count: 0,
+                input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
+                output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
+                error_kind: result.as_ref().err().map(|e| format!("{e:?}")),
+                timestamp_ms: bookforge_core::progress::now_ms(),
+            });
+
+            telemetry.record(ProviderRequestMetric {
+                request_id: format!("batch_{}", batch.id),
+                batch_id: Some(batch.id.clone()),
+                provider: config.provider.clone(),
+                model: config.model.clone(),
+                profile: config.profile.namespace_str().to_string(),
+                items: batch.items.len(),
+                estimated_input_tokens: batch.token_estimate,
+                max_output_tokens: Some(max_output_tokens),
+                input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
+                output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
+                latency_ms,
+                finish_reason: None,
+                status: if result.is_ok() {
+                    "ok".into()
+                } else {
+                    "error".into()
+                },
+                status_code: None,
+                retry_count: 0,
+                backoff_ms: 0,
+                error_kind: None,
+            });
+
+            if let Some(ref limiter) = limiter {
+                match limiter_feedback {
+                    LimiterFeedback::Success => limiter.on_success(),
+                    LimiterFeedback::RateLimited => limiter.on_rate_limit(),
+                    LimiterFeedback::Timeout => limiter.on_timeout(),
+                    LimiterFeedback::None => {}
                 }
             }
 
-            // Drain a single result to free space in both channels
-            if in_flight > 0 {
-                let Some((batch, result)) = result_rx.recv().await else {
-                    break;
-                };
-                in_flight -= 1;
-
-                match result {
-                    Ok(batch_result) => {
-                        if let Some(ref mut sizer) = batch_sizer {
-                            sizer.on_success();
-                        }
-                        all_results.push(batch_result);
+            match result {
+                Ok(batch_result) => {
+                    if let Some(ref mut sizer) = batch_sizer {
+                        sizer.on_success();
                     }
-                    Err(LlmError::InvalidResponse(_)) if batch.kind == BatchKind::Repair => {
-                        eprintln!(
+                    all_results.push(batch_result);
+                }
+                Err(LlmError::InvalidResponse(_)) if batch.kind == BatchKind::Repair => {
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "repair_batch_invalid_response".to_string(),
+                        message: format!(
                             "repair batch {} failed; marking {} items NeedsReview",
                             batch.id,
-                            batch.items.len(),
-                        );
-                        all_results.push(BatchTranslationResult {
-                            batch_id: batch.id.clone(),
-                            translations: Vec::new(),
-                            failures: batch
-                                .items
-                                .iter()
-                                .map(|item| BatchItemFailure {
-                                    item_id: item.item_id.clone(),
-                                    segment_id: item.segment_id.clone(),
-                                    error: "repair batch invalid response".to_string(),
-                                })
-                                .collect(),
-                            input_tokens: None,
-                            output_tokens: None,
-                        });
-                    }
-                    Err(LlmError::InvalidResponse(_)) if batch.items.len() == 1 => {
-                        eprintln!(
+                            batch.items.len()
+                        ),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    all_results.push(BatchTranslationResult {
+                        batch_id: batch.id.clone(),
+                        translations: Vec::new(),
+                        failures: batch
+                            .items
+                            .iter()
+                            .map(|item| BatchItemFailure {
+                                item_id: item.item_id.clone(),
+                                segment_id: item.segment_id.clone(),
+                                error: "repair batch invalid response".to_string(),
+                            })
+                            .collect(),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                }
+                Err(LlmError::InvalidResponse(_)) if batch.items.len() == 1 => {
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "single_item_batch_invalid_response".to_string(),
+                        message: format!(
                             "single-item batch {} failed; not splitting further",
-                            batch.id,
-                        );
-                        all_results.push(BatchTranslationResult {
+                            batch.id
+                        ),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    all_results.push(BatchTranslationResult {
+                        batch_id: batch.id.clone(),
+                        translations: Vec::new(),
+                        failures: batch
+                            .items
+                            .iter()
+                            .map(|item| BatchItemFailure {
+                                item_id: item.item_id.clone(),
+                                segment_id: item.segment_id.clone(),
+                                error: "single-item batch invalid response".to_string(),
+                            })
+                            .collect(),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                }
+                Err(LlmError::InvalidResponse(_)) if batch.items.len() > 1 => {
+                    if let Some(ref mut sizer) = batch_sizer {
+                        sizer.on_invalid_json();
+                    }
+                    let split = split_batch(&batch);
+                    if split.len() == 2 {
+                        progress.emit(bookforge_core::ProgressEvent::BatchSplit {
                             batch_id: batch.id.clone(),
-                            translations: Vec::new(),
-                            failures: batch
-                                .items
-                                .iter()
-                                .map(|item| BatchItemFailure {
-                                    item_id: item.item_id.clone(),
-                                    segment_id: item.segment_id.clone(),
-                                    error: "single-item batch invalid response".to_string(),
-                                })
-                                .collect(),
-                            input_tokens: None,
-                            output_tokens: None,
+                            left_items: split[0].items.len(),
+                            right_items: split[1].items.len(),
+                            timestamp_ms: bookforge_core::progress::now_ms(),
                         });
                     }
-                    Err(LlmError::InvalidResponse(_)) if batch.items.len() > 1 => {
-                        if let Some(ref mut sizer) = batch_sizer {
-                            sizer.on_invalid_json();
-                        }
-                        eprintln!("batch {} failed with invalid response, splitting", batch.id);
-                        pending_queue.extend(split_batch(&batch));
-                    }
-                    Err(ref error)
-                        if is_transient(error) && batch.kind == BatchKind::Translation =>
-                    {
-                        eprintln!("batch {} transient error, retrying: {error}", batch.id);
-                        pending_queue.push_back(batch);
-                    }
-                    Err(error) => {
-                        eprintln!("batch {} failed: {error}", batch.id);
-                        all_results.push(BatchTranslationResult {
-                            batch_id: batch.id.clone(),
-                            translations: Vec::new(),
-                            failures: batch
-                                .items
-                                .iter()
-                                .map(|item| BatchItemFailure {
-                                    item_id: item.item_id.clone(),
-                                    segment_id: item.segment_id.clone(),
-                                    error: format!("{error}"),
-                                })
-                                .collect(),
-                            input_tokens: None,
-                            output_tokens: None,
-                        });
-                    }
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "batch_invalid_response_split".to_string(),
+                        message: format!(
+                            "batch {} failed with invalid response, splitting",
+                            batch.id
+                        ),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    pending_queue.extend(split);
+                }
+                Err(ref error) if is_transient(error) && batch.kind == BatchKind::Translation => {
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "batch_transient_retry".to_string(),
+                        message: format!("batch {} transient error, retrying: {error}", batch.id),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    pending_queue.push_back(batch);
+                }
+                Err(error) => {
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "batch_failed".to_string(),
+                        message: format!("batch {} failed: {error}", batch.id),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    all_results.push(BatchTranslationResult {
+                        batch_id: batch.id.clone(),
+                        translations: Vec::new(),
+                        failures: batch
+                            .items
+                            .iter()
+                            .map(|item| BatchItemFailure {
+                                item_id: item.item_id.clone(),
+                                segment_id: item.segment_id.clone(),
+                                error: format!("{error}"),
+                            })
+                            .collect(),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
                 }
             }
         }
         pending = pending_queue.into();
     }
 
-    // Signal workers to exit and wait for them.
-    drop(work_tx);
-    for handle in worker_handles {
-        let _ = handle.await;
-    }
+    progress.emit(bookforge_core::ProgressEvent::Warning {
+        kind: "batch_finalize_started".to_string(),
+        message: format!(
+            "batch provider requests complete; aggregating {} batch results",
+            all_results.len()
+        ),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
 
     let mut segment_translations: HashMap<String, SegmentTranslation> = HashMap::new();
 
@@ -1004,10 +1030,14 @@ where
                     text: translation.text.clone(),
                 });
             } else {
-                eprintln!(
-                    "batch translation item_id {} missing from all_items; skipping (internal state bug)",
-                    translation.item_id,
-                );
+                progress.emit(bookforge_core::ProgressEvent::Warning {
+                    kind: "batch_internal_missing_item".to_string(),
+                    message: format!(
+                        "batch translation item_id {} missing from all_items; skipping (internal state bug)",
+                        translation.item_id
+                    ),
+                    timestamp_ms: bookforge_core::progress::now_ms(),
+                });
             }
         }
 
@@ -1038,71 +1068,230 @@ where
         })
         .collect();
 
-    if !repair_items.is_empty() {
-        let repair_batch = TranslationBatch {
-            id: "repair".to_string(),
-            ordinal: 999,
-            mode: BatchMode::Plain,
-            kind: BatchKind::Repair,
-            items: repair_items.iter().map(|(_, item)| item.clone()).collect(),
-            token_estimate: repair_items
-                .iter()
-                .map(|(_, item)| token_estimate(&item.source_text))
-                .sum(),
-        };
+    progress.emit(bookforge_core::ProgressEvent::Warning {
+        kind: "batch_aggregation_finished".to_string(),
+        message: format!(
+            "batch aggregation produced {} segment records and {} repair candidates",
+            segment_translations.len(),
+            repair_items.len()
+        ),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
 
-        let items_json: Vec<serde_json::Value> = repair_items
+    if !repair_items.is_empty() {
+        progress.emit(bookforge_core::ProgressEvent::BatchRepairStarted {
+            failed_item_count: repair_items.len(),
+            timestamp_ms: bookforge_core::progress::now_ms(),
+        });
+
+        let repair_errors: Arc<HashMap<String, String>> = Arc::new(
+            repair_items
+                .iter()
+                .map(|(failure, _)| (failure.item_id.clone(), failure.error.clone()))
+                .collect(),
+        );
+        let mut repair_batches: VecDeque<TranslationBatch> = repair_items
             .iter()
-            .map(|(_failure, item)| {
-                serde_json::json!({
-                    "id": item.item_id,
-                    "source_text": item.source_text,
-                    "required_markers": item.required_markers,
-                    "protected": item.protected_spans,
-                })
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>()
+            .chunks(16)
+            .enumerate()
+            .map(|(idx, items)| {
+                let items = items.to_vec();
+                TranslationBatch {
+                    id: format!("repair_{idx:04}"),
+                    ordinal: idx,
+                    mode: BatchMode::Plain,
+                    kind: BatchKind::Repair,
+                    token_estimate: items
+                        .iter()
+                        .map(|item| token_estimate(&item.source_text))
+                        .sum(),
+                    items,
+                }
             })
             .collect();
 
-        let errors_json: Vec<serde_json::Value> = repair_items
-            .iter()
-            .map(|(failure, _)| serde_json::json!({"id": failure.item_id, "error": failure.error}))
-            .collect();
+        let mut repaired_count = 0usize;
+        let mut repair_tasks = JoinSet::<RepairWorkerOutput>::new();
 
-        let mut vars = Substitutions::new();
-        vars.raw(
-            "items_json",
-            serde_json::to_string(&items_json).unwrap_or_default(),
-        )
-        .raw(
-            "errors_json",
-            serde_json::to_string(&errors_json).unwrap_or_default(),
-        );
+        while !repair_batches.is_empty() || !repair_tasks.is_empty() {
+            while repair_tasks.len() < concurrency {
+                let Some(repair_batch) = repair_batches.pop_front() else {
+                    break;
+                };
+                progress.emit(bookforge_core::ProgressEvent::BatchQueued {
+                    batch_id: repair_batch.id.clone(),
+                    item_count: repair_batch.items.len(),
+                    timestamp_ms: bookforge_core::progress::now_ms(),
+                });
 
-        #[allow(clippy::collapsible_if)]
-        let repair_template = if config.compact_prompts {
-            &library.batch_repair_compact
-        } else {
-            &library.batch_repair
-        };
-        #[allow(clippy::collapsible_if)]
-        if let Ok(rendered) = repair_template.render(&vars) {
-            #[allow(clippy::collapsible_if)]
-            if let Ok(response) = provider
-                .complete(CompletionRequest {
-                    system: rendered.system,
-                    user: rendered.user,
-                    response_format: ResponseFormat::Json,
-                    temperature: 0.1,
-                    max_output_tokens: Some(capped_batch_max_output_tokens(
-                        &repair_batch,
-                        &config,
-                        provider.is_reasoning(),
-                    )),
-                    metadata: RequestMetadata::default(),
-                })
-                .await
-            {
-                if let Ok(repaired) = parse_batch_response(&repair_batch, &response.content) {
+                let provider = provider.clone();
+                let library = library.clone();
+                let config = config.clone();
+                let repair_errors = repair_errors.clone();
+                let progress = progress.clone();
+
+                repair_tasks.spawn(async move {
+                    let started = std::time::Instant::now();
+                    let is_reasoning = provider.is_reasoning();
+                    let max_output_tokens =
+                        capped_batch_max_output_tokens(&repair_batch, &config, is_reasoning);
+                    let request_id = format!("batch_{}", repair_batch.id);
+
+                    progress.emit(bookforge_core::ProgressEvent::RequestStarted {
+                        request_id: request_id.clone(),
+                        batch_id: Some(repair_batch.id.clone()),
+                        segment_id: None,
+                        provider: Some(config.provider.clone()),
+                        model: Some(config.model.clone()),
+                        prompt_template: Some("batch_repair".to_string()),
+                        items: repair_batch.items.len(),
+                        estimated_input_tokens: repair_batch.token_estimate,
+                        max_output_tokens: Some(max_output_tokens),
+                        active_requests: 0,
+                        target_concurrency: config.scheduler.concurrency,
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+
+                    let items_json: Vec<serde_json::Value> = repair_batch
+                        .items
+                        .iter()
+                        .map(|item| {
+                            serde_json::json!({
+                                "id": item.item_id,
+                                "source_text": item.source_text,
+                                "required_markers": item.required_markers,
+                                "protected": item.protected_spans,
+                            })
+                        })
+                        .collect();
+
+                    let errors_json: Vec<serde_json::Value> = repair_batch
+                        .items
+                        .iter()
+                        .map(|item| {
+                            serde_json::json!({
+                                "id": item.item_id,
+                                "error": repair_errors
+                                    .get(&item.item_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| "invalid batch item".to_string()),
+                            })
+                        })
+                        .collect();
+
+                    let mut vars = Substitutions::new();
+                    vars.raw(
+                        "items_json",
+                        serde_json::to_string(&items_json).unwrap_or_default(),
+                    )
+                    .raw(
+                        "errors_json",
+                        serde_json::to_string(&errors_json).unwrap_or_default(),
+                    );
+
+                    let repair_template = if config.compact_prompts {
+                        &library.batch_repair_compact
+                    } else {
+                        &library.batch_repair
+                    };
+
+                    let result = match repair_template.render(&vars) {
+                        Ok(rendered) => {
+                            match provider
+                                .complete(CompletionRequest {
+                                    system: rendered.system,
+                                    user: rendered.user,
+                                    response_format: ResponseFormat::Json,
+                                    temperature: 0.1,
+                                    max_output_tokens: Some(max_output_tokens),
+                                    metadata: RequestMetadata::default(),
+                                })
+                                .await
+                            {
+                                Ok(response) => {
+                                    match parse_batch_response(&repair_batch, &response.content) {
+                                        Ok(mut repaired) => {
+                                            repaired.input_tokens = response.input_tokens;
+                                            repaired.output_tokens = response.output_tokens;
+                                            Ok(repaired)
+                                        }
+                                        Err(error) => Err(LlmError::InvalidResponse(error)),
+                                    }
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Err(error) => Err(LlmError::Provider(format!(
+                            "failed to render repair prompt: {error}"
+                        ))),
+                    };
+
+                    RepairWorkerOutput {
+                        batch: repair_batch,
+                        result,
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        max_output_tokens,
+                    }
+                });
+            }
+
+            let Some(joined) = repair_tasks.join_next().await else {
+                continue;
+            };
+            let RepairWorkerOutput {
+                batch,
+                result,
+                latency_ms,
+                max_output_tokens,
+            } = joined
+                .map_err(|err| LlmError::Provider(format!("repair worker task failed: {err}")))?;
+
+            progress.emit(bookforge_core::ProgressEvent::RequestFinished {
+                request_id: format!("batch_{}", batch.id),
+                batch_id: Some(batch.id.clone()),
+                segment_id: None,
+                status: result
+                    .as_ref()
+                    .map_or_else(|e| request_status_from_error(e), |_| "ok")
+                    .to_string(),
+                latency_ms,
+                status_code: None,
+                finish_reason: None,
+                retry_count: 0,
+                input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
+                output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
+                error_kind: result.as_ref().err().map(|e| format!("{e:?}")),
+                timestamp_ms: bookforge_core::progress::now_ms(),
+            });
+
+            telemetry.record(ProviderRequestMetric {
+                request_id: format!("batch_{}", batch.id),
+                batch_id: Some(batch.id.clone()),
+                provider: config.provider.clone(),
+                model: config.model.clone(),
+                profile: config.profile.namespace_str().to_string(),
+                items: batch.items.len(),
+                estimated_input_tokens: batch.token_estimate,
+                max_output_tokens: Some(max_output_tokens),
+                input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
+                output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
+                latency_ms,
+                finish_reason: None,
+                status: if result.is_ok() {
+                    "ok".into()
+                } else {
+                    "error".into()
+                },
+                status_code: None,
+                retry_count: 0,
+                backoff_ms: 0,
+                error_kind: None,
+            });
+
+            match result {
+                Ok(repaired) => {
                     for translation in repaired.translations {
                         let Some(source_item) = all_items.get(&translation.item_id) else {
                             continue;
@@ -1124,11 +1313,29 @@ where
                                     text: translation.text,
                                 });
                             }
+                            repaired_count += 1;
                         }
                     }
                 }
+                Err(error) => {
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "repair_batch_failed".to_string(),
+                        message: format!(
+                            "repair batch {} failed for {} items: {error}",
+                            batch.id,
+                            batch.items.len()
+                        ),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                }
             }
         }
+
+        progress.emit(bookforge_core::ProgressEvent::BatchRepairFinished {
+            repaired_items: repaired_count,
+            still_failed_items: repair_items.len().saturating_sub(repaired_count),
+            timestamp_ms: bookforge_core::progress::now_ms(),
+        });
     }
 
     let mut translations: Vec<SegmentTranslation> = segment_translations.into_values().collect();
@@ -1156,9 +1363,20 @@ where
         }
     }
 
+    progress.emit(bookforge_core::ProgressEvent::Warning {
+        kind: "batch_finalized_segments".to_string(),
+        message: format!(
+            "batch finalization produced {} segment translations",
+            translations.len()
+        ),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
+
     for translation in &mut translations {
         if let Some(ref tx) = finalized_tx {
-            let _ = tx.send(translation.clone()).await;
+            tx.send(translation.clone())
+                .await
+                .map_err(|_| LlmError::Provider("finalized segment channel closed".to_string()))?;
         }
         on_segment(translation)?;
     }
@@ -1371,6 +1589,19 @@ mod tests {
         }
     }
 
+    fn protected_block(text: &str, spans: Vec<String>) -> SegmentBlock {
+        SegmentBlock {
+            block_id: bookforge_core::ir::BlockId(text.to_string()),
+            kind: "paragraph".to_string(),
+            text: text.to_string(),
+            text_runs: vec![SegmentTextRun {
+                id: "r0".to_string(),
+                text: text.to_string(),
+            }],
+            protected_spans: spans,
+        }
+    }
+
     #[test]
     fn plain_blocks_batch_together() {
         let seg1 = make_segment("seg1", vec![plain_block("Hello world")], vec![]);
@@ -1416,6 +1647,38 @@ mod tests {
         let result = parse_batch_response(batch, &response).expect("parse");
         assert_eq!(result.translations.len(), 2);
         assert_eq!(result.failures.len(), 0);
+    }
+
+    #[test]
+    fn restores_missing_protected_tokens_in_batch_response() {
+        let seg = make_segment(
+            "seg1",
+            vec![protected_block("Chapter 4th", vec!["4th".to_string()])],
+            vec!["<bf:keep/>".to_string()],
+        );
+        let config = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&[seg], &config, TranslationProfile::Balanced);
+        let batch = &batches[0];
+        let id = &batch.items[0].item_id;
+
+        let response = serde_json::json!({
+            "items": [
+                {"id": id, "translation": "Capitolo"},
+            ]
+        })
+        .to_string();
+
+        let result = parse_batch_response(batch, &response).expect("parse");
+        assert_eq!(result.failures.len(), 0);
+        assert_eq!(result.translations.len(), 1);
+        assert!(result.translations[0].text.contains("4th"));
+        assert!(result.translations[0].text.contains("<bf:keep/>"));
     }
 
     #[test]
