@@ -83,13 +83,14 @@ pub struct BatchItemFailure {
     pub error: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BatchSizer {
     target_tokens: usize,
     max_items: usize,
     #[allow(dead_code)]
     original_target_tokens: usize,
     original_max_items: usize,
+    progress: Option<Arc<dyn bookforge_core::ProgressSink>>,
 }
 
 impl BatchSizer {
@@ -99,6 +100,21 @@ impl BatchSizer {
             max_items,
             original_target_tokens: target_tokens,
             original_max_items: max_items,
+            progress: None,
+        }
+    }
+
+    pub fn with_progress(
+        target_tokens: usize,
+        max_items: usize,
+        progress: Arc<dyn bookforge_core::ProgressSink>,
+    ) -> Self {
+        Self {
+            target_tokens,
+            max_items,
+            original_target_tokens: target_tokens,
+            original_max_items: max_items,
+            progress: Some(progress),
         }
     }
 
@@ -110,16 +126,27 @@ impl BatchSizer {
         self.max_items
     }
 
+    fn emit_change(&self, reason: &str, prev_target: usize, prev_max: usize) {
+        if let Some(ref p) = self.progress {
+            p.emit(bookforge_core::ProgressEvent::BatchSizingChanged {
+                batch_id: None,
+                previous_target: prev_target,
+                new_target: self.target_tokens,
+                previous_max_items: prev_max,
+                new_max_items: self.max_items,
+                reason: reason.to_string(),
+                timestamp_ms: bookforge_core::progress::now_ms(),
+            });
+        }
+    }
+
     pub fn on_truncation(&mut self) {
         let prev_target = self.target_tokens;
         let prev_max = self.max_items;
         self.target_tokens = ((self.target_tokens as f64) * 0.65) as usize;
         self.max_items = ((self.max_items as f64) * 0.75) as usize;
         self.clamp();
-        eprintln!(
-            "batch sizer: truncation → target {prev_target}→{}, max_items {prev_max}→{}",
-            self.target_tokens, self.max_items
-        );
+        self.emit_change("truncation", prev_target, prev_max);
     }
 
     pub fn on_invalid_json(&mut self) {
@@ -128,10 +155,7 @@ impl BatchSizer {
         self.target_tokens = ((self.target_tokens as f64) * 0.75) as usize;
         self.max_items = ((self.max_items as f64) * 0.85) as usize;
         self.clamp();
-        eprintln!(
-            "batch sizer: invalid JSON → target {prev_target}→{}, max_items {prev_max}→{}",
-            self.target_tokens, self.max_items
-        );
+        self.emit_change("invalid_json", prev_target, prev_max);
     }
 
     pub fn on_p95_high(&mut self) {
@@ -619,6 +643,7 @@ pub async fn translate_batches_with_callback<P, F>(
     limiter: Option<Arc<AdaptiveLimiter>>,
     mut batch_sizer: Option<&mut BatchSizer>,
     progress: Arc<dyn bookforge_core::ProgressSink>,
+    finalized_tx: Option<mpsc::Sender<SegmentTranslation>>,
     mut on_segment: F,
 ) -> Result<Vec<SegmentTranslation>, LlmError>
 where
@@ -729,11 +754,10 @@ where
                     request_id,
                     batch_id: Some(batch.id.clone()),
                     segment_id: None,
-                    status: if result.is_ok() {
-                        "ok".into()
-                    } else {
-                        "error".into()
-                    },
+                    status: result
+                        .as_ref()
+                        .map_or_else(|e| request_status_from_error(e), |_| "ok")
+                        .to_string(),
                     latency_ms,
                     status_code: None,
                     finish_reason: None,
@@ -1133,6 +1157,9 @@ where
     }
 
     for translation in &mut translations {
+        if let Some(ref tx) = finalized_tx {
+            let _ = tx.send(translation.clone()).await;
+        }
         on_segment(translation)?;
     }
 
@@ -1284,6 +1311,21 @@ fn render_batch_items(batch: &TranslationBatch) -> String {
 
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
+
+
+fn request_status_from_error(error: &LlmError) -> &'static str {
+    match error {
+        LlmError::HttpStatus { status: 429, .. } => "rate_limited",
+        LlmError::HttpStatus { status, .. } if *status >= 500 => "server_error",
+        LlmError::Http(e) if e.is_timeout() => "timeout",
+        LlmError::Http(e) if e.is_connect() => "connect_error",
+        LlmError::InvalidResponse(msg) if msg.contains("truncated") => "truncated",
+        LlmError::InvalidResponse(_) => "invalid_response",
+        LlmError::Json(_) => "json_error",
+        _ => "error",
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1631,6 +1673,7 @@ mod tests {
             None,
             None,
             Arc::new(bookforge_core::NullProgressSink),
+            None,
             |_| Ok(()),
         )
         .await
@@ -1731,6 +1774,7 @@ mod tests {
             None,
             None,
             Arc::new(bookforge_core::NullProgressSink),
+            None,
             |_| Ok(()),
         )
         .await

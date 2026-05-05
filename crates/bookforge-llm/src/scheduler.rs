@@ -8,7 +8,10 @@ use bookforge_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinSet,
+};
 
 use crate::{
     prompt::{PromptLibrary, PromptTemplate, Substitutions},
@@ -146,7 +149,7 @@ pub async fn translate_segments<P>(
 where
     P: LlmProvider,
 {
-    translate_segments_with_callback(provider, segments, config, |_| Ok(())).await
+    translate_segments_with_callback(provider, segments, config, |_| Ok(()), None).await
 }
 
 pub async fn translate_segments_with_callback<P, F>(
@@ -154,6 +157,7 @@ pub async fn translate_segments_with_callback<P, F>(
     segments: &[Segment],
     config: &TranslationRunConfig,
     mut on_translation: F,
+    finalized_tx: Option<mpsc::Sender<SegmentTranslation>>,
 ) -> Result<Vec<SegmentTranslation>>
 where
     P: LlmProvider,
@@ -195,6 +199,9 @@ where
     let mut translations = Vec::with_capacity(segments.len());
     while let Some(result) = tasks.join_next().await {
         let translation = result.map_err(|err| LlmError::Provider(err.to_string()))?;
+        if let Some(ref tx) = finalized_tx {
+            let _ = tx.send(translation.clone()).await;
+        }
         on_translation(&translation)?;
         translations.push(translation);
     }

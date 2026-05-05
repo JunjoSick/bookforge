@@ -895,11 +895,41 @@ where
         None
     };
 
-    let mut batch_sizer =
-        bookforge_llm::BatchSizer::new(settings.batch.target_tokens, settings.batch.max_items);
+    let mut batch_sizer = bookforge_llm::BatchSizer::with_progress(
+        settings.batch.target_tokens,
+        settings.batch.max_items,
+        progress.clone(),
+    );
 
     let sender = checkpoint.sender.clone();
-    match translate_batches_with_callback(
+    let (finalized_tx, mut finalized_rx) = tokio::sync::mpsc::channel::<SegmentTranslation>(64);
+
+    let checkpoint_handle = {
+        let sender = sender.clone();
+        let job_id = checkpoint.job_id.to_string();
+        let provider_name = checkpoint.provider.to_string();
+        let model = checkpoint.model.to_string();
+        let prompt_version = checkpoint.prompt_version.to_string();
+        tokio::spawn(async move {
+            while let Some(translation) = finalized_rx.recv().await {
+                sender
+                    .send(CheckpointCommand::SaveTranslation {
+                        job_id: job_id.clone(),
+                        translation: Box::new(translation),
+                        provider: provider_name.clone(),
+                        model: model.clone(),
+                        prompt_version: prompt_version.clone(),
+                    })
+                    .await
+                    .map_err(|e| {
+                        bookforge_llm::LlmError::Provider(format!("checkpoint send failed: {e}"))
+                    })?;
+            }
+            Ok::<(), bookforge_llm::LlmError>(())
+        })
+    };
+
+    let batch_result = translate_batches_with_callback(
         provider,
         batches,
         segments,
@@ -907,24 +937,33 @@ where
         telemetry.clone(),
         limiter,
         Some(&mut batch_sizer),
-        progress,
+        progress.clone(),
+        Some(finalized_tx),
         |_| Ok(()),
     )
-    .await
-    {
-        Ok(translations) => {
+    .await;
+
+    let checkpoint_result = checkpoint_handle.await;
+
+    match (batch_result, checkpoint_result) {
+        (Ok(translations), Ok(Ok(()))) => {
             let snapshot = telemetry.snapshot();
             if !snapshot.is_empty() {
                 println!("\n{}", telemetry_summary(&snapshot));
             }
-            for translation in &translations {
-                sender
-                    .send(make_checkpoint_command(&checkpoint, translation))
-                    .await?;
-            }
             Ok(translations)
         }
-        Err(error) => {
+        (Ok(_), Ok(Err(e))) | (Err(e @ bookforge_llm::LlmError::Provider(_)), _) => {
+            let message = format!("batch translation checkpoint failure: {e}");
+            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            Err(anyhow::anyhow!(message))
+        }
+        (_, Err(join_err)) => {
+            let message = format!("batch checkpoint task panicked: {join_err}");
+            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            Err(anyhow::anyhow!(message))
+        }
+        (Err(error), _) => {
             let message = format!("batch translation failed: {error}");
             mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
             Err(anyhow::anyhow!(message))
@@ -1176,19 +1215,60 @@ where
     P: LlmProvider,
 {
     let sender = checkpoint.sender.clone();
-    let translations =
-        translate_segments_with_callback(provider, segments, config, |_| Ok(())).await;
+    let (finalized_tx, mut finalized_rx) = tokio::sync::mpsc::channel::<SegmentTranslation>(64);
 
-    match translations {
-        Ok(translations) => {
-            for translation in &translations {
+    // Spawn a task that checkpoints each finalized translation as it arrives.
+    let checkpoint_handle = {
+        let sender = sender.clone();
+        let job_id = checkpoint.job_id.to_string();
+        let provider_name = checkpoint.provider.to_string();
+        let model = checkpoint.model.to_string();
+        let prompt_version = checkpoint.prompt_version.to_string();
+        tokio::spawn(async move {
+            while let Some(translation) = finalized_rx.recv().await {
                 sender
-                    .send(make_checkpoint_command(&checkpoint, translation))
-                    .await?;
+                    .send(CheckpointCommand::SaveTranslation {
+                        job_id: job_id.clone(),
+                        translation: Box::new(translation),
+                        provider: provider_name.clone(),
+                        model: model.clone(),
+                        prompt_version: prompt_version.clone(),
+                    })
+                    .await
+                    .map_err(|e| {
+                        bookforge_llm::LlmError::Provider(format!("checkpoint send failed: {e}"))
+                    })?;
             }
-            Ok(translations)
+            Ok::<(), bookforge_llm::LlmError>(())
+        })
+    };
+
+    let translations = translate_segments_with_callback(
+        provider,
+        segments,
+        config,
+        |_| Ok(()),
+        Some(finalized_tx),
+    )
+    .await;
+
+    // Drop finalized_tx so the checkpoint task exits
+    // (finalized_tx was moved into translate_segments_with_callback)
+    let checkpoint_result = checkpoint_handle.await;
+
+    match (translations, checkpoint_result) {
+        (Ok(translations), Ok(Ok(()))) => Ok(translations),
+        (Ok(_), Ok(Err(e))) | (Err(e @ bookforge_llm::LlmError::Provider(_)), _) => {
+            let message = format!("translation checkpoint failure: {e}");
+            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            Err(anyhow::anyhow!(message))
         }
-        Err(error) => {
+        (_, Err(join_err)) => {
+            let message = format!("checkpoint task panicked: {join_err}");
+            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            Err(anyhow::anyhow!(message))
+        }
+        (Err(error), _) => {
             let message = format!(
                 "translation scheduler failed before producing per-segment results: {error}"
             );
@@ -1323,18 +1403,6 @@ fn mark_all_segments_failed(
         store.mark_segment_failed(job_id, &segment.id.0, error)?;
     }
     Ok(())
-}
-fn make_checkpoint_command(
-    ctx: &CheckpointContext<'_>,
-    translation: &SegmentTranslation,
-) -> CheckpointCommand {
-    CheckpointCommand::SaveTranslation {
-        job_id: ctx.job_id.to_string(),
-        translation: Box::new(translation.clone()),
-        provider: ctx.provider.to_string(),
-        model: ctx.model.to_string(),
-        prompt_version: ctx.prompt_version.to_string(),
-    }
 }
 
 pub(crate) fn mark_job_finished(

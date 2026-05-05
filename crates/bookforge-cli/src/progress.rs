@@ -92,237 +92,319 @@ async fn render_loop(
     jsonl_path: Option<PathBuf>,
     dropped: Arc<AtomicUsize>,
 ) -> Result<()> {
-    let effective_mode = match ui_mode {
-        UiMode::Auto if std::io::stderr().is_terminal() => UiMode::Progress,
-        UiMode::Auto => UiMode::Quiet,
-        other => other,
-    };
+    let render_mode = resolve_render_mode(ui_mode, std::io::stderr().is_terminal());
+    let mut file_writer = JsonlFileWriter::new(jsonl_path);
+    let mut renderer = Renderer::new(render_mode)?;
 
-    match effective_mode {
-        UiMode::Quiet => while rx.recv().await.is_some() {},
-        UiMode::Json => {
-            render_jsonl_stdout(&mut rx).await?;
-        }
-        UiMode::Progress | UiMode::Auto => {
-            render_progress_bars(&mut rx, jsonl_path, &dropped).await?;
-        }
-    }
-    Ok(())
-}
-
-async fn render_progress_bars(
-    rx: &mut mpsc::Receiver<ProgressEvent>,
-    jsonl_path: Option<PathBuf>,
-    dropped: &Arc<AtomicUsize>,
-) -> Result<()> {
-    use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-
-    let multi = MultiProgress::new();
-    let stage_bar = multi.add(
-        ProgressBar::new_spinner()
-            .with_style(
-                ProgressStyle::with_template("{spinner:.green} {msg}")
-                    .unwrap()
-                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-            )
-            .with_message("Starting..."),
-    );
-
-    let seg_bar = multi.add(
-        ProgressBar::new(0)
-            .with_style(
-                ProgressStyle::with_template(
-                    "  Segments: [{bar:20.cyan/blue}] {pos}/{len} ({msg})",
-                )
-                .unwrap(),
-            )
-            .with_message("0 cached"),
-    );
-
-    let batch_bar = multi.add(
-        ProgressBar::new_spinner()
-            .with_style(
-                ProgressStyle::with_template("{spinner:.yellow} Batches: {msg}")
-                    .unwrap()
-                    .tick_strings(&["-", "\\", "|", "/"]),
-            )
-            .with_message("queuing..."),
-    );
-
-    let rate_bar = multi.add(
-        ProgressBar::new_spinner()
-            .with_style(ProgressStyle::with_template("  {msg}").unwrap())
-            .with_message(""),
-    );
-
-    let checkpoint_bar = multi.add(
-        ProgressBar::new_spinner()
-            .with_style(ProgressStyle::with_template("  Checkpoint: {msg}").unwrap())
-            .with_message("flushed 0"),
-    );
-
-    let start = Instant::now();
-    let mut total_segments = 0usize;
-    let mut done_segments = 0usize;
-    let mut cached = 0usize;
-    let mut active_requests = 0usize;
-    let mut _checkpoint_flushed = 0usize;
-    let mut last_render = Instant::now();
-    let mut jsonl_writer: Option<BufWriter<std::fs::File>> = None;
-    let mut jsonl_failed = false;
-    let mut jsonl_last_flush = Instant::now();
-
-    loop {
-        // Receive with a short timeout so we can render periodically
-        let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
-
-        match event {
-            Ok(Some(event)) => {
-                // Write to JSONL if enabled
-                let is_critical = is_important_event(&event);
-                if let Some(ref mut w) = jsonl_writer {
-                    let _ = writeln!(w, "{}", serde_json::to_string(&event).unwrap_or_default());
-                    if is_critical || jsonl_last_flush.elapsed() > std::time::Duration::from_secs(2)
-                    {
-                        let _ = w.flush();
-                        jsonl_last_flush = Instant::now();
-                    }
-                }
-
-                match &event {
-                    ProgressEvent::StageStarted { stage, .. } => {
-                        stage_bar.set_message(format!("{stage}..."));
-                    }
-                    ProgressEvent::StageFinished { .. } => {
-                        stage_bar.set_message("translating...");
-                        stage_bar.enable_steady_tick(std::time::Duration::from_millis(80));
-                    }
-                    ProgressEvent::SegmentationFinished { segment_count, .. } => {
-                        total_segments = *segment_count;
-                        seg_bar.set_length(total_segments as u64);
-                        seg_bar.set_message(format!("{cached} cached"));
-                    }
-                    ProgressEvent::CacheScanFinished { hits, .. } => {
-                        cached = *hits;
-                        seg_bar.set_message(format!("{cached} cached"));
-                    }
-                    ProgressEvent::SegmentFinished { status, .. } => {
-                        // Count all terminal statuses as completed
-                        match status.as_str() {
-                            "succeeded" | "skipped_cached" | "needs_review" | "failed" => {
-                                done_segments += 1;
-                                seg_bar.set_position(done_segments as u64);
-                                let elapsed = start.elapsed().as_secs_f64().max(0.1);
-                                let rate_per_min = done_segments as f64 / elapsed * 60.0;
-                                let remaining = total_segments.saturating_sub(done_segments);
-                                let eta_secs = if rate_per_min > 0.0 {
-                                    remaining as f64 / (rate_per_min / 60.0)
-                                } else {
-                                    0.0
-                                };
-                                let eta_str = if eta_secs > 3600.0 {
-                                    format!("{:.1}h", eta_secs / 3600.0)
-                                } else if eta_secs > 60.0 {
-                                    format!("{:.0}m", eta_secs / 60.0)
-                                } else {
-                                    format!("{:.0}s", eta_secs)
-                                };
-                                rate_bar.set_message(format!(
-                                    "{done_segments}/{total_segments} done, {rate_per_min:.1} seg/min, ETA {eta_str}"
-                                ));
-                            }
-                            _ => {}
-                        }
-                    }
-                    ProgressEvent::RequestStarted { .. } => {
-                        active_requests += 1;
-                        batch_bar.set_message(format!("{active_requests} active"));
-                    }
-                    ProgressEvent::RequestFinished { .. } => {
-                        active_requests = active_requests.saturating_sub(1);
-                        batch_bar.set_message(format!("{active_requests} active"));
-                    }
-                    ProgressEvent::CheckpointFlushed { flushed_count, .. } => {
-                        _checkpoint_flushed = *flushed_count;
-                        checkpoint_bar.set_message(format!("flushed {_checkpoint_flushed}"));
-                    }
-                    ProgressEvent::BatchQueued { batch_id, .. } => {
-                        batch_bar.set_message(format!("batch {batch_id} queued"));
-                    }
-                    ProgressEvent::BatchSplit { batch_id, .. } => {
-                        batch_bar.set_message(format!("batch {batch_id} split"));
-                    }
-                    ProgressEvent::Warning { message, .. } => {
-                        multi.println(format!("  [warn] {message}")).ok();
-                    }
-                    ProgressEvent::Error { message, .. } => {
-                        multi.println(format!("  [error] {message}")).ok();
-                    }
-                    ProgressEvent::TranslationFinished {
-                        succeeded,
-                        cached: c,
-                        needs_review,
-                        failed,
-                        ..
-                    } => {
-                        seg_bar.set_position(*succeeded as u64 + *c as u64);
-                        seg_bar.finish_with_message(format!(
-                            "{} done, {} needs review, {} failed",
-                            succeeded + c,
-                            needs_review,
-                            failed
-                        ));
-                        stage_bar.finish_and_clear();
-                        batch_bar.finish_and_clear();
-                        rate_bar.finish_and_clear();
-                        checkpoint_bar.finish_and_clear();
-                    }
-                    _ => {}
-                }
-            }
-            Ok(None) => break, // Channel closed
-            Err(_) => {}       // Timeout, just re-render
-        }
-
-        // Throttle rendering to ~250ms
-        if last_render.elapsed() >= std::time::Duration::from_millis(250) {
-            let dropped_count = dropped.load(Ordering::Relaxed);
-            if dropped_count > 0 {
-                multi
-                    .println(format!("  ({} progress events dropped)", dropped_count))
-                    .ok();
-            }
-            last_render = Instant::now();
-        }
-
-        // Open JSONL file lazily on first event; skip if we already tried and failed.
-        if jsonl_writer.is_none()
-            && !jsonl_failed
-            && let Some(ref path) = jsonl_path
-        {
-            match std::fs::File::create(path) {
-                Ok(f) => {
-                    jsonl_writer = Some(BufWriter::new(f));
-                    jsonl_last_flush = Instant::now();
-                }
-                Err(e) => {
-                    jsonl_failed = true;
-                    let _ = multi.println(format!("  [warn] cannot create JSONL log: {e}"));
-                }
-            }
-        }
-    }
-
-    multi.clear().ok();
-    Ok(())
-}
-
-async fn render_jsonl_stdout(rx: &mut mpsc::Receiver<ProgressEvent>) -> Result<()> {
     while let Some(event) = rx.recv().await {
-        let line = serde_json::to_string(&event).unwrap_or_default();
-        println!("{line}");
+        file_writer.write_event(&event)?;
+        renderer.handle_event(&event)?;
     }
+
+    file_writer.flush()?;
+    renderer.finish()?;
+
+    let d = dropped.load(Ordering::Relaxed);
+    if d > 0 {
+        eprintln!("({d} progress events dropped)");
+    }
+
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    Quiet,
+    Progress,
+    JsonStdout,
+}
+
+fn resolve_render_mode(ui_mode: UiMode, stderr_is_tty: bool) -> RenderMode {
+    match ui_mode {
+        UiMode::Auto if stderr_is_tty => RenderMode::Progress,
+        UiMode::Auto => RenderMode::Quiet,
+        UiMode::Progress => RenderMode::Progress,
+        UiMode::Json => RenderMode::JsonStdout,
+        UiMode::Quiet => RenderMode::Quiet,
+    }
+}
+
+struct JsonlFileWriter {
+    path: Option<PathBuf>,
+    writer: Option<BufWriter<std::fs::File>>,
+    failed: bool,
+    last_flush: Instant,
+}
+
+impl JsonlFileWriter {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            writer: None,
+            failed: false,
+            last_flush: Instant::now(),
+        }
+    }
+
+    fn ensure_open(&mut self) -> Result<()> {
+        if self.writer.is_some() || self.failed {
+            return Ok(());
+        }
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::File::create(path) {
+            Ok(file) => {
+                self.writer = Some(BufWriter::new(file));
+                self.last_flush = Instant::now();
+            }
+            Err(err) => {
+                self.failed = true;
+                eprintln!(
+                    "warn: cannot create JSONL progress log {}: {err}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn write_event(&mut self, event: &ProgressEvent) -> Result<()> {
+        self.ensure_open()?;
+        let Some(writer) = self.writer.as_mut() else {
+            return Ok(());
+        };
+        writeln!(writer, "{}", serde_json::to_string(event)?)?;
+        if is_important_event(event)
+            || self.last_flush.elapsed() >= std::time::Duration::from_secs(2)
+        {
+            writer.flush()?;
+            self.last_flush = Instant::now();
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.flush()?;
+        }
+        Ok(())
+    }
+}
+
+enum Renderer {
+    Quiet,
+    JsonStdout,
+    Progress(ProgressBars),
+}
+
+impl Renderer {
+    fn new(mode: RenderMode) -> Result<Self> {
+        match mode {
+            RenderMode::Quiet => Ok(Renderer::Quiet),
+            RenderMode::JsonStdout => Ok(Renderer::JsonStdout),
+            RenderMode::Progress => Ok(Renderer::Progress(ProgressBars::new()?)),
+        }
+    }
+
+    fn handle_event(&mut self, event: &ProgressEvent) -> Result<()> {
+        match self {
+            Renderer::Quiet => Ok(()),
+            Renderer::JsonStdout => {
+                println!("{}", serde_json::to_string(event)?);
+                Ok(())
+            }
+            Renderer::Progress(bars) => bars.handle_event(event),
+        }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        match self {
+            Renderer::Progress(bars) => bars.finish(),
+            _ => Ok(()),
+        }
+    }
+}
+
+struct ProgressBars {
+    multi: indicatif::MultiProgress,
+    stage_bar: indicatif::ProgressBar,
+    seg_bar: indicatif::ProgressBar,
+    batch_bar: indicatif::ProgressBar,
+    rate_bar: indicatif::ProgressBar,
+    checkpoint_bar: indicatif::ProgressBar,
+    start: Instant,
+    total_segments: usize,
+    done_segments: usize,
+    cached: usize,
+    active_requests: usize,
+    _checkpoint_flushed: usize,
+}
+
+impl ProgressBars {
+    fn new() -> Result<Self> {
+        use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+        let multi = MultiProgress::new();
+        let stage_bar = multi.add(
+            ProgressBar::new_spinner()
+                .with_style(
+                    ProgressStyle::with_template("{spinner:.green} {msg}")
+                        .unwrap()
+                        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+                )
+                .with_message("Starting..."),
+        );
+        let seg_bar = multi.add(
+            ProgressBar::new(0)
+                .with_style(
+                    ProgressStyle::with_template(
+                        "  Segments: [{bar:20.cyan/blue}] {pos}/{len} ({msg})",
+                    )
+                    .unwrap(),
+                )
+                .with_message("0 cached"),
+        );
+        let batch_bar = multi.add(
+            ProgressBar::new_spinner()
+                .with_style(
+                    ProgressStyle::with_template("{spinner:.yellow} Batches: {msg}")
+                        .unwrap()
+                        .tick_strings(&["-", "\\", "|", "/"]),
+                )
+                .with_message("queuing..."),
+        );
+        let rate_bar = multi.add(
+            ProgressBar::new_spinner()
+                .with_style(ProgressStyle::with_template("  {msg}").unwrap())
+                .with_message(""),
+        );
+        let checkpoint_bar = multi.add(
+            ProgressBar::new_spinner()
+                .with_style(ProgressStyle::with_template("  Checkpoint: {msg}").unwrap())
+                .with_message("flushed 0"),
+        );
+
+        Ok(Self {
+            multi,
+            stage_bar,
+            seg_bar,
+            batch_bar,
+            rate_bar,
+            checkpoint_bar,
+            start: Instant::now(),
+            total_segments: 0,
+            done_segments: 0,
+            cached: 0,
+            active_requests: 0,
+            _checkpoint_flushed: 0,
+        })
+    }
+
+    fn handle_event(&mut self, event: &ProgressEvent) -> Result<()> {
+        match event {
+            ProgressEvent::StageStarted { stage, .. } => {
+                self.stage_bar.set_message(format!("{stage}..."));
+            }
+            ProgressEvent::StageFinished { .. } => {
+                self.stage_bar.set_message("translating...");
+                self.stage_bar
+                    .enable_steady_tick(std::time::Duration::from_millis(80));
+            }
+            ProgressEvent::SegmentationFinished { segment_count, .. } => {
+                self.total_segments = *segment_count;
+                self.seg_bar.set_length(self.total_segments as u64);
+                self.seg_bar.set_message(format!("{} cached", self.cached));
+            }
+            ProgressEvent::CacheScanFinished { hits, .. } => {
+                self.cached = *hits;
+                self.seg_bar.set_message(format!("{} cached", self.cached));
+            }
+            ProgressEvent::SegmentFinished { status, .. } => match status.as_str() {
+                "succeeded" | "skipped_cached" | "needs_review" | "failed" => {
+                    self.done_segments += 1;
+                    self.seg_bar.set_position(self.done_segments as u64);
+                    let elapsed = self.start.elapsed().as_secs_f64().max(0.1);
+                    let rate_per_min = self.done_segments as f64 / elapsed * 60.0;
+                    let remaining = self.total_segments.saturating_sub(self.done_segments);
+                    let eta_secs = if rate_per_min > 0.0 {
+                        remaining as f64 / (rate_per_min / 60.0)
+                    } else {
+                        0.0
+                    };
+                    let eta_str = if eta_secs > 3600.0 {
+                        format!("{:.1}h", eta_secs / 3600.0)
+                    } else if eta_secs > 60.0 {
+                        format!("{:.0}m", eta_secs / 60.0)
+                    } else {
+                        format!("{:.0}s", eta_secs)
+                    };
+                    self.rate_bar.set_message(format!(
+                        "{}/{} done, {:.1} seg/min, ETA {eta_str}",
+                        self.done_segments, self.total_segments, rate_per_min
+                    ));
+                }
+                _ => {}
+            },
+            ProgressEvent::RequestStarted { .. } => {
+                self.active_requests += 1;
+                self.batch_bar
+                    .set_message(format!("{} active", self.active_requests));
+            }
+            ProgressEvent::RequestFinished { .. } => {
+                self.active_requests = self.active_requests.saturating_sub(1);
+                self.batch_bar
+                    .set_message(format!("{} active", self.active_requests));
+            }
+            ProgressEvent::CheckpointFlushed { flushed_count, .. } => {
+                self._checkpoint_flushed = *flushed_count;
+                self.checkpoint_bar
+                    .set_message(format!("flushed {}", self._checkpoint_flushed));
+            }
+            ProgressEvent::BatchQueued { batch_id, .. } => {
+                self.batch_bar
+                    .set_message(format!("batch {batch_id} queued"));
+            }
+            ProgressEvent::BatchSplit { batch_id, .. } => {
+                self.batch_bar
+                    .set_message(format!("batch {batch_id} split"));
+            }
+            ProgressEvent::Warning { message, .. } => {
+                self.multi.println(format!("  [warn] {message}")).ok();
+            }
+            ProgressEvent::Error { message, .. } => {
+                self.multi.println(format!("  [error] {message}")).ok();
+            }
+            ProgressEvent::TranslationFinished {
+                succeeded,
+                cached: c,
+                needs_review,
+                failed,
+                ..
+            } => {
+                let done = *succeeded + *c;
+                self.seg_bar.set_position(done as u64);
+                self.seg_bar.finish_with_message(format!(
+                    "{done} done, {} needs review, {} failed",
+                    *needs_review, *failed
+                ));
+                self.stage_bar.finish_and_clear();
+                self.batch_bar.finish_and_clear();
+                self.rate_bar.finish_and_clear();
+                self.checkpoint_bar.finish_and_clear();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.multi.clear().ok();
+        Ok(())
+    }
 }
 
 fn is_important_event(event: &ProgressEvent) -> bool {
