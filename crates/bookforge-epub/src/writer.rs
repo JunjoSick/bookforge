@@ -8,6 +8,7 @@ use std::{
 use bookforge_core::{
     BookforgeError, Result,
     ir::{Block, Book, DomPath},
+    marker::extract_marker_id,
     segment::BlockTranslation,
 };
 use quick_xml::{
@@ -530,17 +531,6 @@ fn parse_empty_marker(text: &str) -> Option<(String, usize)> {
         }
     }
     None
-}
-
-fn extract_marker_id(tag: &str) -> Option<String> {
-    let id_offset = tag.find("id=")? + 3;
-    let quote = tag[id_offset..].chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let value_start = id_offset + quote.len_utf8();
-    let value_end = tag[value_start..].find(quote)? + value_start;
-    Some(tag[value_start..value_end].to_string())
 }
 
 fn find_matching_marker_close(text: &str, tag_name: &str) -> Result<usize> {

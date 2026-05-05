@@ -8,7 +8,10 @@ use bookforge_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinSet,
+};
 
 use crate::{
     prompt::{PromptLibrary, PromptTemplate, Substitutions},
@@ -28,6 +31,10 @@ pub struct TranslationRunConfig {
     pub temperature: f32,
     pub scheduler: SchedulerConfig,
     pub profile: TranslationProfile,
+    pub model_context_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+    pub batch_max_output_tokens: Option<u32>,
+    pub compact_prompts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +149,7 @@ pub async fn translate_segments<P>(
 where
     P: LlmProvider,
 {
-    translate_segments_with_callback(provider, segments, config, |_| Ok(())).await
+    translate_segments_with_callback(provider, segments, config, |_| Ok(()), None).await
 }
 
 pub async fn translate_segments_with_callback<P, F>(
@@ -150,6 +157,7 @@ pub async fn translate_segments_with_callback<P, F>(
     segments: &[Segment],
     config: &TranslationRunConfig,
     mut on_translation: F,
+    finalized_tx: Option<mpsc::Sender<SegmentTranslation>>,
 ) -> Result<Vec<SegmentTranslation>>
 where
     P: LlmProvider,
@@ -163,6 +171,7 @@ where
 
     let library = Arc::new(PromptLibrary::embedded());
     let provider = Arc::new(provider);
+    let config = Arc::new(config.clone());
     let semaphore = Arc::new(Semaphore::new(config.scheduler.concurrency));
     let mut tasks = JoinSet::new();
 
@@ -183,13 +192,18 @@ where
                     None,
                 );
             };
-            translate_one(provider, library, segment, config).await
+            translate_one(provider, library, segment, &config).await
         });
     }
 
     let mut translations = Vec::with_capacity(segments.len());
     while let Some(result) = tasks.join_next().await {
         let translation = result.map_err(|err| LlmError::Provider(err.to_string()))?;
+        if let Some(ref tx) = finalized_tx {
+            tx.send(translation.clone())
+                .await
+                .map_err(|_| LlmError::Provider("finalized segment channel closed".to_string()))?;
+        }
         on_translation(&translation)?;
         translations.push(translation);
     }
@@ -325,7 +339,7 @@ async fn translate_one<P>(
     provider: Arc<P>,
     library: Arc<PromptLibrary>,
     segment: Segment,
-    config: TranslationRunConfig,
+    config: &TranslationRunConfig,
 ) -> SegmentTranslation
 where
     P: LlmProvider,
@@ -342,7 +356,7 @@ where
             provider.as_ref(),
             library.as_ref(),
             &segment,
-            &config,
+            config,
             mode,
             retry_context.as_deref(),
         )
@@ -381,7 +395,7 @@ where
             provider.as_ref(),
             library.as_ref(),
             &segment,
-            &config,
+            config,
             TranslationMode::RunPreserving,
             retry_context.as_deref(),
         )
@@ -663,7 +677,16 @@ fn parse_and_validate(
                 .first()
                 .map(|block| block.protected_spans.as_slice())
                 .unwrap_or(&[]);
-            validate_protected_spans(segment, expected_spans, &parsed.translation)?;
+            let (translation, repaired) =
+                repair_missing_protected_spans(expected_spans, parsed.translation);
+            if !repaired.is_empty() {
+                tracing::warn!(
+                    segment_id = %segment.id.0,
+                    "re-inserted missing protected spans: {:?}",
+                    repaired
+                );
+            }
+            validate_protected_spans(segment, expected_spans, &translation)?;
             let block_id = segment
                 .block_ids
                 .first()
@@ -671,7 +694,7 @@ fn parse_and_validate(
                 .unwrap_or_else(|| BlockId(format!("{}_block", segment.id.0)));
             Ok(vec![BlockTranslation {
                 block_id,
-                text: parsed.translation,
+                text: translation,
             }])
         }
         TranslationMode::MarkerSafe => {
@@ -718,6 +741,16 @@ fn parse_and_validate(
                                 segment.id.0, source_block.block_id.0
                             ))
                         })?;
+                let (translation, repaired) =
+                    repair_missing_protected_spans(&source_block.protected_spans, translation);
+                if !repaired.is_empty() {
+                    tracing::warn!(
+                        segment_id = %segment.id.0,
+                        block_id = %source_block.block_id.0,
+                        "re-inserted missing protected spans: {:?}",
+                        repaired
+                    );
+                }
                 let expected_markers = marker_ids_in_text(&source_block.text);
                 validate_markers(segment, &expected_markers, &translation)?;
                 validate_protected_spans(segment, &source_block.protected_spans, &translation)?;
@@ -769,6 +802,16 @@ fn parse_and_validate(
                         ))
                     })?;
                 let text = validate_and_join_runs(segment, source_block, block.translated_runs)?;
+                let (text, repaired) =
+                    repair_missing_protected_spans(&source_block.protected_spans, text);
+                if !repaired.is_empty() {
+                    tracing::warn!(
+                        segment_id = %segment.id.0,
+                        block_id = %source_block.block_id.0,
+                        "re-inserted missing protected spans in run-preserving: {:?}",
+                        repaired
+                    );
+                }
                 let expected_markers = marker_ids_in_text(&source_block.text);
                 validate_markers(segment, &expected_markers, &text)?;
                 validate_protected_spans(segment, &source_block.protected_spans, &text)?;
@@ -888,6 +931,21 @@ fn validation_retry_appendix(segment: &Segment, mode: TranslationMode, error: &s
     )
 }
 
+fn repair_missing_protected_spans(spans: &[String], mut translation: String) -> (String, Vec<String>) {
+    let mut reinserted = Vec::new();
+    for span in spans {
+        if span.trim().is_empty() || translation.contains(span) {
+            continue;
+        }
+        if !translation.is_empty() && !translation.ends_with(char::is_whitespace) {
+            translation.push(' ');
+        }
+        translation.push_str(span);
+        reinserted.push(span.clone());
+    }
+    (translation, reinserted)
+}
+
 fn validate_protected_spans(segment: &Segment, spans: &[String], translation: &str) -> Result<()> {
     for span in spans {
         if !translation.contains(span) {
@@ -931,54 +989,7 @@ fn validate_markers(segment: &Segment, expected: &[String], translation: &str) -
     Ok(())
 }
 
-fn marker_ids_in_text(text: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let mut rest = text;
-
-    while let Some(index) = rest.find('<') {
-        let tag = &rest[index..];
-        if (tag.starts_with("<m ") || tag.starts_with("<keep "))
-            && let Some(end) = tag.find('>')
-        {
-            if let Some(id) = extract_marker_id(&tag[..=end]) {
-                ids.push(id);
-            }
-            rest = &tag[end + 1..];
-        } else if tag.starts_with("<ref ") {
-            if let Some(end) = tag.find("/>") {
-                if let Some(id) = extract_marker_id(&tag[..end + 2]) {
-                    ids.push(id);
-                }
-                rest = &tag[end + 2..];
-            } else {
-                rest = &tag[1..];
-            }
-        } else {
-            rest = &tag[1..];
-        }
-    }
-
-    ids
-}
-
-fn extract_marker_id(tag: &str) -> Option<String> {
-    let id_offset = tag.find("id=")? + 3;
-    let quote = tag[id_offset..].chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let value_start = id_offset + quote.len_utf8();
-    let value_end = tag[value_start..].find(quote)? + value_start;
-    Some(tag[value_start..value_end].to_string())
-}
-
-fn is_marker_token(text: &str) -> bool {
-    let text = text.trim();
-    text.starts_with("</m") && text.ends_with('>')
-        || text.starts_with("<m ")
-        || text.starts_with("<keep ")
-        || text.starts_with("<ref ")
-}
+use bookforge_core::marker::{is_marker_token, marker_ids_in_text};
 
 fn needs_review_translation_with_tokens(
     segment: &Segment,
@@ -1147,7 +1158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protected_span_failure_is_marked_needs_review() {
+    async fn protected_span_failure_is_repaired() {
         let mut segment = segment("seg_a", 0, vec![("b0", "Visit https://example.com")]);
         segment.source.blocks[0]
             .protected_spans
@@ -1165,8 +1176,28 @@ mod tests {
         .await
         .expect("validation failure should not propagate");
 
-        assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
-        assert_eq!(translations[0].blocks[0].text, "Visit https://example.com");
+        assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+        assert!(
+            translations[0].blocks[0]
+                .text
+                .contains("https://example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_protected_span_is_reinserted_before_validation() {
+        let mut segment = segment("seg_a", 0, vec![("b0", "The 4th day")]);
+        segment.source.blocks[0]
+            .protected_spans
+            .push("4th".to_string());
+        segment.constraints.preserve_spans.push("4th".to_string());
+
+        let translations = translate_segments(MissingProtectedSpanProvider, &[segment], &config())
+            .await
+            .expect("protected span repair should keep segment successful");
+
+        assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+        assert!(translations[0].blocks[0].text.contains("4th"));
     }
 
     #[tokio::test]
@@ -1211,6 +1242,30 @@ mod tests {
                 .error
                 .as_deref()
                 .is_some_and(|error| error.contains("provider offline"))
+        );
+    }
+
+    #[tokio::test]
+    async fn finalized_channel_close_is_run_error() {
+        let segments = vec![segment("seg_a", 0, vec![("b0", "First")])];
+        let (tx, rx) = mpsc::channel::<SegmentTranslation>(1);
+        drop(rx);
+
+        let result = translate_segments_with_callback(
+            MockProvider::new(MockMode::PrefixTarget, "Italian"),
+            &segments,
+            &config(),
+            |_| Ok(()),
+            Some(tx),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("finalized segment channel closed")
         );
     }
 
@@ -1327,6 +1382,10 @@ mod tests {
                 max_attempts: 1,
             },
             profile: TranslationProfile::Balanced,
+            model_context_tokens: None,
+            max_output_tokens: None,
+            batch_max_output_tokens: None,
+            compact_prompts: false,
         }
     }
 
@@ -1392,6 +1451,33 @@ mod tests {
             ProviderCapabilities {
                 supports_json_response_format: true,
                 supports_usage_tokens: false,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct MissingProtectedSpanProvider;
+
+    impl LlmProvider for MissingProtectedSpanProvider {
+        async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+            Ok(CompletionResponse {
+                content: serde_json::json!({
+                    "segment_id": request.metadata.segment_id.unwrap_or_default(),
+                    "translation": "Il giorno"
+                })
+                .to_string(),
+                input_tokens: Some(10),
+                output_tokens: Some(3),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 0,
+                raw: serde_json::json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
             }
         }
     }

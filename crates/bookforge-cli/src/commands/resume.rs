@@ -1,10 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::Arc,
 };
 
 use anyhow::Result;
 use bookforge_core::{
+    NullProgressSink,
     config::SegmentationConfig,
     config::TranslationProfile,
     scheduler::SchedulerConfig,
@@ -46,6 +48,9 @@ pub struct ResumeArgs {
 
     #[arg(long, default_value_t = 120)]
     pub timeout_seconds: u64,
+
+    #[arg(long, default_value_t = false)]
+    pub no_thinking: bool,
 }
 
 pub async fn run(args: ResumeArgs) -> Result<()> {
@@ -80,6 +85,10 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
             max_attempts: args.max_attempts,
         },
         profile: TranslationProfile::Balanced,
+        model_context_tokens: None,
+        max_output_tokens: None,
+        batch_max_output_tokens: None,
+        compact_prompts: false,
     };
 
     // Resume currently rebuilds segments from defaults; namespace must
@@ -88,7 +97,7 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
     let cache_namespace = compute_cache_namespace(
         segmentation.max_segment_tokens,
         segmentation.context_tokens,
-        &format!("{:?}", run_config.profile),
+        run_config.profile.namespace_str(),
         false,
         prompt_version,
     );
@@ -110,8 +119,9 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
     let fresh_translations = if pending_segments.is_empty() {
         Vec::new()
     } else {
-        let writer = CheckpointWriter::spawn(store.path().to_path_buf());
-        let tx = writer.sender();
+        let writer =
+            CheckpointWriter::spawn(store.path().to_path_buf(), Arc::new(NullProgressSink));
+        let sender = writer.sender();
         let result = match job.provider.as_str() {
             "mock" => {
                 let provider = MockProvider::new(mock_mode(&job.model), &job.target_lang);
@@ -125,13 +135,14 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
                         provider: &job.provider,
                         model: &job.model,
                         prompt_version,
-                        tx: &tx,
+                        sender: &sender,
                     },
                 )
                 .await
             }
             "deepseek" | "openrouter" | "openai-compatible" => {
-                let provider_config = openai_compatible_config(&job, args.timeout_seconds, 6)?;
+                let provider_config =
+                    openai_compatible_config(&job, args.timeout_seconds, 6, args.no_thinking)?;
                 let provider = OpenAiCompatibleProvider::new(provider_config)?;
                 translate_and_checkpoint(
                     provider.clone(),
@@ -143,14 +154,14 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
                         provider: &job.provider,
                         model: &job.model,
                         prompt_version,
-                        tx: &tx,
+                        sender: &sender,
                     },
                 )
                 .await
             }
             provider => anyhow::bail!("cannot resume unsupported provider '{provider}'"),
         };
-        drop(tx);
+        drop(sender);
         writer.shutdown().await?;
         result?
     };
@@ -264,6 +275,7 @@ fn openai_compatible_config(
     job: &JobRecord,
     timeout_seconds: u64,
     provider_max_attempts: usize,
+    thinking_disabled: bool,
 ) -> Result<OpenAiCompatibleConfig> {
     let provider_max_attempts = provider_max_attempts.max(1);
     if job.provider == "deepseek" {
@@ -276,6 +288,7 @@ fn openai_compatible_config(
         }
         config.timeout_seconds = timeout_seconds;
         config.provider_max_attempts = provider_max_attempts;
+        config.thinking_disabled = thinking_disabled;
         return Ok(config);
     }
 
@@ -292,7 +305,11 @@ fn openai_compatible_config(
             model: job.model.clone(),
             timeout_seconds,
             provider_max_attempts,
-            thinking_disabled: false,
+            thinking_disabled,
+            retry_after_policy: bookforge_core::RetryAfterPolicy::JitteredExponential,
+            max_backoff_seconds: 30,
+            max_idle_per_host: 32,
+            json_mode: bookforge_core::JsonMode::Auto,
         });
     }
 
@@ -310,7 +327,11 @@ fn openai_compatible_config(
         model: job.model.clone(),
         timeout_seconds,
         provider_max_attempts,
-        thinking_disabled: false,
+        thinking_disabled,
+        retry_after_policy: bookforge_core::RetryAfterPolicy::JitteredExponential,
+        max_backoff_seconds: 30,
+        max_idle_per_host: 32,
+        json_mode: bookforge_core::JsonMode::Auto,
     })
 }
 
@@ -335,15 +356,39 @@ async fn qa_after_resume(
     qa_mode: QaMode,
     timeout_seconds: u64,
 ) -> Result<Vec<QaSegmentReview>> {
+    let qa_config = bookforge_core::QaRunConfig {
+        concurrency: 4,
+        batch_target_tokens: 4_000,
+        model: None,
+        provider: None,
+        base_url: None,
+        api_key_env: None,
+    };
     match job.provider.as_str() {
         "mock" => {
             let provider = MockProvider::new(mock_mode(&job.model), &job.target_lang);
-            Ok(qa_reviews_for_mode(provider, segments, translations, config, qa_mode).await)
+            Ok(qa_reviews_for_mode(
+                provider,
+                segments,
+                translations,
+                config,
+                &qa_config,
+                qa_mode,
+            )
+            .await)
         }
         "deepseek" | "openrouter" | "openai-compatible" => {
-            let provider_config = openai_compatible_config(job, timeout_seconds, 6)?;
+            let provider_config = openai_compatible_config(job, timeout_seconds, 6, false)?;
             let provider = OpenAiCompatibleProvider::new(provider_config)?;
-            Ok(qa_reviews_for_mode(provider, segments, translations, config, qa_mode).await)
+            Ok(qa_reviews_for_mode(
+                provider,
+                segments,
+                translations,
+                config,
+                &qa_config,
+                qa_mode,
+            )
+            .await)
         }
         _ => Ok(Vec::new()),
     }

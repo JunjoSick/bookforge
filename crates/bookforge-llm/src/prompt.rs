@@ -184,6 +184,14 @@ const BATCH_RUN_PRESERVING_TEMPLATE_SOURCE: &str =
     include_str!("../../../prompts/translate_batch_run_preserving.v1.md");
 const BATCH_REPAIR_TEMPLATE_SOURCE: &str =
     include_str!("../../../prompts/translate_batch_repair.v1.md");
+const BATCH_PLAIN_COMPACT_TEMPLATE_SOURCE: &str =
+    include_str!("../../../prompts/translate_batch_plain_compact.v1.md");
+const BATCH_MARKER_SAFE_COMPACT_TEMPLATE_SOURCE: &str =
+    include_str!("../../../prompts/translate_batch_marker_safe_compact.v1.md");
+const BATCH_RUN_PRESERVING_COMPACT_TEMPLATE_SOURCE: &str =
+    include_str!("../../../prompts/translate_batch_run_preserving_compact.v1.md");
+const BATCH_REPAIR_COMPACT_TEMPLATE_SOURCE: &str =
+    include_str!("../../../prompts/translate_batch_repair_compact.v1.md");
 const QA_BATCH_TEMPLATE_SOURCE: &str = include_str!("../../../prompts/qa_batch.v1.md");
 const DOUBLE_CHECK_BATCH_TEMPLATE_SOURCE: &str =
     include_str!("../../../prompts/double_check_batch.v1.md");
@@ -199,12 +207,22 @@ pub struct PromptLibrary {
     pub batch_marker_safe: PromptTemplate,
     pub batch_run_preserving: PromptTemplate,
     pub batch_repair: PromptTemplate,
+    pub batch_plain_compact: PromptTemplate,
+    pub batch_marker_safe_compact: PromptTemplate,
+    pub batch_run_preserving_compact: PromptTemplate,
+    pub batch_repair_compact: PromptTemplate,
     pub qa_batch: PromptTemplate,
     pub double_check_batch: PromptTemplate,
     pub correct_batch: PromptTemplate,
 }
 
 impl PromptLibrary {
+    pub fn global() -> &'static PromptLibrary {
+        use std::sync::OnceLock;
+        static LIBRARY: OnceLock<PromptLibrary> = OnceLock::new();
+        LIBRARY.get_or_init(PromptLibrary::embedded)
+    }
+
     pub fn embedded() -> Self {
         let plain = PromptTemplate::parse("translate_segment", "v1", PLAIN_TEMPLATE_SOURCE)
             .expect("embedded plain template must parse");
@@ -238,6 +256,30 @@ impl PromptLibrary {
         let batch_repair =
             PromptTemplate::parse("translate_batch_repair", "v1", BATCH_REPAIR_TEMPLATE_SOURCE)
                 .expect("embedded batch repair template must parse");
+        let batch_plain_compact = PromptTemplate::parse(
+            "translate_batch_plain_compact",
+            "v1",
+            BATCH_PLAIN_COMPACT_TEMPLATE_SOURCE,
+        )
+        .expect("embedded batch plain compact template must parse");
+        let batch_marker_safe_compact = PromptTemplate::parse(
+            "translate_batch_marker_safe_compact",
+            "v1",
+            BATCH_MARKER_SAFE_COMPACT_TEMPLATE_SOURCE,
+        )
+        .expect("embedded batch marker-safe compact template must parse");
+        let batch_run_preserving_compact = PromptTemplate::parse(
+            "translate_batch_run_preserving_compact",
+            "v1",
+            BATCH_RUN_PRESERVING_COMPACT_TEMPLATE_SOURCE,
+        )
+        .expect("embedded batch run-preserving compact template must parse");
+        let batch_repair_compact = PromptTemplate::parse(
+            "translate_batch_repair_compact",
+            "v1",
+            BATCH_REPAIR_COMPACT_TEMPLATE_SOURCE,
+        )
+        .expect("embedded batch repair compact template must parse");
         let qa_batch = PromptTemplate::parse("qa_batch", "v1", QA_BATCH_TEMPLATE_SOURCE)
             .expect("embedded QA batch template must parse");
         let double_check_batch = PromptTemplate::parse(
@@ -259,6 +301,10 @@ impl PromptLibrary {
             batch_marker_safe,
             batch_run_preserving,
             batch_repair,
+            batch_plain_compact,
+            batch_marker_safe_compact,
+            batch_run_preserving_compact,
+            batch_repair_compact,
             qa_batch,
             double_check_batch,
             correct_batch,

@@ -1,12 +1,14 @@
 mod checkpoint;
 mod commands;
 mod cost;
+mod progress;
 mod report;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use commands::{estimate, inspect, resume, retry, translate, validate};
+use commands::{doctor, estimate, inspect, resume, retry, status, tail, translate, validate};
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug, Parser)]
@@ -29,26 +31,53 @@ enum Command {
     Retry(retry::RetryArgs),
     Validate(validate::ValidateArgs),
     Benchmark(Box<translate::BenchmarkArgs>),
+    Doctor(doctor::DoctorArgs),
+    Status(status::StatusArgs),
+    Tail(tail::TailArgs),
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    install_panic_hook();
+
+    let cancel_token = CancellationToken::new();
+    let cancel = cancel_token.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        cancel.cancel();
+    });
 
     match Cli::parse().command {
         Command::Inspect(args) => inspect::run(args).await,
         Command::Estimate(args) => estimate::run(args).await,
-        Command::Translate(args) => translate::run(*args).await,
+        Command::Translate(args) => translate::run(*args, cancel_token).await,
         Command::Resume(args) => resume::run(args).await,
         Command::Retry(args) => retry::run(args).await,
         Command::Validate(args) => validate::run(args).await,
         Command::Benchmark(args) => translate::run_benchmark(*args).await,
+        Command::Doctor(args) => doctor::run(args).await,
+        Command::Status(args) => status::run(args).await,
+        Command::Tail(args) => tail::run(args).await,
     }
 }
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     fmt().with_env_filter(filter).with_target(false).init();
+}
+
+/// Install a panic hook that attempts to restore terminal state before
+/// printing the panic trace. Without this, indicatif can leave the terminal
+/// in a broken state (hidden cursor, overwritten lines) on panic.
+pub fn install_panic_hook() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // Try to restore terminal visibility
+        let _ = console::Term::stderr().show_cursor();
+        eprintln!();
+        previous_hook(panic_info);
+    }));
 }
 
 #[derive(Debug, Clone, clap::Args)]

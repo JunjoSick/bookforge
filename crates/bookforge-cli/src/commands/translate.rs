@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bookforge_core::{
+    NullProgressSink,
     config::{
         DoubleCheckMode, FallbackScope, ResolvedRunSettings, TranslationConfig, TranslationProfile,
     },
@@ -12,28 +13,27 @@ use bookforge_llm::translate_segments;
 use bookforge_llm::{
     AdaptiveLimiter, LlmError, LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig,
     OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation, TelemetryLog,
-    TranslationRunConfig, build_translation_batches, qa_segments, run_double_check,
+    TranslationRunConfig, build_translation_batches, qa_segments_parallel, run_double_check,
     telemetry_summary, translate_batches_with_callback, translate_segments_with_callback,
 };
 use bookforge_store::{CreateJob, JobRecord, JobStore, SaveCachedTranslation};
 use clap::Args;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     LanguageArgs, ProviderArgs as CliProviderArgs, QaMode,
-    checkpoint::{CheckpointCommand, CheckpointWriter},
+    checkpoint::{CheckpointCommand, CheckpointSender, CheckpointWriter},
     cost::estimate_cost_usd,
     default_output_path,
     report::{ReportInput, write_report},
 };
-use tokio::sync::mpsc::UnboundedSender;
 
 async fn finalize_writer<T>(
     translation_result: Result<T, anyhow::Error>,
-    tx: UnboundedSender<CheckpointCommand>,
+    sender: CheckpointSender,
     writer: CheckpointWriter,
 ) -> Result<T> {
-    drop(tx);
+    drop(sender);
     let writer_result = writer.shutdown().await;
     match (translation_result, writer_result) {
         (Ok(value), Ok(())) => Ok(value),
@@ -162,6 +162,44 @@ pub struct TranslateArgs {
 
     #[arg(long, default_value_t = false)]
     pub no_thinking: bool,
+
+    #[arg(long)]
+    pub model_context_tokens: Option<u32>,
+
+    #[arg(long)]
+    pub max_output_tokens: Option<u32>,
+
+    #[arg(long)]
+    pub batch_max_output_tokens: Option<u32>,
+
+    #[arg(long, value_enum, default_value_t = bookforge_core::JsonMode::Auto)]
+    pub json_mode: bookforge_core::JsonMode,
+
+    #[arg(long, value_enum, default_value_t = crate::progress::UiMode::Auto)]
+    pub ui: crate::progress::UiMode,
+
+    #[arg(long)]
+    pub progress_jsonl: Option<PathBuf>,
+
+    #[arg(long, value_enum)]
+    pub provider_preset: Option<bookforge_core::ProviderPreset>,
+}
+
+fn apply_provider_preset(
+    explicit: &CliProviderArgs,
+    preset: Option<bookforge_core::ProviderPreset>,
+) -> CliProviderArgs {
+    let Some(p) = preset else {
+        return explicit.clone();
+    };
+    let endpoint = p.resolve(None);
+    CliProviderArgs {
+        provider: endpoint.provider,
+        model: explicit.model.clone().or(Some(endpoint.model)),
+        base_url: explicit.base_url.clone().or(endpoint.base_url),
+        api_key_env: explicit.api_key_env.clone().or(endpoint.api_key_env),
+        timeout_seconds: explicit.timeout_seconds,
+    }
 }
 
 fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
@@ -207,6 +245,16 @@ fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
     }
     settings.provider.timeout_seconds = args.provider.timeout_seconds;
     settings.provider.thinking_disabled = args.no_thinking;
+    if let Some(v) = args.model_context_tokens {
+        settings.provider.model_context_tokens = Some(v);
+    }
+    if let Some(v) = args.max_output_tokens {
+        settings.provider.max_output_tokens = Some(v);
+    }
+    if let Some(v) = args.batch_max_output_tokens {
+        settings.provider.batch_max_output_tokens = Some(v);
+    }
+    settings.provider.json_mode = args.json_mode;
 
     settings.qa.concurrency = args.qa_concurrency;
     if let Some(v) = args.qa_batch_target_tokens {
@@ -238,8 +286,15 @@ fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
     settings
 }
 
-pub async fn run(args: TranslateArgs) -> Result<()> {
+pub async fn run(
+    args: TranslateArgs,
+    cancel_token: tokio_util::sync::CancellationToken,
+) -> Result<()> {
     let settings = resolve_settings(&args);
+
+    // Apply provider preset if specified (before explicit CLI overrides)
+    let effective_provider = apply_provider_preset(&args.provider, args.provider_preset);
+
     let output = args
         .out
         .clone()
@@ -247,8 +302,8 @@ pub async fn run(args: TranslateArgs) -> Result<()> {
     let config = TranslationConfig {
         source_language: args.language.source.clone(),
         target_language: args.language.target.clone(),
-        provider: args.provider.provider.clone(),
-        model: args.provider.model.clone(),
+        provider: effective_provider.provider.clone(),
+        model: effective_provider.model.clone(),
         concurrency: settings.scheduler.concurrency,
         max_attempts: settings.scheduler.max_attempts,
         output,
@@ -267,29 +322,76 @@ pub async fn run(args: TranslateArgs) -> Result<()> {
         println!("Batch max items: {}", settings.batch.max_items);
     }
 
-    match config.provider.as_str() {
-        "mock" => {
-            run_mock_translation(&args.input, &config, &args.provider, &args, &settings).await?
-        }
-        "deepseek" | "openrouter" | "openai-compatible" => {
-            run_openai_compatible_translation(
-                &args.input,
-                &config,
-                &args.provider,
-                &args,
-                &settings,
-            )
-            .await?
-        }
-        _ => {
-            println!(
-                "Translation provider '{}' is not implemented yet.",
-                config.provider
-            );
-        }
+    let reporter = crate::progress::ProgressReporter::spawn(args.ui, args.progress_jsonl.clone());
+    let progress_sink = reporter.sink();
+
+    // Warn if retry amplification is high
+    let retry_amplification = settings.provider.provider_max_attempts
+        * settings.scheduler.max_attempts
+        * settings.provider.validation_max_attempts;
+    if retry_amplification > 9 {
+        progress_sink.emit(bookforge_core::ProgressEvent::Warning {
+            kind: "retry_amplification".to_string(),
+            message: format!(
+                "high retry amplification: provider_max_attempts={}, scheduler_max_attempts={}, validation_max_attempts={} (total {} potential retries per segment)",
+                settings.provider.provider_max_attempts,
+                settings.scheduler.max_attempts,
+                settings.provider.validation_max_attempts,
+                retry_amplification
+            ),
+            timestamp_ms: bookforge_core::progress::now_ms(),
+        });
+        eprintln!(
+            "warn: high retry amplification ({} total potential retries per segment)",
+            retry_amplification
+        );
     }
 
-    Ok(())
+    let run_result = async {
+        match config.provider.as_str() {
+            "mock" => {
+                run_mock_translation(&args.input, &config, &effective_provider, &args, &settings)
+                    .await
+            }
+            "deepseek" | "openrouter" | "openai-compatible" => {
+                run_openai_compatible_translation(
+                    &args.input,
+                    &config,
+                    &effective_provider,
+                    &args,
+                    &settings,
+                    &cancel_token,
+                    progress_sink,
+                )
+                .await
+            }
+            _ => {
+                println!(
+                    "Translation provider '{}' is not implemented yet.",
+                    config.provider
+                );
+                Ok(())
+            }
+        }
+    }
+    .await;
+
+    finalize_reporter(run_result, reporter).await
+}
+
+async fn finalize_reporter<T>(
+    result: Result<T, anyhow::Error>,
+    reporter: crate::progress::ProgressReporter,
+) -> Result<T> {
+    let reporter_result = reporter.shutdown().await;
+    match (result, reporter_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(e)) => Err(e),
+        (Err(e), Ok(())) => Err(e),
+        (Err(main_err), Err(progress_err)) => Err(anyhow::anyhow!(
+            "{main_err}; additionally progress reporter failed: {progress_err}"
+        )),
+    }
 }
 
 async fn run_mock_translation(
@@ -321,7 +423,7 @@ async fn run_mock_translation(
     let cache_namespace = compute_cache_namespace(
         settings.segmentation.max_segment_tokens,
         settings.segmentation.context_tokens,
-        &format!("{:?}", settings.profile),
+        settings.profile.namespace_str(),
         settings.batch.enabled,
         prompt_version,
     );
@@ -342,7 +444,11 @@ async fn run_mock_translation(
         temperature: 0.2,
         scheduler: settings.scheduler.clone(),
         profile: settings.profile,
-    };
+        model_context_tokens: None,
+        max_output_tokens: None,
+        batch_max_output_tokens: None,
+        compact_prompts: false,
+    }; // mock
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     let mut translations = apply_cached_translations(
         &segments,
@@ -350,7 +456,7 @@ async fn run_mock_translation(
             store: &store,
             job_id: &job.id,
             prompt_version,
-            provider: "mock",
+            provider: &config.provider,
             model: &model,
             source_lang: config.source_language.as_deref(),
             target_lang: &config.target_language,
@@ -358,8 +464,8 @@ async fn run_mock_translation(
         },
     )?;
     let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
-    let writer = CheckpointWriter::spawn(store.path().to_path_buf());
-    let tx = writer.sender();
+    let writer = CheckpointWriter::spawn(store.path().to_path_buf(), Arc::new(NullProgressSink));
+    let sender = writer.sender();
     let translation_result = translate_and_checkpoint(
         provider.clone(),
         &pending_segments,
@@ -370,11 +476,11 @@ async fn run_mock_translation(
             provider: "mock",
             model: &model,
             prompt_version,
-            tx: &tx,
+            sender: &sender,
         },
     )
     .await;
-    let fresh_translations = finalize_writer(translation_result, tx, writer).await?;
+    let fresh_translations = finalize_writer(translation_result, sender, writer).await?;
     translations.extend(fresh_translations);
     translations.sort_by_key(|translation| translation.ordinal);
     let qa_reviews = qa_reviews_for_mode(
@@ -382,6 +488,7 @@ async fn run_mock_translation(
         &segments,
         &translations,
         &run_config,
+        &settings.qa,
         _cli_args.qa,
     )
     .await;
@@ -415,8 +522,10 @@ async fn run_openai_compatible_translation(
     provider_args: &CliProviderArgs,
     cli_args: &TranslateArgs,
     settings: &ResolvedRunSettings,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
 ) -> Result<()> {
-    let provider_config = match provider_config(
+    let mut provider_config = match provider_config(
         &config.provider,
         config.model.as_deref(),
         provider_args.base_url.as_deref(),
@@ -424,6 +533,8 @@ async fn run_openai_compatible_translation(
         settings.provider.timeout_seconds,
         settings.provider.provider_max_attempts,
         settings.provider.thinking_disabled,
+        settings.provider.retry_after_policy,
+        settings.provider.max_backoff_seconds,
     ) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -435,10 +546,30 @@ async fn run_openai_compatible_translation(
             return Err(e);
         }
     };
-    let provider = OpenAiCompatibleProvider::new(provider_config.clone())?;
+    provider_config.json_mode = settings.provider.json_mode;
+    let provider =
+        OpenAiCompatibleProvider::new_with_cancel(provider_config.clone(), cancel_token.clone())?;
     let model = provider.model().to_string();
+
+    progress.emit(bookforge_core::ProgressEvent::StageStarted {
+        stage: "read_epub".to_string(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
     let book = read_epub(input)?;
+    progress.emit(bookforge_core::ProgressEvent::StageFinished {
+        stage: "read_epub".to_string(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
+
+    progress.emit(bookforge_core::ProgressEvent::StageStarted {
+        stage: "segmentation".to_string(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
     let segments = build_segments(&book, &settings.segmentation)?;
+    progress.emit(bookforge_core::ProgressEvent::SegmentationFinished {
+        segment_count: segments.len(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
     let run_prompt_version = if settings.batch.enabled {
         "batch_v1"
     } else {
@@ -456,10 +587,16 @@ async fn run_openai_compatible_translation(
         api_key_env: Some(&provider_config.api_key_env),
     })?;
     println!("Job: {}", job.id);
+    progress.emit(bookforge_core::ProgressEvent::JobCreated {
+        job_id: job.id.clone(),
+        input_path: input.display().to_string(),
+        output_path: config.output.display().to_string(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
     let cache_namespace = compute_cache_namespace(
         settings.segmentation.max_segment_tokens,
         settings.segmentation.context_tokens,
-        &format!("{:?}", settings.profile),
+        settings.profile.namespace_str(),
         settings.batch.enabled,
         run_prompt_version,
     );
@@ -480,7 +617,12 @@ async fn run_openai_compatible_translation(
         temperature: 0.2,
         scheduler: settings.scheduler.clone(),
         profile: settings.profile,
+        model_context_tokens: settings.provider.model_context_tokens,
+        max_output_tokens: settings.provider.max_output_tokens,
+        batch_max_output_tokens: settings.provider.batch_max_output_tokens,
+        compact_prompts: settings.compact_prompts,
     };
+    // batch_run_config
 
     if settings.batch.enabled {
         let batch_run_config = TranslationRunConfig {
@@ -495,6 +637,10 @@ async fn run_openai_compatible_translation(
                 max_attempts: settings.provider.provider_max_attempts,
             },
             profile: settings.profile,
+            model_context_tokens: settings.provider.model_context_tokens,
+            max_output_tokens: settings.provider.max_output_tokens,
+            batch_max_output_tokens: settings.provider.batch_max_output_tokens,
+            compact_prompts: settings.compact_prompts,
         };
         let mut translations = apply_cached_translations(
             &segments,
@@ -509,9 +655,16 @@ async fn run_openai_compatible_translation(
                 cache_namespace: &cache_namespace,
             },
         )?;
+        let hits = translations.len();
+        let pending_count = segments.len().saturating_sub(hits);
+        progress.emit(bookforge_core::ProgressEvent::CacheScanFinished {
+            hits,
+            misses: pending_count,
+            timestamp_ms: bookforge_core::progress::now_ms(),
+        });
         let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
-        let writer = CheckpointWriter::spawn(store.path().to_path_buf());
-        let tx = writer.sender();
+        let writer = CheckpointWriter::spawn(store.path().to_path_buf(), progress.clone());
+        let sender = writer.sender();
         let translation_result = translate_and_checkpoint_batch(
             provider.clone(),
             &pending_segments,
@@ -523,51 +676,29 @@ async fn run_openai_compatible_translation(
                 provider: &config.provider,
                 model: &model,
                 prompt_version: run_prompt_version,
-                tx: &tx,
+                sender: &sender,
             },
+            progress.clone(),
         )
         .await;
-        let fresh_translations = finalize_writer(translation_result, tx, writer).await?;
+        let fresh_translations = finalize_writer(translation_result, sender, writer).await?;
         translations.extend(fresh_translations);
-        translations.sort_by_key(|translation| translation.ordinal);
-        let qa_reviews = qa_reviews_for_mode(
-            provider.clone(),
-            &segments,
-            &translations,
-            &run_config,
-            cli_args.qa,
-        )
-        .await;
-        translations = run_fallback_pass(
+
+        finish_translation_pipeline(
             &provider,
+            cancel_token,
             cli_args,
             &segments,
-            translations,
-            &store,
-            &job.id,
-            run_prompt_version,
-            settings,
-        )
-        .await?;
-        run_double_check_pass(
-            &provider,
-            cli_args,
-            &segments,
-            &translations,
-            &run_config,
-            settings,
-        )
-        .await?;
-        mark_job_finished(&store, &job.id, &translations)?;
-        print_summary_rebuild_and_report(
+            &mut translations,
             &store,
             &job,
-            &book,
-            &segments,
-            &translations,
-            &qa_reviews,
+            run_prompt_version,
+            settings,
+            &run_config,
             config,
-        )?;
+            &book,
+        )
+        .await?;
     } else {
         let mut translations = apply_cached_translations(
             &segments,
@@ -582,9 +713,16 @@ async fn run_openai_compatible_translation(
                 cache_namespace: &cache_namespace,
             },
         )?;
+        let hits = translations.len();
+        let pending_count = segments.len().saturating_sub(hits);
+        progress.emit(bookforge_core::ProgressEvent::CacheScanFinished {
+            hits,
+            misses: pending_count,
+            timestamp_ms: bookforge_core::progress::now_ms(),
+        });
         let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
-        let writer = CheckpointWriter::spawn(store.path().to_path_buf());
-        let tx = writer.sender();
+        let writer = CheckpointWriter::spawn(store.path().to_path_buf(), progress.clone());
+        let sender = writer.sender();
         let translation_result = translate_and_checkpoint(
             provider.clone(),
             &pending_segments,
@@ -595,56 +733,112 @@ async fn run_openai_compatible_translation(
                 provider: &config.provider,
                 model: &model,
                 prompt_version: run_prompt_version,
-                tx: &tx,
+                sender: &sender,
             },
         )
         .await;
-        let fresh_translations = finalize_writer(translation_result, tx, writer).await?;
+        let fresh_translations = finalize_writer(translation_result, sender, writer).await?;
         translations.extend(fresh_translations);
-        translations.sort_by_key(|translation| translation.ordinal);
-        let qa_reviews = qa_reviews_for_mode(
-            provider.clone(),
-            &segments,
-            &translations,
-            &run_config,
-            cli_args.qa,
-        )
-        .await;
-        translations = run_fallback_pass(
+
+        finish_translation_pipeline(
             &provider,
+            cancel_token,
             cli_args,
             &segments,
-            translations,
-            &store,
-            &job.id,
-            run_prompt_version,
-            settings,
-        )
-        .await?;
-        run_double_check_pass(
-            &provider,
-            cli_args,
-            &segments,
-            &translations,
-            &run_config,
-            settings,
-        )
-        .await?;
-        mark_job_finished(&store, &job.id, &translations)?;
-        print_summary_rebuild_and_report(
+            &mut translations,
             &store,
             &job,
-            &book,
-            &segments,
-            &translations,
-            &qa_reviews,
+            run_prompt_version,
+            settings,
+            &run_config,
             config,
-        )?;
+            &book,
+        )
+        .await?;
+    }
+
+    if cancel_token.is_cancelled() {
+        let _ = store.mark_job_interrupted(&job.id);
+        eprintln!();
+        eprintln!("Interrupted by user.");
+        eprintln!("Your progress has been saved to job: {}", job.id);
+        eprintln!();
+        eprintln!("Resume with:");
+        eprintln!("  bookforge resume {}", job.id);
+        return Ok(());
     }
 
     Ok(())
 }
 
+/// Shared post-translation pipeline: QA, fallback, double-check, finish, report.
+/// Both batch and non-batch paths call this after translation completes.
+#[allow(clippy::too_many_arguments)]
+async fn finish_translation_pipeline(
+    provider: &OpenAiCompatibleProvider,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    cli_args: &TranslateArgs,
+    segments: &[Segment],
+    translations: &mut Vec<SegmentTranslation>,
+    store: &JobStore,
+    job: &JobRecord,
+    run_prompt_version: &str,
+    settings: &ResolvedRunSettings,
+    run_config: &TranslationRunConfig,
+    config: &TranslationConfig,
+    book: &bookforge_core::ir::Book,
+) -> Result<()> {
+    translations.sort_by_key(|t| t.ordinal);
+
+    let qa_reviews = qa_reviews_for_mode(
+        provider.clone(),
+        segments,
+        translations,
+        run_config,
+        &settings.qa,
+        cli_args.qa,
+    )
+    .await;
+
+    let fallback_translations = run_fallback_pass(
+        provider,
+        cli_args,
+        segments,
+        std::mem::take(translations),
+        store,
+        &job.id,
+        run_prompt_version,
+        settings,
+    )
+    .await?;
+    *translations = fallback_translations;
+
+    run_double_check_pass(
+        provider,
+        cancel_token,
+        cli_args,
+        segments,
+        translations,
+        run_config,
+        settings,
+    )
+    .await?;
+
+    mark_job_finished(store, &job.id, translations)?;
+    print_summary_rebuild_and_report(
+        store,
+        job,
+        book,
+        segments,
+        translations,
+        &qa_reviews,
+        config,
+    )?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn provider_config(
     provider: &str,
     model: Option<&str>,
@@ -653,6 +847,8 @@ fn provider_config(
     timeout_seconds: u64,
     provider_max_attempts: usize,
     thinking_disabled: bool,
+    retry_after_policy: bookforge_core::RetryAfterPolicy,
+    max_backoff_seconds: u64,
 ) -> Result<OpenAiCompatibleConfig> {
     let (default_url, default_key_env, default_model) = match provider {
         "deepseek" => (
@@ -686,6 +882,10 @@ fn provider_config(
         timeout_seconds,
         provider_max_attempts: provider_max_attempts.max(1),
         thinking_disabled,
+        retry_after_policy,
+        max_backoff_seconds,
+        max_idle_per_host: 32,
+        json_mode: bookforge_core::JsonMode::Auto,
     })
 }
 
@@ -695,6 +895,7 @@ async fn translate_and_checkpoint_batch<P>(
     config: &TranslationRunConfig,
     settings: &ResolvedRunSettings,
     checkpoint: CheckpointContext<'_>,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
 ) -> Result<Vec<SegmentTranslation>>
 where
     P: LlmProvider,
@@ -719,25 +920,75 @@ where
         None
     };
 
-    match translate_batches_with_callback(
+    let mut batch_sizer = bookforge_llm::BatchSizer::with_progress(
+        settings.batch.target_tokens,
+        settings.batch.max_items,
+        progress.clone(),
+    );
+
+    let sender = checkpoint.sender.clone();
+    let (finalized_tx, mut finalized_rx) = tokio::sync::mpsc::channel::<SegmentTranslation>(64);
+
+    let checkpoint_handle = {
+        let sender = sender.clone();
+        let job_id = checkpoint.job_id.to_string();
+        let provider_name = checkpoint.provider.to_string();
+        let model = checkpoint.model.to_string();
+        let prompt_version = checkpoint.prompt_version.to_string();
+        tokio::spawn(async move {
+            while let Some(translation) = finalized_rx.recv().await {
+                sender
+                    .send(CheckpointCommand::SaveTranslation {
+                        job_id: job_id.clone(),
+                        translation: Box::new(translation),
+                        provider: provider_name.clone(),
+                        model: model.clone(),
+                        prompt_version: prompt_version.clone(),
+                    })
+                    .await
+                    .map_err(|e| {
+                        bookforge_llm::LlmError::Provider(format!("checkpoint send failed: {e}"))
+                    })?;
+            }
+            Ok::<(), bookforge_llm::LlmError>(())
+        })
+    };
+
+    let batch_result = translate_batches_with_callback(
         provider,
         batches,
         segments,
         config,
         telemetry.clone(),
         limiter,
-        |translation| send_checkpoint(checkpoint.tx, checkpoint, translation),
+        Some(&mut batch_sizer),
+        progress.clone(),
+        Some(finalized_tx),
+        |_| Ok(()),
     )
-    .await
-    {
-        Ok(translations) => {
+    .await;
+
+    let checkpoint_result = checkpoint_handle.await;
+
+    match (batch_result, checkpoint_result) {
+        (Ok(translations), Ok(Ok(()))) => {
             let snapshot = telemetry.snapshot();
             if !snapshot.is_empty() {
                 println!("\n{}", telemetry_summary(&snapshot));
             }
             Ok(translations)
         }
-        Err(error) => {
+        (Ok(_), Ok(Err(e))) | (Err(e @ bookforge_llm::LlmError::Provider(_)), _) => {
+            let message = format!("batch translation checkpoint failure: {e}");
+            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            Err(anyhow::anyhow!(message))
+        }
+        (_, Err(join_err)) => {
+            let message = format!("batch checkpoint task panicked: {join_err}");
+            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            Err(anyhow::anyhow!(message))
+        }
+        (Err(error), _) => {
             let message = format!("batch translation failed: {error}");
             mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
             Err(anyhow::anyhow!(message))
@@ -777,10 +1028,15 @@ async fn run_fallback_pass(
         settings.provider.timeout_seconds,
         settings.provider.provider_max_attempts,
         settings.provider.thinking_disabled,
+        settings.provider.retry_after_policy,
+        settings.provider.max_backoff_seconds,
     )?;
 
-    let fallback =
-        OpenAiCompatibleProvider::new(fallback_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let fallback = OpenAiCompatibleProvider::new_with_cancel(
+        fallback_config,
+        primary_provider.cancel_token.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     let fallback_model = fallback.model().to_string();
 
     let candidates: Vec<Segment> = segments
@@ -824,22 +1080,26 @@ async fn run_fallback_pass(
             max_attempts: settings.provider.provider_max_attempts,
         },
         profile: settings.profile,
-    };
+        model_context_tokens: settings.provider.model_context_tokens,
+        max_output_tokens: settings.provider.max_output_tokens,
+        batch_max_output_tokens: settings.provider.batch_max_output_tokens,
+        compact_prompts: settings.compact_prompts,
+    }; // fallback_run_config
 
-    let writer = CheckpointWriter::spawn(store.path().to_path_buf());
-    let tx = writer.sender();
+    let writer = CheckpointWriter::spawn(store.path().to_path_buf(), Arc::new(NullProgressSink));
+    let sender = writer.sender();
     let checkpoint = CheckpointContext {
         store,
         job_id,
         provider: provider_str,
         model: &fallback_model,
         prompt_version,
-        tx: &tx,
+        sender: &sender,
     };
 
     let translation_result =
         translate_and_checkpoint(fallback, &candidates, &run_config, checkpoint).await;
-    let fresh = finalize_writer(translation_result, tx, writer).await?;
+    let fresh = finalize_writer(translation_result, sender, writer).await?;
 
     for ft in &fresh {
         if let Some(existing) = translations
@@ -855,6 +1115,7 @@ async fn run_fallback_pass(
 
 async fn run_double_check_pass(
     provider: &OpenAiCompatibleProvider,
+    cancel_token: &tokio_util::sync::CancellationToken,
     cli_args: &TranslateArgs,
     segments: &[Segment],
     translations: &[SegmentTranslation],
@@ -879,8 +1140,11 @@ async fn run_double_check_pass(
                 settings.provider.timeout_seconds,
                 settings.provider.provider_max_attempts,
                 settings.provider.thinking_disabled,
+                settings.provider.retry_after_policy,
+                settings.provider.max_backoff_seconds,
             )?;
-            OpenAiCompatibleProvider::new(dc_config).map_err(|e| anyhow::anyhow!("{e}"))?
+            OpenAiCompatibleProvider::new_with_cancel(dc_config, cancel_token.clone())
+                .map_err(|e| anyhow::anyhow!("{e}"))?
         } else {
             provider.clone()
         };
@@ -942,7 +1206,7 @@ where
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct CheckpointContext<'a> {
     pub store: &'a JobStore,
     pub job_id: &'a str,
@@ -951,7 +1215,7 @@ pub(crate) struct CheckpointContext<'a> {
     pub prompt_version: &'a str,
     /// Sender to the SQLite writer actor. Per-segment checkpoint writes
     /// go through this channel so the async hot path never blocks on disk.
-    pub tx: &'a UnboundedSender<CheckpointCommand>,
+    pub sender: &'a CheckpointSender,
 }
 
 #[derive(Clone, Copy)]
@@ -975,13 +1239,61 @@ pub(crate) async fn translate_and_checkpoint<P>(
 where
     P: LlmProvider,
 {
-    match translate_segments_with_callback(provider, segments, config, |translation| {
-        send_checkpoint(checkpoint.tx, checkpoint, translation)
-    })
-    .await
-    {
-        Ok(translations) => Ok(translations),
-        Err(error) => {
+    let sender = checkpoint.sender.clone();
+    let (finalized_tx, mut finalized_rx) = tokio::sync::mpsc::channel::<SegmentTranslation>(64);
+
+    // Spawn a task that checkpoints each finalized translation as it arrives.
+    let checkpoint_handle = {
+        let sender = sender.clone();
+        let job_id = checkpoint.job_id.to_string();
+        let provider_name = checkpoint.provider.to_string();
+        let model = checkpoint.model.to_string();
+        let prompt_version = checkpoint.prompt_version.to_string();
+        tokio::spawn(async move {
+            while let Some(translation) = finalized_rx.recv().await {
+                sender
+                    .send(CheckpointCommand::SaveTranslation {
+                        job_id: job_id.clone(),
+                        translation: Box::new(translation),
+                        provider: provider_name.clone(),
+                        model: model.clone(),
+                        prompt_version: prompt_version.clone(),
+                    })
+                    .await
+                    .map_err(|e| {
+                        bookforge_llm::LlmError::Provider(format!("checkpoint send failed: {e}"))
+                    })?;
+            }
+            Ok::<(), bookforge_llm::LlmError>(())
+        })
+    };
+
+    let translations = translate_segments_with_callback(
+        provider,
+        segments,
+        config,
+        |_| Ok(()),
+        Some(finalized_tx),
+    )
+    .await;
+
+    // Drop finalized_tx so the checkpoint task exits
+    // (finalized_tx was moved into translate_segments_with_callback)
+    let checkpoint_result = checkpoint_handle.await;
+
+    match (translations, checkpoint_result) {
+        (Ok(translations), Ok(Ok(()))) => Ok(translations),
+        (Ok(_), Ok(Err(e))) | (Err(e @ bookforge_llm::LlmError::Provider(_)), _) => {
+            let message = format!("translation checkpoint failure: {e}");
+            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            Err(anyhow::anyhow!(message))
+        }
+        (_, Err(join_err)) => {
+            let message = format!("checkpoint task panicked: {join_err}");
+            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            Err(anyhow::anyhow!(message))
+        }
+        (Err(error), _) => {
             let message = format!(
                 "translation scheduler failed before producing per-segment results: {error}"
             );
@@ -995,22 +1307,23 @@ pub(crate) fn apply_cached_translations(
     segments: &[Segment],
     cache: CacheContext<'_>,
 ) -> Result<Vec<SegmentTranslation>> {
-    // Cross prompt-version fallback was removed: namespace + exact
-    // block-ID compatibility now gates reuse, so a stale "batch_v1" hit
-    // on a "v1" run would be unsafe even with matching block IDs.
     let mut cached = Vec::new();
-    for segment in segments {
-        let hit = cache.store.find_cached_translation(
-            segment,
-            cache.prompt_version,
-            cache.provider,
-            cache.model,
-            cache.source_lang,
-            cache.target_lang,
-            cache.cache_namespace,
-        )?;
 
-        let Some(hit) = hit else {
+    let request = bookforge_store::CacheLookupRequest {
+        prompt_version: cache.prompt_version,
+        provider: cache.provider,
+        model: cache.model,
+        source_lang: cache.source_lang,
+        target_lang: cache.target_lang,
+        cache_namespace: cache.cache_namespace,
+    };
+
+    let hits = cache
+        .store
+        .find_cached_translations_batch(segments, request)?;
+
+    for segment in segments {
+        let Some(hit) = hits.get(&segment.id.0) else {
             continue;
         };
         cache.store.save_cached_translation(SaveCachedTranslation {
@@ -1026,7 +1339,7 @@ pub(crate) fn apply_cached_translations(
             segment_id: segment.id.clone(),
             ordinal: segment.ordinal,
             block_ids: segment.block_ids.clone(),
-            blocks: hit.blocks,
+            blocks: hit.blocks.clone(),
             checksum: segment.checksum.clone(),
             status: SegmentStatus::SkippedCached,
             template: "cached".to_string(),
@@ -1060,6 +1373,7 @@ pub(crate) async fn qa_reviews_for_mode<P>(
     segments: &[Segment],
     translations: &[SegmentTranslation],
     config: &TranslationRunConfig,
+    qa_config: &bookforge_core::config::QaRunConfig,
     qa_mode: QaMode,
 ) -> Vec<QaSegmentReview>
 where
@@ -1067,10 +1381,12 @@ where
 {
     match qa_mode {
         QaMode::Off => Vec::new(),
-        QaMode::All => qa_segments(provider, segments, translations, config).await,
+        QaMode::All => {
+            qa_segments_parallel(provider, segments, translations, config, qa_config).await
+        }
         QaMode::Suspicious => {
             let candidates = suspicious_qa_candidates(segments, translations);
-            qa_segments(provider, segments, &candidates, config).await
+            qa_segments_parallel(provider, segments, &candidates, config, qa_config).await
         }
     }
 }
@@ -1112,23 +1428,6 @@ fn mark_all_segments_failed(
         store.mark_segment_failed(job_id, &segment.id.0, error)?;
     }
     Ok(())
-}
-
-fn send_checkpoint(
-    tx: &UnboundedSender<CheckpointCommand>,
-    ctx: CheckpointContext<'_>,
-    translation: &SegmentTranslation,
-) -> std::result::Result<(), LlmError> {
-    tx.send(CheckpointCommand::SaveTranslation {
-        job_id: ctx.job_id.to_string(),
-        translation: Box::new(translation.clone()),
-        provider: ctx.provider.to_string(),
-        model: ctx.model.to_string(),
-        prompt_version: ctx.prompt_version.to_string(),
-    })
-    .map_err(|_| {
-        LlmError::Provider("checkpoint queue closed; checkpoint writer may have failed".to_string())
-    })
 }
 
 pub(crate) fn mark_job_finished(
@@ -1246,7 +1545,11 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
         timeout_seconds: args.provider.timeout_seconds,
         provider_max_attempts: 6,
         thinking_disabled: false,
-    };
+        retry_after_policy: bookforge_core::RetryAfterPolicy::JitteredExponential,
+        max_backoff_seconds: 30,
+        max_idle_per_host: 32,
+        json_mode: bookforge_core::JsonMode::Auto,
+    }; // benchmark
 
     let provider = OpenAiCompatibleProvider::new(provider_config.clone())?;
     let model = provider.model().to_string();
@@ -1427,6 +1730,10 @@ mod tests {
                 max_attempts: 1,
             },
             profile: TranslationProfile::Balanced,
+            model_context_tokens: None,
+            max_output_tokens: None,
+            batch_max_output_tokens: None,
+            compact_prompts: false,
         };
 
         let error = translate_with_scheduler_guard(
@@ -1496,13 +1803,33 @@ mod tests {
 
     #[test]
     fn provider_config_sets_provider_max_attempts() {
-        let cfg = provider_config("openrouter", None, None, None, 120, 2, false)
-            .expect("provider_config should build");
+        use bookforge_core::RetryAfterPolicy;
+        let cfg = provider_config(
+            "openrouter",
+            None,
+            None,
+            None,
+            120,
+            2,
+            false,
+            RetryAfterPolicy::JitteredExponential,
+            30,
+        )
+        .expect("provider_config should build");
         assert_eq!(cfg.provider_max_attempts, 2);
 
-        // Zero gets clamped to a minimum of 1.
-        let cfg = provider_config("openrouter", None, None, None, 120, 0, false)
-            .expect("provider_config should build");
+        let cfg = provider_config(
+            "openrouter",
+            None,
+            None,
+            None,
+            120,
+            0,
+            false,
+            RetryAfterPolicy::JitteredExponential,
+            30,
+        )
+        .expect("provider_config should build");
         assert_eq!(cfg.provider_max_attempts, 1);
     }
 }

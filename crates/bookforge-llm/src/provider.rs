@@ -3,6 +3,10 @@ use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
+
+use bookforge_core::{RetryAfterPolicy, marker::is_marker_token};
 
 pub type Result<T> = std::result::Result<T, LlmError>;
 
@@ -269,14 +273,6 @@ fn transform_text(mode: MockMode, target_language: &str, source: &str) -> String
     }
 }
 
-fn is_marker_token(text: &str) -> bool {
-    let text = text.trim();
-    text == "</m>"
-        || text.starts_with("<m ")
-        || text.starts_with("<keep ")
-        || text.starts_with("<ref ")
-}
-
 /// Recover per-block source strings from a rendered marker-safe user prompt.
 /// The caller embeds blocks as a JSON array under `Source blocks:`; the mock
 /// parses it back so test translations transform the actual source text rather
@@ -422,6 +418,10 @@ pub struct OpenAiCompatibleConfig {
     pub timeout_seconds: u64,
     pub provider_max_attempts: usize,
     pub thinking_disabled: bool,
+    pub retry_after_policy: RetryAfterPolicy,
+    pub max_backoff_seconds: u64,
+    pub max_idle_per_host: usize,
+    pub json_mode: bookforge_core::JsonMode,
 }
 
 impl OpenAiCompatibleConfig {
@@ -433,6 +433,10 @@ impl OpenAiCompatibleConfig {
             timeout_seconds: 120,
             provider_max_attempts: 6,
             thinking_disabled: false,
+            retry_after_policy: RetryAfterPolicy::JitteredExponential,
+            max_backoff_seconds: 60,
+            max_idle_per_host: 32,
+            json_mode: bookforge_core::JsonMode::Auto,
         }
     }
 }
@@ -442,6 +446,8 @@ pub struct OpenAiCompatibleProvider {
     config: OpenAiCompatibleConfig,
     client: reqwest::Client,
     reasoning_detected: AtomicBool,
+    response_format_supported: AtomicBool,
+    pub cancel_token: CancellationToken,
 }
 
 impl Clone for OpenAiCompatibleProvider {
@@ -450,12 +456,23 @@ impl Clone for OpenAiCompatibleProvider {
             config: self.config.clone(),
             client: self.client.clone(),
             reasoning_detected: AtomicBool::new(self.reasoning_detected.load(Ordering::Relaxed)),
+            response_format_supported: AtomicBool::new(
+                self.response_format_supported.load(Ordering::Relaxed),
+            ),
+            cancel_token: self.cancel_token.clone(),
         }
     }
 }
 
 impl OpenAiCompatibleProvider {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self> {
+        Self::new_with_cancel(config, CancellationToken::new())
+    }
+
+    pub fn new_with_cancel(
+        config: OpenAiCompatibleConfig,
+        cancel_token: CancellationToken,
+    ) -> Result<Self> {
         let is_reasoning = model_name_is_reasoning(&config.model);
         let effective_timeout = if is_reasoning {
             config.timeout_seconds.max(300)
@@ -463,13 +480,18 @@ impl OpenAiCompatibleProvider {
             config.timeout_seconds
         };
         let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(effective_timeout))
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(effective_timeout))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(config.max_idle_per_host)
+            .tcp_keepalive(Duration::from_secs(60))
             .build()?;
         Ok(Self {
             config,
             client,
             reasoning_detected: AtomicBool::new(is_reasoning),
+            response_format_supported: AtomicBool::new(true),
+            cancel_token,
         })
     }
 
@@ -508,25 +530,38 @@ impl LlmProvider for OpenAiCompatibleProvider {
             body["thinking"] = json!({"type": "disabled"});
         }
 
-        if request.response_format == ResponseFormat::Json {
+        let use_response_format = request.response_format == ResponseFormat::Json
+            && match self.config.json_mode {
+                bookforge_core::JsonMode::PromptOnly => false,
+                bookforge_core::JsonMode::ResponseFormat => true,
+                bookforge_core::JsonMode::Auto => {
+                    self.response_format_supported.load(Ordering::Relaxed)
+                }
+            };
+
+        if use_response_format {
             body["response_format"] = json!({"type": "json_object"});
         }
 
         let max_attempts = self.config.provider_max_attempts.max(1);
         let body_len = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
+        let max_backoff = Duration::from_secs(self.config.max_backoff_seconds);
+        let policy = self.config.retry_after_policy;
         let mut raw = None;
         let mut last_error = None;
-        for attempt in 0..max_attempts {
-            let response = match self
+        let mut tried_response_format_fallback = false;
+        let mut attempt = 0usize;
+        while attempt < max_attempts {
+            let send_future = self
                 .client
                 .post(&endpoint)
                 .bearer_auth(&api_key)
                 .json(&body)
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
+                .send();
+
+            let response = match cancelable(&self.cancel_token, send_future).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(error)) => {
                     let kind = if error.is_timeout() {
                         "timeout"
                     } else if error.is_connect() {
@@ -538,7 +573,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     } else {
                         "other"
                     };
-                    eprintln!(
+                    warn!(
                         "provider: attempt {}/{} [{kind}] body={body_len}bytes: {error}",
                         attempt + 1,
                         max_attempts,
@@ -546,20 +581,35 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     let retryable = is_retryable_http_error(&error);
                     let attempt_limit = attempt_limit_for_http_error(&error, max_attempts);
                     last_error = Some(LlmError::Http(error));
-                    if !retryable || attempt + 1 == attempt_limit {
+                    if !retryable {
                         return Err(last_error.expect("set above"));
                     }
-                    sleep(backoff_delay(attempt)).await;
+                    attempt += 1;
+                    if attempt >= attempt_limit {
+                        return Err(last_error.expect("set above"));
+                    }
+                    apply_retry_delay(
+                        &self.cancel_token,
+                        policy,
+                        attempt - 1,
+                        None,
+                        max_backoff,
+                        last_error.take().expect("set above"),
+                    )
+                    .await?;
                     continue;
+                }
+                Err(_) => {
+                    return Err(LlmError::Provider("interrupted by user".to_string()));
                 }
             };
             let status = response.status();
 
             if status.is_success() {
-                let response_bytes = match response.bytes().await {
-                    Ok(b) => b,
-                    Err(error) => {
-                        eprintln!(
+                let response_bytes = match cancelable(&self.cancel_token, response.bytes()).await {
+                    Ok(Ok(b)) => b,
+                    Ok(Err(error)) => {
+                        warn!(
                             "provider: attempt {}/{} body read failed (status={status:#}): {error}",
                             attempt + 1,
                             max_attempts,
@@ -567,11 +617,26 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         let retryable = is_retryable_http_error(&error);
                         let attempt_limit = attempt_limit_for_http_error(&error, max_attempts);
                         last_error = Some(LlmError::Http(error));
-                        if !retryable || attempt + 1 == attempt_limit {
+                        if !retryable {
                             return Err(last_error.expect("set above"));
                         }
-                        sleep(backoff_delay(attempt)).await;
+                        attempt += 1;
+                        if attempt >= attempt_limit {
+                            return Err(last_error.expect("set above"));
+                        }
+                        apply_retry_delay(
+                            &self.cancel_token,
+                            policy,
+                            attempt - 1,
+                            None,
+                            max_backoff,
+                            last_error.take().expect("set above"),
+                        )
+                        .await?;
                         continue;
+                    }
+                    Err(_) => {
+                        return Err(LlmError::Provider("interrupted by user".to_string()));
                     }
                 };
                 match serde_json::from_slice::<Value>(&response_bytes) {
@@ -585,17 +650,26 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         } else {
                             &response_bytes
                         });
-                        eprintln!(
+                        warn!(
                             "provider: attempt {}/{} json parse failed ({status:#}): {error}\n  body: {preview}",
                             attempt + 1,
                             max_attempts,
                         );
-                        if attempt + 1 == max_attempts {
+                        attempt += 1;
+                        if attempt >= max_attempts {
                             return Err(LlmError::InvalidResponse(format!(
                                 "JSON parse failed after {max_attempts} attempts: {error}"
                             )));
                         }
-                        sleep(backoff_delay(attempt)).await;
+                        apply_retry_delay(
+                            &self.cancel_token,
+                            policy,
+                            attempt - 1,
+                            None,
+                            max_backoff,
+                            LlmError::InvalidResponse(format!("JSON parse failed: {error}")),
+                        )
+                        .await?;
                         continue;
                     }
                 }
@@ -603,17 +677,68 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
             let status_code = status.as_u16();
             let retry_after = parse_retry_after(response.headers());
-            let body = response.text().await.unwrap_or_default();
+            let response_body = match cancelable(&self.cancel_token, response.text()).await {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
+                    last_error = Some(LlmError::Http(e));
+                    attempt += 1;
+                    if attempt >= max_attempts {
+                        return Err(last_error.expect("set above"));
+                    }
+                    apply_retry_delay(
+                        &self.cancel_token,
+                        policy,
+                        attempt - 1,
+                        None,
+                        max_backoff,
+                        last_error.take().expect("set above"),
+                    )
+                    .await?;
+                    continue;
+                }
+                Err(_) => {
+                    return Err(LlmError::Provider("interrupted by user".to_string()));
+                }
+            };
+
+            // Auto-detect unsupported response_format: 400 with response_format
+            // enabled in Auto mode -> retry once without it. Do NOT count
+            // this as a normal attempt.
+            if status_code == 400
+                && self.config.json_mode == bookforge_core::JsonMode::Auto
+                && use_response_format
+                && !tried_response_format_fallback
+            {
+                warn!("provider: response_format unsupported (400), retrying without it");
+                self.response_format_supported
+                    .store(false, Ordering::Relaxed);
+                body.as_object_mut().map(|o| o.remove("response_format"));
+                tried_response_format_fallback = true;
+                continue; // Does not increment attempt
+            }
+
             last_error = Some(LlmError::HttpStatus {
                 status: status_code,
-                body,
+                body: response_body,
             });
 
-            if !is_retryable_status(status_code) || attempt + 1 == max_attempts {
+            if !is_retryable_status(status_code) {
+                return Err(last_error.expect("set above"));
+            }
+            attempt += 1;
+            if attempt >= max_attempts {
                 return Err(last_error.expect("set above"));
             }
 
-            sleep(retry_after.unwrap_or_else(|| backoff_delay(attempt))).await;
+            apply_retry_delay(
+                &self.cancel_token,
+                policy,
+                attempt - 1,
+                retry_after,
+                max_backoff,
+                last_error.take().expect("set above"),
+            )
+            .await?;
         }
         let raw = raw.ok_or_else(|| {
             last_error.unwrap_or_else(|| {
@@ -673,6 +798,41 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 }
 
+async fn cancelable<T>(
+    token: &CancellationToken,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    tokio::select! {
+        value = fut => Ok(value),
+        _ = token.cancelled() => Err(LlmError::Provider(
+            "interrupted by user".to_string()
+        )),
+    }
+}
+
+async fn cancelable_sleep(token: &CancellationToken, duration: Duration) -> Result<()> {
+    tokio::select! {
+        _ = sleep(duration) => Ok(()),
+        _ = token.cancelled() => Err(LlmError::Provider(
+            "interrupted by user".to_string()
+        )),
+    }
+}
+
+async fn apply_retry_delay(
+    token: &CancellationToken,
+    policy: RetryAfterPolicy,
+    attempt: usize,
+    retry_after: Option<Duration>,
+    max_backoff: Duration,
+    error: LlmError,
+) -> Result<()> {
+    match retry_delay(policy, attempt, retry_after, max_backoff) {
+        Some(delay) => cancelable_sleep(token, delay).await,
+        None => Err(error),
+    }
+}
+
 fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }
@@ -700,16 +860,44 @@ fn attempt_limit_for_http_error(error: &reqwest::Error, max_attempts: usize) -> 
     }
 }
 
-fn backoff_delay(attempt: usize) -> Duration {
-    let millis = match attempt {
-        0 => 500,
-        1 => 1000,
-        2 => 3000,
-        3 => 8000,
-        4 => 20_000,
-        _ => 40_000,
-    };
-    Duration::from_millis(millis)
+fn exponential_delay(attempt: usize) -> Duration {
+    let millis: u64 = 500u64.saturating_mul(2u64.saturating_pow(attempt as u32));
+    Duration::from_millis(millis.min(60_000))
+}
+
+fn apply_jitter(base: Duration, attempt: usize) -> Duration {
+    let millis = base.as_millis() as u64;
+    if millis < 2 {
+        return base;
+    }
+    let spread = millis / 5;
+    let offset = (attempt as u64)
+        .wrapping_mul(1103515245)
+        .wrapping_add(12345)
+        % spread.max(1);
+    Duration::from_millis(millis.saturating_sub(spread / 2).saturating_add(offset))
+}
+
+fn retry_delay(
+    policy: RetryAfterPolicy,
+    attempt: usize,
+    retry_after: Option<Duration>,
+    max_backoff: Duration,
+) -> Option<Duration> {
+    match policy {
+        RetryAfterPolicy::None => None,
+
+        RetryAfterPolicy::RespectHeader => {
+            retry_after.or_else(|| Some(exponential_delay(attempt).min(max_backoff)))
+        }
+
+        RetryAfterPolicy::Fixed => Some(Duration::from_millis(750).min(max_backoff)),
+
+        RetryAfterPolicy::JitteredExponential => {
+            let base = exponential_delay(attempt).min(max_backoff);
+            Some(apply_jitter(base, attempt))
+        }
+    }
 }
 
 fn parse_finish_reason(value: &str) -> FinishReason {
@@ -732,4 +920,179 @@ fn model_name_is_reasoning(model: &str) -> bool {
         || lower.starts_with("o1")
         || lower.starts_with("o3")
         || lower.starts_with("o4")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bookforge_core::RetryAfterPolicy;
+    use tokio::time::Duration;
+
+    #[test]
+    fn retry_policy_none_returns_none_delay() {
+        let delay = retry_delay(RetryAfterPolicy::None, 0, None, Duration::from_secs(30));
+        assert!(
+            delay.is_none(),
+            "RetryAfterPolicy::None must return None delay"
+        );
+    }
+
+    #[test]
+    fn retry_policy_fixed_returns_750ms() {
+        let delay = retry_delay(RetryAfterPolicy::Fixed, 0, None, Duration::from_secs(30));
+        assert_eq!(delay, Some(Duration::from_millis(750)));
+    }
+
+    #[test]
+    fn retry_policy_caps_to_max_backoff() {
+        let delay = retry_delay(
+            RetryAfterPolicy::JitteredExponential,
+            20, // large attempt index yields huge exponential delay
+            None,
+            Duration::from_secs(2),
+        );
+        if let Some(d) = delay {
+            assert!(
+                d <= Duration::from_secs(2),
+                "delay {d:?} must be capped at 2s"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_policy_none_apply_retry_delay_returns_error() {
+        let token = CancellationToken::new();
+        let result = apply_retry_delay(
+            &token,
+            RetryAfterPolicy::None,
+            0,
+            None,
+            Duration::from_secs(30),
+            LlmError::Provider("test error".to_string()),
+        )
+        .await;
+        assert!(result.is_err(), "None policy must return error, not sleep");
+    }
+
+    #[tokio::test]
+    async fn cancel_token_aborts_cancelable() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = cancelable(&token, std::future::pending::<()>()).await;
+        assert!(result.is_err(), "cancelled token must abort cancelable");
+    }
+
+    #[tokio::test]
+    async fn cancel_token_aborts_cancelable_sleep() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = cancelable_sleep(&token, Duration::from_secs(3600)).await;
+        assert!(result.is_err(), "cancelled token must abort sleep");
+    }
+
+    /// Verify that json_mode_auto_fallback retries without response_format
+    /// when the server returns 400, and does NOT consume a provider attempt.
+    #[tokio::test]
+    async fn json_mode_auto_fallback_works_with_one_provider_attempt() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // We need to override reading of the API key env var.
+        // Use a well-known env var name; the actual value is unused by
+        // the test server, but the provider MUST be able to read it.
+        unsafe { std::env::set_var("BOOKFORGE_TEST_JSON_FALLBACK_KEY", "test") };
+
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count_clone = request_count.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        // Server: returns 400 on first request (simulating unsupported
+        // response_format), then 200 with valid JSON on second request.
+        let server_handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let cnt = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Read the request so the client doesn't stall
+                let mut buf = vec![0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+
+                if cnt == 0 {
+                    // First attempt: 400 — unsupported response_format
+                    let body = br#"{"error":{"message":"response_format is not supported"}}"#;
+                    let header = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                } else {
+                    // Second attempt: 200 OK with valid translation
+                    let body = br#"{"choices":[{"message":{"content":"{\"translation\":\"Ciao\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                }
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let config = OpenAiCompatibleConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            api_key_env: "BOOKFORGE_TEST_JSON_FALLBACK_KEY".to_string(),
+            model: "test-model".to_string(),
+            timeout_seconds: 10,
+            provider_max_attempts: 1,
+            thinking_disabled: true,
+            retry_after_policy: RetryAfterPolicy::None,
+            max_backoff_seconds: 30,
+            max_idle_per_host: 32,
+            json_mode: bookforge_core::JsonMode::Auto,
+        };
+
+        let provider = OpenAiCompatibleProvider::new(config).unwrap();
+        let request = CompletionRequest {
+            system: "translate".to_string(),
+            user: "hello".to_string(),
+            response_format: ResponseFormat::Json,
+            temperature: 0.2,
+            max_output_tokens: Some(256),
+            metadata: RequestMetadata::default(),
+        };
+
+        let result = provider.complete(request).await;
+
+        // Server should have received 2 requests (first 400, second 200)
+        let received = request_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            received, 2,
+            "expected 2 requests for 400 fallback + successful retry, got {received}"
+        );
+
+        // The single attempt should succeed after fallback
+        assert!(
+            result.is_ok(),
+            "json_mode_auto_fallback should succeed: {:?}",
+            result.err()
+        );
+
+        // response_format_supported should be set to false after 400
+        assert!(
+            !provider
+                .response_format_supported
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "response_format_supported should be false after 400 fallback"
+        );
+
+        server_handle.abort();
+    }
 }

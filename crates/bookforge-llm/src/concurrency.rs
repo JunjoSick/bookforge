@@ -2,7 +2,10 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
+
+use bookforge_core::{ProgressEvent, ProgressSink};
 
 pub struct AdaptiveLimiter {
     state: Mutex<usize>,
@@ -10,6 +13,9 @@ pub struct AdaptiveLimiter {
     max: usize,
     semaphore: Arc<Semaphore>,
     permits_to_burn: Arc<AtomicUsize>,
+    last_grow: Mutex<Option<Instant>>,
+    grow_interval: Duration,
+    progress: Option<Arc<dyn ProgressSink>>,
 }
 
 pub struct AdaptivePermit {
@@ -37,6 +43,15 @@ impl Drop for AdaptivePermit {
 
 impl AdaptiveLimiter {
     pub fn new(min: usize, max: usize) -> Self {
+        Self::new_with_progress(min, max, Duration::from_secs(2), None)
+    }
+
+    pub fn new_with_progress(
+        min: usize,
+        max: usize,
+        grow_interval: Duration,
+        progress: Option<Arc<dyn ProgressSink>>,
+    ) -> Self {
         let min = min.max(1);
         let max = max.max(min);
         Self {
@@ -45,6 +60,9 @@ impl AdaptiveLimiter {
             max,
             semaphore: Arc::new(Semaphore::new(min)),
             permits_to_burn: Arc::new(AtomicUsize::new(0)),
+            last_grow: Mutex::new(None),
+            grow_interval,
+            progress,
         }
     }
 
@@ -61,6 +79,15 @@ impl AdaptiveLimiter {
     }
 
     pub fn on_success(&self) {
+        let now = Instant::now();
+        let mut last = self.last_grow.lock().unwrap();
+        if let Some(prev) = *last
+            && now.duration_since(prev) < self.grow_interval
+        {
+            return;
+        }
+        *last = Some(now);
+        drop(last);
         self.update(|c| c + 1);
     }
 
@@ -72,13 +99,22 @@ impl AdaptiveLimiter {
         self.update(|c| c * 3 / 4);
     }
 
+    pub fn on_p95_high(&self) {
+        self.update(|c| (c as f64 * 0.85) as usize);
+    }
+
     fn update<F: FnOnce(usize) -> usize>(&self, f: F) {
         let mut state = self.state.lock().unwrap();
+        let previous = *state;
         let new = f(*state).clamp(self.min, self.max);
-        if new > *state {
+        if new == previous {
+            return;
+        }
+
+        if new > previous {
             // Cancel pending burns first so we don't add and immediately
             // burn the same permits.
-            let mut remaining = new - *state;
+            let mut remaining = new - previous;
             *state = new;
             while remaining > 0 {
                 match self.permits_to_burn.fetch_update(
@@ -103,14 +139,19 @@ impl AdaptiveLimiter {
             if remaining > 0 {
                 self.semaphore.add_permits(remaining);
             }
-        } else if new < *state {
-            // Shrink lazily: increment the burn counter. Workers check it
-            // on Drop and forget their permit instead of releasing it,
-            // so the pool drains without enqueueing a large acquire that
-            // would block ahead of normal callers in the FIFO queue.
-            let delta = *state - new;
+        } else {
+            let delta = previous - new;
             *state = new;
             self.permits_to_burn.fetch_add(delta, Ordering::AcqRel);
+        }
+
+        if let Some(ref progress) = self.progress {
+            progress.emit(ProgressEvent::ConcurrencyChanged {
+                previous,
+                current: new,
+                reason: String::new(),
+                timestamp_ms: bookforge_core::progress::now_ms(),
+            });
         }
     }
 }
@@ -150,7 +191,7 @@ mod tests {
 
     #[tokio::test]
     async fn burn_counter_drains_to_target_after_shrink() {
-        let limiter = AdaptiveLimiter::new(1, 8);
+        let limiter = AdaptiveLimiter::new_with_progress(1, 8, Duration::ZERO, None);
         // Grow to 4.
         limiter.on_success(); // 1 -> 2
         limiter.on_success(); // 2 -> 3
@@ -192,7 +233,7 @@ mod tests {
 
     #[tokio::test]
     async fn grow_cancels_pending_burns_first() {
-        let limiter = AdaptiveLimiter::new(1, 8);
+        let limiter = AdaptiveLimiter::new_with_progress(1, 8, Duration::ZERO, None);
         // 1 -> 4
         limiter.on_success();
         limiter.on_success();
