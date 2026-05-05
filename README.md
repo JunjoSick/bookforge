@@ -82,7 +82,7 @@ cargo run -p bookforge-cli -- translate book.epub \
   --source English \
   --target Italian \
   --provider deepseek \
-  --model deepseek-chat \
+  --model deepseek-v4-flash \
   --concurrency 4 \
   --out book.it.epub
 ```

@@ -52,13 +52,25 @@ impl AdaptiveLimiter {
         grow_interval: Duration,
         progress: Option<Arc<dyn ProgressSink>>,
     ) -> Self {
+        Self::new_with_bounds(min, min, max, grow_interval, progress)
+    }
+
+    pub fn new_with_bounds(
+        initial: usize,
+        min: usize,
+        max: usize,
+        grow_interval: Duration,
+        progress: Option<Arc<dyn ProgressSink>>,
+    ) -> Self {
+        let initial = initial.max(1);
         let min = min.max(1);
-        let max = max.max(min);
+        let max = max.max(min).max(initial);
+        let initial = initial.clamp(min, max);
         Self {
-            state: Mutex::new(min),
+            state: Mutex::new(initial),
             min,
             max,
-            semaphore: Arc::new(Semaphore::new(min)),
+            semaphore: Arc::new(Semaphore::new(initial)),
             permits_to_burn: Arc::new(AtomicUsize::new(0)),
             last_grow: Mutex::new(None),
             grow_interval,
@@ -88,22 +100,28 @@ impl AdaptiveLimiter {
         }
         *last = Some(now);
         drop(last);
-        self.update(|c| c + 1);
+        self.update("success", |c| c + 1);
     }
 
     pub fn on_rate_limit(&self) {
-        self.update(|c| c / 2);
+        self.update("rate_limited", |c| c / 2);
     }
 
     pub fn on_timeout(&self) {
-        self.update(|c| c * 3 / 4);
+        self.update("timeout", |c| c * 3 / 4);
     }
 
     pub fn on_p95_high(&self) {
-        self.update(|c| (c as f64 * 0.85) as usize);
+        self.update("high_latency", |c| (c as f64 * 0.85) as usize);
     }
 
-    fn update<F: FnOnce(usize) -> usize>(&self, f: F) {
+    pub fn set_target(&self, target: usize, reason: impl Into<String>) {
+        let target = target.clamp(self.min, self.max);
+        let reason = reason.into();
+        self.update(&reason, |_| target);
+    }
+
+    fn update<F: FnOnce(usize) -> usize>(&self, reason: &str, f: F) {
         let mut state = self.state.lock().unwrap();
         let previous = *state;
         let new = f(*state).clamp(self.min, self.max);
@@ -149,7 +167,7 @@ impl AdaptiveLimiter {
             progress.emit(ProgressEvent::ConcurrencyChanged {
                 previous,
                 current: new,
-                reason: String::new(),
+                reason: reason.to_string(),
                 timestamp_ms: bookforge_core::progress::now_ms(),
             });
         }

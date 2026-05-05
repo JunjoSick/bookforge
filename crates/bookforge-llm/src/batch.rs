@@ -6,26 +6,19 @@ use bookforge_core::{
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::{sync::mpsc, task::JoinSet};
 
 use crate::{
-    AdaptiveLimiter, CompletionRequest, FinishReason, LlmError, LlmProvider, PromptLibrary,
-    RequestMetadata, ResponseFormat, SegmentTranslation, Substitutions, TelemetryLog,
-    TranslationRunConfig,
+    CompletionRequest, FinishReason, LlmError, LlmProvider, PromptLibrary, ProviderRateController,
+    RequestMetadata, RequestStatus, ResponseFormat, SegmentTranslation, Substitutions,
+    TelemetryLog, TranslationRunConfig,
 };
-
-#[derive(Debug, Clone, Copy)]
-enum LimiterFeedback {
-    Success,
-    RateLimited,
-    Timeout,
-    None,
-}
 
 struct BatchWorkerOutput {
     batch: TranslationBatch,
     result: Result<BatchTranslationResult, LlmError>,
-    limiter_feedback: LimiterFeedback,
+    request_status: RequestStatus,
     latency_ms: u64,
     max_output_tokens: u32,
 }
@@ -102,23 +95,47 @@ pub struct BatchItemFailure {
 
 #[derive(Clone)]
 pub struct BatchSizer {
-    target_tokens: usize,
-    max_items: usize,
-    #[allow(dead_code)]
-    original_target_tokens: usize,
-    original_max_items: usize,
+    modes: HashMap<BatchMode, BatchModeSizing>,
+    default_target_tokens: usize,
+    default_max_items: usize,
     progress: Option<Arc<dyn bookforge_core::ProgressSink>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BatchModeSizing {
+    target_tokens: usize,
+    max_items: usize,
+    #[allow(dead_code)]
+    initial_target_tokens: usize,
+    #[allow(dead_code)]
+    initial_max_items: usize,
+    min_tokens: usize,
+    max_tokens: usize,
+    min_items: usize,
+    max_items_cap: usize,
+    recent: VecDeque<BatchSizingObservation>,
+    last_increase: Option<Instant>,
+    last_decrease: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BatchSizingObservation {
+    Success { latency_ms: u64 },
+    Truncation,
+    InvalidJson,
+    HighLatency { latency_ms: u64 },
+    OtherFailure,
+}
+
+const BATCH_SIZER_WINDOW: usize = 20;
+const BATCH_SIZER_STABLE_SUCCESS_THRESHOLD: f64 = 0.98;
+const BATCH_SIZER_INCREASE_INTERVAL: Duration = Duration::from_secs(5);
+const BATCH_SIZER_DECREASE_INTERVAL: Duration = Duration::from_secs(1);
+const BATCH_SIZER_TARGET_P95_LATENCY_MS: u64 = 30_000;
+
 impl BatchSizer {
     pub fn new(target_tokens: usize, max_items: usize) -> Self {
-        Self {
-            target_tokens,
-            max_items,
-            original_target_tokens: target_tokens,
-            original_max_items: max_items,
-            progress: None,
-        }
+        Self::new_with_progress(target_tokens, max_items, None)
     }
 
     pub fn with_progress(
@@ -126,31 +143,77 @@ impl BatchSizer {
         max_items: usize,
         progress: Arc<dyn bookforge_core::ProgressSink>,
     ) -> Self {
+        Self::new_with_progress(target_tokens, max_items, Some(progress))
+    }
+
+    pub fn new_with_progress(
+        target_tokens: usize,
+        max_items: usize,
+        progress: Option<Arc<dyn bookforge_core::ProgressSink>>,
+    ) -> Self {
+        let mut modes = HashMap::new();
+        for mode in [
+            BatchMode::Plain,
+            BatchMode::TurboTextOnly,
+            BatchMode::MarkerSafe,
+            BatchMode::RunPreserving,
+        ] {
+            modes.insert(
+                mode,
+                BatchModeSizing::for_mode(mode, target_tokens, max_items),
+            );
+        }
         Self {
-            target_tokens,
-            max_items,
-            original_target_tokens: target_tokens,
-            original_max_items: max_items,
-            progress: Some(progress),
+            modes,
+            default_target_tokens: target_tokens,
+            default_max_items: max_items,
+            progress,
         }
     }
 
     pub fn target_tokens(&self) -> usize {
-        self.target_tokens
+        self.target_tokens_for_mode(BatchMode::Plain)
     }
 
     pub fn max_items(&self) -> usize {
-        self.max_items
+        self.max_items_for_mode(BatchMode::Plain)
     }
 
-    fn emit_change(&self, reason: &str, prev_target: usize, prev_max: usize) {
+    pub fn target_tokens_for_mode(&self, mode: BatchMode) -> usize {
+        self.modes
+            .get(&mode)
+            .map(|state| state.target_tokens)
+            .unwrap_or_else(|| {
+                self.default_target_tokens
+                    .clamp(mode.min_tokens(), mode.max_tokens())
+            })
+    }
+
+    pub fn max_items_for_mode(&self, mode: BatchMode) -> usize {
+        self.modes
+            .get(&mode)
+            .map(|state| state.max_items)
+            .unwrap_or_else(|| {
+                self.default_max_items
+                    .clamp(mode.min_items(), mode.max_items_cap())
+            })
+    }
+
+    fn emit_change(
+        &self,
+        reason: &str,
+        prev_target: usize,
+        new_target: usize,
+        prev_max: usize,
+        new_max: usize,
+    ) {
         if let Some(ref p) = self.progress {
             p.emit(bookforge_core::ProgressEvent::BatchSizingChanged {
                 batch_id: None,
                 previous_target: prev_target,
-                new_target: self.target_tokens,
+                new_target,
                 previous_max_items: prev_max,
-                new_max_items: self.max_items,
+                new_max_items: new_max,
                 reason: reason.to_string(),
                 timestamp_ms: bookforge_core::progress::now_ms(),
             });
@@ -158,44 +221,268 @@ impl BatchSizer {
     }
 
     pub fn on_truncation(&mut self) {
-        let prev_target = self.target_tokens;
-        let prev_max = self.max_items;
-        self.target_tokens = ((self.target_tokens as f64) * 0.65) as usize;
-        self.max_items = ((self.max_items as f64) * 0.75) as usize;
-        self.clamp();
-        self.emit_change("truncation", prev_target, prev_max);
+        self.on_truncation_for_mode(BatchMode::Plain);
+    }
+
+    pub fn on_truncation_for_mode(&mut self, mode: BatchMode) {
+        if let Some((prev_target, new_target, prev_max, new_max)) =
+            self.decrease_mode(mode, BatchSizingObservation::Truncation, 0.65, 0.75)
+        {
+            self.emit_change("truncation", prev_target, new_target, prev_max, new_max);
+        }
     }
 
     pub fn on_invalid_json(&mut self) {
-        let prev_target = self.target_tokens;
-        let prev_max = self.max_items;
-        self.target_tokens = ((self.target_tokens as f64) * 0.75) as usize;
-        self.max_items = ((self.max_items as f64) * 0.85) as usize;
-        self.clamp();
-        self.emit_change("invalid_json", prev_target, prev_max);
+        self.on_invalid_json_for_mode(BatchMode::Plain);
+    }
+
+    pub fn on_invalid_json_for_mode(&mut self, mode: BatchMode) {
+        if let Some((prev_target, new_target, prev_max, new_max)) =
+            self.decrease_mode(mode, BatchSizingObservation::InvalidJson, 0.75, 0.85)
+        {
+            self.emit_change("invalid_json", prev_target, new_target, prev_max, new_max);
+        }
     }
 
     pub fn on_p95_high(&mut self) {
-        let prev_target = self.target_tokens;
-        let prev_max = self.max_items;
-        self.target_tokens = ((self.target_tokens as f64) * 0.85) as usize;
-        self.clamp();
-        self.emit_change("p95_high", prev_target, prev_max);
+        self.on_high_latency_for_mode(BatchMode::Plain, BATCH_SIZER_TARGET_P95_LATENCY_MS + 1);
+    }
+
+    pub fn on_high_latency_for_mode(&mut self, mode: BatchMode, latency_ms: u64) {
+        if let Some((prev_target, new_target, prev_max, new_max)) = self.decrease_mode(
+            mode,
+            BatchSizingObservation::HighLatency { latency_ms },
+            0.85,
+            1.0,
+        ) {
+            self.emit_change("high_latency", prev_target, new_target, prev_max, new_max);
+        }
     }
 
     pub fn on_success(&mut self) {
-        let prev_target = self.target_tokens;
-        let prev_max = self.max_items;
-        self.target_tokens = ((self.target_tokens as f64) * 1.10) as usize;
-        self.clamp();
-        self.emit_change("success", prev_target, prev_max);
+        self.on_success_for_mode(BatchMode::Plain, 0);
+    }
+
+    pub fn on_success_for_mode(&mut self, mode: BatchMode, latency_ms: u64) {
+        let changed = {
+            let state = self
+                .modes
+                .get_mut(&mode)
+                .expect("all batch modes initialized");
+            state.push_observation(BatchSizingObservation::Success { latency_ms });
+
+            if state
+                .p95_latency_ms()
+                .is_some_and(|p95| p95 > BATCH_SIZER_TARGET_P95_LATENCY_MS)
+            {
+                let prev_target = state.target_tokens;
+                let prev_max = state.max_items;
+                if state.apply_decrease(0.85, 1.0) {
+                    Some((
+                        "high_latency",
+                        prev_target,
+                        state.target_tokens,
+                        prev_max,
+                        state.max_items,
+                    ))
+                } else {
+                    None
+                }
+            } else if state.should_grow() {
+                let prev_target = state.target_tokens;
+                let prev_max = state.max_items;
+                state.target_tokens = ((state.target_tokens as f64) * 1.10).round() as usize;
+                state.max_items = state.max_items.saturating_add(mode.success_item_step());
+                state.clamp();
+                state.last_increase = Some(Instant::now());
+                Some((
+                    "stable_success",
+                    prev_target,
+                    state.target_tokens,
+                    prev_max,
+                    state.max_items,
+                ))
+            } else {
+                None
+            }
+        };
+
+        if let Some((reason, prev_target, new_target, prev_max, new_max)) = changed {
+            self.emit_change(reason, prev_target, new_target, prev_max, new_max);
+        }
+    }
+
+    fn decrease_mode(
+        &mut self,
+        mode: BatchMode,
+        observation: BatchSizingObservation,
+        target_factor: f64,
+        item_factor: f64,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let state = self
+            .modes
+            .get_mut(&mode)
+            .expect("all batch modes initialized");
+        state.push_observation(observation);
+        let prev_target = state.target_tokens;
+        let prev_max = state.max_items;
+        state.apply_decrease(target_factor, item_factor).then_some((
+            prev_target,
+            state.target_tokens,
+            prev_max,
+            state.max_items,
+        ))
+    }
+}
+
+impl BatchModeSizing {
+    fn for_mode(mode: BatchMode, initial_target_tokens: usize, initial_max_items: usize) -> Self {
+        let mut state = Self {
+            target_tokens: initial_target_tokens,
+            max_items: initial_max_items,
+            initial_target_tokens,
+            initial_max_items,
+            min_tokens: mode.min_tokens(),
+            max_tokens: mode.max_tokens(),
+            min_items: mode.min_items(),
+            max_items_cap: mode.max_items_cap(),
+            recent: VecDeque::new(),
+            last_increase: None,
+            last_decrease: None,
+        };
+        state.clamp();
+        state
     }
 
     fn clamp(&mut self) {
-        // Per-mode clamp ranges: Plain/Turbo 4k..32k, MarkerSafe 2k..16k, RunPreserving 1k..8k
-        // Use a conservative general clamp; per-mode limits would need mode tracking.
-        self.target_tokens = self.target_tokens.clamp(1_000, 32_000);
-        self.max_items = self.max_items.clamp(1, self.original_max_items.max(128));
+        self.target_tokens = self.target_tokens.clamp(self.min_tokens, self.max_tokens);
+        self.max_items = self.max_items.clamp(self.min_items, self.max_items_cap);
+    }
+
+    fn push_observation(&mut self, observation: BatchSizingObservation) {
+        self.recent.push_back(observation);
+        while self.recent.len() > BATCH_SIZER_WINDOW {
+            self.recent.pop_front();
+        }
+    }
+
+    fn success_rate(&self) -> f64 {
+        if self.recent.is_empty() {
+            return 0.0;
+        }
+        let success_count = self
+            .recent
+            .iter()
+            .filter(|obs| matches!(obs, BatchSizingObservation::Success { .. }))
+            .count();
+        success_count as f64 / self.recent.len() as f64
+    }
+
+    fn has_recent_truncation_or_invalid_json(&self) -> bool {
+        self.recent.iter().any(|obs| {
+            matches!(
+                obs,
+                BatchSizingObservation::Truncation | BatchSizingObservation::InvalidJson
+            )
+        })
+    }
+
+    fn p95_latency_ms(&self) -> Option<u64> {
+        let mut latencies = self
+            .recent
+            .iter()
+            .filter_map(|obs| match obs {
+                BatchSizingObservation::Success { latency_ms }
+                | BatchSizingObservation::HighLatency { latency_ms } => Some(*latency_ms),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if latencies.is_empty() {
+            return None;
+        }
+        latencies.sort_unstable();
+        let idx = ((latencies.len() as f64) * 0.95).ceil() as usize;
+        Some(latencies[idx.saturating_sub(1).min(latencies.len() - 1)])
+    }
+
+    fn should_grow(&self) -> bool {
+        if self.recent.len() < BATCH_SIZER_WINDOW {
+            return false;
+        }
+        if self.success_rate() < BATCH_SIZER_STABLE_SUCCESS_THRESHOLD {
+            return false;
+        }
+        if self.has_recent_truncation_or_invalid_json() {
+            return false;
+        }
+        if self
+            .p95_latency_ms()
+            .is_some_and(|p95| p95 > BATCH_SIZER_TARGET_P95_LATENCY_MS)
+        {
+            return false;
+        }
+        self.last_increase
+            .map(|last| last.elapsed() >= BATCH_SIZER_INCREASE_INTERVAL)
+            .unwrap_or(true)
+    }
+
+    fn apply_decrease(&mut self, target_factor: f64, item_factor: f64) -> bool {
+        if self
+            .last_decrease
+            .map(|last| last.elapsed() < BATCH_SIZER_DECREASE_INTERVAL)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let prev_target = self.target_tokens;
+        let prev_items = self.max_items;
+        self.target_tokens = ((self.target_tokens as f64) * target_factor).floor() as usize;
+        self.max_items = ((self.max_items as f64) * item_factor).floor() as usize;
+        self.clamp();
+        self.last_decrease = Some(Instant::now());
+        self.target_tokens != prev_target || self.max_items != prev_items
+    }
+}
+
+impl BatchMode {
+    fn min_tokens(self) -> usize {
+        match self {
+            Self::Plain | Self::TurboTextOnly => 4_000,
+            Self::MarkerSafe => 2_000,
+            Self::RunPreserving => 1_000,
+        }
+    }
+
+    fn max_tokens(self) -> usize {
+        match self {
+            Self::Plain | Self::TurboTextOnly => 32_000,
+            Self::MarkerSafe => 16_000,
+            Self::RunPreserving => 8_000,
+        }
+    }
+
+    fn min_items(self) -> usize {
+        match self {
+            Self::Plain | Self::TurboTextOnly => 16,
+            Self::MarkerSafe => 8,
+            Self::RunPreserving => 4,
+        }
+    }
+
+    fn max_items_cap(self) -> usize {
+        match self {
+            Self::Plain | Self::TurboTextOnly => 256,
+            Self::MarkerSafe => 128,
+            Self::RunPreserving => 64,
+        }
+    }
+
+    fn success_item_step(self) -> usize {
+        match self {
+            Self::Plain | Self::TurboTextOnly => 16,
+            Self::MarkerSafe => 8,
+            Self::RunPreserving => 4,
+        }
     }
 }
 
@@ -625,6 +912,71 @@ pub fn split_batch(batch: &TranslationBatch) -> Vec<TranslationBatch> {
     batches
 }
 
+fn normalize_batch_for_current_sizer(
+    batch: TranslationBatch,
+    sizer: Option<&BatchSizer>,
+) -> Vec<TranslationBatch> {
+    let Some(sizer) = sizer else {
+        return vec![batch];
+    };
+    let target_tokens = sizer.target_tokens_for_mode(batch.mode);
+    let max_items = sizer.max_items_for_mode(batch.mode);
+    if batch.token_estimate <= target_tokens && batch.items.len() <= max_items {
+        return vec![batch];
+    }
+    repack_batch(batch, target_tokens, max_items)
+}
+
+fn repack_batch(
+    batch: TranslationBatch,
+    target_tokens: usize,
+    max_items: usize,
+) -> Vec<TranslationBatch> {
+    let target_tokens = target_tokens.max(1);
+    let max_items = max_items.max(1);
+    let mut out = Vec::new();
+    let mut current_items = Vec::new();
+    let mut current_tokens = 0usize;
+    let mut part = 0usize;
+    let base_id = batch.id;
+    let base_ordinal = batch.ordinal;
+    let mode = batch.mode;
+    let kind = batch.kind;
+
+    for item in batch.items {
+        let item_tokens = token_estimate(&item.source_text).max(1);
+        let would_exceed_items = current_items.len() >= max_items;
+        let would_exceed_tokens =
+            !current_items.is_empty() && current_tokens + item_tokens > target_tokens;
+        if would_exceed_items || would_exceed_tokens {
+            out.push(TranslationBatch {
+                id: format!("{base_id}_adaptive_{part}"),
+                ordinal: base_ordinal * 1000 + part,
+                mode,
+                kind,
+                items: std::mem::take(&mut current_items),
+                token_estimate: current_tokens,
+            });
+            current_tokens = 0;
+            part += 1;
+        }
+        current_tokens += item_tokens;
+        current_items.push(item);
+    }
+
+    if !current_items.is_empty() {
+        out.push(TranslationBatch {
+            id: format!("{base_id}_adaptive_{part}"),
+            ordinal: base_ordinal * 1000 + part,
+            mode,
+            kind,
+            items: current_items,
+            token_estimate: current_tokens,
+        });
+    }
+    out
+}
+
 pub fn collect_repair_items(result: &BatchTranslationResult) -> Vec<TranslationBatchItem> {
     result
         .failures
@@ -651,7 +1003,7 @@ pub async fn translate_batches_with_callback<P, F>(
     segments: &[Segment],
     config: &TranslationRunConfig,
     telemetry: Arc<TelemetryLog>,
-    limiter: Option<Arc<AdaptiveLimiter>>,
+    rate_controller: Option<Arc<ProviderRateController>>,
     mut batch_sizer: Option<&mut BatchSizer>,
     progress: Arc<dyn bookforge_core::ProgressSink>,
     finalized_tx: Option<mpsc::Sender<SegmentTranslation>>,
@@ -692,6 +1044,12 @@ where
                 let Some(batch) = pending_queue.pop_front() else {
                     break;
                 };
+                let mut normalized =
+                    normalize_batch_for_current_sizer(batch, batch_sizer.as_deref());
+                let batch = normalized.remove(0);
+                for extra in normalized.into_iter().rev() {
+                    pending_queue.push_front(extra);
+                }
                 progress.emit(bookforge_core::ProgressEvent::BatchQueued {
                     batch_id: batch.id.clone(),
                     item_count: batch.items.len(),
@@ -701,12 +1059,12 @@ where
                 let provider = provider.clone();
                 let library = library.clone();
                 let config = config.clone();
-                let limiter = limiter.clone();
+                let rate_controller = rate_controller.clone();
                 let progress = progress.clone();
 
                 tasks.spawn(async move {
-                    let permit = match limiter.as_ref() {
-                        Some(limiter) => match limiter.acquire().await {
+                    let permit = match rate_controller.as_ref() {
+                        Some(controller) => match controller.acquire().await {
                             Ok(permit) => Some(permit),
                             Err(_) => {
                                 return BatchWorkerOutput {
@@ -714,7 +1072,7 @@ where
                                     result: Err(LlmError::Provider(
                                         "adaptive concurrency limiter closed".to_string(),
                                     )),
-                                    limiter_feedback: LimiterFeedback::None,
+                                    request_status: RequestStatus::OtherError,
                                     latency_ms: 0,
                                     max_output_tokens: 0,
                                 };
@@ -757,25 +1115,13 @@ where
                     .await;
                     let latency_ms = started.elapsed().as_millis() as u64;
 
-                    let limiter_feedback = match &result {
-                        Ok(_) => LimiterFeedback::Success,
-                        Err(LlmError::HttpStatus { status: 429, .. }) => {
-                            LimiterFeedback::RateLimited
-                        }
-                        Err(LlmError::HttpStatus { status, .. }) if *status >= 500 => {
-                            LimiterFeedback::Timeout
-                        }
-                        Err(LlmError::Http(e)) if e.is_timeout() || e.is_connect() => {
-                            LimiterFeedback::Timeout
-                        }
-                        _ => LimiterFeedback::None,
-                    };
+                    let request_status = request_status_for_controller(&result);
 
                     drop(permit);
                     BatchWorkerOutput {
                         batch,
                         result,
-                        limiter_feedback,
+                        request_status,
                         latency_ms,
                         max_output_tokens,
                     }
@@ -788,7 +1134,7 @@ where
             let BatchWorkerOutput {
                 batch,
                 result,
-                limiter_feedback,
+                request_status,
                 latency_ms,
                 max_output_tokens,
             } = joined
@@ -836,19 +1182,14 @@ where
                 error_kind: None,
             });
 
-            if let Some(ref limiter) = limiter {
-                match limiter_feedback {
-                    LimiterFeedback::Success => limiter.on_success(),
-                    LimiterFeedback::RateLimited => limiter.on_rate_limit(),
-                    LimiterFeedback::Timeout => limiter.on_timeout(),
-                    LimiterFeedback::None => {}
-                }
+            if let Some(ref controller) = rate_controller {
+                controller.observe(request_status, latency_ms);
             }
 
             match result {
                 Ok(batch_result) => {
                     if let Some(ref mut sizer) = batch_sizer {
-                        sizer.on_success();
+                        sizer.on_success_for_mode(batch.mode, latency_ms);
                     }
                     all_results.push(batch_result);
                 }
@@ -905,7 +1246,11 @@ where
                 }
                 Err(LlmError::InvalidResponse(_)) if batch.items.len() > 1 => {
                     if let Some(ref mut sizer) = batch_sizer {
-                        sizer.on_invalid_json();
+                        if request_status == RequestStatus::Truncated {
+                            sizer.on_truncation_for_mode(batch.mode);
+                        } else {
+                            sizer.on_invalid_json_for_mode(batch.mode);
+                        }
                     }
                     let split = split_batch(&batch);
                     if split.len() == 2 {
@@ -1543,6 +1888,21 @@ fn request_status_from_error(error: &LlmError) -> &'static str {
     }
 }
 
+fn request_status_for_controller<T>(result: &Result<T, LlmError>) -> RequestStatus {
+    match result {
+        Ok(_) => RequestStatus::Ok,
+        Err(LlmError::HttpStatus { status: 429, .. }) => RequestStatus::RateLimited,
+        Err(LlmError::HttpStatus { status, .. }) if *status >= 500 => RequestStatus::ServerError,
+        Err(LlmError::Http(error)) if error.is_timeout() => RequestStatus::Timeout,
+        Err(LlmError::Http(error)) if error.is_connect() => RequestStatus::ConnectError,
+        Err(LlmError::InvalidResponse(message)) if message.contains("truncated") => {
+            RequestStatus::Truncated
+        }
+        Err(LlmError::InvalidResponse(_)) | Err(LlmError::Json(_)) => RequestStatus::InvalidJson,
+        Err(_) => RequestStatus::OtherError,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1602,6 +1962,21 @@ mod tests {
         }
     }
 
+    fn batch_item(id: &str, source_text: &str) -> TranslationBatchItem {
+        TranslationBatchItem {
+            item_id: id.to_string(),
+            segment_id: SegmentId(format!("seg_{id}")),
+            block_id: bookforge_core::ir::BlockId(format!("block_{id}")),
+            ordinal: 0,
+            kind: "paragraph".to_string(),
+            source_text: source_text.to_string(),
+            text_runs: Vec::new(),
+            protected_spans: Vec::new(),
+            required_markers: Vec::new(),
+            checksum: format!("checksum_{id}"),
+        }
+    }
+
     #[test]
     fn plain_blocks_batch_together() {
         let seg1 = make_segment("seg1", vec![plain_block("Hello world")], vec![]);
@@ -1610,6 +1985,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1620,6 +1996,197 @@ mod tests {
     }
 
     #[test]
+    fn batch_sizer_reduces_after_truncation() {
+        let mut sizer = BatchSizer::new(16_000, 128);
+        sizer.on_truncation_for_mode(BatchMode::Plain);
+        assert_eq!(sizer.target_tokens(), 10_400);
+        assert_eq!(sizer.max_items(), 96);
+    }
+
+    #[test]
+    fn batch_sizer_reduces_after_invalid_json() {
+        let mut sizer = BatchSizer::new(16_000, 128);
+        sizer.on_invalid_json_for_mode(BatchMode::Plain);
+        assert_eq!(sizer.target_tokens(), 12_000);
+        assert_eq!(sizer.max_items(), 108);
+    }
+
+    #[test]
+    fn batch_sizer_reduces_after_high_latency() {
+        let mut sizer = BatchSizer::new(16_000, 128);
+        sizer.on_high_latency_for_mode(BatchMode::Plain, 40_000);
+        assert_eq!(sizer.target_tokens(), 13_600);
+        assert_eq!(sizer.max_items(), 128);
+    }
+
+    #[test]
+    fn batch_sizer_increases_after_stable_success() {
+        let mut sizer = BatchSizer::new(16_000, 128);
+        for _ in 0..20 {
+            sizer.on_success_for_mode(BatchMode::Plain, 100);
+        }
+        assert_eq!(sizer.target_tokens(), 17_600);
+        assert_eq!(sizer.max_items(), 144);
+    }
+
+    #[test]
+    fn batch_sizer_does_not_grow_after_single_success() {
+        let mut sizer = BatchSizer::new(16_000, 128);
+        sizer.on_success_for_mode(BatchMode::Plain, 100);
+        assert_eq!(sizer.target_tokens(), 16_000);
+        assert_eq!(sizer.max_items(), 128);
+    }
+
+    #[test]
+    fn batch_sizer_does_not_grow_when_recent_invalid_json_exists() {
+        let mut sizer = BatchSizer::new(16_000, 128);
+        sizer.on_invalid_json_for_mode(BatchMode::Plain);
+        let after_failure = sizer.target_tokens();
+        for _ in 0..19 {
+            sizer.on_success_for_mode(BatchMode::Plain, 100);
+        }
+        assert_eq!(sizer.target_tokens(), after_failure);
+    }
+
+    #[test]
+    fn batch_sizer_does_not_grow_when_recent_truncation_exists() {
+        let mut sizer = BatchSizer::new(16_000, 128);
+        sizer.on_truncation_for_mode(BatchMode::Plain);
+        let after_failure = sizer.target_tokens();
+        for _ in 0..19 {
+            sizer.on_success_for_mode(BatchMode::Plain, 100);
+        }
+        assert_eq!(sizer.target_tokens(), after_failure);
+    }
+
+    #[test]
+    fn batch_sizer_does_not_grow_when_p95_latency_is_high() {
+        let mut sizer = BatchSizer::new(16_000, 128);
+        for _ in 0..18 {
+            sizer.on_success_for_mode(BatchMode::Plain, 100);
+        }
+        sizer.on_success_for_mode(BatchMode::Plain, 40_000);
+        assert!(sizer.target_tokens() < 16_000);
+    }
+
+    #[test]
+    fn one_slow_outlier_does_not_immediately_shrink_if_window_p95_healthy() {
+        let mut sizer = BatchSizer::new(16_000, 128);
+        for _ in 0..19 {
+            sizer.on_success_for_mode(BatchMode::Plain, 100);
+        }
+        sizer.on_success_for_mode(BatchMode::Plain, 40_000);
+        assert_eq!(sizer.target_tokens(), 17_600);
+    }
+
+    #[test]
+    fn batch_sizer_keeps_independent_plain_and_run_preserving_state() {
+        let mut sizer = BatchSizer::new(16_000, 128);
+        let plain_before = sizer.target_tokens_for_mode(BatchMode::Plain);
+        let run_before = sizer.target_tokens_for_mode(BatchMode::RunPreserving);
+
+        sizer.on_invalid_json_for_mode(BatchMode::RunPreserving);
+
+        assert_eq!(sizer.target_tokens_for_mode(BatchMode::Plain), plain_before);
+        assert!(sizer.target_tokens_for_mode(BatchMode::RunPreserving) < run_before);
+    }
+
+    #[test]
+    fn marker_safe_clamp_does_not_affect_turbo_target() {
+        let mut sizer = BatchSizer::new(32_000, 256);
+        let turbo_before = sizer.target_tokens_for_mode(BatchMode::TurboTextOnly);
+
+        sizer.on_truncation_for_mode(BatchMode::MarkerSafe);
+
+        assert_eq!(
+            sizer.target_tokens_for_mode(BatchMode::TurboTextOnly),
+            turbo_before
+        );
+        assert!(sizer.target_tokens_for_mode(BatchMode::MarkerSafe) < 16_000);
+    }
+
+    #[test]
+    fn batch_sizer_respects_plain_mode_clamps() {
+        let sizer = BatchSizer::new(64_000, 512);
+        assert_eq!(sizer.target_tokens_for_mode(BatchMode::Plain), 32_000);
+        assert_eq!(sizer.max_items_for_mode(BatchMode::Plain), 256);
+    }
+
+    #[test]
+    fn batch_sizer_respects_marker_safe_clamps() {
+        let sizer = BatchSizer::new(64_000, 512);
+        assert_eq!(sizer.target_tokens_for_mode(BatchMode::MarkerSafe), 16_000);
+        assert_eq!(sizer.max_items_for_mode(BatchMode::MarkerSafe), 128);
+    }
+
+    #[test]
+    fn batch_sizer_respects_run_preserving_clamps() {
+        let sizer = BatchSizer::new(64_000, 512);
+        assert_eq!(
+            sizer.target_tokens_for_mode(BatchMode::RunPreserving),
+            8_000
+        );
+        assert_eq!(sizer.max_items_for_mode(BatchMode::RunPreserving), 64);
+    }
+
+    #[test]
+    fn repack_batch_preserves_item_order_and_ids() {
+        let batch = TranslationBatch {
+            id: "batch".to_string(),
+            ordinal: 7,
+            mode: BatchMode::Plain,
+            kind: BatchKind::Translation,
+            token_estimate: 100,
+            items: vec![
+                batch_item("a", "one two three four"),
+                batch_item("b", "five six seven eight"),
+                batch_item("c", "nine ten eleven twelve"),
+            ],
+        };
+
+        let parts = repack_batch(batch, 1, 2);
+        let ids = parts
+            .iter()
+            .flat_map(|part| part.items.iter().map(|item| item.item_id.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert!(parts.iter().all(|part| part.items.len() <= 2));
+    }
+
+    #[test]
+    fn batch_sizer_shrink_affects_later_pending_batches() {
+        let mut sizer = BatchSizer::new(16_000, 128);
+        sizer.on_truncation_for_mode(BatchMode::MarkerSafe);
+        let batch = TranslationBatch {
+            id: "batch".to_string(),
+            ordinal: 0,
+            mode: BatchMode::MarkerSafe,
+            kind: BatchKind::Translation,
+            token_estimate: 80_000,
+            items: (0..32)
+                .map(|idx| batch_item(&format!("{idx}"), &"word ".repeat(2_000)))
+                .collect(),
+        };
+
+        let normalized = normalize_batch_for_current_sizer(batch, Some(&sizer));
+        assert!(normalized.len() > 1);
+        assert!(normalized.iter().all(|part| {
+            part.token_estimate <= sizer.target_tokens_for_mode(BatchMode::MarkerSafe)
+                && part.items.len() <= sizer.max_items_for_mode(BatchMode::MarkerSafe)
+        }));
+    }
+
+    #[test]
+    fn request_status_maps_5xx_to_server_error() {
+        let status =
+            request_status_for_controller::<BatchTranslationResult>(&Err(LlmError::HttpStatus {
+                status: 503,
+                body: "unavailable".to_string(),
+            }));
+        assert_eq!(status, RequestStatus::ServerError);
+    }
+
+    #[test]
     fn parses_valid_batch_response() {
         let seg1 = make_segment("seg1", vec![plain_block("Hello")], vec![]);
         let seg2 = make_segment("seg2", vec![plain_block("Goodbye")], vec![]);
@@ -1627,6 +2194,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1660,6 +2228,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1689,6 +2258,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1717,6 +2287,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1748,6 +2319,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1858,6 +2430,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1911,6 +2484,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -2005,6 +2579,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -2071,6 +2646,7 @@ mod tests {
             enabled: true,
             target_tokens: 16_000,
             max_items: 1,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };

@@ -429,7 +429,7 @@ impl OpenAiCompatibleConfig {
         Self {
             base_url: "https://api.deepseek.com/v1".to_string(),
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
-            model: model.unwrap_or_else(|| "deepseek-chat".to_string()),
+            model: model.unwrap_or_else(|| "deepseek-v4-flash".to_string()),
             timeout_seconds: 120,
             provider_max_attempts: 6,
             thinking_disabled: false,

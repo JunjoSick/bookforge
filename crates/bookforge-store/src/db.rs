@@ -438,6 +438,27 @@ impl JobStore {
         Ok(())
     }
 
+    pub fn mark_segment_failed_if_unfinished(
+        &self,
+        job_id: &str,
+        segment_id: &str,
+        error: &str,
+    ) -> Result<()> {
+        {
+            let conn = self.conn.borrow();
+            conn.execute(
+                "UPDATE segments
+                 SET status = 'failed', attempts = attempts + 1, error = ?1
+                 WHERE job_id = ?2
+                   AND id = ?3
+                   AND status NOT IN ('succeeded', 'skipped_cached', 'needs_review')",
+                params![error, job_id, segment_id],
+            )?;
+        }
+        self.touch_job(job_id, "failed")?;
+        Ok(())
+    }
+
     pub fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>> {
         let conn = self.conn.borrow();
         conn.query_row(

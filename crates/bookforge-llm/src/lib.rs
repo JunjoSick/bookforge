@@ -4,6 +4,7 @@ pub mod double_check;
 pub mod prompt;
 pub mod provider;
 pub mod qa_batch;
+pub mod rate_controller;
 pub mod scheduler;
 pub mod telemetry;
 
@@ -23,6 +24,9 @@ pub use provider::{
     RequestMetadata, ResponseFormat,
 };
 pub use qa_batch::qa_segments_parallel;
+pub use rate_controller::{
+    ProviderRateController, RateControllerConfig, RequestObservation, RequestStatus,
+};
 pub use scheduler::{
     QaIssue, QaSegmentReview, SegmentTranslation, TranslationRunConfig, qa_segments,
     translate_segments, translate_segments_with_callback,

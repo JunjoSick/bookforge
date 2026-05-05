@@ -78,6 +78,7 @@ impl TranslationProfile {
                     enabled: false,
                     target_tokens: 0,
                     max_items: 0,
+                    adaptive_sizing: false,
                     split_on_json_failure: true,
                     repair_invalid_items: true,
                 },
@@ -99,6 +100,7 @@ impl TranslationProfile {
                     max_output_tokens: None,
                     batch_max_output_tokens: None,
                     json_mode: JsonMode::Auto,
+                    max_idle_per_host: 32,
                 },
                 qa: QaRunConfig {
                     concurrency: 4,
@@ -130,6 +132,7 @@ impl TranslationProfile {
                     enabled: true,
                     target_tokens: 8_000,
                     max_items: 64,
+                    adaptive_sizing: false,
                     split_on_json_failure: true,
                     repair_invalid_items: true,
                 },
@@ -151,6 +154,7 @@ impl TranslationProfile {
                     max_output_tokens: None,
                     batch_max_output_tokens: None,
                     json_mode: JsonMode::Auto,
+                    max_idle_per_host: 32,
                 },
                 qa: QaRunConfig {
                     concurrency: 8,
@@ -182,6 +186,7 @@ impl TranslationProfile {
                     enabled: true,
                     target_tokens: 16_000,
                     max_items: 160,
+                    adaptive_sizing: true,
                     split_on_json_failure: true,
                     repair_invalid_items: true,
                 },
@@ -203,6 +208,7 @@ impl TranslationProfile {
                     max_output_tokens: None,
                     batch_max_output_tokens: None,
                     json_mode: JsonMode::Auto,
+                    max_idle_per_host: 32,
                 },
                 qa: QaRunConfig {
                     concurrency: 16,
@@ -234,6 +240,7 @@ impl TranslationProfile {
                     enabled: true,
                     target_tokens: 8_000,
                     max_items: 64,
+                    adaptive_sizing: false,
                     split_on_json_failure: false,
                     repair_invalid_items: true,
                 },
@@ -255,6 +262,7 @@ impl TranslationProfile {
                     max_output_tokens: None,
                     batch_max_output_tokens: None,
                     json_mode: JsonMode::Auto,
+                    max_idle_per_host: 8,
                 },
                 qa: QaRunConfig {
                     concurrency: 1,
@@ -286,6 +294,7 @@ impl TranslationProfile {
                     enabled: true,
                     target_tokens: 24_000,
                     max_items: 250,
+                    adaptive_sizing: true,
                     split_on_json_failure: true,
                     repair_invalid_items: false,
                 },
@@ -307,6 +316,7 @@ impl TranslationProfile {
                     max_output_tokens: None,
                     batch_max_output_tokens: None,
                     json_mode: JsonMode::Auto,
+                    max_idle_per_host: 64,
                 },
                 qa: QaRunConfig {
                     concurrency: 16,
@@ -338,6 +348,7 @@ impl TranslationProfile {
                     enabled: true,
                     target_tokens: 16_000,
                     max_items: 128,
+                    adaptive_sizing: true,
                     split_on_json_failure: true,
                     repair_invalid_items: true,
                 },
@@ -359,6 +370,7 @@ impl TranslationProfile {
                     max_output_tokens: None,
                     batch_max_output_tokens: None,
                     json_mode: JsonMode::Auto,
+                    max_idle_per_host: 64,
                 },
                 qa: QaRunConfig {
                     concurrency: 4,
@@ -398,11 +410,71 @@ pub struct ResolvedRunSettings {
     pub double_check: DoubleCheckConfig,
 }
 
+impl ResolvedRunSettings {
+    pub fn apply_provider_preset_runtime(&mut self, overrides: ProviderPresetRuntimeOverrides) {
+        if let Some(v) = overrides.scheduler_concurrency {
+            self.scheduler.concurrency = v.max(1);
+        }
+        if let Some(v) = overrides.provider_max_attempts {
+            self.provider.provider_max_attempts = v.max(1);
+        }
+        if let Some(v) = overrides.validation_max_attempts {
+            self.provider.validation_max_attempts = v.max(1);
+        }
+        if let Some(v) = overrides.retry_after_policy {
+            self.provider.retry_after_policy = v;
+        }
+        if let Some(v) = overrides.max_backoff_seconds {
+            self.provider.max_backoff_seconds = v;
+        }
+        if let Some(v) = overrides.timeout_seconds {
+            self.provider.timeout_seconds = v;
+        }
+        if let Some(v) = overrides.batch_enabled {
+            self.batch.enabled = v;
+        }
+        if let Some(v) = overrides.batch_target_tokens {
+            self.batch.target_tokens = v;
+        }
+        if let Some(v) = overrides.batch_max_items {
+            self.batch.max_items = v;
+        }
+        if let Some(v) = overrides.adaptive_batch_sizing {
+            self.batch.adaptive_sizing = v;
+        }
+        if let Some(v) = overrides.compact_prompts {
+            self.compact_prompts = v;
+        }
+        if let Some(v) = overrides.adaptive_concurrency {
+            self.adaptive_concurrency = v;
+        }
+        if let Some(v) = overrides.thinking_disabled {
+            self.provider.thinking_disabled = v;
+        }
+        if let Some(v) = overrides.model_context_tokens {
+            self.provider.model_context_tokens = Some(v);
+        }
+        if let Some(v) = overrides.max_output_tokens {
+            self.provider.max_output_tokens = Some(v);
+        }
+        if let Some(v) = overrides.batch_max_output_tokens {
+            self.provider.batch_max_output_tokens = Some(v);
+        }
+        if let Some(v) = overrides.json_mode {
+            self.provider.json_mode = v;
+        }
+        if let Some(v) = overrides.max_idle_per_host {
+            self.provider.max_idle_per_host = v;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BatchConfig {
     pub enabled: bool,
     pub target_tokens: usize,
     pub max_items: usize,
+    pub adaptive_sizing: bool,
     pub split_on_json_failure: bool,
     pub repair_invalid_items: bool,
 }
@@ -451,6 +523,7 @@ pub struct ProviderRuntimeConfig {
     pub max_output_tokens: Option<u32>,
     pub batch_max_output_tokens: Option<u32>,
     pub json_mode: JsonMode,
+    pub max_idle_per_host: usize,
 }
 
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
@@ -496,52 +569,188 @@ pub enum ProviderPreset {
 }
 
 impl ProviderPreset {
-    pub fn resolve(self, custom: Option<ModelEndpoint>) -> ModelEndpoint {
+    pub fn resolve(self) -> Option<ProviderPresetResolved> {
         match self {
-            ProviderPreset::Auto => ModelEndpoint {
-                provider: "deepseek".to_string(),
-                model: "deepseek-chat".to_string(),
-                base_url: Some("https://api.deepseek.com/v1".to_string()),
-                api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
-            },
-            ProviderPreset::OpenRouterFree => ModelEndpoint {
-                provider: "openrouter".to_string(),
-                model: "google/gemini-2.5-flash-lite".to_string(),
-                base_url: Some("https://openrouter.ai/api/v1".to_string()),
-                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
-            },
-            ProviderPreset::OpenRouterPaidFast => ModelEndpoint {
-                provider: "openrouter".to_string(),
-                model: "google/gemini-2.5-flash".to_string(),
-                base_url: Some("https://openrouter.ai/api/v1".to_string()),
-                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
-            },
-            ProviderPreset::DeepSeekFree => ModelEndpoint {
-                provider: "deepseek".to_string(),
-                model: "deepseek-chat".to_string(),
-                base_url: Some("https://api.deepseek.com/v1".to_string()),
-                api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
-            },
-            ProviderPreset::DeepSeekPaid => ModelEndpoint {
-                provider: "deepseek".to_string(),
-                model: "deepseek-reasoner".to_string(),
-                base_url: Some("https://api.deepseek.com/v1".to_string()),
-                api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
-            },
-            ProviderPreset::GeminiFlashLite => ModelEndpoint {
-                provider: "openrouter".to_string(),
-                model: "google/gemini-2.5-flash-lite".to_string(),
-                base_url: Some("https://openrouter.ai/api/v1".to_string()),
-                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
-            },
-            ProviderPreset::Custom => custom.unwrap_or_else(|| ModelEndpoint {
-                provider: "deepseek".to_string(),
-                model: "deepseek-chat".to_string(),
-                base_url: Some("https://api.deepseek.com/v1".to_string()),
-                api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+            ProviderPreset::Auto | ProviderPreset::Custom => None,
+            ProviderPreset::OpenRouterFree => Some(ProviderPresetResolved {
+                endpoint: ModelEndpoint {
+                    provider: "openrouter".to_string(),
+                    model: "google/gemini-2.5-flash-lite".to_string(),
+                    base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                    api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                },
+                runtime: ProviderPresetRuntimeOverrides {
+                    scheduler_concurrency: Some(2),
+                    provider_max_attempts: Some(1),
+                    validation_max_attempts: Some(1),
+                    retry_after_policy: Some(RetryAfterPolicy::RespectHeader),
+                    max_backoff_seconds: Some(90),
+                    timeout_seconds: Some(180),
+                    batch_enabled: Some(true),
+                    batch_target_tokens: Some(6_000),
+                    batch_max_items: Some(48),
+                    compact_prompts: Some(true),
+                    adaptive_concurrency: Some(true),
+                    thinking_disabled: Some(true),
+                    json_mode: Some(JsonMode::Auto),
+                    max_idle_per_host: Some(8),
+                    ..Default::default()
+                },
+            }),
+            ProviderPreset::OpenRouterPaidFast => Some(ProviderPresetResolved {
+                endpoint: ModelEndpoint {
+                    provider: "openrouter".to_string(),
+                    model: "google/gemini-2.5-flash".to_string(),
+                    base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                    api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                },
+                runtime: ProviderPresetRuntimeOverrides {
+                    scheduler_concurrency: Some(32),
+                    provider_max_attempts: Some(1),
+                    validation_max_attempts: Some(1),
+                    retry_after_policy: Some(RetryAfterPolicy::JitteredExponential),
+                    max_backoff_seconds: Some(15),
+                    timeout_seconds: Some(120),
+                    batch_enabled: Some(true),
+                    batch_target_tokens: Some(16_000),
+                    batch_max_items: Some(128),
+                    adaptive_batch_sizing: Some(true),
+                    compact_prompts: Some(true),
+                    adaptive_concurrency: Some(true),
+                    thinking_disabled: Some(true),
+                    json_mode: Some(JsonMode::Auto),
+                    max_idle_per_host: Some(64),
+                    ..Default::default()
+                },
+            }),
+            ProviderPreset::DeepSeekFree => Some(ProviderPresetResolved {
+                endpoint: ModelEndpoint {
+                    provider: "deepseek".to_string(),
+                    model: "deepseek-v4-flash".to_string(),
+                    base_url: Some("https://api.deepseek.com/v1".to_string()),
+                    api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+                },
+                runtime: ProviderPresetRuntimeOverrides {
+                    scheduler_concurrency: Some(1),
+                    provider_max_attempts: Some(1),
+                    validation_max_attempts: Some(1),
+                    retry_after_policy: Some(RetryAfterPolicy::RespectHeader),
+                    max_backoff_seconds: Some(120),
+                    timeout_seconds: Some(240),
+                    batch_enabled: Some(true),
+                    batch_target_tokens: Some(4_000),
+                    batch_max_items: Some(32),
+                    compact_prompts: Some(true),
+                    adaptive_concurrency: Some(false),
+                    thinking_disabled: Some(true),
+                    json_mode: Some(JsonMode::Auto),
+                    max_idle_per_host: Some(4),
+                    ..Default::default()
+                },
+            }),
+            ProviderPreset::DeepSeekPaid => Some(ProviderPresetResolved {
+                endpoint: ModelEndpoint {
+                    provider: "deepseek".to_string(),
+                    model: "deepseek-v4-flash".to_string(),
+                    base_url: Some("https://api.deepseek.com/v1".to_string()),
+                    api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+                },
+                runtime: ProviderPresetRuntimeOverrides {
+                    scheduler_concurrency: Some(8),
+                    provider_max_attempts: Some(2),
+                    validation_max_attempts: Some(1),
+                    retry_after_policy: Some(RetryAfterPolicy::JitteredExponential),
+                    max_backoff_seconds: Some(30),
+                    timeout_seconds: Some(180),
+                    batch_enabled: Some(true),
+                    batch_target_tokens: Some(12_000),
+                    batch_max_items: Some(96),
+                    adaptive_batch_sizing: Some(true),
+                    compact_prompts: Some(true),
+                    adaptive_concurrency: Some(true),
+                    thinking_disabled: Some(false),
+                    json_mode: Some(JsonMode::Auto),
+                    max_idle_per_host: Some(16),
+                    ..Default::default()
+                },
+            }),
+            ProviderPreset::GeminiFlashLite => Some(ProviderPresetResolved {
+                endpoint: ModelEndpoint {
+                    provider: "openrouter".to_string(),
+                    model: "google/gemini-2.5-flash-lite".to_string(),
+                    base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                    api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                },
+                runtime: ProviderPresetRuntimeOverrides {
+                    scheduler_concurrency: Some(40),
+                    provider_max_attempts: Some(1),
+                    validation_max_attempts: Some(1),
+                    retry_after_policy: Some(RetryAfterPolicy::JitteredExponential),
+                    max_backoff_seconds: Some(15),
+                    timeout_seconds: Some(120),
+                    batch_enabled: Some(true),
+                    batch_target_tokens: Some(20_000),
+                    batch_max_items: Some(160),
+                    adaptive_batch_sizing: Some(true),
+                    compact_prompts: Some(true),
+                    adaptive_concurrency: Some(true),
+                    thinking_disabled: Some(true),
+                    json_mode: Some(JsonMode::Auto),
+                    max_idle_per_host: Some(64),
+                    ..Default::default()
+                },
             }),
         }
     }
+
+    pub fn endpoint_or_default(self, custom: Option<ModelEndpoint>) -> ModelEndpoint {
+        if let Some(resolved) = self.resolve() {
+            return resolved.endpoint;
+        }
+        match self {
+            ProviderPreset::Auto => ModelEndpoint {
+                provider: "deepseek".to_string(),
+                model: "deepseek-v4-flash".to_string(),
+                base_url: Some("https://api.deepseek.com/v1".to_string()),
+                api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+            },
+            ProviderPreset::Custom => custom.unwrap_or_else(|| ModelEndpoint {
+                provider: "deepseek".to_string(),
+                model: "deepseek-v4-flash".to_string(),
+                base_url: Some("https://api.deepseek.com/v1".to_string()),
+                api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+            }),
+            _ => unreachable!("resolved presets returned above"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderPresetResolved {
+    pub endpoint: ModelEndpoint,
+    pub runtime: ProviderPresetRuntimeOverrides,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderPresetRuntimeOverrides {
+    pub scheduler_concurrency: Option<usize>,
+    pub provider_max_attempts: Option<usize>,
+    pub validation_max_attempts: Option<usize>,
+    pub retry_after_policy: Option<RetryAfterPolicy>,
+    pub max_backoff_seconds: Option<u64>,
+    pub timeout_seconds: Option<u64>,
+    pub batch_enabled: Option<bool>,
+    pub batch_target_tokens: Option<usize>,
+    pub batch_max_items: Option<usize>,
+    pub adaptive_batch_sizing: Option<bool>,
+    pub compact_prompts: Option<bool>,
+    pub adaptive_concurrency: Option<bool>,
+    pub thinking_disabled: Option<bool>,
+    pub model_context_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+    pub batch_max_output_tokens: Option<u32>,
+    pub json_mode: Option<JsonMode>,
+    pub max_idle_per_host: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -606,4 +815,91 @@ pub enum FallbackScope {
     Failed,
     NeedsReview,
     FailedAndNeedsReview,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openrouter_paid_fast_preset_sets_runtime_overrides() {
+        let resolved = ProviderPreset::OpenRouterPaidFast
+            .resolve()
+            .expect("preset should resolve");
+        assert_eq!(resolved.endpoint.provider, "openrouter");
+        assert_eq!(resolved.runtime.scheduler_concurrency, Some(32));
+        assert_eq!(resolved.runtime.provider_max_attempts, Some(1));
+        assert_eq!(resolved.runtime.batch_target_tokens, Some(16_000));
+        assert_eq!(resolved.runtime.adaptive_batch_sizing, Some(true));
+        assert_eq!(resolved.runtime.max_idle_per_host, Some(64));
+    }
+
+    #[test]
+    fn openrouter_free_preset_uses_low_concurrency_and_respect_retry_after() {
+        let resolved = ProviderPreset::OpenRouterFree
+            .resolve()
+            .expect("preset should resolve");
+        assert_eq!(resolved.runtime.scheduler_concurrency, Some(2));
+        assert_eq!(resolved.runtime.provider_max_attempts, Some(1));
+        assert_eq!(
+            resolved.runtime.retry_after_policy,
+            Some(RetryAfterPolicy::RespectHeader)
+        );
+        assert_eq!(resolved.runtime.max_idle_per_host, Some(8));
+    }
+
+    #[test]
+    fn runtime_config_event_includes_provider_preset_values() {
+        let event = crate::ProgressEvent::RuntimeConfigResolved {
+            profile: "v1_fast".to_string(),
+            provider_preset: Some("OpenRouterPaidFast".to_string()),
+            provider: "openrouter".to_string(),
+            model: "google/gemini-2.5-flash".to_string(),
+            concurrency: 32,
+            max_attempts: 1,
+            provider_max_attempts: 1,
+            validation_max_attempts: 1,
+            retry_after_policy: "JitteredExponential".to_string(),
+            max_backoff_seconds: 15,
+            timeout_seconds: 120,
+            batch_enabled: true,
+            batch_target_tokens: 16_000,
+            batch_max_items: 128,
+            adaptive_batch_sizing: true,
+            adaptive_concurrency: true,
+            compact_prompts: true,
+            thinking_disabled: true,
+            json_mode: "Auto".to_string(),
+            model_context_tokens: None,
+            max_output_tokens: None,
+            batch_max_output_tokens: None,
+            timestamp_ms: 0,
+        };
+        match event {
+            crate::ProgressEvent::RuntimeConfigResolved {
+                provider_preset,
+                batch_target_tokens,
+                adaptive_batch_sizing,
+                provider_max_attempts,
+                ..
+            } => {
+                assert_eq!(provider_preset.as_deref(), Some("OpenRouterPaidFast"));
+                assert_eq!(batch_target_tokens, 16_000);
+                assert!(adaptive_batch_sizing);
+                assert_eq!(provider_max_attempts, 1);
+            }
+            _ => unreachable!("constructed runtime event"),
+        }
+    }
+
+    #[test]
+    fn v1_fast_uses_single_provider_attempt() {
+        let settings = TranslationProfile::V1Fast.resolve();
+        assert_eq!(settings.scheduler.max_attempts, 1);
+        assert_eq!(settings.provider.provider_max_attempts, 1);
+        assert_eq!(settings.provider.validation_max_attempts, 1);
+        assert!(settings.batch.repair_invalid_items);
+        assert!(settings.adaptive_concurrency);
+        assert!(settings.batch.adaptive_sizing);
+    }
 }
