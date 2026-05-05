@@ -51,7 +51,7 @@ pub async fn run(args: EstimateArgs) -> Result<()> {
 fn default_model(provider: &str) -> &str {
     match provider {
         "mock" => "mock-prefix-target",
-        "deepseek" => "deepseek-chat",
+        "deepseek" => "deepseek-v4-flash",
         "openrouter" => "openrouter/auto",
         _ => "unknown",
     }

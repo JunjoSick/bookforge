@@ -626,7 +626,7 @@ impl ProviderPreset {
             ProviderPreset::DeepSeekFree => Some(ProviderPresetResolved {
                 endpoint: ModelEndpoint {
                     provider: "deepseek".to_string(),
-                    model: "deepseek-chat".to_string(),
+                    model: "deepseek-v4-flash".to_string(),
                     base_url: Some("https://api.deepseek.com/v1".to_string()),
                     api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
                 },
@@ -651,7 +651,7 @@ impl ProviderPreset {
             ProviderPreset::DeepSeekPaid => Some(ProviderPresetResolved {
                 endpoint: ModelEndpoint {
                     provider: "deepseek".to_string(),
-                    model: "deepseek-reasoner".to_string(),
+                    model: "deepseek-v4-pro".to_string(),
                     base_url: Some("https://api.deepseek.com/v1".to_string()),
                     api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
                 },
@@ -710,13 +710,13 @@ impl ProviderPreset {
         match self {
             ProviderPreset::Auto => ModelEndpoint {
                 provider: "deepseek".to_string(),
-                model: "deepseek-chat".to_string(),
+                model: "deepseek-v4-flash".to_string(),
                 base_url: Some("https://api.deepseek.com/v1".to_string()),
                 api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
             },
             ProviderPreset::Custom => custom.unwrap_or_else(|| ModelEndpoint {
                 provider: "deepseek".to_string(),
-                model: "deepseek-chat".to_string(),
+                model: "deepseek-v4-flash".to_string(),
                 base_url: Some("https://api.deepseek.com/v1".to_string()),
                 api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
             }),

@@ -895,7 +895,7 @@ fn provider_config(
         "deepseek" => (
             "https://api.deepseek.com/v1",
             "DEEPSEEK_API_KEY",
-            "deepseek-chat",
+            "deepseek-v4-flash",
         ),
         "openrouter" => (
             "https://openrouter.ai/api/v1",
