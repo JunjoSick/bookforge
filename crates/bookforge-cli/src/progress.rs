@@ -175,7 +175,9 @@ impl JsonlFileWriter {
     fn write_event(&mut self, event: &ProgressEvent) -> Result<()> {
         // Lazy open: if no path was explicitly provided, use default
         // job-based path when JobCreated arrives.
-        if self.path.is_none() && self.writer.is_none() && !self.failed
+        if self.path.is_none()
+            && self.writer.is_none()
+            && !self.failed
             && let ProgressEvent::JobCreated { job_id, .. } = event
         {
             let run_dir = PathBuf::from(".bookforge/runs").join(job_id);
