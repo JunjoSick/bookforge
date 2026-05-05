@@ -891,4 +891,15 @@ mod tests {
             _ => unreachable!("constructed runtime event"),
         }
     }
+
+    #[test]
+    fn v1_fast_uses_single_provider_attempt() {
+        let settings = TranslationProfile::V1Fast.resolve();
+        assert_eq!(settings.scheduler.max_attempts, 1);
+        assert_eq!(settings.provider.provider_max_attempts, 1);
+        assert_eq!(settings.provider.validation_max_attempts, 1);
+        assert!(settings.batch.repair_invalid_items);
+        assert!(settings.adaptive_concurrency);
+        assert!(settings.batch.adaptive_sizing);
+    }
 }

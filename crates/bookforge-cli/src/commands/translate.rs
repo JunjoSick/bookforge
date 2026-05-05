@@ -12,9 +12,10 @@ use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::translate_segments;
 use bookforge_llm::{
     AdaptiveLimiter, LlmError, LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig,
-    OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation, TelemetryLog,
-    TranslationRunConfig, build_translation_batches, qa_segments_parallel, run_double_check,
-    telemetry_summary, translate_batches_with_callback, translate_segments_with_callback,
+    OpenAiCompatibleProvider, ProviderRateController, QaSegmentReview, RateControllerConfig,
+    SegmentTranslation, TelemetryLog, TranslationRunConfig, build_translation_batches,
+    qa_segments_parallel, run_double_check, telemetry_summary, translate_batches_with_callback,
+    translate_segments_with_callback,
 };
 use bookforge_store::{CreateJob, JobRecord, JobStore, SaveCachedTranslation};
 use clap::Args;
@@ -337,26 +338,13 @@ pub async fn run(
     let reporter = crate::progress::ProgressReporter::spawn(args.ui, args.progress_jsonl.clone());
     let progress_sink = reporter.sink();
 
-    // Warn if retry amplification is high
-    let retry_amplification = settings.provider.provider_max_attempts
-        * settings.scheduler.max_attempts
-        * settings.provider.validation_max_attempts;
-    if retry_amplification > 9 {
+    if let Some(message) = retry_amplification_warning(&settings) {
         progress_sink.emit(bookforge_core::ProgressEvent::Warning {
             kind: "retry_amplification".to_string(),
-            message: format!(
-                "high retry amplification: provider_max_attempts={}, scheduler_max_attempts={}, validation_max_attempts={} (total {} potential retries per segment)",
-                settings.provider.provider_max_attempts,
-                settings.scheduler.max_attempts,
-                settings.provider.validation_max_attempts,
-                retry_amplification
-            ),
+            message: message.clone(),
             timestamp_ms: bookforge_core::progress::now_ms(),
         });
-        eprintln!(
-            "warn: high retry amplification ({} total potential retries per segment)",
-            retry_amplification
-        );
+        eprintln!("warn: {message}");
     }
 
     let run_result = async {
@@ -389,6 +377,23 @@ pub async fn run(
     .await;
 
     finalize_reporter(run_result, reporter).await
+}
+
+fn retry_amplification_warning(settings: &ResolvedRunSettings) -> Option<String> {
+    let scheduler_provider_product =
+        settings.scheduler.max_attempts * settings.provider.provider_max_attempts;
+    if scheduler_provider_product < 6 {
+        return None;
+    }
+    let total = scheduler_provider_product * settings.provider.validation_max_attempts;
+    Some(format!(
+        "scheduler attempts {} x provider attempts {} can produce up to {} calls per failed unit before validation retries ({} total with validation attempts {})",
+        settings.scheduler.max_attempts,
+        settings.provider.provider_max_attempts,
+        scheduler_provider_product,
+        total,
+        settings.provider.validation_max_attempts
+    ))
 }
 
 async fn finalize_reporter<T>(
@@ -952,10 +957,18 @@ where
     use std::sync::Arc;
     let telemetry = Arc::new(TelemetryLog::new());
 
-    let limiter = if settings.adaptive_concurrency {
-        Some(Arc::new(AdaptiveLimiter::new(
+    let rate_controller = if settings.adaptive_concurrency {
+        let limiter = Arc::new(AdaptiveLimiter::new_with_bounds(
             settings.scheduler.concurrency.max(1),
+            1,
             (settings.scheduler.concurrency * 4).max(1),
+            std::time::Duration::from_secs(2),
+            Some(progress.clone()),
+        ));
+        Some(Arc::new(ProviderRateController::new(
+            limiter,
+            RateControllerConfig::for_target(settings.scheduler.concurrency.max(1)),
+            progress.clone(),
         )))
     } else {
         None
@@ -1003,7 +1016,7 @@ where
         segments,
         config,
         telemetry.clone(),
-        limiter,
+        rate_controller,
         batch_sizer.as_mut(),
         progress.clone(),
         Some(finalized_tx),
@@ -1945,6 +1958,18 @@ mod tests {
         .expect("provider_config should build");
 
         assert_eq!(cfg.json_mode, bookforge_core::JsonMode::PromptOnly);
+    }
+
+    #[test]
+    fn retry_amplification_warning_emitted_for_high_attempt_product() {
+        let mut settings = TranslationProfile::Safe.resolve();
+        settings.scheduler.max_attempts = 3;
+        settings.provider.provider_max_attempts = 2;
+        settings.provider.validation_max_attempts = 1;
+
+        let warning = retry_amplification_warning(&settings).expect("warning expected");
+        assert!(warning.contains("scheduler attempts 3 x provider attempts 2"));
+        assert!(warning.contains("up to 6 calls"));
     }
 
     fn translate_args_with_preset(

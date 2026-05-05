@@ -423,4 +423,48 @@ mod tests {
         assert_eq!(library.double_check_batch.name, "double_check_batch");
         assert_eq!(library.correct_batch.name, "correct_batch");
     }
+
+    #[test]
+    fn compact_batch_prompt_is_shorter_than_standard_prompt() {
+        let library = PromptLibrary::embedded();
+        let standard = library.batch_plain.system.len() + library.batch_plain.user.len();
+        let compact =
+            library.batch_plain_compact.system.len() + library.batch_plain_compact.user.len();
+        assert!(compact < standard, "compact={compact} standard={standard}");
+    }
+
+    #[test]
+    fn compact_prompt_preserves_required_json_contract() {
+        let library = PromptLibrary::embedded();
+        let prompt = format!(
+            "{}\n{}",
+            library.batch_plain_compact.system, library.batch_plain_compact.user
+        );
+        assert!(prompt.contains("Return exactly:"));
+        assert!(prompt.contains(r#"{"items":[{"id":"...","translation":"..."}]}"#));
+        assert!(prompt.contains("{{items_json}}"));
+    }
+
+    #[test]
+    fn marker_safe_compact_prompt_mentions_marker_preservation() {
+        let library = PromptLibrary::embedded();
+        let prompt = format!(
+            "{}\n{}",
+            library.batch_marker_safe_compact.system, library.batch_marker_safe_compact.user
+        );
+        assert!(prompt.to_ascii_lowercase().contains("marker"));
+        assert!(prompt.contains("{{items_json}}"));
+    }
+
+    #[test]
+    fn repair_compact_prompt_mentions_failed_items_only() {
+        let library = PromptLibrary::embedded();
+        let prompt = format!(
+            "{}\n{}",
+            library.batch_repair_compact.system, library.batch_repair_compact.user
+        );
+        assert!(prompt.to_ascii_lowercase().contains("repair"));
+        assert!(prompt.contains("{{errors_json}}"));
+        assert!(prompt.contains("{{items_json}}"));
+    }
 }
