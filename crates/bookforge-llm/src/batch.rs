@@ -1610,6 +1610,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1627,6 +1628,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1660,6 +1662,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1689,6 +1692,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1717,6 +1721,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1748,6 +1753,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1858,6 +1864,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -1911,6 +1918,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -2005,6 +2013,7 @@ mod tests {
             enabled: true,
             target_tokens: 1000,
             max_items: 64,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };
@@ -2071,6 +2080,7 @@ mod tests {
             enabled: true,
             target_tokens: 16_000,
             max_items: 1,
+            adaptive_sizing: false,
             split_on_json_failure: true,
             repair_invalid_items: true,
         };

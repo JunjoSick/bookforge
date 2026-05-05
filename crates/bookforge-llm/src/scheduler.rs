@@ -931,7 +931,10 @@ fn validation_retry_appendix(segment: &Segment, mode: TranslationMode, error: &s
     )
 }
 
-fn repair_missing_protected_spans(spans: &[String], mut translation: String) -> (String, Vec<String>) {
+fn repair_missing_protected_spans(
+    spans: &[String],
+    mut translation: String,
+) -> (String, Vec<String>) {
     let mut reinserted = Vec::new();
     for span in spans {
         if span.trim().is_empty() || translation.contains(span) {

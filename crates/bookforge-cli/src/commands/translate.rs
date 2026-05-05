@@ -82,11 +82,11 @@ pub struct TranslateArgs {
     #[arg(long)]
     pub turbo_text_only: bool,
 
-    #[arg(long, default_value_t = 4)]
-    pub concurrency: usize,
+    #[arg(long)]
+    pub concurrency: Option<usize>,
 
-    #[arg(long, default_value_t = 3)]
-    pub max_attempts: usize,
+    #[arg(long)]
+    pub max_attempts: Option<usize>,
 
     #[arg(long)]
     pub provider_max_attempts: Option<usize>,
@@ -192,7 +192,7 @@ fn apply_provider_preset(
     let Some(p) = preset else {
         return explicit.clone();
     };
-    let endpoint = p.resolve(None);
+    let endpoint = p.endpoint_or_default(None);
     CliProviderArgs {
         provider: endpoint.provider,
         model: explicit.model.clone().or(Some(endpoint.model)),
@@ -211,6 +211,10 @@ fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
         };
 
     let mut settings = effective_profile.resolve();
+
+    if let Some(preset) = args.provider_preset.and_then(|preset| preset.resolve()) {
+        settings.apply_provider_preset_runtime(preset.runtime);
+    }
 
     if let Some(v) = args.max_segment_tokens {
         settings.segmentation.max_segment_tokens = v;
@@ -234,8 +238,12 @@ fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
         settings.adaptive_concurrency = v;
     }
 
-    settings.scheduler.concurrency = args.concurrency;
-    settings.scheduler.max_attempts = args.max_attempts;
+    if let Some(v) = args.concurrency {
+        settings.scheduler.concurrency = v;
+    }
+    if let Some(v) = args.max_attempts {
+        settings.scheduler.max_attempts = v;
+    }
 
     if let Some(v) = args.provider_max_attempts {
         settings.provider.provider_max_attempts = v;
@@ -243,8 +251,12 @@ fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
     if let Some(v) = args.validation_max_attempts {
         settings.provider.validation_max_attempts = v;
     }
-    settings.provider.timeout_seconds = args.provider.timeout_seconds;
-    settings.provider.thinking_disabled = args.no_thinking;
+    if let Some(v) = args.provider.timeout_seconds {
+        settings.provider.timeout_seconds = v;
+    }
+    if args.no_thinking {
+        settings.provider.thinking_disabled = true;
+    }
     if let Some(v) = args.model_context_tokens {
         settings.provider.model_context_tokens = Some(v);
     }
@@ -535,6 +547,7 @@ async fn run_openai_compatible_translation(
         settings.provider.thinking_disabled,
         settings.provider.retry_after_policy,
         settings.provider.max_backoff_seconds,
+        settings.provider.max_idle_per_host,
     ) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -550,6 +563,31 @@ async fn run_openai_compatible_translation(
     let provider =
         OpenAiCompatibleProvider::new_with_cancel(provider_config.clone(), cancel_token.clone())?;
     let model = provider.model().to_string();
+    progress.emit(bookforge_core::ProgressEvent::RuntimeConfigResolved {
+        profile: format!("{:?}", settings.profile),
+        provider_preset: cli_args.provider_preset.map(|preset| format!("{preset:?}")),
+        provider: config.provider.clone(),
+        model: model.clone(),
+        concurrency: settings.scheduler.concurrency,
+        max_attempts: settings.scheduler.max_attempts,
+        provider_max_attempts: settings.provider.provider_max_attempts,
+        validation_max_attempts: settings.provider.validation_max_attempts,
+        retry_after_policy: format!("{:?}", settings.provider.retry_after_policy),
+        max_backoff_seconds: settings.provider.max_backoff_seconds,
+        timeout_seconds: settings.provider.timeout_seconds,
+        batch_enabled: settings.batch.enabled,
+        batch_target_tokens: settings.batch.target_tokens,
+        batch_max_items: settings.batch.max_items,
+        adaptive_batch_sizing: settings.batch.adaptive_sizing,
+        adaptive_concurrency: settings.adaptive_concurrency,
+        compact_prompts: settings.compact_prompts,
+        thinking_disabled: settings.provider.thinking_disabled,
+        json_mode: format!("{:?}", settings.provider.json_mode),
+        model_context_tokens: settings.provider.model_context_tokens,
+        max_output_tokens: settings.provider.max_output_tokens,
+        batch_max_output_tokens: settings.provider.batch_max_output_tokens,
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
 
     progress.emit(bookforge_core::ProgressEvent::StageStarted {
         stage: "read_epub".to_string(),
@@ -849,6 +887,7 @@ fn provider_config(
     thinking_disabled: bool,
     retry_after_policy: bookforge_core::RetryAfterPolicy,
     max_backoff_seconds: u64,
+    max_idle_per_host: usize,
 ) -> Result<OpenAiCompatibleConfig> {
     let (default_url, default_key_env, default_model) = match provider {
         "deepseek" => (
@@ -884,7 +923,7 @@ fn provider_config(
         thinking_disabled,
         retry_after_policy,
         max_backoff_seconds,
-        max_idle_per_host: 32,
+        max_idle_per_host,
         json_mode: bookforge_core::JsonMode::Auto,
     })
 }
@@ -920,11 +959,13 @@ where
         None
     };
 
-    let mut batch_sizer = bookforge_llm::BatchSizer::with_progress(
-        settings.batch.target_tokens,
-        settings.batch.max_items,
-        progress.clone(),
-    );
+    let mut batch_sizer = settings.batch.adaptive_sizing.then(|| {
+        bookforge_llm::BatchSizer::with_progress(
+            settings.batch.target_tokens,
+            settings.batch.max_items,
+            progress.clone(),
+        )
+    });
 
     let sender = checkpoint.sender.clone();
     let (finalized_tx, mut finalized_rx) = tokio::sync::mpsc::channel::<SegmentTranslation>(64);
@@ -961,7 +1002,7 @@ where
         config,
         telemetry.clone(),
         limiter,
-        Some(&mut batch_sizer),
+        batch_sizer.as_mut(),
         progress.clone(),
         Some(finalized_tx),
         |_| Ok(()),
@@ -980,17 +1021,32 @@ where
         }
         (Ok(_), Ok(Err(e))) | (Err(e @ bookforge_llm::LlmError::Provider(_)), _) => {
             let message = format!("batch translation checkpoint failure: {e}");
-            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            mark_unfinished_segments_failed(
+                checkpoint.store,
+                checkpoint.job_id,
+                segments,
+                &message,
+            )?;
             Err(anyhow::anyhow!(message))
         }
         (_, Err(join_err)) => {
             let message = format!("batch checkpoint task panicked: {join_err}");
-            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            mark_unfinished_segments_failed(
+                checkpoint.store,
+                checkpoint.job_id,
+                segments,
+                &message,
+            )?;
             Err(anyhow::anyhow!(message))
         }
         (Err(error), _) => {
             let message = format!("batch translation failed: {error}");
-            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            mark_unfinished_segments_failed(
+                checkpoint.store,
+                checkpoint.job_id,
+                segments,
+                &message,
+            )?;
             Err(anyhow::anyhow!(message))
         }
     }
@@ -1030,6 +1086,7 @@ async fn run_fallback_pass(
         settings.provider.thinking_disabled,
         settings.provider.retry_after_policy,
         settings.provider.max_backoff_seconds,
+        settings.provider.max_idle_per_host,
     )?;
 
     let fallback = OpenAiCompatibleProvider::new_with_cancel(
@@ -1142,6 +1199,7 @@ async fn run_double_check_pass(
                 settings.provider.thinking_disabled,
                 settings.provider.retry_after_policy,
                 settings.provider.max_backoff_seconds,
+                settings.provider.max_idle_per_host,
             )?;
             OpenAiCompatibleProvider::new_with_cancel(dc_config, cancel_token.clone())
                 .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -1200,7 +1258,7 @@ where
             let message = format!(
                 "translation scheduler failed before producing per-segment results: {error}"
             );
-            mark_all_segments_failed(store, job_id, segments, &message)?;
+            mark_unfinished_segments_failed(store, job_id, segments, &message)?;
             Err(anyhow::anyhow!(message))
         }
     }
@@ -1285,19 +1343,34 @@ where
         (Ok(translations), Ok(Ok(()))) => Ok(translations),
         (Ok(_), Ok(Err(e))) | (Err(e @ bookforge_llm::LlmError::Provider(_)), _) => {
             let message = format!("translation checkpoint failure: {e}");
-            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            mark_unfinished_segments_failed(
+                checkpoint.store,
+                checkpoint.job_id,
+                segments,
+                &message,
+            )?;
             Err(anyhow::anyhow!(message))
         }
         (_, Err(join_err)) => {
             let message = format!("checkpoint task panicked: {join_err}");
-            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            mark_unfinished_segments_failed(
+                checkpoint.store,
+                checkpoint.job_id,
+                segments,
+                &message,
+            )?;
             Err(anyhow::anyhow!(message))
         }
         (Err(error), _) => {
             let message = format!(
                 "translation scheduler failed before producing per-segment results: {error}"
             );
-            mark_all_segments_failed(checkpoint.store, checkpoint.job_id, segments, &message)?;
+            mark_unfinished_segments_failed(
+                checkpoint.store,
+                checkpoint.job_id,
+                segments,
+                &message,
+            )?;
             Err(anyhow::anyhow!(message))
         }
     }
@@ -1418,14 +1491,14 @@ fn suspicious_qa_candidates(
         .collect()
 }
 
-fn mark_all_segments_failed(
+fn mark_unfinished_segments_failed(
     store: &JobStore,
     job_id: &str,
     segments: &[Segment],
     error: &str,
 ) -> Result<()> {
     for segment in segments {
-        store.mark_segment_failed(job_id, &segment.id.0, error)?;
+        store.mark_segment_failed_if_unfinished(job_id, &segment.id.0, error)?;
     }
     Ok(())
 }
@@ -1542,7 +1615,7 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
             .model
             .clone()
             .unwrap_or_else(|| "openrouter/auto".to_string()),
-        timeout_seconds: args.provider.timeout_seconds,
+        timeout_seconds: args.provider.timeout_seconds.unwrap_or(120),
         provider_max_attempts: 6,
         thinking_disabled: false,
         retry_after_policy: bookforge_core::RetryAfterPolicy::JitteredExponential,
@@ -1696,7 +1769,7 @@ mod tests {
     use std::{fs, time::SystemTime};
 
     #[tokio::test]
-    async fn scheduler_guard_marks_all_segments_failed_only_on_run_level_error() {
+    async fn scheduler_guard_preserves_completed_segments_on_run_level_error() {
         let db_path = temp_path("jobs.sqlite");
         let input_path = temp_path("input.epub");
         fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
@@ -1718,6 +1791,19 @@ mod tests {
         store
             .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "test_ns")
             .expect("segments should insert");
+        store
+            .save_translation(bookforge_store::SaveTranslation {
+                job_id: &job.id,
+                segment_id: "seg_a",
+                translated_text: "Gia fatto",
+                blocks: &[],
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+            })
+            .expect("completed segment should save");
         let config = TranslationRunConfig {
             source_language: Some("English".to_string()),
             target_language: "Italian".to_string(),
@@ -1755,8 +1841,8 @@ mod tests {
             .summary(&job.id)
             .expect("summary should load")
             .expect("job should exist");
-        assert_eq!(summary.failed, 2);
-        assert_eq!(summary.succeeded, 0);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.succeeded, 1);
 
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(input_path);
@@ -1814,6 +1900,7 @@ mod tests {
             false,
             RetryAfterPolicy::JitteredExponential,
             30,
+            32,
         )
         .expect("provider_config should build");
         assert_eq!(cfg.provider_max_attempts, 2);
@@ -1828,8 +1915,101 @@ mod tests {
             false,
             RetryAfterPolicy::JitteredExponential,
             30,
+            32,
         )
         .expect("provider_config should build");
         assert_eq!(cfg.provider_max_attempts, 1);
+    }
+
+    fn translate_args_with_preset(
+        provider_preset: Option<bookforge_core::ProviderPreset>,
+    ) -> TranslateArgs {
+        TranslateArgs {
+            input: temp_path("input.epub"),
+            language: LanguageArgs {
+                source: Some("English".to_string()),
+                target: "Italian".to_string(),
+            },
+            provider: CliProviderArgs {
+                provider: "deepseek".to_string(),
+                model: None,
+                base_url: None,
+                api_key_env: None,
+                timeout_seconds: None,
+            },
+            profile: TranslationProfile::V1Fast,
+            max_segment_tokens: None,
+            context_tokens: None,
+            batch_target_tokens: None,
+            batch_max_items: None,
+            compact_prompts: None,
+            retry_failed_only: None,
+            adaptive_concurrency: None,
+            turbo_text_only: false,
+            concurrency: None,
+            max_attempts: None,
+            provider_max_attempts: None,
+            validation_max_attempts: None,
+            out: None,
+            qa: QaMode::Off,
+            qa_concurrency: 8,
+            qa_batch_target_tokens: None,
+            qa_model: None,
+            qa_provider: None,
+            qa_base_url: None,
+            qa_api_key_env: None,
+            double_check: DoubleCheckMode::Off,
+            double_check_model: None,
+            double_check_provider: None,
+            double_check_base_url: None,
+            double_check_api_key_env: None,
+            double_check_concurrency: 4,
+            double_check_batch_target_tokens: None,
+            auto_correct: false,
+            correction_rounds: 1,
+            fallback_provider: None,
+            fallback_model: None,
+            fallback_base_url: None,
+            fallback_api_key_env: None,
+            fallback_only: FallbackScope::Failed,
+            no_thinking: false,
+            model_context_tokens: None,
+            max_output_tokens: None,
+            batch_max_output_tokens: None,
+            json_mode: bookforge_core::JsonMode::Auto,
+            ui: crate::progress::UiMode::Quiet,
+            progress_jsonl: None,
+            provider_preset,
+        }
+    }
+
+    #[test]
+    fn explicit_cli_concurrency_overrides_provider_preset() {
+        let mut args =
+            translate_args_with_preset(Some(bookforge_core::ProviderPreset::OpenRouterPaidFast));
+        args.concurrency = Some(8);
+        let settings = resolve_settings(&args);
+        assert_eq!(settings.scheduler.concurrency, 8);
+    }
+
+    #[test]
+    fn explicit_cli_provider_max_attempts_overrides_provider_preset() {
+        let mut args =
+            translate_args_with_preset(Some(bookforge_core::ProviderPreset::OpenRouterPaidFast));
+        args.provider_max_attempts = Some(3);
+        let settings = resolve_settings(&args);
+        assert_eq!(settings.provider.provider_max_attempts, 3);
+    }
+
+    #[test]
+    fn provider_preset_runtime_is_reflected_in_resolved_settings() {
+        let args = translate_args_with_preset(Some(bookforge_core::ProviderPreset::OpenRouterFree));
+        let settings = resolve_settings(&args);
+        assert_eq!(settings.scheduler.concurrency, 2);
+        assert_eq!(
+            settings.provider.retry_after_policy,
+            bookforge_core::RetryAfterPolicy::RespectHeader
+        );
+        assert_eq!(settings.provider.max_idle_per_host, 8);
     }
 }

@@ -103,8 +103,8 @@ pub(crate) struct ProviderArgs {
     #[arg(long)]
     pub(crate) api_key_env: Option<String>,
 
-    #[arg(long, default_value_t = 120)]
-    pub(crate) timeout_seconds: u64,
+    #[arg(long)]
+    pub(crate) timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
