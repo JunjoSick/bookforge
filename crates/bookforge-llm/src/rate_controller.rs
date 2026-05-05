@@ -4,7 +4,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bookforge_core::ProgressSink;
 use tokio::sync::AcquireError;
 
 use crate::{AdaptiveLimiter, concurrency::AdaptivePermit};
@@ -15,7 +14,8 @@ pub struct RateControllerConfig {
     pub max_concurrency: usize,
     pub target_p95_latency_ms: u64,
     pub increase_interval: Duration,
-    pub decrease_interval: Duration,
+    pub rate_limit_decrease_interval: Duration,
+    pub generic_decrease_interval: Duration,
     pub observation_window: usize,
     pub stable_success_threshold: f64,
     pub rate_limit_cut_factor: f64,
@@ -32,7 +32,8 @@ impl RateControllerConfig {
             max_concurrency: max,
             target_p95_latency_ms: 30_000,
             increase_interval: Duration::from_secs(2),
-            decrease_interval: Duration::from_secs(2),
+            rate_limit_decrease_interval: Duration::from_millis(250),
+            generic_decrease_interval: Duration::from_secs(2),
             observation_window: 20,
             stable_success_threshold: 0.98,
             rate_limit_cut_factor: 0.50,
@@ -48,6 +49,7 @@ pub enum RequestStatus {
     RateLimited,
     Timeout,
     ConnectError,
+    ServerError,
     InvalidJson,
     Truncated,
     OtherError,
@@ -63,7 +65,8 @@ pub struct RequestObservation {
 struct RateControllerState {
     observations: VecDeque<RequestObservation>,
     last_increase: Instant,
-    last_decrease: Instant,
+    last_rate_limit_decrease: Instant,
+    last_generic_decrease: Instant,
 }
 
 pub struct ProviderRateController {
@@ -73,25 +76,26 @@ pub struct ProviderRateController {
 }
 
 impl ProviderRateController {
-    pub fn new(
-        limiter: Arc<AdaptiveLimiter>,
-        config: RateControllerConfig,
-        _progress: Arc<dyn ProgressSink>,
-    ) -> Self {
+    pub fn new(limiter: Arc<AdaptiveLimiter>, config: RateControllerConfig) -> Self {
         let now = Instant::now();
         Self {
             limiter,
             state: Mutex::new(RateControllerState {
                 observations: VecDeque::with_capacity(config.observation_window),
                 last_increase: now.checked_sub(config.increase_interval).unwrap_or(now),
-                last_decrease: now.checked_sub(config.decrease_interval).unwrap_or(now),
+                last_rate_limit_decrease: now
+                    .checked_sub(config.rate_limit_decrease_interval)
+                    .unwrap_or(now),
+                last_generic_decrease: now
+                    .checked_sub(config.generic_decrease_interval)
+                    .unwrap_or(now),
             }),
             config,
         }
     }
 
     pub fn with_limiter(limiter: Arc<AdaptiveLimiter>, config: RateControllerConfig) -> Self {
-        Self::new(limiter, config, Arc::new(bookforge_core::NullProgressSink))
+        Self::new(limiter, config)
     }
 
     pub async fn acquire(&self) -> Result<AdaptivePermit, AcquireError> {
@@ -116,24 +120,49 @@ impl ProviderRateController {
 
         match status {
             RequestStatus::RateLimited => {
-                self.cut_locked(
+                self.cut_locked_with_cooldown(
                     &mut state,
                     self.config.rate_limit_cut_factor,
                     "rate_limited",
+                    self.config.rate_limit_decrease_interval,
+                    CutKind::RateLimit,
                 );
             }
             RequestStatus::Timeout => {
-                self.cut_locked(&mut state, self.config.timeout_cut_factor, "timeout");
+                self.cut_locked_with_cooldown(
+                    &mut state,
+                    self.config.timeout_cut_factor,
+                    "timeout",
+                    self.config.generic_decrease_interval,
+                    CutKind::Generic,
+                );
             }
             RequestStatus::ConnectError => {
-                self.cut_locked(&mut state, self.config.timeout_cut_factor, "connect_error");
+                self.cut_locked_with_cooldown(
+                    &mut state,
+                    self.config.timeout_cut_factor,
+                    "connect_error",
+                    self.config.generic_decrease_interval,
+                    CutKind::Generic,
+                );
+            }
+            RequestStatus::ServerError => {
+                self.cut_locked_with_cooldown(
+                    &mut state,
+                    self.config.timeout_cut_factor,
+                    "server_error",
+                    self.config.generic_decrease_interval,
+                    CutKind::Generic,
+                );
             }
             RequestStatus::Ok => {
                 if self.rolling_p95_locked(&state) > self.config.target_p95_latency_ms {
-                    self.cut_locked(
+                    self.cut_locked_with_cooldown(
                         &mut state,
                         self.config.high_latency_cut_factor,
                         "high_latency",
+                        self.config.generic_decrease_interval,
+                        CutKind::Generic,
                     );
                 } else {
                     self.grow_if_stable_locked(&mut state);
@@ -143,12 +172,23 @@ impl ProviderRateController {
         }
     }
 
-    fn cut_locked(&self, state: &mut RateControllerState, factor: f64, reason: &str) {
+    fn cut_locked_with_cooldown(
+        &self,
+        state: &mut RateControllerState,
+        factor: f64,
+        reason: &str,
+        cooldown: Duration,
+        kind: CutKind,
+    ) {
         let now = Instant::now();
-        if now.duration_since(state.last_decrease) < self.config.decrease_interval {
+        let last_decrease = match kind {
+            CutKind::RateLimit => &mut state.last_rate_limit_decrease,
+            CutKind::Generic => &mut state.last_generic_decrease,
+        };
+        if now.duration_since(*last_decrease) < cooldown {
             return;
         }
-        state.last_decrease = now;
+        *last_decrease = now;
         let current = self.limiter.current();
         let target = ((current as f64) * factor).floor() as usize;
         self.limiter
@@ -197,6 +237,12 @@ impl ProviderRateController {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CutKind {
+    RateLimit,
+    Generic,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,7 +262,8 @@ mod tests {
                 max_concurrency: initial * 4,
                 target_p95_latency_ms: 1_000,
                 increase_interval: Duration::ZERO,
-                decrease_interval: Duration::from_secs(60),
+                rate_limit_decrease_interval: Duration::ZERO,
+                generic_decrease_interval: Duration::from_secs(60),
                 observation_window: 4,
                 stable_success_threshold: 0.98,
                 rate_limit_cut_factor: 0.50,
@@ -237,6 +284,13 @@ mod tests {
     fn rate_controller_reduces_on_timeout() {
         let controller = controller(8);
         controller.observe(RequestStatus::Timeout, 100);
+        assert_eq!(controller.current(), 6);
+    }
+
+    #[test]
+    fn rate_controller_reduces_on_server_error() {
+        let controller = controller(8);
+        controller.observe(RequestStatus::ServerError, 100);
         assert_eq!(controller.current(), 6);
     }
 
@@ -276,5 +330,21 @@ mod tests {
             controller.observe(RequestStatus::Ok, 100);
         }
         assert_eq!(controller.current(), 4);
+    }
+
+    #[test]
+    fn repeated_429s_can_reduce_more_than_once_with_short_rate_limit_cooldown() {
+        let controller = controller(16);
+        controller.observe(RequestStatus::RateLimited, 100);
+        controller.observe(RequestStatus::RateLimited, 100);
+        assert_eq!(controller.current(), 4);
+    }
+
+    #[test]
+    fn repeated_timeouts_respect_generic_decrease_cooldown() {
+        let controller = controller(16);
+        controller.observe(RequestStatus::Timeout, 100);
+        controller.observe(RequestStatus::Timeout, 100);
+        assert_eq!(controller.current(), 12);
     }
 }

@@ -968,7 +968,6 @@ where
         Some(Arc::new(ProviderRateController::new(
             limiter,
             RateControllerConfig::for_target(settings.scheduler.concurrency.max(1)),
-            progress.clone(),
         )))
     } else {
         None
