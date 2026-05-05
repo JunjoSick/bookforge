@@ -419,3 +419,153 @@ fn is_important_event(event: &ProgressEvent) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_auto_uses_progress_when_tty() {
+        assert_eq!(
+            resolve_render_mode(UiMode::Auto, true),
+            RenderMode::Progress
+        );
+    }
+
+    #[test]
+    fn ui_auto_uses_quiet_when_not_tty() {
+        assert_eq!(resolve_render_mode(UiMode::Auto, false), RenderMode::Quiet);
+    }
+
+    #[test]
+    fn ui_progress_always_uses_progress() {
+        assert_eq!(
+            resolve_render_mode(UiMode::Progress, false),
+            RenderMode::Progress
+        );
+        assert_eq!(
+            resolve_render_mode(UiMode::Progress, true),
+            RenderMode::Progress
+        );
+    }
+
+    #[test]
+    fn ui_json_always_uses_json_stdout() {
+        assert_eq!(
+            resolve_render_mode(UiMode::Json, false),
+            RenderMode::JsonStdout
+        );
+        assert_eq!(
+            resolve_render_mode(UiMode::Json, true),
+            RenderMode::JsonStdout
+        );
+    }
+
+    #[test]
+    fn ui_quiet_always_uses_quiet() {
+        assert_eq!(resolve_render_mode(UiMode::Quiet, false), RenderMode::Quiet);
+        assert_eq!(resolve_render_mode(UiMode::Quiet, true), RenderMode::Quiet);
+    }
+
+    /// With --progress-jsonl set, events are written to file regardless of
+    /// quiet mode (no progress bars, no stdout).
+    #[tokio::test]
+    async fn progress_jsonl_writes_file_in_quiet_mode() {
+        let path =
+            std::env::temp_dir().join(format!("bookforge-test-quiet-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (tx, rx) = mpsc::channel::<ProgressEvent>(16);
+
+        // Spawn reporter in quiet mode with JSONL file
+        let reporter_task = render_loop(
+            rx,
+            UiMode::Quiet,
+            Some(path.clone()),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let handle = tokio::spawn(reporter_task);
+
+        tx.send(ProgressEvent::StageStarted {
+            stage: "test".to_string(),
+            timestamp_ms: 0,
+        })
+        .await
+        .unwrap();
+        tx.send(ProgressEvent::StageFinished {
+            stage: "test".to_string(),
+            timestamp_ms: 0,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        handle.await.unwrap().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("StageStarted"));
+        assert!(content.contains("StageFinished"));
+    }
+
+    /// With --progress-jsonl and --ui json, both stdout JSON and file are emitted.
+    #[tokio::test]
+    async fn progress_jsonl_writes_file_in_json_stdout_mode() {
+        let path =
+            std::env::temp_dir().join(format!("bookforge-test-json-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (tx, rx) = mpsc::channel::<ProgressEvent>(16);
+
+        let reporter_task = render_loop(
+            rx,
+            UiMode::Json,
+            Some(path.clone()),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let handle = tokio::spawn(reporter_task);
+
+        tx.send(ProgressEvent::StageStarted {
+            stage: "json_test".to_string(),
+            timestamp_ms: 0,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        handle.await.unwrap().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("StageStarted"));
+    }
+
+    /// With --progress-jsonl and --ui progress, both bars and file are emitted.
+    #[tokio::test]
+    async fn progress_jsonl_writes_file_in_progress_mode() {
+        let path = std::env::temp_dir().join(format!(
+            "bookforge-test-progress-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (tx, rx) = mpsc::channel::<ProgressEvent>(16);
+
+        let reporter_task = render_loop(
+            rx,
+            UiMode::Progress,
+            Some(path.clone()),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let handle = tokio::spawn(reporter_task);
+
+        tx.send(ProgressEvent::Warning {
+            kind: "test".to_string(),
+            message: "testing".to_string(),
+            timestamp_ms: 0,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        handle.await.unwrap().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("Warning"));
+    }
+}

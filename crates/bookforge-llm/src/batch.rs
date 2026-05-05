@@ -1312,7 +1312,6 @@ fn render_batch_items(batch: &TranslationBatch) -> String {
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
-
 fn request_status_from_error(error: &LlmError) -> &'static str {
     match error {
         LlmError::HttpStatus { status: 429, .. } => "rate_limited",
@@ -1325,7 +1324,6 @@ fn request_status_from_error(error: &LlmError) -> &'static str {
         _ => "error",
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1795,5 +1793,54 @@ mod tests {
             error.contains(&missing_block_id),
             "error must name missing block id {missing_block_id}, got: {error}",
         );
+    }
+
+    #[tokio::test]
+    async fn batch_scheduler_does_not_deadlock_when_work_and_result_queues_are_bounded() {
+        // Create enough batches to stress both bounded work/result queues.
+        let mut blocks = Vec::new();
+        for i in 0..64 {
+            blocks.push(plain_block(&format!("text_{i}")));
+        }
+        let segment = make_segment("seg_stress", blocks, vec![]);
+        let segments = vec![segment];
+        let cfg = BatchConfig {
+            enabled: true,
+            target_tokens: 16_000,
+            max_items: 1,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+        // With max_items = 1, we get many small batches
+        assert!(batches.len() > 32, "need many batches to stress queues");
+
+        // Use MockProvider which handles concurrent requests safely.
+        use crate::provider::{MockMode, MockProvider};
+        let provider = MockProvider::new(MockMode::PrefixTarget, "Italian");
+        let telemetry = Arc::new(TelemetryLog::new());
+        let config = test_run_config();
+        let progress = Arc::new(bookforge_core::NullProgressSink);
+
+        let run = async {
+            translate_batches_with_callback(
+                provider,
+                batches,
+                &segments,
+                &config,
+                telemetry,
+                None,
+                None,
+                progress,
+                None,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("batch scheduler must not deadlock");
     }
 }
