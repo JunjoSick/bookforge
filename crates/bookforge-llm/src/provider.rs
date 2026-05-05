@@ -920,3 +920,74 @@ fn model_name_is_reasoning(model: &str) -> bool {
         || lower.starts_with("o3")
         || lower.starts_with("o4")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bookforge_core::RetryAfterPolicy;
+    use tokio::time::Duration;
+
+    #[test]
+    fn retry_policy_none_returns_none_delay() {
+        let delay = retry_delay(RetryAfterPolicy::None, 0, None, Duration::from_secs(30));
+        assert!(
+            delay.is_none(),
+            "RetryAfterPolicy::None must return None delay"
+        );
+    }
+
+    #[test]
+    fn retry_policy_fixed_returns_750ms() {
+        let delay = retry_delay(RetryAfterPolicy::Fixed, 0, None, Duration::from_secs(30));
+        assert_eq!(delay, Some(Duration::from_millis(750)));
+    }
+
+    #[test]
+    fn retry_policy_caps_to_max_backoff() {
+        let delay = retry_delay(
+            RetryAfterPolicy::JitteredExponential,
+            20, // large attempt index yields huge exponential delay
+            None,
+            Duration::from_secs(2),
+        );
+        if let Some(d) = delay {
+            assert!(
+                d <= Duration::from_secs(2),
+                "delay {d:?} must be capped at 2s"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_policy_none_apply_retry_delay_returns_error() {
+        let token = CancellationToken::new();
+        let result = apply_retry_delay(
+            &token,
+            RetryAfterPolicy::None,
+            0,
+            None,
+            Duration::from_secs(30),
+            LlmError::Provider("test error".to_string()),
+        )
+        .await;
+        assert!(result.is_err(), "None policy must return error, not sleep");
+    }
+
+    #[tokio::test]
+    async fn cancel_token_aborts_cancelable() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = cancelable(&token, std::future::pending::<()>()).await;
+        assert!(result.is_err(), "cancelled token must abort cancelable");
+    }
+
+    #[tokio::test]
+    async fn cancel_token_aborts_cancelable_sleep() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = cancelable_sleep(&token, Duration::from_secs(3600)).await;
+        assert!(result.is_err(), "cancelled token must abort sleep");
+    }
+}

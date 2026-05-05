@@ -184,7 +184,10 @@ async fn run_provider_doctor(
         json_mode: bookforge_core::JsonMode::Auto,
     };
 
-    let provider = match OpenAiCompatibleProvider::new(config.clone()) {
+    let provider = match OpenAiCompatibleProvider::new_with_cancel(
+        config.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    ) {
         Ok(p) => p,
         Err(e) => {
             println!("  Provider init: FAILED ({e})");

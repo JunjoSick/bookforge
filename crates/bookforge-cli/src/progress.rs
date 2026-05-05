@@ -173,6 +173,16 @@ impl JsonlFileWriter {
     }
 
     fn write_event(&mut self, event: &ProgressEvent) -> Result<()> {
+        // Lazy open: if no path was explicitly provided, use default
+        // job-based path when JobCreated arrives.
+        if self.path.is_none() && self.writer.is_none() && !self.failed
+            && let ProgressEvent::JobCreated { job_id, .. } = event
+        {
+            let run_dir = PathBuf::from(".bookforge/runs").join(job_id);
+            std::fs::create_dir_all(&run_dir)?;
+            self.path = Some(run_dir.join("events.jsonl"));
+        }
+
         self.ensure_open()?;
         let Some(writer) = self.writer.as_mut() else {
             return Ok(());
@@ -567,5 +577,80 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("Warning"));
+    }
+
+    #[test]
+    fn critical_events_are_correctly_identified() {
+        // Error is critical
+        assert!(is_important_event(&ProgressEvent::Error {
+            kind: "test".into(),
+            message: "test".into(),
+            timestamp_ms: 0,
+        }));
+        // Warning is critical
+        assert!(is_important_event(&ProgressEvent::Warning {
+            kind: "test".into(),
+            message: "test".into(),
+            timestamp_ms: 0,
+        }));
+        // BatchRepairFinished is critical
+        assert!(is_important_event(&ProgressEvent::BatchRepairFinished {
+            repaired_items: 0,
+            still_failed_items: 1,
+            timestamp_ms: 0,
+        }));
+        // CheckpointFlushed is critical
+        assert!(is_important_event(&ProgressEvent::CheckpointFlushed {
+            segment_id: None,
+            flushed_count: 1,
+            latency_ms: None,
+            timestamp_ms: 0,
+        }));
+        // TranslationFinished is critical
+        assert!(is_important_event(&ProgressEvent::TranslationFinished {
+            succeeded: 0,
+            cached: 0,
+            needs_review: 0,
+            failed: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            elapsed_ms: 0,
+            timestamp_ms: 0,
+        }));
+        // RequestFinished with non-ok status is critical
+        assert!(is_important_event(&ProgressEvent::RequestFinished {
+            request_id: "x".into(),
+            batch_id: None,
+            segment_id: None,
+            status: "rate_limited".into(),
+            latency_ms: 0,
+            status_code: None,
+            finish_reason: None,
+            retry_count: 0,
+            input_tokens: None,
+            output_tokens: None,
+            error_kind: None,
+            timestamp_ms: 0,
+        }));
+        // RequestFinished with ok status is NOT critical
+        assert!(!is_important_event(&ProgressEvent::RequestFinished {
+            request_id: "x".into(),
+            batch_id: None,
+            segment_id: None,
+            status: "ok".into(),
+            latency_ms: 0,
+            status_code: None,
+            finish_reason: None,
+            retry_count: 0,
+            input_tokens: None,
+            output_tokens: None,
+            error_kind: None,
+            timestamp_ms: 0,
+        }));
+        // StageStarted is NOT critical
+        assert!(!is_important_event(&ProgressEvent::StageStarted {
+            stage: "test".into(),
+            timestamp_ms: 0,
+        }));
     }
 }
