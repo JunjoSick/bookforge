@@ -30,6 +30,9 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     if let Some(ref base_url) = job.base_url {
         println!("Base URL: {base_url}");
     }
+    if let Some(ref api_key_env) = job.api_key_env {
+        println!("API key env: {api_key_env}");
+    }
     println!();
     println!("Segments:");
     println!("  total:       {}", summary.total_segments);
@@ -49,6 +52,18 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
         std::path::PathBuf::from(format!(".bookforge/runs/{}/events.jsonl", args.job_id));
     if event_log_path.exists() {
         println!("Event log: {}", event_log_path.display());
+    }
+    let report_path =
+        std::path::PathBuf::from(format!(".bookforge/runs/{}/report.md", args.job_id));
+    if report_path.exists() {
+        println!("Report: {}", report_path.display());
+    }
+
+    if matches!(
+        summary.status.as_str(),
+        "failed" | "interrupted" | "retry_pending"
+    ) {
+        println!("Resume: bookforge resume {}", args.job_id);
     }
 
     Ok(())

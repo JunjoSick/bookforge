@@ -169,7 +169,7 @@ where
         ));
     }
 
-    let library = Arc::new(PromptLibrary::embedded());
+    let library = Arc::new(PromptLibrary::global().clone());
     let provider = Arc::new(provider);
     let config = Arc::new(config.clone());
     let semaphore = Arc::new(Semaphore::new(config.scheduler.concurrency));
@@ -221,7 +221,7 @@ pub async fn qa_segments<P>(
 where
     P: LlmProvider,
 {
-    let library = PromptLibrary::embedded();
+    let library = PromptLibrary::global();
     let by_segment = segments
         .iter()
         .map(|segment| (segment.id.0.as_str(), segment))
@@ -235,7 +235,7 @@ where
         let Some(segment) = by_segment.get(translation.segment_id.0.as_str()) else {
             continue;
         };
-        match request_qa(&provider, &library, segment, translation, config).await {
+        match request_qa(&provider, library, segment, translation, config).await {
             Ok(review) => reviews.push(review),
             Err(error) => reviews.push(QaSegmentReview {
                 segment_id: translation.segment_id.clone(),

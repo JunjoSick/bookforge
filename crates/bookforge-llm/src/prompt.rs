@@ -425,6 +425,23 @@ mod tests {
     }
 
     #[test]
+    fn prompt_library_global_returns_same_instance() {
+        let first = PromptLibrary::global() as *const PromptLibrary;
+        let second = PromptLibrary::global() as *const PromptLibrary;
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn prompt_library_global_contains_required_templates() {
+        let library = PromptLibrary::global();
+        assert_eq!(library.plain.name, "translate_segment");
+        assert_eq!(library.batch_plain.name, "translate_batch_plain");
+        assert_eq!(library.qa.name, "qa_segment");
+        assert_eq!(library.double_check_batch.name, "double_check_batch");
+        assert_eq!(library.correct_batch.name, "correct_batch");
+    }
+
+    #[test]
     fn compact_batch_prompt_is_shorter_than_standard_prompt() {
         let library = PromptLibrary::embedded();
         let standard = library.batch_plain.system.len() + library.batch_plain.user.len();

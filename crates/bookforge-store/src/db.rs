@@ -418,12 +418,20 @@ impl JobStore {
         self.touch_job(job_id, "succeeded")
     }
 
+    pub fn mark_job_succeeded(&self, job_id: &str) -> Result<()> {
+        self.mark_job_complete(job_id)
+    }
+
     pub fn mark_job_needs_review(&self, job_id: &str) -> Result<()> {
         self.touch_job(job_id, "needs_review")
     }
 
     pub fn mark_job_interrupted(&self, job_id: &str) -> Result<()> {
         self.touch_job(job_id, "interrupted")
+    }
+
+    pub fn mark_job_failed(&self, job_id: &str) -> Result<()> {
+        self.touch_job(job_id, "failed")
     }
 
     pub fn mark_segment_failed(&self, job_id: &str, segment_id: &str, error: &str) -> Result<()> {
@@ -457,6 +465,47 @@ impl JobStore {
         }
         self.touch_job(job_id, "failed")?;
         Ok(())
+    }
+
+    pub fn mark_unfinished_segments_failed(
+        &self,
+        job_id: &str,
+        candidate_segment_ids: &[String],
+        error: &str,
+    ) -> Result<usize> {
+        const SQLITE_IN_CHUNK_SIZE: usize = 900;
+        let mut updated = 0;
+
+        for chunk in candidate_segment_ids.chunks(SQLITE_IN_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE segments
+                 SET status = 'failed', attempts = attempts + 1, error = ?
+                 WHERE job_id = ?
+                   AND id IN ({placeholders})
+                   AND status NOT IN ('succeeded', 'skipped_cached', 'needs_review')"
+            );
+
+            let conn = self.conn.borrow();
+            let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(chunk.len() + 2);
+            params.push(&error);
+            params.push(&job_id);
+            for id in chunk {
+                params.push(id);
+            }
+            updated += conn.execute(&sql, params.as_slice())?;
+        }
+
+        if updated > 0 {
+            self.touch_job(job_id, "failed")?;
+        }
+        Ok(updated)
     }
 
     pub fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>> {
@@ -1200,6 +1249,117 @@ mod tests {
 
         let _ = fs::remove_file(input_path);
         (store, job, seg)
+    }
+
+    #[test]
+    fn mark_unfinished_segments_failed_preserves_terminal_segments() {
+        let db_path = temp_path("unfinished_preserve.sqlite");
+        let input_path = temp_path("input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+            })
+            .expect("job should be created");
+        let segments = vec![
+            segment("seg_succeeded", 0),
+            segment("seg_cached", 1),
+            segment("seg_review", 2),
+            segment("seg_queued", 3),
+            segment("seg_retry", 4),
+        ];
+        store
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "test_ns")
+            .expect("segments should insert");
+        store
+            .save_translation(SaveTranslation {
+                job_id: &job.id,
+                segment_id: "seg_succeeded",
+                translated_text: "Done",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "Done".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                input_tokens: None,
+                output_tokens: None,
+            })
+            .expect("succeeded segment should save");
+        store
+            .save_cached_translation(SaveCachedTranslation {
+                job_id: &job.id,
+                segment_id: "seg_cached",
+                translated_text: "Cached",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000001".to_string()),
+                    text: "Cached".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+            })
+            .expect("cached segment should save");
+        store
+            .save_needs_review(SaveNeedsReview {
+                job_id: &job.id,
+                segment_id: "seg_review",
+                preserved_text: "Needs review",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000002".to_string()),
+                    text: "Needs review".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                error: "qa issue",
+                input_tokens: None,
+                output_tokens: None,
+            })
+            .expect("needs-review segment should save");
+        store
+            .retry_segments(&job.id, RetryScope::Failed)
+            .expect("retry with no failed segments should be harmless");
+        {
+            let conn = store.conn.borrow();
+            conn.execute(
+                "UPDATE segments SET status = 'retry_pending' WHERE job_id = ?1 AND id = 'seg_retry'",
+                params![job.id],
+            )
+            .expect("test status update should work");
+        }
+
+        let candidate_ids = segments
+            .iter()
+            .map(|segment| segment.id.0.clone())
+            .collect::<Vec<_>>();
+        let changed = store
+            .mark_unfinished_segments_failed(&job.id, &candidate_ids, "run failed")
+            .expect("unfinished segments should be marked failed");
+        assert_eq!(changed, 2);
+
+        let records = store.segment_records(&job.id).expect("records should load");
+        let statuses = records
+            .into_iter()
+            .map(|record| (record.id, record.status))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(statuses["seg_succeeded"], "succeeded");
+        assert_eq!(statuses["seg_cached"], "skipped_cached");
+        assert_eq!(statuses["seg_review"], "needs_review");
+        assert_eq!(statuses["seg_queued"], "failed");
+        assert_eq!(statuses["seg_retry"], "failed");
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
     }
 
     #[test]

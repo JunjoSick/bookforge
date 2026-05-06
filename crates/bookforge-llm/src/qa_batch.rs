@@ -28,7 +28,7 @@ pub async fn qa_segments_parallel<P>(
 where
     P: LlmProvider,
 {
-    let library = Arc::new(PromptLibrary::embedded());
+    let library = Arc::new(PromptLibrary::global().clone());
     let provider = Arc::new(provider);
     let semaphore = Arc::new(Semaphore::new(qa_config.concurrency.max(1)));
     let mut tasks = JoinSet::new();

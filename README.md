@@ -16,6 +16,7 @@ MVP functionality is implemented:
 - Bounded parallel segment translation with `--concurrency`
 - SQLite checkpoint store
 - Resume and retry commands
+- Status and tail commands for persisted jobs
 - Segment-level cache reuse for compatible prior translations
 - QA reports in JSON and Markdown
 - Optional LLM QA review pass
@@ -73,6 +74,26 @@ cargo run -p bookforge-cli -- translate book.epub \
   --out book.it.epub
 ```
 
+Translate with the v1 fast preset:
+
+```bash
+cargo run -p bookforge-cli -- translate book.epub \
+  --target Italian \
+  --provider-preset openrouter-paid-fast \
+  --profile v1-fast \
+  --ui progress \
+  --out book.it.epub
+```
+
+Check provider and storage health:
+
+```bash
+cargo run -p bookforge-cli -- doctor --storage
+cargo run -p bookforge-cli -- doctor \
+  --provider openrouter \
+  --model google/gemini-2.5-flash-lite
+```
+
 Translate with DeepSeek:
 
 ```bash
@@ -107,6 +128,13 @@ Resume a job:
 
 ```bash
 cargo run -p bookforge-cli -- resume <job-id> --timeout-seconds 120
+```
+
+Inspect persisted job state and recent events:
+
+```bash
+cargo run -p bookforge-cli -- status <job-id>
+cargo run -p bookforge-cli -- tail <job-id> --lines 40
 ```
 
 Retry failed or review-needed segments:
@@ -144,6 +172,29 @@ Runtime state is stored in:
 ```
 
 That path is ignored by git. Segment translations are persisted as each segment completes. New jobs reuse compatible cached translations when the source hash, prompt version, provider, model, source language, and target language match.
+
+Progress events can be written in every UI mode:
+
+```bash
+cargo run -p bookforge-cli -- translate book.epub \
+  --target Italian \
+  --provider mock \
+  --model mock-prefix-target \
+  --ui json \
+  --progress-jsonl .bookforge/runs/example/events.jsonl
+```
+
+Known limitations: resume depends on the original input path remaining available, provider API keys are read from environment variables, and validation is intentionally pragmatic rather than a full EPUBCheck replacement.
+
+## Benchmarks
+
+Run the mock release smoke benchmark with:
+
+```bash
+scripts/bench-mock.sh
+```
+
+See `docs/benchmarks.md` for metrics to capture in real-provider runs.
 
 ## Secrets And Local Tests
 

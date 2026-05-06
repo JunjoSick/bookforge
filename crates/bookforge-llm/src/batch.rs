@@ -1013,7 +1013,7 @@ where
     P: LlmProvider,
     F: FnMut(&SegmentTranslation) -> Result<(), LlmError>,
 {
-    let library = Arc::new(PromptLibrary::embedded());
+    let library = Arc::new(PromptLibrary::global().clone());
     let provider = Arc::new(provider);
     let config = Arc::new(config.clone());
     let concurrency = config.scheduler.concurrency.max(1);
@@ -2444,7 +2444,7 @@ mod tests {
     async fn batch_length_finish_reason_returns_invalid_response() {
         let batch = make_two_item_batch();
         let provider = Arc::new(StubProvider::new(StubBehavior::FinishLength));
-        let library = Arc::new(PromptLibrary::embedded());
+        let library = Arc::new(PromptLibrary::global().clone());
         let config = test_run_config();
 
         let result = translate_one_batch(provider, library, batch, &config).await;
@@ -2462,7 +2462,7 @@ mod tests {
         let provider = Arc::new(StubProvider::new(StubBehavior::ErrInvalid(
             "output was truncated".to_string(),
         )));
-        let library = Arc::new(PromptLibrary::embedded());
+        let library = Arc::new(PromptLibrary::global().clone());
         let config = test_run_config();
 
         let result = translate_one_batch(provider, library, batch, &config).await;
