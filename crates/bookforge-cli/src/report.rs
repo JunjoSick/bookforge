@@ -11,6 +11,7 @@ use bookforge_store::{JobRecord, JobSummary, SegmentRecord};
 use serde::Serialize;
 
 use crate::cost::estimate_cost_usd;
+use crate::performance::RunPerformanceSummary;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReportFiles {
@@ -26,6 +27,7 @@ pub(crate) struct ReportInput<'a> {
     pub segment_records: &'a [SegmentRecord],
     pub translations: &'a [SegmentTranslation],
     pub qa_reviews: &'a [QaSegmentReview],
+    pub performance: Option<RunPerformanceSummary>,
     pub output: &'a Path,
 }
 
@@ -50,6 +52,7 @@ struct QaReport {
     estimated_cost: Option<f64>,
     qa_reviewed_segments: usize,
     qa_warnings: Vec<QaWarning>,
+    performance: Option<RunPerformanceSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +90,7 @@ pub(crate) fn write_report(input: ReportInput<'_>) -> Result<ReportFiles> {
         ),
         qa_reviewed_segments: input.qa_reviews.len(),
         qa_warnings: qa_warnings(&input),
+        performance: input.performance.clone(),
     };
 
     if let Some(parent) = files.json.parent() {
@@ -97,7 +101,7 @@ pub(crate) fn write_report(input: ReportInput<'_>) -> Result<ReportFiles> {
     Ok(files)
 }
 
-fn report_paths(output: &Path) -> ReportFiles {
+pub(crate) fn report_paths(output: &Path) -> ReportFiles {
     let parent = output.parent().unwrap_or_else(|| Path::new(""));
     let stem = output
         .file_stem()
@@ -402,5 +406,46 @@ fn render_markdown(report: &QaReport) -> String {
         }
     }
 
+    output.push_str("\n## Performance\n\n");
+    if let Some(perf) = &report.performance {
+        output.push_str(&format!("- Requests: {}\n", perf.request_count));
+        output.push_str(&format!(
+            "- Latency p50/p95: {}/{} ms\n",
+            optional_u64(perf.p50_latency_ms),
+            optional_u64(perf.p95_latency_ms)
+        ));
+        output.push_str(&format!("- Retries: {}\n", perf.retries));
+        output.push_str(&format!(
+            "- 429/timeouts/server errors: {}/{}/{}\n",
+            perf.rate_limited, perf.timeouts, perf.server_errors
+        ));
+        output.push_str(&format!(
+            "- Invalid responses/truncations: {}/{}\n",
+            perf.invalid_responses, perf.truncations
+        ));
+        output.push_str(&format!(
+            "- Batch splits/repair batches/repair failures: {}/{}/{}\n",
+            perf.batch_splits, perf.repair_batches, perf.repair_failures
+        ));
+        output.push_str(&format!(
+            "- Checkpoint flushes: {}\n",
+            perf.checkpoint_flushes
+        ));
+        output.push_str(&format!(
+            "- Blocks/min: {}\n",
+            perf.blocks_per_minute
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "n/a".to_string())
+        ));
+    } else {
+        output.push_str("Performance data unavailable: no event log was available.\n");
+    }
+
     output
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
 }

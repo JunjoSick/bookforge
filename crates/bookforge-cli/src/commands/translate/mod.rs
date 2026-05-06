@@ -34,12 +34,14 @@ mod cache;
 mod checkpointing;
 mod reporting;
 mod settings;
+mod snapshot;
 
 pub use args::TranslateArgs;
 pub(crate) use cache::{CacheContext, apply_cached_translations, pending_segments_for_job};
 use checkpointing::finalize_writer;
 use reporting::print_summary_rebuild_and_report;
 use settings::{apply_provider_preset, resolve_settings, retry_amplification_warning};
+use snapshot::persist_snapshot;
 
 pub async fn run(
     args: TranslateArgs,
@@ -92,8 +94,15 @@ pub async fn run(
     let run_result = async {
         match config.provider.as_str() {
             "mock" => {
-                run_mock_translation(&args.input, &config, &effective_provider, &args, &settings)
-                    .await
+                run_mock_translation(
+                    &args.input,
+                    &config,
+                    &effective_provider,
+                    &args,
+                    &settings,
+                    progress_sink,
+                )
+                .await
             }
             "deepseek" | "openrouter" | "openai-compatible" => {
                 run_openai_compatible_translation(
@@ -139,12 +148,30 @@ async fn finalize_reporter<T>(
 async fn run_mock_translation(
     input: &PathBuf,
     config: &TranslationConfig,
-    _provider_args: &CliProviderArgs,
-    _cli_args: &TranslateArgs,
+    provider_args: &CliProviderArgs,
+    cli_args: &TranslateArgs,
     settings: &ResolvedRunSettings,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
+    progress.emit(bookforge_core::ProgressEvent::StageStarted {
+        stage: "read_epub".to_string(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
     let book = read_epub(input)?;
+    progress.emit(bookforge_core::ProgressEvent::StageFinished {
+        stage: "read_epub".to_string(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
+    progress.emit(bookforge_core::ProgressEvent::StageStarted {
+        stage: "segmentation".to_string(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
     let segments = build_segments(&book, &settings.segmentation)?;
+    progress.emit(bookforge_core::ProgressEvent::SegmentationFinished {
+        segment_count: segments.len(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
     let model = config
         .model
         .clone()
@@ -162,6 +189,12 @@ async fn run_mock_translation(
         api_key_env: None,
     })?;
     println!("Job: {}", job.id);
+    progress.emit(bookforge_core::ProgressEvent::JobCreated {
+        job_id: job.id.clone(),
+        input_path: input.display().to_string(),
+        output_path: config.output.display().to_string(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
     let cache_namespace = compute_cache_namespace(
         settings.segmentation.max_segment_tokens,
         settings.segmentation.context_tokens,
@@ -169,6 +202,20 @@ async fn run_mock_translation(
         settings.batch.enabled,
         prompt_version,
     );
+    persist_snapshot(
+        &store,
+        &job,
+        input,
+        &config.output,
+        provider_args,
+        cli_args,
+        settings,
+        prompt_version,
+        &cache_namespace,
+        &model,
+        None,
+        None,
+    )?;
     store.insert_segments(
         &job.id,
         &segments,
@@ -206,7 +253,12 @@ async fn run_mock_translation(
         },
     )?;
     let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
-    let writer = CheckpointWriter::spawn(store.path().to_path_buf(), Arc::new(NullProgressSink));
+    progress.emit(bookforge_core::ProgressEvent::CacheScanFinished {
+        hits: translations.len(),
+        misses: pending_segments.len(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
+    let writer = CheckpointWriter::spawn(store.path().to_path_buf(), progress.clone());
     let sender = writer.sender();
     let translation_result = translate_and_checkpoint(
         provider.clone(),
@@ -231,7 +283,7 @@ async fn run_mock_translation(
         &translations,
         &run_config,
         &settings.qa,
-        _cli_args.qa,
+        cli_args.qa,
     )
     .await;
     mark_job_finished(&store, &job.id, &translations)?;
@@ -244,6 +296,23 @@ async fn run_mock_translation(
         &qa_reviews,
         config,
     )?;
+    let summary = store
+        .summary(&job.id)?
+        .ok_or_else(|| anyhow::anyhow!("job '{}' summary unavailable", job.id))?;
+    progress.emit(bookforge_core::ProgressEvent::ArtifactWritten {
+        path: config.output.display().to_string(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
+    progress.emit(bookforge_core::ProgressEvent::TranslationFinished {
+        succeeded: summary.succeeded,
+        cached: summary.cached,
+        needs_review: summary.needs_review,
+        failed: summary.failed,
+        input_tokens: summary.input_tokens,
+        output_tokens: summary.output_tokens,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
 
     Ok(())
 }
@@ -267,6 +336,7 @@ async fn run_openai_compatible_translation(
     cancel_token: &tokio_util::sync::CancellationToken,
     progress: Arc<dyn bookforge_core::ProgressSink>,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
     let mut provider_config = match provider_config(
         &config.provider,
         config.model.as_deref(),
@@ -369,6 +439,20 @@ async fn run_openai_compatible_translation(
         settings.batch.enabled,
         run_prompt_version,
     );
+    persist_snapshot(
+        &store,
+        &job,
+        input,
+        &config.output,
+        provider_args,
+        cli_args,
+        settings,
+        run_prompt_version,
+        &cache_namespace,
+        &model,
+        Some(provider_config.base_url.clone()),
+        Some(provider_config.api_key_env.clone()),
+    )?;
     store.insert_segments(
         &job.id,
         &segments,
@@ -466,6 +550,8 @@ async fn run_openai_compatible_translation(
             &run_config,
             config,
             &book,
+            progress.clone(),
+            started,
         )
         .await?;
     } else {
@@ -522,6 +608,8 @@ async fn run_openai_compatible_translation(
             &run_config,
             config,
             &book,
+            progress.clone(),
+            started,
         )
         .await?;
     }
@@ -556,6 +644,8 @@ async fn finish_translation_pipeline(
     run_config: &TranslationRunConfig,
     config: &TranslationConfig,
     book: &bookforge_core::ir::Book,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
+    started: std::time::Instant,
 ) -> Result<()> {
     translations.sort_by_key(|t| t.ordinal);
 
@@ -603,6 +693,23 @@ async fn finish_translation_pipeline(
         &qa_reviews,
         config,
     )?;
+    let summary = store
+        .summary(&job.id)?
+        .ok_or_else(|| anyhow::anyhow!("job '{}' summary unavailable", job.id))?;
+    progress.emit(bookforge_core::ProgressEvent::ArtifactWritten {
+        path: config.output.display().to_string(),
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
+    progress.emit(bookforge_core::ProgressEvent::TranslationFinished {
+        succeeded: summary.succeeded,
+        cached: summary.cached,
+        needs_review: summary.needs_review,
+        failed: summary.failed,
+        input_tokens: summary.input_tokens,
+        output_tokens: summary.output_tokens,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
 
     Ok(())
 }

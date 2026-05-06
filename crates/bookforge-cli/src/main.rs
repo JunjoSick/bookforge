@@ -1,6 +1,7 @@
 mod checkpoint;
 mod commands;
 mod cost;
+mod performance;
 mod progress;
 mod report;
 

@@ -9,6 +9,7 @@ use bookforge_store::{JobRecord, JobStore};
 
 use crate::{
     cost::estimate_cost_usd,
+    performance::performance_summary_from_events,
     report::{ReportInput, write_report},
 };
 
@@ -33,16 +34,25 @@ pub fn print_summary_rebuild_and_report(
     let summary = store
         .summary(&job.id)?
         .ok_or_else(|| anyhow::anyhow!("job '{}' was not found after translation", job.id))?;
+    let report_job = store
+        .get_job(&job.id)?
+        .ok_or_else(|| anyhow::anyhow!("job '{}' was not found after translation", job.id))?;
     let segment_records = store.segment_records(&job.id)?;
+    let performance = report_job
+        .events_path
+        .as_ref()
+        .and_then(|path| performance_summary_from_events(path).ok().flatten());
     let report = write_report(ReportInput {
-        job,
+        job: &report_job,
         summary: &summary,
         segments,
         segment_records: &segment_records,
         translations,
         qa_reviews,
+        performance,
         output: &config.output,
     })?;
+    store.update_job_report_paths(&job.id, &report.json, &report.markdown)?;
 
     println!(
         "Translated: {}/{} segments",
