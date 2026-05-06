@@ -20,6 +20,7 @@ pub fn block_translations(translations: &[SegmentTranslation]) -> Vec<BlockTrans
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn print_summary_rebuild_and_report(
     store: &JobStore,
     job: &JobRecord,
@@ -28,6 +29,7 @@ pub fn print_summary_rebuild_and_report(
     translations: &[SegmentTranslation],
     qa_reviews: &[QaSegmentReview],
     config: &TranslationConfig,
+    print_stdout: bool,
 ) -> Result<()> {
     let block_translations = block_translations(translations);
     rebuild_epub(book, &block_translations, &config.output)?;
@@ -54,26 +56,28 @@ pub fn print_summary_rebuild_and_report(
     })?;
     store.update_job_report_paths(&job.id, &report.json, &report.markdown)?;
 
-    println!(
-        "Translated: {}/{} segments",
-        summary.succeeded, summary.total_segments
-    );
-    println!("Cached: {}", summary.cached);
-    println!("Retried: {}", summary.retried);
-    println!("Needs review: {}", summary.needs_review);
-    println!("Failed: {}", summary.failed);
-    println!("Input tokens: {}", summary.input_tokens);
-    println!("Output tokens: {}", summary.output_tokens);
-    if let Some(cost) = estimate_cost_usd(
-        &job.provider,
-        &job.model,
-        summary.input_tokens,
-        summary.output_tokens,
-    ) {
-        println!("Estimated cost: ${cost:.6}");
+    if print_stdout {
+        println!(
+            "Translated: {}/{} segments",
+            summary.succeeded, summary.total_segments
+        );
+        println!("Cached: {}", summary.cached);
+        println!("Retried: {}", summary.retried);
+        println!("Needs review: {}", summary.needs_review);
+        println!("Failed: {}", summary.failed);
+        println!("Input tokens: {}", summary.input_tokens);
+        println!("Output tokens: {}", summary.output_tokens);
+        if let Some(cost) = estimate_cost_usd(
+            &job.provider,
+            &job.model,
+            summary.input_tokens,
+            summary.output_tokens,
+        ) {
+            println!("Estimated cost: ${cost:.6}");
+        }
+        println!("Output: {}", config.output.display());
+        println!("Report: {}", report.markdown.display());
     }
-    println!("Output: {}", config.output.display());
-    println!("Report: {}", report.markdown.display());
 
     Ok(())
 }

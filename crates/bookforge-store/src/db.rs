@@ -1447,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_round_trips_and_excludes_api_key_values() {
+    fn job_config_snapshot_round_trips_through_store() {
         let db_path = temp_path("snapshot.sqlite");
         let input_path = temp_path("input.epub");
         fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
@@ -1492,9 +1492,6 @@ mod tests {
             .expect("snapshot should load")
             .expect("snapshot should exist");
         assert_eq!(loaded, snapshot);
-        let json = serde_json::to_string(&loaded).expect("snapshot should serialize");
-        assert!(json.contains("OPENROUTER_API_KEY"));
-        assert!(!json.contains("sk-live-secret"));
 
         let reloaded_job = store
             .get_job(&job.id)
@@ -1507,6 +1504,75 @@ mod tests {
             snapshot.report_markdown_path
         );
 
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn job_config_snapshot_does_not_store_api_key_value() {
+        let db_path = temp_path("snapshot_secret.sqlite");
+        let input_path = temp_path("input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+        let api_key_env = "BOOKFORGE_TEST_API_KEY_VALUE_NOT_STORED";
+        let api_key_value = "sk-live-secret-that-must-not-be-persisted";
+        // This test uses a unique process-local env var and verifies snapshot
+        // serialization never reads the value.
+        unsafe {
+            std::env::set_var(api_key_env, api_key_value);
+        }
+
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "openrouter",
+                model: "model",
+                base_url: Some("https://example.test/v1"),
+                api_key_env: Some(api_key_env),
+            })
+            .expect("job should be created");
+        let settings = bookforge_core::TranslationProfile::Balanced.resolve();
+        let snapshot = RunConfigSnapshot {
+            input_path: input_path.clone(),
+            output_path: temp_path("translated.epub"),
+            events_path: Some(temp_path("events.jsonl")),
+            report_json_path: Some(temp_path("report.json")),
+            report_markdown_path: Some(temp_path("report.md")),
+            source_language: Some("English".to_string()),
+            target_language: "Italian".to_string(),
+            provider: "openrouter".to_string(),
+            model: "model".to_string(),
+            base_url: Some("https://example.test/v1".to_string()),
+            api_key_env: Some(api_key_env.to_string()),
+            profile: settings.profile,
+            provider_preset: None,
+            prompt_version: "batch_v1".to_string(),
+            cache_namespace: "cache_ns".to_string(),
+            settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
+        };
+
+        store
+            .update_job_config_snapshot(&job.id, &snapshot)
+            .expect("snapshot should persist");
+        let raw_json = {
+            let conn = store.conn.borrow();
+            conn.query_row(
+                "SELECT config_json FROM jobs WHERE id = ?1",
+                params![job.id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("raw snapshot JSON should load")
+        };
+
+        assert!(raw_json.contains(api_key_env));
+        assert!(!raw_json.contains(api_key_value));
+
+        unsafe {
+            std::env::remove_var(api_key_env);
+        }
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(input_path);
     }
@@ -1717,6 +1783,178 @@ mod tests {
         assert_eq!(statuses["seg_queued"], "failed");
         assert_eq!(statuses["seg_retry"], "failed");
 
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn mark_unfinished_segments_failed_marks_only_resumable_segments() {
+        let db_path = temp_path("unfinished_resumable_only.sqlite");
+        let input_path = temp_path("input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+            })
+            .expect("job should be created");
+        let segments = vec![
+            segment("seg_succeeded", 0),
+            segment("seg_cached", 1),
+            segment("seg_review", 2),
+            segment("seg_failed", 3),
+            segment("seg_retry", 4),
+            segment("seg_queued", 5),
+        ];
+        store
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "test_ns")
+            .expect("segments should insert");
+        {
+            let conn = store.conn.borrow();
+            for (id, status) in [
+                ("seg_succeeded", "succeeded"),
+                ("seg_cached", "skipped_cached"),
+                ("seg_review", "needs_review"),
+                ("seg_failed", "failed"),
+                ("seg_retry", "retry_pending"),
+                ("seg_queued", "queued"),
+            ] {
+                conn.execute(
+                    "UPDATE segments SET status = ?1 WHERE job_id = ?2 AND id = ?3",
+                    params![status, job.id, id],
+                )
+                .expect("status should update");
+            }
+        }
+
+        let candidate_ids = segments
+            .iter()
+            .map(|segment| segment.id.0.clone())
+            .collect::<Vec<_>>();
+        let changed = store
+            .mark_unfinished_segments_failed(&job.id, &candidate_ids, "run failed")
+            .expect("unfinished segments should be marked failed");
+
+        assert_eq!(changed, 3);
+        let records = store.segment_records(&job.id).expect("records should load");
+        let statuses = records
+            .into_iter()
+            .map(|record| (record.id, record.status))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(statuses["seg_succeeded"], "succeeded");
+        assert_eq!(statuses["seg_cached"], "skipped_cached");
+        assert_eq!(statuses["seg_review"], "needs_review");
+        assert_eq!(statuses["seg_failed"], "failed");
+        assert_eq!(statuses["seg_retry"], "failed");
+        assert_eq!(statuses["seg_queued"], "failed");
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn resumable_segment_ids_excludes_succeeded_cached_and_needs_review() {
+        let db_path = temp_path("resumable_excludes.sqlite");
+        let input_path = temp_path("input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+            })
+            .expect("job should be created");
+        let segments = vec![
+            segment("seg_succeeded", 0),
+            segment("seg_cached", 1),
+            segment("seg_review", 2),
+        ];
+        store
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "test_ns")
+            .expect("segments should insert");
+        {
+            let conn = store.conn.borrow();
+            for (id, status) in [
+                ("seg_succeeded", "succeeded"),
+                ("seg_cached", "skipped_cached"),
+                ("seg_review", "needs_review"),
+            ] {
+                conn.execute(
+                    "UPDATE segments SET status = ?1 WHERE job_id = ?2 AND id = ?3",
+                    params![status, job.id, id],
+                )
+                .expect("status should update");
+            }
+        }
+
+        let ids = store
+            .resumable_segment_ids(&job.id)
+            .expect("resumable ids should load");
+
+        assert!(ids.is_empty());
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn resumable_segment_ids_includes_failed_retry_pending_and_pending() {
+        let db_path = temp_path("resumable_includes.sqlite");
+        let input_path = temp_path("input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+            })
+            .expect("job should be created");
+        let segments = vec![
+            segment("seg_failed", 0),
+            segment("seg_retry", 1),
+            segment("seg_queued", 2),
+        ];
+        store
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "test_ns")
+            .expect("segments should insert");
+        {
+            let conn = store.conn.borrow();
+            for (id, status) in [
+                ("seg_failed", "failed"),
+                ("seg_retry", "retry_pending"),
+                ("seg_queued", "queued"),
+            ] {
+                conn.execute(
+                    "UPDATE segments SET status = ?1 WHERE job_id = ?2 AND id = ?3",
+                    params![status, job.id, id],
+                )
+                .expect("status should update");
+            }
+        }
+
+        let ids = store
+            .resumable_segment_ids(&job.id)
+            .expect("resumable ids should load");
+
+        assert_eq!(ids, vec!["seg_failed", "seg_retry", "seg_queued"]);
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(input_path);
     }

@@ -71,12 +71,7 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
     let Some(job) = store.get_job(&args.job_id)? else {
         anyhow::bail!("job '{}' was not found", args.job_id);
     };
-    let Some(mut snapshot) = store.load_job_config_snapshot(&args.job_id)? else {
-        anyhow::bail!(
-            "job '{}' does not have a run configuration snapshot; it cannot be resumed deterministically",
-            args.job_id
-        );
-    };
+    let mut snapshot = load_resume_snapshot(&store, &args.job_id)?;
 
     let progress_jsonl = args
         .progress_jsonl
@@ -91,6 +86,16 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
 
     let run_result = run_inner(args, store, job, &mut snapshot, progress).await;
     finalize_reporter(run_result, reporter).await
+}
+
+fn load_resume_snapshot(store: &JobStore, job_id: &str) -> Result<RunConfigSnapshot> {
+    let Some(snapshot) = store.load_job_config_snapshot(job_id)? else {
+        anyhow::bail!(
+            "job '{}' does not have a run configuration snapshot; it cannot be resumed deterministically",
+            job_id
+        );
+    };
+    Ok(snapshot)
 }
 
 async fn finalize_reporter<T>(
@@ -190,11 +195,14 @@ async fn run_inner(
     let segments = build_segments(&book, &settings.segmentation)?;
     let pending_ids = store.resumable_segment_ids(&job.id)?;
 
-    println!("Job: {}", job.id);
-    println!("Input: {}", input.display());
-    println!("Output: {}", output.display());
-    println!("Provider: {}", job.provider);
-    println!("Pending: {}", pending_ids.len());
+    let print_stdout = human_stdout_enabled(args.ui);
+    if print_stdout {
+        println!("Job: {}", job.id);
+        println!("Input: {}", input.display());
+        println!("Output: {}", output.display());
+        println!("Provider: {}", job.provider);
+        println!("Pending: {}", pending_ids.len());
+    }
 
     let pending_segments = select_pending_segments(&segments, &pending_ids)?;
     let prompt_version = snapshot.prompt_version.as_str();
@@ -398,28 +406,37 @@ async fn run_inner(
         timestamp_ms: now_ms(),
     });
 
-    println!(
-        "Translated: {}/{} segments",
-        summary.succeeded, summary.total_segments
-    );
-    println!("Cached: {}", summary.cached);
-    println!("Retried: {}", summary.retried);
-    println!("Needs review: {}", summary.needs_review);
-    println!("Failed: {}", summary.failed);
-    println!("Input tokens: {}", summary.input_tokens);
-    println!("Output tokens: {}", summary.output_tokens);
-    if let Some(cost) = estimate_cost_usd(
-        &job.provider,
-        &job.model,
-        summary.input_tokens,
-        summary.output_tokens,
-    ) {
-        println!("Estimated cost: ${cost:.6}");
+    if print_stdout {
+        println!(
+            "Translated: {}/{} segments",
+            summary.succeeded, summary.total_segments
+        );
+        println!("Cached: {}", summary.cached);
+        println!("Retried: {}", summary.retried);
+        println!("Needs review: {}", summary.needs_review);
+        println!("Failed: {}", summary.failed);
+        println!("Input tokens: {}", summary.input_tokens);
+        println!("Output tokens: {}", summary.output_tokens);
+        if let Some(cost) = estimate_cost_usd(
+            &job.provider,
+            &job.model,
+            summary.input_tokens,
+            summary.output_tokens,
+        ) {
+            println!("Estimated cost: ${cost:.6}");
+        }
+        println!("Output: {}", output.display());
+        println!("Report: {}", report.markdown.display());
     }
-    println!("Output: {}", output.display());
-    println!("Report: {}", report.markdown.display());
 
     Ok(())
+}
+
+fn human_stdout_enabled(ui: Option<crate::progress::UiMode>) -> bool {
+    !matches!(
+        ui,
+        Some(crate::progress::UiMode::Json | crate::progress::UiMode::Quiet)
+    )
 }
 
 fn select_pending_segments(segments: &[Segment], pending_ids: &[String]) -> Result<Vec<Segment>> {
@@ -709,5 +726,513 @@ fn segment_status(status: &str) -> SegmentStatus {
         "needs_review" => SegmentStatus::NeedsReview,
         "failed" => SegmentStatus::Failed,
         _ => SegmentStatus::Succeeded,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bookforge_core::{
+        JsonMode, TranslationProfile,
+        ir::{BlockId, SectionId},
+        segment::{
+            SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
+            SegmentSource, SegmentTextRun,
+        },
+    };
+    use bookforge_store::{CreateJob, SaveNeedsReview, SaveTranslation};
+    use std::sync::Mutex;
+
+    struct RecordingSink {
+        events: Arc<Mutex<Vec<ProgressEvent>>>,
+    }
+
+    impl ProgressSink for RecordingSink {
+        fn emit(&self, event: ProgressEvent) {
+            self.events.lock().expect("events lock").push(event);
+        }
+    }
+
+    struct ResumeFixture {
+        _tempdir: tempfile::TempDir,
+        store: JobStore,
+        job: JobRecord,
+        snapshot: RunConfigSnapshot,
+        segments: Vec<Segment>,
+    }
+
+    #[tokio::test]
+    async fn resume_uses_snapshot_segmentation_settings() {
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.batch.enabled = false;
+        settings.segmentation.max_segment_tokens = 1377;
+        settings.segmentation.context_tokens = 77;
+        let mut fixture = resume_fixture(settings, 1);
+
+        run_fixture(&mut fixture)
+            .await
+            .expect("resume should use snapshot segmentation settings");
+
+        let summary = fixture
+            .store
+            .summary(&fixture.job.id)
+            .expect("summary should load")
+            .expect("job should exist");
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.succeeded, 1);
+    }
+
+    #[tokio::test]
+    async fn resume_uses_snapshot_profile_and_compact_prompt_settings() {
+        let mut settings = TranslationProfile::Safe.resolve();
+        settings.batch.enabled = false;
+        settings.compact_prompts = true;
+        let mut fixture = resume_fixture(settings, 1);
+
+        let events = run_fixture(&mut fixture)
+            .await
+            .expect("resume should succeed");
+        let runtime = runtime_config_event(&events);
+
+        assert_eq!(runtime.profile, "Safe");
+        assert!(runtime.compact_prompts);
+    }
+
+    #[tokio::test]
+    async fn resume_uses_snapshot_provider_json_mode_and_attempts() {
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.batch.enabled = false;
+        settings.provider.json_mode = JsonMode::PromptOnly;
+        settings.provider.provider_max_attempts = 4;
+        let mut fixture = resume_fixture(settings.clone(), 1);
+
+        let config = openai_compatible_config_from_parts(
+            "openrouter",
+            "snapshot-model",
+            Some("https://snapshot.example/v1"),
+            Some("SNAPSHOT_API_KEY"),
+            &fixture.job.id,
+            &settings,
+        )
+        .expect("provider config should build from snapshot settings");
+        assert_eq!(config.json_mode, JsonMode::PromptOnly);
+        assert_eq!(config.provider_max_attempts, 4);
+
+        let events = run_fixture(&mut fixture)
+            .await
+            .expect("resume should succeed");
+        let runtime = runtime_config_event(&events);
+        assert_eq!(runtime.json_mode, "PromptOnly");
+        assert_eq!(runtime.provider_max_attempts, 4);
+    }
+
+    #[tokio::test]
+    async fn resume_missing_config_snapshot_fails_clearly() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let input = fixture_input();
+        let output = tempdir.path().join("out.epub");
+        let store = JobStore::open(tempdir.path().join("jobs.sqlite")).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input,
+                output: &output,
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix-target",
+                base_url: None,
+                api_key_env: None,
+            })
+            .expect("job should be created");
+
+        let error = load_resume_snapshot(&store, &job.id)
+            .expect_err("missing snapshot should fail clearly");
+
+        assert!(error.to_string().contains("run configuration snapshot"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be resumed deterministically")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_reuses_checkpointed_segments_and_translates_only_resumable_segments() {
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.batch.enabled = false;
+        let mut fixture = resume_fixture(settings, 2);
+        save_succeeded(
+            &fixture.store,
+            &fixture.job.id,
+            &fixture.segments[0],
+            "stored",
+        );
+        fixture
+            .store
+            .mark_segment_failed(&fixture.job.id, &fixture.segments[1].id.0, "retry")
+            .expect("segment should be failed");
+
+        let events = run_fixture(&mut fixture)
+            .await
+            .expect("resume should succeed");
+        let finished = segment_finished_ids(&events);
+
+        assert_eq!(finished, vec![fixture.segments[1].id.0.clone()]);
+        let summary = fixture
+            .store
+            .summary(&fixture.job.id)
+            .expect("summary should load")
+            .expect("job should exist");
+        assert_eq!(summary.succeeded, 2);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn resume_skips_needs_review_by_default() {
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.batch.enabled = false;
+        let mut fixture = resume_fixture(settings, 2);
+        for segment in &fixture.segments {
+            save_needs_review(&fixture.store, &fixture.job.id, segment);
+        }
+
+        let events = run_fixture(&mut fixture)
+            .await
+            .expect("resume should succeed without retrying needs-review segments");
+
+        assert!(segment_finished_ids(&events).is_empty());
+        let summary = fixture
+            .store
+            .summary(&fixture.job.id)
+            .expect("summary should load")
+            .expect("job should exist");
+        assert_eq!(summary.needs_review, 2);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn resume_rebuilds_output_from_stored_and_fresh_translations_in_original_order() {
+        let segments = vec![
+            test_segment("seg_a", 0),
+            test_segment("seg_b", 1),
+            test_segment("seg_c", 2),
+        ];
+        let stored = vec![
+            StoredBlockTranslation {
+                segment_id: "seg_c".to_string(),
+                block_id: "b_000002".to_string(),
+                text: "stored c".to_string(),
+            },
+            StoredBlockTranslation {
+                segment_id: "seg_a".to_string(),
+                block_id: "b_000000".to_string(),
+                text: "stored a".to_string(),
+            },
+        ];
+        let fresh = vec![bookforge_llm::SegmentTranslation {
+            segment_id: SegmentId("seg_b".to_string()),
+            ordinal: 1,
+            block_ids: vec![BlockId("b_000001".to_string())],
+            blocks: vec![BlockTranslation {
+                block_id: BlockId("b_000001".to_string()),
+                text: "fresh b".to_string(),
+            }],
+            checksum: "checksum_1".to_string(),
+            status: SegmentStatus::Succeeded,
+            template: "mock".to_string(),
+            error: None,
+            input_tokens: None,
+            output_tokens: None,
+        }];
+
+        let rebuilt = rebuild_block_translations(&segments, &stored, &fresh);
+        let texts = rebuilt
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts, vec!["stored a", "fresh b", "stored c"]);
+    }
+
+    #[tokio::test]
+    async fn resume_errors_on_cache_namespace_mismatch() {
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.batch.enabled = false;
+        let mut fixture = resume_fixture(settings, 1);
+        fixture.snapshot.cache_namespace = "wrong-cache-namespace".to_string();
+
+        let error = run_fixture(&mut fixture)
+            .await
+            .expect_err("cache namespace mismatch should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("resume cache namespace mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_errors_when_rebuilt_segments_do_not_match_stored_pending_ids() {
+        let segments = vec![test_segment("seg_a", 0)];
+        let pending_ids = vec!["seg_missing".to_string()];
+
+        let error = select_pending_segments(&segments, &pending_ids)
+            .expect_err("missing pending IDs should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("segment IDs that no longer exist")
+        );
+        assert!(error.to_string().contains("seg_missing"));
+    }
+
+    fn resume_fixture(settings: ResolvedRunSettings, segment_count: usize) -> ResumeFixture {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let input = fixture_input();
+        let output = tempdir.path().join("translated.epub");
+        let events = tempdir.path().join("events.jsonl");
+        let store = JobStore::open(tempdir.path().join("jobs.sqlite")).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input,
+                output: &output,
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix-target",
+                base_url: None,
+                api_key_env: None,
+            })
+            .expect("job should be created");
+        let book = read_epub(&input).expect("fixture EPUB should read");
+        let all_segments =
+            build_segments(&book, &settings.segmentation).expect("segments should build");
+        assert!(
+            all_segments.len() >= segment_count,
+            "fixture should have enough segments"
+        );
+        let segments = all_segments
+            .into_iter()
+            .take(segment_count)
+            .collect::<Vec<_>>();
+        let prompt_version = "v1";
+        let cache_namespace = compute_cache_namespace(
+            settings.segmentation.max_segment_tokens,
+            settings.segmentation.context_tokens,
+            settings.profile.namespace_str(),
+            settings.batch.enabled,
+            prompt_version,
+        );
+        store
+            .insert_segments(
+                &job.id,
+                &segments,
+                prompt_version,
+                "mock",
+                "mock-prefix-target",
+                &cache_namespace,
+            )
+            .expect("segments should insert");
+        let snapshot = RunConfigSnapshot {
+            input_path: input,
+            output_path: output,
+            events_path: Some(events),
+            report_json_path: None,
+            report_markdown_path: None,
+            source_language: Some("English".to_string()),
+            target_language: "Italian".to_string(),
+            provider: "mock".to_string(),
+            model: "mock-prefix-target".to_string(),
+            base_url: None,
+            api_key_env: None,
+            profile: settings.profile,
+            provider_preset: None,
+            prompt_version: prompt_version.to_string(),
+            cache_namespace,
+            settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
+        };
+        store
+            .update_job_config_snapshot(&job.id, &snapshot)
+            .expect("snapshot should persist");
+
+        ResumeFixture {
+            _tempdir: tempdir,
+            store,
+            job,
+            snapshot,
+            segments,
+        }
+    }
+
+    async fn run_fixture(fixture: &mut ResumeFixture) -> Result<Vec<ProgressEvent>> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink {
+            events: events.clone(),
+        });
+        let run_store = JobStore::open(fixture.store.path()).expect("store should reopen");
+        let args = ResumeArgs {
+            job_id: fixture.job.id.clone(),
+            concurrency: None,
+            max_attempts: None,
+            provider_max_attempts: None,
+            validation_max_attempts: None,
+            qa: QaMode::Off,
+            timeout_seconds: None,
+            ui: None,
+            progress_jsonl: None,
+            output: None,
+            no_thinking: false,
+        };
+
+        run_inner(
+            args,
+            run_store,
+            fixture.job.clone(),
+            &mut fixture.snapshot,
+            sink,
+        )
+        .await?;
+
+        Ok(events.lock().expect("events lock").clone())
+    }
+
+    fn runtime_config_event(events: &[ProgressEvent]) -> RuntimeConfigEvent<'_> {
+        events
+            .iter()
+            .find_map(|event| {
+                if let ProgressEvent::RuntimeConfigResolved {
+                    profile,
+                    provider_max_attempts,
+                    compact_prompts,
+                    json_mode,
+                    ..
+                } = event
+                {
+                    Some(RuntimeConfigEvent {
+                        profile,
+                        provider_max_attempts: *provider_max_attempts,
+                        compact_prompts: *compact_prompts,
+                        json_mode,
+                    })
+                } else {
+                    None
+                }
+            })
+            .expect("runtime config event should be emitted")
+    }
+
+    struct RuntimeConfigEvent<'a> {
+        profile: &'a str,
+        provider_max_attempts: usize,
+        compact_prompts: bool,
+        json_mode: &'a str,
+    }
+
+    fn segment_finished_ids(events: &[ProgressEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| {
+                if let ProgressEvent::SegmentFinished { segment_id, .. } = event {
+                    Some(segment_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn save_succeeded(store: &JobStore, job_id: &str, segment: &Segment, prefix: &str) {
+        let blocks = translated_blocks(segment, prefix);
+        let translated_text = blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        store
+            .save_translation(SaveTranslation {
+                job_id,
+                segment_id: &segment.id.0,
+                translated_text: &translated_text,
+                blocks: &blocks,
+                provider: "mock",
+                model: "mock-prefix-target",
+                prompt_version: "v1",
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            })
+            .expect("translation should save");
+    }
+
+    fn save_needs_review(store: &JobStore, job_id: &str, segment: &Segment) {
+        let blocks = translated_blocks(segment, "review");
+        let preserved_text = blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        store
+            .save_needs_review(SaveNeedsReview {
+                job_id,
+                segment_id: &segment.id.0,
+                preserved_text: &preserved_text,
+                blocks: &blocks,
+                provider: "mock",
+                model: "mock-prefix-target",
+                prompt_version: "v1",
+                error: "manual review",
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            })
+            .expect("needs-review translation should save");
+    }
+
+    fn translated_blocks(segment: &Segment, prefix: &str) -> Vec<BlockTranslation> {
+        segment
+            .source
+            .blocks
+            .iter()
+            .map(|block| BlockTranslation {
+                block_id: block.block_id.clone(),
+                text: format!("{prefix} {}", block.block_id.0),
+            })
+            .collect()
+    }
+
+    fn fixture_input() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("cli crate should be under crates/bookforge-cli")
+            .join("test/test.epub")
+    }
+
+    fn test_segment(id: &str, ordinal: usize) -> Segment {
+        let block_id = BlockId(format!("b_{ordinal:06}"));
+        Segment {
+            id: SegmentId(id.to_string()),
+            section_id: SectionId("sec_000000".to_string()),
+            ordinal,
+            block_ids: vec![block_id.clone()],
+            source: SegmentSource {
+                text: format!("Source {ordinal}"),
+                blocks: vec![SegmentBlock {
+                    block_id,
+                    kind: "paragraph".to_string(),
+                    text: format!("Source {ordinal}"),
+                    text_runs: vec![SegmentTextRun {
+                        id: format!("r{ordinal}"),
+                        text: format!("Source {ordinal}"),
+                    }],
+                    protected_spans: Vec::new(),
+                }],
+                token_estimate: 2,
+            },
+            context: SegmentContext::default(),
+            metadata: SegmentMetadata::default(),
+            constraints: SegmentConstraints::default(),
+            checksum: format!("checksum_{ordinal}"),
+        }
     }
 }

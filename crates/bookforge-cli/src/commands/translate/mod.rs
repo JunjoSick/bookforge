@@ -66,17 +66,19 @@ pub async fn run(
         output,
     };
 
-    println!("Input: {}", args.input.display());
-    println!("Output: {}", config.output.display());
-    println!("Target: {}", config.target_language);
-    println!("Provider: {}", config.provider);
-    println!("Profile: {:?}", args.profile);
-    println!("Concurrency: {}", config.concurrency);
-    println!("Batch enabled: {}", settings.batch.enabled);
+    if human_stdout_enabled(args.ui) {
+        println!("Input: {}", args.input.display());
+        println!("Output: {}", config.output.display());
+        println!("Target: {}", config.target_language);
+        println!("Provider: {}", config.provider);
+        println!("Profile: {:?}", args.profile);
+        println!("Concurrency: {}", config.concurrency);
+        println!("Batch enabled: {}", settings.batch.enabled);
 
-    if settings.batch.enabled {
-        println!("Batch target tokens: {}", settings.batch.target_tokens);
-        println!("Batch max items: {}", settings.batch.max_items);
+        if settings.batch.enabled {
+            println!("Batch target tokens: {}", settings.batch.target_tokens);
+            println!("Batch max items: {}", settings.batch.max_items);
+        }
     }
 
     let reporter = crate::progress::ProgressReporter::spawn(args.ui, args.progress_jsonl.clone());
@@ -117,10 +119,12 @@ pub async fn run(
                 .await
             }
             _ => {
-                println!(
-                    "Translation provider '{}' is not implemented yet.",
-                    config.provider
-                );
+                if human_stdout_enabled(args.ui) {
+                    println!(
+                        "Translation provider '{}' is not implemented yet.",
+                        config.provider
+                    );
+                }
                 Ok(())
             }
         }
@@ -128,6 +132,13 @@ pub async fn run(
     .await;
 
     finalize_reporter(run_result, reporter).await
+}
+
+fn human_stdout_enabled(ui: crate::progress::UiMode) -> bool {
+    !matches!(
+        ui,
+        crate::progress::UiMode::Json | crate::progress::UiMode::Quiet
+    )
 }
 
 async fn finalize_reporter<T>(
@@ -188,7 +199,9 @@ async fn run_mock_translation(
         base_url: None,
         api_key_env: None,
     })?;
-    println!("Job: {}", job.id);
+    if human_stdout_enabled(cli_args.ui) {
+        println!("Job: {}", job.id);
+    }
     progress.emit(bookforge_core::ProgressEvent::JobCreated {
         job_id: job.id.clone(),
         input_path: input.display().to_string(),
@@ -295,6 +308,7 @@ async fn run_mock_translation(
         &translations,
         &qa_reviews,
         config,
+        human_stdout_enabled(cli_args.ui),
     )?;
     let summary = store
         .summary(&job.id)?
@@ -425,7 +439,9 @@ async fn run_openai_compatible_translation(
         base_url: Some(&provider_config.base_url),
         api_key_env: Some(&provider_config.api_key_env),
     })?;
-    println!("Job: {}", job.id);
+    if human_stdout_enabled(cli_args.ui) {
+        println!("Job: {}", job.id);
+    }
     progress.emit(bookforge_core::ProgressEvent::JobCreated {
         job_id: job.id.clone(),
         input_path: input.display().to_string(),
@@ -692,6 +708,7 @@ async fn finish_translation_pipeline(
         translations,
         &qa_reviews,
         config,
+        human_stdout_enabled(cli_args.ui),
     )?;
     let summary = store
         .summary(&job.id)?
@@ -784,7 +801,7 @@ where
         return translate_and_checkpoint(provider, segments, config, checkpoint).await;
     }
 
-    println!("Batches: {}", batches.len());
+    eprintln!("Batches: {}", batches.len());
 
     use std::sync::Arc;
     let telemetry = Arc::new(TelemetryLog::new());
@@ -861,7 +878,7 @@ where
         (Ok(translations), Ok(Ok(()))) => {
             let snapshot = telemetry.snapshot();
             if !snapshot.is_empty() {
-                println!("\n{}", telemetry_summary(&snapshot));
+                eprintln!("\n{}", telemetry_summary(&snapshot));
             }
             Ok(translations)
         }
