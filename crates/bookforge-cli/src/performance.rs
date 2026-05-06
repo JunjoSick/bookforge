@@ -67,23 +67,28 @@ pub(crate) fn performance_summary_from_events(
                     latencies.push(latency);
                 }
                 let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
+                let status_lower = status.to_ascii_lowercase();
                 let code = payload.get("status_code").and_then(Value::as_u64);
                 let error_kind = payload
                     .get("error_kind")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if code == Some(429) || status.contains("rate") {
+                let error_kind_lower = error_kind.to_ascii_lowercase();
+                if code == Some(429) || status_lower.contains("rate") {
                     summary.rate_limited += 1;
                 }
-                if status.contains("timeout") || error_kind.contains("timeout") {
+                if status_lower.contains("timeout") || error_kind_lower.contains("timeout") {
                     summary.timeouts += 1;
                 }
-                if code.is_some_and(|code| (500..600).contains(&code)) {
+                if code.is_some_and(|code| (500..600).contains(&code))
+                    || status_lower.contains("server")
+                {
                     summary.server_errors += 1;
                 }
-                if error_kind.contains("json")
-                    || error_kind.contains("invalid")
-                    || status.contains("invalid")
+                if error_kind_lower.contains("json")
+                    || error_kind_lower.contains("invalid")
+                    || status_lower.contains("invalid")
+                    || status_lower.contains("json")
                 {
                     summary.invalid_responses += 1;
                 }
@@ -91,6 +96,8 @@ pub(crate) fn performance_summary_from_events(
                     .get("finish_reason")
                     .and_then(Value::as_str)
                     .is_some_and(|reason| reason.eq_ignore_ascii_case("length"))
+                    || status_lower.contains("truncated")
+                    || error_kind_lower.contains("truncated")
                 {
                     summary.truncations += 1;
                 }
@@ -171,10 +178,197 @@ fn percentile(values: &[u64], percentile: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bookforge_core::ProgressEvent;
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn performance_summary_from_events_counts_requests() {
+        let path = temp_path("requests.jsonl");
+        write_events(
+            &path,
+            &[
+                ProgressEvent::RequestFinished {
+                    request_id: "r1".to_string(),
+                    batch_id: None,
+                    segment_id: Some("s1".to_string()),
+                    status: "ok".to_string(),
+                    latency_ms: 10,
+                    status_code: None,
+                    finish_reason: None,
+                    retry_count: 0,
+                    input_tokens: Some(11),
+                    output_tokens: Some(7),
+                    error_kind: None,
+                    timestamp_ms: 1,
+                },
+                ProgressEvent::RequestFinished {
+                    request_id: "r2".to_string(),
+                    batch_id: None,
+                    segment_id: Some("s2".to_string()),
+                    status: "ok".to_string(),
+                    latency_ms: 20,
+                    status_code: None,
+                    finish_reason: None,
+                    retry_count: 1,
+                    input_tokens: Some(13),
+                    output_tokens: Some(5),
+                    error_kind: None,
+                    timestamp_ms: 2,
+                },
+            ],
+        );
+
+        let summary = performance_summary_from_events(&path)
+            .expect("summary should parse")
+            .expect("summary should exist");
+
+        assert_eq!(summary.request_count, 2);
+        assert_eq!(summary.retries, 1);
+        assert_eq!(summary.input_tokens, 24);
+        assert_eq!(summary.output_tokens, 12);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn performance_summary_from_events_computes_latency_percentiles() {
+        let path = temp_path("latencies.jsonl");
+        write_events(
+            &path,
+            &[10, 20, 30, 40, 50]
+                .into_iter()
+                .enumerate()
+                .map(|(index, latency_ms)| ProgressEvent::RequestFinished {
+                    request_id: format!("r{index}"),
+                    batch_id: None,
+                    segment_id: Some(format!("s{index}")),
+                    status: "ok".to_string(),
+                    latency_ms,
+                    status_code: None,
+                    finish_reason: None,
+                    retry_count: 0,
+                    input_tokens: None,
+                    output_tokens: None,
+                    error_kind: None,
+                    timestamp_ms: index as u64,
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let summary = performance_summary_from_events(&path)
+            .expect("summary should parse")
+            .expect("summary should exist");
+
+        assert_eq!(summary.p50_latency_ms, Some(30));
+        assert_eq!(summary.p95_latency_ms, Some(50));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn performance_summary_from_events_counts_rate_limits_timeouts_server_errors() {
+        let path = temp_path("errors.jsonl");
+        write_events(
+            &path,
+            &[
+                request_finished("rate", "rate_limited", Some(429), None),
+                request_finished("timeout", "timeout", None, Some("Http timeout")),
+                request_finished("server", "server_error", None, None),
+            ],
+        );
+
+        let summary = performance_summary_from_events(&path)
+            .expect("summary should parse")
+            .expect("summary should exist");
+
+        assert_eq!(summary.rate_limited, 1);
+        assert_eq!(summary.timeouts, 1);
+        assert_eq!(summary.server_errors, 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn performance_summary_from_events_counts_invalid_responses_and_truncations() {
+        let path = temp_path("invalid-truncated.jsonl");
+        write_events(
+            &path,
+            &[
+                request_finished(
+                    "invalid",
+                    "invalid_response",
+                    None,
+                    Some("InvalidResponse(\"bad json\")"),
+                ),
+                request_finished(
+                    "truncated",
+                    "truncated",
+                    None,
+                    Some("InvalidResponse(\"truncated response\")"),
+                ),
+                ProgressEvent::RequestFinished {
+                    request_id: "length".to_string(),
+                    batch_id: None,
+                    segment_id: Some("s_length".to_string()),
+                    status: "ok".to_string(),
+                    latency_ms: 5,
+                    status_code: None,
+                    finish_reason: Some("length".to_string()),
+                    retry_count: 0,
+                    input_tokens: None,
+                    output_tokens: None,
+                    error_kind: None,
+                    timestamp_ms: 3,
+                },
+            ],
+        );
+
+        let summary = performance_summary_from_events(&path)
+            .expect("summary should parse")
+            .expect("summary should exist");
+
+        assert_eq!(summary.invalid_responses, 2);
+        assert_eq!(summary.truncations, 2);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn performance_summary_from_events_counts_checkpoint_flushes() {
+        let path = temp_path("checkpoint-flushes.jsonl");
+        write_events(
+            &path,
+            &[
+                ProgressEvent::CheckpointFlushed {
+                    segment_id: Some("s1".to_string()),
+                    flushed_count: 1,
+                    latency_ms: Some(2),
+                    timestamp_ms: 1,
+                },
+                ProgressEvent::CheckpointFlushed {
+                    segment_id: Some("s2".to_string()),
+                    flushed_count: 2,
+                    latency_ms: Some(3),
+                    timestamp_ms: 2,
+                },
+            ],
+        );
+
+        let summary = performance_summary_from_events(&path)
+            .expect("summary should parse")
+            .expect("summary should exist");
+
+        assert_eq!(summary.checkpoint_flushes, 2);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn performance_summary_from_events_returns_none_for_missing_file() {
+        let path = temp_path("missing.jsonl");
+
+        let summary = performance_summary_from_events(&path).expect("missing file should not fail");
+
+        assert!(summary.is_none());
+    }
 
     #[test]
     fn request_and_segment_tokens_are_not_double_counted() {
@@ -229,5 +423,36 @@ mod tests {
             "bookforge-performance-test-{}-{nanos}-{name}",
             std::process::id()
         ))
+    }
+
+    fn write_events(path: &std::path::Path, events: &[ProgressEvent]) {
+        let jsonl = events
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("event should serialize"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, jsonl).expect("fixture should be written");
+    }
+
+    fn request_finished(
+        request_id: &str,
+        status: &str,
+        status_code: Option<u16>,
+        error_kind: Option<&str>,
+    ) -> ProgressEvent {
+        ProgressEvent::RequestFinished {
+            request_id: request_id.to_string(),
+            batch_id: None,
+            segment_id: Some(format!("segment_{request_id}")),
+            status: status.to_string(),
+            latency_ms: 5,
+            status_code,
+            finish_reason: None,
+            retry_count: 0,
+            input_tokens: None,
+            output_tokens: None,
+            error_kind: error_kind.map(ToOwned::to_owned),
+            timestamp_ms: 1,
+        }
     }
 }
