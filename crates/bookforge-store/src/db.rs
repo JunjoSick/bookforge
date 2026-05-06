@@ -9,6 +9,7 @@ use std::{
 use bookforge_core::{
     Result as CoreResult,
     ir::BlockId,
+    run_snapshot::RunConfigSnapshot,
     segment::{BlockTranslation, Segment},
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -26,6 +27,9 @@ pub enum StoreError {
 
     #[error("core error: {0}")]
     Core(#[from] bookforge_core::BookforgeError),
+
+    #[error("serialization error: {0}")]
+    Serialization(String),
 }
 
 pub struct JobStore {
@@ -46,6 +50,9 @@ pub struct JobRecord {
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub status: String,
+    pub events_path: Option<PathBuf>,
+    pub report_json_path: Option<PathBuf>,
+    pub report_markdown_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,6 +95,16 @@ pub struct StoredBlockTranslation {
     pub segment_id: String,
     pub block_id: String,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSegmentTranslation {
+    pub segment_id: String,
+    pub ordinal: usize,
+    pub status: String,
+    pub error: Option<String>,
+    pub translated_text: String,
+    pub blocks: Vec<BlockTranslation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,7 +289,105 @@ impl JobStore {
             base_url: request.base_url.map(ToOwned::to_owned),
             api_key_env: request.api_key_env.map(ToOwned::to_owned),
             status: "running".to_string(),
+            events_path: None,
+            report_json_path: None,
+            report_markdown_path: None,
         })
+    }
+
+    pub fn update_job_config_snapshot(
+        &self,
+        job_id: &str,
+        snapshot: &RunConfigSnapshot,
+    ) -> Result<()> {
+        let json = serde_json::to_string(snapshot)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let conn = self.conn.borrow();
+        conn.execute(
+            "UPDATE jobs
+             SET config_json = ?1,
+                 events_path = ?2,
+                 report_json_path = ?3,
+                 report_markdown_path = ?4,
+                 updated_at = ?5
+             WHERE id = ?6",
+            params![
+                json,
+                snapshot
+                    .events_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string()),
+                snapshot
+                    .report_json_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string()),
+                snapshot
+                    .report_markdown_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string()),
+                timestamp_string(),
+                job_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_job_config_snapshot(&self, job_id: &str) -> Result<Option<RunConfigSnapshot>> {
+        let conn = self.conn.borrow();
+        let Some(json) = conn
+            .query_row(
+                "SELECT config_json FROM jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        else {
+            return Ok(None);
+        };
+
+        serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|e| StoreError::Serialization(e.to_string()))
+    }
+
+    pub fn update_job_event_path(&self, job_id: &str, path: &Path) -> Result<()> {
+        let conn = self.conn.borrow();
+        conn.execute(
+            "UPDATE jobs SET events_path = ?1, updated_at = ?2 WHERE id = ?3",
+            params![path.to_string_lossy(), timestamp_string(), job_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_job_report_paths(
+        &self,
+        job_id: &str,
+        json_path: &Path,
+        markdown_path: &Path,
+    ) -> Result<()> {
+        let conn = self.conn.borrow();
+        conn.execute(
+            "UPDATE jobs
+             SET report_json_path = ?1, report_markdown_path = ?2, updated_at = ?3
+             WHERE id = ?4",
+            params![
+                json_path.to_string_lossy(),
+                markdown_path.to_string_lossy(),
+                timestamp_string(),
+                job_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_job_output_path(&self, job_id: &str, path: &Path) -> Result<()> {
+        let conn = self.conn.borrow();
+        conn.execute(
+            "UPDATE jobs SET output_path = ?1, updated_at = ?2 WHERE id = ?3",
+            params![path.to_string_lossy(), timestamp_string(), job_id],
+        )?;
+        Ok(())
     }
 
     pub fn insert_segments(
@@ -418,12 +533,24 @@ impl JobStore {
         self.touch_job(job_id, "succeeded")
     }
 
+    pub fn mark_job_running(&self, job_id: &str) -> Result<()> {
+        self.touch_job(job_id, "running")
+    }
+
+    pub fn mark_job_succeeded(&self, job_id: &str) -> Result<()> {
+        self.mark_job_complete(job_id)
+    }
+
     pub fn mark_job_needs_review(&self, job_id: &str) -> Result<()> {
         self.touch_job(job_id, "needs_review")
     }
 
     pub fn mark_job_interrupted(&self, job_id: &str) -> Result<()> {
         self.touch_job(job_id, "interrupted")
+    }
+
+    pub fn mark_job_failed(&self, job_id: &str) -> Result<()> {
+        self.touch_job(job_id, "failed")
     }
 
     pub fn mark_segment_failed(&self, job_id: &str, segment_id: &str, error: &str) -> Result<()> {
@@ -459,10 +586,52 @@ impl JobStore {
         Ok(())
     }
 
+    pub fn mark_unfinished_segments_failed(
+        &self,
+        job_id: &str,
+        candidate_segment_ids: &[String],
+        error: &str,
+    ) -> Result<usize> {
+        const SQLITE_IN_CHUNK_SIZE: usize = 900;
+        let mut updated = 0;
+
+        for chunk in candidate_segment_ids.chunks(SQLITE_IN_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE segments
+                 SET status = 'failed', attempts = attempts + 1, error = ?
+                 WHERE job_id = ?
+                   AND id IN ({placeholders})
+                   AND status NOT IN ('succeeded', 'skipped_cached', 'needs_review')"
+            );
+
+            let conn = self.conn.borrow();
+            let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(chunk.len() + 2);
+            params.push(&error);
+            params.push(&job_id);
+            for id in chunk {
+                params.push(id);
+            }
+            updated += conn.execute(&sql, params.as_slice())?;
+        }
+
+        if updated > 0 {
+            self.touch_job(job_id, "failed")?;
+        }
+        Ok(updated)
+    }
+
     pub fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>> {
         let conn = self.conn.borrow();
         conn.query_row(
-            "SELECT id, input_path, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, status
+            "SELECT id, input_path, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, status,
+                    events_path, report_json_path, report_markdown_path
              FROM jobs WHERE id = ?1",
             params![job_id],
             |row| {
@@ -478,6 +647,9 @@ impl JobStore {
                     base_url: row.get(8)?,
                     api_key_env: row.get(9)?,
                     status: row.get(10)?,
+                    events_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+                    report_json_path: row.get::<_, Option<String>>(12)?.map(PathBuf::from),
+                    report_markdown_path: row.get::<_, Option<String>>(13)?.map(PathBuf::from),
                 })
             },
         )
@@ -593,6 +765,70 @@ impl JobStore {
                 text: row.get(2)?,
             })
         })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_terminal_segment_translations(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<StoredSegmentTranslation>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.ordinal, s.status, s.error, t.translated_text
+             FROM segments s
+             JOIN translations t ON t.job_id = s.job_id AND t.segment_id = s.id
+             WHERE s.job_id = ?1 AND s.status IN ('succeeded', 'skipped_cached', 'needs_review')
+             ORDER BY s.ordinal",
+        )?;
+        let rows = stmt.query_map(params![job_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (segment_id, ordinal, status, error, translated_text) = row?;
+            let mut block_stmt = conn.prepare(
+                "SELECT block_id, translated_text
+                 FROM translation_blocks
+                 WHERE job_id = ?1 AND segment_id = ?2
+                 ORDER BY block_id",
+            )?;
+            let blocks = block_stmt
+                .query_map(params![job_id, segment_id.as_str()], |row| {
+                    Ok(BlockTranslation {
+                        block_id: BlockId(row.get::<_, String>(0)?),
+                        text: row.get(1)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            records.push(StoredSegmentTranslation {
+                segment_id,
+                ordinal: ordinal as usize,
+                status,
+                error,
+                translated_text,
+                blocks,
+            });
+        }
+
+        Ok(records)
+    }
+
+    pub fn resumable_segment_ids(&self, job_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM segments
+             WHERE job_id = ?1 AND status IN ('queued', 'retry_pending', 'failed')
+             ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(params![job_id], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -836,6 +1072,10 @@ impl JobStore {
               base_url TEXT,
               api_key_env TEXT,
               status TEXT NOT NULL,
+              config_json TEXT,
+              events_path TEXT,
+              report_json_path TEXT,
+              report_markdown_path TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
@@ -896,6 +1136,10 @@ impl JobStore {
         ensure_column(&conn, "jobs", "output_path", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "jobs", "base_url", "TEXT")?;
         ensure_column(&conn, "jobs", "api_key_env", "TEXT")?;
+        ensure_column(&conn, "jobs", "config_json", "TEXT")?;
+        ensure_column(&conn, "jobs", "events_path", "TEXT")?;
+        ensure_column(&conn, "jobs", "report_json_path", "TEXT")?;
+        ensure_column(&conn, "jobs", "report_markdown_path", "TEXT")?;
         ensure_column(
             &conn,
             "segments",
@@ -1200,6 +1444,281 @@ mod tests {
 
         let _ = fs::remove_file(input_path);
         (store, job, seg)
+    }
+
+    #[test]
+    fn snapshot_round_trips_and_excludes_api_key_values() {
+        let db_path = temp_path("snapshot.sqlite");
+        let input_path = temp_path("input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "openrouter",
+                model: "model",
+                base_url: Some("https://example.test/v1"),
+                api_key_env: Some("OPENROUTER_API_KEY"),
+            })
+            .expect("job should be created");
+        let settings = bookforge_core::TranslationProfile::Balanced.resolve();
+        let snapshot = RunConfigSnapshot {
+            input_path: input_path.clone(),
+            output_path: temp_path("translated.epub"),
+            events_path: Some(temp_path("events.jsonl")),
+            report_json_path: Some(temp_path("report.json")),
+            report_markdown_path: Some(temp_path("report.md")),
+            source_language: Some("English".to_string()),
+            target_language: "Italian".to_string(),
+            provider: "openrouter".to_string(),
+            model: "model".to_string(),
+            base_url: Some("https://example.test/v1".to_string()),
+            api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+            profile: settings.profile,
+            provider_preset: None,
+            prompt_version: "batch_v1".to_string(),
+            cache_namespace: "cache_ns".to_string(),
+            settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
+        };
+
+        store
+            .update_job_config_snapshot(&job.id, &snapshot)
+            .expect("snapshot should persist");
+        let loaded = store
+            .load_job_config_snapshot(&job.id)
+            .expect("snapshot should load")
+            .expect("snapshot should exist");
+        assert_eq!(loaded, snapshot);
+        let json = serde_json::to_string(&loaded).expect("snapshot should serialize");
+        assert!(json.contains("OPENROUTER_API_KEY"));
+        assert!(!json.contains("sk-live-secret"));
+
+        let reloaded_job = store
+            .get_job(&job.id)
+            .expect("job should load")
+            .expect("job should exist");
+        assert_eq!(reloaded_job.events_path, snapshot.events_path);
+        assert_eq!(reloaded_job.report_json_path, snapshot.report_json_path);
+        assert_eq!(
+            reloaded_job.report_markdown_path,
+            snapshot.report_markdown_path
+        );
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn terminal_loading_and_resumable_ids_preserve_lifecycle_boundaries() {
+        let db_path = temp_path("terminal_resume.sqlite");
+        let input_path = temp_path("input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+            })
+            .expect("job should be created");
+        let segments = vec![
+            segment("seg_done", 0),
+            segment("seg_cached", 1),
+            segment("seg_review", 2),
+            segment("seg_failed", 3),
+            segment("seg_queued", 4),
+        ];
+        store
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "ns")
+            .expect("segments should insert");
+        store
+            .save_translation(SaveTranslation {
+                job_id: &job.id,
+                segment_id: "seg_done",
+                translated_text: "Done",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "Done".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                input_tokens: None,
+                output_tokens: None,
+            })
+            .expect("done should save");
+        store
+            .save_cached_translation(SaveCachedTranslation {
+                job_id: &job.id,
+                segment_id: "seg_cached",
+                translated_text: "Cached",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000001".to_string()),
+                    text: "Cached".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+            })
+            .expect("cached should save");
+        store
+            .save_needs_review(SaveNeedsReview {
+                job_id: &job.id,
+                segment_id: "seg_review",
+                preserved_text: "Review",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000002".to_string()),
+                    text: "Review".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                error: "needs eyes",
+                input_tokens: None,
+                output_tokens: None,
+            })
+            .expect("review should save");
+        store
+            .mark_segment_failed(&job.id, "seg_failed", "failed")
+            .expect("failed should mark");
+
+        let terminal = store
+            .load_terminal_segment_translations(&job.id)
+            .expect("terminal records should load");
+        let ids = terminal
+            .iter()
+            .map(|record| record.segment_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["seg_done", "seg_cached", "seg_review"]);
+        assert_eq!(terminal[0].blocks[0].block_id.0, "b_000000");
+        assert_eq!(terminal[2].status, "needs_review");
+
+        let resumable = store
+            .resumable_segment_ids(&job.id)
+            .expect("resumable ids should load");
+        assert_eq!(resumable, vec!["seg_failed", "seg_queued"]);
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn mark_unfinished_segments_failed_preserves_terminal_segments() {
+        let db_path = temp_path("unfinished_preserve.sqlite");
+        let input_path = temp_path("input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+            })
+            .expect("job should be created");
+        let segments = vec![
+            segment("seg_succeeded", 0),
+            segment("seg_cached", 1),
+            segment("seg_review", 2),
+            segment("seg_queued", 3),
+            segment("seg_retry", 4),
+        ];
+        store
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "test_ns")
+            .expect("segments should insert");
+        store
+            .save_translation(SaveTranslation {
+                job_id: &job.id,
+                segment_id: "seg_succeeded",
+                translated_text: "Done",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "Done".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                input_tokens: None,
+                output_tokens: None,
+            })
+            .expect("succeeded segment should save");
+        store
+            .save_cached_translation(SaveCachedTranslation {
+                job_id: &job.id,
+                segment_id: "seg_cached",
+                translated_text: "Cached",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000001".to_string()),
+                    text: "Cached".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+            })
+            .expect("cached segment should save");
+        store
+            .save_needs_review(SaveNeedsReview {
+                job_id: &job.id,
+                segment_id: "seg_review",
+                preserved_text: "Needs review",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000002".to_string()),
+                    text: "Needs review".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                error: "qa issue",
+                input_tokens: None,
+                output_tokens: None,
+            })
+            .expect("needs-review segment should save");
+        store
+            .retry_segments(&job.id, RetryScope::Failed)
+            .expect("retry with no failed segments should be harmless");
+        {
+            let conn = store.conn.borrow();
+            conn.execute(
+                "UPDATE segments SET status = 'retry_pending' WHERE job_id = ?1 AND id = 'seg_retry'",
+                params![job.id],
+            )
+            .expect("test status update should work");
+        }
+
+        let candidate_ids = segments
+            .iter()
+            .map(|segment| segment.id.0.clone())
+            .collect::<Vec<_>>();
+        let changed = store
+            .mark_unfinished_segments_failed(&job.id, &candidate_ids, "run failed")
+            .expect("unfinished segments should be marked failed");
+        assert_eq!(changed, 2);
+
+        let records = store.segment_records(&job.id).expect("records should load");
+        let statuses = records
+            .into_iter()
+            .map(|record| (record.id, record.status))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(statuses["seg_succeeded"], "succeeded");
+        assert_eq!(statuses["seg_cached"], "skipped_cached");
+        assert_eq!(statuses["seg_review"], "needs_review");
+        assert_eq!(statuses["seg_queued"], "failed");
+        assert_eq!(statuses["seg_retry"], "failed");
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
     }
 
     #[test]

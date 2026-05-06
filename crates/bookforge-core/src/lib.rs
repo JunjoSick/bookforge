@@ -3,6 +3,7 @@ pub mod error;
 pub mod ir;
 pub mod marker;
 pub mod progress;
+pub mod run_snapshot;
 pub mod scheduler;
 pub mod segment;
 
@@ -15,4 +16,5 @@ pub use config::{
 };
 pub use error::{BookforgeError, Result};
 pub use progress::{NullProgressSink, ProgressEvent, ProgressSink, now_ms};
+pub use run_snapshot::{ResolvedRunSettingsSnapshot, RunConfigSnapshot};
 pub use scheduler::SchedulerConfig;

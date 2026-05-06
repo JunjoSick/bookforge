@@ -102,7 +102,7 @@ where
         return Ok(Vec::new());
     }
 
-    let library = PromptLibrary::embedded();
+    let library = PromptLibrary::global();
     let by_segment = segments
         .iter()
         .map(|s| (s.id.0.as_str(), s))
@@ -143,7 +143,7 @@ where
     let mut all_issues = Vec::new();
     for chunk in &chunks {
         let audit_result =
-            run_audit_chunk(&provider, &library, chunk, config, double_check_config).await?;
+            run_audit_chunk(&provider, library, chunk, config, double_check_config).await?;
         all_issues.extend(audit_result);
     }
 
@@ -168,7 +168,7 @@ where
 
     let mut records = Vec::new();
     for corr_chunk in correction_items.chunks(chunk_size.max(1)) {
-        let corr_results = run_correction_chunk(&provider, &library, corr_chunk, config).await?;
+        let corr_results = run_correction_chunk(&provider, library, corr_chunk, config).await?;
 
         for result in corr_results {
             let valid = validate_correction(&result);

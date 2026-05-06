@@ -4,17 +4,29 @@ use std::io::BufRead;
 
 use serde_json::Value;
 
+use bookforge_store::JobStore;
+
 #[derive(Debug, Args)]
 pub struct TailArgs {
     pub job_id: String,
 
-    #[arg(long, default_value_t = 20)]
-    pub lines: usize,
+    #[arg(long, alias = "lines", default_value_t = 20)]
+    pub last: usize,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 pub async fn run(args: TailArgs) -> anyhow::Result<()> {
-    let event_log_path =
-        std::path::PathBuf::from(format!(".bookforge/runs/{}/events.jsonl", args.job_id));
+    let store = JobStore::open_default()?;
+    let job = store.get_job(&args.job_id)?;
+    let snapshot = store.load_job_config_snapshot(&args.job_id)?;
+    let event_log_path = job
+        .and_then(|job| job.events_path)
+        .or_else(|| snapshot.and_then(|snapshot| snapshot.events_path))
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(format!(".bookforge/runs/{}/events.jsonl", args.job_id))
+        });
 
     if !event_log_path.exists() {
         anyhow::bail!(
@@ -35,11 +47,20 @@ pub async fn run(args: TailArgs) -> anyhow::Result<()> {
         }
     }
 
-    let start = events.len().saturating_sub(args.lines);
+    let start = events.len().saturating_sub(args.last);
     let recent: Vec<&String> = events.iter().skip(start).collect();
 
     if recent.is_empty() {
-        println!("(no events)");
+        if !args.json {
+            println!("(no events)");
+        }
+        return Ok(());
+    }
+
+    if args.json {
+        for line in recent {
+            println!("{line}");
+        }
         return Ok(());
     }
 
