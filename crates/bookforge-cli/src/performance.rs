@@ -38,6 +38,11 @@ pub(crate) fn performance_summary_from_events(
     let mut first_ts = None::<u64>;
     let mut last_ts = None::<u64>;
     let mut finished_segments = 0usize;
+    let mut request_input_tokens = 0u64;
+    let mut request_output_tokens = 0u64;
+    let mut request_events_with_tokens = 0usize;
+    let mut segment_input_tokens = 0u64;
+    let mut segment_output_tokens = 0u64;
 
     for line in reader.lines() {
         let line = line?;
@@ -93,22 +98,21 @@ pub(crate) fn performance_summary_from_events(
                     .get("retry_count")
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as usize;
-                summary.input_tokens += payload
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                summary.output_tokens += payload
-                    .get("output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                let input_tokens = payload.get("input_tokens").and_then(Value::as_u64);
+                let output_tokens = payload.get("output_tokens").and_then(Value::as_u64);
+                if input_tokens.is_some() || output_tokens.is_some() {
+                    request_events_with_tokens += 1;
+                }
+                request_input_tokens += input_tokens.unwrap_or(0);
+                request_output_tokens += output_tokens.unwrap_or(0);
             }
             "SegmentFinished" => {
                 finished_segments += 1;
-                summary.input_tokens += payload
+                segment_input_tokens += payload
                     .get("input_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                summary.output_tokens += payload
+                segment_output_tokens += payload
                     .get("output_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
@@ -136,6 +140,13 @@ pub(crate) fn performance_summary_from_events(
     latencies.sort_unstable();
     summary.p50_latency_ms = percentile(&latencies, 0.50);
     summary.p95_latency_ms = percentile(&latencies, 0.95);
+    if request_events_with_tokens > 0 {
+        summary.input_tokens = request_input_tokens;
+        summary.output_tokens = request_output_tokens;
+    } else {
+        summary.input_tokens = segment_input_tokens;
+        summary.output_tokens = segment_output_tokens;
+    }
     let elapsed_ms = summary.elapsed_ms.or_else(|| {
         first_ts
             .zip(last_ts)
@@ -155,4 +166,68 @@ fn percentile(values: &[u64], percentile: f64) -> Option<u64> {
     }
     let index = ((values.len() - 1) as f64 * percentile).round() as usize;
     values.get(index).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn request_and_segment_tokens_are_not_double_counted() {
+        let path = temp_path("request-segment-tokens.jsonl");
+        fs::write(
+            &path,
+            [
+                r#"{"RequestFinished":{"request_id":"r1","batch_id":null,"segment_id":"s1","status":"ok","latency_ms":10,"status_code":null,"finish_reason":null,"retry_count":0,"input_tokens":11,"output_tokens":7,"error_kind":null,"timestamp_ms":1}}"#,
+                r#"{"SegmentFinished":{"segment_id":"s1","status":"succeeded","input_tokens":11,"output_tokens":7,"timestamp_ms":2}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("fixture should be written");
+
+        let summary = performance_summary_from_events(&path)
+            .expect("summary should parse")
+            .expect("summary should exist");
+
+        assert_eq!(summary.input_tokens, 11);
+        assert_eq!(summary.output_tokens, 7);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn segment_tokens_are_used_when_request_tokens_are_absent() {
+        let path = temp_path("segment-only-tokens.jsonl");
+        fs::write(
+            &path,
+            [
+                r#"{"RequestFinished":{"request_id":"r1","batch_id":null,"segment_id":"s1","status":"ok","latency_ms":10,"status_code":null,"finish_reason":null,"retry_count":0,"input_tokens":null,"output_tokens":null,"error_kind":null,"timestamp_ms":1}}"#,
+                r#"{"SegmentFinished":{"segment_id":"s1","status":"succeeded","input_tokens":13,"output_tokens":5,"timestamp_ms":2}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("fixture should be written");
+
+        let summary = performance_summary_from_events(&path)
+            .expect("summary should parse")
+            .expect("summary should exist");
+
+        assert_eq!(summary.input_tokens, 13);
+        assert_eq!(summary.output_tokens, 5);
+        let _ = fs::remove_file(path);
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bookforge-performance-test-{}-{nanos}-{name}",
+            std::process::id()
+        ))
+    }
 }

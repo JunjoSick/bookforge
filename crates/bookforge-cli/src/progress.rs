@@ -61,11 +61,15 @@ pub struct ProgressReporter {
 
 impl ProgressReporter {
     pub fn spawn(ui_mode: UiMode, jsonl_path: Option<PathBuf>) -> Self {
+        Self::spawn_with_append(ui_mode, jsonl_path, false)
+    }
+
+    pub fn spawn_with_append(ui_mode: UiMode, jsonl_path: Option<PathBuf>, append: bool) -> Self {
         let (tx, rx) = mpsc::channel::<ProgressEvent>(PROGRESS_EVENT_QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicUsize::new(0));
         let dropped_clone = dropped.clone();
 
-        let join = tokio::spawn(render_loop(rx, ui_mode, jsonl_path, dropped_clone));
+        let join = tokio::spawn(render_loop(rx, ui_mode, jsonl_path, append, dropped_clone));
 
         Self { tx, join, dropped }
     }
@@ -90,10 +94,11 @@ async fn render_loop(
     mut rx: mpsc::Receiver<ProgressEvent>,
     ui_mode: UiMode,
     jsonl_path: Option<PathBuf>,
+    append: bool,
     dropped: Arc<AtomicUsize>,
 ) -> Result<()> {
     let render_mode = resolve_render_mode(ui_mode, std::io::stderr().is_terminal());
-    let mut file_writer = JsonlFileWriter::new(jsonl_path);
+    let mut file_writer = JsonlFileWriter::new(jsonl_path, append);
     let mut renderer = Renderer::new(render_mode)?;
 
     while let Some(event) = rx.recv().await {
@@ -134,15 +139,17 @@ struct JsonlFileWriter {
     writer: Option<BufWriter<std::fs::File>>,
     failed: bool,
     last_flush: Instant,
+    append: bool,
 }
 
 impl JsonlFileWriter {
-    fn new(path: Option<PathBuf>) -> Self {
+    fn new(path: Option<PathBuf>, append: bool) -> Self {
         Self {
             path,
             writer: None,
             failed: false,
             last_flush: Instant::now(),
+            append,
         }
     }
 
@@ -156,7 +163,13 @@ impl JsonlFileWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        match std::fs::File::create(path) {
+        let file_result = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(self.append)
+            .truncate(!self.append)
+            .open(path);
+        match file_result {
             Ok(file) => {
                 self.writer = Some(BufWriter::new(file));
                 self.last_flush = Instant::now();
@@ -495,6 +508,7 @@ mod tests {
             rx,
             UiMode::Quiet,
             Some(path.clone()),
+            false,
             Arc::new(AtomicUsize::new(0)),
         );
         let handle = tokio::spawn(reporter_task);
@@ -532,6 +546,7 @@ mod tests {
             rx,
             UiMode::Json,
             Some(path.clone()),
+            false,
             Arc::new(AtomicUsize::new(0)),
         );
         let handle = tokio::spawn(reporter_task);
@@ -564,6 +579,7 @@ mod tests {
             rx,
             UiMode::Progress,
             Some(path.clone()),
+            false,
             Arc::new(AtomicUsize::new(0)),
         );
         let handle = tokio::spawn(reporter_task);

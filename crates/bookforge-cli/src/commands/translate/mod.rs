@@ -767,7 +767,7 @@ fn provider_config(
     })
 }
 
-async fn translate_and_checkpoint_batch<P>(
+pub(crate) async fn translate_and_checkpoint_batch<P>(
     provider: P,
     segments: &[Segment],
     config: &TranslationRunConfig,
