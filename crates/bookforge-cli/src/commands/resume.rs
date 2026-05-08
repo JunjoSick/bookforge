@@ -883,6 +883,8 @@ mod tests {
                 model: "mock-prefix-target",
                 base_url: None,
                 api_key_env: None,
+                            book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
 
@@ -1047,6 +1049,8 @@ mod tests {
                 model: "mock-prefix-target",
                 base_url: None,
                 api_key_env: None,
+                            book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
         let book = read_epub(&input).expect("fixture EPUB should read");

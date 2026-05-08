@@ -198,6 +198,8 @@ async fn run_mock_translation(
         model: &model,
         base_url: None,
         api_key_env: None,
+        book_id: None,
+        series_id: None,
     })?;
     if human_stdout_enabled(cli_args.ui) {
         println!("Job: {}", job.id);
@@ -438,6 +440,8 @@ async fn run_openai_compatible_translation(
         model: &model,
         base_url: Some(&provider_config.base_url),
         api_key_env: Some(&provider_config.api_key_env),
+        book_id: None,
+        series_id: None,
     })?;
     if human_stdout_enabled(cli_args.ui) {
         println!("Job: {}", job.id);
@@ -1519,6 +1523,8 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
+                            book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
         let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];

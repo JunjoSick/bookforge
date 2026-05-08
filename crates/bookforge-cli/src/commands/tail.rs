@@ -195,6 +195,8 @@ mod tests {
             events_path,
             report_json_path: None,
             report_markdown_path: None,
+            book_id: None,
+            series_id: None,
         }
     }
 

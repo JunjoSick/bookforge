@@ -55,6 +55,8 @@ pub struct JobRecord {
     pub events_path: Option<PathBuf>,
     pub report_json_path: Option<PathBuf>,
     pub report_markdown_path: Option<PathBuf>,
+    pub book_id: Option<String>,
+    pub series_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -83,6 +85,8 @@ pub struct CreateJob<'a> {
     pub model: &'a str,
     pub base_url: Option<&'a str>,
     pub api_key_env: Option<&'a str>,
+    pub book_id: Option<&'a str>,
+    pub series_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -282,8 +286,8 @@ impl JobStore {
         let conn = self.conn.borrow();
         conn.execute(
             "INSERT INTO jobs
-             (id, input_path, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'running', ?11, ?11)",
+             (id, input_path, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, book_id, series_id, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'running', ?13, ?13)",
             params![
                 id,
                 input_path.to_string_lossy(),
@@ -295,6 +299,8 @@ impl JobStore {
                 request.model,
                 request.base_url,
                 request.api_key_env,
+                request.book_id,
+                request.series_id,
                 now,
             ],
         )?;
@@ -316,6 +322,8 @@ impl JobStore {
             events_path: None,
             report_json_path: None,
             report_markdown_path: None,
+            book_id: request.book_id.map(ToOwned::to_owned),
+            series_id: request.series_id.map(ToOwned::to_owned),
         })
     }
 
@@ -717,7 +725,7 @@ impl JobStore {
         let conn = self.conn.borrow();
         conn.query_row(
             "SELECT id, input_path, input_snapshot_path, input_sha256, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, status,
-                    events_path, report_json_path, report_markdown_path
+                    events_path, report_json_path, report_markdown_path, book_id, series_id
              FROM jobs WHERE id = ?1",
             params![job_id],
             |row| {
@@ -738,6 +746,8 @@ impl JobStore {
                     events_path: row.get::<_, Option<String>>(13)?.map(PathBuf::from),
                     report_json_path: row.get::<_, Option<String>>(14)?.map(PathBuf::from),
                     report_markdown_path: row.get::<_, Option<String>>(15)?.map(PathBuf::from),
+                    book_id: row.get(16)?,
+                    series_id: row.get(17)?,
                 })
             },
         )
@@ -1263,6 +1273,8 @@ impl JobStore {
               events_path TEXT,
               report_json_path TEXT,
               report_markdown_path TEXT,
+              book_id TEXT,
+              series_id TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
@@ -1334,6 +1346,28 @@ impl JobStore {
               consumed INTEGER NOT NULL DEFAULT 0,
               FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS glossary_terms (
+              id INTEGER PRIMARY KEY,
+              scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global', 'series', 'book')),
+              scope_id TEXT,
+              source_text TEXT NOT NULL,
+              target_text TEXT NOT NULL,
+              category TEXT NOT NULL CHECK(category IN
+                ('person', 'place', 'object', 'invented', 'style', 'phrase', 'other')),
+              notes TEXT,
+              case_sensitive INTEGER NOT NULL DEFAULT 0,
+              always_active INTEGER NOT NULL DEFAULT 0,
+              status TEXT NOT NULL CHECK(status IN
+                ('user_seeded', 'auto_candidate', 'accepted', 'rejected'))
+                DEFAULT 'user_seeded',
+              source_language TEXT NOT NULL,
+              target_language TEXT NOT NULL,
+              source_count INTEGER DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(scope_kind, scope_id, source_text, source_language, target_language)
+            );
             ",
         )?;
         ensure_column(&conn, "jobs", "input_path", "TEXT NOT NULL DEFAULT ''")?;
@@ -1346,6 +1380,8 @@ impl JobStore {
         ensure_column(&conn, "jobs", "events_path", "TEXT")?;
         ensure_column(&conn, "jobs", "report_json_path", "TEXT")?;
         ensure_column(&conn, "jobs", "report_markdown_path", "TEXT")?;
+        ensure_column(&conn, "jobs", "book_id", "TEXT")?;
+        ensure_column(&conn, "jobs", "series_id", "TEXT")?;
         ensure_column(
             &conn,
             "segments",
@@ -1365,11 +1401,14 @@ impl JobStore {
             "CREATE INDEX IF NOT EXISTS idx_segments_cache_lookup
              ON segments(source_hash, cache_namespace, prompt_version, provider, model, status);
              CREATE INDEX IF NOT EXISTS idx_segment_flags_job
-             ON segment_flags(job_id, consumed);",
+             ON segment_flags(job_id, consumed);
+             CREATE INDEX IF NOT EXISTS idx_glossary_lookup
+             ON glossary_terms(source_language, target_language, scope_kind, scope_id, status);",
         )?;
         record_migration(&conn, 1, "initial")?;
         record_migration(&conn, 2, "v1_0_1_input_snapshot")?;
         record_migration(&conn, 3, "v1_1_segment_flags")?;
+        record_migration(&conn, 4, "v1_2_glossary_terms")?;
         Ok(())
     }
 
@@ -1533,6 +1572,8 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
+                            book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
         let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
@@ -1636,6 +1677,8 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
+                            book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
 
@@ -1695,6 +1738,8 @@ mod tests {
                 model: "model",
                 base_url: Some("https://example.test/v1"),
                 api_key_env: Some("OPENROUTER_API_KEY"),
+                            book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
         let settings = bookforge_core::TranslationProfile::Balanced.resolve();
@@ -1767,6 +1812,8 @@ mod tests {
                 model: "model",
                 base_url: Some("https://example.test/v1"),
                 api_key_env: Some(api_key_env),
+                            book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
         let settings = bookforge_core::TranslationProfile::Balanced.resolve();
@@ -1830,6 +1877,8 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
+                            book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
         let segments = vec![
@@ -1933,6 +1982,8 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
+                            book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
         let segments = vec![
@@ -2048,6 +2099,8 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
+                            book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
         let segments = vec![
@@ -2120,6 +2173,8 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
+                            book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
         let segments = vec![
@@ -2170,6 +2225,8 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
+                            book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
         let segments = vec![
@@ -2360,6 +2417,8 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
+                            book_id: None,
+                series_id: None,
             })
             .expect("job created");
         drop(store);
@@ -2410,6 +2469,8 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
+                            book_id: None,
+                series_id: None,
             })
             .expect("job created");
         store_w
@@ -2437,5 +2498,83 @@ mod tests {
         let _ = fs::remove_file(input_path);
         let _ = fs::remove_file(wal_path);
         let _ = fs::remove_file(shm_path);
+    }
+
+    #[test]
+    fn migrate_creates_glossary_terms_table() {
+        let db_path = temp_path("glossary_migrate.sqlite");
+        let store = JobStore::open(&db_path).expect("store opens");
+        let conn = store.conn.borrow();
+        let table: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'glossary_terms'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("glossary_terms table exists");
+        assert_eq!(table, "glossary_terms");
+        let index: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_glossary_lookup'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("idx_glossary_lookup exists");
+        assert_eq!(index, "idx_glossary_lookup");
+        let version: i64 = conn
+            .query_row(
+                "SELECT version FROM _migrations WHERE name = 'v1_2_glossary_terms'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v1_2 migration recorded");
+        assert_eq!(version, 4);
+        drop(conn);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn migrate_is_idempotent_v1_2() {
+        let db_path = temp_path("glossary_idem.sqlite");
+        // Open twice; second open re-runs migrate() and must not error.
+        {
+            let _store = JobStore::open(&db_path).expect("first open");
+        }
+        {
+            let _store = JobStore::open(&db_path).expect("second open");
+        }
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn create_job_persists_book_and_series_ids() {
+        let db_path = temp_path("glossary_jobids.sqlite");
+        let input_path = temp_path("input_jobids.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture");
+        let store = JobStore::open(&db_path).expect("store opens");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("out_jobids.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock",
+                base_url: None,
+                api_key_env: None,
+                book_id: Some("fellowship"),
+                series_id: Some("lord-of-the-rings"),
+            })
+            .expect("job created");
+        assert_eq!(job.book_id.as_deref(), Some("fellowship"));
+        assert_eq!(job.series_id.as_deref(), Some("lord-of-the-rings"));
+        let loaded = store
+            .get_job(&job.id)
+            .expect("get_job ok")
+            .expect("job present");
+        assert_eq!(loaded.book_id.as_deref(), Some("fellowship"));
+        assert_eq!(loaded.series_id.as_deref(), Some("lord-of-the-rings"));
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(input_path);
     }
 }
