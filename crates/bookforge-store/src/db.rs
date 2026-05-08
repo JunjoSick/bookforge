@@ -41,6 +41,8 @@ pub struct JobStore {
 pub struct JobRecord {
     pub id: String,
     pub input_path: PathBuf,
+    pub input_snapshot_path: Option<PathBuf>,
+    pub input_sha256: Option<String>,
     pub output_path: PathBuf,
     pub input_hash: String,
     pub source_lang: Option<String>,
@@ -67,6 +69,7 @@ pub struct JobSummary {
     pub cached: usize,
     pub retried: usize,
     pub input_tokens: u64,
+    pub input_cached_tokens: u64,
     pub output_tokens: u64,
 }
 
@@ -88,6 +91,10 @@ pub struct SegmentRecord {
     pub status: String,
     pub attempts: usize,
     pub error: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub input_cached_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub tokens_estimated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,7 +130,9 @@ pub struct SaveTranslation<'a> {
     pub model: &'a str,
     pub prompt_version: &'a str,
     pub input_tokens: Option<u64>,
+    pub input_cached_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub tokens_estimated: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,7 +146,9 @@ pub struct SaveNeedsReview<'a> {
     pub prompt_version: &'a str,
     pub error: &'a str,
     pub input_tokens: Option<u64>,
+    pub input_cached_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub tokens_estimated: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +170,17 @@ pub struct CacheLookupRequest<'a> {
     pub source_lang: Option<&'a str>,
     pub target_lang: &'a str,
     pub cache_namespace: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewSegmentFlag<'a> {
+    pub job_id: &'a str,
+    pub segment_id: &'a str,
+    pub kind: &'a str,
+    pub note: Option<&'a str>,
+    pub suggested_source: Option<&'a str>,
+    pub suggested_target: Option<&'a str>,
+    pub consumed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +302,8 @@ impl JobStore {
         Ok(JobRecord {
             id,
             input_path,
+            input_snapshot_path: None,
+            input_sha256: None,
             output_path,
             input_hash,
             source_lang: request.source_lang.map(ToOwned::to_owned),
@@ -309,8 +333,10 @@ impl JobStore {
                  events_path = ?2,
                  report_json_path = ?3,
                  report_markdown_path = ?4,
-                 updated_at = ?5
-             WHERE id = ?6",
+                 input_snapshot_path = ?5,
+                 input_sha256 = ?6,
+                 updated_at = ?7
+             WHERE id = ?8",
             params![
                 json,
                 snapshot
@@ -325,8 +351,36 @@ impl JobStore {
                     .report_markdown_path
                     .as_ref()
                     .map(|path| path.to_string_lossy().to_string()),
+                snapshot
+                    .input_snapshot_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string()),
+                snapshot.input_sha256.as_deref(),
                 timestamp_string(),
                 job_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_job_input_snapshot(
+        &self,
+        job_id: &str,
+        snapshot_path: &Path,
+        input_sha256: &str,
+    ) -> Result<()> {
+        let conn = self.conn.borrow();
+        conn.execute(
+            "UPDATE jobs
+             SET input_snapshot_path = ?1,
+                 input_sha256 = ?2,
+                 updated_at = ?3
+             WHERE id = ?4",
+            params![
+                snapshot_path.to_string_lossy(),
+                input_sha256,
+                timestamp_string(),
+                job_id
             ],
         )?;
         Ok(())
@@ -445,11 +499,24 @@ impl JobStore {
             replace_block_translations(&conn, request.job_id, request.segment_id, request.blocks)?;
             conn.execute(
                 "UPDATE segments
-                 SET status = 'succeeded', attempts = attempts + 1, input_tokens = ?1, output_tokens = ?2, translated_hash = ?3, error = NULL
-                 WHERE job_id = ?4 AND id = ?5",
+                 SET status = 'succeeded',
+                     attempts = attempts + 1,
+                     tokens_input = ?1,
+                     tokens_input_cached = ?2,
+                     tokens_output = ?3,
+                     tokens_estimated = ?4,
+                     translated_hash = ?5,
+                     error = NULL
+                 WHERE job_id = ?6 AND id = ?7",
                 params![
                     request.input_tokens.map(|value| value as i64),
+                    request.input_cached_tokens.map(|value| value as i64),
                     request.output_tokens.map(|value| value as i64),
+                    if request.tokens_estimated {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
                     translated_hash,
                     request.job_id,
                     request.segment_id,
@@ -482,11 +549,24 @@ impl JobStore {
             replace_block_translations(&conn, request.job_id, request.segment_id, request.blocks)?;
             conn.execute(
                 "UPDATE segments
-                 SET status = 'needs_review', attempts = attempts + 1, input_tokens = ?1, output_tokens = ?2, translated_hash = ?3, error = ?4
-                 WHERE job_id = ?5 AND id = ?6",
+                 SET status = 'needs_review',
+                     attempts = attempts + 1,
+                     tokens_input = ?1,
+                     tokens_input_cached = ?2,
+                     tokens_output = ?3,
+                     tokens_estimated = ?4,
+                     translated_hash = ?5,
+                     error = ?6
+                 WHERE job_id = ?7 AND id = ?8",
                 params![
                     request.input_tokens.map(|value| value as i64),
+                    request.input_cached_tokens.map(|value| value as i64),
                     request.output_tokens.map(|value| value as i64),
+                    if request.tokens_estimated {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
                     translated_hash,
                     request.error,
                     request.job_id,
@@ -520,7 +600,13 @@ impl JobStore {
             replace_block_translations(&conn, request.job_id, request.segment_id, request.blocks)?;
             conn.execute(
                 "UPDATE segments
-                 SET status = 'skipped_cached', input_tokens = NULL, output_tokens = NULL, translated_hash = ?1, error = NULL
+                 SET status = 'skipped_cached',
+                     tokens_input = NULL,
+                     tokens_input_cached = NULL,
+                     tokens_output = NULL,
+                     tokens_estimated = 0,
+                     translated_hash = ?1,
+                     error = NULL
                  WHERE job_id = ?2 AND id = ?3",
                 params![translated_hash, request.job_id, request.segment_id],
             )?;
@@ -630,7 +716,7 @@ impl JobStore {
     pub fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>> {
         let conn = self.conn.borrow();
         conn.query_row(
-            "SELECT id, input_path, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, status,
+            "SELECT id, input_path, input_snapshot_path, input_sha256, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, status,
                     events_path, report_json_path, report_markdown_path
              FROM jobs WHERE id = ?1",
             params![job_id],
@@ -638,18 +724,20 @@ impl JobStore {
                 Ok(JobRecord {
                     id: row.get(0)?,
                     input_path: PathBuf::from(row.get::<_, String>(1)?),
-                    output_path: PathBuf::from(row.get::<_, String>(2)?),
-                    input_hash: row.get(3)?,
-                    source_lang: row.get(4)?,
-                    target_lang: row.get(5)?,
-                    provider: row.get(6)?,
-                    model: row.get(7)?,
-                    base_url: row.get(8)?,
-                    api_key_env: row.get(9)?,
-                    status: row.get(10)?,
-                    events_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
-                    report_json_path: row.get::<_, Option<String>>(12)?.map(PathBuf::from),
-                    report_markdown_path: row.get::<_, Option<String>>(13)?.map(PathBuf::from),
+                    input_snapshot_path: row.get::<_, Option<String>>(2)?.map(PathBuf::from),
+                    input_sha256: row.get(3)?,
+                    output_path: PathBuf::from(row.get::<_, String>(4)?),
+                    input_hash: row.get(5)?,
+                    source_lang: row.get(6)?,
+                    target_lang: row.get(7)?,
+                    provider: row.get(8)?,
+                    model: row.get(9)?,
+                    base_url: row.get(10)?,
+                    api_key_env: row.get(11)?,
+                    status: row.get(12)?,
+                    events_path: row.get::<_, Option<String>>(13)?.map(PathBuf::from),
+                    report_json_path: row.get::<_, Option<String>>(14)?.map(PathBuf::from),
+                    report_markdown_path: row.get::<_, Option<String>>(15)?.map(PathBuf::from),
                 })
             },
         )
@@ -669,7 +757,11 @@ impl JobStore {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT status, COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+            "SELECT status,
+                    COUNT(*),
+                    COALESCE(SUM(COALESCE(tokens_input, input_tokens)), 0),
+                    COALESCE(SUM(tokens_input_cached), 0),
+                    COALESCE(SUM(COALESCE(tokens_output, output_tokens)), 0)
              FROM segments WHERE job_id = ?1 GROUP BY status",
         )?;
         let rows = stmt.query_map(params![job_id], |row| {
@@ -678,14 +770,16 @@ impl JobStore {
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
 
         for row in rows {
-            let (status, count, input_tokens, output_tokens) = row?;
+            let (status, count, input_tokens, input_cached_tokens, output_tokens) = row?;
             let count = count as usize;
             summary.total_segments += count;
             summary.input_tokens += input_tokens as u64;
+            summary.input_cached_tokens += input_cached_tokens as u64;
             summary.output_tokens += output_tokens as u64;
             match status.as_str() {
                 "succeeded" => summary.succeeded += count,
@@ -723,6 +817,79 @@ impl JobStore {
         Ok(count)
     }
 
+    pub fn insert_segment_flags(&self, flags: &[NewSegmentFlag<'_>]) -> Result<usize> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        let ingested_at = timestamp_string();
+        let mut inserted = 0usize;
+        for flag in flags {
+            inserted += tx.execute(
+                "INSERT INTO segment_flags
+                 (job_id, segment_id, kind, note, suggested_source, suggested_target, ingested_at, consumed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    flag.job_id,
+                    flag.segment_id,
+                    flag.kind,
+                    flag.note,
+                    flag.suggested_source,
+                    flag.suggested_target,
+                    ingested_at,
+                    if flag.consumed { 1_i64 } else { 0_i64 },
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn mark_segments_needs_review(
+        &self,
+        job_id: &str,
+        segment_ids: &[String],
+        reason: &str,
+    ) -> Result<usize> {
+        const SQLITE_IN_CHUNK_SIZE: usize = 900;
+        let mut updated = 0usize;
+        for chunk in segment_ids.chunks(SQLITE_IN_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE segments
+                 SET status = 'needs_review',
+                     error = ?
+                 WHERE job_id = ?
+                   AND id IN ({placeholders})"
+            );
+            let conn = self.conn.borrow();
+            let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(chunk.len() + 2);
+            params.push(&reason);
+            params.push(&job_id);
+            for id in chunk {
+                params.push(id);
+            }
+            updated += conn.execute(&sql, params.as_slice())?;
+        }
+        if updated > 0 {
+            self.touch_job(job_id, "needs_review")?;
+        }
+        Ok(updated)
+    }
+
+    pub fn segment_flag_count(&self, job_id: &str) -> Result<usize> {
+        let conn = self.conn.borrow();
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM segment_flags WHERE job_id = ?1",
+            params![job_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as usize)
+    }
+
     pub fn pending_segment_ids(&self, job_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
@@ -738,7 +905,15 @@ impl JobStore {
     pub fn segment_records(&self, job_id: &str) -> Result<Vec<SegmentRecord>> {
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
-            "SELECT id, status, attempts, error FROM segments WHERE job_id = ?1 ORDER BY ordinal",
+            "SELECT id,
+                    status,
+                    attempts,
+                    error,
+                    COALESCE(tokens_input, input_tokens),
+                    tokens_input_cached,
+                    COALESCE(tokens_output, output_tokens),
+                    tokens_estimated
+             FROM segments WHERE job_id = ?1 ORDER BY ordinal",
         )?;
         let rows = stmt.query_map(params![job_id], |row| {
             Ok(SegmentRecord {
@@ -746,6 +921,10 @@ impl JobStore {
                 status: row.get(1)?,
                 attempts: row.get::<_, i64>(2)? as usize,
                 error: row.get(3)?,
+                input_tokens: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                input_cached_tokens: row.get::<_, Option<i64>>(5)?.map(|value| value as u64),
+                output_tokens: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+                tokens_estimated: row.get::<_, i64>(7)? != 0,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1060,9 +1239,17 @@ impl JobStore {
         conn.execute_batch(
             "
             PRAGMA foreign_keys = ON;
+            CREATE TABLE IF NOT EXISTS _migrations (
+              version INTEGER PRIMARY KEY,
+              name TEXT NOT NULL,
+              applied_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS jobs (
               id TEXT PRIMARY KEY,
               input_path TEXT NOT NULL DEFAULT '',
+              input_snapshot_path TEXT,
+              input_sha256 TEXT,
               output_path TEXT NOT NULL DEFAULT '',
               input_hash TEXT NOT NULL,
               source_lang TEXT,
@@ -1093,6 +1280,10 @@ impl JobStore {
               attempts INTEGER NOT NULL DEFAULT 0,
               input_tokens INTEGER,
               output_tokens INTEGER,
+              tokens_input INTEGER,
+              tokens_input_cached INTEGER,
+              tokens_output INTEGER,
+              tokens_estimated INTEGER NOT NULL DEFAULT 0,
               cost_estimate REAL,
               error TEXT,
               translated_hash TEXT,
@@ -1130,9 +1321,24 @@ impl JobStore {
               message TEXT NOT NULL,
               FOREIGN KEY(job_id, segment_id) REFERENCES segments(job_id, id)
             );
+
+            CREATE TABLE IF NOT EXISTS segment_flags (
+              id INTEGER PRIMARY KEY,
+              job_id TEXT NOT NULL,
+              segment_id TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              note TEXT,
+              suggested_source TEXT,
+              suggested_target TEXT,
+              ingested_at TEXT NOT NULL,
+              consumed INTEGER NOT NULL DEFAULT 0,
+              FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
             ",
         )?;
         ensure_column(&conn, "jobs", "input_path", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "jobs", "input_snapshot_path", "TEXT")?;
+        ensure_column(&conn, "jobs", "input_sha256", "TEXT")?;
         ensure_column(&conn, "jobs", "output_path", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "jobs", "base_url", "TEXT")?;
         ensure_column(&conn, "jobs", "api_key_env", "TEXT")?;
@@ -1146,10 +1352,24 @@ impl JobStore {
             "cache_namespace",
             "TEXT NOT NULL DEFAULT ''",
         )?;
+        ensure_column(&conn, "segments", "tokens_input", "INTEGER")?;
+        ensure_column(&conn, "segments", "tokens_input_cached", "INTEGER")?;
+        ensure_column(&conn, "segments", "tokens_output", "INTEGER")?;
+        ensure_column(
+            &conn,
+            "segments",
+            "tokens_estimated",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_segments_cache_lookup
-             ON segments(source_hash, cache_namespace, prompt_version, provider, model, status);",
+             ON segments(source_hash, cache_namespace, prompt_version, provider, model, status);
+             CREATE INDEX IF NOT EXISTS idx_segment_flags_job
+             ON segment_flags(job_id, consumed);",
         )?;
+        record_migration(&conn, 1, "initial")?;
+        record_migration(&conn, 2, "v1_0_1_input_snapshot")?;
+        record_migration(&conn, 3, "v1_1_segment_flags")?;
         Ok(())
     }
 
@@ -1204,6 +1424,15 @@ fn ensure_column(
             [],
         )?;
     }
+    Ok(())
+}
+
+fn record_migration(conn: &Connection, version: i64, name: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO _migrations (version, name, applied_at)
+         VALUES (?1, ?2, ?3)",
+        params![version, name, timestamp_string()],
+    )?;
     Ok(())
 }
 
@@ -1324,7 +1553,9 @@ mod tests {
                 model: "mock-prefix",
                 prompt_version: "v1",
                 input_tokens: Some(11),
+                input_cached_tokens: Some(0),
                 output_tokens: Some(7),
+                tokens_estimated: false,
             })
             .expect("translation should save");
         store
@@ -1438,7 +1669,9 @@ mod tests {
                 model: "mock-prefix",
                 prompt_version: "v1",
                 input_tokens: Some(11),
+                input_cached_tokens: Some(0),
                 output_tokens: Some(7),
+                tokens_estimated: false,
             })
             .expect("translation should save");
 
@@ -1467,6 +1700,8 @@ mod tests {
         let settings = bookforge_core::TranslationProfile::Balanced.resolve();
         let snapshot = RunConfigSnapshot {
             input_path: input_path.clone(),
+            input_snapshot_path: Some(temp_path("input-snapshot.epub")),
+            input_sha256: Some("abc123".to_string()),
             output_path: temp_path("translated.epub"),
             events_path: Some(temp_path("events.jsonl")),
             report_json_path: Some(temp_path("report.json")),
@@ -1537,6 +1772,8 @@ mod tests {
         let settings = bookforge_core::TranslationProfile::Balanced.resolve();
         let snapshot = RunConfigSnapshot {
             input_path: input_path.clone(),
+            input_snapshot_path: None,
+            input_sha256: None,
             output_path: temp_path("translated.epub"),
             events_path: Some(temp_path("events.jsonl")),
             report_json_path: Some(temp_path("report.json")),
@@ -1618,7 +1855,9 @@ mod tests {
                 model: "mock-prefix",
                 prompt_version: "v1",
                 input_tokens: None,
+                input_cached_tokens: None,
                 output_tokens: None,
+                tokens_estimated: false,
             })
             .expect("done should save");
         store
@@ -1649,7 +1888,9 @@ mod tests {
                 prompt_version: "v1",
                 error: "needs eyes",
                 input_tokens: None,
+                input_cached_tokens: None,
                 output_tokens: None,
+                tokens_estimated: false,
             })
             .expect("review should save");
         store
@@ -1717,7 +1958,9 @@ mod tests {
                 model: "mock-prefix",
                 prompt_version: "v1",
                 input_tokens: None,
+                input_cached_tokens: None,
                 output_tokens: None,
+                tokens_estimated: false,
             })
             .expect("succeeded segment should save");
         store
@@ -1748,7 +1991,9 @@ mod tests {
                 prompt_version: "v1",
                 error: "qa issue",
                 input_tokens: None,
+                input_cached_tokens: None,
                 output_tokens: None,
+                tokens_estimated: false,
             })
             .expect("needs-review segment should save");
         store

@@ -1,7 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use assert_cmd::Command;
 use bookforge_store::JobStore;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 fn bookforge() -> Command {
@@ -206,6 +210,160 @@ fn cli_resume_reuses_checkpointed_segments() {
     );
 }
 
+#[test]
+fn cli_resume_uses_input_snapshot_after_original_is_moved() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = temp.path().join("source.epub");
+    let moved = temp.path().join("source-moved.epub");
+    fs::copy(fixture_input(), &input).expect("fixture should copy");
+    let run = translate_quiet_input(&temp, &input, "mock-prefix-target");
+
+    let snapshot = temp
+        .path()
+        .join(".bookforge/runs")
+        .join(&run.job_id)
+        .join("input.epub");
+    let snapshot_sha = temp
+        .path()
+        .join(".bookforge/runs")
+        .join(&run.job_id)
+        .join("input.sha256");
+    assert!(snapshot.exists(), "input snapshot should exist");
+    assert_eq!(
+        fs::read_to_string(&snapshot_sha)
+            .expect("snapshot sha should read")
+            .trim(),
+        sha256_file(&snapshot)
+    );
+
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
+    let retry_id = store
+        .segment_records(&run.job_id)
+        .expect("segments should load")
+        .into_iter()
+        .next()
+        .expect("fixture should have a segment")
+        .id;
+    store
+        .mark_segment_failed(&run.job_id, &retry_id, "force resume")
+        .expect("segment should mark failed");
+    drop(store);
+    fs::rename(&input, &moved).expect("input should move");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["resume", &run.job_id, "--ui", "quiet"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn cli_review_generates_artifacts_and_ingest_flags_marks_retry() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let run = translate_quiet(&temp, "mock-prefix-target");
+    let review_dir = temp.path().join("review-out");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["review", &run.job_id, "--out", review_dir.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let review_json_path = review_dir.join("review.json");
+    let review_html_path = review_dir.join("index.html");
+    assert!(review_json_path.exists(), "review.json should exist");
+    assert!(review_html_path.exists(), "index.html should exist");
+    let review_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&review_json_path).expect("review JSON should read"),
+    )
+    .expect("review JSON should parse");
+    let segments = review_json
+        .get("segments")
+        .and_then(|value| value.as_array())
+        .expect("segments array should exist");
+    assert!(!segments.is_empty(), "review should contain segments");
+    let sum_input = segments
+        .iter()
+        .map(|segment| {
+            segment
+                .pointer("/tokens/input")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    let total_input = review_json
+        .pointer("/totals/tokens_input")
+        .and_then(|value| value.as_u64())
+        .expect("total input tokens should exist");
+    assert_eq!(total_input, sum_input);
+    assert!(
+        fs::read_to_string(&review_html_path)
+            .expect("review HTML should read")
+            .contains("This page contains the full text of your book. Treat as private.")
+    );
+
+    let first_segment = segments[0]
+        .get("segment_id")
+        .and_then(|value| value.as_str())
+        .expect("segment id should exist");
+    let flags_path = temp.path().join("flags.json");
+    fs::write(
+        &flags_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "job_id": run.job_id.clone(),
+            "exported_at": "2026-05-06T13:45:00Z",
+            "flags": [{
+                "segment_id": first_segment,
+                "kind": "wrong_translation",
+                "note": "Meaning is reversed.",
+                "suggested_source": null,
+                "suggested_target": null
+            }]
+        }))
+        .unwrap(),
+    )
+    .expect("flags should write");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "ingest-flags",
+            &run.job_id,
+            "--flags",
+            flags_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
+    assert_eq!(
+        store
+            .segment_flag_count(&run.job_id)
+            .expect("flag count should load"),
+        1
+    );
+    let summary = store
+        .summary(&run.job_id)
+        .expect("summary should load")
+        .expect("job should exist");
+    assert_eq!(summary.needs_review, 1);
+    drop(store);
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["retry", &run.job_id, "--only", "needs-review"])
+        .assert()
+        .success();
+
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
+    let summary = store
+        .summary(&run.job_id)
+        .expect("summary should load")
+        .expect("job should exist");
+    assert_eq!(summary.retry_pending, 1);
+}
+
 struct TranslateRun {
     job_id: String,
     output: PathBuf,
@@ -214,13 +372,17 @@ struct TranslateRun {
 }
 
 fn translate_quiet(temp: &TempDir, model: &str) -> TranslateRun {
+    translate_quiet_input(temp, &fixture_input(), model)
+}
+
+fn translate_quiet_input(temp: &TempDir, input: &Path, model: &str) -> TranslateRun {
     let output = temp.path().join("out.epub");
     let events = temp.path().join("events.jsonl");
     let assert = bookforge()
         .current_dir(temp.path())
         .args([
             "translate",
-            fixture_input().to_str().unwrap(),
+            input.to_str().unwrap(),
             "--target",
             "Italian",
             "--provider",
@@ -250,6 +412,17 @@ fn translate_quiet(temp: &TempDir, model: &str) -> TranslateRun {
         output,
         events,
     }
+}
+
+fn sha256_file(path: &Path) -> String {
+    let bytes = fs::read(path).expect("file should read");
+    let digest = Sha256::digest(&bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing hash should not fail");
+    }
+    output
 }
 
 fn job_id_from_events(path: &Path) -> String {

@@ -48,7 +48,9 @@ pub struct SegmentTranslation {
     pub template: String,
     pub error: Option<String>,
     pub input_tokens: Option<u64>,
+    pub input_cached_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub tokens_estimated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +190,7 @@ where
                     &segment,
                     mode,
                     "scheduler semaphore closed before segment could run".to_string(),
+                    None,
                     None,
                     None,
                 );
@@ -348,6 +351,7 @@ where
     let attempts = config.scheduler.max_attempts.max(1);
     let mut last_error: Option<LlmError> = None;
     let mut accum_in: u64 = 0;
+    let mut accum_cached_in: u64 = 0;
     let mut accum_out: u64 = 0;
 
     for _ in 0..attempts {
@@ -365,8 +369,14 @@ where
             Ok(translation) => {
                 let mut translation = translation;
                 accum_in += translation.input_tokens.unwrap_or(0);
+                accum_cached_in += translation.input_cached_tokens.unwrap_or(0);
                 accum_out += translation.output_tokens.unwrap_or(0);
                 translation.input_tokens = if accum_in > 0 { Some(accum_in) } else { None };
+                translation.input_cached_tokens = if accum_cached_in > 0 {
+                    Some(accum_cached_in)
+                } else {
+                    None
+                };
                 translation.output_tokens = if accum_out > 0 { Some(accum_out) } else { None };
                 return translation;
             }
@@ -375,12 +385,18 @@ where
                     last_error = Some(error);
                 } else {
                     let tokens_in = if accum_in > 0 { Some(accum_in) } else { None };
+                    let cached_in = if accum_cached_in > 0 {
+                        Some(accum_cached_in)
+                    } else {
+                        None
+                    };
                     let tokens_out = if accum_out > 0 { Some(accum_out) } else { None };
                     return failed_translation_with_tokens(
                         &segment,
                         mode,
                         error.to_string(),
                         tokens_in,
+                        cached_in,
                         tokens_out,
                     );
                 }
@@ -404,8 +420,14 @@ where
             Ok(translation) => {
                 let mut translation = translation;
                 accum_in += translation.input_tokens.unwrap_or(0);
+                accum_cached_in += translation.input_cached_tokens.unwrap_or(0);
                 accum_out += translation.output_tokens.unwrap_or(0);
                 translation.input_tokens = if accum_in > 0 { Some(accum_in) } else { None };
+                translation.input_cached_tokens = if accum_cached_in > 0 {
+                    Some(accum_cached_in)
+                } else {
+                    None
+                };
                 translation.output_tokens = if accum_out > 0 { Some(accum_out) } else { None };
                 return translation;
             }
@@ -415,12 +437,18 @@ where
                     last_error = Some(error);
                 } else {
                     let tokens_in = if accum_in > 0 { Some(accum_in) } else { None };
+                    let cached_in = if accum_cached_in > 0 {
+                        Some(accum_cached_in)
+                    } else {
+                        None
+                    };
                     let tokens_out = if accum_out > 0 { Some(accum_out) } else { None };
                     return failed_translation_with_tokens(
                         &segment,
                         TranslationMode::RunPreserving,
                         error.to_string(),
                         tokens_in,
+                        cached_in,
                         tokens_out,
                     );
                 }
@@ -429,11 +457,23 @@ where
     }
 
     let tokens_in = if accum_in > 0 { Some(accum_in) } else { None };
+    let cached_in = if accum_cached_in > 0 {
+        Some(accum_cached_in)
+    } else {
+        None
+    };
     let tokens_out = if accum_out > 0 { Some(accum_out) } else { None };
     let error_message = last_error
         .map(|err| err.to_string())
         .unwrap_or_else(|| "exhausted validation retries".to_string());
-    needs_review_translation_with_tokens(&segment, final_mode, error_message, tokens_in, tokens_out)
+    needs_review_translation_with_tokens(
+        &segment,
+        final_mode,
+        error_message,
+        tokens_in,
+        cached_in,
+        tokens_out,
+    )
 }
 
 fn select_mode(segment: &Segment) -> TranslationMode {
@@ -506,7 +546,9 @@ where
         template: template.name.clone(),
         error: None,
         input_tokens: response.input_tokens,
+        input_cached_tokens: response.input_cached_tokens,
         output_tokens: response.output_tokens,
+        tokens_estimated: false,
     })
 }
 
@@ -999,6 +1041,7 @@ fn needs_review_translation_with_tokens(
     mode: TranslationMode,
     error: String,
     input_tokens: Option<u64>,
+    input_cached_tokens: Option<u64>,
     output_tokens: Option<u64>,
 ) -> SegmentTranslation {
     SegmentTranslation {
@@ -1011,7 +1054,9 @@ fn needs_review_translation_with_tokens(
         template: mode.template_name().to_string(),
         error: Some(error),
         input_tokens,
+        input_cached_tokens,
         output_tokens,
+        tokens_estimated: false,
     }
 }
 
@@ -1020,6 +1065,7 @@ fn failed_translation_with_tokens(
     mode: TranslationMode,
     error: String,
     input_tokens: Option<u64>,
+    input_cached_tokens: Option<u64>,
     output_tokens: Option<u64>,
 ) -> SegmentTranslation {
     SegmentTranslation {
@@ -1032,7 +1078,9 @@ fn failed_translation_with_tokens(
         template: mode.template_name().to_string(),
         error: Some(error),
         input_tokens,
+        input_cached_tokens,
         output_tokens,
+        tokens_estimated: false,
     }
 }
 
@@ -1470,6 +1518,7 @@ mod tests {
                 })
                 .to_string(),
                 input_tokens: Some(10),
+                input_cached_tokens: Some(0),
                 output_tokens: Some(3),
                 finish_reason: FinishReason::Stop,
                 provider_latency_ms: 0,

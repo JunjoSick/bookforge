@@ -159,6 +159,8 @@ mod tests {
         JobRecord {
             id: "job_test".to_string(),
             input_path: PathBuf::from("input.epub"),
+            input_snapshot_path: None,
+            input_sha256: None,
             output_path: PathBuf::from("/tmp/bookforge-status/out.epub"),
             input_hash: "hash".to_string(),
             source_lang: Some("English".to_string()),
@@ -181,6 +183,8 @@ mod tests {
         let settings = bookforge_core::TranslationProfile::V1Fast.resolve();
         RunConfigSnapshot {
             input_path: PathBuf::from("input.epub"),
+            input_snapshot_path: None,
+            input_sha256: None,
             output_path: PathBuf::from("/tmp/bookforge-status/out.epub"),
             events_path,
             report_json_path: None,

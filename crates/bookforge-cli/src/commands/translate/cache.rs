@@ -57,7 +57,9 @@ pub fn apply_cached_translations(
             template: "cached".to_string(),
             error: None,
             input_tokens: None,
+            input_cached_tokens: None,
             output_tokens: None,
+            tokens_estimated: false,
         });
     }
     Ok(cached)

@@ -203,7 +203,9 @@ fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
                         model: &model,
                         prompt_version: &prompt_version,
                         input_tokens: translation.input_tokens,
+                        input_cached_tokens: translation.input_cached_tokens,
                         output_tokens: translation.output_tokens,
+                        tokens_estimated: translation.tokens_estimated,
                     })?;
                 }
                 SegmentStatus::NeedsReview => {
@@ -220,7 +222,9 @@ fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
                             .as_deref()
                             .unwrap_or("translation requires review"),
                         input_tokens: translation.input_tokens,
+                        input_cached_tokens: translation.input_cached_tokens,
                         output_tokens: translation.output_tokens,
+                        tokens_estimated: translation.tokens_estimated,
                     })?;
                 }
                 SegmentStatus::Failed => {
@@ -279,7 +283,9 @@ mod tests {
                 None
             },
             input_tokens: Some(10),
+            input_cached_tokens: Some(0),
             output_tokens: Some(5),
+            tokens_estimated: false,
         }
     }
 

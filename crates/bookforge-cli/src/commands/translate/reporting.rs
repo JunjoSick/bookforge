@@ -77,6 +77,7 @@ pub fn print_summary_rebuild_and_report(
         }
         println!("Output: {}", config.output.display());
         println!("Report: {}", report.markdown.display());
+        println!("Review: bookforge review {} --open", job.id);
     }
 
     Ok(())

@@ -1,8 +1,8 @@
-# Bookforge
+# BookForge
 
-Bookforge is a Rust, CLI-first EPUB translation engine. It parses EPUB structure, builds semantic segments, sends only structured prose payloads to an LLM, validates responses, checkpoints segment results, and rebuilds a valid EPUB.
+BookForge is the EPUB translation engine that keeps the LLM away from your document structure. It parses EPUBs into validated JSON payloads, checkpoints every segment, preserves markup/footnotes/links, and rebuilds valid EPUBs.
 
-The program owns EPUB structure. The model only translates validated JSON payloads.
+I built this to translate books for my partner. It's MIT-licensed in case it's useful to you.
 
 ## Status
 
@@ -18,6 +18,7 @@ MVP functionality is implemented:
 - Resume and retry commands
 - Status and tail commands for persisted jobs
 - Segment-level cache reuse for compatible prior translations
+- Static side-by-side review HTML with flag export/import
 - QA reports in JSON and Markdown
 - Optional LLM QA review pass
 - Cost estimates for known provider/model pairs
@@ -130,6 +131,19 @@ Resume a job:
 cargo run -p bookforge-cli -- resume <job-id> --timeout-seconds 120
 ```
 
+Generate a side-by-side review page:
+
+```bash
+cargo run -p bookforge-cli -- review <job-id> --open
+```
+
+Ingest exported review flags and mark bad translations for retry:
+
+```bash
+cargo run -p bookforge-cli -- ingest-flags <job-id> --flags flags.json
+cargo run -p bookforge-cli -- retry <job-id> --only needs-review
+```
+
 Inspect persisted job state and recent events:
 
 ```bash
@@ -184,7 +198,9 @@ cargo run -p bookforge-cli -- translate book.epub \
   --progress-jsonl .bookforge/runs/example/events.jsonl
 ```
 
-Known limitations: resume depends on the original input path remaining available, provider API keys are read from environment variables, and validation is intentionally pragmatic rather than a full EPUBCheck replacement.
+Review artifacts contain the full source and translated text of the book. They are written locally under `.bookforge/runs/<job-id>/review/`; treat them as private user data.
+
+Known limitations: provider API keys are read from environment variables, and validation is intentionally pragmatic rather than a full EPUBCheck replacement.
 
 ## Benchmarks
 

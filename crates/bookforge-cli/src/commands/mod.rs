@@ -1,8 +1,10 @@
 pub mod doctor;
 pub mod estimate;
+pub mod ingest_flags;
 pub mod inspect;
 pub mod resume;
 pub mod retry;
+pub mod review;
 pub mod status;
 pub mod tail;
 pub mod translate;
