@@ -169,33 +169,33 @@ fn json_escape_inner(value: &str) -> String {
     serialized[1..serialized.len() - 1].to_string()
 }
 
-const PLAIN_TEMPLATE_SOURCE: &str = include_str!("../../../prompts/translate_segment.v1.md");
+const PLAIN_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_segment.v1.md");
 const MARKER_SAFE_TEMPLATE_SOURCE: &str =
-    include_str!("../../../prompts/translate_marker_safe.v1.md");
+    include_str!("../prompts/translate_marker_safe.v1.md");
 const RUN_PRESERVING_TEMPLATE_SOURCE: &str =
-    include_str!("../../../prompts/translate_run_preserving.v1.md");
-const QA_TEMPLATE_SOURCE: &str = include_str!("../../../prompts/qa_segment.v1.md");
+    include_str!("../prompts/translate_run_preserving.v1.md");
+const QA_TEMPLATE_SOURCE: &str = include_str!("../prompts/qa_segment.v1.md");
 
 const BATCH_PLAIN_TEMPLATE_SOURCE: &str =
-    include_str!("../../../prompts/translate_batch_plain.v1.md");
+    include_str!("../prompts/translate_batch_plain.v1.md");
 const BATCH_MARKER_SAFE_TEMPLATE_SOURCE: &str =
-    include_str!("../../../prompts/translate_batch_marker_safe.v1.md");
+    include_str!("../prompts/translate_batch_marker_safe.v1.md");
 const BATCH_RUN_PRESERVING_TEMPLATE_SOURCE: &str =
-    include_str!("../../../prompts/translate_batch_run_preserving.v1.md");
+    include_str!("../prompts/translate_batch_run_preserving.v1.md");
 const BATCH_REPAIR_TEMPLATE_SOURCE: &str =
-    include_str!("../../../prompts/translate_batch_repair.v1.md");
+    include_str!("../prompts/translate_batch_repair.v1.md");
 const BATCH_PLAIN_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../../../prompts/translate_batch_plain_compact.v1.md");
+    include_str!("../prompts/translate_batch_plain_compact.v1.md");
 const BATCH_MARKER_SAFE_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../../../prompts/translate_batch_marker_safe_compact.v1.md");
+    include_str!("../prompts/translate_batch_marker_safe_compact.v1.md");
 const BATCH_RUN_PRESERVING_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../../../prompts/translate_batch_run_preserving_compact.v1.md");
+    include_str!("../prompts/translate_batch_run_preserving_compact.v1.md");
 const BATCH_REPAIR_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../../../prompts/translate_batch_repair_compact.v1.md");
-const QA_BATCH_TEMPLATE_SOURCE: &str = include_str!("../../../prompts/qa_batch.v1.md");
+    include_str!("../prompts/translate_batch_repair_compact.v1.md");
+const QA_BATCH_TEMPLATE_SOURCE: &str = include_str!("../prompts/qa_batch.v1.md");
 const DOUBLE_CHECK_BATCH_TEMPLATE_SOURCE: &str =
-    include_str!("../../../prompts/double_check_batch.v1.md");
-const CORRECT_BATCH_TEMPLATE_SOURCE: &str = include_str!("../../../prompts/correct_batch.v1.md");
+    include_str!("../prompts/double_check_batch.v1.md");
+const CORRECT_BATCH_TEMPLATE_SOURCE: &str = include_str!("../prompts/correct_batch.v1.md");
 
 #[derive(Debug, Clone)]
 pub struct PromptLibrary {

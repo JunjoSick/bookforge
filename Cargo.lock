@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-cli"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -177,6 +177,7 @@ dependencies = [
  "indicatif",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -186,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-core"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "clap",
  "quick-xml",
@@ -198,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-epub"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "bookforge-core",
  "quick-xml",
@@ -208,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-llm"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "bookforge-core",
  "reqwest",
@@ -222,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-store"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "bookforge-core",
  "rusqlite",

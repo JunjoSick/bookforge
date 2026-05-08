@@ -1,7 +1,12 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
 
 use bookforge_core::{ResolvedRunSettings, ResolvedRunSettingsSnapshot, RunConfigSnapshot};
 use bookforge_store::{JobRecord, JobStore};
+use sha2::{Digest, Sha256};
 
 use crate::{ProviderArgs as CliProviderArgs, report::report_paths};
 
@@ -33,8 +38,11 @@ pub(crate) fn persist_snapshot(
         .progress_jsonl
         .clone()
         .unwrap_or_else(|| default_event_path(&job.id));
+    let input_snapshot = snapshot_input_epub(store, job, input)?;
     let snapshot = RunConfigSnapshot {
         input_path: input.to_path_buf(),
+        input_snapshot_path: Some(input_snapshot.epub_path.clone()),
+        input_sha256: Some(input_snapshot.sha256.clone()),
         output_path: output.to_path_buf(),
         events_path: Some(events_path.clone()),
         report_json_path: Some(reports.json),
@@ -54,4 +62,72 @@ pub(crate) fn persist_snapshot(
     store.update_job_config_snapshot(&job.id, &snapshot)?;
     store.update_job_event_path(&job.id, &events_path)?;
     Ok(snapshot)
+}
+
+#[derive(Debug, Clone)]
+struct InputSnapshot {
+    epub_path: PathBuf,
+    sha256: String,
+}
+
+fn snapshot_input_epub(
+    store: &JobStore,
+    job: &JobRecord,
+    input: &Path,
+) -> anyhow::Result<InputSnapshot> {
+    let run_dir = PathBuf::from(".bookforge/runs").join(&job.id);
+    fs::create_dir_all(&run_dir)?;
+    let epub_path = run_dir.join("input.epub");
+    let sha_path = run_dir.join("input.sha256");
+
+    let sha256 = match fs::hard_link(input, &epub_path) {
+        Ok(()) => sha256_file(&epub_path)?,
+        Err(_) => copy_and_hash(input, &epub_path)?,
+    };
+
+    fs::write(&sha_path, format!("{sha256}\n"))?;
+    store.update_job_input_snapshot(&job.id, &epub_path, &sha256)?;
+
+    Ok(InputSnapshot { epub_path, sha256 })
+}
+
+fn copy_and_hash(input: &Path, output: &Path) -> anyhow::Result<String> {
+    let mut reader = fs::File::open(input)?;
+    let mut writer = fs::File::create(output)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        writer.write_all(&buffer[..read])?;
+    }
+    writer.flush()?;
+    Ok(hex_digest(hasher.finalize().as_slice()))
+}
+
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let mut reader = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_digest(hasher.finalize().as_slice()))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing to string cannot fail");
+    }
+    output
 }

@@ -81,6 +81,7 @@ pub struct RequestMetadata {
 pub struct CompletionResponse {
     pub content: String,
     pub input_tokens: Option<u64>,
+    pub input_cached_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub finish_reason: FinishReason,
     pub provider_latency_ms: u64,
@@ -145,6 +146,7 @@ impl LlmProvider for MockProvider {
             return Ok(CompletionResponse {
                 content: "{not valid json".to_string(),
                 input_tokens: Some(estimate_tokens(&request.user)),
+                input_cached_tokens: Some(0),
                 output_tokens: None,
                 finish_reason: FinishReason::Stop,
                 provider_latency_ms: started.elapsed().as_millis() as u64,
@@ -236,6 +238,7 @@ impl LlmProvider for MockProvider {
 
         Ok(CompletionResponse {
             input_tokens: Some(estimate_tokens(&request.user)),
+            input_cached_tokens: Some(0),
             output_tokens: Some(estimate_tokens(&content)),
             finish_reason: FinishReason::Stop,
             provider_latency_ms: started.elapsed().as_millis() as u64,
@@ -408,6 +411,24 @@ fn extract_plain_source(user_prompt: &str) -> Option<String> {
 
 fn estimate_tokens(text: &str) -> u64 {
     text.split_whitespace().count().max(1) as u64
+}
+
+fn cached_input_tokens(raw: &Value) -> Option<u64> {
+    raw.pointer("/usage/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            raw.pointer("/usage/input_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| {
+            raw.pointer("/usage/input_token_details/cache_read")
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| {
+            raw.pointer("/usage/cache_read_input_tokens")
+                .and_then(Value::as_u64)
+        })
+        .or(Some(0))
 }
 
 #[derive(Debug, Clone)]
@@ -761,6 +782,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .map(parse_finish_reason)
             .unwrap_or(FinishReason::Unknown);
         let input_tokens = raw.pointer("/usage/prompt_tokens").and_then(Value::as_u64);
+        let input_cached_tokens = cached_input_tokens(&raw);
         let output_tokens = raw
             .pointer("/usage/completion_tokens")
             .and_then(Value::as_u64);
@@ -779,6 +801,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         Ok(CompletionResponse {
             content,
             input_tokens,
+            input_cached_tokens,
             output_tokens,
             finish_reason,
             provider_latency_ms: started.elapsed().as_millis() as u64,

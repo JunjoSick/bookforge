@@ -8,6 +8,10 @@ use crate::{
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RunConfigSnapshot {
     pub input_path: PathBuf,
+    #[serde(default)]
+    pub input_snapshot_path: Option<PathBuf>,
+    #[serde(default)]
+    pub input_sha256: Option<String>,
     pub output_path: PathBuf,
     pub events_path: Option<PathBuf>,
     pub report_json_path: Option<PathBuf>,

@@ -125,7 +125,7 @@ async fn run_inner(
         stage: "resume".to_string(),
         timestamp_ms: now_ms(),
     });
-    let input = snapshot.input_path.clone();
+    let input = resolve_resume_input(&job, snapshot)?;
     let output = args
         .output
         .clone()
@@ -427,6 +427,7 @@ async fn run_inner(
         }
         println!("Output: {}", output.display());
         println!("Report: {}", report.markdown.display());
+        println!("Review: bookforge review {} --open", job.id);
     }
 
     Ok(())
@@ -436,6 +437,44 @@ fn human_stdout_enabled(ui: Option<crate::progress::UiMode>) -> bool {
     !matches!(
         ui,
         Some(crate::progress::UiMode::Json | crate::progress::UiMode::Quiet)
+    )
+}
+
+fn resolve_resume_input(job: &JobRecord, snapshot: &RunConfigSnapshot) -> Result<PathBuf> {
+    if let Some(path) = snapshot
+        .input_snapshot_path
+        .as_ref()
+        .or(job.input_snapshot_path.as_ref())
+        && path.exists()
+    {
+        return Ok(path.clone());
+    }
+
+    if snapshot.input_snapshot_path.is_none() && job.input_snapshot_path.is_none() {
+        tracing::warn!(
+            "job '{}' predates input EPUB snapshots; falling back to original input path",
+            job.id
+        );
+        if snapshot.input_path.exists() {
+            return Ok(snapshot.input_path.clone());
+        }
+        anyhow::bail!(
+            "job '{}' does not have an input snapshot and the original input path no longer exists: {}",
+            job.id,
+            snapshot.input_path.display()
+        );
+    }
+
+    let snapshot_path = snapshot
+        .input_snapshot_path
+        .as_ref()
+        .or(job.input_snapshot_path.as_ref())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<missing>".to_string());
+    anyhow::bail!(
+        "job '{}' input snapshot is missing: {}",
+        job.id,
+        snapshot_path
     )
 }
 
@@ -712,7 +751,9 @@ fn rebuild_segment_translations(
                 template: "stored".to_string(),
                 error,
                 input_tokens: None,
+                input_cached_tokens: None,
                 output_tokens: None,
+                tokens_estimated: false,
             });
         }
     }
@@ -942,7 +983,9 @@ mod tests {
             template: "mock".to_string(),
             error: None,
             input_tokens: None,
+            input_cached_tokens: None,
             output_tokens: None,
+            tokens_estimated: false,
         }];
 
         let rebuilt = rebuild_block_translations(&segments, &stored, &fresh);
@@ -1037,6 +1080,8 @@ mod tests {
             .expect("segments should insert");
         let snapshot = RunConfigSnapshot {
             input_path: input,
+            input_snapshot_path: None,
+            input_sha256: None,
             output_path: output,
             events_path: Some(events),
             report_json_path: None,
@@ -1160,7 +1205,9 @@ mod tests {
                 model: "mock-prefix-target",
                 prompt_version: "v1",
                 input_tokens: Some(1),
+                input_cached_tokens: Some(0),
                 output_tokens: Some(1),
+                tokens_estimated: false,
             })
             .expect("translation should save");
     }
@@ -1183,7 +1230,9 @@ mod tests {
                 prompt_version: "v1",
                 error: "manual review",
                 input_tokens: Some(1),
+                input_cached_tokens: Some(0),
                 output_tokens: Some(1),
+                tokens_estimated: false,
             })
             .expect("needs-review translation should save");
     }

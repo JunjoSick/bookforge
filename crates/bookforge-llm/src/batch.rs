@@ -74,6 +74,7 @@ pub struct BatchTranslationResult {
     pub translations: Vec<BatchItemTranslation>,
     pub failures: Vec<BatchItemFailure>,
     pub input_tokens: Option<u64>,
+    pub input_cached_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
 }
 
@@ -83,7 +84,9 @@ pub struct BatchItemTranslation {
     pub segment_id: SegmentId,
     pub text: String,
     pub input_tokens: Option<u64>,
+    pub input_cached_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub tokens_estimated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +94,10 @@ pub struct BatchItemFailure {
     pub item_id: String,
     pub segment_id: SegmentId,
     pub error: String,
+    pub input_tokens: Option<u64>,
+    pub input_cached_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub tokens_estimated: bool,
 }
 
 #[derive(Clone)]
@@ -733,6 +740,10 @@ fn parse_text_batch_response(
                 item_id: item.id.clone(),
                 segment_id: SegmentId("unknown".to_string()),
                 error: "duplicate item ID in batch response".to_string(),
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                tokens_estimated: false,
             });
             continue;
         }
@@ -747,6 +758,10 @@ fn parse_text_batch_response(
                 item_id: item.id.clone(),
                 segment_id: request_item.segment_id.clone(),
                 error: "empty translation for non-empty source".to_string(),
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                tokens_estimated: false,
             });
             continue;
         }
@@ -762,7 +777,9 @@ fn parse_text_batch_response(
             segment_id: request_item.segment_id.clone(),
             text: translation,
             input_tokens: None,
+            input_cached_tokens: None,
             output_tokens: None,
+            tokens_estimated: false,
         });
     }
 
@@ -772,6 +789,10 @@ fn parse_text_batch_response(
                 item_id: item.item_id.clone(),
                 segment_id: item.segment_id.clone(),
                 error: "item missing from batch response".to_string(),
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                tokens_estimated: false,
             });
         }
     }
@@ -781,6 +802,7 @@ fn parse_text_batch_response(
         translations,
         failures,
         input_tokens: None,
+        input_cached_tokens: None,
         output_tokens: None,
     })
 }
@@ -808,6 +830,10 @@ fn parse_run_batch_response(
                 item_id: item.id.clone(),
                 segment_id: SegmentId("unknown".to_string()),
                 error: "duplicate item ID in batch response".to_string(),
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                tokens_estimated: false,
             });
             continue;
         }
@@ -826,6 +852,10 @@ fn parse_run_batch_response(
                     "run count mismatch: expected {expected_run_count}, got {}",
                     item.runs.len()
                 ),
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                tokens_estimated: false,
             });
             continue;
         }
@@ -842,6 +872,10 @@ fn parse_run_batch_response(
                     item_id: item.id.clone(),
                     segment_id: request_item.segment_id.clone(),
                     error: format!("unknown run ID in response: {}", run.id),
+                    input_tokens: None,
+                    input_cached_tokens: None,
+                    output_tokens: None,
+                    tokens_estimated: false,
                 });
                 break;
             }
@@ -853,7 +887,9 @@ fn parse_run_batch_response(
             segment_id: request_item.segment_id.clone(),
             text: joined.join(""),
             input_tokens: None,
+            input_cached_tokens: None,
             output_tokens: None,
+            tokens_estimated: false,
         });
     }
 
@@ -863,6 +899,10 @@ fn parse_run_batch_response(
                 item_id: item.item_id.clone(),
                 segment_id: item.segment_id.clone(),
                 error: "item missing from batch response".to_string(),
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                tokens_estimated: false,
             });
         }
     }
@@ -872,6 +912,7 @@ fn parse_run_batch_response(
         translations,
         failures,
         input_tokens: None,
+        input_cached_tokens: None,
         output_tokens: None,
     })
 }
@@ -1213,9 +1254,14 @@ where
                                 item_id: item.item_id.clone(),
                                 segment_id: item.segment_id.clone(),
                                 error: "repair batch invalid response".to_string(),
+                                input_tokens: None,
+                                input_cached_tokens: None,
+                                output_tokens: None,
+                                tokens_estimated: false,
                             })
                             .collect(),
                         input_tokens: None,
+                        input_cached_tokens: None,
                         output_tokens: None,
                     });
                 }
@@ -1238,9 +1284,14 @@ where
                                 item_id: item.item_id.clone(),
                                 segment_id: item.segment_id.clone(),
                                 error: "single-item batch invalid response".to_string(),
+                                input_tokens: None,
+                                input_cached_tokens: None,
+                                output_tokens: None,
+                                tokens_estimated: false,
                             })
                             .collect(),
                         input_tokens: None,
+                        input_cached_tokens: None,
                         output_tokens: None,
                     });
                 }
@@ -1295,9 +1346,14 @@ where
                                 item_id: item.item_id.clone(),
                                 segment_id: item.segment_id.clone(),
                                 error: format!("{error}"),
+                                input_tokens: None,
+                                input_cached_tokens: None,
+                                output_tokens: None,
+                                tokens_estimated: false,
                             })
                             .collect(),
                         input_tokens: None,
+                        input_cached_tokens: None,
                         output_tokens: None,
                     });
                 }
@@ -1324,7 +1380,9 @@ where
                       status: SegmentStatus,
                       error: Option<String>,
                       input_tokens: Option<u64>,
-                      output_tokens: Option<u64>|
+                      input_cached_tokens: Option<u64>,
+                      output_tokens: Option<u64>,
+                      tokens_estimated: bool|
      -> SegmentTranslation {
         if let Some(seg) = segments_by_id.get(seg_id) {
             SegmentTranslation {
@@ -1337,7 +1395,9 @@ where
                 template: "batch".to_string(),
                 error,
                 input_tokens,
+                input_cached_tokens,
                 output_tokens,
+                tokens_estimated,
             }
         } else {
             SegmentTranslation {
@@ -1350,7 +1410,9 @@ where
                 template: "batch".to_string(),
                 error,
                 input_tokens,
+                input_cached_tokens,
                 output_tokens,
+                tokens_estimated,
             }
         }
     };
@@ -1365,10 +1427,13 @@ where
                         &seg_id,
                         SegmentStatus::Succeeded,
                         None,
-                        Some(batch_result.input_tokens.unwrap_or(0)),
-                        Some(batch_result.output_tokens.unwrap_or(0)),
+                        None,
+                        None,
+                        None,
+                        false,
                     )
                 });
+            add_usage(entry, translation);
             if let Some(source_item) = all_items.get(&translation.item_id) {
                 entry.blocks.push(BlockTranslation {
                     block_id: source_item.block_id.clone(),
@@ -1388,7 +1453,7 @@ where
 
         for failure in &batch_result.failures {
             let seg_id = failure.segment_id.0.clone();
-            segment_translations
+            let entry = segment_translations
                 .entry(seg_id.clone())
                 .or_insert_with(|| {
                     make_entry(
@@ -1397,8 +1462,11 @@ where
                         Some(failure.error.clone()),
                         None,
                         None,
+                        None,
+                        false,
                     )
                 });
+            add_failure_usage(entry, failure);
         }
     }
 
@@ -1837,7 +1905,9 @@ async fn translate_one_batch(
             let mut result =
                 parse_batch_response(&batch, &resp.content).map_err(LlmError::InvalidResponse)?;
             result.input_tokens = resp.input_tokens;
+            result.input_cached_tokens = resp.input_cached_tokens;
             result.output_tokens = resp.output_tokens;
+            apportion_batch_usage(&batch, &mut result);
             Ok(result)
         }
         Err(e) => Err(e),
@@ -1873,6 +1943,101 @@ fn render_batch_items(batch: &TranslationBatch) -> String {
         .collect();
 
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn apportion_batch_usage(batch: &TranslationBatch, result: &mut BatchTranslationResult) {
+    let total_input = result.input_tokens;
+    let total_cached = result.input_cached_tokens;
+    let total_output = result.output_tokens;
+    if total_input.is_none() && total_cached.is_none() && total_output.is_none() {
+        return;
+    }
+
+    let weights = batch
+        .items
+        .iter()
+        .map(|item| token_estimate(&item.source_text).max(1) as u64)
+        .collect::<Vec<_>>();
+    if weights.is_empty() {
+        return;
+    }
+
+    let input = apportion(total_input, &weights);
+    let cached = apportion(total_cached, &weights);
+    let output = apportion(total_output, &weights);
+    let estimated = batch.items.len() > 1;
+
+    let usage_by_item = batch
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            (
+                item.item_id.as_str(),
+                (input[index], cached[index], output[index]),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    for translation in &mut result.translations {
+        if let Some((input, cached, output)) = usage_by_item.get(translation.item_id.as_str()) {
+            translation.input_tokens = *input;
+            translation.input_cached_tokens = *cached;
+            translation.output_tokens = *output;
+            translation.tokens_estimated = estimated;
+        }
+    }
+
+    for failure in &mut result.failures {
+        if let Some((input, cached, output)) = usage_by_item.get(failure.item_id.as_str()) {
+            failure.input_tokens = *input;
+            failure.input_cached_tokens = *cached;
+            failure.output_tokens = *output;
+            failure.tokens_estimated = estimated;
+        }
+    }
+}
+
+fn add_usage(entry: &mut SegmentTranslation, item: &BatchItemTranslation) {
+    entry.input_tokens = add_optional(entry.input_tokens, item.input_tokens);
+    entry.input_cached_tokens = add_optional(entry.input_cached_tokens, item.input_cached_tokens);
+    entry.output_tokens = add_optional(entry.output_tokens, item.output_tokens);
+    entry.tokens_estimated |= item.tokens_estimated;
+}
+
+fn add_failure_usage(entry: &mut SegmentTranslation, item: &BatchItemFailure) {
+    entry.input_tokens = add_optional(entry.input_tokens, item.input_tokens);
+    entry.input_cached_tokens = add_optional(entry.input_cached_tokens, item.input_cached_tokens);
+    entry.output_tokens = add_optional(entry.output_tokens, item.output_tokens);
+    entry.tokens_estimated |= item.tokens_estimated;
+}
+
+fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn apportion(total: Option<u64>, weights: &[u64]) -> Vec<Option<u64>> {
+    let Some(total) = total else {
+        return vec![None; weights.len()];
+    };
+    let weight_sum = weights.iter().sum::<u64>().max(1);
+    let mut values = Vec::with_capacity(weights.len());
+    let mut used = 0_u64;
+    for (index, weight) in weights.iter().enumerate() {
+        let value = if index + 1 == weights.len() {
+            total.saturating_sub(used)
+        } else {
+            total.saturating_mul(*weight) / weight_sum
+        };
+        used = used.saturating_add(value);
+        values.push(Some(value));
+    }
+    values
 }
 
 fn request_status_from_error(error: &LlmError) -> &'static str {
@@ -2373,6 +2538,7 @@ mod tests {
                 StubBehavior::FinishLength => Ok(CompletionResponse {
                     content: "{\"items\":[]}".to_string(),
                     input_tokens: Some(1),
+                    input_cached_tokens: Some(0),
                     output_tokens: Some(1),
                     finish_reason: FinishReason::Length,
                     provider_latency_ms: 0,
@@ -2389,6 +2555,7 @@ mod tests {
                     Ok(CompletionResponse {
                         content: json.to_string(),
                         input_tokens: Some(1),
+                        input_cached_tokens: Some(0),
                         output_tokens: Some(1),
                         finish_reason: FinishReason::Stop,
                         provider_latency_ms: 0,
@@ -2552,6 +2719,7 @@ mod tests {
             Ok(CompletionResponse {
                 content: next,
                 input_tokens: Some(1),
+                input_cached_tokens: Some(0),
                 output_tokens: Some(1),
                 finish_reason: FinishReason::Stop,
                 provider_latency_ms: 0,
