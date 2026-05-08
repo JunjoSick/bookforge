@@ -246,9 +246,9 @@ cargo clippy --all-targets --all-features
 crates/bookforge-core   IR, segmentation, shared config
 crates/bookforge-epub   EPUB inspect/read/rebuild
 crates/bookforge-llm    prompts, providers, scheduler, validators
+crates/bookforge-llm/prompts  Versioned prompt templates
 crates/bookforge-store  SQLite checkpoint store
 crates/bookforge-cli    CLI commands and reports
-prompts/                Versioned prompt templates
 docs/                   Architecture notes
 tests/fixtures/         Committed minimal fixture only
 ```
