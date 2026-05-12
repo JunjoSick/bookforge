@@ -8,7 +8,7 @@ use crate::{
 };
 
 /// Bumped when the cache key derivation changes incompatibly.
-pub const CACHE_KEY_SCHEMA_VERSION: u32 = 1;
+pub const CACHE_KEY_SCHEMA_VERSION: u32 = 2;
 /// Bumped when Segment / SegmentBlock layout changes incompatibly.
 pub const SEGMENT_SCHEMA_VERSION: u32 = 1;
 /// Bumped when inline marker extraction (m/keep/ref) changes incompatibly.
@@ -23,9 +23,48 @@ pub fn compute_cache_namespace(
     profile: &str,
     batch_enabled: bool,
     prompt_version: &str,
+    glossary_fingerprint: &str,
+) -> String {
+    compute_cache_namespace_inner(
+        CACHE_KEY_SCHEMA_VERSION,
+        max_segment_tokens,
+        context_tokens,
+        profile,
+        batch_enabled,
+        prompt_version,
+        Some(glossary_fingerprint),
+    )
+}
+
+pub fn compute_cache_namespace_v1(
+    max_segment_tokens: usize,
+    context_tokens: usize,
+    profile: &str,
+    batch_enabled: bool,
+    prompt_version: &str,
+) -> String {
+    compute_cache_namespace_inner(
+        1,
+        max_segment_tokens,
+        context_tokens,
+        profile,
+        batch_enabled,
+        prompt_version,
+        None,
+    )
+}
+
+fn compute_cache_namespace_inner(
+    cache_key_schema_version: u32,
+    max_segment_tokens: usize,
+    context_tokens: usize,
+    profile: &str,
+    batch_enabled: bool,
+    prompt_version: &str,
+    glossary_fingerprint: Option<&str>,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(CACHE_KEY_SCHEMA_VERSION.to_le_bytes());
+    hasher.update(cache_key_schema_version.to_le_bytes());
     hasher.update(SEGMENT_SCHEMA_VERSION.to_le_bytes());
     hasher.update(INLINE_MARKER_SCHEMA_VERSION.to_le_bytes());
     hasher.update((max_segment_tokens as u64).to_le_bytes());
@@ -33,6 +72,9 @@ pub fn compute_cache_namespace(
     hasher.update(profile.as_bytes());
     hasher.update([batch_enabled as u8]);
     hasher.update(prompt_version.as_bytes());
+    if let Some(glossary_fingerprint) = glossary_fingerprint {
+        hasher.update(glossary_fingerprint.as_bytes());
+    }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -409,16 +451,33 @@ mod tests {
 
     #[test]
     fn cache_namespace_changes_when_segmentation_settings_change() {
-        let a = compute_cache_namespace(1200, 160, "Balanced", false, "v1");
-        let b = compute_cache_namespace(1201, 160, "Balanced", false, "v1");
-        let c = compute_cache_namespace(1200, 160, "Balanced", true, "v1");
-        let d = compute_cache_namespace(1200, 160, "Balanced", false, "batch_v1");
-        let e = compute_cache_namespace(1200, 160, "Balanced", false, "v1");
+        let a = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a");
+        let b = compute_cache_namespace(1201, 160, "Balanced", false, "v1", "glossary:a");
+        let c = compute_cache_namespace(1200, 160, "Balanced", true, "v1", "glossary:a");
+        let d = compute_cache_namespace(1200, 160, "Balanced", false, "batch_v1", "glossary:a");
+        let e = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a");
+        let f = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:b");
 
         assert_ne!(a, b, "max_segment_tokens must affect namespace");
         assert_ne!(a, c, "batch_enabled must affect namespace");
         assert_ne!(a, d, "prompt_version must affect namespace");
+        assert_ne!(a, f, "glossary fingerprint must affect namespace");
         assert_eq!(a, e, "namespace is deterministic for identical inputs");
+    }
+
+    #[test]
+    fn legacy_cache_namespace_v1_ignores_glossary_fingerprint() {
+        let current_without_terms = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "");
+        let current_with_terms =
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a");
+        let legacy = compute_cache_namespace_v1(1200, 160, "Balanced", false, "v1");
+
+        assert_ne!(legacy, current_without_terms);
+        assert_ne!(legacy, current_with_terms);
+        assert_eq!(
+            legacy,
+            compute_cache_namespace_v1(1200, 160, "Balanced", false, "v1")
+        );
     }
 
     fn book_with_two_sections() -> Book {

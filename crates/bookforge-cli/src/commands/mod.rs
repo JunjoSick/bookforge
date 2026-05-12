@@ -1,5 +1,6 @@
 pub mod doctor;
 pub mod estimate;
+pub mod glossary;
 pub mod ingest_flags;
 pub mod inspect;
 pub mod resume;

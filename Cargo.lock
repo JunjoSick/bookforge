@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -181,13 +181,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "bookforge-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "quick-xml",
@@ -199,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-epub"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bookforge-core",
  "quick-xml",
@@ -209,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-llm"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bookforge-core",
  "reqwest",
@@ -223,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-store"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bookforge-core",
  "rusqlite",

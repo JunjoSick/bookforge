@@ -8,12 +8,14 @@ use std::{
 
 use bookforge_core::{
     Result as CoreResult,
+    glossary::{GlossaryScopeKind, GlossaryTerm},
     ir::BlockId,
     run_snapshot::RunConfigSnapshot,
     segment::{BlockTranslation, Segment},
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, types::Type};
 use sha2::{Digest, Sha256};
+use std::str::FromStr;
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -185,6 +187,15 @@ pub struct NewSegmentFlag<'a> {
     pub suggested_source: Option<&'a str>,
     pub suggested_target: Option<&'a str>,
     pub consumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GlossaryFilter<'a> {
+    pub scope_kind: Option<GlossaryScopeKind>,
+    pub scope_id: Option<&'a str>,
+    pub source_language: Option<&'a str>,
+    pub target_language: Option<&'a str>,
+    pub active_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -900,6 +911,201 @@ impl JobStore {
         Ok(count as usize)
     }
 
+    pub fn upsert_glossary_terms(&self, terms: &[GlossaryTerm]) -> Result<usize> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        let now = timestamp_string();
+        let mut changed = 0usize;
+        for term in terms {
+            let existing_id = tx
+                .query_row(
+                    "SELECT id FROM glossary_terms
+                     WHERE scope_kind = ?1
+                       AND ((?2 IS NULL AND scope_id IS NULL) OR scope_id = ?2)
+                       AND source_text = ?3
+                       AND source_language = ?4
+                       AND target_language = ?5",
+                    params![
+                        term.scope_kind.as_str(),
+                        term.scope_id.as_deref(),
+                        term.source_text,
+                        term.source_language,
+                        term.target_language,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(id) = existing_id {
+                changed += tx.execute(
+                    "UPDATE glossary_terms
+                     SET target_text = ?1,
+                         category = ?2,
+                         notes = ?3,
+                         case_sensitive = ?4,
+                         always_active = ?5,
+                         status = ?6,
+                         source_count = ?7,
+                         updated_at = ?8
+                     WHERE id = ?9",
+                    params![
+                        term.target_text,
+                        term.category.as_str(),
+                        term.notes.as_deref(),
+                        if term.case_sensitive { 1_i64 } else { 0_i64 },
+                        if term.always_active { 1_i64 } else { 0_i64 },
+                        term.status.as_str(),
+                        term.source_count as i64,
+                        now,
+                        id,
+                    ],
+                )?;
+            } else {
+                changed += tx.execute(
+                    "INSERT INTO glossary_terms
+                     (scope_kind, scope_id, source_text, target_text, category, notes,
+                      case_sensitive, always_active, status, source_language, target_language,
+                      source_count, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                    params![
+                        term.scope_kind.as_str(),
+                        term.scope_id.as_deref(),
+                        term.source_text,
+                        term.target_text,
+                        term.category.as_str(),
+                        term.notes.as_deref(),
+                        if term.case_sensitive { 1_i64 } else { 0_i64 },
+                        if term.always_active { 1_i64 } else { 0_i64 },
+                        term.status.as_str(),
+                        term.source_language,
+                        term.target_language,
+                        term.source_count as i64,
+                        now,
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    pub fn add_glossary_term(&self, term: &GlossaryTerm) -> Result<i64> {
+        self.upsert_glossary_terms(std::slice::from_ref(term))?;
+        let conn = self.conn.borrow();
+        let id = conn.query_row(
+            "SELECT id FROM glossary_terms
+             WHERE scope_kind = ?1
+               AND ((?2 IS NULL AND scope_id IS NULL) OR scope_id = ?2)
+               AND source_text = ?3
+               AND source_language = ?4
+               AND target_language = ?5",
+            params![
+                term.scope_kind.as_str(),
+                term.scope_id.as_deref(),
+                term.source_text,
+                term.source_language,
+                term.target_language,
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_glossary_terms(&self, filter: GlossaryFilter<'_>) -> Result<Vec<GlossaryTerm>> {
+        let conn = self.conn.borrow();
+        let mut sql = String::from(
+            "SELECT id, scope_kind, scope_id, source_text, target_text, category, notes,
+                    case_sensitive, always_active, status, source_language, target_language,
+                    source_count
+             FROM glossary_terms
+             WHERE 1 = 1",
+        );
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(scope_kind) = filter.scope_kind {
+            sql.push_str(" AND scope_kind = ?");
+            values.push(Box::new(scope_kind.as_str().to_string()));
+        }
+        if let Some(scope_id) = filter.scope_id {
+            sql.push_str(" AND scope_id = ?");
+            values.push(Box::new(scope_id.to_string()));
+        }
+        if let Some(source_language) = filter.source_language {
+            sql.push_str(" AND source_language = ?");
+            values.push(Box::new(source_language.to_string()));
+        }
+        if let Some(target_language) = filter.target_language {
+            sql.push_str(" AND target_language = ?");
+            values.push(Box::new(target_language.to_string()));
+        }
+        if filter.active_only {
+            sql.push_str(" AND status IN ('user_seeded', 'accepted')");
+        }
+        sql.push_str(
+            " ORDER BY source_language, target_language, scope_kind, scope_id, source_text",
+        );
+        let param_refs = values
+            .iter()
+            .map(|value| value.as_ref())
+            .collect::<Vec<&dyn rusqlite::types::ToSql>>();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), glossary_term_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_active_glossary_terms(
+        &self,
+        source_language: &str,
+        target_language: &str,
+        book_id: Option<&str>,
+        series_id: Option<&str>,
+    ) -> Result<Vec<GlossaryTerm>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT id, scope_kind, scope_id, source_text, target_text, category, notes,
+                    case_sensitive, always_active, status, source_language, target_language,
+                    source_count
+             FROM glossary_terms
+             WHERE source_language = ?1
+               AND target_language = ?2
+               AND status IN ('user_seeded', 'accepted')
+               AND (
+                    scope_kind = 'global'
+                    OR (scope_kind = 'series' AND scope_id = ?3)
+                    OR (scope_kind = 'book' AND scope_id = ?4)
+               )
+             ORDER BY scope_kind, scope_id, source_text",
+        )?;
+        let rows = stmt.query_map(
+            params![source_language, target_language, series_id, book_id],
+            glossary_term_from_row,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn remove_glossary_term(&self, id: i64) -> Result<usize> {
+        let conn = self.conn.borrow();
+        conn.execute("DELETE FROM glossary_terms WHERE id = ?1", params![id])
+            .map_err(StoreError::from)
+    }
+
+    pub fn clear_glossary_scope(
+        &self,
+        scope_kind: GlossaryScopeKind,
+        scope_id: Option<&str>,
+    ) -> Result<usize> {
+        let conn = self.conn.borrow();
+        let count = if scope_kind == GlossaryScopeKind::Global {
+            conn.execute("DELETE FROM glossary_terms WHERE scope_kind = 'global'", [])?
+        } else {
+            conn.execute(
+                "DELETE FROM glossary_terms WHERE scope_kind = ?1 AND scope_id = ?2",
+                params![scope_kind.as_str(), scope_id],
+            )?
+        };
+        Ok(count)
+    }
+
     pub fn pending_segment_ids(&self, job_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
@@ -1475,6 +1681,47 @@ fn record_migration(conn: &Connection, version: i64, name: &str) -> rusqlite::Re
     Ok(())
 }
 
+fn glossary_term_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GlossaryTerm> {
+    let scope_kind_text: String = row.get(1)?;
+    let category_text: String = row.get(5)?;
+    let status_text: String = row.get(9)?;
+    Ok(GlossaryTerm {
+        id: Some(row.get(0)?),
+        scope_kind: parse_row_enum(&scope_kind_text, 1)?,
+        scope_id: row.get(2)?,
+        source_text: row.get(3)?,
+        target_text: row.get(4)?,
+        category: parse_row_enum(&category_text, 5)?,
+        notes: row.get(6)?,
+        case_sensitive: row.get::<_, i64>(7)? != 0,
+        always_active: row.get::<_, i64>(8)? != 0,
+        status: parse_row_enum(&status_text, 9)?,
+        source_language: row.get(10)?,
+        target_language: row.get(11)?,
+        source_count: row.get::<_, Option<i64>>(12)?.unwrap_or(0).max(0) as usize,
+    })
+}
+
+fn parse_row_enum<T>(value: &str, column: usize) -> rusqlite::Result<T>
+where
+    T: FromStr<Err = String>,
+{
+    value.parse::<T>().map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(RowEnumError(err)))
+    })
+}
+
+#[derive(Debug)]
+struct RowEnumError(String);
+
+impl std::fmt::Display for RowEnumError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RowEnumError {}
+
 fn replace_block_translations(
     conn: &Connection,
     job_id: &str,
@@ -1572,7 +1819,7 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job should be created");
@@ -1677,7 +1924,7 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job should be created");
@@ -1738,7 +1985,7 @@ mod tests {
                 model: "model",
                 base_url: Some("https://example.test/v1"),
                 api_key_env: Some("OPENROUTER_API_KEY"),
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job should be created");
@@ -1761,6 +2008,13 @@ mod tests {
             provider_preset: None,
             prompt_version: "batch_v1".to_string(),
             cache_namespace: "cache_ns".to_string(),
+            book_id: None,
+            series_id: None,
+            glossary_budget_tokens: 800,
+            glossary_format: bookforge_core::GlossaryFormat::Json,
+            prompt_extra: None,
+            glossary_fingerprint: String::new(),
+            glossary_terms: Vec::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
 
@@ -1812,7 +2066,7 @@ mod tests {
                 model: "model",
                 base_url: Some("https://example.test/v1"),
                 api_key_env: Some(api_key_env),
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job should be created");
@@ -1835,6 +2089,13 @@ mod tests {
             provider_preset: None,
             prompt_version: "batch_v1".to_string(),
             cache_namespace: "cache_ns".to_string(),
+            book_id: None,
+            series_id: None,
+            glossary_budget_tokens: 800,
+            glossary_format: bookforge_core::GlossaryFormat::Json,
+            prompt_extra: None,
+            glossary_fingerprint: String::new(),
+            glossary_terms: Vec::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
 
@@ -1877,7 +2138,7 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job should be created");
@@ -1982,7 +2243,7 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job should be created");
@@ -2099,7 +2360,7 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job should be created");
@@ -2173,7 +2434,7 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job should be created");
@@ -2225,7 +2486,7 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job should be created");
@@ -2417,7 +2678,7 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job created");
@@ -2469,7 +2730,7 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job created");
@@ -2547,6 +2808,53 @@ mod tests {
     }
 
     #[test]
+    fn glossary_terms_upsert_list_and_active_lookup() {
+        let db_path = temp_path("glossary_terms.sqlite");
+        let store = JobStore::open(&db_path).expect("store opens");
+        let mut global = glossary_term(
+            bookforge_core::GlossaryScopeKind::Global,
+            None,
+            "Aragorn",
+            "Aragorn",
+        );
+        let book = glossary_term(
+            bookforge_core::GlossaryScopeKind::Book,
+            Some("fellowship"),
+            "Aragorn",
+            "Granpasso",
+        );
+
+        assert_eq!(
+            store
+                .upsert_glossary_terms(&[global.clone(), book.clone()])
+                .expect("terms upsert"),
+            2
+        );
+        global.target_text = "Aragorn II".to_string();
+        store
+            .upsert_glossary_terms(&[global.clone()])
+            .expect("global term updates instead of duplicating");
+
+        let all = store
+            .list_glossary_terms(GlossaryFilter::default())
+            .expect("terms list");
+        assert_eq!(all.len(), 2);
+
+        let active = store
+            .load_active_glossary_terms("English", "Italian", Some("fellowship"), Some("lotr"))
+            .expect("active terms");
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|term| term.target_text == "Granpasso"));
+
+        let removed = store
+            .clear_glossary_scope(bookforge_core::GlossaryScopeKind::Global, None)
+            .expect("global clear");
+        assert_eq!(removed, 1);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
     fn create_job_persists_book_and_series_ids() {
         let db_path = temp_path("glossary_jobids.sqlite");
         let input_path = temp_path("input_jobids.epub");
@@ -2576,5 +2884,28 @@ mod tests {
         assert_eq!(loaded.series_id.as_deref(), Some("lord-of-the-rings"));
         let _ = fs::remove_file(&db_path);
         let _ = fs::remove_file(input_path);
+    }
+
+    fn glossary_term(
+        scope_kind: bookforge_core::GlossaryScopeKind,
+        scope_id: Option<&str>,
+        source: &str,
+        target: &str,
+    ) -> bookforge_core::GlossaryTerm {
+        bookforge_core::GlossaryTerm {
+            id: None,
+            scope_kind,
+            scope_id: scope_id.map(ToOwned::to_owned),
+            source_text: source.to_string(),
+            target_text: target.to_string(),
+            category: bookforge_core::GlossaryCategory::Person,
+            notes: None,
+            case_sensitive: true,
+            always_active: false,
+            status: bookforge_core::GlossaryStatus::UserSeeded,
+            source_language: "English".to_string(),
+            target_language: "Italian".to_string(),
+            source_count: 0,
+        }
     }
 }

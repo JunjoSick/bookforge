@@ -170,20 +170,17 @@ fn json_escape_inner(value: &str) -> String {
 }
 
 const PLAIN_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_segment.v1.md");
-const MARKER_SAFE_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_marker_safe.v1.md");
+const MARKER_SAFE_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_marker_safe.v1.md");
 const RUN_PRESERVING_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/translate_run_preserving.v1.md");
 const QA_TEMPLATE_SOURCE: &str = include_str!("../prompts/qa_segment.v1.md");
 
-const BATCH_PLAIN_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_plain.v1.md");
+const BATCH_PLAIN_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_plain.v1.md");
 const BATCH_MARKER_SAFE_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/translate_batch_marker_safe.v1.md");
 const BATCH_RUN_PRESERVING_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/translate_batch_run_preserving.v1.md");
-const BATCH_REPAIR_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_repair.v1.md");
+const BATCH_REPAIR_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_repair.v1.md");
 const BATCH_PLAIN_COMPACT_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/translate_batch_plain_compact.v1.md");
 const BATCH_MARKER_SAFE_COMPACT_TEMPLATE_SOURCE: &str =

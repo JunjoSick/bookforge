@@ -7,7 +7,9 @@ use std::{
 };
 
 use anyhow::Result;
-use bookforge_core::{RunConfigSnapshot, segment::build_segments};
+use bookforge_core::{
+    GlossaryTerm, RunConfigSnapshot, segment::build_segments, target_matches, term_matches,
+};
 use bookforge_epub::read_epub;
 use bookforge_store::{JobRecord, JobStore};
 use clap::Args;
@@ -70,6 +72,14 @@ struct ReviewSegment {
 struct ReviewWarning {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    term_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    found_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     threshold: Option<f64>,
@@ -110,6 +120,16 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("job '{}' summary unavailable", job.id))?;
     let records = store.segment_records(&job.id)?;
     let translations = store.load_terminal_segment_translations(&job.id)?;
+    let glossary_terms = if snapshot.glossary_fingerprint.is_empty() {
+        store.load_active_glossary_terms(
+            job.source_lang.as_deref().unwrap_or("auto"),
+            &job.target_lang,
+            job.book_id.as_deref(),
+            job.series_id.as_deref(),
+        )?
+    } else {
+        snapshot.glossary_terms.clone()
+    };
 
     let document = build_review_document(
         &job,
@@ -119,6 +139,7 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
         &records,
         &translations,
         &summary,
+        &glossary_terms,
     );
 
     let out_dir = args.out.unwrap_or_else(|| {
@@ -191,6 +212,7 @@ fn build_review_document(
     records: &[bookforge_store::SegmentRecord],
     translations: &[bookforge_store::StoredSegmentTranslation],
     summary: &bookforge_store::JobSummary,
+    glossary_terms: &[GlossaryTerm],
 ) -> ReviewDocument {
     let records_by_id = records
         .iter()
@@ -223,7 +245,12 @@ fn build_review_document(
                     .flatten(),
                 ordinal: segment.ordinal + 1,
                 source_text: segment.source.text.clone(),
-                soft_warnings: soft_warnings(record, &segment.source.text, &target_text),
+                soft_warnings: soft_warnings(
+                    record,
+                    &segment.source.text,
+                    &target_text,
+                    glossary_terms,
+                ),
                 target_text,
                 tokens: ReviewTokens {
                     input: record.input_tokens.unwrap_or(0),
@@ -271,6 +298,7 @@ fn soft_warnings(
     record: &bookforge_store::SegmentRecord,
     source: &str,
     target: &str,
+    glossary_terms: &[GlossaryTerm],
 ) -> Vec<ReviewWarning> {
     let mut warnings = Vec::new();
     match record.status.as_str() {
@@ -299,6 +327,10 @@ fn soft_warnings(
         if !(0.33..=3.0).contains(&ratio) {
             warnings.push(ReviewWarning {
                 kind: "length_ratio".to_string(),
+                term_id: None,
+                source: None,
+                expected_target: None,
+                found_target: None,
                 value: Some((ratio * 100.0).round() / 100.0),
                 threshold: Some(3.0),
                 from: None,
@@ -328,12 +360,44 @@ fn soft_warnings(
             "translation appears to include model commentary",
         ));
     }
+    warnings.extend(glossary_warnings(source, target, glossary_terms));
     warnings
+}
+
+fn glossary_warnings(
+    source: &str,
+    target: &str,
+    glossary_terms: &[GlossaryTerm],
+) -> Vec<ReviewWarning> {
+    glossary_terms
+        .iter()
+        .filter(|term| term_matches(source, term))
+        .filter(|term| !target_matches(target, term))
+        .map(|term| ReviewWarning {
+            kind: "glossary_mismatch".to_string(),
+            term_id: term.id,
+            source: Some(term.source_text.clone()),
+            expected_target: Some(term.target_text.clone()),
+            found_target: None,
+            value: None,
+            threshold: None,
+            from: None,
+            to: None,
+            message: Some(format!(
+                "expected glossary target '{}' for source '{}'",
+                term.target_text, term.source_text
+            )),
+        })
+        .collect()
 }
 
 fn warning_message(kind: &str, message: &str) -> ReviewWarning {
     ReviewWarning {
         kind: kind.to_string(),
+        term_id: None,
+        source: None,
+        expected_target: None,
+        found_target: None,
         value: None,
         threshold: None,
         from: None,
@@ -348,6 +412,10 @@ fn missing_tokens(kind: &str, source: &[String], target: &[String]) -> Vec<Revie
         .filter(|token| !target.contains(token))
         .map(|token| ReviewWarning {
             kind: kind.to_string(),
+            term_id: None,
+            source: None,
+            expected_target: None,
+            found_target: None,
             value: None,
             threshold: None,
             from: Some(token.clone()),
@@ -564,7 +632,11 @@ input[type="search"] {
   padding: 1px 7px;
   font-size: 11px;
 }
-.badge.status-needs_review, .badge.status-failed { border-color: #fecaca; background: #fef2f2; color: var(--bad); }
+.badge.status-needs_review, .badge.status-failed, .badge.glossary-mismatch {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: var(--bad);
+}
 .flag-panel {
   display: none;
   margin-top: 10px;
@@ -675,6 +747,7 @@ function warningLabel(w) {
   if (w.kind === "length_ratio" && w.value) return `length ${w.value}x`;
   if (w.kind === "url_changed") return "url";
   if (w.kind === "number_changed") return "number";
+  if (w.kind === "glossary_mismatch") return `glossary: ${w.source || ""}`;
   return w.kind.replaceAll("_", " ");
 }
 
@@ -711,7 +784,7 @@ function renderSegment(segment, side) {
   }
   for (const warning of segment.soft_warnings) {
     const b = document.createElement("span");
-    b.className = "badge";
+    b.className = warning.kind === "glossary_mismatch" ? "badge glossary-mismatch" : "badge";
     b.textContent = warningLabel(warning);
     b.title = warning.message || warning.kind;
     badges.appendChild(b);
@@ -894,5 +967,33 @@ mod tests {
         let html = render_html(&json!({"schema_version": 1, "x": "<tag>"}).to_string());
         assert!(html.contains("embedded-review-json"));
         assert!(html.contains("\\u003ctag\\u003e"));
+    }
+
+    #[test]
+    fn glossary_warning_reports_expected_target() {
+        let warnings = glossary_warnings(
+            "Aragorn arrived.",
+            "Granpasso arrivo.",
+            &[GlossaryTerm {
+                id: Some(42),
+                scope_kind: bookforge_core::GlossaryScopeKind::Book,
+                scope_id: Some("fellowship".to_string()),
+                source_text: "Aragorn".to_string(),
+                target_text: "Aragorn".to_string(),
+                category: bookforge_core::GlossaryCategory::Person,
+                notes: None,
+                case_sensitive: true,
+                always_active: false,
+                status: bookforge_core::GlossaryStatus::UserSeeded,
+                source_language: "English".to_string(),
+                target_language: "Italian".to_string(),
+                source_count: 0,
+            }],
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].kind, "glossary_mismatch");
+        assert_eq!(warnings[0].term_id, Some(42));
+        assert_eq!(warnings[0].expected_target.as_deref(), Some("Aragorn"));
     }
 }

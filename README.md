@@ -86,6 +86,23 @@ cargo run -p bookforge-cli -- translate book.epub \
   --out book.it.epub
 ```
 
+Translate with a glossary:
+
+```bash
+cargo run -p bookforge-cli -- glossary import glossary.series.toml
+cargo run -p bookforge-cli -- translate book.epub \
+  --source English \
+  --target Italian \
+  --provider-preset openrouter-paid-fast \
+  --book-id fellowship \
+  --series-id lord-of-the-rings \
+  --glossary glossary.series.toml \
+  --glossary-budget-tokens 800 \
+  --glossary-format json \
+  --prompt-extra "Maintain a literary register." \
+  --out book.it.epub
+```
+
 Check provider and storage health:
 
 ```bash
@@ -142,6 +159,23 @@ Ingest exported review flags and mark bad translations for retry:
 ```bash
 cargo run -p bookforge-cli -- ingest-flags <job-id> --flags flags.json
 cargo run -p bookforge-cli -- retry <job-id> --only needs-review
+```
+
+Manage glossary terms:
+
+```bash
+cargo run -p bookforge-cli -- glossary list --language 'English->Italian'
+cargo run -p bookforge-cli -- glossary add "Aragorn" "Aragorn" \
+  --category person \
+  --scope series \
+  --scope-id lord-of-the-rings \
+  --source-lang English \
+  --target-lang Italian \
+  --case-sensitive
+cargo run -p bookforge-cli -- glossary export glossary.series.toml \
+  --scope series \
+  --scope-id lord-of-the-rings \
+  --language 'English->Italian'
 ```
 
 Inspect persisted job state and recent events:

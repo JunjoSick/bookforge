@@ -95,6 +95,18 @@ Glossary and fixed terminology:
 {{glossary_json}}
 ```
 
+Glossary prose constraints:
+
+```txt
+{{glossary_block_prose}}
+```
+
+Additional instructions:
+
+```txt
+{{prompt_extra}}
+```
+
 Protected spans that must not be changed:
 
 ```json

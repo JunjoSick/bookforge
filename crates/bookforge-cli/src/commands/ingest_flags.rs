@@ -1,7 +1,8 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use anyhow::Result;
-use bookforge_store::{JobStore, NewSegmentFlag};
+use bookforge_core::{GlossaryCategory, GlossaryScopeKind, GlossaryStatus, GlossaryTerm};
+use bookforge_store::{JobRecord, JobStore, NewSegmentFlag};
 use clap::Args;
 use serde::Deserialize;
 
@@ -11,6 +12,9 @@ pub struct IngestFlagsArgs {
 
     #[arg(long)]
     pub flags: PathBuf,
+
+    #[arg(long, value_enum)]
+    pub default_scope: Option<GlossaryScopeKind>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,9 +37,9 @@ struct FlagEntry {
 
 pub async fn run(args: IngestFlagsArgs) -> Result<()> {
     let store = JobStore::open_default()?;
-    if store.get_job(&args.job_id)?.is_none() {
+    let Some(job) = store.get_job(&args.job_id)? else {
         anyhow::bail!("job '{}' was not found", args.job_id);
-    }
+    };
 
     let parsed: FlagsFile = serde_json::from_str(&fs::read_to_string(&args.flags)?)
         .map_err(|err| anyhow::anyhow!("invalid flags JSON: {err}"))?;
@@ -62,6 +66,7 @@ pub async fn run(args: IngestFlagsArgs) -> Result<()> {
         .filter(|flag| flag.kind == "wrong_translation")
         .map(|flag| flag.segment_id.clone())
         .collect::<BTreeSet<_>>();
+    let glossary_terms = glossary_terms_from_flags(&job, args.default_scope, &parsed.flags)?;
 
     let new_flags = parsed
         .flags
@@ -73,11 +78,14 @@ pub async fn run(args: IngestFlagsArgs) -> Result<()> {
             note: flag.note.as_deref(),
             suggested_source: flag.suggested_source.as_deref(),
             suggested_target: flag.suggested_target.as_deref(),
-            consumed: flag.kind == "wrong_translation",
+            consumed: flag.kind == "wrong_translation"
+                || (flag.kind == "name" && flag.suggested_target.is_some())
+                || flag.kind == "register",
         })
         .collect::<Vec<_>>();
 
     let inserted = store.insert_segment_flags(&new_flags)?;
+    let glossary_added = store.upsert_glossary_terms(&glossary_terms)?;
     let wrong_translation_ids = wrong_translation_ids.into_iter().collect::<Vec<_>>();
     let marked = store.mark_segments_needs_review(
         &args.job_id,
@@ -86,10 +94,94 @@ pub async fn run(args: IngestFlagsArgs) -> Result<()> {
     )?;
 
     println!(
-        "Ingested {inserted} flags. {marked} segments marked needs-review. Glossary integration will be available in v1.2."
+        "Ingested {inserted} flags. {marked} segments marked needs-review. {glossary_added} glossary terms saved."
     );
 
     Ok(())
+}
+
+fn glossary_terms_from_flags(
+    job: &JobRecord,
+    default_scope: Option<GlossaryScopeKind>,
+    flags: &[FlagEntry],
+) -> Result<Vec<GlossaryTerm>> {
+    let scope_kind = default_scope.unwrap_or(GlossaryScopeKind::Book);
+    let scope_id = match scope_kind {
+        GlossaryScopeKind::Global => None,
+        GlossaryScopeKind::Book => Some(job.book_id.clone().unwrap_or_else(|| job.id.clone())),
+        GlossaryScopeKind::Series => Some(job.series_id.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--default-scope series requires job '{}' to have a series_id",
+                job.id
+            )
+        })?),
+    };
+    let source_language = job
+        .source_lang
+        .clone()
+        .unwrap_or_else(|| "auto".to_string());
+    let mut terms = Vec::new();
+    for flag in flags {
+        match flag.kind.as_str() {
+            "name"
+                if flag
+                    .suggested_target
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()) =>
+            {
+                let target = flag.suggested_target.clone().unwrap_or_default();
+                let source = flag
+                    .suggested_source
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| target.clone());
+                terms.push(GlossaryTerm {
+                    id: None,
+                    scope_kind,
+                    scope_id: scope_id.clone(),
+                    source_text: source,
+                    target_text: target,
+                    category: GlossaryCategory::Person,
+                    notes: flag.note.clone(),
+                    case_sensitive: true,
+                    always_active: false,
+                    status: GlossaryStatus::UserSeeded,
+                    source_language: source_language.clone(),
+                    target_language: job.target_lang.clone(),
+                    source_count: 0,
+                });
+            }
+            "register" => {
+                let source = flag
+                    .suggested_source
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| format!("__register:{}", flag.segment_id));
+                let target = flag
+                    .suggested_target
+                    .clone()
+                    .or_else(|| flag.note.clone())
+                    .unwrap_or_else(|| "register".to_string());
+                terms.push(GlossaryTerm {
+                    id: None,
+                    scope_kind,
+                    scope_id: scope_id.clone(),
+                    source_text: source,
+                    target_text: target,
+                    category: GlossaryCategory::Style,
+                    notes: flag.note.clone(),
+                    case_sensitive: false,
+                    always_active: true,
+                    status: GlossaryStatus::UserSeeded,
+                    source_language: source_language.clone(),
+                    target_language: job.target_lang.clone(),
+                    source_count: 0,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(terms)
 }
 
 fn validate_flags(job_id: &str, parsed: &FlagsFile) -> Result<()> {
@@ -159,5 +251,46 @@ mod tests {
         };
         let error = validate_flags("job_1", &parsed).expect_err("should reject kind");
         assert!(error.to_string().contains("invalid"));
+    }
+
+    #[test]
+    fn name_flags_seed_book_scoped_glossary_terms() {
+        let job = JobRecord {
+            id: "job_1".to_string(),
+            input_path: "input.epub".into(),
+            input_snapshot_path: None,
+            input_sha256: None,
+            output_path: "out.epub".into(),
+            input_hash: "hash".to_string(),
+            source_lang: Some("English".to_string()),
+            target_lang: "Italian".to_string(),
+            provider: "mock".to_string(),
+            model: "mock".to_string(),
+            base_url: None,
+            api_key_env: None,
+            status: "succeeded".to_string(),
+            events_path: None,
+            report_json_path: None,
+            report_markdown_path: None,
+            book_id: Some("fellowship".to_string()),
+            series_id: Some("lotr".to_string()),
+        };
+        let terms = glossary_terms_from_flags(
+            &job,
+            None,
+            &[FlagEntry {
+                segment_id: "seg_1".to_string(),
+                kind: "name".to_string(),
+                note: Some("preserve".to_string()),
+                suggested_source: Some("Aragorn".to_string()),
+                suggested_target: Some("Aragorn".to_string()),
+            }],
+        )
+        .expect("terms should build");
+
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].scope_kind, GlossaryScopeKind::Book);
+        assert_eq!(terms[0].scope_id.as_deref(), Some("fellowship"));
+        assert_eq!(terms[0].category, GlossaryCategory::Person);
     }
 }

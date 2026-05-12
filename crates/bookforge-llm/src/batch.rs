@@ -1,5 +1,6 @@
 use bookforge_core::{
     config::{BatchConfig, ProviderRequestMetric, TranslationProfile},
+    glossary::GlossaryFormat,
     ir::BlockId,
     segment::{BlockTranslation, Segment, SegmentId, SegmentStatus, SegmentTextRun},
 };
@@ -557,6 +558,24 @@ pub fn build_translation_batches(
     group_batches(items, config)
 }
 
+pub fn account_for_batch_prompt_overhead(
+    batches: Vec<TranslationBatch>,
+    config: &BatchConfig,
+    run_config: &TranslationRunConfig,
+) -> Vec<TranslationBatch> {
+    let target_tokens = mode_target_tokens(config.target_tokens);
+    batches
+        .into_iter()
+        .flat_map(|batch| {
+            let token_limit = target_tokens
+                .get(&batch.mode)
+                .copied()
+                .unwrap_or(config.target_tokens);
+            repack_batch_with_config(batch, token_limit, config.max_items, Some(run_config))
+        })
+        .collect()
+}
+
 fn group_batches(items: Vec<TranslationBatchItem>, config: &BatchConfig) -> Vec<TranslationBatch> {
     let mut mode_groups: HashMap<BatchMode, Vec<TranslationBatchItem>> = HashMap::new();
     for item in items {
@@ -648,6 +667,55 @@ fn token_estimate(text: &str) -> usize {
         return 0;
     }
     (chars / 4).max(1)
+}
+
+fn item_token_estimate(
+    item: &TranslationBatchItem,
+    config: Option<&TranslationRunConfig>,
+) -> usize {
+    let mut estimate = token_estimate(&item.source_text).max(1);
+    let Some(config) = config else {
+        return estimate;
+    };
+
+    let entries = config
+        .glossary
+        .entries_by_segment
+        .get(&item.segment_id.0)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if entries.is_empty() {
+        return estimate;
+    }
+    estimate += match config.glossary.format {
+        GlossaryFormat::Json => {
+            let rendered = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_string());
+            token_estimate("glossary") + token_estimate(&rendered)
+        }
+        GlossaryFormat::Prose => {
+            let rendered = crate::scheduler::render_glossary_prose(entries);
+            token_estimate("glossary_prose") + token_estimate(&rendered)
+        }
+    };
+    estimate
+}
+
+fn batch_fixed_token_estimate(config: Option<&TranslationRunConfig>) -> usize {
+    config
+        .and_then(|config| config.glossary.prompt_extra.as_deref())
+        .map(token_estimate)
+        .unwrap_or(0)
+}
+
+fn batch_token_estimate(
+    items: &[TranslationBatchItem],
+    config: Option<&TranslationRunConfig>,
+) -> usize {
+    batch_fixed_token_estimate(config)
+        + items
+            .iter()
+            .map(|item| item_token_estimate(item, config))
+            .sum::<usize>()
 }
 
 fn restore_missing_tokens(mut translation: String, required: &[String]) -> String {
@@ -926,6 +994,13 @@ fn is_transient(err: &LlmError) -> bool {
 }
 
 pub fn split_batch(batch: &TranslationBatch) -> Vec<TranslationBatch> {
+    split_batch_with_config(batch, None)
+}
+
+fn split_batch_with_config(
+    batch: &TranslationBatch,
+    config: Option<&TranslationRunConfig>,
+) -> Vec<TranslationBatch> {
     if batch.items.len() <= 1 {
         return vec![batch.clone()];
     }
@@ -938,7 +1013,7 @@ pub fn split_batch(batch: &TranslationBatch) -> Vec<TranslationBatch> {
             batch.ordinal * 2,
             batch.mode,
             left.to_vec(),
-            left.iter().map(|i| token_estimate(&i.source_text)).sum(),
+            batch_token_estimate(left, config),
         ));
     }
     if !right.is_empty() {
@@ -947,7 +1022,7 @@ pub fn split_batch(batch: &TranslationBatch) -> Vec<TranslationBatch> {
             batch.ordinal * 2 + 1,
             batch.mode,
             right.to_vec(),
-            right.iter().map(|i| token_estimate(&i.source_text)).sum(),
+            batch_token_estimate(right, config),
         ));
     }
     batches
@@ -956,28 +1031,41 @@ pub fn split_batch(batch: &TranslationBatch) -> Vec<TranslationBatch> {
 fn normalize_batch_for_current_sizer(
     batch: TranslationBatch,
     sizer: Option<&BatchSizer>,
+    config: Option<&TranslationRunConfig>,
 ) -> Vec<TranslationBatch> {
     let Some(sizer) = sizer else {
-        return vec![batch];
+        return vec![with_configured_token_estimate(batch, config)];
     };
     let target_tokens = sizer.target_tokens_for_mode(batch.mode);
     let max_items = sizer.max_items_for_mode(batch.mode);
+    let batch = with_configured_token_estimate(batch, config);
     if batch.token_estimate <= target_tokens && batch.items.len() <= max_items {
         return vec![batch];
     }
-    repack_batch(batch, target_tokens, max_items)
+    repack_batch_with_config(batch, target_tokens, max_items, config)
 }
 
+#[cfg(test)]
 fn repack_batch(
     batch: TranslationBatch,
     target_tokens: usize,
     max_items: usize,
 ) -> Vec<TranslationBatch> {
+    repack_batch_with_config(batch, target_tokens, max_items, None)
+}
+
+fn repack_batch_with_config(
+    batch: TranslationBatch,
+    target_tokens: usize,
+    max_items: usize,
+    config: Option<&TranslationRunConfig>,
+) -> Vec<TranslationBatch> {
     let target_tokens = target_tokens.max(1);
     let max_items = max_items.max(1);
     let mut out = Vec::new();
     let mut current_items = Vec::new();
-    let mut current_tokens = 0usize;
+    let fixed_tokens = batch_fixed_token_estimate(config);
+    let mut current_tokens = fixed_tokens;
     let mut part = 0usize;
     let base_id = batch.id;
     let base_ordinal = batch.ordinal;
@@ -985,7 +1073,7 @@ fn repack_batch(
     let kind = batch.kind;
 
     for item in batch.items {
-        let item_tokens = token_estimate(&item.source_text).max(1);
+        let item_tokens = item_token_estimate(&item, config).max(1);
         let would_exceed_items = current_items.len() >= max_items;
         let would_exceed_tokens =
             !current_items.is_empty() && current_tokens + item_tokens > target_tokens;
@@ -998,7 +1086,7 @@ fn repack_batch(
                 items: std::mem::take(&mut current_items),
                 token_estimate: current_tokens,
             });
-            current_tokens = 0;
+            current_tokens = fixed_tokens;
             part += 1;
         }
         current_tokens += item_tokens;
@@ -1016,6 +1104,14 @@ fn repack_batch(
         });
     }
     out
+}
+
+fn with_configured_token_estimate(
+    mut batch: TranslationBatch,
+    config: Option<&TranslationRunConfig>,
+) -> TranslationBatch {
+    batch.token_estimate = batch_token_estimate(&batch.items, config);
+    batch
 }
 
 pub fn collect_repair_items(result: &BatchTranslationResult) -> Vec<TranslationBatchItem> {
@@ -1085,8 +1181,11 @@ where
                 let Some(batch) = pending_queue.pop_front() else {
                     break;
                 };
-                let mut normalized =
-                    normalize_batch_for_current_sizer(batch, batch_sizer.as_deref());
+                let mut normalized = normalize_batch_for_current_sizer(
+                    batch,
+                    batch_sizer.as_deref(),
+                    Some(config.as_ref()),
+                );
                 let batch = normalized.remove(0);
                 for extra in normalized.into_iter().rev() {
                     pending_queue.push_front(extra);
@@ -1303,7 +1402,7 @@ where
                             sizer.on_invalid_json_for_mode(batch.mode);
                         }
                     }
-                    let split = split_batch(&batch);
+                    let split = split_batch_with_config(&batch, Some(config.as_ref()));
                     if split.len() == 2 {
                         progress.emit(bookforge_core::ProgressEvent::BatchSplit {
                             batch_id: batch.id.clone(),
@@ -1843,7 +1942,7 @@ async fn translate_one_batch(
     batch: TranslationBatch,
     config: &TranslationRunConfig,
 ) -> Result<BatchTranslationResult, LlmError> {
-    let items_json = render_batch_items(&batch);
+    let items_json = render_batch_items(&batch, config);
     let template = if config.compact_prompts {
         match batch.mode {
             BatchMode::Plain | BatchMode::TurboTextOnly => &library.batch_plain_compact,
@@ -1867,6 +1966,10 @@ async fn translate_one_batch(
             .unwrap_or("the source language"),
     )
     .string("target_language", &config.target_language)
+    .raw(
+        "prompt_extra",
+        config.glossary.prompt_extra.clone().unwrap_or_default(),
+    )
     .raw("items_json", items_json);
 
     let rendered = template
@@ -1914,31 +2017,53 @@ async fn translate_one_batch(
     }
 }
 
-fn render_batch_items(batch: &TranslationBatch) -> String {
+fn render_batch_items(batch: &TranslationBatch, config: &TranslationRunConfig) -> String {
     let items: Vec<serde_json::Value> = batch
         .items
         .iter()
         .map(|item| {
-            let base = serde_json::json!({
+            let mut obj = serde_json::json!({
                 "id": item.item_id,
                 "kind": item.kind,
                 "text": item.source_text,
                 "required_markers": item.required_markers,
                 "protected": item.protected_spans,
-            });
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+
+            let entries = config
+                .glossary
+                .entries_by_segment
+                .get(&item.segment_id.0)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            match config.glossary.format {
+                GlossaryFormat::Json => {
+                    obj.insert(
+                        "glossary".to_string(),
+                        serde_json::to_value(entries)
+                            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+                    );
+                }
+                GlossaryFormat::Prose => {
+                    obj.insert(
+                        "glossary_prose".to_string(),
+                        serde_json::Value::String(crate::scheduler::render_glossary_prose(entries)),
+                    );
+                }
+            }
 
             if batch.mode == BatchMode::RunPreserving {
-                let mut obj = base.as_object().cloned().unwrap_or_default();
                 let runs: Vec<serde_json::Value> = item
                     .text_runs
                     .iter()
                     .map(|r| serde_json::json!({"id": r.id, "text": r.text}))
                     .collect();
                 obj.insert("runs".to_string(), serde_json::Value::Array(runs));
-                serde_json::Value::Object(obj)
-            } else {
-                base
             }
+            serde_json::Value::Object(obj)
         })
         .collect();
 
@@ -2333,7 +2458,7 @@ mod tests {
                 .collect(),
         };
 
-        let normalized = normalize_batch_for_current_sizer(batch, Some(&sizer));
+        let normalized = normalize_batch_for_current_sizer(batch, Some(&sizer), None);
         assert!(normalized.len() > 1);
         assert!(normalized.iter().all(|part| {
             part.token_estimate <= sizer.target_tokens_for_mode(BatchMode::MarkerSafe)
@@ -2587,6 +2712,7 @@ mod tests {
             max_output_tokens: None,
             batch_max_output_tokens: None,
             compact_prompts: false,
+            glossary: crate::GlossaryRunConfig::default(),
         }
     }
 
@@ -2605,6 +2731,69 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    #[test]
+    fn batch_items_include_segment_glossary() {
+        let batch = make_two_item_batch();
+        let mut config = test_run_config();
+        config.glossary.entries_by_segment.insert(
+            "seg1".to_string(),
+            vec![bookforge_core::GlossaryPromptTerm {
+                source: "Hello".to_string(),
+                target: "Ciao".to_string(),
+                category: bookforge_core::GlossaryCategory::Phrase,
+                note: None,
+                term_id: Some(7),
+                case_sensitive: false,
+            }],
+        );
+        config.glossary.prompt_extra = Some("Use informal register.".to_string());
+
+        let rendered = render_batch_items(&batch, &config);
+        assert!(rendered.contains("\"glossary\""));
+        assert!(rendered.contains("\"source\":\"Hello\""));
+        assert!(!rendered.contains("Use informal register."));
+    }
+
+    #[test]
+    fn batch_prompt_overhead_repacks_glossary_heavy_items() {
+        let seg1 = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+        let seg2 = make_segment("seg2", vec![plain_block("Goodbye")], vec![]);
+        let batch_config = BatchConfig {
+            enabled: true,
+            target_tokens: 120,
+            max_items: 64,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches =
+            build_translation_batches(&[seg1, seg2], &batch_config, TranslationProfile::Balanced);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].items.len(), 2);
+
+        let mut config = test_run_config();
+        for segment_id in ["seg1", "seg2"] {
+            config.glossary.entries_by_segment.insert(
+                segment_id.to_string(),
+                vec![bookforge_core::GlossaryPromptTerm {
+                    source: format!("{segment_id}_source"),
+                    target: format!("{segment_id}_target"),
+                    category: bookforge_core::GlossaryCategory::Phrase,
+                    note: Some("x".repeat(480)),
+                    term_id: None,
+                    case_sensitive: false,
+                }],
+            );
+        }
+        config.glossary.prompt_extra = Some("y".repeat(160));
+
+        let adjusted = account_for_batch_prompt_overhead(batches, &batch_config, &config);
+
+        assert_eq!(adjusted.len(), 2);
+        assert!(adjusted.iter().all(|batch| batch.items.len() == 1));
+        assert!(adjusted.iter().all(|batch| batch.token_estimate > 120));
     }
 
     #[tokio::test]

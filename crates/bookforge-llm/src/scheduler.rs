@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bookforge_core::{
     config::TranslationProfile,
+    glossary::{GlossaryFormat, GlossaryPromptTerm},
     ir::BlockId,
     scheduler::SchedulerConfig,
     segment::{BlockTranslation, Segment, SegmentBlock, SegmentId, SegmentStatus},
@@ -35,6 +37,24 @@ pub struct TranslationRunConfig {
     pub max_output_tokens: Option<u32>,
     pub batch_max_output_tokens: Option<u32>,
     pub compact_prompts: bool,
+    pub glossary: GlossaryRunConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlossaryRunConfig {
+    pub format: GlossaryFormat,
+    pub entries_by_segment: HashMap<String, Vec<GlossaryPromptTerm>>,
+    pub prompt_extra: Option<String>,
+}
+
+impl Default for GlossaryRunConfig {
+    fn default() -> Self {
+        Self {
+            format: GlossaryFormat::Json,
+            entries_by_segment: HashMap::new(),
+            prompt_extra: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,6 +350,8 @@ fn render_qa_prompt(
         segment.metadata.section_title.as_deref().unwrap_or(""),
     )
     .json("glossary_json", &Value::Array(Vec::new()))
+    .raw("glossary_block_prose", "")
+    .raw("prompt_extra", "")
     .raw("source_text", &segment.source.text)
     .raw("translation_text", translation.joined_text());
 
@@ -586,6 +608,7 @@ fn render_prompt(
     config: &TranslationRunConfig,
     mode: TranslationMode,
 ) -> Result<crate::prompt::Rendered> {
+    let (glossary_json, glossary_prose) = glossary_for_segment(config, &segment.id.0);
     let mut vars = Substitutions::new();
     vars.string(
         "source_language",
@@ -615,7 +638,12 @@ fn render_prompt(
         "context_after",
         segment.context.after.clone().unwrap_or_default(),
     )
-    .json("glossary_json", &Value::Array(Vec::new()))
+    .json("glossary_json", &glossary_json)
+    .raw("glossary_block_prose", glossary_prose)
+    .raw(
+        "prompt_extra",
+        config.glossary.prompt_extra.clone().unwrap_or_default(),
+    )
     .json(
         "protected_spans_json",
         &Value::Array(
@@ -674,6 +702,47 @@ fn render_prompt(
     template
         .render(&vars)
         .map_err(|err| LlmError::Provider(format!("prompt render failed: {err}")))
+}
+
+pub(crate) fn glossary_for_segment(
+    config: &TranslationRunConfig,
+    segment_id: &str,
+) -> (Value, String) {
+    let entries = config
+        .glossary
+        .entries_by_segment
+        .get(segment_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    match config.glossary.format {
+        GlossaryFormat::Json => (
+            serde_json::to_value(entries).unwrap_or(Value::Array(vec![])),
+            String::new(),
+        ),
+        GlossaryFormat::Prose => (Value::Array(vec![]), render_glossary_prose(entries)),
+    }
+}
+
+pub(crate) fn render_glossary_prose(entries: &[GlossaryPromptTerm]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Active glossary constraints (must be honored):\n");
+    for entry in entries {
+        out.push_str("- \"");
+        out.push_str(&entry.source);
+        out.push_str("\" -> \"");
+        out.push_str(&entry.target);
+        out.push_str("\" (");
+        out.push_str(entry.category.as_str());
+        out.push(')');
+        if let Some(note) = entry.note.as_deref().filter(|note| !note.is_empty()) {
+            out.push_str(": ");
+            out.push_str(note);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn segment_block_to_json(block: &SegmentBlock) -> Value {
@@ -1420,6 +1489,46 @@ mod tests {
         assert!(translations[0].error.is_some());
     }
 
+    #[test]
+    fn prompt_renders_glossary_json_prose_and_prompt_extra() {
+        let segment = segment("seg_a", 0, vec![("b0", "Aragorn enters.")]);
+        let mut json_config = config();
+        json_config.glossary.entries_by_segment.insert(
+            "seg_a".to_string(),
+            vec![GlossaryPromptTerm {
+                source: "Aragorn".to_string(),
+                target: "Aragorn".to_string(),
+                category: bookforge_core::GlossaryCategory::Person,
+                note: Some("Preserve name".to_string()),
+                term_id: Some(42),
+                case_sensitive: true,
+            }],
+        );
+        json_config.glossary.prompt_extra = Some("Maintain a literary register.".to_string());
+
+        let rendered = render_prompt(
+            &PromptLibrary::global().plain,
+            &segment,
+            &json_config,
+            TranslationMode::Plain,
+        )
+        .expect("prompt should render");
+        assert!(rendered.user.contains("\"source\": \"Aragorn\""));
+        assert!(rendered.user.contains("Maintain a literary register."));
+
+        let mut prose_config = json_config.clone();
+        prose_config.glossary.format = bookforge_core::GlossaryFormat::Prose;
+        let rendered = render_prompt(
+            &PromptLibrary::global().plain,
+            &segment,
+            &prose_config,
+            TranslationMode::Plain,
+        )
+        .expect("prompt should render");
+        assert!(rendered.user.contains("Active glossary constraints"));
+        assert!(rendered.user.contains("\"Aragorn\" -> \"Aragorn\""));
+    }
+
     fn config() -> TranslationRunConfig {
         TranslationRunConfig {
             source_language: Some("English".to_string()),
@@ -1437,6 +1546,7 @@ mod tests {
             max_output_tokens: None,
             batch_max_output_tokens: None,
             compact_prompts: false,
+            glossary: GlossaryRunConfig::default(),
         }
     }
 

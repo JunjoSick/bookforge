@@ -344,7 +344,7 @@ mod tests {
                 model: "mock-model",
                 base_url: None,
                 api_key_env: None,
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job created");
@@ -460,7 +460,7 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
-                            book_id: None,
+                book_id: None,
                 series_id: None,
             })
             .expect("job created");
