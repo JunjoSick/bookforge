@@ -6,14 +6,18 @@ use std::{
 
 use anyhow::Result;
 use bookforge_core::{
-    ProgressEvent, ProgressSink, ResolvedRunSettings, RunConfigSnapshot,
+    ProgressEvent, ProgressSink, ResolvedRunSettings, RunConfigSnapshot, merge_scope_terms,
     progress::now_ms,
-    segment::{BlockTranslation, Segment, SegmentStatus, build_segments, compute_cache_namespace},
+    segment::{
+        BlockTranslation, Segment, SegmentStatus, build_segments, compute_cache_namespace,
+        compute_cache_namespace_v1,
+    },
+    select_glossary_for_segments,
 };
 use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::{
-    MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, QaSegmentReview,
-    SegmentTranslation, TranslationRunConfig,
+    GlossaryRunConfig, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
+    QaSegmentReview, SegmentTranslation, TranslationRunConfig,
 };
 use bookforge_store::{JobRecord, JobStore, StoredBlockTranslation};
 use clap::Args;
@@ -206,6 +210,33 @@ async fn run_inner(
 
     let pending_segments = select_pending_segments(&segments, &pending_ids)?;
     let prompt_version = snapshot.prompt_version.as_str();
+    let legacy_cache_namespace = snapshot.glossary_fingerprint.is_empty();
+    let glossary = if legacy_cache_namespace {
+        crate::commands::translate::PreparedGlossary {
+            run_config: GlossaryRunConfig::default(),
+            fingerprint: String::new(),
+            active_terms: Vec::new(),
+        }
+    } else {
+        let active_terms = merge_scope_terms(&snapshot.glossary_terms);
+        let selected =
+            select_glossary_for_segments(&segments, &active_terms, snapshot.glossary_budget_tokens);
+        let fingerprint = crate::commands::translate::glossary_fingerprint(
+            snapshot.glossary_format,
+            snapshot.glossary_budget_tokens,
+            snapshot.prompt_extra.as_deref(),
+            &active_terms,
+        );
+        crate::commands::translate::PreparedGlossary {
+            run_config: GlossaryRunConfig {
+                format: snapshot.glossary_format,
+                entries_by_segment: selected.entries_by_segment,
+                prompt_extra: snapshot.prompt_extra.clone(),
+            },
+            fingerprint,
+            active_terms,
+        }
+    };
     let run_config = TranslationRunConfig {
         source_language: snapshot.source_language.clone(),
         target_language: snapshot.target_language.clone(),
@@ -219,15 +250,27 @@ async fn run_inner(
         max_output_tokens: settings.provider.max_output_tokens,
         batch_max_output_tokens: settings.provider.batch_max_output_tokens,
         compact_prompts: settings.compact_prompts,
+        glossary: glossary.run_config.clone(),
     };
 
-    let cache_namespace = compute_cache_namespace(
-        settings.segmentation.max_segment_tokens,
-        settings.segmentation.context_tokens,
-        run_config.profile.namespace_str(),
-        settings.batch.enabled,
-        prompt_version,
-    );
+    let cache_namespace = if legacy_cache_namespace {
+        compute_cache_namespace_v1(
+            settings.segmentation.max_segment_tokens,
+            settings.segmentation.context_tokens,
+            run_config.profile.namespace_str(),
+            settings.batch.enabled,
+            prompt_version,
+        )
+    } else {
+        compute_cache_namespace(
+            settings.segmentation.max_segment_tokens,
+            settings.segmentation.context_tokens,
+            run_config.profile.namespace_str(),
+            settings.batch.enabled,
+            prompt_version,
+            &glossary.fingerprint,
+        )
+    };
     if cache_namespace != snapshot.cache_namespace {
         anyhow::bail!(
             "resume cache namespace mismatch for job '{}': snapshot={}, recomputed={}",
@@ -607,6 +650,7 @@ fn batch_run_config(
         max_output_tokens: settings.provider.max_output_tokens,
         batch_max_output_tokens: settings.provider.batch_max_output_tokens,
         compact_prompts: settings.compact_prompts,
+        glossary: run_config.glossary.clone(),
     }
 }
 
@@ -883,6 +927,8 @@ mod tests {
                 model: "mock-prefix-target",
                 base_url: None,
                 api_key_env: None,
+                book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
 
@@ -1016,6 +1062,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_accepts_legacy_v1_snapshot_without_glossary_metadata() {
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.batch.enabled = false;
+        let mut fixture = resume_fixture(settings.clone(), 1);
+        fixture.snapshot.glossary_fingerprint.clear();
+        fixture.snapshot.glossary_terms.clear();
+        fixture.snapshot.cache_namespace = compute_cache_namespace_v1(
+            settings.segmentation.max_segment_tokens,
+            settings.segmentation.context_tokens,
+            settings.profile.namespace_str(),
+            settings.batch.enabled,
+            fixture.snapshot.prompt_version.as_str(),
+        );
+        fixture
+            .store
+            .update_job_config_snapshot(&fixture.job.id, &fixture.snapshot)
+            .expect("legacy snapshot should persist");
+
+        let events = run_fixture(&mut fixture)
+            .await
+            .expect("legacy v1 snapshot should resume");
+
+        assert!(!segment_finished_ids(&events).is_empty());
+    }
+
+    #[tokio::test]
     async fn resume_errors_when_rebuilt_segments_do_not_match_stored_pending_ids() {
         let segments = vec![test_segment("seg_a", 0)];
         let pending_ids = vec!["seg_missing".to_string()];
@@ -1047,6 +1119,8 @@ mod tests {
                 model: "mock-prefix-target",
                 base_url: None,
                 api_key_env: None,
+                book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
         let book = read_epub(&input).expect("fixture EPUB should read");
@@ -1061,12 +1135,19 @@ mod tests {
             .take(segment_count)
             .collect::<Vec<_>>();
         let prompt_version = "v1";
+        let glossary_fingerprint = crate::commands::translate::glossary_fingerprint(
+            bookforge_core::GlossaryFormat::Json,
+            800,
+            None,
+            &[],
+        );
         let cache_namespace = compute_cache_namespace(
             settings.segmentation.max_segment_tokens,
             settings.segmentation.context_tokens,
             settings.profile.namespace_str(),
             settings.batch.enabled,
             prompt_version,
+            &glossary_fingerprint,
         );
         store
             .insert_segments(
@@ -1096,6 +1177,13 @@ mod tests {
             provider_preset: None,
             prompt_version: prompt_version.to_string(),
             cache_namespace,
+            book_id: None,
+            series_id: None,
+            glossary_budget_tokens: 800,
+            glossary_format: bookforge_core::GlossaryFormat::Json,
+            prompt_extra: None,
+            glossary_fingerprint,
+            glossary_terms: Vec::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
         store

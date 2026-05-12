@@ -21,6 +21,12 @@ Return exactly:
 
 Translate every item.
 
+Each input item may include `glossary` or `glossary_prose`; honor those constraints for that item. Additional instructions:
+
+```txt
+{{prompt_extra}}
+```
+
 Input:
 {{items_json}}
 

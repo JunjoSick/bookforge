@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crate::{
     BatchConfig, DoubleCheckConfig, JsonMode, ProviderPreset, ProviderRuntimeConfig, QaRunConfig,
     ResolvedRunSettings, RetryAfterPolicy, SchedulerConfig, SegmentationConfig, TranslationProfile,
+    glossary::{GlossaryFormat, GlossaryTerm},
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -26,7 +27,29 @@ pub struct RunConfigSnapshot {
     pub provider_preset: Option<ProviderPreset>,
     pub prompt_version: String,
     pub cache_namespace: String,
+    #[serde(default)]
+    pub book_id: Option<String>,
+    #[serde(default)]
+    pub series_id: Option<String>,
+    #[serde(default = "default_glossary_budget_tokens")]
+    pub glossary_budget_tokens: usize,
+    #[serde(default = "default_glossary_format")]
+    pub glossary_format: GlossaryFormat,
+    #[serde(default)]
+    pub prompt_extra: Option<String>,
+    #[serde(default)]
+    pub glossary_fingerprint: String,
+    #[serde(default)]
+    pub glossary_terms: Vec<GlossaryTerm>,
     pub settings: ResolvedRunSettingsSnapshot,
+}
+
+fn default_glossary_budget_tokens() -> usize {
+    800
+}
+
+fn default_glossary_format() -> GlossaryFormat {
+    GlossaryFormat::Json
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

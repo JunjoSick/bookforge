@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use bookforge_core::{
-    JsonMode, ProviderPreset,
+    GlossaryFormat, JsonMode, ProviderPreset,
     config::{DoubleCheckMode, FallbackScope, TranslationProfile},
 };
 use clap::Args;
@@ -59,6 +59,24 @@ pub struct TranslateArgs {
 
     #[arg(long)]
     pub out: Option<PathBuf>,
+
+    #[arg(long)]
+    pub book_id: Option<String>,
+
+    #[arg(long)]
+    pub series_id: Option<String>,
+
+    #[arg(long = "glossary")]
+    pub glossary: Vec<PathBuf>,
+
+    #[arg(long, default_value_t = 800)]
+    pub glossary_budget_tokens: usize,
+
+    #[arg(long, value_enum, default_value_t = GlossaryFormat::Json)]
+    pub glossary_format: GlossaryFormat,
+
+    #[arg(long)]
+    pub prompt_extra: Option<String>,
 
     #[arg(long, value_enum, default_value_t = QaMode::Off)]
     pub qa: QaMode,

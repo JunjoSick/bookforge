@@ -1,6 +1,6 @@
 [package]
 name = "bookforge-cli"
-version = "1.1.0"
+version = "1.2.0"
 description = "CLI-first EPUB translation engine with deterministic structure rebuild and review loop."
 readme = "../../README.md"
 edition.workspace = true
@@ -14,10 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-bookforge-core = { version = "1.1.0", path = "../bookforge-core", features = ["cli"] }
-bookforge-epub = { version = "1.1.0", path = "../bookforge-epub" }
-bookforge-llm = { version = "1.1.0", path = "../bookforge-llm" }
-bookforge-store = { version = "1.1.0", path = "../bookforge-store" }
+bookforge-core = { version = "1.2.0", path = "../bookforge-core", features = ["cli"] }
+bookforge-epub = { version = "1.2.0", path = "../bookforge-epub" }
+bookforge-llm = { version = "1.2.0", path = "../bookforge-llm" }
+bookforge-store = { version = "1.2.0", path = "../bookforge-store" }
 clap.workspace = true
 console.workspace = true
 indicatif.workspace = true
@@ -26,6 +26,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

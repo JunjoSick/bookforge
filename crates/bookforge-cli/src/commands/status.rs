@@ -173,6 +173,8 @@ mod tests {
             events_path: None,
             report_json_path: None,
             report_markdown_path: None,
+            book_id: None,
+            series_id: None,
         }
     }
 
@@ -199,6 +201,13 @@ mod tests {
             provider_preset: None,
             prompt_version: "v1".to_string(),
             cache_namespace: "cache".to_string(),
+            book_id: None,
+            series_id: None,
+            glossary_budget_tokens: 800,
+            glossary_format: bookforge_core::GlossaryFormat::Json,
+            prompt_extra: None,
+            glossary_fingerprint: String::new(),
+            glossary_terms: Vec::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         }
     }

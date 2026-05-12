@@ -8,8 +8,8 @@ mod report;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use commands::{
-    doctor, estimate, ingest_flags, inspect, resume, retry, review, status, tail, translate,
-    validate,
+    doctor, estimate, glossary, ingest_flags, inspect, resume, retry, review, status, tail,
+    translate, validate,
 };
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +34,7 @@ enum Command {
     Resume(resume::ResumeArgs),
     Review(review::ReviewArgs),
     IngestFlags(ingest_flags::IngestFlagsArgs),
+    Glossary(glossary::GlossaryArgs),
     Retry(retry::RetryArgs),
     Validate(validate::ValidateArgs),
     Benchmark(Box<translate::BenchmarkArgs>),
@@ -61,6 +62,7 @@ async fn main() -> Result<()> {
         Command::Resume(args) => resume::run(args).await,
         Command::Review(args) => review::run(args).await,
         Command::IngestFlags(args) => ingest_flags::run(args).await,
+        Command::Glossary(args) => glossary::run(args).await,
         Command::Retry(args) => retry::run(args).await,
         Command::Validate(args) => validate::run(args).await,
         Command::Benchmark(args) => translate::run_benchmark(*args).await,

@@ -10,8 +10,9 @@ pub mod telemetry;
 
 pub use batch::{
     BatchItemFailure, BatchItemTranslation, BatchKind, BatchMode, BatchSizer,
-    BatchTranslationResult, TranslationBatch, TranslationBatchItem, build_translation_batches,
-    collect_repair_items, parse_batch_response, split_batch, translate_batches_with_callback,
+    BatchTranslationResult, TranslationBatch, TranslationBatchItem,
+    account_for_batch_prompt_overhead, build_translation_batches, collect_repair_items,
+    parse_batch_response, split_batch, translate_batches_with_callback,
 };
 pub use concurrency::AdaptiveLimiter;
 pub use double_check::{
@@ -28,7 +29,7 @@ pub use rate_controller::{
     ProviderRateController, RateControllerConfig, RequestObservation, RequestStatus,
 };
 pub use scheduler::{
-    QaIssue, QaSegmentReview, SegmentTranslation, TranslationRunConfig, qa_segments,
-    translate_segments, translate_segments_with_callback,
+    GlossaryRunConfig, QaIssue, QaSegmentReview, SegmentTranslation, TranslationRunConfig,
+    qa_segments, translate_segments, translate_segments_with_callback,
 };
 pub use telemetry::{TelemetryLog, telemetry_summary};

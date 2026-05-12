@@ -4,7 +4,8 @@ use std::{
 };
 
 use assert_cmd::Command;
-use bookforge_store::JobStore;
+use bookforge_core::GlossaryTerm;
+use bookforge_store::{GlossaryFilter, JobStore};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -32,6 +33,173 @@ fn cli_translate_mock_quiet_writes_output_report_and_events() {
     assert!(run.output.exists(), "translated EPUB should exist");
     assert!(run.events.exists(), "event log should exist");
     assert!(run.report.exists(), "markdown report should exist");
+}
+
+#[test]
+fn cli_translate_mock_with_same_glossary_is_bit_identical() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = fixture_input();
+    let glossary = temp.path().join("glossary.toml");
+    fs::write(
+        &glossary,
+        r#"[meta]
+schema_version = 1
+source_language = "English"
+target_language = "Italian"
+
+[meta.scope]
+kind = "book"
+id = "smoke"
+
+[[term]]
+source = "Aragorn"
+target = "Aragorn"
+category = "person"
+case_sensitive = true
+"#,
+    )
+    .expect("glossary should write");
+
+    let first = temp.path().join("a.epub");
+    let second = temp.path().join("b.epub");
+    for output in [&first, &second] {
+        bookforge()
+            .current_dir(temp.path())
+            .args([
+                "translate",
+                input.to_str().unwrap(),
+                "--source",
+                "English",
+                "--target",
+                "Italian",
+                "--provider",
+                "mock",
+                "--model",
+                "mock-prefix-target",
+                "--profile",
+                "v1-fast",
+                "--ui",
+                "quiet",
+                "--book-id",
+                "smoke",
+                "--glossary",
+                glossary.to_str().unwrap(),
+                "--out",
+                output.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+    }
+
+    assert_eq!(
+        fs::read(&first).expect("first EPUB should read"),
+        fs::read(&second).expect("second EPUB should read"),
+        "same input and glossary should produce bit-identical EPUBs"
+    );
+}
+
+#[test]
+fn cli_glossary_import_export_reimports_identical_terms() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let imported = temp.path().join("imported.toml");
+    let exported = temp.path().join("exported.toml");
+    fs::write(
+        &imported,
+        r#"[meta]
+schema_version = 1
+source_language = "English"
+target_language = "Italian"
+
+[meta.scope]
+kind = "book"
+id = "roundtrip"
+
+[[term]]
+source = "Aragorn"
+target = "Aragorn"
+category = "person"
+case_sensitive = true
+status = "user_seeded"
+source_count = 4
+
+[[term]]
+source = "Shire"
+target = "Contea"
+category = "place"
+notes = "Canonical place name."
+status = "accepted"
+source_count = 2
+"#,
+    )
+    .expect("glossary should write");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["glossary", "import", imported.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let store_path = temp.path().join(".bookforge/jobs.sqlite");
+    let store = JobStore::open(&store_path).expect("store opens");
+    let original = store
+        .list_glossary_terms(roundtrip_filter())
+        .expect("terms should list");
+    assert_eq!(original.len(), 2);
+    assert!(
+        original
+            .iter()
+            .any(|term| term.status == bookforge_core::GlossaryStatus::UserSeeded)
+    );
+    assert!(
+        original
+            .iter()
+            .any(|term| term.status == bookforge_core::GlossaryStatus::Accepted)
+    );
+    drop(store);
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "glossary",
+            "export",
+            exported.to_str().unwrap(),
+            "--scope",
+            "book",
+            "--scope-id",
+            "roundtrip",
+            "--language",
+            "English->Italian",
+        ])
+        .assert()
+        .success();
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "glossary",
+            "clear",
+            "--scope",
+            "book",
+            "--scope-id",
+            "roundtrip",
+        ])
+        .assert()
+        .success();
+    bookforge()
+        .current_dir(temp.path())
+        .args(["glossary", "import", exported.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let store = JobStore::open(&store_path).expect("store opens");
+    let roundtripped = store
+        .list_glossary_terms(roundtrip_filter())
+        .expect("terms should list");
+    assert_eq!(
+        normalized_terms(original),
+        normalized_terms(roundtripped),
+        "exported TOML should reimport to the same glossary term fields"
+    );
 }
 
 #[test]
@@ -83,6 +251,39 @@ fn cli_translate_json_mode_emits_valid_jsonl_stdout_and_file_log() {
             .any(|event| event.get("TranslationFinished").is_some()),
         "file JSONL should include completion"
     );
+}
+
+fn roundtrip_filter<'a>() -> GlossaryFilter<'a> {
+    GlossaryFilter {
+        scope_kind: Some(bookforge_core::GlossaryScopeKind::Book),
+        scope_id: Some("roundtrip"),
+        source_language: Some("English"),
+        target_language: Some("Italian"),
+        active_only: false,
+    }
+}
+
+fn normalized_terms(mut terms: Vec<GlossaryTerm>) -> Vec<GlossaryTerm> {
+    for term in &mut terms {
+        term.id = None;
+    }
+    terms.sort_by(|a, b| {
+        (
+            a.scope_kind.as_str(),
+            a.scope_id.as_deref(),
+            a.source_text.as_str(),
+            a.source_language.as_str(),
+            a.target_language.as_str(),
+        )
+            .cmp(&(
+                b.scope_kind.as_str(),
+                b.scope_id.as_deref(),
+                b.source_text.as_str(),
+                b.source_language.as_str(),
+                b.target_language.as_str(),
+            ))
+    });
+    terms
 }
 
 #[test]

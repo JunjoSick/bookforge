@@ -2,23 +2,27 @@ use anyhow::Result;
 #[cfg(test)]
 use bookforge_core::config::TranslationProfile;
 use bookforge_core::{
-    NullProgressSink,
+    GlossaryFormat, GlossaryTerm, NullProgressSink,
     config::{DoubleCheckMode, FallbackScope, ResolvedRunSettings, TranslationConfig},
+    merge_scope_terms,
     scheduler::SchedulerConfig,
     segment::{Segment, SegmentStatus, build_segments, compute_cache_namespace},
+    select_glossary_for_segments,
 };
 use bookforge_epub::read_epub;
 #[cfg(test)]
 use bookforge_llm::translate_segments;
 use bookforge_llm::{
-    AdaptiveLimiter, LlmError, LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig,
-    OpenAiCompatibleProvider, ProviderRateController, QaSegmentReview, RateControllerConfig,
-    SegmentTranslation, TelemetryLog, TranslationRunConfig, build_translation_batches,
-    qa_segments_parallel, run_double_check, telemetry_summary, translate_batches_with_callback,
+    AdaptiveLimiter, GlossaryRunConfig, LlmError, LlmProvider, MockMode, MockProvider,
+    OpenAiCompatibleConfig, OpenAiCompatibleProvider, ProviderRateController, QaSegmentReview,
+    RateControllerConfig, SegmentTranslation, TelemetryLog, TranslationRunConfig,
+    account_for_batch_prompt_overhead, build_translation_batches, qa_segments_parallel,
+    run_double_check, telemetry_summary, translate_batches_with_callback,
     translate_segments_with_callback,
 };
 use bookforge_store::{CreateJob, JobRecord, JobStore};
 use clap::Args;
+use sha2::{Digest, Sha256};
 use std::{path::PathBuf, sync::Arc};
 
 #[cfg(test)]
@@ -26,6 +30,7 @@ use crate::LanguageArgs;
 use crate::{
     ProviderArgs as CliProviderArgs, QaMode,
     checkpoint::{CheckpointCommand, CheckpointSender, CheckpointWriter},
+    commands::glossary::read_glossary_file,
     default_output_path,
 };
 
@@ -141,6 +146,109 @@ fn human_stdout_enabled(ui: crate::progress::UiMode) -> bool {
     )
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedGlossary {
+    pub run_config: GlossaryRunConfig,
+    pub fingerprint: String,
+    pub active_terms: Vec<GlossaryTerm>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_glossary_run_config(
+    store: &JobStore,
+    glossary_files: &[PathBuf],
+    source_language: Option<&str>,
+    target_language: &str,
+    book_id: Option<&str>,
+    series_id: Option<&str>,
+    format: GlossaryFormat,
+    budget_tokens: usize,
+    prompt_extra: Option<String>,
+    segments: &[Segment],
+) -> Result<PreparedGlossary> {
+    let imported_terms = import_glossary_files(store, glossary_files)?;
+    let source_key = source_language.unwrap_or("auto");
+    let mut active_terms =
+        store.load_active_glossary_terms(source_key, target_language, book_id, series_id)?;
+    active_terms.extend(imported_terms.into_iter().filter(|term| {
+        term.active()
+            && term.target_language == target_language
+            && source_language.is_none_or(|source| term.source_language == source)
+    }));
+    active_terms = merge_scope_terms(&active_terms);
+    let selected = select_glossary_for_segments(segments, &active_terms, budget_tokens);
+    if selected.truncated_authoritative_entries > 0 {
+        tracing::warn!(
+            count = selected.truncated_authoritative_entries,
+            "glossary token budget dropped authoritative entries"
+        );
+    }
+    let fingerprint = glossary_fingerprint(
+        format,
+        budget_tokens,
+        prompt_extra.as_deref(),
+        &active_terms,
+    );
+    Ok(PreparedGlossary {
+        run_config: GlossaryRunConfig {
+            format,
+            entries_by_segment: selected.entries_by_segment,
+            prompt_extra,
+        },
+        fingerprint,
+        active_terms,
+    })
+}
+
+fn import_glossary_files(
+    store: &JobStore,
+    glossary_files: &[PathBuf],
+) -> Result<Vec<GlossaryTerm>> {
+    let mut imported = Vec::new();
+    for path in glossary_files {
+        let terms = read_glossary_file(path)?;
+        store.upsert_glossary_terms(&terms)?;
+        imported.extend(terms);
+    }
+    Ok(imported)
+}
+
+pub(crate) fn glossary_fingerprint(
+    format: GlossaryFormat,
+    budget_tokens: usize,
+    prompt_extra: Option<&str>,
+    terms: &[GlossaryTerm],
+) -> String {
+    let mut normalized = terms.to_vec();
+    for term in &mut normalized {
+        term.id = None;
+    }
+    normalized.sort_by(|a, b| {
+        a.source_language
+            .cmp(&b.source_language)
+            .then_with(|| a.target_language.cmp(&b.target_language))
+            .then_with(|| a.scope_kind.priority().cmp(&b.scope_kind.priority()))
+            .then_with(|| a.scope_id.cmp(&b.scope_id))
+            .then_with(|| a.source_text.cmp(&b.source_text))
+            .then_with(|| a.target_text.cmp(&b.target_text))
+    });
+    let payload = serde_json::json!({
+        "schema": 1,
+        "format": format.as_str(),
+        "budget_tokens": budget_tokens,
+        "prompt_extra": prompt_extra.unwrap_or(""),
+        "terms": normalized,
+    });
+    let serialized = serde_json::to_vec(&payload).unwrap_or_default();
+    let digest = Sha256::digest(serialized);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("writing to string cannot fail");
+    }
+    hex
+}
+
 async fn finalize_reporter<T>(
     result: Result<T, anyhow::Error>,
     reporter: crate::progress::ProgressReporter,
@@ -189,6 +297,18 @@ async fn run_mock_translation(
         .unwrap_or_else(|| "mock-prefix-target".to_string());
     let prompt_version = "v1";
     let store = JobStore::open_default()?;
+    let glossary = prepare_glossary_run_config(
+        &store,
+        &cli_args.glossary,
+        config.source_language.as_deref(),
+        &config.target_language,
+        cli_args.book_id.as_deref(),
+        cli_args.series_id.as_deref(),
+        cli_args.glossary_format,
+        cli_args.glossary_budget_tokens,
+        cli_args.prompt_extra.clone(),
+        &segments,
+    )?;
     let job = store.create_job(CreateJob {
         input,
         output: &config.output,
@@ -198,6 +318,8 @@ async fn run_mock_translation(
         model: &model,
         base_url: None,
         api_key_env: None,
+        book_id: cli_args.book_id.as_deref(),
+        series_id: cli_args.series_id.as_deref(),
     })?;
     if human_stdout_enabled(cli_args.ui) {
         println!("Job: {}", job.id);
@@ -214,6 +336,7 @@ async fn run_mock_translation(
         settings.profile.namespace_str(),
         settings.batch.enabled,
         prompt_version,
+        &glossary.fingerprint,
     );
     persist_snapshot(
         &store,
@@ -225,6 +348,8 @@ async fn run_mock_translation(
         settings,
         prompt_version,
         &cache_namespace,
+        &glossary.fingerprint,
+        &glossary.active_terms,
         &model,
         None,
         None,
@@ -250,6 +375,7 @@ async fn run_mock_translation(
         max_output_tokens: None,
         batch_max_output_tokens: None,
         compact_prompts: false,
+        glossary: glossary.run_config.clone(),
     }; // mock
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     let mut translations = apply_cached_translations(
@@ -429,6 +555,18 @@ async fn run_openai_compatible_translation(
         "v1"
     };
     let store = JobStore::open_default()?;
+    let glossary = prepare_glossary_run_config(
+        &store,
+        &cli_args.glossary,
+        config.source_language.as_deref(),
+        &config.target_language,
+        cli_args.book_id.as_deref(),
+        cli_args.series_id.as_deref(),
+        cli_args.glossary_format,
+        cli_args.glossary_budget_tokens,
+        cli_args.prompt_extra.clone(),
+        &segments,
+    )?;
     let job = store.create_job(CreateJob {
         input,
         output: &config.output,
@@ -438,6 +576,8 @@ async fn run_openai_compatible_translation(
         model: &model,
         base_url: Some(&provider_config.base_url),
         api_key_env: Some(&provider_config.api_key_env),
+        book_id: cli_args.book_id.as_deref(),
+        series_id: cli_args.series_id.as_deref(),
     })?;
     if human_stdout_enabled(cli_args.ui) {
         println!("Job: {}", job.id);
@@ -454,6 +594,7 @@ async fn run_openai_compatible_translation(
         settings.profile.namespace_str(),
         settings.batch.enabled,
         run_prompt_version,
+        &glossary.fingerprint,
     );
     persist_snapshot(
         &store,
@@ -465,6 +606,8 @@ async fn run_openai_compatible_translation(
         settings,
         run_prompt_version,
         &cache_namespace,
+        &glossary.fingerprint,
+        &glossary.active_terms,
         &model,
         Some(provider_config.base_url.clone()),
         Some(provider_config.api_key_env.clone()),
@@ -490,6 +633,7 @@ async fn run_openai_compatible_translation(
         max_output_tokens: settings.provider.max_output_tokens,
         batch_max_output_tokens: settings.provider.batch_max_output_tokens,
         compact_prompts: settings.compact_prompts,
+        glossary: glossary.run_config.clone(),
     };
     // batch_run_config
 
@@ -510,6 +654,7 @@ async fn run_openai_compatible_translation(
             max_output_tokens: settings.provider.max_output_tokens,
             batch_max_output_tokens: settings.provider.batch_max_output_tokens,
             compact_prompts: settings.compact_prompts,
+            glossary: run_config.glossary.clone(),
         };
         let mut translations = apply_cached_translations(
             &segments,
@@ -684,6 +829,7 @@ async fn finish_translation_pipeline(
         &job.id,
         run_prompt_version,
         settings,
+        run_config,
     )
     .await?;
     *translations = fallback_translations;
@@ -795,7 +941,11 @@ pub(crate) async fn translate_and_checkpoint_batch<P>(
 where
     P: LlmProvider,
 {
-    let batches = build_translation_batches(segments, &settings.batch, settings.profile);
+    let batches = account_for_batch_prompt_overhead(
+        build_translation_batches(segments, &settings.batch, settings.profile),
+        &settings.batch,
+        config,
+    );
 
     if batches.is_empty() {
         return translate_and_checkpoint(provider, segments, config, checkpoint).await;
@@ -925,6 +1075,7 @@ async fn run_fallback_pass(
     job_id: &str,
     prompt_version: &str,
     settings: &ResolvedRunSettings,
+    primary_run_config: &TranslationRunConfig,
 ) -> Result<Vec<SegmentTranslation>> {
     if cli_args.fallback_provider.is_none() && cli_args.fallback_model.is_none() {
         return Ok(translations);
@@ -990,8 +1141,8 @@ async fn run_fallback_pass(
     );
 
     let run_config = TranslationRunConfig {
-        source_language: None,
-        target_language: String::new(),
+        source_language: primary_run_config.source_language.clone(),
+        target_language: primary_run_config.target_language.clone(),
         provider: provider_str.to_string(),
         model: fallback_model.clone(),
         prompt_version: prompt_version.to_string(),
@@ -1005,6 +1156,7 @@ async fn run_fallback_pass(
         max_output_tokens: settings.provider.max_output_tokens,
         batch_max_output_tokens: settings.provider.batch_max_output_tokens,
         compact_prompts: settings.compact_prompts,
+        glossary: primary_run_config.glossary.clone(),
     }; // fallback_run_config
 
     let writer = CheckpointWriter::spawn(store.path().to_path_buf(), Arc::new(NullProgressSink));
@@ -1519,6 +1671,8 @@ mod tests {
                 model: "mock-prefix",
                 base_url: None,
                 api_key_env: None,
+                book_id: None,
+                series_id: None,
             })
             .expect("job should be created");
         let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
@@ -1556,6 +1710,7 @@ mod tests {
             max_output_tokens: None,
             batch_max_output_tokens: None,
             compact_prompts: false,
+            glossary: GlossaryRunConfig::default(),
         };
 
         let error = translate_with_scheduler_guard(
@@ -1582,6 +1737,83 @@ mod tests {
 
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn glossary_file_is_selected_for_matching_segment() {
+        let db_path = temp_path("glossary_prepare.sqlite");
+        let glossary_path = temp_path("glossary.toml");
+        fs::write(
+            &glossary_path,
+            r#"
+[meta]
+schema_version = 1
+source_language = "English"
+target_language = "Italian"
+
+[meta.scope]
+kind = "book"
+id = "fellowship"
+
+[[term]]
+source = "Aragorn"
+target = "Aragorn"
+category = "person"
+case_sensitive = true
+"#,
+        )
+        .expect("glossary fixture should write");
+        let store = JobStore::open(&db_path).expect("store should open");
+        let mut segment = segment("seg_a", 0);
+        segment.source.text = "Aragorn entered the room.".to_string();
+        segment.source.blocks[0].text = segment.source.text.clone();
+
+        let prepared = prepare_glossary_run_config(
+            &store,
+            std::slice::from_ref(&glossary_path),
+            Some("English"),
+            "Italian",
+            Some("fellowship"),
+            None,
+            GlossaryFormat::Json,
+            800,
+            None,
+            &[segment],
+        )
+        .expect("glossary should prepare");
+
+        let entries = &prepared.run_config.entries_by_segment["seg_a"];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "Aragorn");
+        assert_eq!(entries[0].target, "Aragorn");
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(glossary_path);
+    }
+
+    #[test]
+    fn glossary_format_changes_cache_fingerprint() {
+        let term = GlossaryTerm {
+            id: Some(1),
+            scope_kind: bookforge_core::GlossaryScopeKind::Book,
+            scope_id: Some("fellowship".to_string()),
+            source_text: "Aragorn".to_string(),
+            target_text: "Aragorn".to_string(),
+            category: bookforge_core::GlossaryCategory::Person,
+            notes: None,
+            case_sensitive: true,
+            always_active: false,
+            status: bookforge_core::GlossaryStatus::UserSeeded,
+            source_language: "English".to_string(),
+            target_language: "Italian".to_string(),
+            source_count: 0,
+        };
+
+        let json =
+            glossary_fingerprint(GlossaryFormat::Json, 800, None, std::slice::from_ref(&term));
+        let prose = glossary_fingerprint(GlossaryFormat::Prose, 800, None, &[term]);
+
+        assert_ne!(json, prose);
     }
 
     fn segment(id: &str, ordinal: usize) -> Segment {
@@ -1721,6 +1953,12 @@ mod tests {
             provider_max_attempts: None,
             validation_max_attempts: None,
             out: None,
+            book_id: None,
+            series_id: None,
+            glossary: Vec::new(),
+            glossary_budget_tokens: 800,
+            glossary_format: GlossaryFormat::Json,
+            prompt_extra: None,
             qa: QaMode::Off,
             qa_concurrency: 8,
             qa_batch_target_tokens: None,

@@ -1,7 +1,7 @@
 # BookForge — Technical Roadmap, v1.0.1 through v2
 
-**Document version:** 1.0
-**Last updated:** 2026-05-06
+**Document version:** 1.1
+**Last updated:** 2026-05-12
 **Status:** active planning document
 **Audience:** project maintainer + Claude Code (or any other coding agent) implementing
 the milestones below.
@@ -91,17 +91,17 @@ via `java`, but the BookForge binary itself does not need Java to run.
 
 ## 2. Roadmap overview
 
-| Version | Theme | Estimated effort | Marketing posture |
-|---------|-------|------------------|-------------------|
-| v1.0.1 | Snapshot patch | 0.5–1 day | none (silent patch) |
-| v1.1 | Review loop | 5–8 days | minimal (README rewrite, GitHub topics, crates.io publish) |
-| v1.2 | Glossary, manual | 8–12 days | none (development quiet) |
-| v1.2.x | Glossary, auto-extraction | 4–6 days | none |
-| v1.3 | Context + style | 8–12 days | none (explicit "no promotion" rule) |
-| v1.4 | Distribution + writeup | 5–7 days | one technical post, two or three venues; cargo-dist binaries land here |
-| v1.5 | Structural credibility | 10–14 days | README final rewrite citing corpus |
-| v1.6 | Bilingual output | 5–8 days | passive (release notes only) |
-| v2 | Open-ended | not committed | recompute from v1.4/v1.5 feedback |
+| Version | Theme | Estimated effort | Marketing posture | Status |
+|---------|-------|------------------|-------------------|--------|
+| v1.0.1 | Snapshot patch | 0.5–1 day | none (silent patch) | shipped |
+| v1.1 | Review loop | 5–8 days | minimal (README rewrite, GitHub topics, crates.io publish) | shipped |
+| v1.2 | Glossary, manual | 8–12 days | none (development quiet) | shipped |
+| v1.2.x | Glossary, auto-extraction | 4–6 days | none | planned |
+| v1.3 | Context + style | 8–12 days | none (explicit "no promotion" rule) | planned |
+| v1.4 | Distribution + writeup | 5–7 days | one technical post, two or three venues; cargo-dist binaries land here | planned |
+| v1.5 | Structural credibility | 10–14 days | README final rewrite citing corpus | planned |
+| v1.6 | Bilingual output | 5–8 days | passive (release notes only) | planned |
+| v2 | Open-ended | not committed | recompute from v1.4/v1.5 feedback | planned |
 
 Total v1.x roadmap is roughly 45–70 person-days of focused work; in calendar
 terms, with a maintainer who has limited evenings and weekends and a
@@ -605,7 +605,10 @@ book" to "translates her books."
 - `glossary_terms` table in SQLite.
 - TOML import/export format (§5.5).
 - CLI commands for glossary management (§5.7).
-- Prompt injection during translation, token-budgeted (§5.8).
+- Prompt injection during translation, token-budgeted (§5.8). Two
+  render formats — structured JSON and prose bullets — selectable via
+  `--glossary-format`; both ship in v1.2 so we can A/B which the model
+  honors better.
 - Review UI updated to highlight glossary mismatches (§5.9).
 - `--prompt-extra` flag for ad-hoc instructions (oomol-lab inspiration, §5.10).
 - ingest-flags from v1.1 lights up: flags of kind `name` with
@@ -744,12 +747,16 @@ bookforge translate book.epub \
     --glossary ~/Books/lord-of-the-rings/glossary.series.toml \
     --glossary ~/Books/lord-of-the-rings/glossary.fellowship.toml \
     --glossary-budget-tokens 800 \
+    --glossary-format json \
     --prompt-extra "Maintain a literary register typical of Tolkien translation."
 ```
 
 `--book-id` and `--series-id` associate the job with scope identifiers,
 which become the default scope for `bookforge glossary add` if invoked
 during the same session.
+
+`--glossary-format` accepts `json` (default) or `prose`. Both inject the
+same selected entries; only the rendered shape differs. See §5.8.
 
 ### 5.8 Prompt injection (token-budgeted)
 
@@ -799,7 +806,36 @@ order and truncated at the token budget (default 800 tokens, configurable
 via `--glossary-budget-tokens`). A `tracing::warn!()` line fires if
 truncation drops any `user_seeded` or `always_active` entries.
 
-The injected block in the prompt looks like:
+**Token estimator.** v1.2 uses a conservative `chars / 3` heuristic
+(rounded up) instead of a real BPE tokenizer. The heuristic over-counts
+slightly on Latin scripts and under-counts on Asian scripts; both
+directions stay safely inside the budget for our purposes. A real
+tokenizer (`tiktoken-rs` or per-provider equivalent) is deferred to v1.3
+once style sheets land and per-segment token accounting becomes a more
+load-bearing concern. Code carries a `// TODO(v1.3): real tokenizer`
+marker.
+
+**Render format (selectable).** The injected block has two shapes,
+selected per-job via `--glossary-format`. Both inject the same selected
+entries; we ship both so users can A/B which the model honors better in
+their language pair and against their model. The format choice is
+hashed into the segment cache namespace so switching formats does not
+silently mix cached translations from different shapes.
+
+`--glossary-format json` (default) populates the existing
+`{{glossary_json}}` template placeholder with a structured array:
+
+```json
+[
+  {"source":"Aragorn","target":"Aragorn","category":"person"},
+  {"source":"the One Ring","target":"l'Unico Anello","category":"object"},
+  {"source":"you","target":"tu","category":"style",
+   "note":"informal in hobbit dialogue"}
+]
+```
+
+`--glossary-format prose` populates a sibling `{{glossary_block_prose}}`
+placeholder with a human-readable bullet list:
 
 ```
 Active glossary constraints (must be honored):
@@ -903,6 +939,16 @@ When ingesting `flags.json`:
    request log in tests).
 8. Translating a book without any `--glossary` flag works exactly as
    in v1.1 (no regressions).
+9. Switching `--glossary-format` between `json` and `prose` for the same
+   `(book, glossary)` pair produces a different cache namespace and
+   re-translates rather than reusing the prior format's cache.
+
+**Cache compatibility note.** v1.2 bumps `CACHE_KEY_SCHEMA_VERSION` from
+1 to 2 unconditionally so that glossary content and format always factor
+into the cache key. The first v1.2 run on a v1.1 book will re-translate
+even with no `--glossary`. This one-time cost is preferred over the
+footgun where adding one term mid-job silently mixes glossary-aware and
+glossary-blind cached segments.
 
 ### 5.14 Effort
 

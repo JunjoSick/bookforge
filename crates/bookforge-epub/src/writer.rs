@@ -15,7 +15,7 @@ use quick_xml::{
     Reader, Writer,
     events::{BytesEnd, BytesText, Event},
 };
-use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
+use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 pub fn rebuild_epub(book: &Book, translations: &[BlockTranslation], output: &Path) -> Result<()> {
     let source_path = book.source_path.as_deref().ok_or_else(|| {
@@ -43,7 +43,9 @@ pub fn rebuild_epub(book: &Book, translations: &[BlockTranslation], output: &Pat
 
     write_mimetype_first(&mut archive, &mut writer)?;
 
-    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let deflated = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .last_modified_time(deterministic_zip_time());
     let mut total_skipped = 0usize;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
@@ -101,10 +103,16 @@ fn write_mimetype_first(source: &mut ZipArchive<File>, writer: &mut ZipWriter<Fi
         ));
     }
 
-    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let stored = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Stored)
+        .last_modified_time(deterministic_zip_time());
     writer.start_file("mimetype", stored)?;
     writer.write_all(b"application/epub+zip")?;
     Ok(())
+}
+
+fn deterministic_zip_time() -> DateTime {
+    DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("DOS epoch timestamp should be valid")
 }
 
 fn patches_by_href<'a>(

@@ -11,5 +11,6 @@ Return exactly:
 ## User
 
 Translate every item.
+Honor item `glossary`/`glossary_prose` constraints. Extra: {{prompt_extra}}
 {{items_json}}
 Return JSON only.

@@ -4,7 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bookforge_core::{ResolvedRunSettings, ResolvedRunSettingsSnapshot, RunConfigSnapshot};
+use bookforge_core::{
+    GlossaryTerm, ResolvedRunSettings, ResolvedRunSettingsSnapshot, RunConfigSnapshot,
+};
 use bookforge_store::{JobRecord, JobStore};
 use sha2::{Digest, Sha256};
 
@@ -29,6 +31,8 @@ pub(crate) fn persist_snapshot(
     settings: &ResolvedRunSettings,
     prompt_version: &str,
     cache_namespace: &str,
+    glossary_fingerprint: &str,
+    glossary_terms: &[GlossaryTerm],
     model: &str,
     base_url: Option<String>,
     api_key_env: Option<String>,
@@ -57,6 +61,13 @@ pub(crate) fn persist_snapshot(
         provider_preset: cli_args.provider_preset,
         prompt_version: prompt_version.to_string(),
         cache_namespace: cache_namespace.to_string(),
+        book_id: cli_args.book_id.clone(),
+        series_id: cli_args.series_id.clone(),
+        glossary_budget_tokens: cli_args.glossary_budget_tokens,
+        glossary_format: cli_args.glossary_format,
+        prompt_extra: cli_args.prompt_extra.clone(),
+        glossary_fingerprint: glossary_fingerprint.to_string(),
+        glossary_terms: glossary_terms.to_vec(),
         settings: ResolvedRunSettingsSnapshot::from_settings(settings),
     };
     store.update_job_config_snapshot(&job.id, &snapshot)?;
