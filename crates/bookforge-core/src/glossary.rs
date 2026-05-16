@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::segment::Segment;
+use crate::{ir::Block, marker::extract_marker_id, segment::Segment};
 
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -196,6 +196,66 @@ impl GlossaryTerm {
     pub fn active(&self) -> bool {
         self.status.is_active()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlossaryCandidate {
+    pub source_text: String,
+    pub category: GlossaryCategory,
+    pub source_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateStats {
+    category: GlossaryCategory,
+    source_count: usize,
+    forms: BTreeMap<String, usize>,
+}
+
+pub fn extract_glossary_candidates(
+    blocks: &[Block],
+    source_language: &str,
+    min_count: usize,
+    limit: Option<usize>,
+) -> Vec<GlossaryCandidate> {
+    let stopwords = common_words(source_language);
+    let mut candidates = BTreeMap::<String, CandidateStats>::new();
+
+    for block in blocks {
+        let quoted_italic_sources = collect_quoted_italic_candidates(block, &mut candidates);
+        let visible_text = block_visible_text(block);
+        collect_capitalized_candidates(
+            &visible_text,
+            stopwords,
+            &quoted_italic_sources,
+            &mut candidates,
+        );
+    }
+
+    let min_count = min_count.max(1);
+    let mut candidates = candidates
+        .into_values()
+        .filter(|stats| {
+            stats.category == GlossaryCategory::Invented || stats.source_count >= min_count
+        })
+        .map(|stats| GlossaryCandidate {
+            source_text: preferred_form(&stats.forms),
+            category: stats.category,
+            source_count: stats.source_count,
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        right
+            .source_count
+            .cmp(&left.source_count)
+            .then_with(|| left.source_text.cmp(&right.source_text))
+            .then_with(|| left.category.as_str().cmp(right.category.as_str()))
+    });
+    if let Some(limit) = limit {
+        candidates.truncate(limit);
+    }
+    candidates
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,6 +484,296 @@ fn high_frequency_anchors<'a>(
         .collect()
 }
 
+fn collect_capitalized_candidates(
+    text: &str,
+    stopwords: &[&str],
+    skip_sources: &HashSet<String>,
+    candidates: &mut BTreeMap<String, CandidateStats>,
+) {
+    let words = tokenize_words(text);
+    let mut index = 0usize;
+    while index < words.len() {
+        let word = &words[index];
+        if !is_capitalized_candidate_word(word) {
+            index += 1;
+            continue;
+        }
+
+        if !is_common_word(word, stopwords) && !skip_sources.contains(&word.to_lowercase()) {
+            add_candidate(candidates, word, GlossaryCategory::Other);
+        }
+
+        let start = index;
+        let mut end = index;
+        while end < words.len()
+            && is_capitalized_candidate_word(&words[end])
+            && !is_common_word(&words[end], stopwords)
+        {
+            end += 1;
+        }
+        if end.saturating_sub(start) >= 2 {
+            let phrase = words[start..end].join(" ");
+            if !skip_sources.contains(&phrase.to_lowercase()) {
+                add_candidate(candidates, &phrase, GlossaryCategory::Other);
+            }
+        }
+        index += 1;
+    }
+}
+
+fn collect_quoted_italic_candidates(
+    block: &Block,
+    candidates: &mut BTreeMap<String, CandidateStats>,
+) -> HashSet<String> {
+    let italic_ids = block
+        .inline_marks
+        .iter()
+        .filter(|mark| {
+            let kind = mark.kind.to_ascii_lowercase();
+            kind == "em" || kind == "i"
+        })
+        .map(|mark| mark.id.as_str())
+        .collect::<HashSet<_>>();
+    if italic_ids.is_empty() {
+        return HashSet::new();
+    }
+
+    let mut sources = HashSet::new();
+    let marked = marked_block_text(block);
+    let mut offset = 0usize;
+    while let Some(relative_start) = marked[offset..].find("<m ") {
+        let tag_start = offset + relative_start;
+        let Some(relative_tag_end) = marked[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + relative_tag_end + 1;
+        let tag = &marked[tag_start..tag_end];
+        let Some(marker_id) = extract_marker_id(tag) else {
+            offset = tag_end;
+            continue;
+        };
+        let Some(relative_close) = marked[tag_end..].find("</m>") else {
+            break;
+        };
+        let close_start = tag_end + relative_close;
+        let close_end = close_start + "</m>".len();
+        if italic_ids.contains(marker_id.as_str()) {
+            let raw_content = &marked[tag_end..close_start];
+            if let Some(phrase) = quoted_italic_phrase(&marked, tag_start, close_end, raw_content) {
+                sources.insert(phrase.to_lowercase());
+                add_candidate(candidates, &phrase, GlossaryCategory::Invented);
+            }
+        }
+        offset = close_end;
+    }
+    sources
+}
+
+fn quoted_italic_phrase(
+    marked_text: &str,
+    marker_start: usize,
+    marker_end: usize,
+    raw_content: &str,
+) -> Option<String> {
+    let content = normalize_candidate_text(&strip_marker_tokens(raw_content));
+    if content.is_empty() {
+        return None;
+    }
+    if let Some(inner) = trim_enclosing_quotes(&content) {
+        return nonempty_candidate(inner);
+    }
+
+    let before = previous_visible_char(&marked_text[..marker_start]);
+    let after = next_visible_char(&marked_text[marker_end..]);
+    if before.zip(after).is_some_and(|(left, right)| {
+        is_quote_pair(left, right) || (is_quote(left) && is_quote(right))
+    }) {
+        return Some(content);
+    }
+    None
+}
+
+fn add_candidate(
+    candidates: &mut BTreeMap<String, CandidateStats>,
+    source_text: &str,
+    category: GlossaryCategory,
+) {
+    let source_text = normalize_candidate_text(source_text);
+    if source_text.chars().filter(|ch| ch.is_alphabetic()).count() < 2 {
+        return;
+    }
+    let key = source_text.to_lowercase();
+    let entry = candidates.entry(key).or_insert_with(|| CandidateStats {
+        category,
+        source_count: 0,
+        forms: BTreeMap::new(),
+    });
+    if category == GlossaryCategory::Invented {
+        entry.category = GlossaryCategory::Invented;
+    }
+    entry.source_count += 1;
+    *entry.forms.entry(source_text).or_insert(0) += 1;
+}
+
+fn preferred_form(forms: &BTreeMap<String, usize>) -> String {
+    forms
+        .iter()
+        .max_by(|left, right| left.1.cmp(right.1).then_with(|| right.0.cmp(left.0)))
+        .map(|(form, _)| form.clone())
+        .unwrap_or_default()
+}
+
+fn tokenize_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch.is_alphabetic() {
+            current.push(ch);
+        } else if is_internal_word_connector(ch)
+            && !current.is_empty()
+            && chars.peek().is_some_and(|next| next.is_alphabetic())
+        {
+            current.push(ch);
+        } else if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn is_capitalized_candidate_word(word: &str) -> bool {
+    let mut alphabetic = word.chars().filter(|ch| ch.is_alphabetic());
+    let Some(first) = alphabetic.next() else {
+        return false;
+    };
+    first.is_uppercase()
+        && word.chars().filter(|ch| ch.is_alphabetic()).count() > 1
+        && word.chars().any(|ch| ch.is_lowercase())
+}
+
+fn is_common_word(word: &str, stopwords: &[&str]) -> bool {
+    let key = word.to_lowercase();
+    stopwords.contains(&key.as_str())
+}
+
+fn is_internal_word_connector(ch: char) -> bool {
+    matches!(ch, '\'' | '’' | '-' | '‐' | '‑')
+}
+
+fn marked_block_text(block: &Block) -> String {
+    block
+        .text_runs
+        .iter()
+        .map(|run| run.text.as_str())
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn block_visible_text(block: &Block) -> String {
+    normalize_candidate_text(&strip_marker_tokens(&marked_block_text(block)))
+}
+
+fn strip_marker_tokens(text: &str) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+
+    while let Some(index) = rest.find('<') {
+        output.push_str(&rest[..index]);
+        let tag = &rest[index..];
+        if (tag.starts_with("<m ") || tag.starts_with("<ref ") || tag.starts_with("</m>"))
+            && let Some(end) = tag.find('>')
+        {
+            rest = &tag[end + 1..];
+            continue;
+        }
+        output.push('<');
+        rest = &tag[1..];
+    }
+
+    output.push_str(rest);
+    output
+}
+
+fn previous_visible_char(text: &str) -> Option<char> {
+    strip_marker_tokens(text)
+        .chars()
+        .rev()
+        .find(|ch| !ch.is_whitespace())
+}
+
+fn next_visible_char(text: &str) -> Option<char> {
+    strip_marker_tokens(text)
+        .chars()
+        .find(|ch| !ch.is_whitespace())
+}
+
+fn normalize_candidate_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn trim_enclosing_quotes(text: &str) -> Option<&str> {
+    let mut chars = text.char_indices();
+    let (_, first) = chars.next()?;
+    let (last_start, last) = text.char_indices().next_back()?;
+    if first.len_utf8() >= text.len() || !is_quote_pair(first, last) {
+        return None;
+    }
+    Some(text[first.len_utf8()..last_start].trim())
+}
+
+fn nonempty_candidate(text: &str) -> Option<String> {
+    let normalized = normalize_candidate_text(text);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn is_quote_pair(left: char, right: char) -> bool {
+    matches!(
+        (left, right),
+        ('"', '"') | ('\'', '\'') | ('“', '”') | ('‘', '’') | ('«', '»') | ('„', '“')
+    )
+}
+
+fn is_quote(ch: char) -> bool {
+    matches!(ch, '"' | '\'' | '“' | '”' | '‘' | '’' | '«' | '»' | '„')
+}
+
+fn common_words(source_language: &str) -> &'static [&'static str] {
+    let normalized = source_language.to_lowercase();
+    if normalized == "en" || normalized.starts_with("en-") || normalized.contains("english") {
+        ENGLISH_COMMON_WORDS
+    } else {
+        FALLBACK_COMMON_WORDS
+    }
+}
+
+const FALLBACK_COMMON_WORDS: &[&str] = &[
+    "a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "into", "of", "on", "or",
+    "the", "to", "with",
+];
+
+const ENGLISH_COMMON_WORDS: &[&str] = &[
+    "a", "about", "after", "again", "all", "also", "an", "and", "another", "any", "are", "as",
+    "at", "away", "be", "because", "been", "before", "being", "but", "by", "came", "can", "come",
+    "could", "day", "did", "do", "does", "down", "each", "even", "every", "for", "from", "get",
+    "go", "had", "has", "have", "he", "her", "here", "him", "his", "how", "i", "if", "in", "into",
+    "is", "it", "its", "just", "like", "made", "make", "man", "many", "me", "more", "much", "must",
+    "my", "no", "not", "now", "of", "off", "on", "one", "only", "or", "other", "our", "out",
+    "over", "said", "same", "see", "she", "should", "so", "some", "such", "than", "that", "the",
+    "their", "them", "then", "there", "these", "they", "this", "those", "through", "time", "to",
+    "too", "up", "very", "was", "way", "we", "well", "were", "what", "when", "where", "which",
+    "while", "who", "will", "with", "would", "you", "your",
+];
+
 trait SyntheticId {
     fn synthetic_id(&self) -> i64;
 }
@@ -453,7 +803,7 @@ impl SyntheticId for GlossaryTerm {
 mod tests {
     use super::*;
     use crate::{
-        ir::{BlockId, SectionId},
+        ir::{Block, BlockId, BlockKind, DomPath, InlineMark, SectionId, TextRun},
         segment::{
             Segment, SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
             SegmentSource,
@@ -505,6 +855,101 @@ mod tests {
         assert!(second.iter().any(|entry| entry.source == "you"));
     }
 
+    #[test]
+    fn extracts_repeated_capitalized_names_and_counts() {
+        let blocks = vec![block(
+            "Ivan Ilych met Peter Ivanovich. Ivan Ilych greeted Ivan again.",
+        )];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 2, None);
+
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.source_text == "Ivan" && candidate.source_count == 3
+            }),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.source_text == "Ivan Ilych" && candidate.source_count == 2
+            }),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
+    fn extraction_filters_common_sentence_words() {
+        let blocks = vec![block(
+            "The Court waited. The Court spoke. Then Court adjourned.",
+        )];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 2, None);
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.source_text == "The")
+        );
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.source_text == "Then")
+        );
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.source_text == "Court" && candidate.source_count == 3
+            })
+        );
+    }
+
+    #[test]
+    fn extraction_discovers_quoted_italic_invented_phrases() {
+        let blocks = vec![marked_block(
+            vec![
+                "He whispered “",
+                "<m id=\"m000000_000\">Lukh</m>",
+                "” once.",
+            ],
+            vec![InlineMark {
+                id: "m000000_000".to_string(),
+                kind: "em".to_string(),
+            }],
+        )];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 4, None);
+
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.source_text == "Lukh"
+                    && candidate.category == GlossaryCategory::Invented
+                    && candidate.source_count == 1
+            }),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
+    fn extraction_deduplicates_case_variants_with_preferred_count() {
+        let blocks = vec![block(
+            "Gerasim helped Gerasim. GERASIM shouted. Gerasim helped.",
+        )];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 2, None);
+        let gerasim = candidates
+            .iter()
+            .find(|candidate| candidate.source_text == "Gerasim")
+            .expect("Gerasim should be extracted");
+
+        assert_eq!(gerasim.source_count, 3);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.source_text.eq_ignore_ascii_case("gerasim"))
+                .count(),
+            1
+        );
+    }
+
     fn term(source: &str, target: &str, scope_kind: GlossaryScopeKind) -> GlossaryTerm {
         GlossaryTerm {
             id: None,
@@ -545,6 +990,30 @@ mod tests {
             metadata: SegmentMetadata::default(),
             constraints: SegmentConstraints::default(),
             checksum: id.to_string(),
+        }
+    }
+
+    fn block(text: &str) -> Block {
+        marked_block(vec![text], Vec::new())
+    }
+
+    fn marked_block(text_runs: Vec<&str>, inline_marks: Vec<InlineMark>) -> Block {
+        Block {
+            id: BlockId("b_000000".to_string()),
+            section_id: SectionId("sec_1".to_string()),
+            kind: BlockKind::Paragraph,
+            dom_path: DomPath(vec![0]),
+            text_runs: text_runs
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| TextRun {
+                    id: format!("r000000_{index:03}"),
+                    text: text.to_string(),
+                })
+                .collect(),
+            inline_marks,
+            protected_spans: Vec::new(),
+            token_estimate: 1,
         }
     }
 }

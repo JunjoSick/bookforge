@@ -8,7 +8,7 @@ use std::{
 
 use bookforge_core::{
     Result as CoreResult,
-    glossary::{GlossaryScopeKind, GlossaryTerm},
+    glossary::{GlossaryCategory, GlossaryScopeKind, GlossaryStatus, GlossaryTerm},
     ir::BlockId,
     run_snapshot::RunConfigSnapshot,
     segment::{BlockTranslation, Segment},
@@ -196,6 +196,35 @@ pub struct GlossaryFilter<'a> {
     pub source_language: Option<&'a str>,
     pub target_language: Option<&'a str>,
     pub active_only: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewGlossaryCandidate<'a> {
+    pub source_text: &'a str,
+    pub category: GlossaryCategory,
+    pub source_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GlossaryCandidateUpsertResult {
+    pub inserted: usize,
+    pub updated: usize,
+    pub skipped: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredGlossaryCandidate {
+    pub id: i64,
+    pub source_text: String,
+    pub target_text: Option<String>,
+    pub category: GlossaryCategory,
+    pub notes: Option<String>,
+    pub case_sensitive: bool,
+    pub always_active: bool,
+    pub status: GlossaryStatus,
+    pub source_language: String,
+    pub target_language: String,
+    pub source_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1010,10 +1039,176 @@ impl JobStore {
         Ok(id)
     }
 
+    pub fn upsert_glossary_candidates(
+        &self,
+        book_id: &str,
+        source_language: &str,
+        target_language: &str,
+        candidates: &[NewGlossaryCandidate<'_>],
+    ) -> Result<GlossaryCandidateUpsertResult> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        let now = timestamp_string();
+        let mut result = GlossaryCandidateUpsertResult::default();
+
+        for candidate in candidates {
+            let existing = tx
+                .query_row(
+                    "SELECT id, status FROM glossary_terms
+                     WHERE scope_kind = 'book'
+                       AND scope_id = ?1
+                       AND source_text = ?2
+                       AND source_language = ?3
+                       AND target_language = ?4",
+                    params![
+                        book_id,
+                        candidate.source_text,
+                        source_language,
+                        target_language
+                    ],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+
+            match existing {
+                Some((id, status)) if status == GlossaryStatus::AutoCandidate.as_str() => {
+                    tx.execute(
+                        "UPDATE glossary_terms
+                         SET category = ?1,
+                             source_count = ?2,
+                             updated_at = ?3
+                         WHERE id = ?4",
+                        params![
+                            candidate.category.as_str(),
+                            candidate.source_count as i64,
+                            now,
+                            id,
+                        ],
+                    )?;
+                    result.updated += 1;
+                }
+                Some(_) => {
+                    result.skipped += 1;
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO glossary_terms
+                         (scope_kind, scope_id, source_text, target_text, category, notes,
+                          case_sensitive, always_active, status, source_language, target_language,
+                          source_count, created_at, updated_at)
+                         VALUES ('book', ?1, ?2, NULL, ?3, NULL, 1, 0, 'auto_candidate',
+                                 ?4, ?5, ?6, ?7, ?7)",
+                        params![
+                            book_id,
+                            candidate.source_text,
+                            candidate.category.as_str(),
+                            source_language,
+                            target_language,
+                            candidate.source_count as i64,
+                            now,
+                        ],
+                    )?;
+                    result.inserted += 1;
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub fn list_glossary_candidate_language_pairs(
+        &self,
+        book_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT source_language, target_language
+             FROM glossary_terms
+             WHERE scope_kind = 'book'
+               AND scope_id = ?1
+               AND status = 'auto_candidate'
+             ORDER BY source_language, target_language",
+        )?;
+        let rows = stmt.query_map(params![book_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_glossary_candidates(
+        &self,
+        book_id: &str,
+        source_language: &str,
+        target_language: &str,
+    ) -> Result<Vec<StoredGlossaryCandidate>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT id, source_text, target_text, category, notes, case_sensitive,
+                    always_active, status, source_language, target_language, source_count
+             FROM glossary_terms
+             WHERE scope_kind = 'book'
+               AND scope_id = ?1
+               AND source_language = ?2
+               AND target_language = ?3
+               AND status = 'auto_candidate'
+             ORDER BY source_count DESC, source_text",
+        )?;
+        let rows = stmt.query_map(
+            params![book_id, source_language, target_language],
+            glossary_candidate_from_row,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn accept_glossary_candidate(&self, id: i64, target_text: Option<&str>) -> Result<bool> {
+        let conn = self.conn.borrow();
+        let Some((source_text, existing_target)) = conn
+            .query_row(
+                "SELECT source_text, target_text
+                 FROM glossary_terms
+                 WHERE id = ?1 AND status = 'auto_candidate'",
+                params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let target = target_text
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| existing_target.filter(|value| !value.trim().is_empty()))
+            .unwrap_or(source_text);
+        let updated = conn.execute(
+            "UPDATE glossary_terms
+             SET target_text = ?1,
+                 status = 'accepted',
+                 updated_at = ?2
+             WHERE id = ?3 AND status = 'auto_candidate'",
+            params![target, timestamp_string(), id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn reject_glossary_candidate(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.borrow();
+        let updated = conn.execute(
+            "UPDATE glossary_terms
+             SET status = 'rejected',
+                 updated_at = ?1
+             WHERE id = ?2 AND status = 'auto_candidate'",
+            params![timestamp_string(), id],
+        )?;
+        Ok(updated > 0)
+    }
+
     pub fn list_glossary_terms(&self, filter: GlossaryFilter<'_>) -> Result<Vec<GlossaryTerm>> {
         let conn = self.conn.borrow();
         let mut sql = String::from(
-            "SELECT id, scope_kind, scope_id, source_text, target_text, category, notes,
+            "SELECT id, scope_kind, scope_id, source_text, COALESCE(target_text, ''), category, notes,
                     case_sensitive, always_active, status, source_language, target_language,
                     source_count
              FROM glossary_terms
@@ -1061,7 +1256,7 @@ impl JobStore {
     ) -> Result<Vec<GlossaryTerm>> {
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
-            "SELECT id, scope_kind, scope_id, source_text, target_text, category, notes,
+            "SELECT id, scope_kind, scope_id, source_text, COALESCE(target_text, ''), category, notes,
                     case_sensitive, always_active, status, source_language, target_language,
                     source_count
              FROM glossary_terms
@@ -1077,6 +1272,35 @@ impl JobStore {
         )?;
         let rows = stmt.query_map(
             params![source_language, target_language, series_id, book_id],
+            glossary_term_from_row,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_active_glossary_terms_for_target(
+        &self,
+        target_language: &str,
+        book_id: Option<&str>,
+        series_id: Option<&str>,
+    ) -> Result<Vec<GlossaryTerm>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT id, scope_kind, scope_id, source_text, COALESCE(target_text, ''), category, notes,
+                    case_sensitive, always_active, status, source_language, target_language,
+                    source_count
+             FROM glossary_terms
+             WHERE target_language = ?1
+               AND status IN ('user_seeded', 'accepted')
+               AND (
+                    scope_kind = 'global'
+                    OR (scope_kind = 'series' AND scope_id = ?2)
+                    OR (scope_kind = 'book' AND scope_id = ?3)
+               )
+             ORDER BY scope_kind, scope_id, source_language, source_text",
+        )?;
+        let rows = stmt.query_map(
+            params![target_language, series_id, book_id],
             glossary_term_from_row,
         )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1558,7 +1782,7 @@ impl JobStore {
               scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global', 'series', 'book')),
               scope_id TEXT,
               source_text TEXT NOT NULL,
-              target_text TEXT NOT NULL,
+              target_text TEXT,
               category TEXT NOT NULL CHECK(category IN
                 ('person', 'place', 'object', 'invented', 'style', 'phrase', 'other')),
               notes TEXT,
@@ -1576,6 +1800,7 @@ impl JobStore {
             );
             ",
         )?;
+        ensure_glossary_target_nullable(&conn)?;
         ensure_column(&conn, "jobs", "input_path", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "jobs", "input_snapshot_path", "TEXT")?;
         ensure_column(&conn, "jobs", "input_sha256", "TEXT")?;
@@ -1615,6 +1840,7 @@ impl JobStore {
         record_migration(&conn, 2, "v1_0_1_input_snapshot")?;
         record_migration(&conn, 3, "v1_1_segment_flags")?;
         record_migration(&conn, 4, "v1_2_glossary_terms")?;
+        record_migration(&conn, 5, "v1_2_1_nullable_glossary_candidate_targets")?;
         Ok(())
     }
 
@@ -1672,6 +1898,70 @@ fn ensure_column(
     Ok(())
 }
 
+fn ensure_glossary_target_nullable(conn: &Connection) -> rusqlite::Result<()> {
+    if !table_exists(conn, "glossary_terms")?
+        || !table_column_is_not_null(conn, "glossary_terms", "target_text")?
+    {
+        return Ok(());
+    }
+
+    let legacy_table = format!("glossary_terms_v1_2_0_{}", unix_timestamp_nanos());
+    conn.execute_batch(&format!(
+        "
+        DROP INDEX IF EXISTS idx_glossary_lookup;
+        ALTER TABLE glossary_terms RENAME TO {legacy_table};
+        CREATE TABLE glossary_terms (
+          id INTEGER PRIMARY KEY,
+          scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global', 'series', 'book')),
+          scope_id TEXT,
+          source_text TEXT NOT NULL,
+          target_text TEXT,
+          category TEXT NOT NULL CHECK(category IN
+            ('person', 'place', 'object', 'invented', 'style', 'phrase', 'other')),
+          notes TEXT,
+          case_sensitive INTEGER NOT NULL DEFAULT 0,
+          always_active INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL CHECK(status IN
+            ('user_seeded', 'auto_candidate', 'accepted', 'rejected'))
+            DEFAULT 'user_seeded',
+          source_language TEXT NOT NULL,
+          target_language TEXT NOT NULL,
+          source_count INTEGER DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(scope_kind, scope_id, source_text, source_language, target_language)
+        );
+        INSERT INTO glossary_terms
+          (id, scope_kind, scope_id, source_text, target_text, category, notes,
+           case_sensitive, always_active, status, source_language, target_language,
+           source_count, created_at, updated_at)
+        SELECT id, scope_kind, scope_id, source_text, target_text, category, notes,
+               case_sensitive, always_active, status, source_language, target_language,
+               source_count, created_at, updated_at
+        FROM {legacy_table};
+        DROP TABLE {legacy_table};
+        ",
+    ))?;
+    Ok(())
+}
+
+fn table_column_is_not_null(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            let not_null: i64 = row.get(3)?;
+            return Ok(not_null != 0);
+        }
+    }
+    Ok(false)
+}
+
 fn record_migration(conn: &Connection, version: i64, name: &str) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO _migrations (version, name, applied_at)
@@ -1699,6 +1989,26 @@ fn glossary_term_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GlossaryT
         source_language: row.get(10)?,
         target_language: row.get(11)?,
         source_count: row.get::<_, Option<i64>>(12)?.unwrap_or(0).max(0) as usize,
+    })
+}
+
+fn glossary_candidate_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredGlossaryCandidate> {
+    let category_text: String = row.get(3)?;
+    let status_text: String = row.get(7)?;
+    Ok(StoredGlossaryCandidate {
+        id: row.get(0)?,
+        source_text: row.get(1)?,
+        target_text: row.get(2)?,
+        category: parse_row_enum(&category_text, 3)?,
+        notes: row.get(4)?,
+        case_sensitive: row.get::<_, i64>(5)? != 0,
+        always_active: row.get::<_, i64>(6)? != 0,
+        status: parse_row_enum(&status_text, 7)?,
+        source_language: row.get(8)?,
+        target_language: row.get(9)?,
+        source_count: row.get::<_, Option<i64>>(10)?.unwrap_or(0).max(0) as usize,
     })
 }
 
@@ -2808,6 +3118,235 @@ mod tests {
     }
 
     #[test]
+    fn migrate_rebuilds_glossary_terms_with_nullable_target_text() {
+        let db_path = temp_path("glossary_nullable_target.sqlite");
+        {
+            let conn = Connection::open(&db_path).expect("legacy db opens");
+            conn.execute_batch(
+                "
+                CREATE TABLE _migrations (
+                  version INTEGER PRIMARY KEY,
+                  name TEXT NOT NULL,
+                  applied_at TEXT NOT NULL
+                );
+                CREATE TABLE glossary_terms (
+                  id INTEGER PRIMARY KEY,
+                  scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global', 'series', 'book')),
+                  scope_id TEXT,
+                  source_text TEXT NOT NULL,
+                  target_text TEXT NOT NULL,
+                  category TEXT NOT NULL CHECK(category IN
+                    ('person', 'place', 'object', 'invented', 'style', 'phrase', 'other')),
+                  notes TEXT,
+                  case_sensitive INTEGER NOT NULL DEFAULT 0,
+                  always_active INTEGER NOT NULL DEFAULT 0,
+                  status TEXT NOT NULL CHECK(status IN
+                    ('user_seeded', 'auto_candidate', 'accepted', 'rejected'))
+                    DEFAULT 'user_seeded',
+                  source_language TEXT NOT NULL,
+                  target_language TEXT NOT NULL,
+                  source_count INTEGER DEFAULT 0,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  UNIQUE(scope_kind, scope_id, source_text, source_language, target_language)
+                );
+                CREATE INDEX idx_glossary_lookup
+                  ON glossary_terms(source_language, target_language, scope_kind, scope_id, status);
+                INSERT INTO glossary_terms
+                  (id, scope_kind, scope_id, source_text, target_text, category, notes,
+                   case_sensitive, always_active, status, source_language, target_language,
+                   source_count, created_at, updated_at)
+                VALUES
+                  (42, 'book', 'ivan', 'Ivan Ilych', 'Ivan Il''ich', 'person', 'legacy',
+                   1, 0, 'user_seeded', 'English', 'Italian', 9, 'created', 'updated');
+                ",
+            )
+            .expect("legacy schema should initialize");
+        }
+
+        let store = JobStore::open(&db_path).expect("store opens and migrates");
+        let conn = store.conn.borrow();
+        assert!(
+            !table_column_is_not_null(&conn, "glossary_terms", "target_text")
+                .expect("table info should load")
+        );
+        let row = conn
+            .query_row(
+                "SELECT id, target_text, created_at, updated_at FROM glossary_terms WHERE id = 42",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .expect("legacy glossary row should survive");
+        assert_eq!(row.0, 42);
+        assert_eq!(row.1, "Ivan Il'ich");
+        assert_eq!(row.2, "created");
+        assert_eq!(row.3, "updated");
+        let version: i64 = conn
+            .query_row(
+                "SELECT version FROM _migrations WHERE name = 'v1_2_1_nullable_glossary_candidate_targets'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v1.2.1 migration recorded");
+        assert_eq!(version, 5);
+        let index: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_glossary_lookup'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("idx_glossary_lookup should be recreated");
+        assert_eq!(index, "idx_glossary_lookup");
+        let duplicate = conn.execute(
+            "INSERT INTO glossary_terms
+              (scope_kind, scope_id, source_text, target_text, category, notes,
+               case_sensitive, always_active, status, source_language, target_language,
+               source_count, created_at, updated_at)
+             VALUES
+              ('book', 'ivan', 'Ivan Ilych', 'duplicate', 'person', NULL,
+               1, 0, 'user_seeded', 'English', 'Italian', 1, 'now', 'now')",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "unique constraint should survive the rebuild"
+        );
+        drop(conn);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn glossary_candidate_upsert_updates_auto_and_skips_rejected() {
+        let db_path = temp_path("glossary_candidates.sqlite");
+        let store = JobStore::open(&db_path).expect("store opens");
+        let first = store
+            .upsert_glossary_candidates(
+                "ivan",
+                "English",
+                "Italian",
+                &[NewGlossaryCandidate {
+                    source_text: "Ivan Ilych",
+                    category: GlossaryCategory::Other,
+                    source_count: 4,
+                }],
+            )
+            .expect("candidate inserts");
+        assert_eq!(first.inserted, 1);
+
+        let candidates = store
+            .list_glossary_candidates("ivan", "English", "Italian")
+            .expect("candidates should list");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].target_text, None);
+        assert_eq!(candidates[0].source_count, 4);
+
+        let second = store
+            .upsert_glossary_candidates(
+                "ivan",
+                "English",
+                "Italian",
+                &[NewGlossaryCandidate {
+                    source_text: "Ivan Ilych",
+                    category: GlossaryCategory::Other,
+                    source_count: 7,
+                }],
+            )
+            .expect("candidate updates");
+        assert_eq!(second.updated, 1);
+        assert_eq!(
+            store
+                .list_glossary_candidates("ivan", "English", "Italian")
+                .expect("candidates should list")[0]
+                .source_count,
+            7
+        );
+
+        assert!(
+            store
+                .reject_glossary_candidate(candidates[0].id)
+                .expect("candidate rejects")
+        );
+        let third = store
+            .upsert_glossary_candidates(
+                "ivan",
+                "English",
+                "Italian",
+                &[NewGlossaryCandidate {
+                    source_text: "Ivan Ilych",
+                    category: GlossaryCategory::Other,
+                    source_count: 9,
+                }],
+            )
+            .expect("rejected candidate is skipped");
+        assert_eq!(third.skipped, 1);
+        assert!(
+            store
+                .list_glossary_candidates("ivan", "English", "Italian")
+                .expect("rejected candidates are not pending")
+                .is_empty()
+        );
+
+        let all = store
+            .list_glossary_terms(GlossaryFilter {
+                scope_kind: Some(GlossaryScopeKind::Book),
+                scope_id: Some("ivan"),
+                source_language: Some("English"),
+                target_language: Some("Italian"),
+                active_only: false,
+            })
+            .expect("terms should list");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].status, GlossaryStatus::Rejected);
+        assert_eq!(all[0].source_count, 7);
+
+        let seeded = glossary_term(
+            bookforge_core::GlossaryScopeKind::Book,
+            Some("ivan"),
+            "Aragorn",
+            "Aragorn",
+        );
+        let mut accepted = glossary_term(
+            bookforge_core::GlossaryScopeKind::Book,
+            Some("ivan"),
+            "Mount Doom",
+            "Monte Fato",
+        );
+        accepted.status = GlossaryStatus::Accepted;
+        store
+            .upsert_glossary_terms(&[seeded, accepted])
+            .expect("active terms should insert");
+        let fourth = store
+            .upsert_glossary_candidates(
+                "ivan",
+                "English",
+                "Italian",
+                &[
+                    NewGlossaryCandidate {
+                        source_text: "Aragorn",
+                        category: GlossaryCategory::Other,
+                        source_count: 12,
+                    },
+                    NewGlossaryCandidate {
+                        source_text: "Mount Doom",
+                        category: GlossaryCategory::Other,
+                        source_count: 11,
+                    },
+                ],
+            )
+            .expect("active terms are skipped");
+        assert_eq!(fourth.skipped, 2);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
     fn glossary_terms_upsert_list_and_active_lookup() {
         let db_path = temp_path("glossary_terms.sqlite");
         let store = JobStore::open(&db_path).expect("store opens");
@@ -2845,6 +3384,15 @@ mod tests {
             .expect("active terms");
         assert_eq!(active.len(), 2);
         assert!(active.iter().any(|term| term.target_text == "Granpasso"));
+        let active_by_target = store
+            .load_active_glossary_terms_for_target("Italian", Some("fellowship"), Some("lotr"))
+            .expect("target-only active terms");
+        assert_eq!(active_by_target.len(), 2);
+        assert!(
+            active_by_target
+                .iter()
+                .any(|term| term.source_language == "English" && term.target_text == "Granpasso")
+        );
 
         let removed = store
             .clear_glossary_scope(bookforge_core::GlossaryScopeKind::Global, None)
