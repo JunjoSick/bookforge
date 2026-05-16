@@ -1,0 +1,4 @@
+-- v1.2.1 glossary auto-candidates need unresolved target_text values.
+-- SQLite cannot drop NOT NULL in place, so the runtime migrator rebuilds
+-- glossary_terms idempotently while preserving ids, rows, timestamps, the
+-- unique constraint, and idx_glossary_lookup.

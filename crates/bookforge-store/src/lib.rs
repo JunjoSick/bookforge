@@ -1,8 +1,9 @@
 pub mod db;
 
 pub use db::{
-    CacheLookupRequest, CachedTranslation, CreateJob, GlossaryFilter, JobRecord, JobStore,
-    JobSummary, NewSegmentFlag, RetryScope, SaveCachedTranslation, SaveNeedsReview,
-    SaveTranslation, SegmentRecord, StorageDoctor, StoreError, StoredBlockTranslation,
+    CacheLookupRequest, CachedTranslation, CreateJob, GlossaryCandidateUpsertResult,
+    GlossaryFilter, JobRecord, JobStore, JobSummary, NewGlossaryCandidate, NewSegmentFlag,
+    RetryScope, SaveCachedTranslation, SaveNeedsReview, SaveTranslation, SegmentRecord,
+    StorageDoctor, StoreError, StoredBlockTranslation, StoredGlossaryCandidate,
     StoredSegmentTranslation, run_doctor,
 };

@@ -17,9 +17,9 @@ pub use config::{
 };
 pub use error::{BookforgeError, Result};
 pub use glossary::{
-    GlossaryCategory, GlossaryFormat, GlossaryPromptTerm, GlossaryScopeKind, GlossaryStatus,
-    GlossaryTerm, SegmentGlossarySelections, merge_scope_terms, select_glossary_for_segments,
-    target_matches, term_matches,
+    GlossaryCandidate, GlossaryCategory, GlossaryFormat, GlossaryPromptTerm, GlossaryScopeKind,
+    GlossaryStatus, GlossaryTerm, SegmentGlossarySelections, extract_glossary_candidates,
+    merge_scope_terms, select_glossary_for_segments, target_matches, term_matches,
 };
 pub use progress::{NullProgressSink, ProgressEvent, ProgressSink, now_ms};
 pub use run_snapshot::{ResolvedRunSettingsSnapshot, RunConfigSnapshot};

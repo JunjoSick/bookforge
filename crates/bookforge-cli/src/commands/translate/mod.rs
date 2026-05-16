@@ -167,9 +167,11 @@ pub(crate) fn prepare_glossary_run_config(
     segments: &[Segment],
 ) -> Result<PreparedGlossary> {
     let imported_terms = import_glossary_files(store, glossary_files)?;
-    let source_key = source_language.unwrap_or("auto");
-    let mut active_terms =
-        store.load_active_glossary_terms(source_key, target_language, book_id, series_id)?;
+    let mut active_terms = if let Some(source_language) = source_language {
+        store.load_active_glossary_terms(source_language, target_language, book_id, series_id)?
+    } else {
+        store.load_active_glossary_terms_for_target(target_language, book_id, series_id)?
+    };
     active_terms.extend(imported_terms.into_iter().filter(|term| {
         term.active()
             && term.target_language == target_language
@@ -1789,6 +1791,53 @@ case_sensitive = true
 
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(glossary_path);
+    }
+
+    #[test]
+    fn persisted_glossary_is_selected_when_source_is_auto() {
+        let db_path = temp_path("glossary_auto_source.sqlite");
+        let store = JobStore::open(&db_path).expect("store should open");
+        store
+            .upsert_glossary_terms(&[GlossaryTerm {
+                id: None,
+                scope_kind: bookforge_core::GlossaryScopeKind::Book,
+                scope_id: Some("fellowship".to_string()),
+                source_text: "Aragorn".to_string(),
+                target_text: "Aragorn".to_string(),
+                category: bookforge_core::GlossaryCategory::Person,
+                notes: None,
+                case_sensitive: true,
+                always_active: false,
+                status: bookforge_core::GlossaryStatus::UserSeeded,
+                source_language: "English".to_string(),
+                target_language: "Italian".to_string(),
+                source_count: 0,
+            }])
+            .expect("persisted glossary should insert");
+        let mut segment = segment("seg_auto", 0);
+        segment.source.text = "Aragorn entered the room.".to_string();
+        segment.source.blocks[0].text = segment.source.text.clone();
+
+        let prepared = prepare_glossary_run_config(
+            &store,
+            &[],
+            None,
+            "Italian",
+            Some("fellowship"),
+            None,
+            GlossaryFormat::Json,
+            800,
+            None,
+            &[segment],
+        )
+        .expect("glossary should prepare without explicit source");
+
+        let entries = &prepared.run_config.entries_by_segment["seg_auto"];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "Aragorn");
+        assert_eq!(entries[0].target, "Aragorn");
+
+        let _ = fs::remove_file(db_path);
     }
 
     #[test]

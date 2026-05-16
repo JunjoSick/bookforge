@@ -4,8 +4,8 @@ use std::{
 };
 
 use assert_cmd::Command;
-use bookforge_core::GlossaryTerm;
-use bookforge_store::{GlossaryFilter, JobStore};
+use bookforge_core::{GlossaryCategory, GlossaryStatus, GlossaryTerm};
+use bookforge_store::{GlossaryFilter, JobStore, NewGlossaryCandidate};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -200,6 +200,179 @@ source_count = 2
         normalized_terms(roundtripped),
         "exported TOML should reimport to the same glossary term fields"
     );
+}
+
+#[test]
+fn cli_glossary_extract_candidates_stores_auto_candidates() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "glossary",
+            "extract-candidates",
+            fixture_input().to_str().unwrap(),
+            "--book-id",
+            "ivan",
+            "--source-lang",
+            "English",
+            "--target-lang",
+            "Italian",
+            "--min-count",
+            "4",
+        ])
+        .assert()
+        .success();
+
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
+    let candidates = store
+        .list_glossary_candidates("ivan", "English", "Italian")
+        .expect("candidates should list");
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.source_text == "Ivan Ilych")
+    );
+    assert!(candidates.iter().all(|candidate| {
+        candidate.target_text.is_none() && candidate.status == GlossaryStatus::AutoCandidate
+    }));
+}
+
+#[test]
+fn cli_glossary_review_candidates_accepts_sets_and_rejects() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let store_path = temp.path().join(".bookforge/jobs.sqlite");
+    let store = JobStore::open(&store_path).expect("store opens");
+    store
+        .upsert_glossary_candidates(
+            "manual-review",
+            "English",
+            "Italian",
+            &[
+                NewGlossaryCandidate {
+                    source_text: "Aragorn",
+                    category: GlossaryCategory::Other,
+                    source_count: 10,
+                },
+                NewGlossaryCandidate {
+                    source_text: "Mount Doom",
+                    category: GlossaryCategory::Other,
+                    source_count: 9,
+                },
+                NewGlossaryCandidate {
+                    source_text: "Ivan Ilych",
+                    category: GlossaryCategory::Other,
+                    source_count: 8,
+                },
+            ],
+        )
+        .expect("candidates should insert");
+    drop(store);
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "glossary",
+            "review-candidates",
+            "manual-review",
+            "--language",
+            "English->Italian",
+        ])
+        .write_stdin("accept 1\nset 1 \"Monte Fato\"\nreject 1\nquit\n")
+        .assert()
+        .success();
+
+    let store = JobStore::open(&store_path).expect("store opens");
+    let terms = store
+        .list_glossary_terms(GlossaryFilter {
+            scope_kind: Some(bookforge_core::GlossaryScopeKind::Book),
+            scope_id: Some("manual-review"),
+            source_language: Some("English"),
+            target_language: Some("Italian"),
+            active_only: false,
+        })
+        .expect("terms should list");
+
+    assert!(terms.iter().any(|term| {
+        term.source_text == "Aragorn"
+            && term.target_text == "Aragorn"
+            && term.status == GlossaryStatus::Accepted
+    }));
+    assert!(terms.iter().any(|term| {
+        term.source_text == "Mount Doom"
+            && term.target_text == "Monte Fato"
+            && term.status == GlossaryStatus::Accepted
+    }));
+    assert!(terms.iter().any(|term| {
+        term.source_text == "Ivan Ilych" && term.status == GlossaryStatus::Rejected
+    }));
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "glossary",
+            "extract-candidates",
+            fixture_input().to_str().unwrap(),
+            "--book-id",
+            "manual-review",
+            "--source-lang",
+            "English",
+            "--target-lang",
+            "Italian",
+            "--min-count",
+            "1",
+        ])
+        .assert()
+        .success();
+    let terms_after_rerun = store
+        .list_glossary_terms(GlossaryFilter {
+            scope_kind: Some(bookforge_core::GlossaryScopeKind::Book),
+            scope_id: Some("manual-review"),
+            source_language: Some("English"),
+            target_language: Some("Italian"),
+            active_only: false,
+        })
+        .expect("terms should list after rerun");
+    assert_eq!(
+        terms_after_rerun
+            .iter()
+            .filter(|term| term.source_text == "Ivan Ilych")
+            .count(),
+        1,
+        "rejected candidates should not be resurrected"
+    );
+}
+
+#[test]
+fn cli_glossary_review_candidates_requires_language_when_ambiguous() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let store_path = temp.path().join(".bookforge/jobs.sqlite");
+    let store = JobStore::open(&store_path).expect("store opens");
+    for (source, target) in [("English", "Italian"), ("English", "French")] {
+        store
+            .upsert_glossary_candidates(
+                "ambiguous-review",
+                source,
+                target,
+                &[NewGlossaryCandidate {
+                    source_text: "Ivan Ilych",
+                    category: GlossaryCategory::Other,
+                    source_count: 8,
+                }],
+            )
+            .expect("candidate should insert");
+    }
+    drop(store);
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args(["glossary", "review-candidates", "ambiguous-review"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains("multiple candidate language pairs exist"));
+    assert!(stderr.contains("English->French"));
+    assert!(stderr.contains("English->Italian"));
 }
 
 #[test]

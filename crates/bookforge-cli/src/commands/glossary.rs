@@ -1,8 +1,14 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    io::{self, BufRead, Write},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result};
-use bookforge_core::{GlossaryCategory, GlossaryScopeKind, GlossaryStatus, GlossaryTerm};
-use bookforge_store::{GlossaryFilter, JobStore};
+use bookforge_core::{
+    GlossaryCategory, GlossaryScopeKind, GlossaryStatus, GlossaryTerm, extract_glossary_candidates,
+};
+use bookforge_store::{GlossaryFilter, JobStore, NewGlossaryCandidate, StoredGlossaryCandidate};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +26,8 @@ enum GlossaryCommand {
     Clear(ClearArgs),
     Import(ImportArgs),
     Export(ExportArgs),
+    ExtractCandidates(ExtractCandidatesArgs),
+    ReviewCandidates(ReviewCandidatesArgs),
 }
 
 #[derive(Debug, Args)]
@@ -97,6 +105,34 @@ struct ExportArgs {
     language: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct ExtractCandidatesArgs {
+    input: PathBuf,
+
+    #[arg(long)]
+    book_id: String,
+
+    #[arg(long)]
+    source_lang: String,
+
+    #[arg(long)]
+    target_lang: String,
+
+    #[arg(long, default_value_t = 4)]
+    min_count: usize,
+
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct ReviewCandidatesArgs {
+    book_id: String,
+
+    #[arg(long)]
+    language: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct GlossaryToml {
     meta: GlossaryTomlMeta,
@@ -145,6 +181,8 @@ pub async fn run(args: GlossaryArgs) -> Result<()> {
         GlossaryCommand::Clear(args) => clear_terms(&store, args),
         GlossaryCommand::Import(args) => import_terms(&store, args),
         GlossaryCommand::Export(args) => export_terms(&store, args),
+        GlossaryCommand::ExtractCandidates(args) => extract_candidates(&store, args),
+        GlossaryCommand::ReviewCandidates(args) => review_candidates(&store, args),
     }
 }
 
@@ -186,6 +224,254 @@ fn export_terms(store: &JobStore, args: ExportArgs) -> Result<()> {
     fs::write(&args.file, toml::to_string_pretty(&output)?)?;
     println!("Exported {} glossary terms.", output.terms.len());
     Ok(())
+}
+
+fn extract_candidates(store: &JobStore, args: ExtractCandidatesArgs) -> Result<()> {
+    let book = bookforge_epub::read_epub(&args.input)
+        .with_context(|| format!("failed to read EPUB {}", args.input.display()))?;
+    let extracted =
+        extract_glossary_candidates(&book.blocks, &args.source_lang, args.min_count, args.limit);
+    let candidates = extracted
+        .iter()
+        .map(|candidate| NewGlossaryCandidate {
+            source_text: candidate.source_text.as_str(),
+            category: candidate.category,
+            source_count: candidate.source_count,
+        })
+        .collect::<Vec<_>>();
+    let result = store.upsert_glossary_candidates(
+        &args.book_id,
+        &args.source_lang,
+        &args.target_lang,
+        &candidates,
+    )?;
+    println!(
+        "Extracted {} candidates: {} inserted, {} updated, {} skipped.",
+        extracted.len(),
+        result.inserted,
+        result.updated,
+        result.skipped
+    );
+    Ok(())
+}
+
+fn review_candidates(store: &JobStore, args: ReviewCandidatesArgs) -> Result<()> {
+    let Some((source_language, target_language)) =
+        resolve_candidate_language_pair(store, &args.book_id, args.language.as_deref())?
+    else {
+        println!("No pending glossary candidates.");
+        return Ok(());
+    };
+
+    let mut candidates =
+        store.list_glossary_candidates(&args.book_id, &source_language, &target_language)?;
+    if candidates.is_empty() {
+        println!("No pending glossary candidates.");
+        return Ok(());
+    }
+
+    println!(
+        "Reviewing {} candidates for {} {}->{}.",
+        candidates.len(),
+        args.book_id,
+        source_language,
+        target_language
+    );
+    print_candidate_help();
+    print_candidates(&candidates);
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut lines = stdin.lock().lines();
+    loop {
+        print!("glossary> ");
+        stdout.flush()?;
+        let Some(line) = lines.next() else {
+            break;
+        };
+        let line = line?;
+        match parse_review_command(&line) {
+            Ok(ReviewCommand::Accept(number)) => {
+                let candidate = match candidate_by_number(&candidates, number) {
+                    Ok(candidate) => candidate,
+                    Err(err) => {
+                        eprintln!("{err}");
+                        continue;
+                    }
+                };
+                if store.accept_glossary_candidate(candidate.id, None)? {
+                    println!("Accepted {}.", candidate.source_text);
+                }
+            }
+            Ok(ReviewCommand::Set(number, target)) => {
+                let candidate = match candidate_by_number(&candidates, number) {
+                    Ok(candidate) => candidate,
+                    Err(err) => {
+                        eprintln!("{err}");
+                        continue;
+                    }
+                };
+                if store.accept_glossary_candidate(candidate.id, Some(&target))? {
+                    println!("Accepted {} -> {}.", candidate.source_text, target);
+                }
+            }
+            Ok(ReviewCommand::Reject(number)) => {
+                let candidate = match candidate_by_number(&candidates, number) {
+                    Ok(candidate) => candidate,
+                    Err(err) => {
+                        eprintln!("{err}");
+                        continue;
+                    }
+                };
+                if store.reject_glossary_candidate(candidate.id)? {
+                    println!("Rejected {}.", candidate.source_text);
+                }
+            }
+            Ok(ReviewCommand::List) => {}
+            Ok(ReviewCommand::Help) => {
+                print_candidate_help();
+                continue;
+            }
+            Ok(ReviewCommand::Quit) => break,
+            Ok(ReviewCommand::Empty) => continue,
+            Err(err) => {
+                eprintln!("{err}");
+                continue;
+            }
+        }
+
+        candidates =
+            store.list_glossary_candidates(&args.book_id, &source_language, &target_language)?;
+        if candidates.is_empty() {
+            println!("No pending glossary candidates.");
+        } else {
+            print_candidates(&candidates);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_candidate_language_pair(
+    store: &JobStore,
+    book_id: &str,
+    language: Option<&str>,
+) -> Result<Option<(String, String)>> {
+    if let Some(language) = language {
+        let (source, target) = parse_language_pair(language)?;
+        return Ok(Some((source, target)));
+    }
+
+    let pairs = store.list_glossary_candidate_language_pairs(book_id)?;
+    match pairs.as_slice() {
+        [] => Ok(None),
+        [(source, target)] => Ok(Some((source.clone(), target.clone()))),
+        _ => {
+            let available = pairs
+                .iter()
+                .map(|(source, target)| format!("{source}->{target}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "multiple candidate language pairs exist for book '{book_id}'; pass --language with one of: {available}"
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewCommand {
+    Accept(usize),
+    Set(usize, String),
+    Reject(usize),
+    List,
+    Help,
+    Quit,
+    Empty,
+}
+
+fn parse_review_command(line: &str) -> Result<ReviewCommand> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(ReviewCommand::Empty);
+    }
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let command = parts.next().unwrap_or_default();
+    let rest = parts.next().unwrap_or_default();
+    match command {
+        "accept" => Ok(ReviewCommand::Accept(parse_candidate_number(rest)?)),
+        "reject" => Ok(ReviewCommand::Reject(parse_candidate_number(rest)?)),
+        "set" => {
+            let rest = rest.trim();
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let Some(number) = parts.next() else {
+                anyhow::bail!("usage: set N \"translation\"");
+            };
+            let Some(target) = parts.next() else {
+                anyhow::bail!("usage: set N \"translation\"");
+            };
+            let target = unquote(target.trim());
+            if target.is_empty() {
+                anyhow::bail!("usage: set N \"translation\"");
+            }
+            Ok(ReviewCommand::Set(
+                parse_candidate_number(number)?,
+                target.to_string(),
+            ))
+        }
+        "list" => Ok(ReviewCommand::List),
+        "help" => Ok(ReviewCommand::Help),
+        "quit" | "exit" => Ok(ReviewCommand::Quit),
+        other => anyhow::bail!(
+            "unknown command '{other}'; expected accept, set, reject, list, help, or quit"
+        ),
+    }
+}
+
+fn parse_candidate_number(value: &str) -> Result<usize> {
+    let number = value.trim().parse::<usize>()?;
+    if number == 0 {
+        anyhow::bail!("candidate number must be 1 or greater");
+    }
+    Ok(number)
+}
+
+fn unquote(value: &str) -> &str {
+    let value = value.trim();
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+fn candidate_by_number(
+    candidates: &[StoredGlossaryCandidate],
+    number: usize,
+) -> Result<&StoredGlossaryCandidate> {
+    candidates
+        .get(number - 1)
+        .ok_or_else(|| anyhow::anyhow!("candidate {number} is not in the current list"))
+}
+
+fn print_candidate_help() {
+    println!("Commands: accept N, set N \"translation\", reject N, list, help, quit");
+}
+
+fn print_candidates(candidates: &[StoredGlossaryCandidate]) {
+    for (index, candidate) in candidates.iter().enumerate() {
+        println!(
+            "{}\t{}\t{}\t{}\t{} -> {}",
+            index + 1,
+            candidate.source_count,
+            candidate.category,
+            candidate.status.as_str(),
+            candidate.source_text,
+            candidate.target_text.as_deref().unwrap_or("-")
+        );
+    }
 }
 
 fn list_terms(store: &JobStore, args: ListArgs) -> Result<()> {
@@ -420,6 +706,34 @@ case_sensitive = true
         assert_eq!(
             parse_language_pair("English->Italian").expect("pair"),
             ("English".to_string(), "Italian".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_candidate_review_commands() {
+        assert_eq!(
+            parse_review_command("accept 2").expect("accept command"),
+            ReviewCommand::Accept(2)
+        );
+        assert_eq!(
+            parse_review_command("set 3 \"Monte Fato\"").expect("set command"),
+            ReviewCommand::Set(3, "Monte Fato".to_string())
+        );
+        assert_eq!(
+            parse_review_command("reject 4").expect("reject command"),
+            ReviewCommand::Reject(4)
+        );
+        assert_eq!(
+            parse_review_command("list").expect("list command"),
+            ReviewCommand::List
+        );
+        assert_eq!(
+            parse_review_command("help").expect("help command"),
+            ReviewCommand::Help
+        );
+        assert_eq!(
+            parse_review_command("quit").expect("quit command"),
+            ReviewCommand::Quit
         );
     }
 
