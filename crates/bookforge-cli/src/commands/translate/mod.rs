@@ -16,7 +16,7 @@ use bookforge_llm::{
     AdaptiveLimiter, ContextRegistry, ContextRunConfig, GlossaryRunConfig, LlmError, LlmProvider,
     MockMode, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
     ProviderRateController, QaSegmentReview, RateControllerConfig, SegmentTranslation,
-    TelemetryLog, TranslationRunConfig, account_for_batch_prompt_overhead,
+    StyleRunConfig, TelemetryLog, TranslationRunConfig, account_for_batch_prompt_overhead,
     build_translation_batches, qa_segments_parallel, run_double_check, telemetry_summary,
     translate_batches_with_callback, translate_segments_with_callback,
 };
@@ -160,6 +160,66 @@ pub(crate) fn context_run_config_from_args(cli_args: &TranslateArgs) -> ContextR
         budget_tokens: cli_args.context_budget_tokens,
         scope: cli_args.context_scope,
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedStyle {
+    pub run_config: Option<StyleRunConfig>,
+    pub fingerprint: String,
+    pub rendered_block: String,
+}
+
+/// Load `--style` files into the store, merge all sheets for the active
+/// scope, render the prompt block, and produce both the run-time
+/// injection bundle and the snapshot-capture fields.
+pub(crate) fn prepare_style_run_config(
+    store: &JobStore,
+    style_files: &[PathBuf],
+    target_language: &str,
+    book_id: Option<&str>,
+    series_id: Option<&str>,
+) -> Result<PreparedStyle> {
+    for path in style_files {
+        let sheet = crate::commands::style::read_style_file(path)?;
+        let content_toml = std::fs::read_to_string(path)?;
+        let one_sheet = vec![sheet.clone()];
+        let merged_for_one = bookforge_core::style::merge_style_sheets(&one_sheet);
+        let fp = bookforge_core::style::style_fingerprint(merged_for_one.as_ref());
+        store.upsert_style_sheet(&bookforge_store::NewStyleSheet {
+            scope_kind: sheet.scope_kind,
+            scope_id: sheet.scope_id.as_deref(),
+            target_language: &sheet.target_language,
+            content_toml: &content_toml,
+            fingerprint: &fp,
+        })?;
+    }
+    let stored = store.load_active_style_sheets(target_language, book_id, series_id)?;
+    let mut parsed: Vec<bookforge_core::style::StyleSheet> = Vec::new();
+    for record in &stored {
+        match crate::commands::style::parse_style_toml(&record.content_toml) {
+            Ok(sheet) => parsed.push(sheet),
+            Err(err) => tracing::warn!(
+                style_id = record.id,
+                "skipping stored style sheet that failed to parse: {err}"
+            ),
+        }
+    }
+    let merged = bookforge_core::style::merge_style_sheets(&parsed);
+    let rendered_block = bookforge_core::style::render_style_block(merged.as_ref());
+    let fingerprint = bookforge_core::style::style_fingerprint(merged.as_ref());
+    let run_config = if rendered_block.is_empty() {
+        None
+    } else {
+        Some(StyleRunConfig {
+            rendered_block: rendered_block.clone(),
+            fingerprint: fingerprint.clone(),
+        })
+    };
+    Ok(PreparedStyle {
+        run_config,
+        fingerprint,
+        rendered_block,
+    })
 }
 
 /// Seed the in-memory completion fence from already-completed translations
@@ -344,6 +404,13 @@ async fn run_mock_translation(
     } else {
         None
     };
+    let style = prepare_style_run_config(
+        &store,
+        &cli_args.style,
+        &config.target_language,
+        cli_args.book_id.as_deref(),
+        cli_args.series_id.as_deref(),
+    )?;
     let job = store.create_job(CreateJob {
         input,
         output: &config.output,
@@ -385,6 +452,8 @@ async fn run_mock_translation(
         &cache_namespace,
         &glossary.fingerprint,
         &glossary.active_terms,
+        &style.fingerprint,
+        &style.rendered_block,
         &model,
         None,
         None,
@@ -413,6 +482,7 @@ async fn run_mock_translation(
         glossary: glossary.run_config.clone(),
         context: context_run_config,
         context_registry: context_registry.clone(),
+        style: style.run_config.clone(),
     }; // mock
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     let mut translations = apply_cached_translations(
@@ -611,6 +681,13 @@ async fn run_openai_compatible_translation(
     } else {
         None
     };
+    let style = prepare_style_run_config(
+        &store,
+        &cli_args.style,
+        &config.target_language,
+        cli_args.book_id.as_deref(),
+        cli_args.series_id.as_deref(),
+    )?;
     let job = store.create_job(CreateJob {
         input,
         output: &config.output,
@@ -652,6 +729,8 @@ async fn run_openai_compatible_translation(
         &cache_namespace,
         &glossary.fingerprint,
         &glossary.active_terms,
+        &style.fingerprint,
+        &style.rendered_block,
         &model,
         Some(provider_config.base_url.clone()),
         Some(provider_config.api_key_env.clone()),
@@ -680,6 +759,7 @@ async fn run_openai_compatible_translation(
         glossary: glossary.run_config.clone(),
         context: context_run_config,
         context_registry: context_registry.clone(),
+        style: style.run_config.clone(),
     };
     // batch_run_config
 
@@ -703,6 +783,7 @@ async fn run_openai_compatible_translation(
             glossary: run_config.glossary.clone(),
             context: run_config.context,
             context_registry: run_config.context_registry.clone(),
+            style: run_config.style.clone(),
         };
         let mut translations = apply_cached_translations(
             &segments,
@@ -1209,6 +1290,7 @@ async fn run_fallback_pass(
         glossary: primary_run_config.glossary.clone(),
         context: primary_run_config.context,
         context_registry: primary_run_config.context_registry.clone(),
+        style: primary_run_config.style.clone(),
     }; // fallback_run_config
 
     let writer = CheckpointWriter::spawn(store.path().to_path_buf(), Arc::new(NullProgressSink));
@@ -1765,6 +1847,7 @@ mod tests {
             glossary: GlossaryRunConfig::default(),
             context: ContextRunConfig::default(),
             context_registry: None,
+            style: None,
         };
 
         let error = translate_with_scheduler_guard(

@@ -48,6 +48,15 @@ pub struct RunConfigSnapshot {
     pub context_budget_tokens: usize,
     #[serde(default)]
     pub context_scope: ContextScope,
+    /// SHA-256 of the merged style sheet's normalized JSON form. Stable
+    /// for users without `--style` (fingerprint of `None`).
+    #[serde(default)]
+    pub style_fingerprint: String,
+    /// Pre-rendered style guide block — captured so resume reproduces the
+    /// exact prompt the original run sent, even if the source TOML files
+    /// have moved or been edited.
+    #[serde(default)]
+    pub style_rendered_block: String,
     pub settings: ResolvedRunSettingsSnapshot,
 }
 

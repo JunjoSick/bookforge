@@ -94,6 +94,11 @@ pub struct TranslateArgs {
     #[arg(long, value_enum, default_value_t = ContextScope::Chapter)]
     pub context_scope: ContextScope,
 
+    /// Style sheet TOML to merge into prompts (repeatable). Sheets merge
+    /// with `book > series > global` precedence.
+    #[arg(long = "style")]
+    pub style: Vec<PathBuf>,
+
     #[arg(long, value_enum, default_value_t = QaMode::Off)]
     pub qa: QaMode,
 

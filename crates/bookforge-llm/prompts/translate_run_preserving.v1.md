@@ -75,6 +75,12 @@ Already-translated prior segments (use for pronoun, gender, and voice consistenc
 {{context_translation_pairs}}
 ```
 
+Active style guide (apply consistently throughout):
+
+```txt
+{{style_guide_block}}
+```
+
 Glossary and fixed terminology:
 
 ```json

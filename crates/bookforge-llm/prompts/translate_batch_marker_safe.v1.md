@@ -55,7 +55,15 @@ Return exactly:
 
 Translate every structured item. Preserve ALL markers exactly.
 
-Each input item may include `glossary` or `glossary_prose`; honor those constraints for that item. Additional instructions:
+Each input item may include `glossary` or `glossary_prose`; honor those constraints for that item.
+
+Active style guide (apply consistently to every item):
+
+```txt
+{{style_guide_block}}
+```
+
+Additional instructions:
 
 ```txt
 {{prompt_extra}}
