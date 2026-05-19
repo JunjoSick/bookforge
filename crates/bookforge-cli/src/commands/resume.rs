@@ -16,8 +16,8 @@ use bookforge_core::{
 };
 use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::{
-    GlossaryRunConfig, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
-    QaSegmentReview, SegmentTranslation, TranslationRunConfig,
+    ContextRegistry, ContextRunConfig, GlossaryRunConfig, MockProvider, OpenAiCompatibleConfig,
+    OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation, TranslationRunConfig,
 };
 use bookforge_store::{JobRecord, JobStore, StoredBlockTranslation};
 use clap::Args;
@@ -237,6 +237,14 @@ async fn run_inner(
             active_terms,
         }
     };
+    let context_cfg = snapshot_context_run_config(snapshot);
+    let context_registry: Option<Arc<ContextRegistry>> = if context_cfg.enabled() {
+        let registry = Arc::new(ContextRegistry::new(&segments));
+        rehydrate_context_registry_from_store(&registry, &segments, &store, &job.id)?;
+        Some(registry)
+    } else {
+        None
+    };
     let run_config = TranslationRunConfig {
         source_language: snapshot.source_language.clone(),
         target_language: snapshot.target_language.clone(),
@@ -251,6 +259,8 @@ async fn run_inner(
         batch_max_output_tokens: settings.provider.batch_max_output_tokens,
         compact_prompts: settings.compact_prompts,
         glossary: glossary.run_config.clone(),
+        context: context_cfg,
+        context_registry: context_registry.clone(),
     };
 
     let cache_namespace = if legacy_cache_namespace {
@@ -651,7 +661,40 @@ fn batch_run_config(
         batch_max_output_tokens: settings.provider.batch_max_output_tokens,
         compact_prompts: settings.compact_prompts,
         glossary: run_config.glossary.clone(),
+        context: run_config.context,
+        context_registry: run_config.context_registry.clone(),
     }
+}
+
+fn snapshot_context_run_config(snapshot: &RunConfigSnapshot) -> ContextRunConfig {
+    ContextRunConfig {
+        window: snapshot.context_window,
+        budget_tokens: snapshot.context_budget_tokens,
+        scope: snapshot.context_scope,
+    }
+}
+
+fn rehydrate_context_registry_from_store(
+    registry: &Arc<ContextRegistry>,
+    segments: &[Segment],
+    store: &JobStore,
+    job_id: &str,
+) -> Result<()> {
+    let stored = store.load_terminal_segment_translations(job_id)?;
+    let by_id: std::collections::HashMap<&str, &Segment> =
+        segments.iter().map(|s| (s.id.0.as_str(), s)).collect();
+    for record in &stored {
+        let Some(segment) = by_id.get(record.segment_id.as_str()) else {
+            continue;
+        };
+        let status = match record.status.as_str() {
+            "succeeded" | "skipped_cached" => SegmentStatus::Succeeded,
+            "needs_review" => SegmentStatus::NeedsReview,
+            _ => SegmentStatus::Failed,
+        };
+        registry.pre_populate_text(segment, record.translated_text.clone(), status);
+    }
+    Ok(())
 }
 
 fn mark_job_from_summary(store: &JobStore, job_id: &str) -> Result<()> {
@@ -1184,6 +1227,9 @@ mod tests {
             prompt_extra: None,
             glossary_fingerprint,
             glossary_terms: Vec::new(),
+            context_window: 0,
+            context_budget_tokens: 1200,
+            context_scope: bookforge_core::config::ContextScope::Chapter,
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
         store

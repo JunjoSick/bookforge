@@ -534,6 +534,26 @@ pub enum JsonMode {
     PromptOnly,
 }
 
+/// Whether sliding-context injection considers all prior segments or only
+/// those in the same chapter. Chapter scope keeps concurrency high; book
+/// scope serializes across the whole document.
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ContextScope {
+    #[default]
+    Chapter,
+    Book,
+}
+
+impl ContextScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContextScope::Chapter => "chapter",
+            ContextScope::Book => "book",
+        }
+    }
+}
+
 pub fn cap_output_tokens(
     computed: u32,
     estimated_prompt_tokens: usize,

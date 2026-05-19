@@ -68,6 +68,9 @@ pub(crate) fn persist_snapshot(
         prompt_extra: cli_args.prompt_extra.clone(),
         glossary_fingerprint: glossary_fingerprint.to_string(),
         glossary_terms: glossary_terms.to_vec(),
+        context_window: cli_args.context_window,
+        context_budget_tokens: cli_args.context_budget_tokens,
+        context_scope: cli_args.context_scope,
         settings: ResolvedRunSettingsSnapshot::from_settings(settings),
     };
     store.update_job_config_snapshot(&job.id, &snapshot)?;

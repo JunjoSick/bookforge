@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crate::{
     BatchConfig, DoubleCheckConfig, JsonMode, ProviderPreset, ProviderRuntimeConfig, QaRunConfig,
     ResolvedRunSettings, RetryAfterPolicy, SchedulerConfig, SegmentationConfig, TranslationProfile,
+    config::ContextScope,
     glossary::{GlossaryFormat, GlossaryTerm},
 };
 
@@ -41,7 +42,17 @@ pub struct RunConfigSnapshot {
     pub glossary_fingerprint: String,
     #[serde(default)]
     pub glossary_terms: Vec<GlossaryTerm>,
+    #[serde(default)]
+    pub context_window: usize,
+    #[serde(default = "default_context_budget_tokens")]
+    pub context_budget_tokens: usize,
+    #[serde(default)]
+    pub context_scope: ContextScope,
     pub settings: ResolvedRunSettingsSnapshot,
+}
+
+fn default_context_budget_tokens() -> usize {
+    1200
 }
 
 fn default_glossary_budget_tokens() -> usize {

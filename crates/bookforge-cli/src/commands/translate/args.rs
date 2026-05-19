@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use bookforge_core::{
     GlossaryFormat, JsonMode, ProviderPreset,
-    config::{DoubleCheckMode, FallbackScope, TranslationProfile},
+    config::{ContextScope, DoubleCheckMode, FallbackScope, TranslationProfile},
 };
 use clap::Args;
 
@@ -77,6 +77,22 @@ pub struct TranslateArgs {
 
     #[arg(long)]
     pub prompt_extra: Option<String>,
+
+    /// Sliding context window: how many prior segments' source/target pairs
+    /// to inject into each prompt. `0` disables; default `3` enables.
+    #[arg(long, default_value_t = 3)]
+    pub context_window: usize,
+
+    /// Hard token cap on the sliding-context block; oldest pairs are
+    /// dropped first when the budget is exceeded.
+    #[arg(long, default_value_t = 1200)]
+    pub context_budget_tokens: usize,
+
+    /// Scope of the sliding context. `chapter` (default) limits context to
+    /// the same chapter; `book` walks the entire book and materially
+    /// reduces cross-chapter concurrency.
+    #[arg(long, value_enum, default_value_t = ContextScope::Chapter)]
+    pub context_scope: ContextScope,
 
     #[arg(long, value_enum, default_value_t = QaMode::Off)]
     pub qa: QaMode,
