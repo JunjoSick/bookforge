@@ -45,6 +45,17 @@ pub struct TranslationRunConfig {
     /// scheduler runs without context injection even if `context.window`
     /// is non-zero (degrades silently with a `tracing::warn!`).
     pub context_registry: Option<Arc<ContextRegistry>>,
+    /// Merged style sheet pre-rendered as a prompt block. The scheduler
+    /// substitutes `rendered_block` into the `{{style_guide_block}}`
+    /// placeholder in per-segment and batch prompts. `None` = no style
+    /// sheet active; renders to empty string.
+    pub style: Option<StyleRunConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyleRunConfig {
+    pub rendered_block: String,
+    pub fingerprint: String,
 }
 
 /// Sliding-context injection settings. `window == 0` disables the feature
@@ -626,6 +637,14 @@ fn render_qa_prompt(
     )
     .json("glossary_json", &Value::Array(Vec::new()))
     .raw("glossary_block_prose", "")
+    .raw(
+        "style_guide_block",
+        config
+            .style
+            .as_ref()
+            .map(|s| s.rendered_block.clone())
+            .unwrap_or_default(),
+    )
     .raw("prompt_extra", "")
     .raw("source_text", &segment.source.text)
     .raw("translation_text", translation.joined_text());
@@ -929,6 +948,14 @@ fn render_prompt(
     .json("glossary_json", &glossary_json)
     .raw("glossary_block_prose", glossary_prose)
     .raw("context_translation_pairs", context_block)
+    .raw(
+        "style_guide_block",
+        config
+            .style
+            .as_ref()
+            .map(|s| s.rendered_block.clone())
+            .unwrap_or_default(),
+    )
     .raw(
         "prompt_extra",
         config.glossary.prompt_extra.clone().unwrap_or_default(),
@@ -1864,6 +1891,7 @@ mod tests {
             glossary: GlossaryRunConfig::default(),
             context: ContextRunConfig::default(),
             context_registry: None,
+            style: None,
         }
     }
 

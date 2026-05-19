@@ -1977,6 +1977,14 @@ async fn translate_one_batch(
     )
     .string("target_language", &config.target_language)
     .raw(
+        "style_guide_block",
+        config
+            .style
+            .as_ref()
+            .map(|s| s.rendered_block.clone())
+            .unwrap_or_default(),
+    )
+    .raw(
         "prompt_extra",
         config.glossary.prompt_extra.clone().unwrap_or_default(),
     )
@@ -2725,6 +2733,7 @@ mod tests {
             glossary: crate::GlossaryRunConfig::default(),
             context: crate::ContextRunConfig::default(),
             context_registry: None,
+            style: None,
         }
     }
 

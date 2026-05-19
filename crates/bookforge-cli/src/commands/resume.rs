@@ -261,6 +261,7 @@ async fn run_inner(
         glossary: glossary.run_config.clone(),
         context: context_cfg,
         context_registry: context_registry.clone(),
+        style: style_run_config_from_snapshot(snapshot),
     };
 
     let cache_namespace = if legacy_cache_namespace {
@@ -663,6 +664,7 @@ fn batch_run_config(
         glossary: run_config.glossary.clone(),
         context: run_config.context,
         context_registry: run_config.context_registry.clone(),
+        style: run_config.style.clone(),
     }
 }
 
