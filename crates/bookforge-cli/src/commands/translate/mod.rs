@@ -439,6 +439,11 @@ async fn run_mock_translation(
         settings.batch.enabled,
         prompt_version,
         &glossary.fingerprint,
+        if style.run_config.is_some() {
+            &style.fingerprint
+        } else {
+            ""
+        },
     );
     persist_snapshot(
         &store,
@@ -716,6 +721,11 @@ async fn run_openai_compatible_translation(
         settings.batch.enabled,
         run_prompt_version,
         &glossary.fingerprint,
+        if style.run_config.is_some() {
+            &style.fingerprint
+        } else {
+            ""
+        },
     );
     persist_snapshot(
         &store,
@@ -2146,6 +2156,7 @@ case_sensitive = true
             context_window: 0,
             context_budget_tokens: 1200,
             context_scope: bookforge_core::config::ContextScope::Chapter,
+            style: Vec::new(),
             qa: QaMode::Off,
             qa_concurrency: 8,
             qa_batch_target_tokens: None,

@@ -230,6 +230,8 @@ mod tests {
             context_window: 0,
             context_budget_tokens: 1200,
             context_scope: bookforge_core::config::ContextScope::Chapter,
+            style_fingerprint: String::new(),
+            style_rendered_block: String::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         }
     }

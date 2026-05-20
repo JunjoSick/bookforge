@@ -17,7 +17,8 @@ use bookforge_core::{
 use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::{
     ContextRegistry, ContextRunConfig, GlossaryRunConfig, MockProvider, OpenAiCompatibleConfig,
-    OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation, TranslationRunConfig,
+    OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation, StyleRunConfig,
+    TranslationRunConfig,
 };
 use bookforge_store::{JobRecord, JobStore, StoredBlockTranslation};
 use clap::Args;
@@ -280,6 +281,11 @@ async fn run_inner(
             settings.batch.enabled,
             prompt_version,
             &glossary.fingerprint,
+            if snapshot.style_rendered_block.is_empty() {
+                ""
+            } else {
+                snapshot.style_fingerprint.as_str()
+            },
         )
     };
     if cache_namespace != snapshot.cache_namespace {
@@ -673,6 +679,17 @@ fn snapshot_context_run_config(snapshot: &RunConfigSnapshot) -> ContextRunConfig
         window: snapshot.context_window,
         budget_tokens: snapshot.context_budget_tokens,
         scope: snapshot.context_scope,
+    }
+}
+
+fn style_run_config_from_snapshot(snapshot: &RunConfigSnapshot) -> Option<StyleRunConfig> {
+    if snapshot.style_rendered_block.is_empty() {
+        None
+    } else {
+        Some(StyleRunConfig {
+            rendered_block: snapshot.style_rendered_block.clone(),
+            fingerprint: snapshot.style_fingerprint.clone(),
+        })
     }
 }
 
@@ -1193,6 +1210,7 @@ mod tests {
             settings.batch.enabled,
             prompt_version,
             &glossary_fingerprint,
+            "",
         );
         store
             .insert_segments(
@@ -1232,6 +1250,8 @@ mod tests {
             context_window: 0,
             context_budget_tokens: 1200,
             context_scope: bookforge_core::config::ContextScope::Chapter,
+            style_fingerprint: String::new(),
+            style_rendered_block: String::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
         store

@@ -184,8 +184,11 @@ fn import_style(store: &JobStore, args: ImportArgs) -> Result<()> {
 }
 
 fn list_styles(store: &JobStore, args: ListArgs) -> Result<()> {
-    let stored =
-        store.list_style_sheets(args.language.as_deref(), args.scope, args.scope_id.as_deref())?;
+    let stored = store.list_style_sheets(
+        args.language.as_deref(),
+        args.scope,
+        args.scope_id.as_deref(),
+    )?;
     if stored.is_empty() {
         println!("No style sheets matched.");
         return Ok(());
@@ -214,7 +217,11 @@ fn export_style(store: &JobStore, args: ExportArgs) -> Result<()> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("no style sheet matched the export filters"))?;
     fs::write(&args.file, record.content_toml)?;
-    println!("Exported style sheet id={} to {}", record.id, args.file.display());
+    println!(
+        "Exported style sheet id={} to {}",
+        record.id,
+        args.file.display()
+    );
     Ok(())
 }
 
@@ -238,7 +245,10 @@ fn show_style(store: &JobStore, args: ShowArgs) -> Result<()> {
     for record in &records {
         match parse_style_toml(&record.content_toml) {
             Ok(s) => sheets.push(s),
-            Err(err) => eprintln!("warn: skipping malformed style sheet id={}: {err}", record.id),
+            Err(err) => eprintln!(
+                "warn: skipping malformed style sheet id={}: {err}",
+                record.id
+            ),
         }
     }
     let merged = merge_style_sheets(&sheets);

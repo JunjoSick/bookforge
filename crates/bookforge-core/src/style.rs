@@ -95,8 +95,7 @@ pub fn merge_style_sheets(sheets: &[StyleSheet]) -> Option<StyleSheet> {
         do_not: DoNotFields::default(),
     };
     let mut instructions: Vec<String> = Vec::new();
-    let mut translate_seen: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut translate_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut punct_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for sheet in ordered {
@@ -322,8 +321,18 @@ mod tests {
         book.do_not.translate_terms = vec!["mithril".to_string(), "lembas".to_string()];
         let merged = merge_style_sheets(&[global, book]).expect("merged");
         assert_eq!(merged.do_not.translate_terms.len(), 2);
-        assert!(merged.do_not.translate_terms.contains(&"mithril".to_string()));
-        assert!(merged.do_not.translate_terms.contains(&"lembas".to_string()));
+        assert!(
+            merged
+                .do_not
+                .translate_terms
+                .contains(&"mithril".to_string())
+        );
+        assert!(
+            merged
+                .do_not
+                .translate_terms
+                .contains(&"lembas".to_string())
+        );
     }
 
     #[test]
