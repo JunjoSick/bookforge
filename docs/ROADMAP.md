@@ -96,8 +96,8 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v1.0.1 | Snapshot patch | 0.5–1 day | none (silent patch) | shipped |
 | v1.1 | Review loop | 5–8 days | minimal (README rewrite, GitHub topics, crates.io publish) | shipped |
 | v1.2 | Glossary, manual | 8–12 days | none (development quiet) | shipped |
-| v1.2.x | Glossary, auto-extraction | 4–6 days | none | planned |
-| v1.3 | Context + style | 8–12 days | none (explicit "no promotion" rule) | planned |
+| v1.2.x | Glossary, auto-extraction | 4–6 days | none | shipped |
+| v1.3 | Context + style | 8–12 days | none (explicit "no promotion" rule) | shipped |
 | v1.4 | Distribution + writeup | 5–7 days | one technical post, two or three venues; cargo-dist binaries land here | planned |
 | v1.5 | Structural credibility | 10–14 days | README final rewrite citing corpus | planned |
 | v1.6 | Bilingual output | 5–8 days | passive (release notes only) | planned |

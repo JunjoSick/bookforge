@@ -260,6 +260,130 @@ role = "object"
 }
 
 #[test]
+fn cli_translate_with_full_v1_3_stack_persists_all_three_blocks() {
+    // Acceptance §6.9: a single translate run with --context-window,
+    // --style, and --entities together must capture all three blocks in
+    // the persisted snapshot. This is the gate that proves the three
+    // PRs interoperate end-to-end (PR1 sliding context + PR2 style +
+    // PR3 entities + PR4 plumbing).
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let style_path = temp.path().join("style.toml");
+    fs::write(
+        &style_path,
+        r#"[meta]
+schema_version = 1
+target_language = "Italian"
+
+[meta.scope]
+kind = "book"
+id = "fellowship"
+
+[register]
+narration = "literary"
+dialogue_default = "tu"
+
+[free_text]
+instructions = "Preserve em-dashes and ellipses."
+"#,
+    )
+    .expect("style sheet should write");
+
+    let entities_path = temp.path().join("entities.toml");
+    fs::write(
+        &entities_path,
+        r#"[meta]
+schema_version = 1
+source_language = "English"
+target_language = "Italian"
+
+[meta.scope]
+kind = "book"
+id = "fellowship"
+
+[[entity]]
+source_name = "Galadriel"
+target_name = "Galadriel"
+gender_target = "f"
+
+[[entity]]
+source_name = "the Ring"
+target_name = "l'Anello"
+gender_target = "m"
+"#,
+    )
+    .expect("entities file should write");
+
+    let output = temp.path().join("out.epub");
+    let events = temp.path().join("events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            fixture_input().to_str().unwrap(),
+            "--source",
+            "English",
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--profile",
+            "v1-fast",
+            "--book-id",
+            "fellowship",
+            "--context-window",
+            "3",
+            "--context-scope",
+            "chapter",
+            "--style",
+            style_path.to_str().unwrap(),
+            "--entities",
+            entities_path.to_str().unwrap(),
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let job_id = job_id_from_events(&events);
+    let store =
+        JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store should open");
+    let snapshot = store
+        .load_job_config_snapshot(&job_id)
+        .expect("snapshot load")
+        .expect("snapshot present");
+
+    // Sliding context: settings round-trip.
+    assert_eq!(snapshot.context_window, 3);
+    assert_eq!(
+        snapshot.context_scope,
+        bookforge_core::config::ContextScope::Chapter
+    );
+
+    // Style sheet: block + fingerprint present.
+    assert!(!snapshot.style_rendered_block.is_empty());
+    assert!(snapshot.style_rendered_block.contains("Register: literary"));
+    assert!(!snapshot.style_fingerprint.is_empty());
+
+    // Entity sheet: block + fingerprint present.
+    assert!(!snapshot.entities_rendered_block.is_empty());
+    assert!(
+        snapshot
+            .entities_rendered_block
+            .contains("l'Anello (the Ring): masculine")
+    );
+    assert!(!snapshot.entities_fingerprint.is_empty());
+
+    // Style and entity fingerprints are independent — domain-separator test.
+    assert_ne!(snapshot.style_fingerprint, snapshot.entities_fingerprint);
+}
+
+#[test]
 fn cli_entities_import_then_show_matches_input() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let entities_path = temp.path().join("entities.toml");
