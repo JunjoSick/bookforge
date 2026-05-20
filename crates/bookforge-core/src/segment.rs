@@ -18,10 +18,12 @@ pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 1;
 /// schema and segmentation parameters. Cached rows from a different
 /// namespace are not eligible for reuse.
 ///
-/// `style_fingerprint` is an opt-in mixin: pass an empty string to
-/// preserve cache compatibility with runs that didn't use style sheets;
-/// pass a non-empty fingerprint when a sheet is active and the rendered
-/// prompt is materially different.
+/// `style_fingerprint` and `entities_fingerprint` are opt-in mixins:
+/// pass an empty string to preserve cache compatibility with runs that
+/// didn't use the feature; pass a non-empty fingerprint when the
+/// rendered prompt actually changes. The two slots use distinct domain
+/// separators so a style fingerprint can never collide with an entity
+/// fingerprint of the same content.
 pub fn compute_cache_namespace(
     max_segment_tokens: usize,
     context_tokens: usize,
@@ -30,6 +32,7 @@ pub fn compute_cache_namespace(
     prompt_version: &str,
     glossary_fingerprint: &str,
     style_fingerprint: &str,
+    entities_fingerprint: &str,
 ) -> String {
     compute_cache_namespace_inner(
         CACHE_KEY_SCHEMA_VERSION,
@@ -43,6 +46,11 @@ pub fn compute_cache_namespace(
             None
         } else {
             Some(style_fingerprint)
+        },
+        if entities_fingerprint.is_empty() {
+            None
+        } else {
+            Some(entities_fingerprint)
         },
     )
 }
@@ -63,6 +71,7 @@ pub fn compute_cache_namespace_v1(
         prompt_version,
         None,
         None,
+        None,
     )
 }
 
@@ -75,6 +84,7 @@ fn compute_cache_namespace_inner(
     prompt_version: &str,
     glossary_fingerprint: Option<&str>,
     style_fingerprint: Option<&str>,
+    entities_fingerprint: Option<&str>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(cache_key_schema_version.to_le_bytes());
@@ -89,9 +99,12 @@ fn compute_cache_namespace_inner(
         hasher.update(glossary_fingerprint.as_bytes());
     }
     if let Some(style_fingerprint) = style_fingerprint {
-        // Domain separator so glossary and style fingerprints can never collide.
         hasher.update(b"|style|");
         hasher.update(style_fingerprint.as_bytes());
+    }
+    if let Some(entities_fingerprint) = entities_fingerprint {
+        hasher.update(b"|entities|");
+        hasher.update(entities_fingerprint.as_bytes());
     }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
@@ -469,12 +482,21 @@ mod tests {
 
     #[test]
     fn cache_namespace_changes_when_segmentation_settings_change() {
-        let a = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "");
-        let b = compute_cache_namespace(1201, 160, "Balanced", false, "v1", "glossary:a", "");
-        let c = compute_cache_namespace(1200, 160, "Balanced", true, "v1", "glossary:a", "");
-        let d = compute_cache_namespace(1200, 160, "Balanced", false, "batch_v1", "glossary:a", "");
-        let e = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "");
-        let f = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:b", "");
+        let a = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "", "");
+        let b = compute_cache_namespace(1201, 160, "Balanced", false, "v1", "glossary:a", "", "");
+        let c = compute_cache_namespace(1200, 160, "Balanced", true, "v1", "glossary:a", "", "");
+        let d = compute_cache_namespace(
+            1200,
+            160,
+            "Balanced",
+            false,
+            "batch_v1",
+            "glossary:a",
+            "",
+            "",
+        );
+        let e = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "", "");
+        let f = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:b", "", "");
 
         assert_ne!(a, b, "max_segment_tokens must affect namespace");
         assert_ne!(a, c, "batch_enabled must affect namespace");
@@ -486,9 +508,9 @@ mod tests {
     #[test]
     fn legacy_cache_namespace_v1_ignores_glossary_fingerprint() {
         let current_without_terms =
-            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "", "");
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "", "", "");
         let current_with_terms =
-            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "");
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "", "");
         let legacy = compute_cache_namespace_v1(1200, 160, "Balanced", false, "v1");
 
         assert_ne!(legacy, current_without_terms);
@@ -504,20 +526,36 @@ mod tests {
         // Users who don't use --style must see no cache invalidation when
         // they upgrade to a build that supports style sheets.
         let without_style =
-            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "");
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "", "");
         let still_without_style =
-            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "");
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "", "");
         assert_eq!(without_style, still_without_style);
     }
 
     #[test]
     fn cache_namespace_changes_when_style_fingerprint_changes() {
         let baseline =
-            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "");
-        let with_style =
-            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "style:a");
-        let with_other_style =
-            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "style:b");
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "", "");
+        let with_style = compute_cache_namespace(
+            1200,
+            160,
+            "Balanced",
+            false,
+            "v1",
+            "glossary:a",
+            "style:a",
+            "",
+        );
+        let with_other_style = compute_cache_namespace(
+            1200,
+            160,
+            "Balanced",
+            false,
+            "v1",
+            "glossary:a",
+            "style:b",
+            "",
+        );
 
         assert_ne!(
             baseline, with_style,
@@ -527,6 +565,51 @@ mod tests {
             with_style, with_other_style,
             "different style fingerprints must yield different namespaces"
         );
+    }
+
+    #[test]
+    fn cache_namespace_changes_when_entities_fingerprint_changes() {
+        let baseline =
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "", "");
+        let with_entities = compute_cache_namespace(
+            1200,
+            160,
+            "Balanced",
+            false,
+            "v1",
+            "glossary:a",
+            "",
+            "entities:a",
+        );
+        let with_other_entities = compute_cache_namespace(
+            1200,
+            160,
+            "Balanced",
+            false,
+            "v1",
+            "glossary:a",
+            "",
+            "entities:b",
+        );
+        assert_ne!(
+            baseline, with_entities,
+            "switching on entities must invalidate cache"
+        );
+        assert_ne!(
+            with_entities, with_other_entities,
+            "different entity fingerprints must yield different namespaces"
+        );
+    }
+
+    #[test]
+    fn style_and_entities_fingerprints_use_distinct_domain_separators() {
+        // The same hex string used as style vs. entities must not produce
+        // the same namespace — domain separators prevent the collision.
+        let as_style =
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "ab", "");
+        let as_entities =
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "", "ab");
+        assert_ne!(as_style, as_entities);
     }
 
     fn book_with_two_sections() -> Book {

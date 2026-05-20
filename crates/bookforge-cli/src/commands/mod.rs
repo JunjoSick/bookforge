@@ -1,4 +1,5 @@
 pub mod doctor;
+pub mod entity;
 pub mod estimate;
 pub mod glossary;
 pub mod ingest_flags;

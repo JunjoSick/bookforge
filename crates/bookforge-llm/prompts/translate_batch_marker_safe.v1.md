@@ -63,6 +63,12 @@ Active style guide (apply consistently to every item):
 {{style_guide_block}}
 ```
 
+Entity grammatical agreement (use for adjective/article concord across all items):
+
+```txt
+{{entity_agreement_block}}
+```
+
 Additional instructions:
 
 ```txt

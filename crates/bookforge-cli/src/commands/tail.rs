@@ -232,6 +232,8 @@ mod tests {
             context_scope: bookforge_core::config::ContextScope::Chapter,
             style_fingerprint: String::new(),
             style_rendered_block: String::new(),
+            entities_fingerprint: String::new(),
+            entities_rendered_block: String::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         }
     }

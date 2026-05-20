@@ -50,10 +50,20 @@ pub struct TranslationRunConfig {
     /// placeholder in per-segment and batch prompts. `None` = no style
     /// sheet active; renders to empty string.
     pub style: Option<StyleRunConfig>,
+    /// Merged entity table pre-rendered as a prompt block. The scheduler
+    /// substitutes `rendered_block` into the `{{entity_agreement_block}}`
+    /// placeholder. `None` = no entities active; renders to empty string.
+    pub entities: Option<EntityRunConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyleRunConfig {
+    pub rendered_block: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityRunConfig {
     pub rendered_block: String,
     pub fingerprint: String,
 }
@@ -645,6 +655,14 @@ fn render_qa_prompt(
             .map(|s| s.rendered_block.clone())
             .unwrap_or_default(),
     )
+    .raw(
+        "entity_agreement_block",
+        config
+            .entities
+            .as_ref()
+            .map(|e| e.rendered_block.clone())
+            .unwrap_or_default(),
+    )
     .raw("prompt_extra", "")
     .raw("source_text", &segment.source.text)
     .raw("translation_text", translation.joined_text());
@@ -954,6 +972,14 @@ fn render_prompt(
             .style
             .as_ref()
             .map(|s| s.rendered_block.clone())
+            .unwrap_or_default(),
+    )
+    .raw(
+        "entity_agreement_block",
+        config
+            .entities
+            .as_ref()
+            .map(|e| e.rendered_block.clone())
             .unwrap_or_default(),
     )
     .raw(
@@ -1892,6 +1918,7 @@ mod tests {
             context: ContextRunConfig::default(),
             context_registry: None,
             style: None,
+            entities: None,
         }
     }
 

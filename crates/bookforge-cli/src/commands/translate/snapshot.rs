@@ -35,6 +35,8 @@ pub(crate) fn persist_snapshot(
     glossary_terms: &[GlossaryTerm],
     style_fingerprint: &str,
     style_rendered_block: &str,
+    entities_fingerprint: &str,
+    entities_rendered_block: &str,
     model: &str,
     base_url: Option<String>,
     api_key_env: Option<String>,
@@ -75,6 +77,8 @@ pub(crate) fn persist_snapshot(
         context_scope: cli_args.context_scope,
         style_fingerprint: style_fingerprint.to_string(),
         style_rendered_block: style_rendered_block.to_string(),
+        entities_fingerprint: entities_fingerprint.to_string(),
+        entities_rendered_block: entities_rendered_block.to_string(),
         settings: ResolvedRunSettingsSnapshot::from_settings(settings),
     };
     store.update_job_config_snapshot(&job.id, &snapshot)?;

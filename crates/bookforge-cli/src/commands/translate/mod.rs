@@ -13,12 +13,13 @@ use bookforge_epub::read_epub;
 #[cfg(test)]
 use bookforge_llm::translate_segments;
 use bookforge_llm::{
-    AdaptiveLimiter, ContextRegistry, ContextRunConfig, GlossaryRunConfig, LlmError, LlmProvider,
-    MockMode, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
-    ProviderRateController, QaSegmentReview, RateControllerConfig, SegmentTranslation,
-    StyleRunConfig, TelemetryLog, TranslationRunConfig, account_for_batch_prompt_overhead,
-    build_translation_batches, qa_segments_parallel, run_double_check, telemetry_summary,
-    translate_batches_with_callback, translate_segments_with_callback,
+    AdaptiveLimiter, ContextRegistry, ContextRunConfig, EntityRunConfig, GlossaryRunConfig,
+    LlmError, LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig,
+    OpenAiCompatibleProvider, ProviderRateController, QaSegmentReview, RateControllerConfig,
+    SegmentTranslation, StyleRunConfig, TelemetryLog, TranslationRunConfig,
+    account_for_batch_prompt_overhead, build_translation_batches, qa_segments_parallel,
+    run_double_check, telemetry_summary, translate_batches_with_callback,
+    translate_segments_with_callback,
 };
 use bookforge_store::{CreateJob, JobRecord, JobStore};
 use clap::Args;
@@ -167,6 +168,74 @@ pub(crate) struct PreparedStyle {
     pub run_config: Option<StyleRunConfig>,
     pub fingerprint: String,
     pub rendered_block: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedEntities {
+    pub run_config: Option<EntityRunConfig>,
+    pub fingerprint: String,
+    pub rendered_block: String,
+}
+
+/// Import `--entities` files into the store, then load all entities
+/// applicable to the current (source_language, target_language, book_id,
+/// series_id) scope and produce both the runtime injection bundle and
+/// the snapshot-capture fields.
+pub(crate) fn prepare_entities_run_config(
+    store: &JobStore,
+    entity_files: &[PathBuf],
+    source_language: Option<&str>,
+    target_language: &str,
+    book_id: Option<&str>,
+    series_id: Option<&str>,
+) -> Result<PreparedEntities> {
+    for path in entity_files {
+        let entities = crate::commands::entity::read_entities_file(path)?;
+        crate::commands::entity::upsert_entities(store, &entities)?;
+    }
+    // Without a source language we can't load entities (they're keyed on
+    // both languages). The run still needs a stable fingerprint.
+    let Some(source_language) = source_language else {
+        let fp = bookforge_core::entity::entities_fingerprint(&[]);
+        return Ok(PreparedEntities {
+            run_config: None,
+            fingerprint: fp,
+            rendered_block: String::new(),
+        });
+    };
+    let stored =
+        store.load_active_entities(source_language, target_language, book_id, series_id)?;
+    let active: Vec<bookforge_core::entity::Entity> = stored
+        .into_iter()
+        .map(|r| bookforge_core::entity::Entity {
+            id: Some(r.id),
+            scope_kind: r.scope_kind,
+            scope_id: r.scope_id,
+            source_name: r.source_name,
+            target_name: r.target_name,
+            gender_target: r.gender_target,
+            role: r.role,
+            notes: r.notes,
+            source_language: r.source_language,
+            target_language: r.target_language,
+        })
+        .collect();
+    let merged = bookforge_core::entity::merge_scope_entities(&active);
+    let rendered_block = bookforge_core::entity::render_entity_agreement_block(&merged);
+    let fingerprint = bookforge_core::entity::entities_fingerprint(&merged);
+    let run_config = if rendered_block.is_empty() {
+        None
+    } else {
+        Some(EntityRunConfig {
+            rendered_block: rendered_block.clone(),
+            fingerprint: fingerprint.clone(),
+        })
+    };
+    Ok(PreparedEntities {
+        run_config,
+        fingerprint,
+        rendered_block,
+    })
 }
 
 /// Load `--style` files into the store, merge all sheets for the active
@@ -411,6 +480,14 @@ async fn run_mock_translation(
         cli_args.book_id.as_deref(),
         cli_args.series_id.as_deref(),
     )?;
+    let entities = prepare_entities_run_config(
+        &store,
+        &cli_args.entities,
+        config.source_language.as_deref(),
+        &config.target_language,
+        cli_args.book_id.as_deref(),
+        cli_args.series_id.as_deref(),
+    )?;
     let job = store.create_job(CreateJob {
         input,
         output: &config.output,
@@ -444,6 +521,11 @@ async fn run_mock_translation(
         } else {
             ""
         },
+        if entities.run_config.is_some() {
+            &entities.fingerprint
+        } else {
+            ""
+        },
     );
     persist_snapshot(
         &store,
@@ -459,6 +541,8 @@ async fn run_mock_translation(
         &glossary.active_terms,
         &style.fingerprint,
         &style.rendered_block,
+        &entities.fingerprint,
+        &entities.rendered_block,
         &model,
         None,
         None,
@@ -488,6 +572,7 @@ async fn run_mock_translation(
         context: context_run_config,
         context_registry: context_registry.clone(),
         style: style.run_config.clone(),
+        entities: entities.run_config.clone(),
     }; // mock
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     let mut translations = apply_cached_translations(
@@ -693,6 +778,14 @@ async fn run_openai_compatible_translation(
         cli_args.book_id.as_deref(),
         cli_args.series_id.as_deref(),
     )?;
+    let entities = prepare_entities_run_config(
+        &store,
+        &cli_args.entities,
+        config.source_language.as_deref(),
+        &config.target_language,
+        cli_args.book_id.as_deref(),
+        cli_args.series_id.as_deref(),
+    )?;
     let job = store.create_job(CreateJob {
         input,
         output: &config.output,
@@ -726,6 +819,11 @@ async fn run_openai_compatible_translation(
         } else {
             ""
         },
+        if entities.run_config.is_some() {
+            &entities.fingerprint
+        } else {
+            ""
+        },
     );
     persist_snapshot(
         &store,
@@ -741,6 +839,8 @@ async fn run_openai_compatible_translation(
         &glossary.active_terms,
         &style.fingerprint,
         &style.rendered_block,
+        &entities.fingerprint,
+        &entities.rendered_block,
         &model,
         Some(provider_config.base_url.clone()),
         Some(provider_config.api_key_env.clone()),
@@ -770,6 +870,7 @@ async fn run_openai_compatible_translation(
         context: context_run_config,
         context_registry: context_registry.clone(),
         style: style.run_config.clone(),
+        entities: entities.run_config.clone(),
     };
     // batch_run_config
 
@@ -794,6 +895,7 @@ async fn run_openai_compatible_translation(
             context: run_config.context,
             context_registry: run_config.context_registry.clone(),
             style: run_config.style.clone(),
+            entities: run_config.entities.clone(),
         };
         let mut translations = apply_cached_translations(
             &segments,
@@ -1301,6 +1403,7 @@ async fn run_fallback_pass(
         context: primary_run_config.context,
         context_registry: primary_run_config.context_registry.clone(),
         style: primary_run_config.style.clone(),
+        entities: primary_run_config.entities.clone(),
     }; // fallback_run_config
 
     let writer = CheckpointWriter::spawn(store.path().to_path_buf(), Arc::new(NullProgressSink));
@@ -1858,6 +1961,7 @@ mod tests {
             context: ContextRunConfig::default(),
             context_registry: None,
             style: None,
+            entities: None,
         };
 
         let error = translate_with_scheduler_guard(
@@ -2157,6 +2261,7 @@ case_sensitive = true
             context_budget_tokens: 1200,
             context_scope: bookforge_core::config::ContextScope::Chapter,
             style: Vec::new(),
+            entities: Vec::new(),
             qa: QaMode::Off,
             qa_concurrency: 8,
             qa_batch_target_tokens: None,

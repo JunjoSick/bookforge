@@ -57,6 +57,14 @@ pub struct RunConfigSnapshot {
     /// have moved or been edited.
     #[serde(default)]
     pub style_rendered_block: String,
+    /// SHA-256 of the merged entity set. Same opt-in stance as
+    /// `style_fingerprint`: empty rendered block means the cache
+    /// namespace ignores this field.
+    #[serde(default)]
+    pub entities_fingerprint: String,
+    /// Pre-rendered entity grammatical-agreement block.
+    #[serde(default)]
+    pub entities_rendered_block: String,
     pub settings: ResolvedRunSettingsSnapshot,
 }
 
