@@ -69,6 +69,12 @@ Entity grammatical agreement (use for adjective/article concord across all items
 {{entity_agreement_block}}
 ```
 
+Already-translated prior segments from the same chapter (use for pronoun, gender, and voice consistency only — do not retranslate):
+
+```txt
+{{context_translation_pairs}}
+```
+
 Additional instructions:
 
 ```txt
