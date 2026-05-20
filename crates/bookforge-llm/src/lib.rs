@@ -30,7 +30,7 @@ pub use rate_controller::{
 };
 pub use scheduler::{
     CompletedContext, ContextRegistry, ContextRunConfig, GlossaryRunConfig, QaIssue,
-    QaSegmentReview, SegmentTranslation, TranslationRunConfig, qa_segments, translate_segments,
-    translate_segments_with_callback,
+    QaSegmentReview, SegmentTranslation, StyleRunConfig, TranslationRunConfig, qa_segments,
+    translate_segments, translate_segments_with_callback,
 };
 pub use telemetry::{TelemetryLog, telemetry_summary};

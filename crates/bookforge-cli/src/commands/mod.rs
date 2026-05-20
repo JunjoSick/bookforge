@@ -7,6 +7,7 @@ pub mod resume;
 pub mod retry;
 pub mod review;
 pub mod status;
+pub mod style;
 pub mod tail;
 pub mod translate;
 pub mod validate;

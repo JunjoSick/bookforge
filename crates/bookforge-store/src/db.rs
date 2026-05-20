@@ -1433,19 +1433,16 @@ impl JobStore {
              ORDER BY scope_kind, scope_id",
         )?;
         let scope_text = scope_kind.map(|s| s.as_str().to_string());
-        let rows = stmt.query_map(
-            params![target_language, scope_text, scope_id],
-            |row| {
-                Ok(StoredStyleSheet {
-                    id: row.get(0)?,
-                    scope_kind: parse_row_enum(&row.get::<_, String>(1)?, 1)?,
-                    scope_id: row.get(2)?,
-                    target_language: row.get(3)?,
-                    content_toml: row.get(4)?,
-                    fingerprint: row.get(5)?,
-                })
-            },
-        )?;
+        let rows = stmt.query_map(params![target_language, scope_text, scope_id], |row| {
+            Ok(StoredStyleSheet {
+                id: row.get(0)?,
+                scope_kind: parse_row_enum(&row.get::<_, String>(1)?, 1)?,
+                scope_id: row.get(2)?,
+                target_language: row.get(3)?,
+                content_toml: row.get(4)?,
+                fingerprint: row.get(5)?,
+            })
+        })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -2499,6 +2496,8 @@ mod tests {
             context_window: 0,
             context_budget_tokens: 1200,
             context_scope: bookforge_core::config::ContextScope::Chapter,
+            style_fingerprint: String::new(),
+            style_rendered_block: String::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
 
@@ -2583,6 +2582,8 @@ mod tests {
             context_window: 0,
             context_budget_tokens: 1200,
             context_scope: bookforge_core::config::ContextScope::Chapter,
+            style_fingerprint: String::new(),
+            style_rendered_block: String::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
 

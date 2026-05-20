@@ -17,6 +17,11 @@ pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 1;
 /// Compute a cache namespace that scopes lookups to a single set of
 /// schema and segmentation parameters. Cached rows from a different
 /// namespace are not eligible for reuse.
+///
+/// `style_fingerprint` is an opt-in mixin: pass an empty string to
+/// preserve cache compatibility with runs that didn't use style sheets;
+/// pass a non-empty fingerprint when a sheet is active and the rendered
+/// prompt is materially different.
 pub fn compute_cache_namespace(
     max_segment_tokens: usize,
     context_tokens: usize,
@@ -24,6 +29,7 @@ pub fn compute_cache_namespace(
     batch_enabled: bool,
     prompt_version: &str,
     glossary_fingerprint: &str,
+    style_fingerprint: &str,
 ) -> String {
     compute_cache_namespace_inner(
         CACHE_KEY_SCHEMA_VERSION,
@@ -33,6 +39,11 @@ pub fn compute_cache_namespace(
         batch_enabled,
         prompt_version,
         Some(glossary_fingerprint),
+        if style_fingerprint.is_empty() {
+            None
+        } else {
+            Some(style_fingerprint)
+        },
     )
 }
 
@@ -51,6 +62,7 @@ pub fn compute_cache_namespace_v1(
         batch_enabled,
         prompt_version,
         None,
+        None,
     )
 }
 
@@ -62,6 +74,7 @@ fn compute_cache_namespace_inner(
     batch_enabled: bool,
     prompt_version: &str,
     glossary_fingerprint: Option<&str>,
+    style_fingerprint: Option<&str>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(cache_key_schema_version.to_le_bytes());
@@ -74,6 +87,11 @@ fn compute_cache_namespace_inner(
     hasher.update(prompt_version.as_bytes());
     if let Some(glossary_fingerprint) = glossary_fingerprint {
         hasher.update(glossary_fingerprint.as_bytes());
+    }
+    if let Some(style_fingerprint) = style_fingerprint {
+        // Domain separator so glossary and style fingerprints can never collide.
+        hasher.update(b"|style|");
+        hasher.update(style_fingerprint.as_bytes());
     }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
@@ -451,12 +469,12 @@ mod tests {
 
     #[test]
     fn cache_namespace_changes_when_segmentation_settings_change() {
-        let a = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a");
-        let b = compute_cache_namespace(1201, 160, "Balanced", false, "v1", "glossary:a");
-        let c = compute_cache_namespace(1200, 160, "Balanced", true, "v1", "glossary:a");
-        let d = compute_cache_namespace(1200, 160, "Balanced", false, "batch_v1", "glossary:a");
-        let e = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a");
-        let f = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:b");
+        let a = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "");
+        let b = compute_cache_namespace(1201, 160, "Balanced", false, "v1", "glossary:a", "");
+        let c = compute_cache_namespace(1200, 160, "Balanced", true, "v1", "glossary:a", "");
+        let d = compute_cache_namespace(1200, 160, "Balanced", false, "batch_v1", "glossary:a", "");
+        let e = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "");
+        let f = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:b", "");
 
         assert_ne!(a, b, "max_segment_tokens must affect namespace");
         assert_ne!(a, c, "batch_enabled must affect namespace");
@@ -467,9 +485,10 @@ mod tests {
 
     #[test]
     fn legacy_cache_namespace_v1_ignores_glossary_fingerprint() {
-        let current_without_terms = compute_cache_namespace(1200, 160, "Balanced", false, "v1", "");
+        let current_without_terms =
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "", "");
         let current_with_terms =
-            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a");
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "");
         let legacy = compute_cache_namespace_v1(1200, 160, "Balanced", false, "v1");
 
         assert_ne!(legacy, current_without_terms);
@@ -477,6 +496,36 @@ mod tests {
         assert_eq!(
             legacy,
             compute_cache_namespace_v1(1200, 160, "Balanced", false, "v1")
+        );
+    }
+
+    #[test]
+    fn cache_namespace_is_stable_when_style_fingerprint_is_empty() {
+        // Users who don't use --style must see no cache invalidation when
+        // they upgrade to a build that supports style sheets.
+        let without_style =
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "");
+        let still_without_style =
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "");
+        assert_eq!(without_style, still_without_style);
+    }
+
+    #[test]
+    fn cache_namespace_changes_when_style_fingerprint_changes() {
+        let baseline =
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "");
+        let with_style =
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "style:a");
+        let with_other_style =
+            compute_cache_namespace(1200, 160, "Balanced", false, "v1", "glossary:a", "style:b");
+
+        assert_ne!(
+            baseline, with_style,
+            "switching on a style sheet must invalidate cache"
+        );
+        assert_ne!(
+            with_style, with_other_style,
+            "different style fingerprints must yield different namespaces"
         );
     }
 
