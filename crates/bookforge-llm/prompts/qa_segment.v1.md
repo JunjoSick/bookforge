@@ -72,6 +72,12 @@ Active style guide (review for adherence to register and dialogue conventions):
 {{style_guide_block}}
 ```
 
+Entity grammatical agreement (flag any disagreement on adjective/article concord):
+
+```txt
+{{entity_agreement_block}}
+```
+
 Source:
 
 ```txt

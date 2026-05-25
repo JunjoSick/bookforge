@@ -16,9 +16,9 @@ use bookforge_core::{
 };
 use bookforge_epub::{read_epub, rebuild_epub};
 use bookforge_llm::{
-    ContextRegistry, ContextRunConfig, GlossaryRunConfig, MockProvider, OpenAiCompatibleConfig,
-    OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation, StyleRunConfig,
-    TranslationRunConfig,
+    ContextRegistry, ContextRunConfig, EntityRunConfig, GlossaryRunConfig, MockProvider,
+    OpenAiCompatibleConfig, OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation,
+    StyleRunConfig, TranslationRunConfig,
 };
 use bookforge_store::{JobRecord, JobStore, StoredBlockTranslation};
 use clap::Args;
@@ -263,6 +263,7 @@ async fn run_inner(
         context: context_cfg,
         context_registry: context_registry.clone(),
         style: style_run_config_from_snapshot(snapshot),
+        entities: entities_run_config_from_snapshot(snapshot),
     };
 
     let cache_namespace = if legacy_cache_namespace {
@@ -285,6 +286,11 @@ async fn run_inner(
                 ""
             } else {
                 snapshot.style_fingerprint.as_str()
+            },
+            if snapshot.entities_rendered_block.is_empty() {
+                ""
+            } else {
+                snapshot.entities_fingerprint.as_str()
             },
         )
     };
@@ -671,6 +677,7 @@ fn batch_run_config(
         context: run_config.context,
         context_registry: run_config.context_registry.clone(),
         style: run_config.style.clone(),
+        entities: run_config.entities.clone(),
     }
 }
 
@@ -689,6 +696,17 @@ fn style_run_config_from_snapshot(snapshot: &RunConfigSnapshot) -> Option<StyleR
         Some(StyleRunConfig {
             rendered_block: snapshot.style_rendered_block.clone(),
             fingerprint: snapshot.style_fingerprint.clone(),
+        })
+    }
+}
+
+fn entities_run_config_from_snapshot(snapshot: &RunConfigSnapshot) -> Option<EntityRunConfig> {
+    if snapshot.entities_rendered_block.is_empty() {
+        None
+    } else {
+        Some(EntityRunConfig {
+            rendered_block: snapshot.entities_rendered_block.clone(),
+            fingerprint: snapshot.entities_fingerprint.clone(),
         })
     }
 }
@@ -1211,6 +1229,7 @@ mod tests {
             prompt_version,
             &glossary_fingerprint,
             "",
+            "",
         );
         store
             .insert_segments(
@@ -1252,6 +1271,8 @@ mod tests {
             context_scope: bookforge_core::config::ContextScope::Chapter,
             style_fingerprint: String::new(),
             style_rendered_block: String::new(),
+            entities_fingerprint: String::new(),
+            entities_rendered_block: String::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
         store

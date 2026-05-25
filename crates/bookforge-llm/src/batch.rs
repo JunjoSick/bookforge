@@ -1985,6 +1985,14 @@ async fn translate_one_batch(
             .unwrap_or_default(),
     )
     .raw(
+        "entity_agreement_block",
+        config
+            .entities
+            .as_ref()
+            .map(|e| e.rendered_block.clone())
+            .unwrap_or_default(),
+    )
+    .raw(
         "prompt_extra",
         config.glossary.prompt_extra.clone().unwrap_or_default(),
     )
@@ -2734,6 +2742,7 @@ mod tests {
             context: crate::ContextRunConfig::default(),
             context_registry: None,
             style: None,
+            entities: None,
         }
     }
 

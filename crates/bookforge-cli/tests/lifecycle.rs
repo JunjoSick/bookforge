@@ -170,6 +170,143 @@ instructions = "Maintain a literary register typical of Italian fiction translat
 }
 
 #[test]
+fn cli_translate_with_entities_persists_agreement_block_in_snapshot() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let entities_path = temp.path().join("entities.toml");
+    fs::write(
+        &entities_path,
+        r#"[meta]
+schema_version = 1
+source_language = "English"
+target_language = "Italian"
+
+[meta.scope]
+kind = "book"
+id = "fellowship"
+
+[[entity]]
+source_name = "Galadriel"
+target_name = "Galadriel"
+gender_target = "f"
+role = "elf-queen"
+
+[[entity]]
+source_name = "the Ring"
+target_name = "l'Anello"
+gender_target = "m"
+role = "object"
+"#,
+    )
+    .expect("entities file should write");
+
+    let output = temp.path().join("out.epub");
+    let events = temp.path().join("events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            fixture_input().to_str().unwrap(),
+            "--source",
+            "English",
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--profile",
+            "v1-fast",
+            "--book-id",
+            "fellowship",
+            "--entities",
+            entities_path.to_str().unwrap(),
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let job_id = job_id_from_events(&events);
+    let store =
+        JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store should open");
+    let snapshot = store
+        .load_job_config_snapshot(&job_id)
+        .expect("snapshot load")
+        .expect("snapshot present");
+    assert!(
+        !snapshot.entities_rendered_block.is_empty(),
+        "snapshot should capture a non-empty entity block when --entities is supplied"
+    );
+    assert!(
+        snapshot
+            .entities_rendered_block
+            .contains("Galadriel: feminine"),
+        "rendered block must list feminine entities"
+    );
+    assert!(
+        snapshot
+            .entities_rendered_block
+            .contains("l'Anello (the Ring): masculine"),
+        "rendered block must list masculine entities with source-name disambiguation"
+    );
+    assert!(
+        !snapshot.entities_fingerprint.is_empty(),
+        "snapshot should record an entity fingerprint when entities are active"
+    );
+}
+
+#[test]
+fn cli_entities_import_then_show_matches_input() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let entities_path = temp.path().join("entities.toml");
+    fs::write(
+        &entities_path,
+        r#"[meta]
+schema_version = 1
+source_language = "English"
+target_language = "Italian"
+
+[meta.scope]
+kind = "global"
+
+[[entity]]
+source_name = "Gandalf"
+target_name = "Gandalf"
+gender_target = "m"
+"#,
+    )
+    .expect("entities file should write");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["entities", "import", entities_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args([
+            "entities",
+            "show",
+            "--source-language",
+            "English",
+            "--target-language",
+            "Italian",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("Gandalf: masculine"),
+        "entities show should render the imported entry; got: {stdout}"
+    );
+}
+
+#[test]
 fn cli_style_import_then_show_matches_input() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let style_path = temp.path().join("style.toml");

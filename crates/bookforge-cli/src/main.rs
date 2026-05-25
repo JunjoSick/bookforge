@@ -8,8 +8,8 @@ mod report;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use commands::{
-    doctor, estimate, glossary, ingest_flags, inspect, resume, retry, review, status, style, tail,
-    translate, validate,
+    doctor, entity, estimate, glossary, ingest_flags, inspect, resume, retry, review, status,
+    style, tail, translate, validate,
 };
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +39,7 @@ enum Command {
     Validate(validate::ValidateArgs),
     Benchmark(Box<translate::BenchmarkArgs>),
     Doctor(doctor::DoctorArgs),
+    Entities(entity::EntitiesArgs),
     Status(status::StatusArgs),
     Style(style::StyleArgs),
     Tail(tail::TailArgs),
@@ -68,6 +69,7 @@ async fn main() -> Result<()> {
         Command::Validate(args) => validate::run(args).await,
         Command::Benchmark(args) => translate::run_benchmark(*args).await,
         Command::Doctor(args) => doctor::run(args).await,
+        Command::Entities(args) => entity::run(args).await,
         Command::Status(args) => status::run(args).await,
         Command::Style(args) => style::run(args).await,
         Command::Tail(args) => tail::run(args).await,

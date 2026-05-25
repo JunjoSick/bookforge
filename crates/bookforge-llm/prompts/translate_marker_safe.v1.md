@@ -101,6 +101,12 @@ Active style guide (apply consistently throughout):
 {{style_guide_block}}
 ```
 
+Entity grammatical agreement (use for adjective/article concord):
+
+```txt
+{{entity_agreement_block}}
+```
+
 Glossary and fixed terminology:
 
 ```json

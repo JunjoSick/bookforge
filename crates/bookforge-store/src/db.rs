@@ -8,6 +8,7 @@ use std::{
 
 use bookforge_core::{
     Result as CoreResult,
+    entity::EntityGender,
     glossary::{GlossaryCategory, GlossaryScopeKind, GlossaryStatus, GlossaryTerm},
     ir::BlockId,
     run_snapshot::RunConfigSnapshot,
@@ -244,6 +245,33 @@ pub struct StoredStyleSheet {
     pub target_language: String,
     pub content_toml: String,
     pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewEntity<'a> {
+    pub scope_kind: GlossaryScopeKind,
+    pub scope_id: Option<&'a str>,
+    pub source_name: &'a str,
+    pub target_name: &'a str,
+    pub gender_target: Option<EntityGender>,
+    pub role: Option<&'a str>,
+    pub notes: Option<&'a str>,
+    pub source_language: &'a str,
+    pub target_language: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEntity {
+    pub id: i64,
+    pub scope_kind: GlossaryScopeKind,
+    pub scope_id: Option<String>,
+    pub source_name: String,
+    pub target_name: String,
+    pub gender_target: Option<EntityGender>,
+    pub role: Option<String>,
+    pub notes: Option<String>,
+    pub source_language: String,
+    pub target_language: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1464,6 +1492,145 @@ impl JobStore {
         Ok(count)
     }
 
+    pub fn upsert_entities(&self, entities: &[NewEntity<'_>]) -> Result<usize> {
+        if entities.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.borrow();
+        let now = timestamp_string();
+        let mut changed = 0usize;
+        for entity in entities {
+            conn.execute(
+                "INSERT INTO entities
+                    (scope_kind, scope_id, source_name, target_name, gender_target,
+                     role, notes, source_language, target_language, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+                 ON CONFLICT(scope_kind, scope_id, source_name, source_language, target_language)
+                 DO UPDATE SET
+                    target_name = excluded.target_name,
+                    gender_target = excluded.gender_target,
+                    role = excluded.role,
+                    notes = excluded.notes,
+                    updated_at = excluded.updated_at",
+                params![
+                    entity.scope_kind.as_str(),
+                    entity.scope_id,
+                    entity.source_name,
+                    entity.target_name,
+                    entity.gender_target.map(|g| g.as_short()),
+                    entity.role,
+                    entity.notes,
+                    entity.source_language,
+                    entity.target_language,
+                    now,
+                ],
+            )?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
+    /// Load all entities that apply for a language pair and optional
+    /// book/series scopes. Caller is responsible for merging via
+    /// [`bookforge_core::entity::merge_scope_entities`].
+    pub fn load_active_entities(
+        &self,
+        source_language: &str,
+        target_language: &str,
+        book_id: Option<&str>,
+        series_id: Option<&str>,
+    ) -> Result<Vec<StoredEntity>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT id, scope_kind, scope_id, source_name, target_name, gender_target,
+                    role, notes, source_language, target_language
+             FROM entities
+             WHERE source_language = ?1
+               AND target_language = ?2
+               AND ( (scope_kind = 'global')
+                  OR (scope_kind = 'series' AND scope_id = ?3)
+                  OR (scope_kind = 'book' AND scope_id = ?4) )",
+        )?;
+        let rows = stmt.query_map(
+            params![source_language, target_language, series_id, book_id],
+            |row| {
+                let gender: Option<String> = row.get(5)?;
+                Ok(StoredEntity {
+                    id: row.get(0)?,
+                    scope_kind: parse_row_enum(&row.get::<_, String>(1)?, 1)?,
+                    scope_id: row.get(2)?,
+                    source_name: row.get(3)?,
+                    target_name: row.get(4)?,
+                    gender_target: gender.and_then(|g| parse_gender_short(&g)),
+                    role: row.get(6)?,
+                    notes: row.get(7)?,
+                    source_language: row.get(8)?,
+                    target_language: row.get(9)?,
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_entities(
+        &self,
+        source_language: Option<&str>,
+        target_language: Option<&str>,
+        scope_kind: Option<GlossaryScopeKind>,
+        scope_id: Option<&str>,
+    ) -> Result<Vec<StoredEntity>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT id, scope_kind, scope_id, source_name, target_name, gender_target,
+                    role, notes, source_language, target_language
+             FROM entities
+             WHERE (?1 IS NULL OR source_language = ?1)
+               AND (?2 IS NULL OR target_language = ?2)
+               AND (?3 IS NULL OR scope_kind = ?3)
+               AND (?4 IS NULL OR scope_id = ?4)
+             ORDER BY scope_kind, scope_id, source_name",
+        )?;
+        let scope_text = scope_kind.map(|s| s.as_str().to_string());
+        let rows = stmt.query_map(
+            params![source_language, target_language, scope_text, scope_id],
+            |row| {
+                let gender: Option<String> = row.get(5)?;
+                Ok(StoredEntity {
+                    id: row.get(0)?,
+                    scope_kind: parse_row_enum(&row.get::<_, String>(1)?, 1)?,
+                    scope_id: row.get(2)?,
+                    source_name: row.get(3)?,
+                    target_name: row.get(4)?,
+                    gender_target: gender.and_then(|g| parse_gender_short(&g)),
+                    role: row.get(6)?,
+                    notes: row.get(7)?,
+                    source_language: row.get(8)?,
+                    target_language: row.get(9)?,
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn clear_entities_scope(
+        &self,
+        scope_kind: GlossaryScopeKind,
+        scope_id: Option<&str>,
+    ) -> Result<usize> {
+        let conn = self.conn.borrow();
+        let count = if scope_kind == GlossaryScopeKind::Global {
+            conn.execute("DELETE FROM entities WHERE scope_kind = 'global'", [])?
+        } else {
+            conn.execute(
+                "DELETE FROM entities WHERE scope_kind = ?1 AND scope_id = ?2",
+                params![scope_kind.as_str(), scope_id],
+            )?
+        };
+        Ok(count)
+    }
+
     pub fn pending_segment_ids(&self, job_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
@@ -2180,6 +2347,15 @@ fn glossary_candidate_from_row(
     })
 }
 
+fn parse_gender_short(value: &str) -> Option<EntityGender> {
+    match value {
+        "m" => Some(EntityGender::Masculine),
+        "f" => Some(EntityGender::Feminine),
+        "n" => Some(EntityGender::Neuter),
+        _ => None,
+    }
+}
+
 fn parse_row_enum<T>(value: &str, column: usize) -> rusqlite::Result<T>
 where
     T: FromStr<Err = String>,
@@ -2498,6 +2674,8 @@ mod tests {
             context_scope: bookforge_core::config::ContextScope::Chapter,
             style_fingerprint: String::new(),
             style_rendered_block: String::new(),
+            entities_fingerprint: String::new(),
+            entities_rendered_block: String::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
 
@@ -2584,6 +2762,8 @@ mod tests {
             context_scope: bookforge_core::config::ContextScope::Chapter,
             style_fingerprint: String::new(),
             style_rendered_block: String::new(),
+            entities_fingerprint: String::new(),
+            entities_rendered_block: String::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
 

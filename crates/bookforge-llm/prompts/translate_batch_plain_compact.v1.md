@@ -12,6 +12,7 @@ Return exactly:
 
 Translate every item.
 Honor item `glossary`/`glossary_prose` constraints. Style: {{style_guide_block}}
+Entities: {{entity_agreement_block}}
 Extra: {{prompt_extra}}
 {{items_json}}
 Return JSON only.

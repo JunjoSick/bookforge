@@ -99,6 +99,12 @@ pub struct TranslateArgs {
     #[arg(long = "style")]
     pub style: Vec<PathBuf>,
 
+    /// Entities TOML to merge into prompts (repeatable). Entries become
+    /// a grammatical-agreement table; helps the model keep gender concord
+    /// consistent across paragraphs.
+    #[arg(long = "entities")]
+    pub entities: Vec<PathBuf>,
+
     #[arg(long, value_enum, default_value_t = QaMode::Off)]
     pub qa: QaMode,
 
