@@ -53,12 +53,19 @@ pub struct TranslationBatch {
     pub kind: BatchKind,
     pub items: Vec<TranslationBatchItem>,
     pub token_estimate: usize,
+    /// All items in a batch belong to the same chapter — guaranteed by
+    /// [`build_translation_batches`] partitioning by `section_id` before
+    /// it groups by mode and token budget. Sliding-context fencing
+    /// (PR1) relies on this invariant: a batch awaits context for its
+    /// earliest item once and reuses the same block for every item.
+    pub section_id: bookforge_core::ir::SectionId,
 }
 
 #[derive(Debug, Clone)]
 pub struct TranslationBatchItem {
     pub item_id: String,
     pub segment_id: SegmentId,
+    pub section_id: bookforge_core::ir::SectionId,
     pub block_id: BlockId,
     pub ordinal: usize,
     pub kind: String,
@@ -542,6 +549,7 @@ pub fn build_translation_batches(
             items.push(TranslationBatchItem {
                 item_id: format!("{}:{}", segment.id.0, block.block_id.0),
                 segment_id: segment.id.clone(),
+                section_id: segment.section_id.clone(),
                 block_id: block.block_id.clone(),
                 ordinal,
                 kind: block.kind.clone(),
@@ -577,16 +585,48 @@ pub fn account_for_batch_prompt_overhead(
 }
 
 fn group_batches(items: Vec<TranslationBatchItem>, config: &BatchConfig) -> Vec<TranslationBatch> {
-    let mut mode_groups: HashMap<BatchMode, Vec<TranslationBatchItem>> = HashMap::new();
+    // Partition items by (section_id, mode) before token-budget packing.
+    // Section partitioning is the invariant that lets the sliding-context
+    // fence work in batch mode: a batch never crosses a chapter boundary,
+    // so awaiting context for the batch's earliest segment can never
+    // deadlock on a sibling item in the same batch.
+    let mut section_mode_groups: HashMap<
+        (bookforge_core::ir::SectionId, BatchMode),
+        Vec<TranslationBatchItem>,
+    > = HashMap::new();
     for item in items {
-        mode_groups.entry(item.mode()).or_default().push(item);
+        let key = (item.section_id.clone(), item.mode());
+        section_mode_groups.entry(key).or_default().push(item);
     }
+
+    // Walk groups in (section ordinal, mode) order so the output `batches`
+    // vec ends up ordered as the source document reads. The scheduler relies
+    // on this to dispatch earlier sections first.
+    let mut ordered_keys: Vec<(bookforge_core::ir::SectionId, BatchMode)> =
+        section_mode_groups.keys().cloned().collect();
+    ordered_keys.sort_by(|a, b| {
+        let section_a = section_mode_groups[a]
+            .iter()
+            .map(|item| item.ordinal)
+            .min()
+            .unwrap_or(usize::MAX);
+        let section_b = section_mode_groups[b]
+            .iter()
+            .map(|item| item.ordinal)
+            .min()
+            .unwrap_or(usize::MAX);
+        section_a
+            .cmp(&section_b)
+            .then_with(|| (a.1 as u8).cmp(&(b.1 as u8)))
+    });
 
     let target_tokens = mode_target_tokens(config.target_tokens);
     let mut batches = Vec::new();
     let mut batch_ordinal = 0usize;
 
-    for (mode, group_items) in mode_groups {
+    for key in ordered_keys {
+        let (section_id, mode) = key.clone();
+        let group_items = section_mode_groups.remove(&key).unwrap_or_default();
         let token_limit = target_tokens
             .get(&mode)
             .copied()
@@ -609,6 +649,7 @@ fn group_batches(items: Vec<TranslationBatchItem>, config: &BatchConfig) -> Vec<
                     mode,
                     std::mem::take(&mut current),
                     current_tokens,
+                    section_id.clone(),
                 );
                 batches.push(batch);
                 batch_ordinal += 1;
@@ -626,6 +667,7 @@ fn group_batches(items: Vec<TranslationBatchItem>, config: &BatchConfig) -> Vec<
                 mode,
                 current,
                 current_tokens,
+                section_id.clone(),
             );
             batches.push(batch);
             batch_ordinal += 1;
@@ -641,6 +683,7 @@ fn make_batch(
     mode: BatchMode,
     items: Vec<TranslationBatchItem>,
     token_estimate: usize,
+    section_id: bookforge_core::ir::SectionId,
 ) -> TranslationBatch {
     TranslationBatch {
         id,
@@ -649,6 +692,7 @@ fn make_batch(
         kind: BatchKind::Translation,
         items,
         token_estimate,
+        section_id,
     }
 }
 
@@ -1014,6 +1058,7 @@ fn split_batch_with_config(
             batch.mode,
             left.to_vec(),
             batch_token_estimate(left, config),
+            batch.section_id.clone(),
         ));
     }
     if !right.is_empty() {
@@ -1023,6 +1068,7 @@ fn split_batch_with_config(
             batch.mode,
             right.to_vec(),
             batch_token_estimate(right, config),
+            batch.section_id.clone(),
         ));
     }
     batches
@@ -1071,6 +1117,7 @@ fn repack_batch_with_config(
     let base_ordinal = batch.ordinal;
     let mode = batch.mode;
     let kind = batch.kind;
+    let section_id = batch.section_id;
 
     for item in batch.items {
         let item_tokens = item_token_estimate(&item, config).max(1);
@@ -1085,6 +1132,7 @@ fn repack_batch_with_config(
                 kind,
                 items: std::mem::take(&mut current_items),
                 token_estimate: current_tokens,
+                section_id: section_id.clone(),
             });
             current_tokens = fixed_tokens;
             part += 1;
@@ -1101,6 +1149,7 @@ fn repack_batch_with_config(
             kind,
             items: current_items,
             token_estimate: current_tokens,
+            section_id,
         });
     }
     out
@@ -1121,6 +1170,11 @@ pub fn collect_repair_items(result: &BatchTranslationResult) -> Vec<TranslationB
         .map(|f| TranslationBatchItem {
             item_id: f.item_id.clone(),
             segment_id: f.segment_id.clone(),
+            // Repair items don't participate in the sliding-context fence
+            // — they're JSON-syntax fixups, not new translation work. The
+            // sentinel empty section_id is intentional and safe; the
+            // batch driver never awaits context for Repair-kind batches.
+            section_id: bookforge_core::ir::SectionId(String::new()),
             block_id: bookforge_core::ir::BlockId(String::new()),
             ordinal: 0,
             kind: String::new(),
@@ -1131,6 +1185,27 @@ pub fn collect_repair_items(result: &BatchTranslationResult) -> Vec<TranslationB
             checksum: String::new(),
         })
         .collect()
+}
+
+/// Publish Failed status for each segment in a batch that hit a terminal
+/// error. This unblocks the sliding-context fence so downstream batches
+/// don't deadlock waiting on a segment that will never succeed.
+fn unblock_fence_for_batch_failure(
+    registry: Option<&crate::scheduler::ContextRegistry>,
+    segments_by_id: &HashMap<String, Segment>,
+    items: &[TranslationBatchItem],
+) {
+    let Some(registry) = registry else { return };
+    let mut seen = std::collections::HashSet::<String>::new();
+    for item in items {
+        let key = item.segment_id.0.clone();
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        if let Some(segment) = segments_by_id.get(&key) {
+            registry.pre_populate_text(segment, String::new(), SegmentStatus::Failed);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1160,6 +1235,21 @@ where
         .flat_map(|b| b.items.iter())
         .map(|item| (item.item_id.clone(), item.clone()))
         .collect();
+
+    // Sliding-context fence (PR5): publish per-segment as soon as all of a
+    // segment's blocks have arrived from one or more batches. We buffer
+    // per-segment blocks until the count matches the expected block count,
+    // then push the joined text into the context registry so later batches
+    // can read it as prior context.
+    let segments_by_id: HashMap<String, Segment> = segments
+        .iter()
+        .map(|s| (s.id.0.clone(), s.clone()))
+        .collect();
+    let segment_block_expected: HashMap<String, usize> = segments
+        .iter()
+        .map(|s| (s.id.0.clone(), s.block_ids.len()))
+        .collect();
+    let mut pending_segment_blocks: HashMap<String, Vec<String>> = HashMap::new();
 
     let mut all_results: Vec<BatchTranslationResult> = Vec::new();
     let mut pending: Vec<TranslationBatch> = batches;
@@ -1331,6 +1421,49 @@ where
                     if let Some(ref mut sizer) = batch_sizer {
                         sizer.on_success_for_mode(batch.mode, latency_ms);
                     }
+                    // Publish completed segments to the context registry as
+                    // soon as all of their blocks have landed. Repair batches
+                    // don't participate (they're fixing prior translations,
+                    // not producing new ones — and they carry the sentinel
+                    // empty section_id).
+                    if let Some(registry) = config.context_registry.as_deref()
+                        && batch.kind == BatchKind::Translation
+                    {
+                        for item in &batch_result.translations {
+                            let key = item.segment_id.0.clone();
+                            pending_segment_blocks
+                                .entry(key.clone())
+                                .or_default()
+                                .push(item.text.clone());
+                            let expected = segment_block_expected
+                                .get(&key)
+                                .copied()
+                                .unwrap_or(usize::MAX);
+                            if pending_segment_blocks[&key].len() >= expected
+                                && let Some(segment) = segments_by_id.get(&key)
+                            {
+                                let blocks = pending_segment_blocks.remove(&key).unwrap();
+                                let joined = blocks.join("\n\n");
+                                registry.pre_populate_text(
+                                    segment,
+                                    joined,
+                                    SegmentStatus::Succeeded,
+                                );
+                            }
+                        }
+                        // Failures must also unblock the fence so downstream
+                        // batches don't deadlock waiting on a segment that
+                        // will never publish a Succeeded entry.
+                        for failure in &batch_result.failures {
+                            if let Some(segment) = segments_by_id.get(&failure.segment_id.0) {
+                                registry.pre_populate_text(
+                                    segment,
+                                    String::new(),
+                                    SegmentStatus::Failed,
+                                );
+                            }
+                        }
+                    }
                     all_results.push(batch_result);
                 }
                 Err(LlmError::InvalidResponse(_)) if batch.kind == BatchKind::Repair => {
@@ -1343,6 +1476,14 @@ where
                         ),
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
+                    // Repair batches don't participate in the fence — but
+                    // their underlying segments may not be otherwise
+                    // resolved, so still unblock anyone waiting on them.
+                    unblock_fence_for_batch_failure(
+                        config.context_registry.as_deref(),
+                        &segments_by_id,
+                        &batch.items,
+                    );
                     all_results.push(BatchTranslationResult {
                         batch_id: batch.id.clone(),
                         translations: Vec::new(),
@@ -1373,6 +1514,11 @@ where
                         ),
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
+                    unblock_fence_for_batch_failure(
+                        config.context_registry.as_deref(),
+                        &segments_by_id,
+                        &batch.items,
+                    );
                     all_results.push(BatchTranslationResult {
                         batch_id: batch.id.clone(),
                         translations: Vec::new(),
@@ -1435,6 +1581,11 @@ where
                         message: format!("batch {} failed: {error}", batch.id),
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
+                    unblock_fence_for_batch_failure(
+                        config.context_registry.as_deref(),
+                        &segments_by_id,
+                        &batch.items,
+                    );
                     all_results.push(BatchTranslationResult {
                         batch_id: batch.id.clone(),
                         translations: Vec::new(),
@@ -1620,6 +1771,10 @@ where
                         .map(|item| token_estimate(&item.source_text))
                         .sum(),
                     items,
+                    // Repair batches don't participate in the sliding-
+                    // context fence (they fix JSON syntax, not translation
+                    // content); the sentinel section_id is harmless.
+                    section_id: bookforge_core::ir::SectionId(String::new()),
                 }
             })
             .collect();
@@ -1942,16 +2097,31 @@ async fn translate_one_batch(
     batch: TranslationBatch,
     config: &TranslationRunConfig,
 ) -> Result<BatchTranslationResult, LlmError> {
-    if config.context.enabled() {
-        // v1.3 PR1 limitation: batches are not section-aware, so injecting
-        // sliding context risks deadlock when a single batch contains
-        // multiple segments from the same chapter. Section-aware batches
-        // land in a follow-up; for now batch mode skips context injection.
-        tracing::warn!(
-            batch_id = batch.id,
-            "sliding context disabled for batch mode (--context-window > 0 ignored in this batch)"
-        );
-    }
+    // Sliding-context fence (ROADMAP §6.4 — PR5 makes this work in batch
+    // mode). build_translation_batches guarantees no batch crosses a
+    // section boundary, so awaiting the batch's earliest segment is safe:
+    // its prior-N dependencies are necessarily in *earlier* batches of
+    // the same section (or earlier sections, depending on scope) and
+    // can't deadlock on a sibling item in this same batch.
+    let context_pairs = match (config.context_registry.as_deref(), batch.kind) {
+        (Some(registry), BatchKind::Translation) if config.context.enabled() => {
+            let earliest = batch
+                .items
+                .iter()
+                .min_by_key(|item| item.ordinal)
+                .map(|item| item.segment_id.clone());
+            match earliest {
+                Some(segment_id) => {
+                    registry
+                        .await_context_for(&segment_id, config.context)
+                        .await
+                }
+                None => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    };
+    let context_block = crate::scheduler::render_context_pairs(&context_pairs);
     let items_json = render_batch_items(&batch, config);
     let template = if config.compact_prompts {
         match batch.mode {
@@ -1992,6 +2162,7 @@ async fn translate_one_batch(
             .map(|e| e.rendered_block.clone())
             .unwrap_or_default(),
     )
+    .raw("context_translation_pairs", context_block)
     .raw(
         "prompt_extra",
         config.glossary.prompt_extra.clone().unwrap_or_default(),
@@ -2228,10 +2399,20 @@ mod tests {
     };
 
     fn make_segment(id: &str, blocks: Vec<SegmentBlock>, markers: Vec<String>) -> Segment {
+        make_segment_in_section(id, "sec_000000", 0, blocks, markers)
+    }
+
+    fn make_segment_in_section(
+        id: &str,
+        section_id: &str,
+        ordinal: usize,
+        blocks: Vec<SegmentBlock>,
+        markers: Vec<String>,
+    ) -> Segment {
         Segment {
             id: SegmentId(id.to_string()),
-            section_id: bookforge_core::ir::SectionId("sec_000000".to_string()),
-            ordinal: 0,
+            section_id: bookforge_core::ir::SectionId(section_id.to_string()),
+            ordinal,
             block_ids: blocks.iter().map(|b| b.block_id.clone()).collect(),
             source: SegmentSource {
                 text: blocks
@@ -2248,7 +2429,7 @@ mod tests {
                 preserve_markers: markers,
                 ..Default::default()
             },
-            checksum: "abc".to_string(),
+            checksum: format!("checksum_{id}"),
         }
     }
 
@@ -2282,6 +2463,7 @@ mod tests {
         TranslationBatchItem {
             item_id: id.to_string(),
             segment_id: SegmentId(format!("seg_{id}")),
+            section_id: bookforge_core::ir::SectionId("test_section".to_string()),
             block_id: bookforge_core::ir::BlockId(format!("block_{id}")),
             ordinal: 0,
             kind: "paragraph".to_string(),
@@ -2309,6 +2491,79 @@ mod tests {
             build_translation_batches(&[seg1, seg2], &config, TranslationProfile::Balanced);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].items.len(), 2);
+    }
+
+    #[test]
+    fn batches_never_cross_section_boundaries() {
+        // PR5 invariant: build_translation_batches must partition by section
+        // before grouping by token budget, so sliding-context awaiting in
+        // batch mode can't deadlock on a sibling item in the same batch.
+        let seg_a1 =
+            make_segment_in_section("a1", "sec_A", 0, vec![plain_block("Alpha one")], vec![]);
+        let seg_a2 =
+            make_segment_in_section("a2", "sec_A", 1, vec![plain_block("Alpha two")], vec![]);
+        let seg_b1 =
+            make_segment_in_section("b1", "sec_B", 2, vec![plain_block("Bravo one")], vec![]);
+        let seg_b2 =
+            make_segment_in_section("b2", "sec_B", 3, vec![plain_block("Bravo two")], vec![]);
+        let config = BatchConfig {
+            enabled: true,
+            target_tokens: 100_000,
+            max_items: 64,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(
+            &[seg_a1, seg_a2, seg_b1, seg_b2],
+            &config,
+            TranslationProfile::Balanced,
+        );
+        // Token budget could fit all four in one batch — but section
+        // partitioning forces two batches, one per section.
+        assert_eq!(batches.len(), 2);
+        for batch in &batches {
+            let section_set: std::collections::HashSet<&str> = batch
+                .items
+                .iter()
+                .map(|item| item.section_id.0.as_str())
+                .collect();
+            assert_eq!(
+                section_set.len(),
+                1,
+                "batch {} mixes sections: {:?}",
+                batch.id,
+                section_set
+            );
+            // Batch.section_id matches its items'.
+            assert_eq!(
+                batch.section_id.0, batch.items[0].section_id.0,
+                "batch.section_id must match its items"
+            );
+        }
+    }
+
+    #[test]
+    fn batches_emerge_in_input_order_across_sections() {
+        // build_translation_batches respects the input order of `segments`
+        // (which `build_segments` produces in document order). The dispatcher
+        // pulls batches FIFO from the queue, so earlier-input sections get
+        // dispatched first.
+        let seg_a = make_segment_in_section("a", "sec_A", 0, vec![plain_block("Alpha")], vec![]);
+        let seg_b = make_segment_in_section("b", "sec_B", 1, vec![plain_block("Bravo")], vec![]);
+        let config = BatchConfig {
+            enabled: true,
+            target_tokens: 100_000,
+            max_items: 64,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches =
+            build_translation_batches(&[seg_a, seg_b], &config, TranslationProfile::Balanced);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].section_id.0, "sec_A");
+        assert_eq!(batches[1].section_id.0, "sec_B");
     }
 
     #[test]
@@ -2458,6 +2713,7 @@ mod tests {
                 batch_item("b", "five six seven eight"),
                 batch_item("c", "nine ten eleven twelve"),
             ],
+            section_id: bookforge_core::ir::SectionId("test_section".to_string()),
         };
 
         let parts = repack_batch(batch, 1, 2);
@@ -2482,6 +2738,7 @@ mod tests {
             items: (0..32)
                 .map(|idx| batch_item(&format!("{idx}"), &"word ".repeat(2_000)))
                 .collect(),
+            section_id: bookforge_core::ir::SectionId("test_section".to_string()),
         };
 
         let normalized = normalize_batch_for_current_sizer(batch, Some(&sizer), None);

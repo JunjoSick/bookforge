@@ -260,6 +260,48 @@ role = "object"
 }
 
 #[test]
+fn cli_translate_batch_mode_with_sliding_context_completes_without_deadlock() {
+    // PR5: section-aware batching enables sliding context in batch mode.
+    // Before this change, build_translation_batches could pack multiple
+    // segments of the same chapter into one batch, and awaiting context
+    // for a later segment would deadlock on a sibling in the same batch.
+    // With section partitioning, no batch crosses a chapter, so the
+    // sliding-context fence works correctly. This test just asserts the
+    // happy path completes — the value is "doesn't hang", which the
+    // 60-second test timeout enforces by failure.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let output = temp.path().join("out.epub");
+    let events = temp.path().join("events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            fixture_input().to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--profile",
+            "v1-fast", // batch-enabled
+            "--context-window",
+            "3",
+            "--context-scope",
+            "chapter",
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert!(output.exists(), "translated EPUB should exist");
+}
+
+#[test]
 fn cli_translate_with_full_v1_3_stack_persists_all_three_blocks() {
     // Acceptance §6.9: a single translate run with --context-window,
     // --style, and --entities together must capture all three blocks in
