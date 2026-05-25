@@ -36,6 +36,54 @@ fn cli_translate_mock_quiet_writes_output_report_and_events() {
 }
 
 #[test]
+fn cli_translate_context_window_persists_snapshot_settings() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let output = temp.path().join("out.epub");
+    let events = temp.path().join("events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            fixture_input().to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--profile",
+            "v1-fast",
+            "--context-window",
+            "5",
+            "--context-budget-tokens",
+            "900",
+            "--context-scope",
+            "book",
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let job_id = job_id_from_events(&events);
+    let store =
+        JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store should open");
+    let snapshot = store
+        .load_job_config_snapshot(&job_id)
+        .expect("snapshot load")
+        .expect("snapshot present");
+    assert_eq!(snapshot.context_window, 5);
+    assert_eq!(snapshot.context_budget_tokens, 900);
+    assert_eq!(
+        snapshot.context_scope,
+        bookforge_core::config::ContextScope::Book
+    );
+}
+
+#[test]
 fn cli_translate_mock_with_same_glossary_is_bit_identical() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let input = fixture_input();

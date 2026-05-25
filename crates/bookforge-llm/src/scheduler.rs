@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bookforge_core::{
-    config::TranslationProfile,
+    config::{ContextScope, TranslationProfile},
     glossary::{GlossaryFormat, GlossaryPromptTerm},
     ir::BlockId,
     scheduler::SchedulerConfig,
@@ -38,6 +38,273 @@ pub struct TranslationRunConfig {
     pub batch_max_output_tokens: Option<u32>,
     pub compact_prompts: bool,
     pub glossary: GlossaryRunConfig,
+    pub context: ContextRunConfig,
+    /// In-memory completion fence for sliding-context injection. Built by
+    /// the caller from the full segments list and pre-populated with any
+    /// cache hits before translation starts. Optional; when `None` the
+    /// scheduler runs without context injection even if `context.window`
+    /// is non-zero (degrades silently with a `tracing::warn!`).
+    pub context_registry: Option<Arc<ContextRegistry>>,
+}
+
+/// Sliding-context injection settings. `window == 0` disables the feature
+/// entirely; existing cache entries stay valid because the context block
+/// is rendered as an empty string and the rendered prompt itself is not
+/// part of the cache key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextRunConfig {
+    pub window: usize,
+    pub budget_tokens: usize,
+    pub scope: ContextScope,
+}
+
+impl Default for ContextRunConfig {
+    fn default() -> Self {
+        Self {
+            window: 0,
+            budget_tokens: 1200,
+            scope: ContextScope::Chapter,
+        }
+    }
+}
+
+impl ContextRunConfig {
+    pub fn enabled(&self) -> bool {
+        self.window > 0
+    }
+}
+
+/// A completed prior segment, exposed to the prompt renderer as one side
+/// of a (source, target) pair in the sliding-context block.
+#[derive(Debug, Clone)]
+pub struct CompletedContext {
+    pub segment_id: SegmentId,
+    pub section_id: bookforge_core::ir::SectionId,
+    pub ordinal: usize,
+    pub source_text: String,
+    pub translated_text: String,
+    pub status: SegmentStatus,
+    pub source_token_estimate: usize,
+}
+
+/// In-memory completion fence for sliding-context injection.
+///
+/// Each segment is pre-registered before translation starts. As segments
+/// complete (whether from cache, prior run, or fresh translation), they
+/// publish a `CompletedContext`; waiters subscribe on the segments they
+/// need and unblock once those entries land. Failed and needs-review
+/// statuses are recorded so they unblock waiters but are filtered out of
+/// the rendered context, per ROADMAP §6.4.
+#[derive(Clone)]
+pub struct ContextRegistry {
+    inner: Arc<ContextRegistryInner>,
+}
+
+impl std::fmt::Debug for ContextRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextRegistry")
+            .field("segments", &self.inner.segment_index.len())
+            .field("sections", &self.inner.section_order.len())
+            .finish()
+    }
+}
+
+struct ContextRegistryInner {
+    completed: std::sync::Mutex<HashMap<SegmentId, CompletedContext>>,
+    notify: tokio::sync::Notify,
+    section_order: HashMap<bookforge_core::ir::SectionId, Vec<SegmentId>>,
+    book_order: Vec<SegmentId>,
+    segment_index: HashMap<SegmentId, SegmentLocation>,
+}
+
+#[derive(Clone)]
+struct SegmentLocation {
+    section_id: bookforge_core::ir::SectionId,
+}
+
+impl ContextRegistry {
+    pub fn new(segments: &[Segment]) -> Self {
+        let mut section_order: HashMap<bookforge_core::ir::SectionId, Vec<(usize, SegmentId)>> =
+            HashMap::new();
+        let mut book_order: Vec<(usize, SegmentId)> = Vec::with_capacity(segments.len());
+        let mut segment_index: HashMap<SegmentId, SegmentLocation> = HashMap::new();
+        for segment in segments {
+            section_order
+                .entry(segment.section_id.clone())
+                .or_default()
+                .push((segment.ordinal, segment.id.clone()));
+            book_order.push((segment.ordinal, segment.id.clone()));
+            segment_index.insert(
+                segment.id.clone(),
+                SegmentLocation {
+                    section_id: segment.section_id.clone(),
+                },
+            );
+        }
+        for list in section_order.values_mut() {
+            list.sort_by_key(|(ord, _)| *ord);
+        }
+        book_order.sort_by_key(|(ord, _)| *ord);
+        let section_order: HashMap<_, Vec<SegmentId>> = section_order
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().map(|(_, id)| id).collect()))
+            .collect();
+        let book_order: Vec<SegmentId> = book_order.into_iter().map(|(_, id)| id).collect();
+        Self {
+            inner: Arc::new(ContextRegistryInner {
+                completed: std::sync::Mutex::new(HashMap::new()),
+                notify: tokio::sync::Notify::new(),
+                section_order,
+                book_order,
+                segment_index,
+            }),
+        }
+    }
+
+    /// Publish a completed context. Idempotent: late re-publishes simply
+    /// overwrite the prior entry (in practice this only happens during
+    /// retries, where the freshest result is preferred).
+    pub fn publish(&self, ctx: CompletedContext) {
+        let mut map = self
+            .inner
+            .completed
+            .lock()
+            .expect("context registry mutex poisoned");
+        map.insert(ctx.segment_id.clone(), ctx);
+        drop(map);
+        self.inner.notify.notify_waiters();
+    }
+
+    /// Convenience: seed the registry from a `(segment, translation)` pair
+    /// known to be complete before translation starts (cache hit, prior
+    /// run, etc.).
+    pub fn pre_populate(&self, segment: &Segment, translation: &SegmentTranslation) {
+        self.publish(CompletedContext {
+            segment_id: segment.id.clone(),
+            section_id: segment.section_id.clone(),
+            ordinal: segment.ordinal,
+            source_text: segment.source.text.clone(),
+            translated_text: translation.joined_text(),
+            status: translation.status,
+            source_token_estimate: segment.source.token_estimate,
+        });
+    }
+
+    /// Convenience: seed the registry from raw (segment, translated_text, status).
+    /// Used on resume to rehydrate the fence from persisted translations.
+    pub fn pre_populate_text(
+        &self,
+        segment: &Segment,
+        translated_text: impl Into<String>,
+        status: SegmentStatus,
+    ) {
+        self.publish(CompletedContext {
+            segment_id: segment.id.clone(),
+            section_id: segment.section_id.clone(),
+            ordinal: segment.ordinal,
+            source_text: segment.source.text.clone(),
+            translated_text: translated_text.into(),
+            status,
+            source_token_estimate: segment.source.token_estimate,
+        });
+    }
+
+    /// Wait for the prior `config.window` segments (scoped per `config.scope`)
+    /// to complete, then return their `CompletedContext` entries in
+    /// closest-first order, filtered to successful translations and
+    /// truncated to fit `config.budget_tokens`.
+    pub async fn await_context_for(
+        &self,
+        segment_id: &SegmentId,
+        config: ContextRunConfig,
+    ) -> Vec<CompletedContext> {
+        if !config.enabled() {
+            return Vec::new();
+        }
+        let Some(loc) = self.inner.segment_index.get(segment_id) else {
+            return Vec::new();
+        };
+        let prior: Vec<SegmentId> = match config.scope {
+            ContextScope::Chapter => {
+                let Some(section) = self.inner.section_order.get(&loc.section_id) else {
+                    return Vec::new();
+                };
+                prior_segments_before(section, segment_id, config.window)
+            }
+            ContextScope::Book => {
+                prior_segments_before(&self.inner.book_order, segment_id, config.window)
+            }
+        };
+        if prior.is_empty() {
+            return Vec::new();
+        }
+        loop {
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            {
+                let map = self
+                    .inner
+                    .completed
+                    .lock()
+                    .expect("context registry mutex poisoned");
+                if prior.iter().all(|id| map.contains_key(id)) {
+                    let succeeded: Vec<CompletedContext> = prior
+                        .iter()
+                        .filter_map(|id| map.get(id).cloned())
+                        .filter(|ctx| {
+                            matches!(
+                                ctx.status,
+                                SegmentStatus::Succeeded | SegmentStatus::SkippedCached
+                            )
+                        })
+                        .collect();
+                    return apply_context_budget(succeeded, config.budget_tokens);
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+fn prior_segments_before(
+    ordered: &[SegmentId],
+    needle: &SegmentId,
+    window: usize,
+) -> Vec<SegmentId> {
+    let Some(idx) = ordered.iter().position(|id| id == needle) else {
+        return Vec::new();
+    };
+    if idx == 0 || window == 0 {
+        return Vec::new();
+    }
+    let start = idx.saturating_sub(window);
+    // Closest-first: walk from idx-1 down to start.
+    (start..idx).rev().map(|i| ordered[i].clone()).collect()
+}
+
+fn apply_context_budget(
+    closest_first: Vec<CompletedContext>,
+    budget_tokens: usize,
+) -> Vec<CompletedContext> {
+    if budget_tokens == 0 {
+        return Vec::new();
+    }
+    let mut total = 0usize;
+    let mut kept: Vec<CompletedContext> = Vec::with_capacity(closest_first.len());
+    for ctx in closest_first {
+        let tokens = estimate_context_tokens(&ctx);
+        if total.saturating_add(tokens) > budget_tokens {
+            break;
+        }
+        total += tokens;
+        kept.push(ctx);
+    }
+    kept
+}
+
+fn estimate_context_tokens(ctx: &CompletedContext) -> usize {
+    let translation_tokens = ctx.translated_text.len() / 4;
+    ctx.source_token_estimate.saturating_add(translation_tokens)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +473,7 @@ where
         tasks.spawn(async move {
             let mode = select_mode(&segment);
             let Ok(_permit) = semaphore.acquire_owned().await else {
-                return failed_translation_with_tokens(
+                let failed = failed_translation_with_tokens(
                     &segment,
                     mode,
                     "scheduler semaphore closed before segment could run".to_string(),
@@ -214,8 +481,16 @@ where
                     None,
                     None,
                 );
+                if let Some(registry) = config.context_registry.as_deref() {
+                    registry.pre_populate(&segment, &failed);
+                }
+                return failed;
             };
-            translate_one(provider, library, segment, &config).await
+            let translation = translate_one(provider, library, segment.clone(), &config).await;
+            if let Some(registry) = config.context_registry.as_deref() {
+                registry.pre_populate(&segment, &translation);
+            }
+            translation
         });
     }
 
@@ -375,6 +650,14 @@ where
     let mut accum_in: u64 = 0;
     let mut accum_cached_in: u64 = 0;
     let mut accum_out: u64 = 0;
+    let context_pairs = match config.context_registry.as_deref() {
+        Some(registry) if config.context.enabled() => {
+            registry
+                .await_context_for(&segment.id, config.context)
+                .await
+        }
+        _ => Vec::new(),
+    };
 
     for _ in 0..attempts {
         let retry_context = last_error.as_ref().map(ToString::to_string);
@@ -385,6 +668,7 @@ where
             config,
             mode,
             retry_context.as_deref(),
+            &context_pairs,
         )
         .await;
         match result {
@@ -436,6 +720,7 @@ where
             config,
             TranslationMode::RunPreserving,
             retry_context.as_deref(),
+            &context_pairs,
         )
         .await;
         match result {
@@ -513,6 +798,7 @@ async fn request_translation<P>(
     config: &TranslationRunConfig,
     mode: TranslationMode,
     retry_context: Option<&str>,
+    context_pairs: &[CompletedContext],
 ) -> Result<SegmentTranslation>
 where
     P: LlmProvider,
@@ -522,7 +808,7 @@ where
         TranslationMode::MarkerSafe => &library.marker_safe,
         TranslationMode::RunPreserving => &library.run_preserving,
     };
-    let mut rendered = render_prompt(template, segment, config, mode)?;
+    let mut rendered = render_prompt(template, segment, config, mode, context_pairs)?;
     if let Some(retry_context) = retry_context {
         rendered
             .user
@@ -607,8 +893,10 @@ fn render_prompt(
     segment: &Segment,
     config: &TranslationRunConfig,
     mode: TranslationMode,
+    context_pairs: &[CompletedContext],
 ) -> Result<crate::prompt::Rendered> {
     let (glossary_json, glossary_prose) = glossary_for_segment(config, &segment.id.0);
+    let context_block = render_context_pairs(context_pairs);
     let mut vars = Substitutions::new();
     vars.string(
         "source_language",
@@ -640,6 +928,7 @@ fn render_prompt(
     )
     .json("glossary_json", &glossary_json)
     .raw("glossary_block_prose", glossary_prose)
+    .raw("context_translation_pairs", context_block)
     .raw(
         "prompt_extra",
         config.glossary.prompt_extra.clone().unwrap_or_default(),
@@ -702,6 +991,30 @@ fn render_prompt(
     template
         .render(&vars)
         .map_err(|err| LlmError::Provider(format!("prompt render failed: {err}")))
+}
+
+pub(crate) fn render_context_pairs(pairs: &[CompletedContext]) -> String {
+    if pairs.is_empty() {
+        return String::new();
+    }
+    // Pairs arrive closest-first; chronological order in the prompt reads
+    // better, so we flip them for rendering.
+    let mut out = String::from("=== Context (already translated, do not retranslate) ===\n");
+    let mut first = true;
+    for ctx in pairs.iter().rev() {
+        if !first {
+            out.push_str("---\n");
+        }
+        out.push_str("Source: ");
+        out.push_str(ctx.source_text.trim());
+        out.push('\n');
+        out.push_str("Target: ");
+        out.push_str(ctx.translated_text.trim());
+        out.push('\n');
+        first = false;
+    }
+    out.push_str("=== End context ===\n");
+    out
 }
 
 pub(crate) fn glossary_for_segment(
@@ -1511,6 +1824,7 @@ mod tests {
             &segment,
             &json_config,
             TranslationMode::Plain,
+            &[],
         )
         .expect("prompt should render");
         assert!(rendered.user.contains("\"source\": \"Aragorn\""));
@@ -1523,6 +1837,7 @@ mod tests {
             &segment,
             &prose_config,
             TranslationMode::Plain,
+            &[],
         )
         .expect("prompt should render");
         assert!(rendered.user.contains("Active glossary constraints"));
@@ -1547,6 +1862,8 @@ mod tests {
             batch_max_output_tokens: None,
             compact_prompts: false,
             glossary: GlossaryRunConfig::default(),
+            context: ContextRunConfig::default(),
+            context_registry: None,
         }
     }
 
@@ -1642,5 +1959,381 @@ mod tests {
                 supports_usage_tokens: true,
             }
         }
+    }
+
+    fn segment_in_section(id: &str, section_id: &str, ordinal: usize, block_text: &str) -> Segment {
+        let mut seg = segment(id, ordinal, vec![("b0", block_text)]);
+        seg.section_id = SectionId(section_id.to_string());
+        seg
+    }
+
+    fn translation_for(seg: &Segment, text: &str, status: SegmentStatus) -> SegmentTranslation {
+        SegmentTranslation {
+            segment_id: seg.id.clone(),
+            ordinal: seg.ordinal,
+            block_ids: seg.block_ids.clone(),
+            blocks: seg
+                .block_ids
+                .iter()
+                .map(|id| BlockTranslation {
+                    block_id: id.clone(),
+                    text: text.to_string(),
+                })
+                .collect(),
+            checksum: seg.checksum.clone(),
+            status,
+            template: "translate_segment".to_string(),
+            error: None,
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            tokens_estimated: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn context_registry_returns_prior_pairs_in_closest_first_order() {
+        let segs = vec![
+            segment_in_section("a", "s1", 0, "Alpha"),
+            segment_in_section("b", "s1", 1, "Bravo"),
+            segment_in_section("c", "s1", 2, "Charlie"),
+            segment_in_section("d", "s1", 3, "Delta"),
+        ];
+        let registry = ContextRegistry::new(&segs);
+        for seg in &segs[..3] {
+            registry.pre_populate(
+                seg,
+                &translation_for(
+                    seg,
+                    &format!("[T]{}", seg.source.text),
+                    SegmentStatus::Succeeded,
+                ),
+            );
+        }
+        let cfg = ContextRunConfig {
+            window: 3,
+            budget_tokens: 10_000,
+            scope: ContextScope::Chapter,
+        };
+        let pairs = registry.await_context_for(&segs[3].id, cfg).await;
+        let ids: Vec<&str> = pairs.iter().map(|p| p.segment_id.0.as_str()).collect();
+        assert_eq!(ids, vec!["c", "b", "a"], "closest segment must come first");
+    }
+
+    #[tokio::test]
+    async fn context_registry_skips_failed_status() {
+        let segs = vec![
+            segment_in_section("a", "s1", 0, "Alpha"),
+            segment_in_section("b", "s1", 1, "Bravo"),
+            segment_in_section("c", "s1", 2, "Charlie"),
+        ];
+        let registry = ContextRegistry::new(&segs);
+        registry.pre_populate(
+            &segs[0],
+            &translation_for(&segs[0], "[T]Alpha", SegmentStatus::Succeeded),
+        );
+        registry.pre_populate(
+            &segs[1],
+            &translation_for(&segs[1], "[T]Bravo", SegmentStatus::Failed),
+        );
+        let cfg = ContextRunConfig {
+            window: 3,
+            budget_tokens: 10_000,
+            scope: ContextScope::Chapter,
+        };
+        let pairs = registry.await_context_for(&segs[2].id, cfg).await;
+        let ids: Vec<&str> = pairs.iter().map(|p| p.segment_id.0.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a"],
+            "failed segment must unblock the fence but be filtered out"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_registry_chapter_scope_excludes_other_sections() {
+        let segs = vec![
+            segment_in_section("a", "s1", 0, "Alpha"),
+            segment_in_section("b", "s2", 1, "Bravo"),
+            segment_in_section("c", "s2", 2, "Charlie"),
+        ];
+        let registry = ContextRegistry::new(&segs);
+        for seg in &segs[..2] {
+            registry.pre_populate(
+                seg,
+                &translation_for(
+                    seg,
+                    &format!("[T]{}", seg.source.text),
+                    SegmentStatus::Succeeded,
+                ),
+            );
+        }
+        let cfg = ContextRunConfig {
+            window: 3,
+            budget_tokens: 10_000,
+            scope: ContextScope::Chapter,
+        };
+        let pairs = registry.await_context_for(&segs[2].id, cfg).await;
+        let ids: Vec<&str> = pairs.iter().map(|p| p.segment_id.0.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["b"],
+            "chapter scope must exclude cross-section segments"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_registry_book_scope_walks_global_order() {
+        let segs = vec![
+            segment_in_section("a", "s1", 0, "Alpha"),
+            segment_in_section("b", "s2", 1, "Bravo"),
+            segment_in_section("c", "s2", 2, "Charlie"),
+        ];
+        let registry = ContextRegistry::new(&segs);
+        for seg in &segs[..2] {
+            registry.pre_populate(
+                seg,
+                &translation_for(
+                    seg,
+                    &format!("[T]{}", seg.source.text),
+                    SegmentStatus::Succeeded,
+                ),
+            );
+        }
+        let cfg = ContextRunConfig {
+            window: 3,
+            budget_tokens: 10_000,
+            scope: ContextScope::Book,
+        };
+        let pairs = registry.await_context_for(&segs[2].id, cfg).await;
+        let ids: Vec<&str> = pairs.iter().map(|p| p.segment_id.0.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["b", "a"],
+            "book scope must walk segments across sections in canonical order"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_budget_drops_oldest_pairs_first() {
+        let segs = vec![
+            segment_in_section("a", "s1", 0, "AlphaAlphaAlphaAlphaAlphaAlphaAlphaAlpha"),
+            segment_in_section("b", "s1", 1, "BravoBravoBravoBravoBravoBravoBravoBravo"),
+            segment_in_section("c", "s1", 2, "CharlieCharlieCharlieCharlieCharlieCharlie"),
+            segment_in_section("d", "s1", 3, "Delta"),
+        ];
+        let registry = ContextRegistry::new(&segs);
+        for seg in &segs[..3] {
+            registry.pre_populate(
+                seg,
+                &translation_for(
+                    seg,
+                    &format!("[T]{} long-target-text-that-eats-budget", seg.source.text),
+                    SegmentStatus::Succeeded,
+                ),
+            );
+        }
+        let cfg = ContextRunConfig {
+            window: 3,
+            budget_tokens: 30, // intentionally tight
+            scope: ContextScope::Chapter,
+        };
+        let pairs = registry.await_context_for(&segs[3].id, cfg).await;
+        assert!(
+            pairs.len() < 3,
+            "budget should cap pairs (got {})",
+            pairs.len()
+        );
+        if !pairs.is_empty() {
+            // Closest-first: the kept entries must start at segment c (closest).
+            assert_eq!(pairs[0].segment_id.0, "c");
+        }
+    }
+
+    #[tokio::test]
+    async fn context_registry_disabled_returns_empty() {
+        let segs = vec![
+            segment_in_section("a", "s1", 0, "Alpha"),
+            segment_in_section("b", "s1", 1, "Bravo"),
+        ];
+        let registry = ContextRegistry::new(&segs);
+        registry.pre_populate(
+            &segs[0],
+            &translation_for(&segs[0], "[T]Alpha", SegmentStatus::Succeeded),
+        );
+        let cfg = ContextRunConfig {
+            window: 0,
+            budget_tokens: 1200,
+            scope: ContextScope::Chapter,
+        };
+        let pairs = registry.await_context_for(&segs[1].id, cfg).await;
+        assert!(pairs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_registry_waits_for_late_publish() {
+        let segs = vec![
+            segment_in_section("a", "s1", 0, "Alpha"),
+            segment_in_section("b", "s1", 1, "Bravo"),
+        ];
+        let registry = Arc::new(ContextRegistry::new(&segs));
+        let registry_clone = registry.clone();
+        let seg_a = segs[0].clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            registry_clone.pre_populate(
+                &seg_a,
+                &translation_for(&seg_a, "[T]Alpha-late", SegmentStatus::Succeeded),
+            );
+        });
+        let cfg = ContextRunConfig {
+            window: 3,
+            budget_tokens: 10_000,
+            scope: ContextScope::Chapter,
+        };
+        let pairs = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            registry.await_context_for(&segs[1].id, cfg),
+        )
+        .await
+        .expect("fence must unblock once segment a publishes");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].translated_text, "[T]Alpha-late");
+    }
+
+    #[test]
+    fn render_context_pairs_formats_chronological() {
+        let segs = [
+            segment_in_section("a", "s1", 0, "Alpha"),
+            segment_in_section("b", "s1", 1, "Bravo"),
+        ];
+        let pairs = [
+            CompletedContext {
+                segment_id: segs[1].id.clone(),
+                section_id: segs[1].section_id.clone(),
+                ordinal: 1,
+                source_text: "Bravo source".to_string(),
+                translated_text: "Bravo target".to_string(),
+                status: SegmentStatus::Succeeded,
+                source_token_estimate: 2,
+            },
+            CompletedContext {
+                segment_id: segs[0].id.clone(),
+                section_id: segs[0].section_id.clone(),
+                ordinal: 0,
+                source_text: "Alpha source".to_string(),
+                translated_text: "Alpha target".to_string(),
+                status: SegmentStatus::Succeeded,
+                source_token_estimate: 2,
+            },
+        ];
+        let rendered = render_context_pairs(&pairs);
+        // Closest-first input becomes chronological in output (oldest at top).
+        let alpha_pos = rendered.find("Alpha source").expect("alpha present");
+        let bravo_pos = rendered.find("Bravo source").expect("bravo present");
+        assert!(alpha_pos < bravo_pos, "older segment must render first");
+        assert!(rendered.contains("=== Context"));
+        assert!(rendered.contains("=== End context ==="));
+    }
+
+    #[test]
+    fn render_context_pairs_empty_returns_empty() {
+        assert_eq!(render_context_pairs(&[]), "");
+    }
+
+    #[derive(Clone, Default)]
+    struct PromptCaptureProvider {
+        // segment_id -> last user prompt seen
+        log: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    }
+
+    impl LlmProvider for PromptCaptureProvider {
+        async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+            let segment_id = request
+                .metadata
+                .segment_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            {
+                let mut log = self.log.lock().expect("prompt log mutex poisoned");
+                log.insert(segment_id.clone(), request.user.clone());
+            }
+            // Emit a minimal valid plain-mode JSON response so the validator passes.
+            let body = serde_json::json!({
+                "segment_id": segment_id,
+                "translation": format!("[T]{segment_id}"),
+            });
+            Ok(CompletionResponse {
+                content: body.to_string(),
+                input_tokens: Some(10),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(5),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 0,
+                raw: serde_json::json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sliding_context_inserts_prior_pairs_into_segment_prompt() {
+        let segs = vec![
+            segment_in_section("s0", "ch1", 0, "First sentence."),
+            segment_in_section("s1", "ch1", 1, "Second sentence."),
+            segment_in_section("s2", "ch1", 2, "Third sentence."),
+            segment_in_section("s3", "ch1", 3, "Fourth sentence."),
+        ];
+        let registry = Arc::new(ContextRegistry::new(&segs));
+        let provider = PromptCaptureProvider::default();
+        let log = provider.log.clone();
+
+        let mut cfg = config();
+        cfg.scheduler.concurrency = 1; // deterministic ordering
+        cfg.context = ContextRunConfig {
+            window: 3,
+            budget_tokens: 10_000,
+            scope: ContextScope::Chapter,
+        };
+        cfg.context_registry = Some(registry.clone());
+
+        let translations = translate_segments(provider, &segs, &cfg)
+            .await
+            .expect("mock translation should succeed");
+        assert_eq!(translations.len(), 4);
+        for t in &translations {
+            assert_eq!(t.status, SegmentStatus::Succeeded);
+        }
+
+        let log = log.lock().expect("log");
+        let s3_prompt = log.get("s3").expect("s3 prompt captured");
+        assert!(
+            s3_prompt.contains("=== Context (already translated"),
+            "s3 prompt must include sliding-context block"
+        );
+        assert!(
+            s3_prompt.contains("First sentence."),
+            "context for s3 must include earliest in-window source"
+        );
+        assert!(
+            s3_prompt.contains("Second sentence."),
+            "context for s3 must include second source"
+        );
+        assert!(
+            s3_prompt.contains("Third sentence."),
+            "context for s3 must include third source (closest)"
+        );
+
+        let s0_prompt = log.get("s0").expect("s0 prompt captured");
+        assert!(
+            !s0_prompt.contains("=== Context"),
+            "first segment has no prior context"
+        );
     }
 }

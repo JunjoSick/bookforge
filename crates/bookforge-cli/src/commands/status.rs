@@ -208,6 +208,9 @@ mod tests {
             prompt_extra: None,
             glossary_fingerprint: String::new(),
             glossary_terms: Vec::new(),
+            context_window: 0,
+            context_budget_tokens: 1200,
+            context_scope: bookforge_core::config::ContextScope::Chapter,
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         }
     }

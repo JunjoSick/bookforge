@@ -13,12 +13,12 @@ use bookforge_epub::read_epub;
 #[cfg(test)]
 use bookforge_llm::translate_segments;
 use bookforge_llm::{
-    AdaptiveLimiter, GlossaryRunConfig, LlmError, LlmProvider, MockMode, MockProvider,
-    OpenAiCompatibleConfig, OpenAiCompatibleProvider, ProviderRateController, QaSegmentReview,
-    RateControllerConfig, SegmentTranslation, TelemetryLog, TranslationRunConfig,
-    account_for_batch_prompt_overhead, build_translation_batches, qa_segments_parallel,
-    run_double_check, telemetry_summary, translate_batches_with_callback,
-    translate_segments_with_callback,
+    AdaptiveLimiter, ContextRegistry, ContextRunConfig, GlossaryRunConfig, LlmError, LlmProvider,
+    MockMode, MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
+    ProviderRateController, QaSegmentReview, RateControllerConfig, SegmentTranslation,
+    TelemetryLog, TranslationRunConfig, account_for_batch_prompt_overhead,
+    build_translation_batches, qa_segments_parallel, run_double_check, telemetry_summary,
+    translate_batches_with_callback, translate_segments_with_callback,
 };
 use bookforge_store::{CreateJob, JobRecord, JobStore};
 use clap::Args;
@@ -154,6 +154,33 @@ pub(crate) struct PreparedGlossary {
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn context_run_config_from_args(cli_args: &TranslateArgs) -> ContextRunConfig {
+    ContextRunConfig {
+        window: cli_args.context_window,
+        budget_tokens: cli_args.context_budget_tokens,
+        scope: cli_args.context_scope,
+    }
+}
+
+/// Seed the in-memory completion fence from already-completed translations
+/// (cache hits, prior runs). Without this the fence would deadlock on
+/// segments that won't be re-translated this run.
+pub(crate) fn prepopulate_context_registry(
+    registry: Option<&Arc<ContextRegistry>>,
+    segments: &[Segment],
+    translations: &[SegmentTranslation],
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    let by_id: std::collections::HashMap<_, _> = segments.iter().map(|s| (&s.id, s)).collect();
+    for translation in translations {
+        if let Some(segment) = by_id.get(&translation.segment_id) {
+            registry.pre_populate(segment, translation);
+        }
+    }
+}
+
 pub(crate) fn prepare_glossary_run_config(
     store: &JobStore,
     glossary_files: &[PathBuf],
@@ -311,6 +338,12 @@ async fn run_mock_translation(
         cli_args.prompt_extra.clone(),
         &segments,
     )?;
+    let context_run_config = context_run_config_from_args(cli_args);
+    let context_registry: Option<Arc<ContextRegistry>> = if context_run_config.enabled() {
+        Some(Arc::new(ContextRegistry::new(&segments)))
+    } else {
+        None
+    };
     let job = store.create_job(CreateJob {
         input,
         output: &config.output,
@@ -378,6 +411,8 @@ async fn run_mock_translation(
         batch_max_output_tokens: None,
         compact_prompts: false,
         glossary: glossary.run_config.clone(),
+        context: context_run_config,
+        context_registry: context_registry.clone(),
     }; // mock
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     let mut translations = apply_cached_translations(
@@ -394,6 +429,7 @@ async fn run_mock_translation(
         },
     )?;
     let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
+    prepopulate_context_registry(context_registry.as_ref(), &segments, &translations);
     progress.emit(bookforge_core::ProgressEvent::CacheScanFinished {
         hits: translations.len(),
         misses: pending_segments.len(),
@@ -569,6 +605,12 @@ async fn run_openai_compatible_translation(
         cli_args.prompt_extra.clone(),
         &segments,
     )?;
+    let context_run_config = context_run_config_from_args(cli_args);
+    let context_registry: Option<Arc<ContextRegistry>> = if context_run_config.enabled() {
+        Some(Arc::new(ContextRegistry::new(&segments)))
+    } else {
+        None
+    };
     let job = store.create_job(CreateJob {
         input,
         output: &config.output,
@@ -636,6 +678,8 @@ async fn run_openai_compatible_translation(
         batch_max_output_tokens: settings.provider.batch_max_output_tokens,
         compact_prompts: settings.compact_prompts,
         glossary: glossary.run_config.clone(),
+        context: context_run_config,
+        context_registry: context_registry.clone(),
     };
     // batch_run_config
 
@@ -657,6 +701,8 @@ async fn run_openai_compatible_translation(
             batch_max_output_tokens: settings.provider.batch_max_output_tokens,
             compact_prompts: settings.compact_prompts,
             glossary: run_config.glossary.clone(),
+            context: run_config.context,
+            context_registry: run_config.context_registry.clone(),
         };
         let mut translations = apply_cached_translations(
             &segments,
@@ -679,6 +725,7 @@ async fn run_openai_compatible_translation(
             timestamp_ms: bookforge_core::progress::now_ms(),
         });
         let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
+        prepopulate_context_registry(context_registry.as_ref(), &segments, &translations);
         let writer = CheckpointWriter::spawn(store.path().to_path_buf(), progress.clone());
         let sender = writer.sender();
         let translation_result = translate_and_checkpoint_batch(
@@ -739,6 +786,7 @@ async fn run_openai_compatible_translation(
             timestamp_ms: bookforge_core::progress::now_ms(),
         });
         let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
+        prepopulate_context_registry(context_registry.as_ref(), &segments, &translations);
         let writer = CheckpointWriter::spawn(store.path().to_path_buf(), progress.clone());
         let sender = writer.sender();
         let translation_result = translate_and_checkpoint(
@@ -1159,6 +1207,8 @@ async fn run_fallback_pass(
         batch_max_output_tokens: settings.provider.batch_max_output_tokens,
         compact_prompts: settings.compact_prompts,
         glossary: primary_run_config.glossary.clone(),
+        context: primary_run_config.context,
+        context_registry: primary_run_config.context_registry.clone(),
     }; // fallback_run_config
 
     let writer = CheckpointWriter::spawn(store.path().to_path_buf(), Arc::new(NullProgressSink));
@@ -1713,6 +1763,8 @@ mod tests {
             batch_max_output_tokens: None,
             compact_prompts: false,
             glossary: GlossaryRunConfig::default(),
+            context: ContextRunConfig::default(),
+            context_registry: None,
         };
 
         let error = translate_with_scheduler_guard(
@@ -2008,6 +2060,9 @@ case_sensitive = true
             glossary_budget_tokens: 800,
             glossary_format: GlossaryFormat::Json,
             prompt_extra: None,
+            context_window: 0,
+            context_budget_tokens: 1200,
+            context_scope: bookforge_core::config::ContextScope::Chapter,
             qa: QaMode::Off,
             qa_concurrency: 8,
             qa_batch_target_tokens: None,

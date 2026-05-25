@@ -1942,6 +1942,16 @@ async fn translate_one_batch(
     batch: TranslationBatch,
     config: &TranslationRunConfig,
 ) -> Result<BatchTranslationResult, LlmError> {
+    if config.context.enabled() {
+        // v1.3 PR1 limitation: batches are not section-aware, so injecting
+        // sliding context risks deadlock when a single batch contains
+        // multiple segments from the same chapter. Section-aware batches
+        // land in a follow-up; for now batch mode skips context injection.
+        tracing::warn!(
+            batch_id = batch.id,
+            "sliding context disabled for batch mode (--context-window > 0 ignored in this batch)"
+        );
+    }
     let items_json = render_batch_items(&batch, config);
     let template = if config.compact_prompts {
         match batch.mode {
@@ -2713,6 +2723,8 @@ mod tests {
             batch_max_output_tokens: None,
             compact_prompts: false,
             glossary: crate::GlossaryRunConfig::default(),
+            context: crate::ContextRunConfig::default(),
+            context_registry: None,
         }
     }
 
