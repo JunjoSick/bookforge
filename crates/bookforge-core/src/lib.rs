@@ -7,6 +7,7 @@ pub mod progress;
 pub mod run_snapshot;
 pub mod scheduler;
 pub mod segment;
+pub mod style;
 
 pub use config::{
     BatchConfig, DoubleCheckConfig, DoubleCheckMode, FallbackScope, JsonMode, ModelEndpoint,
@@ -24,3 +25,7 @@ pub use glossary::{
 pub use progress::{NullProgressSink, ProgressEvent, ProgressSink, now_ms};
 pub use run_snapshot::{ResolvedRunSettingsSnapshot, RunConfigSnapshot};
 pub use scheduler::SchedulerConfig;
+pub use style::{
+    DoNotFields, RegisterFields, StyleSheet, VoiceFields, merge_style_sheets, render_style_block,
+    style_fingerprint,
+};

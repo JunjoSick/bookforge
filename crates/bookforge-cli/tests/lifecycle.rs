@@ -84,6 +84,129 @@ fn cli_translate_context_window_persists_snapshot_settings() {
 }
 
 #[test]
+fn cli_translate_with_style_sheet_persists_rendered_block_in_snapshot() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let style_path = temp.path().join("style.toml");
+    fs::write(
+        &style_path,
+        r#"[meta]
+schema_version = 1
+target_language = "Italian"
+
+[meta.scope]
+kind = "book"
+id = "smoke"
+
+[register]
+narration = "literary"
+dialogue_default = "tu"
+
+[free_text]
+instructions = "Maintain a literary register typical of Italian fiction translation."
+"#,
+    )
+    .expect("style sheet should write");
+
+    let output = temp.path().join("out.epub");
+    let events = temp.path().join("events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            fixture_input().to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--profile",
+            "v1-fast",
+            "--book-id",
+            "smoke",
+            "--style",
+            style_path.to_str().unwrap(),
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let job_id = job_id_from_events(&events);
+    let store =
+        JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store should open");
+    let snapshot = store
+        .load_job_config_snapshot(&job_id)
+        .expect("snapshot load")
+        .expect("snapshot present");
+    assert!(
+        !snapshot.style_rendered_block.is_empty(),
+        "snapshot should capture a non-empty style block when --style is supplied"
+    );
+    assert!(
+        snapshot.style_rendered_block.contains("Register: literary"),
+        "rendered block must include configured register"
+    );
+    assert!(
+        snapshot
+            .style_rendered_block
+            .contains("Dialogue default: tu"),
+        "rendered block must include configured dialogue default"
+    );
+    assert!(
+        snapshot
+            .style_rendered_block
+            .contains("Maintain a literary register"),
+        "rendered block must include free-text instructions"
+    );
+    assert!(
+        !snapshot.style_fingerprint.is_empty(),
+        "snapshot should record a style fingerprint when style is active"
+    );
+}
+
+#[test]
+fn cli_style_import_then_show_matches_input() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let style_path = temp.path().join("style.toml");
+    fs::write(
+        &style_path,
+        r#"[meta]
+schema_version = 1
+target_language = "Italian"
+
+[meta.scope]
+kind = "global"
+
+[register]
+narration = "neutral"
+"#,
+    )
+    .expect("style sheet should write");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["style", "import", style_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args(["style", "show", "--language", "Italian"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("Register: neutral"),
+        "show output should render the imported register; got: {stdout}"
+    );
+}
+
+#[test]
 fn cli_translate_mock_with_same_glossary_is_bit_identical() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let input = fixture_input();

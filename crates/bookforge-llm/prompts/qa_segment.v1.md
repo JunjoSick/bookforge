@@ -66,6 +66,12 @@ Glossary and fixed terminology:
 {{glossary_json}}
 ```
 
+Active style guide (review for adherence to register and dialogue conventions):
+
+```txt
+{{style_guide_block}}
+```
+
 Source:
 
 ```txt

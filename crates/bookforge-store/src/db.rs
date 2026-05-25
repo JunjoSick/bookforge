@@ -227,6 +227,25 @@ pub struct StoredGlossaryCandidate {
     pub source_count: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct NewStyleSheet<'a> {
+    pub scope_kind: GlossaryScopeKind,
+    pub scope_id: Option<&'a str>,
+    pub target_language: &'a str,
+    pub content_toml: &'a str,
+    pub fingerprint: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredStyleSheet {
+    pub id: i64,
+    pub scope_kind: GlossaryScopeKind,
+    pub scope_id: Option<String>,
+    pub target_language: String,
+    pub content_toml: String,
+    pub fingerprint: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct StorageDoctor {
     pub database_path: PathBuf,
@@ -1330,6 +1349,121 @@ impl JobStore {
         Ok(count)
     }
 
+    /// Upsert a style sheet for a (scope, target_language) tuple. Returns
+    /// the row id of the inserted/updated row.
+    pub fn upsert_style_sheet(&self, record: &NewStyleSheet<'_>) -> Result<i64> {
+        let conn = self.conn.borrow();
+        let now = timestamp_string();
+        conn.execute(
+            "INSERT INTO style_sheets
+                (scope_kind, scope_id, target_language, content_toml, fingerprint, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             ON CONFLICT(scope_kind, scope_id, target_language) DO UPDATE SET
+                content_toml = excluded.content_toml,
+                fingerprint = excluded.fingerprint,
+                updated_at = excluded.updated_at",
+            params![
+                record.scope_kind.as_str(),
+                record.scope_id,
+                record.target_language,
+                record.content_toml,
+                record.fingerprint,
+                now,
+            ],
+        )?;
+        let id: i64 = conn.query_row(
+            "SELECT id FROM style_sheets
+                WHERE scope_kind = ?1 AND IFNULL(scope_id, '') = IFNULL(?2, '')
+                  AND target_language = ?3",
+            params![
+                record.scope_kind.as_str(),
+                record.scope_id,
+                record.target_language
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    /// Load all style sheets that apply for a given language pair and
+    /// optional book/series scopes. Caller is responsible for merging via
+    /// [`bookforge_core::style::merge_style_sheets`].
+    pub fn load_active_style_sheets(
+        &self,
+        target_language: &str,
+        book_id: Option<&str>,
+        series_id: Option<&str>,
+    ) -> Result<Vec<StoredStyleSheet>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT id, scope_kind, scope_id, target_language, content_toml, fingerprint
+             FROM style_sheets
+             WHERE target_language = ?1
+               AND ( (scope_kind = 'global')
+                  OR (scope_kind = 'series' AND scope_id = ?2)
+                  OR (scope_kind = 'book' AND scope_id = ?3) )",
+        )?;
+        let rows = stmt.query_map(params![target_language, series_id, book_id], |row| {
+            Ok(StoredStyleSheet {
+                id: row.get(0)?,
+                scope_kind: parse_row_enum(&row.get::<_, String>(1)?, 1)?,
+                scope_id: row.get(2)?,
+                target_language: row.get(3)?,
+                content_toml: row.get(4)?,
+                fingerprint: row.get(5)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_style_sheets(
+        &self,
+        target_language: Option<&str>,
+        scope_kind: Option<GlossaryScopeKind>,
+        scope_id: Option<&str>,
+    ) -> Result<Vec<StoredStyleSheet>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT id, scope_kind, scope_id, target_language, content_toml, fingerprint
+             FROM style_sheets
+             WHERE (?1 IS NULL OR target_language = ?1)
+               AND (?2 IS NULL OR scope_kind = ?2)
+               AND (?3 IS NULL OR scope_id = ?3)
+             ORDER BY scope_kind, scope_id",
+        )?;
+        let scope_text = scope_kind.map(|s| s.as_str().to_string());
+        let rows = stmt.query_map(params![target_language, scope_text, scope_id], |row| {
+            Ok(StoredStyleSheet {
+                id: row.get(0)?,
+                scope_kind: parse_row_enum(&row.get::<_, String>(1)?, 1)?,
+                scope_id: row.get(2)?,
+                target_language: row.get(3)?,
+                content_toml: row.get(4)?,
+                fingerprint: row.get(5)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn clear_style_scope(
+        &self,
+        scope_kind: GlossaryScopeKind,
+        scope_id: Option<&str>,
+    ) -> Result<usize> {
+        let conn = self.conn.borrow();
+        let count = if scope_kind == GlossaryScopeKind::Global {
+            conn.execute("DELETE FROM style_sheets WHERE scope_kind = 'global'", [])?
+        } else {
+            conn.execute(
+                "DELETE FROM style_sheets WHERE scope_kind = ?1 AND scope_id = ?2",
+                params![scope_kind.as_str(), scope_id],
+            )?
+        };
+        Ok(count)
+    }
+
     pub fn pending_segment_ids(&self, job_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
@@ -1798,6 +1932,35 @@ impl JobStore {
               updated_at TEXT NOT NULL,
               UNIQUE(scope_kind, scope_id, source_text, source_language, target_language)
             );
+
+            CREATE TABLE IF NOT EXISTS style_sheets (
+              id INTEGER PRIMARY KEY,
+              scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global', 'series', 'book')),
+              scope_id TEXT,
+              target_language TEXT NOT NULL,
+              content_toml TEXT NOT NULL,
+              fingerprint TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(scope_kind, scope_id, target_language)
+            );
+
+            CREATE TABLE IF NOT EXISTS entities (
+              id INTEGER PRIMARY KEY,
+              scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global', 'series', 'book')),
+              scope_id TEXT,
+              source_name TEXT NOT NULL,
+              target_name TEXT NOT NULL,
+              gender_target TEXT
+                CHECK(gender_target IS NULL OR gender_target IN ('m', 'f', 'n')),
+              role TEXT,
+              notes TEXT,
+              source_language TEXT NOT NULL,
+              target_language TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(scope_kind, scope_id, source_name, source_language, target_language)
+            );
             ",
         )?;
         ensure_glossary_target_nullable(&conn)?;
@@ -1834,13 +1997,18 @@ impl JobStore {
              CREATE INDEX IF NOT EXISTS idx_segment_flags_job
              ON segment_flags(job_id, consumed);
              CREATE INDEX IF NOT EXISTS idx_glossary_lookup
-             ON glossary_terms(source_language, target_language, scope_kind, scope_id, status);",
+             ON glossary_terms(source_language, target_language, scope_kind, scope_id, status);
+             CREATE INDEX IF NOT EXISTS idx_style_lookup
+             ON style_sheets(target_language, scope_kind, scope_id);
+             CREATE INDEX IF NOT EXISTS idx_entity_lookup
+             ON entities(source_language, target_language, scope_kind, scope_id);",
         )?;
         record_migration(&conn, 1, "initial")?;
         record_migration(&conn, 2, "v1_0_1_input_snapshot")?;
         record_migration(&conn, 3, "v1_1_segment_flags")?;
         record_migration(&conn, 4, "v1_2_glossary_terms")?;
         record_migration(&conn, 5, "v1_2_1_nullable_glossary_candidate_targets")?;
+        record_migration(&conn, 6, "v1_3_context_styles_entities")?;
         Ok(())
     }
 
@@ -2328,6 +2496,8 @@ mod tests {
             context_window: 0,
             context_budget_tokens: 1200,
             context_scope: bookforge_core::config::ContextScope::Chapter,
+            style_fingerprint: String::new(),
+            style_rendered_block: String::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
 
@@ -2412,6 +2582,8 @@ mod tests {
             context_window: 0,
             context_budget_tokens: 1200,
             context_scope: bookforge_core::config::ContextScope::Chapter,
+            style_fingerprint: String::new(),
+            style_rendered_block: String::new(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
 
