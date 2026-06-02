@@ -59,6 +59,9 @@ pub struct ResumeArgs {
     pub timeout_seconds: Option<u64>,
 
     #[arg(long)]
+    pub max_output_tokens: Option<u32>,
+
+    #[arg(long)]
     pub ui: Option<crate::progress::UiMode>,
 
     #[arg(long)]
@@ -165,6 +168,9 @@ async fn run_inner(
     }
     if let Some(value) = args.timeout_seconds {
         settings.provider.timeout_seconds = value;
+    }
+    if let Some(value) = args.max_output_tokens {
+        settings.provider.max_output_tokens = Some(value);
     }
     if args.no_thinking {
         settings.provider.thinking_disabled = true;
@@ -1302,6 +1308,7 @@ mod tests {
             validation_max_attempts: None,
             qa: QaMode::Off,
             timeout_seconds: None,
+            max_output_tokens: None,
             ui: None,
             progress_jsonl: None,
             output: None,

@@ -39,7 +39,10 @@ where
         .collect::<std::collections::HashMap<_, _>>();
 
     for translation in translations.iter().cloned() {
-        if translation.status != SegmentStatus::Succeeded {
+        if !matches!(
+            translation.status,
+            SegmentStatus::Succeeded | SegmentStatus::SkippedCached
+        ) {
             continue;
         }
         let Some(segment) = by_segment.get(translation.segment_id.0.as_str()).cloned() else {
@@ -128,8 +131,14 @@ where
     P: LlmProvider,
 {
     use crate::Substitutions;
+    let (glossary_json, _glossary_prose) =
+        crate::scheduler::glossary_for_segment(config, &segment.id.0);
     let mut vars = Substitutions::new();
     vars.string("segment_id", &segment.id.0)
+        .string(
+            "book_title",
+            segment.metadata.book_title.as_deref().unwrap_or(""),
+        )
         .string(
             "source_language",
             config
@@ -138,8 +147,29 @@ where
                 .unwrap_or("the source language"),
         )
         .string("target_language", &config.target_language)
-        .string("source_text", &segment.source.text)
-        .string("translation_text", translation.joined_text())
+        .string(
+            "section_title",
+            segment.metadata.section_title.as_deref().unwrap_or(""),
+        )
+        .json("glossary_json", &glossary_json)
+        .raw(
+            "style_guide_block",
+            config
+                .style
+                .as_ref()
+                .map(|style| style.rendered_block.clone())
+                .unwrap_or_default(),
+        )
+        .raw(
+            "entity_agreement_block",
+            config
+                .entities
+                .as_ref()
+                .map(|entities| entities.rendered_block.clone())
+                .unwrap_or_default(),
+        )
+        .raw("source_text", &segment.source.text)
+        .raw("translation_text", translation.joined_text())
         .json("required_markers", &segment.constraints.preserve_markers)
         .json("protected_spans", &segment.constraints.preserve_spans);
 
