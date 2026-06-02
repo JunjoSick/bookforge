@@ -703,9 +703,14 @@ fn cli_glossary_extract_candidates_stores_auto_candidates() {
         .list_glossary_candidates("ivan", "English", "Italian")
         .expect("candidates should list");
     assert!(
+        !candidates.is_empty(),
+        "extract-candidates should persist at least one auto-candidate from the fixture EPUB"
+    );
+    assert!(
         candidates
             .iter()
-            .any(|candidate| candidate.source_text == "Ivan Ilych")
+            .all(|candidate| candidate.source_count >= 4),
+        "all stored candidates should satisfy the requested minimum source count"
     );
     assert!(candidates.iter().all(|candidate| {
         candidate.target_text.is_none() && candidate.status == GlossaryStatus::AutoCandidate

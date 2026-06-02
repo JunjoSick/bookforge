@@ -857,12 +857,15 @@ where
         mode.temperature_default()
     };
 
+    let max_output_tokens = config
+        .max_output_tokens
+        .unwrap_or_else(|| max_output_tokens(segment, mode, provider.is_reasoning()));
     let request = CompletionRequest {
         system: rendered.system,
         user: rendered.user,
         response_format: ResponseFormat::Json,
         temperature,
-        max_output_tokens: Some(max_output_tokens(segment, mode, provider.is_reasoning())),
+        max_output_tokens: Some(max_output_tokens),
         metadata: RequestMetadata {
             segment_id: Some(segment.id.0.clone()),
             block_ids: segment.block_ids.iter().map(|id| id.0.clone()).collect(),

@@ -1661,7 +1661,12 @@ fn suspicious_qa_candidates(
         .collect::<std::collections::HashMap<_, _>>();
     translations
         .iter()
-        .filter(|translation| translation.status == SegmentStatus::Succeeded)
+        .filter(|translation| {
+            matches!(
+                translation.status,
+                SegmentStatus::Succeeded | SegmentStatus::SkippedCached
+            )
+        })
         .filter(|translation| {
             let Some(segment) = by_segment.get(translation.segment_id.0.as_str()) else {
                 return false;
