@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Roadmap and planned milestones
+    url: https://github.com/JunjoSick/bookforge/blob/main/docs/ROADMAP.md
+    about: Most "when will you add X?" questions are answered here.
+  - name: Contributing guide
+    url: https://github.com/JunjoSick/bookforge/blob/main/CONTRIBUTING.md
+    about: How to file bugs, propose features, and submit PRs.

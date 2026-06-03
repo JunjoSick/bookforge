@@ -274,6 +274,10 @@ cargo test
 cargo clippy --all-targets --all-features
 ```
 
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for what's expected in issues
+and pull requests, and the architectural invariants any change has to
+respect.
+
 ## Repository Layout
 
 ```txt

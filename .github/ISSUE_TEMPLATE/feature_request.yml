@@ -1,0 +1,46 @@
+name: Feature request
+description: Something BookForge doesn't do that you think it should.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: please check [`docs/ROADMAP.md`](https://github.com/JunjoSick/bookforge/blob/main/docs/ROADMAP.md).
+        Most likely requests already map to a milestone, and the roadmap is
+        the answer to "when."
+
+        Requests that conflict with the architectural invariants in
+        ROADMAP §1 (especially the "program owns EPUB structure"
+        invariant) are unlikely to land. If your request needs to bend
+        an invariant, please say so explicitly and explain why.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the underlying need, not the proposed solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour (optional)
+      description: Concrete shape — flags, output, file layouts. Skip if you'd rather discuss the problem first.
+    validations:
+      required: false
+  - type: textarea
+    id: roadmap
+    attributes:
+      label: Where does this fit on the roadmap?
+      description: |
+        If you've already found a matching section, name it (e.g. "v1.5
+        §8.4 EPUBCheck integration"). If you've checked and nothing
+        matches, say so.
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Does this respect the architectural invariants?
+      description: Quick self-check against ROADMAP §1. Most requests do; some don't and that's worth flagging upfront.
+    validations:
+      required: false

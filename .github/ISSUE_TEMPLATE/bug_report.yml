@@ -1,0 +1,68 @@
+name: Bug report
+description: Something BookForge did wrong, or failed to do, that you can describe with a command and an EPUB.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: please skim [`docs/ROADMAP.md`](https://github.com/JunjoSick/bookforge/blob/main/docs/ROADMAP.md)
+        to check that what you're hitting isn't already a known limitation on
+        the way to a planned milestone.
+
+        Do **not** paste API keys, real book contents, or your `.bookforge/`
+        directory. Those are private data.
+  - type: input
+    id: version
+    attributes:
+      label: BookForge version
+      description: Output of `bookforge --version`.
+      placeholder: bookforge 1.4.0
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: e.g. macOS 15.4 arm64, Ubuntu 24.04 x86_64, Windows 11 x86_64
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command you ran
+      description: Paste the full `bookforge ...` invocation. Redact API keys.
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened
+      description: Error messages, log output, validator complaints, EPUB rendering problems, etc.
+    validations:
+      required: true
+  - type: textarea
+    id: repro_epub
+    attributes:
+      label: EPUB or repro description
+      description: |
+        If the EPUB is public domain (e.g. a Standard Ebooks fixture), share
+        the URL. If it's private, describe the structural features that
+        likely triggered the bug — footnotes, RTL passages, drop caps,
+        tables, math, very large chapters, etc.
+    validations:
+      required: true
+  - type: textarea
+    id: events
+    attributes:
+      label: Relevant `events.jsonl` excerpts
+      description: Optional. From `.bookforge/runs/<job-id>/events.jsonl`. Redact any source/target text you don't want shared.
+      render: jsonl
+    validations:
+      required: false
