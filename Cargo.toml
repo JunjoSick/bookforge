@@ -12,7 +12,7 @@ resolver = "3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/JunjoSick/bookforge"
-rust-version = "1.95"
+rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -32,3 +32,8 @@ quick-xml = "0.38"
 zip = "6.0"
 rusqlite = { version = "0.37", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip", "brotli"], default-features = false }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
