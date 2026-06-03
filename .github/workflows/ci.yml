@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel in-flight runs on the same ref when a new commit lands.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Pre-existing too_many_arguments warnings are tolerated; everything else fails the job.
+      - run: cargo clippy --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Lifecycle integration tests under crates/bookforge-cli/tests/ require
+      # test/test.epub, which is gitignored. They will be skipped in CI; that
+      # is intentional. The remaining workspace tests still run.
+      - run: cargo test --workspace --locked
+
+  msrv:
+    name: msrv (1.88.0)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.88
+      # Verifies the rust-version pin in Cargo.toml. If this job fails, either
+      # the codebase started using an API newer than 1.88 or a dependency's
+      # transitive MSRV climbed. See docs/msrv-audit.md before raising the floor.
+      - run: cargo check --workspace --all-targets --locked

@@ -623,6 +623,10 @@ fn preferred_form(forms: &BTreeMap<String, usize>) -> String {
         .unwrap_or_default()
 }
 
+// The two `current.push(ch)` branches look identical to clippy but guard
+// semantically distinct cases (alphabetic char vs. internal-word connector
+// with lookahead). Collapsing them with `||` would obscure intent.
+#[allow(clippy::if_same_then_else)]
 fn tokenize_words(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();

@@ -119,22 +119,21 @@ No source-code changes. No edition migration. No resolver change. CI
 config (when it lands in v1.5) should include a `cargo +1.88 check` job
 to enforce the floor against future API drift.
 
-## 6. Verification plan
+## 6. Verification
 
-The maintainer machine runs 1.95. The 1.88 build was **not** exercised
-as part of this audit because installing `rustup` on Arch is intrusive
-and out of scope for an evening audit. Verification should happen in
-one of:
+The maintainer machine runs 1.95 (Arch's system Rust, no `rustup`).
+Live verification under 1.88 happens via CI rather than a one-off
+local check: `.github/workflows/ci.yml` defines an `msrv` job that
+pins to `1.88.0` via `dtolnay/rust-toolchain@master` and runs
+`cargo check --workspace --all-targets --locked` on every PR and
+every push to `main`. The job is required before tagging `v1.4.0`.
 
-1. CI matrix job once GitHub Actions is configured for v1.4
-   (`actions-rs/toolchain@v1` with `toolchain: 1.88.0`).
-2. One-off local `rustup install 1.88 && cargo +1.88 check --workspace`
-   on the maintainer machine before tagging v1.4.0.
-
-If the build under 1.88 surfaces an API we missed in the grep, the
-options in priority order are: (a) rewrite the callsite (preferred),
-(b) bump MSRV to whatever the missing API actually requires and
-document why, (c) drop the offending dep version.
+If the MSRV job fails, the options in priority order are: (a) rewrite
+the callsite (preferred — the offending API likely has a stable-since-
+1.82 equivalent), (b) bump MSRV to whatever the missing API actually
+requires and document why, (c) pin the offending dep to a version with
+a lower MSRV (rarely viable; the `time 0.3.47` floor came in via the
+deliberate `zip 6.0` security bump).
 
 ## 7. Out of scope for this audit
 
