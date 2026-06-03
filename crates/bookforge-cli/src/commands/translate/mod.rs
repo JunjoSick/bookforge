@@ -21,7 +21,7 @@ use bookforge_llm::{
     run_double_check, telemetry_summary, translate_batches_with_callback,
     translate_segments_with_callback,
 };
-use bookforge_store::{CreateJob, JobRecord, JobStore};
+use bookforge_store::{CreateJob, JobRecord, JobStore, SaveTranslation};
 use clap::Args;
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, sync::Arc};
@@ -1077,15 +1077,17 @@ async fn finish_translation_pipeline(
     .await?;
     *translations = fallback_translations;
 
-    run_double_check_pass(
+    run_double_check_pass(DoubleCheckPass {
         provider,
         cancel_token,
         cli_args,
         segments,
         translations,
-        run_config,
+        store,
+        job_id: &job.id,
+        config: run_config,
         settings,
-    )
+    })
     .await?;
 
     mark_job_finished(store, &job.id, translations)?;
@@ -1433,15 +1435,30 @@ async fn run_fallback_pass(
     Ok(translations)
 }
 
-async fn run_double_check_pass(
-    provider: &OpenAiCompatibleProvider,
-    cancel_token: &tokio_util::sync::CancellationToken,
-    cli_args: &TranslateArgs,
-    segments: &[Segment],
-    translations: &[SegmentTranslation],
-    config: &TranslationRunConfig,
-    settings: &ResolvedRunSettings,
-) -> Result<()> {
+struct DoubleCheckPass<'a> {
+    provider: &'a OpenAiCompatibleProvider,
+    cancel_token: &'a tokio_util::sync::CancellationToken,
+    cli_args: &'a TranslateArgs,
+    segments: &'a [Segment],
+    translations: &'a mut [SegmentTranslation],
+    store: &'a JobStore,
+    job_id: &'a str,
+    config: &'a TranslationRunConfig,
+    settings: &'a ResolvedRunSettings,
+}
+
+async fn run_double_check_pass(pass: DoubleCheckPass<'_>) -> Result<()> {
+    let DoubleCheckPass {
+        provider,
+        cancel_token,
+        cli_args,
+        segments,
+        translations,
+        store,
+        job_id,
+        config,
+        settings,
+    } = pass;
     if settings.double_check.mode == DoubleCheckMode::Off {
         return Ok(());
     }
@@ -1500,7 +1517,81 @@ async fn run_double_check_pass(
         .filter(|c| matches!(c.status, bookforge_llm::CorrectionStatus::Unresolved))
         .count();
 
-    println!("  Corrections: {applied} applied, {rejected} rejected, {unresolved} unresolved");
+    let changed_segment_ids = apply_double_check_corrections(translations, &corrections);
+    persist_corrected_translations(store, job_id, config, translations, &changed_segment_ids)?;
+
+    println!(
+        "  Corrections: {applied} applied, {rejected} rejected, {unresolved} unresolved, {} segments updated",
+        changed_segment_ids.len()
+    );
+
+    Ok(())
+}
+
+pub(crate) fn apply_double_check_corrections(
+    translations: &mut [SegmentTranslation],
+    corrections: &[bookforge_llm::CorrectionRecord],
+) -> Vec<String> {
+    let mut changed_segment_ids = std::collections::BTreeSet::new();
+
+    for correction in corrections {
+        if !matches!(correction.status, bookforge_llm::CorrectionStatus::Applied) {
+            continue;
+        }
+        let Some(corrected) = correction.corrected_translation.as_deref() else {
+            continue;
+        };
+        let Some(translation) = translations
+            .iter_mut()
+            .find(|translation| translation.segment_id == correction.segment_id)
+        else {
+            continue;
+        };
+        let Some(block) = translation
+            .blocks
+            .iter_mut()
+            .find(|block| block.block_id == correction.block_id)
+        else {
+            continue;
+        };
+        if block.text != corrected {
+            block.text = corrected.to_string();
+            changed_segment_ids.insert(translation.segment_id.0.clone());
+        }
+    }
+
+    changed_segment_ids.into_iter().collect()
+}
+
+fn persist_corrected_translations(
+    store: &JobStore,
+    job_id: &str,
+    config: &TranslationRunConfig,
+    translations: &[SegmentTranslation],
+    changed_segment_ids: &[String],
+) -> Result<()> {
+    for segment_id in changed_segment_ids {
+        let Some(translation) = translations
+            .iter()
+            .find(|translation| translation.segment_id.0 == *segment_id)
+        else {
+            continue;
+        };
+        let joined = translation.joined_text();
+        store.save_translation(SaveTranslation {
+            job_id,
+            segment_id: &translation.segment_id.0,
+            translated_text: &joined,
+            blocks: &translation.blocks,
+            provider: &config.provider,
+            model: &config.model,
+            prompt_version: &config.prompt_version,
+            input_tokens: translation.input_tokens,
+            input_cached_tokens: translation.input_cached_tokens,
+            output_tokens: translation.output_tokens,
+            tokens_estimated: translation.tokens_estimated,
+        })?;
+    }
 
     Ok(())
 }
@@ -1900,8 +1991,8 @@ mod tests {
     use bookforge_core::{
         ir::{BlockId, SectionId},
         segment::{
-            SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
-            SegmentSource, SegmentTextRun,
+            BlockTranslation, SegmentBlock, SegmentConstraints, SegmentContext, SegmentId,
+            SegmentMetadata, SegmentSource, SegmentTextRun,
         },
     };
     use std::{fs, time::SystemTime};
@@ -2117,6 +2208,52 @@ case_sensitive = true
         let prose = glossary_fingerprint(GlossaryFormat::Prose, 800, None, &[term]);
 
         assert_ne!(json, prose);
+    }
+
+    #[test]
+    fn applied_double_check_corrections_update_matching_blocks() {
+        let mut translations = vec![SegmentTranslation {
+            segment_id: SegmentId("seg_a".to_string()),
+            ordinal: 0,
+            block_ids: vec![BlockId("b_000000".to_string())],
+            blocks: vec![BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "vecchio testo".to_string(),
+            }],
+            checksum: "checksum".to_string(),
+            status: SegmentStatus::Succeeded,
+            template: "translate_segment".to_string(),
+            error: None,
+            input_tokens: Some(10),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(12),
+            tokens_estimated: false,
+        }];
+        let corrections = vec![
+            bookforge_llm::CorrectionRecord {
+                item_id: "seg_a:b_000000".to_string(),
+                segment_id: SegmentId("seg_a".to_string()),
+                block_id: BlockId("b_000000".to_string()),
+                original_translation: "vecchio testo".to_string(),
+                corrected_translation: Some("testo corretto".to_string()),
+                status: bookforge_llm::CorrectionStatus::Applied,
+                issues: Vec::new(),
+            },
+            bookforge_llm::CorrectionRecord {
+                item_id: "seg_a:b_000000".to_string(),
+                segment_id: SegmentId("seg_a".to_string()),
+                block_id: BlockId("b_000000".to_string()),
+                original_translation: "testo corretto".to_string(),
+                corrected_translation: Some("non applicato".to_string()),
+                status: bookforge_llm::CorrectionStatus::Unresolved,
+                issues: Vec::new(),
+            },
+        ];
+
+        let changed = apply_double_check_corrections(&mut translations, &corrections);
+
+        assert_eq!(changed, vec!["seg_a".to_string()]);
+        assert_eq!(translations[0].blocks[0].text, "testo corretto");
     }
 
     fn segment(id: &str, ordinal: usize) -> Segment {

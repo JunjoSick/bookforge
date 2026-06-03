@@ -1779,7 +1779,9 @@ impl JobStore {
                    AND j.target_lang = ?6
                    AND s.cache_namespace = ?7
                    AND s.status IN ('succeeded', 'skipped_cached')
-                 ORDER BY t.created_at DESC
+                 ORDER BY CASE s.status WHEN 'succeeded' THEN 0 ELSE 1 END,
+                          CAST(t.created_at AS INTEGER) DESC,
+                          t.rowid DESC
                  LIMIT 1",
                 params![
                     segment.checksum,
@@ -1871,7 +1873,9 @@ impl JobStore {
                    AND j.target_lang = ?{}
                    AND s.cache_namespace = ?{}
                    AND s.status IN ('succeeded', 'skipped_cached')
-                 ORDER BY t.created_at DESC",
+                 ORDER BY CASE s.status WHEN 'succeeded' THEN 0 ELSE 1 END,
+                          CAST(t.created_at AS INTEGER) DESC,
+                          t.rowid DESC",
                 hashes.len() + 1,
                 hashes.len() + 2,
                 hashes.len() + 3,
@@ -2596,7 +2600,7 @@ mod tests {
         store
             .insert_segments(
                 &job.id,
-                &[seg.clone()],
+                std::slice::from_ref(&seg),
                 "v1",
                 "mock",
                 "mock-prefix",
@@ -3251,6 +3255,134 @@ mod tests {
         );
 
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn cached_translation_prefers_repaired_succeeded_rows_over_cached_clones() {
+        let db_path = temp_path("cache_prefers_repaired.sqlite");
+        let (store, _stale_job, seg) =
+            build_seeded_store_with_translation(&db_path, "cache_ns", &["b_000000"]);
+        let cached_input = temp_path("cached-input.epub");
+        let repaired_input = temp_path("repaired-input.epub");
+        fs::write(&cached_input, b"cached input").expect("cached input should be writable");
+        fs::write(&repaired_input, b"repaired input").expect("repaired input should be writable");
+
+        let cached_job = store
+            .create_job(CreateJob {
+                input: &cached_input,
+                output: &temp_path("cached-output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("cached job should be created");
+        store
+            .insert_segments(
+                &cached_job.id,
+                std::slice::from_ref(&seg),
+                "v1",
+                "mock",
+                "mock-prefix",
+                "cache_ns",
+            )
+            .expect("cached job segment should insert");
+        store
+            .save_cached_translation(SaveCachedTranslation {
+                job_id: &cached_job.id,
+                segment_id: "seg_a",
+                translated_text: "stale cached clone",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "stale cached clone".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+            })
+            .expect("cached clone should save");
+
+        let repaired_job = store
+            .create_job(CreateJob {
+                input: &repaired_input,
+                output: &temp_path("repaired-output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("repaired job should be created");
+        store
+            .insert_segments(
+                &repaired_job.id,
+                std::slice::from_ref(&seg),
+                "v1",
+                "mock",
+                "mock-prefix",
+                "cache_ns",
+            )
+            .expect("repaired job segment should insert");
+        store
+            .save_translation(SaveTranslation {
+                job_id: &repaired_job.id,
+                segment_id: "seg_a",
+                translated_text: "repaired translation",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "repaired translation".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                input_tokens: Some(12),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(8),
+                tokens_estimated: false,
+            })
+            .expect("repaired translation should save");
+
+        let request = CacheLookupRequest {
+            prompt_version: "v1",
+            provider: "mock",
+            model: "mock-prefix",
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            cache_namespace: "cache_ns",
+        };
+        let single_hit = store
+            .find_cached_translation(
+                &seg,
+                request.prompt_version,
+                request.provider,
+                request.model,
+                request.source_lang,
+                request.target_lang,
+                request.cache_namespace,
+            )
+            .expect("single lookup should succeed")
+            .expect("single lookup should hit");
+        let batch_hit = store
+            .find_cached_translations_batch(std::slice::from_ref(&seg), request)
+            .expect("batch lookup should succeed")
+            .remove(&seg.id.0)
+            .expect("batch lookup should hit");
+
+        assert_eq!(single_hit.translated_text, "repaired translation");
+        assert_eq!(single_hit.blocks[0].text, "repaired translation");
+        assert_eq!(batch_hit.translated_text, "repaired translation");
+        assert_eq!(batch_hit.blocks[0].text, "repaired translation");
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(cached_input);
+        let _ = fs::remove_file(repaired_input);
     }
 
     #[test]
