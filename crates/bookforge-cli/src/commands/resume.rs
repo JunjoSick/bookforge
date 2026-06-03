@@ -949,7 +949,9 @@ mod tests {
         settings.batch.enabled = false;
         settings.segmentation.max_segment_tokens = 1377;
         settings.segmentation.context_tokens = 77;
-        let mut fixture = resume_fixture(settings, 1);
+        let Some(mut fixture) = resume_fixture(settings, 1) else {
+            return;
+        };
 
         run_fixture(&mut fixture)
             .await
@@ -969,7 +971,9 @@ mod tests {
         let mut settings = TranslationProfile::Safe.resolve();
         settings.batch.enabled = false;
         settings.compact_prompts = true;
-        let mut fixture = resume_fixture(settings, 1);
+        let Some(mut fixture) = resume_fixture(settings, 1) else {
+            return;
+        };
 
         let events = run_fixture(&mut fixture)
             .await
@@ -986,7 +990,9 @@ mod tests {
         settings.batch.enabled = false;
         settings.provider.json_mode = JsonMode::PromptOnly;
         settings.provider.provider_max_attempts = 4;
-        let mut fixture = resume_fixture(settings.clone(), 1);
+        let Some(mut fixture) = resume_fixture(settings.clone(), 1) else {
+            return;
+        };
 
         let config = openai_compatible_config_from_parts(
             "openrouter",
@@ -1011,7 +1017,9 @@ mod tests {
     #[tokio::test]
     async fn resume_missing_config_snapshot_fails_clearly() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let input = fixture_input();
+        let Some(input) = fixture_input_or_skip() else {
+            return;
+        };
         let output = tempdir.path().join("out.epub");
         let store = JobStore::open(tempdir.path().join("jobs.sqlite")).expect("store should open");
         let job = store
@@ -1044,7 +1052,9 @@ mod tests {
     async fn resume_reuses_checkpointed_segments_and_translates_only_resumable_segments() {
         let mut settings = TranslationProfile::V1Fast.resolve();
         settings.batch.enabled = false;
-        let mut fixture = resume_fixture(settings, 2);
+        let Some(mut fixture) = resume_fixture(settings, 2) else {
+            return;
+        };
         save_succeeded(
             &fixture.store,
             &fixture.job.id,
@@ -1075,7 +1085,9 @@ mod tests {
     async fn resume_retry_pending_bypasses_cache() {
         let mut settings = TranslationProfile::V1Fast.resolve();
         settings.batch.enabled = false;
-        let mut fixture = resume_fixture(settings, 1);
+        let Some(mut fixture) = resume_fixture(settings, 1) else {
+            return;
+        };
         let cache_job = fixture
             .store
             .create_job(CreateJob {
@@ -1143,7 +1155,9 @@ mod tests {
     async fn resume_skips_needs_review_by_default() {
         let mut settings = TranslationProfile::V1Fast.resolve();
         settings.batch.enabled = false;
-        let mut fixture = resume_fixture(settings, 2);
+        let Some(mut fixture) = resume_fixture(settings, 2) else {
+            return;
+        };
         for segment in &fixture.segments {
             save_needs_review(&fixture.store, &fixture.job.id, segment);
         }
@@ -1212,7 +1226,9 @@ mod tests {
     async fn resume_errors_on_cache_namespace_mismatch() {
         let mut settings = TranslationProfile::V1Fast.resolve();
         settings.batch.enabled = false;
-        let mut fixture = resume_fixture(settings, 1);
+        let Some(mut fixture) = resume_fixture(settings, 1) else {
+            return;
+        };
         fixture.snapshot.cache_namespace = "wrong-cache-namespace".to_string();
 
         let error = run_fixture(&mut fixture)
@@ -1230,7 +1246,9 @@ mod tests {
     async fn resume_accepts_legacy_v1_snapshot_without_glossary_metadata() {
         let mut settings = TranslationProfile::V1Fast.resolve();
         settings.batch.enabled = false;
-        let mut fixture = resume_fixture(settings.clone(), 1);
+        let Some(mut fixture) = resume_fixture(settings.clone(), 1) else {
+            return;
+        };
         fixture.snapshot.glossary_fingerprint.clear();
         fixture.snapshot.glossary_terms.clear();
         fixture.snapshot.cache_namespace = compute_cache_namespace_v1(
@@ -1268,9 +1286,12 @@ mod tests {
         assert!(error.to_string().contains("seg_missing"));
     }
 
-    fn resume_fixture(settings: ResolvedRunSettings, segment_count: usize) -> ResumeFixture {
+    fn resume_fixture(
+        settings: ResolvedRunSettings,
+        segment_count: usize,
+    ) -> Option<ResumeFixture> {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let input = fixture_input();
+        let input = fixture_input_or_skip()?;
         let output = tempdir.path().join("translated.epub");
         let events = tempdir.path().join("events.jsonl");
         let store = JobStore::open(tempdir.path().join("jobs.sqlite")).expect("store should open");
@@ -1364,13 +1385,13 @@ mod tests {
             .update_job_config_snapshot(&job.id, &snapshot)
             .expect("snapshot should persist");
 
-        ResumeFixture {
+        Some(ResumeFixture {
             _tempdir: tempdir,
             store,
             job,
             snapshot,
             segments,
-        }
+        })
     }
 
     async fn run_fixture(fixture: &mut ResumeFixture) -> Result<Vec<ProgressEvent>> {
@@ -1512,12 +1533,22 @@ mod tests {
             .collect()
     }
 
-    fn fixture_input() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    // Returns the path to test/test.epub if present, otherwise prints a skip
+    // line and returns None. The fixture is gitignored (private to the
+    // maintainer), so CI and contributor checkouts must skip these tests
+    // rather than fail. See CLAUDE.md and CONTRIBUTING.md.
+    fn fixture_input_or_skip() -> Option<PathBuf> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)
             .expect("cli crate should be under crates/bookforge-cli")
-            .join("test/test.epub")
+            .join("test/test.epub");
+        if !path.exists() {
+            let name = std::thread::current().name().unwrap_or("?").to_string();
+            eprintln!("[skip] {name}: requires test/test.epub fixture");
+            return None;
+        }
+        Some(path)
     }
 
     fn test_segment(id: &str, ordinal: usize) -> Segment {

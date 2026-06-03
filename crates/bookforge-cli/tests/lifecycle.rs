@@ -21,14 +21,25 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn fixture_input() -> PathBuf {
-    workspace_root().join("test/test.epub")
+// Returns the path to test/test.epub if present, otherwise prints a skip line
+// and returns None. The fixture is gitignored; CI and contributor checkouts
+// must skip these tests rather than fail. See CLAUDE.md and CONTRIBUTING.md.
+fn fixture_input_or_skip() -> Option<PathBuf> {
+    let path = workspace_root().join("test/test.epub");
+    if !path.exists() {
+        let name = std::thread::current().name().unwrap_or("?").to_string();
+        eprintln!("[skip] {name}: requires test/test.epub fixture");
+        return None;
+    }
+    Some(path)
 }
 
 #[test]
 fn cli_translate_mock_quiet_writes_output_report_and_events() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let run = translate_quiet(&temp, "mock-prefix-target");
+    let Some(run) = translate_quiet(&temp, "mock-prefix-target") else {
+        return;
+    };
 
     assert!(run.output.exists(), "translated EPUB should exist");
     assert!(run.events.exists(), "event log should exist");
@@ -38,13 +49,16 @@ fn cli_translate_mock_quiet_writes_output_report_and_events() {
 #[test]
 fn cli_translate_context_window_persists_snapshot_settings() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
+    let Some(input) = fixture_input_or_skip() else {
+        return;
+    };
     let output = temp.path().join("out.epub");
     let events = temp.path().join("events.jsonl");
     bookforge()
         .current_dir(temp.path())
         .args([
             "translate",
-            fixture_input().to_str().unwrap(),
+            input.to_str().unwrap(),
             "--target",
             "Italian",
             "--provider",
@@ -86,6 +100,9 @@ fn cli_translate_context_window_persists_snapshot_settings() {
 #[test]
 fn cli_translate_with_style_sheet_persists_rendered_block_in_snapshot() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
+    let Some(input) = fixture_input_or_skip() else {
+        return;
+    };
     let style_path = temp.path().join("style.toml");
     fs::write(
         &style_path,
@@ -113,7 +130,7 @@ instructions = "Maintain a literary register typical of Italian fiction translat
         .current_dir(temp.path())
         .args([
             "translate",
-            fixture_input().to_str().unwrap(),
+            input.to_str().unwrap(),
             "--target",
             "Italian",
             "--provider",
@@ -172,6 +189,9 @@ instructions = "Maintain a literary register typical of Italian fiction translat
 #[test]
 fn cli_translate_with_entities_persists_agreement_block_in_snapshot() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
+    let Some(input) = fixture_input_or_skip() else {
+        return;
+    };
     let entities_path = temp.path().join("entities.toml");
     fs::write(
         &entities_path,
@@ -205,7 +225,7 @@ role = "object"
         .current_dir(temp.path())
         .args([
             "translate",
-            fixture_input().to_str().unwrap(),
+            input.to_str().unwrap(),
             "--source",
             "English",
             "--target",
@@ -270,13 +290,16 @@ fn cli_translate_batch_mode_with_sliding_context_completes_without_deadlock() {
     // happy path completes — the value is "doesn't hang", which the
     // 60-second test timeout enforces by failure.
     let temp = tempfile::tempdir().expect("temp dir should be created");
+    let Some(input) = fixture_input_or_skip() else {
+        return;
+    };
     let output = temp.path().join("out.epub");
     let events = temp.path().join("events.jsonl");
     bookforge()
         .current_dir(temp.path())
         .args([
             "translate",
-            fixture_input().to_str().unwrap(),
+            input.to_str().unwrap(),
             "--target",
             "Italian",
             "--provider",
@@ -309,6 +332,9 @@ fn cli_translate_with_full_v1_3_stack_persists_all_three_blocks() {
     // PRs interoperate end-to-end (PR1 sliding context + PR2 style +
     // PR3 entities + PR4 plumbing).
     let temp = tempfile::tempdir().expect("temp dir should be created");
+    let Some(input) = fixture_input_or_skip() else {
+        return;
+    };
     let style_path = temp.path().join("style.toml");
     fs::write(
         &style_path,
@@ -361,7 +387,7 @@ gender_target = "m"
         .current_dir(temp.path())
         .args([
             "translate",
-            fixture_input().to_str().unwrap(),
+            input.to_str().unwrap(),
             "--source",
             "English",
             "--target",
@@ -512,7 +538,9 @@ narration = "neutral"
 #[test]
 fn cli_translate_mock_with_same_glossary_is_bit_identical() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let input = fixture_input();
+    let Some(input) = fixture_input_or_skip() else {
+        return;
+    };
     let glossary = temp.path().join("glossary.toml");
     fs::write(
         &glossary,
@@ -679,13 +707,16 @@ source_count = 2
 #[test]
 fn cli_glossary_extract_candidates_stores_auto_candidates() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
+    let Some(input) = fixture_input_or_skip() else {
+        return;
+    };
 
     bookforge()
         .current_dir(temp.path())
         .args([
             "glossary",
             "extract-candidates",
-            fixture_input().to_str().unwrap(),
+            input.to_str().unwrap(),
             "--book-id",
             "ivan",
             "--source-lang",
@@ -720,6 +751,9 @@ fn cli_glossary_extract_candidates_stores_auto_candidates() {
 #[test]
 fn cli_glossary_review_candidates_accepts_sets_and_rejects() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
+    let Some(input) = fixture_input_or_skip() else {
+        return;
+    };
     let store_path = temp.path().join(".bookforge/jobs.sqlite");
     let store = JobStore::open(&store_path).expect("store opens");
     store
@@ -791,7 +825,7 @@ fn cli_glossary_review_candidates_accepts_sets_and_rejects() {
         .args([
             "glossary",
             "extract-candidates",
-            fixture_input().to_str().unwrap(),
+            input.to_str().unwrap(),
             "--book-id",
             "manual-review",
             "--source-lang",
@@ -857,13 +891,16 @@ fn cli_glossary_review_candidates_requires_language_when_ambiguous() {
 #[test]
 fn cli_translate_json_mode_emits_valid_jsonl_stdout_and_file_log() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
+    let Some(input) = fixture_input_or_skip() else {
+        return;
+    };
     let output = temp.path().join("json.epub");
     let events = temp.path().join("json-events.jsonl");
     let assert = bookforge()
         .current_dir(temp.path())
         .args([
             "translate",
-            fixture_input().to_str().unwrap(),
+            input.to_str().unwrap(),
             "--target",
             "Italian",
             "--provider",
@@ -941,7 +978,9 @@ fn normalized_terms(mut terms: Vec<GlossaryTerm>) -> Vec<GlossaryTerm> {
 #[test]
 fn cli_status_after_translate_reports_succeeded_job() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let run = translate_quiet(&temp, "mock-prefix-target");
+    let Some(run) = translate_quiet(&temp, "mock-prefix-target") else {
+        return;
+    };
 
     let assert = bookforge()
         .current_dir(temp.path())
@@ -962,7 +1001,9 @@ fn cli_status_after_translate_reports_succeeded_job() {
 #[test]
 fn cli_tail_after_translate_prints_recent_events() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let run = translate_quiet(&temp, "mock-prefix-target");
+    let Some(run) = translate_quiet(&temp, "mock-prefix-target") else {
+        return;
+    };
 
     let assert = bookforge()
         .current_dir(temp.path())
@@ -978,7 +1019,9 @@ fn cli_tail_after_translate_prints_recent_events() {
 #[test]
 fn cli_tail_json_outputs_valid_jsonl() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let run = translate_quiet(&temp, "mock-prefix-target");
+    let Some(run) = translate_quiet(&temp, "mock-prefix-target") else {
+        return;
+    };
 
     let assert = bookforge()
         .current_dir(temp.path())
@@ -1013,7 +1056,9 @@ fn cli_resume_missing_job_fails_clearly() {
 #[test]
 fn cli_resume_reuses_checkpointed_segments() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let run = translate_quiet(&temp, "mock-prefix-target");
+    let Some(run) = translate_quiet(&temp, "mock-prefix-target") else {
+        return;
+    };
     let resume_events = temp.path().join("resume-events.jsonl");
     let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
     let segment_ids = store
@@ -1066,9 +1111,12 @@ fn cli_resume_reuses_checkpointed_segments() {
 #[test]
 fn cli_resume_uses_input_snapshot_after_original_is_moved() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
+    let Some(fixture) = fixture_input_or_skip() else {
+        return;
+    };
     let input = temp.path().join("source.epub");
     let moved = temp.path().join("source-moved.epub");
-    fs::copy(fixture_input(), &input).expect("fixture should copy");
+    fs::copy(&fixture, &input).expect("fixture should copy");
     let run = translate_quiet_input(&temp, &input, "mock-prefix-target");
 
     let snapshot = temp
@@ -1113,7 +1161,9 @@ fn cli_resume_uses_input_snapshot_after_original_is_moved() {
 #[test]
 fn cli_review_generates_artifacts_and_ingest_flags_marks_retry() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let run = translate_quiet(&temp, "mock-prefix-target");
+    let Some(run) = translate_quiet(&temp, "mock-prefix-target") else {
+        return;
+    };
     let review_dir = temp.path().join("review-out");
 
     bookforge()
@@ -1224,8 +1274,9 @@ struct TranslateRun {
     report: PathBuf,
 }
 
-fn translate_quiet(temp: &TempDir, model: &str) -> TranslateRun {
-    translate_quiet_input(temp, &fixture_input(), model)
+fn translate_quiet(temp: &TempDir, model: &str) -> Option<TranslateRun> {
+    let input = fixture_input_or_skip()?;
+    Some(translate_quiet_input(temp, &input, model))
 }
 
 fn translate_quiet_input(temp: &TempDir, input: &Path, model: &str) -> TranslateRun {
