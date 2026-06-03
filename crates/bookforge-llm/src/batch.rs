@@ -8,7 +8,10 @@ use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinSet,
+};
 
 use crate::{
     CompletionRequest, FinishReason, LlmError, LlmProvider, PromptLibrary, ProviderRateController,
@@ -1229,6 +1232,7 @@ where
     let provider = Arc::new(provider);
     let config = Arc::new(config.clone());
     let concurrency = config.scheduler.concurrency.max(1);
+    let request_semaphore = Arc::new(Semaphore::new(concurrency));
 
     let all_items: HashMap<String, TranslationBatchItem> = batches
         .iter()
@@ -1254,23 +1258,22 @@ where
     let mut all_results: Vec<BatchTranslationResult> = Vec::new();
     let mut pending: Vec<TranslationBatch> = batches;
     let max_rounds = 3usize;
+    let mut single_invalid_attempts: HashMap<String, usize> = HashMap::new();
 
     for _round in 0..max_rounds {
         if pending.is_empty() {
             break;
         }
 
-        // Keep one spawned task per in-flight batch. This avoids the
-        // persistent-worker/result-channel deadlock class where a worker logs
-        // request completion but the coordinator never observes a result.
+        // Spawn one task per queued batch, but gate provider calls below with
+        // request_semaphore. Context waiters must not consume provider
+        // concurrency, otherwise a split prerequisite batch can be stranded
+        // behind later batches that are waiting for its context.
         let mut pending_queue: VecDeque<TranslationBatch> = pending.drain(..).collect();
         let mut tasks = JoinSet::<BatchWorkerOutput>::new();
 
         while !pending_queue.is_empty() || !tasks.is_empty() {
-            while tasks.len() < concurrency {
-                let Some(batch) = pending_queue.pop_front() else {
-                    break;
-                };
+            while let Some(batch) = pending_queue.pop_front() {
                 let mut normalized = normalize_batch_for_current_sizer(
                     batch,
                     batch_sizer.as_deref(),
@@ -1291,8 +1294,25 @@ where
                 let config = config.clone();
                 let rate_controller = rate_controller.clone();
                 let progress = progress.clone();
+                let request_semaphore = request_semaphore.clone();
 
                 tasks.spawn(async move {
+                    let context_pairs = context_pairs_for_batch(&batch, &config).await;
+                    let request_permit = match request_semaphore.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            return BatchWorkerOutput {
+                                batch,
+                                result: Err(LlmError::Provider(
+                                    "batch request semaphore closed".to_string(),
+                                )),
+                                request_status: RequestStatus::OtherError,
+                                latency_ms: 0,
+                                max_output_tokens: 0,
+                            };
+                        }
+                    };
+
                     let permit = match rate_controller.as_ref() {
                         Some(controller) => match controller.acquire().await {
                             Ok(permit) => Some(permit),
@@ -1341,6 +1361,7 @@ where
                         library.clone(),
                         batch.clone(),
                         &config,
+                        context_pairs,
                     )
                     .await;
                     let latency_ms = started.elapsed().as_millis() as u64;
@@ -1348,6 +1369,7 @@ where
                     let request_status = request_status_for_controller(&result);
 
                     drop(permit);
+                    drop(request_permit);
                     BatchWorkerOutput {
                         batch,
                         result,
@@ -1505,40 +1527,56 @@ where
                         output_tokens: None,
                     });
                 }
-                Err(LlmError::InvalidResponse(_)) if batch.items.len() == 1 => {
-                    progress.emit(bookforge_core::ProgressEvent::Warning {
-                        kind: "single_item_batch_invalid_response".to_string(),
-                        message: format!(
-                            "single-item batch {} failed; not splitting further",
-                            batch.id
-                        ),
-                        timestamp_ms: bookforge_core::progress::now_ms(),
-                    });
-                    unblock_fence_for_batch_failure(
-                        config.context_registry.as_deref(),
-                        &segments_by_id,
-                        &batch.items,
-                    );
-                    all_results.push(BatchTranslationResult {
-                        batch_id: batch.id.clone(),
-                        translations: Vec::new(),
-                        failures: batch
-                            .items
-                            .iter()
-                            .map(|item| BatchItemFailure {
-                                item_id: item.item_id.clone(),
-                                segment_id: item.segment_id.clone(),
-                                error: "single-item batch invalid response".to_string(),
-                                input_tokens: None,
-                                input_cached_tokens: None,
-                                output_tokens: None,
-                                tokens_estimated: false,
-                            })
-                            .collect(),
-                        input_tokens: None,
-                        input_cached_tokens: None,
-                        output_tokens: None,
-                    });
+                Err(error @ LlmError::InvalidResponse(_)) if batch.items.len() == 1 => {
+                    let attempts = single_invalid_attempts
+                        .entry(batch.id.clone())
+                        .and_modify(|count| *count += 1)
+                        .or_insert(1);
+                    if *attempts < config.scheduler.max_attempts.max(1) {
+                        progress.emit(bookforge_core::ProgressEvent::Warning {
+                            kind: "single_item_batch_invalid_response_retry".to_string(),
+                            message: format!(
+                                "single-item batch {} returned invalid response on attempt {}; retrying: {error}",
+                                batch.id, attempts
+                            ),
+                            timestamp_ms: bookforge_core::progress::now_ms(),
+                        });
+                        pending_queue.push_back(batch);
+                    } else {
+                        progress.emit(bookforge_core::ProgressEvent::Warning {
+                            kind: "single_item_batch_invalid_response".to_string(),
+                            message: format!(
+                                "single-item batch {} failed after {} attempts; not splitting further",
+                                batch.id, attempts
+                            ),
+                            timestamp_ms: bookforge_core::progress::now_ms(),
+                        });
+                        unblock_fence_for_batch_failure(
+                            config.context_registry.as_deref(),
+                            &segments_by_id,
+                            &batch.items,
+                        );
+                        all_results.push(BatchTranslationResult {
+                            batch_id: batch.id.clone(),
+                            translations: Vec::new(),
+                            failures: batch
+                                .items
+                                .iter()
+                                .map(|item| BatchItemFailure {
+                                    item_id: item.item_id.clone(),
+                                    segment_id: item.segment_id.clone(),
+                                    error: format!("single-item batch invalid response: {error}"),
+                                    input_tokens: None,
+                                    input_cached_tokens: None,
+                                    output_tokens: None,
+                                    tokens_estimated: false,
+                                })
+                                .collect(),
+                            input_tokens: None,
+                            input_cached_tokens: None,
+                            output_tokens: None,
+                        });
+                    }
                 }
                 Err(LlmError::InvalidResponse(_)) if batch.items.len() > 1 => {
                     if let Some(ref mut sizer) = batch_sizer {
@@ -2096,31 +2134,8 @@ async fn translate_one_batch(
     library: Arc<PromptLibrary>,
     batch: TranslationBatch,
     config: &TranslationRunConfig,
+    context_pairs: Vec<crate::scheduler::CompletedContext>,
 ) -> Result<BatchTranslationResult, LlmError> {
-    // Sliding-context fence (ROADMAP §6.4 — PR5 makes this work in batch
-    // mode). build_translation_batches guarantees no batch crosses a
-    // section boundary, so awaiting the batch's earliest segment is safe:
-    // its prior-N dependencies are necessarily in *earlier* batches of
-    // the same section (or earlier sections, depending on scope) and
-    // can't deadlock on a sibling item in this same batch.
-    let context_pairs = match (config.context_registry.as_deref(), batch.kind) {
-        (Some(registry), BatchKind::Translation) if config.context.enabled() => {
-            let earliest = batch
-                .items
-                .iter()
-                .min_by_key(|item| item.ordinal)
-                .map(|item| item.segment_id.clone());
-            match earliest {
-                Some(segment_id) => {
-                    registry
-                        .await_context_for(&segment_id, config.context)
-                        .await
-                }
-                None => Vec::new(),
-            }
-        }
-        _ => Vec::new(),
-    };
     let context_block = crate::scheduler::render_context_pairs(&context_pairs);
     let items_json = render_batch_items(&batch, config);
     let template = if config.compact_prompts {
@@ -2211,6 +2226,38 @@ async fn translate_one_batch(
             Ok(result)
         }
         Err(e) => Err(e),
+    }
+}
+
+async fn context_pairs_for_batch(
+    batch: &TranslationBatch,
+    config: &TranslationRunConfig,
+) -> Vec<crate::scheduler::CompletedContext> {
+    // Sliding-context fence (ROADMAP §6.4 — PR5 makes this work in batch
+    // mode). build_translation_batches guarantees no batch crosses a
+    // section boundary, so awaiting the batch's earliest segment is safe:
+    // its prior-N dependencies are necessarily in *earlier* batches of
+    // the same section (or earlier sections, depending on scope) and
+    // can't deadlock on a sibling item in this same batch. The scheduler
+    // calls this before acquiring request concurrency so context waiters
+    // cannot starve prerequisite split batches.
+    match (config.context_registry.as_deref(), batch.kind) {
+        (Some(registry), BatchKind::Translation) if config.context.enabled() => {
+            let earliest = batch
+                .items
+                .iter()
+                .min_by_key(|item| item.ordinal)
+                .map(|item| item.segment_id.clone());
+            match earliest {
+                Some(segment_id) => {
+                    registry
+                        .await_context_for(&segment_id, config.context)
+                        .await
+                }
+                None => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -3090,7 +3137,7 @@ mod tests {
         let library = Arc::new(PromptLibrary::global().clone());
         let config = test_run_config();
 
-        let result = translate_one_batch(provider, library, batch, &config).await;
+        let result = translate_one_batch(provider, library, batch, &config, Vec::new()).await;
         match result {
             Err(LlmError::InvalidResponse(msg)) => {
                 assert!(msg.contains("truncated"), "unexpected msg: {msg}")
@@ -3108,7 +3155,7 @@ mod tests {
         let library = Arc::new(PromptLibrary::global().clone());
         let config = test_run_config();
 
-        let result = translate_one_batch(provider, library, batch, &config).await;
+        let result = translate_one_batch(provider, library, batch, &config, Vec::new()).await;
         match result {
             Err(LlmError::InvalidResponse(msg)) => {
                 assert!(msg.contains("truncated"), "unexpected msg: {msg}")
@@ -3211,6 +3258,78 @@ mod tests {
         }
     }
 
+    struct FirstInvalidThenPromptEchoProvider {
+        calls: Mutex<usize>,
+    }
+
+    impl FirstInvalidThenPromptEchoProvider {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(0),
+            }
+        }
+    }
+
+    impl LlmProviderTrait for FirstInvalidThenPromptEchoProvider {
+        async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+            let mut calls = self.calls.lock().unwrap();
+            let call = *calls;
+            *calls += 1;
+            drop(calls);
+
+            let content = if call == 0 {
+                "{not valid json".to_string()
+            } else {
+                let item_ids = item_ids_from_batch_prompt(&request.user);
+                serde_json::json!({
+                    "items": item_ids
+                        .into_iter()
+                        .map(|id| serde_json::json!({
+                            "id": id,
+                            "translation": format!("[it] {id}"),
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+                .to_string()
+            };
+
+            Ok(CompletionResponse {
+                content,
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(1),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 0,
+                raw: serde_json::json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    fn item_ids_from_batch_prompt(user_prompt: &str) -> Vec<String> {
+        let Some(after_input) = user_prompt.split("Input:\n").nth(1) else {
+            return Vec::new();
+        };
+        let json_text = after_input
+            .split("\n\nReturn JSON only.")
+            .next()
+            .unwrap_or(after_input)
+            .trim();
+        let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(json_text) else {
+            return Vec::new();
+        };
+        items
+            .into_iter()
+            .filter_map(|item| item.get("id")?.as_str().map(ToString::to_string))
+            .collect()
+    }
+
     #[tokio::test]
     async fn partial_batch_failure_without_successful_repair_marks_segment_needs_review() {
         let seg = make_segment(
@@ -3274,6 +3393,111 @@ mod tests {
         assert!(
             error.contains(&missing_block_id),
             "error must name missing block id {missing_block_id}, got: {error}",
+        );
+    }
+
+    #[tokio::test]
+    async fn single_item_invalid_response_retries_before_needs_review() {
+        let segment = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+        let segments = vec![segment];
+        let cfg = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 1,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+        assert_eq!(batches.len(), 1);
+        let item_id = batches[0].items[0].item_id.clone();
+        let provider = SequenceProvider::new(vec![
+            "{not valid json".to_string(),
+            serde_json::json!({
+                "items": [
+                    {"id": item_id, "translation": "[it] Hello"},
+                ],
+            })
+            .to_string(),
+        ]);
+        let telemetry = Arc::new(TelemetryLog::new());
+        let mut config = test_run_config();
+        config.scheduler.max_attempts = 2;
+
+        let translations = translate_batches_with_callback(
+            provider,
+            batches,
+            &segments,
+            &config,
+            telemetry,
+            None,
+            None,
+            Arc::new(bookforge_core::NullProgressSink),
+            None,
+            |_| Ok(()),
+        )
+        .await
+        .expect("single-item invalid response should retry and succeed");
+
+        assert_eq!(translations.len(), 1);
+        assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+        assert_eq!(translations[0].joined_text(), "[it] Hello");
+    }
+
+    #[tokio::test]
+    async fn split_prerequisite_batch_unblocks_book_scoped_context_waiters() {
+        let segments = vec![
+            make_segment_in_section("seg0", "sec0", 0, vec![plain_block("Alpha")], vec![]),
+            make_segment_in_section("seg1", "sec0", 1, vec![plain_block("Beta")], vec![]),
+            make_segment_in_section("seg2", "sec1", 2, vec![plain_block("Gamma")], vec![]),
+            make_segment_in_section("seg3", "sec2", 3, vec![plain_block("Delta")], vec![]),
+        ];
+        let cfg = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+        assert!(batches.len() >= 3, "expected section-partitioned batches");
+        assert!(batches[0].items.len() > 1, "first batch must be splittable");
+
+        let provider = FirstInvalidThenPromptEchoProvider::new();
+        let telemetry = Arc::new(TelemetryLog::new());
+        let mut config = test_run_config();
+        config.scheduler.concurrency = 4;
+        config.context = crate::ContextRunConfig {
+            window: 1,
+            budget_tokens: 1000,
+            scope: bookforge_core::config::ContextScope::Book,
+        };
+        config.context_registry = Some(Arc::new(crate::ContextRegistry::new(&segments)));
+
+        let run = translate_batches_with_callback(
+            provider,
+            batches,
+            &segments,
+            &config,
+            telemetry,
+            None,
+            None,
+            Arc::new(bookforge_core::NullProgressSink),
+            None,
+            |_| Ok(()),
+        );
+
+        let translations = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("split prerequisite batch must not deadlock context waiters")
+            .expect("translation should complete");
+
+        assert_eq!(translations.len(), segments.len());
+        assert!(
+            translations
+                .iter()
+                .all(|translation| translation.status == SegmentStatus::Succeeded)
         );
     }
 

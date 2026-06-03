@@ -4,6 +4,7 @@ use bookforge_core::{
     segment::{Segment, SegmentId, SegmentStatus},
 };
 use serde::Deserialize;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::{
     CompletionRequest, LlmError, LlmProvider, PromptLibrary, RequestMetadata, ResponseFormat,
@@ -82,6 +83,8 @@ pub enum CorrectionStatus {
 
 pub struct CorrectionRecord {
     pub item_id: String,
+    pub segment_id: SegmentId,
+    pub block_id: BlockId,
     pub original_translation: String,
     pub corrected_translation: Option<String>,
     pub status: CorrectionStatus,
@@ -135,15 +138,13 @@ where
     }
 
     let chunk_size = double_check_config.batch_target_tokens.max(1);
-    let chunks: Vec<Vec<DoubleCheckItem>> = items
-        .chunks(chunk_size.max(1))
-        .map(|c| c.to_vec())
-        .collect();
+    let chunks = chunk_double_check_items(&items, chunk_size);
 
     let mut all_issues = Vec::new();
     for chunk in &chunks {
         let audit_result =
-            run_audit_chunk(&provider, library, chunk, config, double_check_config).await?;
+            run_audit_chunk_resilient(&provider, library, chunk, config, double_check_config)
+                .await?;
         all_issues.extend(audit_result);
     }
 
@@ -152,6 +153,8 @@ where
             .into_iter()
             .map(|item| CorrectionRecord {
                 item_id: item.item_id,
+                segment_id: item.segment_id,
+                block_id: item.block_id,
                 original_translation: item.current_translation,
                 corrected_translation: None,
                 status: CorrectionStatus::Unresolved,
@@ -161,28 +164,224 @@ where
         return Ok(records);
     }
 
+    let mut records: Vec<CorrectionRecord> = all_issues
+        .iter()
+        .filter(|item| is_audit_unresolved_item(item))
+        .map(|item| CorrectionRecord {
+            item_id: item.item_id.clone(),
+            segment_id: item.segment_id.clone(),
+            block_id: item.block_id.clone(),
+            original_translation: item.current_translation.clone(),
+            corrected_translation: None,
+            status: CorrectionStatus::Unresolved,
+            issues: item.issues.clone(),
+        })
+        .collect();
+
     let correction_items: Vec<CorrectionItem> = all_issues
         .into_iter()
         .filter(|item| item.issues.iter().any(|i| i.needs_correction))
         .collect();
 
-    let mut records = Vec::new();
-    for corr_chunk in correction_items.chunks(chunk_size.max(1)) {
-        let corr_results = run_correction_chunk(&provider, library, corr_chunk, config).await?;
+    for corr_chunk in chunk_correction_items(&correction_items, chunk_size) {
+        let original_by_id: HashMap<&str, &CorrectionItem> = corr_chunk
+            .iter()
+            .map(|item| (item.item_id.as_str(), item))
+            .collect();
+        let corr_results =
+            run_correction_chunk_resilient(&provider, library, &corr_chunk, config).await?;
+        let mut returned_ids = BTreeSet::new();
 
         for result in corr_results {
+            returned_ids.insert(result.item_id.clone());
+            let Some(original) = original_by_id.get(result.item_id.as_str()) else {
+                continue;
+            };
             let valid = validate_correction(&result);
             records.push(CorrectionRecord {
                 item_id: result.item_id.clone(),
-                original_translation: result.current_translation.clone(),
+                segment_id: result.segment_id.clone(),
+                block_id: result.block_id.clone(),
+                original_translation: original.current_translation.clone(),
                 corrected_translation: Some(result.current_translation.clone()),
                 status: valid,
                 issues: result.issues.clone(),
             });
         }
+
+        for original in &corr_chunk {
+            if !returned_ids.contains(&original.item_id) {
+                records.push(CorrectionRecord {
+                    item_id: original.item_id.clone(),
+                    segment_id: original.segment_id.clone(),
+                    block_id: original.block_id.clone(),
+                    original_translation: original.current_translation.clone(),
+                    corrected_translation: None,
+                    status: CorrectionStatus::Unresolved,
+                    issues: original.issues.clone(),
+                });
+            }
+        }
     }
 
     Ok(records)
+}
+
+fn chunk_double_check_items(
+    items: &[DoubleCheckItem],
+    budget_tokens: usize,
+) -> Vec<Vec<DoubleCheckItem>> {
+    chunk_by_budget(items, budget_tokens, estimate_double_check_item_tokens)
+}
+
+fn chunk_correction_items(
+    items: &[CorrectionItem],
+    budget_tokens: usize,
+) -> Vec<Vec<CorrectionItem>> {
+    chunk_by_budget(items, budget_tokens, estimate_correction_item_tokens)
+}
+
+fn chunk_by_budget<T: Clone>(
+    items: &[T],
+    budget_tokens: usize,
+    estimate: impl Fn(&T) -> usize,
+) -> Vec<Vec<T>> {
+    let budget_tokens = budget_tokens.max(1);
+    let mut chunks: Vec<Vec<T>> = Vec::new();
+    let mut current: Vec<T> = Vec::new();
+    let mut current_tokens = 0usize;
+
+    for item in items {
+        let item_tokens = estimate(item).max(1);
+        if !current.is_empty() && current_tokens.saturating_add(item_tokens) > budget_tokens {
+            chunks.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        current.push(item.clone());
+        current_tokens = current_tokens.saturating_add(item_tokens);
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
+}
+
+fn estimate_double_check_item_tokens(item: &DoubleCheckItem) -> usize {
+    96 + estimate_text_tokens(&item.id)
+        + estimate_text_tokens(&item.section_title.clone().unwrap_or_default())
+        + estimate_text_tokens(&item.kind)
+        + estimate_text_tokens(&item.source)
+        + estimate_text_tokens(&item.translation)
+        + item
+            .required_markers
+            .iter()
+            .map(|value| estimate_text_tokens(value))
+            .sum::<usize>()
+        + item
+            .protected_spans
+            .iter()
+            .map(|value| estimate_text_tokens(value))
+            .sum::<usize>()
+        + item
+            .deterministic_warnings
+            .iter()
+            .map(|value| estimate_text_tokens(value))
+            .sum::<usize>()
+}
+
+fn estimate_correction_item_tokens(item: &CorrectionItem) -> usize {
+    96 + estimate_text_tokens(&item.item_id)
+        + estimate_text_tokens(&item.source)
+        + estimate_text_tokens(&item.current_translation)
+        + item
+            .required_markers
+            .iter()
+            .map(|value| estimate_text_tokens(value))
+            .sum::<usize>()
+        + item
+            .protected_spans
+            .iter()
+            .map(|value| estimate_text_tokens(value))
+            .sum::<usize>()
+        + item
+            .issues
+            .iter()
+            .map(|issue| {
+                estimate_text_tokens(&issue.severity)
+                    + estimate_text_tokens(&issue.kind)
+                    + estimate_text_tokens(&issue.message)
+            })
+            .sum::<usize>()
+}
+
+fn estimate_text_tokens(text: &str) -> usize {
+    (text.chars().count() / 4).max(1)
+}
+
+fn is_json_shape_error(error: &LlmError) -> bool {
+    matches!(error, LlmError::Json(_) | LlmError::InvalidResponse(_))
+}
+
+const AUDIT_UNRESOLVED_KIND: &str = "audit_unavailable";
+
+fn audit_unresolved_issue(error: &LlmError) -> DoubleCheckIssue {
+    DoubleCheckIssue {
+        severity: "minor".to_string(),
+        kind: AUDIT_UNRESOLVED_KIND.to_string(),
+        message: format!("double-check audit could not parse provider response: {error}"),
+        source_excerpt: None,
+        translation_excerpt: None,
+        needs_correction: false,
+    }
+}
+
+fn is_audit_unresolved_item(item: &CorrectionItem) -> bool {
+    item.issues
+        .iter()
+        .any(|issue| issue.kind == AUDIT_UNRESOLVED_KIND)
+}
+
+async fn run_audit_chunk_resilient<P>(
+    provider: &P,
+    library: &PromptLibrary,
+    items: &[DoubleCheckItem],
+    config: &TranslationRunConfig,
+    double_check_config: &DoubleCheckConfig,
+) -> Result<Vec<CorrectionItem>, LlmError>
+where
+    P: LlmProvider,
+{
+    let mut queue = VecDeque::from([items.to_vec()]);
+    let mut corrections = Vec::new();
+
+    while let Some(chunk) = queue.pop_front() {
+        match run_audit_chunk(provider, library, &chunk, config, double_check_config).await {
+            Ok(mut result) => corrections.append(&mut result),
+            Err(error) if is_json_shape_error(&error) && chunk.len() > 1 => {
+                let mid = chunk.len() / 2;
+                queue.push_front(chunk[mid..].to_vec());
+                queue.push_front(chunk[..mid].to_vec());
+            }
+            Err(error) if is_json_shape_error(&error) => {
+                let item = &chunk[0];
+                corrections.push(CorrectionItem {
+                    item_id: item.id.clone(),
+                    segment_id: SegmentId(item.segment_id.clone()),
+                    block_id: BlockId(item.block_id.clone()),
+                    source: item.source.clone(),
+                    current_translation: item.translation.clone(),
+                    required_markers: item.required_markers.clone(),
+                    protected_spans: item.protected_spans.clone(),
+                    issues: vec![audit_unresolved_issue(&error)],
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(corrections)
 }
 
 async fn run_audit_chunk<P>(
@@ -359,6 +558,34 @@ where
     Ok(result_items)
 }
 
+async fn run_correction_chunk_resilient<P>(
+    provider: &P,
+    library: &PromptLibrary,
+    items: &[CorrectionItem],
+    config: &TranslationRunConfig,
+) -> Result<Vec<CorrectionItem>, LlmError>
+where
+    P: LlmProvider,
+{
+    let mut queue = VecDeque::from([items.to_vec()]);
+    let mut corrected = Vec::new();
+
+    while let Some(chunk) = queue.pop_front() {
+        match run_correction_chunk(provider, library, &chunk, config).await {
+            Ok(mut result) => corrected.append(&mut result),
+            Err(error) if is_json_shape_error(&error) && chunk.len() > 1 => {
+                let mid = chunk.len() / 2;
+                queue.push_front(chunk[mid..].to_vec());
+                queue.push_front(chunk[..mid].to_vec());
+            }
+            Err(error) if is_json_shape_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(corrected)
+}
+
 fn validate_correction(item: &CorrectionItem) -> CorrectionStatus {
     let text = &item.current_translation;
 
@@ -393,5 +620,327 @@ fn double_check_mode_str(mode: bookforge_core::config::DoubleCheckMode) -> &'sta
         bookforge_core::config::DoubleCheckMode::Formatting => "formatting",
         bookforge_core::config::DoubleCheckMode::Semantic => "semantic",
         bookforge_core::config::DoubleCheckMode::Full => "full",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{CorrectionStatus, DoubleCheckItem, chunk_double_check_items, run_double_check};
+    use bookforge_core::{
+        config::{DoubleCheckConfig, DoubleCheckMode, TranslationProfile},
+        ir::{BlockId, SectionId},
+        scheduler::SchedulerConfig,
+        segment::{
+            BlockTranslation, Segment, SegmentBlock, SegmentConstraints, SegmentContext, SegmentId,
+            SegmentMetadata, SegmentSource, SegmentStatus, SegmentTextRun,
+        },
+    };
+    use serde_json::json;
+
+    use crate::{
+        CompletionRequest, CompletionResponse, FinishReason, GlossaryRunConfig, LlmProvider,
+        ProviderCapabilities, SegmentTranslation, TranslationRunConfig,
+    };
+
+    #[derive(Clone)]
+    struct SequenceProvider {
+        responses: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SequenceProvider {
+        fn new(responses: Vec<String>) -> Self {
+            let mut responses = responses;
+            responses.reverse();
+            Self {
+                responses: Arc::new(Mutex::new(responses)),
+            }
+        }
+    }
+
+    impl LlmProvider for SequenceProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> crate::provider::Result<CompletionResponse> {
+            let content = self
+                .responses
+                .lock()
+                .expect("responses mutex should not be poisoned")
+                .pop()
+                .expect("provider response should be queued");
+            Ok(CompletionResponse {
+                content,
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(1),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 0,
+                raw: json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    fn segment() -> Segment {
+        Segment {
+            id: SegmentId("seg".to_string()),
+            section_id: SectionId("sec".to_string()),
+            ordinal: 0,
+            block_ids: vec![BlockId("b".to_string())],
+            source: SegmentSource {
+                text: "source".to_string(),
+                blocks: vec![SegmentBlock {
+                    block_id: BlockId("b".to_string()),
+                    kind: "paragraph".to_string(),
+                    text: "source".to_string(),
+                    text_runs: vec![SegmentTextRun {
+                        id: "r".to_string(),
+                        text: "source".to_string(),
+                    }],
+                    protected_spans: Vec::new(),
+                }],
+                token_estimate: 1,
+            },
+            context: SegmentContext::default(),
+            metadata: SegmentMetadata::default(),
+            constraints: SegmentConstraints::default(),
+            checksum: "checksum".to_string(),
+        }
+    }
+
+    fn translation() -> SegmentTranslation {
+        SegmentTranslation {
+            segment_id: SegmentId("seg".to_string()),
+            ordinal: 0,
+            block_ids: vec![BlockId("b".to_string())],
+            blocks: vec![BlockTranslation {
+                block_id: BlockId("b".to_string()),
+                text: "errato".to_string(),
+            }],
+            checksum: "checksum".to_string(),
+            status: SegmentStatus::Succeeded,
+            template: "translate_segment".to_string(),
+            error: None,
+            input_tokens: Some(5),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(6),
+            tokens_estimated: false,
+        }
+    }
+
+    fn segment_with_id(segment_id: &str, block_id: &str) -> Segment {
+        let mut segment = segment();
+        segment.id = SegmentId(segment_id.to_string());
+        segment.block_ids = vec![BlockId(block_id.to_string())];
+        segment.source.blocks[0].block_id = BlockId(block_id.to_string());
+        segment.checksum = format!("checksum-{segment_id}");
+        segment
+    }
+
+    fn translation_with_id(segment_id: &str, block_id: &str, text: &str) -> SegmentTranslation {
+        let mut translation = translation();
+        translation.segment_id = SegmentId(segment_id.to_string());
+        translation.block_ids = vec![BlockId(block_id.to_string())];
+        translation.blocks[0].block_id = BlockId(block_id.to_string());
+        translation.blocks[0].text = text.to_string();
+        translation.checksum = format!("checksum-{segment_id}");
+        translation
+    }
+
+    fn run_config() -> TranslationRunConfig {
+        TranslationRunConfig {
+            source_language: Some("English".to_string()),
+            target_language: "Italian".to_string(),
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            prompt_version: "v1".to_string(),
+            temperature: 0.0,
+            scheduler: SchedulerConfig {
+                concurrency: 1,
+                max_attempts: 1,
+            },
+            profile: TranslationProfile::Balanced,
+            model_context_tokens: None,
+            max_output_tokens: None,
+            batch_max_output_tokens: None,
+            compact_prompts: false,
+            glossary: GlossaryRunConfig::default(),
+            context: crate::ContextRunConfig::default(),
+            context_registry: None,
+            style: None,
+            entities: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_correct_records_original_and_corrected_text() {
+        let provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg:b","verdict":"fail","issues":[{"severity":"major","kind":"formatting","message":"fix it","source_excerpt":null,"translation_excerpt":null,"needs_correction":true}]}]}"#.to_string(),
+            r#"{"items":[{"id":"seg:b","corrected_translation":"corretto"}]}"#.to_string(),
+        ]);
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: true,
+            correction_rounds: 1,
+        };
+
+        let records = run_double_check(
+            provider,
+            &[segment()],
+            &[translation()],
+            &run_config(),
+            &double_check,
+        )
+        .await
+        .expect("double-check should succeed");
+
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.segment_id.0, "seg");
+        assert_eq!(record.block_id.0, "b");
+        assert_eq!(record.original_translation, "errato");
+        assert_eq!(record.corrected_translation.as_deref(), Some("corretto"));
+        assert!(matches!(record.status, CorrectionStatus::Applied));
+    }
+
+    #[tokio::test]
+    async fn auto_correct_marks_missing_correction_unresolved() {
+        let provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg:b","verdict":"fail","issues":[{"severity":"major","kind":"formatting","message":"fix it","source_excerpt":null,"translation_excerpt":null,"needs_correction":true}]}]}"#.to_string(),
+            r#"{"items":[]}"#.to_string(),
+        ]);
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: true,
+            correction_rounds: 1,
+        };
+
+        let records = run_double_check(
+            provider,
+            &[segment()],
+            &[translation()],
+            &run_config(),
+            &double_check,
+        )
+        .await
+        .expect("double-check should succeed");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].corrected_translation, None);
+        assert!(matches!(records[0].status, CorrectionStatus::Unresolved));
+    }
+
+    #[tokio::test]
+    async fn audit_json_error_splits_chunk_and_continues() {
+        let provider = SequenceProvider::new(vec![
+            "{".to_string(),
+            r#"{"items":[{"id":"seg_a:a","verdict":"fail","issues":[{"severity":"minor","kind":"formatting","message":"spacing","source_excerpt":null,"translation_excerpt":null,"needs_correction":false}]}]}"#.to_string(),
+            r#"{"items":[{"id":"seg_b:b","verdict":"pass","issues":[]}]}"#.to_string(),
+        ]);
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: false,
+            correction_rounds: 1,
+        };
+
+        let records = run_double_check(
+            provider,
+            &[segment_with_id("seg_a", "a"), segment_with_id("seg_b", "b")],
+            &[
+                translation_with_id("seg_a", "a", "errato a"),
+                translation_with_id("seg_b", "b", "corretto b"),
+            ],
+            &run_config(),
+            &double_check,
+        )
+        .await
+        .expect("double-check should split malformed audit chunks");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].item_id, "seg_a:a");
+        assert_eq!(records[0].original_translation, "errato a");
+        assert!(matches!(records[0].status, CorrectionStatus::Unresolved));
+    }
+
+    #[tokio::test]
+    async fn single_item_audit_json_error_is_recorded_unresolved() {
+        let provider = SequenceProvider::new(vec!["{".to_string()]);
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: true,
+            correction_rounds: 1,
+        };
+
+        let records = run_double_check(
+            provider,
+            &[segment()],
+            &[translation()],
+            &run_config(),
+            &double_check,
+        )
+        .await
+        .expect("single malformed audit response should not fail the run");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].item_id, "seg:b");
+        assert_eq!(records[0].corrected_translation, None);
+        assert!(matches!(records[0].status, CorrectionStatus::Unresolved));
+        assert_eq!(records[0].issues[0].kind, "audit_unavailable");
+    }
+
+    #[test]
+    fn double_check_chunks_use_token_budget() {
+        let item = |id: &str, source_len: usize, translation_len: usize| DoubleCheckItem {
+            id: id.to_string(),
+            segment_id: "seg".to_string(),
+            block_id: "b".to_string(),
+            section_title: None,
+            kind: "paragraph".to_string(),
+            source: "s".repeat(source_len),
+            translation: "t".repeat(translation_len),
+            required_markers: Vec::new(),
+            protected_spans: Vec::new(),
+            deterministic_warnings: Vec::new(),
+        };
+        let items = vec![item("a", 800, 800), item("b", 800, 800), item("c", 10, 10)];
+
+        let chunks = chunk_double_check_items(&items, 550);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0][0].id, "a");
+        assert_eq!(chunks[1][0].id, "b");
+        assert_eq!(chunks[2][0].id, "c");
     }
 }

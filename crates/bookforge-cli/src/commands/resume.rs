@@ -308,8 +308,19 @@ async fn run_inner(
             cache_namespace
         );
     }
+    let retry_pending_ids = store
+        .segment_records(&job.id)?
+        .into_iter()
+        .filter(|record| record.status == "retry_pending")
+        .map(|record| record.id)
+        .collect::<HashSet<_>>();
+    let cacheable_pending_segments = pending_segments
+        .iter()
+        .filter(|segment| !retry_pending_ids.contains(&segment.id.0))
+        .cloned()
+        .collect::<Vec<_>>();
     let mut cached_translations = apply_cached_translations(
-        &pending_segments,
+        &cacheable_pending_segments,
         CacheContext {
             store: &store,
             job_id: &job.id,
@@ -1058,6 +1069,74 @@ mod tests {
             .expect("job should exist");
         assert_eq!(summary.succeeded, 2);
         assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn resume_retry_pending_bypasses_cache() {
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.batch.enabled = false;
+        let mut fixture = resume_fixture(settings, 1);
+        let cache_job = fixture
+            .store
+            .create_job(CreateJob {
+                input: &fixture.snapshot.input_path,
+                output: &fixture._tempdir.path().join("cache-output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix-target",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("cache job should be created");
+        fixture
+            .store
+            .insert_segments(
+                &cache_job.id,
+                &fixture.segments,
+                fixture.snapshot.prompt_version.as_str(),
+                "mock",
+                "mock-prefix-target",
+                fixture.snapshot.cache_namespace.as_str(),
+            )
+            .expect("cache job segments should insert");
+        save_succeeded(
+            &fixture.store,
+            &cache_job.id,
+            &fixture.segments[0],
+            "stale cached text",
+        );
+        fixture
+            .store
+            .mark_segment_failed(&fixture.job.id, &fixture.segments[0].id.0, "retry")
+            .expect("segment should be failed");
+        fixture
+            .store
+            .retry_segments(&fixture.job.id, bookforge_store::RetryScope::Failed)
+            .expect("segment should become retry-pending");
+
+        let events = run_fixture(&mut fixture)
+            .await
+            .expect("resume should freshly translate retry-pending segments");
+        let finished = segment_finished_ids(&events);
+
+        assert_eq!(finished, vec![fixture.segments[0].id.0.clone()]);
+        let stored = fixture
+            .store
+            .load_block_translations(&fixture.job.id)
+            .expect("stored blocks should load");
+        assert!(
+            stored
+                .iter()
+                .all(|block| block.text.as_str() != "stale cached text")
+        );
+        assert!(
+            stored
+                .iter()
+                .any(|block| block.text.starts_with("[Italian]"))
+        );
     }
 
     #[tokio::test]

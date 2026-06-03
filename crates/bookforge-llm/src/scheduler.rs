@@ -485,7 +485,8 @@ where
     let semaphore = Arc::new(Semaphore::new(config.scheduler.concurrency));
     let mut tasks = JoinSet::new();
 
-    for segment in segments.iter().cloned() {
+    for segment in segments {
+        let segment = segment.clone();
         let provider = provider.clone();
         let config = config.clone();
         let library = library.clone();
@@ -493,6 +494,7 @@ where
 
         tasks.spawn(async move {
             let mode = select_mode(&segment);
+            let context_pairs = context_pairs_for_segment(&segment, &config).await;
             let Ok(_permit) = semaphore.acquire_owned().await else {
                 let failed = failed_translation_with_tokens(
                     &segment,
@@ -507,7 +509,8 @@ where
                 }
                 return failed;
             };
-            let translation = translate_one(provider, library, segment.clone(), &config).await;
+            let translation =
+                translate_one(provider, library, segment.clone(), &config, context_pairs).await;
             if let Some(registry) = config.context_registry.as_deref() {
                 registry.pre_populate(&segment, &translation);
             }
@@ -677,6 +680,7 @@ async fn translate_one<P>(
     library: Arc<PromptLibrary>,
     segment: Segment,
     config: &TranslationRunConfig,
+    context_pairs: Vec<CompletedContext>,
 ) -> SegmentTranslation
 where
     P: LlmProvider,
@@ -687,14 +691,6 @@ where
     let mut accum_in: u64 = 0;
     let mut accum_cached_in: u64 = 0;
     let mut accum_out: u64 = 0;
-    let context_pairs = match config.context_registry.as_deref() {
-        Some(registry) if config.context.enabled() => {
-            registry
-                .await_context_for(&segment.id, config.context)
-                .await
-        }
-        _ => Vec::new(),
-    };
 
     for _ in 0..attempts {
         let retry_context = last_error.as_ref().map(ToString::to_string);
@@ -818,6 +814,20 @@ where
         cached_in,
         tokens_out,
     )
+}
+
+async fn context_pairs_for_segment(
+    segment: &Segment,
+    config: &TranslationRunConfig,
+) -> Vec<CompletedContext> {
+    match config.context_registry.as_deref() {
+        Some(registry) if config.context.enabled() => {
+            registry
+                .await_context_for(&segment.id, config.context)
+                .await
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn select_mode(segment: &Segment) -> TranslationMode {
@@ -1622,6 +1632,47 @@ mod tests {
 
         assert_eq!(translations[0].segment_id.0, "seg_a");
         assert_eq!(translations[1].segment_id.0, "seg_b");
+    }
+
+    #[tokio::test]
+    async fn non_batch_context_waiters_do_not_consume_scheduler_permits() {
+        let segments = vec![
+            segment("seg_d", 3, vec![("b0", "Fourth")]),
+            segment("seg_c", 2, vec![("b0", "Third")]),
+            segment("seg_b", 1, vec![("b0", "Second")]),
+            segment("seg_a", 0, vec![("b0", "First")]),
+        ];
+        let mut cfg = config();
+        cfg.scheduler.concurrency = 1;
+        cfg.context = ContextRunConfig {
+            window: 1,
+            budget_tokens: 1000,
+            scope: ContextScope::Book,
+        };
+        cfg.context_registry = Some(Arc::new(ContextRegistry::new(&segments)));
+
+        let run = translate_segments(
+            MockProvider::new(MockMode::PrefixTarget, "Italian"),
+            &segments,
+            &cfg,
+        );
+        let translations = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("context waiters must not starve predecessor segments")
+            .expect("mock translation should succeed");
+
+        assert_eq!(
+            translations
+                .iter()
+                .map(|translation| translation.segment_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["seg_a", "seg_b", "seg_c", "seg_d"]
+        );
+        assert!(
+            translations
+                .iter()
+                .all(|translation| translation.status == SegmentStatus::Succeeded)
+        );
     }
 
     #[tokio::test]
