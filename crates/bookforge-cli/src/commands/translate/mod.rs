@@ -4,6 +4,7 @@ use bookforge_core::config::TranslationProfile;
 use bookforge_core::{
     GlossaryFormat, GlossaryTerm, NullProgressSink,
     config::{DoubleCheckMode, FallbackScope, ResolvedRunSettings, TranslationConfig},
+    marker::extract_marker_id,
     merge_scope_terms,
     scheduler::SchedulerConfig,
     segment::{Segment, SegmentStatus, build_segments, compute_cache_namespace},
@@ -1768,10 +1769,110 @@ fn suspicious_qa_candidates(
             !(0.5..=2.2).contains(&ratio)
                 || translation.template == "translate_run_preserving"
                 || segment.constraints.preserve_spans.len() >= 4
-                || !segment.constraints.preserve_markers.is_empty()
+                || marker_structure_changed(segment, translation)
         })
         .cloned()
         .collect()
+}
+
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct MarkerSignature {
+    id: String,
+    shape: MarkerShape,
+}
+
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
+enum MarkerShape {
+    PairedM,
+    PairedKeep,
+    EmptyRef,
+}
+
+fn marker_structure_changed(segment: &Segment, translation: &SegmentTranslation) -> bool {
+    let Some(mut expected) = marker_signatures_for_blocks(
+        segment
+            .source
+            .blocks
+            .iter()
+            .map(|block| block.text.as_str()),
+    ) else {
+        return true;
+    };
+    let Some(mut actual) =
+        marker_signatures_for_blocks(translation.blocks.iter().map(|block| block.text.as_str()))
+    else {
+        return true;
+    };
+    expected.sort();
+    actual.sort();
+    expected != actual
+}
+
+fn marker_signatures_for_blocks<'a>(
+    blocks: impl Iterator<Item = &'a str>,
+) -> Option<Vec<MarkerSignature>> {
+    let mut signatures = Vec::new();
+    for text in blocks {
+        signatures.extend(marker_signatures_in_text(text)?);
+    }
+    Some(signatures)
+}
+
+fn marker_signatures_in_text(text: &str) -> Option<Vec<MarkerSignature>> {
+    let mut signatures = Vec::new();
+    let mut open_stack: Vec<&'static str> = Vec::new();
+    let mut rest = text;
+
+    while let Some(index) = rest.find('<') {
+        let tag = &rest[index..];
+        if tag.starts_with("<m ") || tag.starts_with("<keep ") {
+            let end = tag.find('>')?;
+            let open_tag = &tag[..=end];
+            if open_tag.ends_with("/>") {
+                return None;
+            }
+            let (tag_name, shape) = if tag.starts_with("<m ") {
+                ("m", MarkerShape::PairedM)
+            } else {
+                ("keep", MarkerShape::PairedKeep)
+            };
+            signatures.push(MarkerSignature {
+                id: extract_marker_id(open_tag)?,
+                shape,
+            });
+            open_stack.push(tag_name);
+            rest = &tag[end + 1..];
+        } else if tag.starts_with("<ref ") {
+            let end = tag.find('>')?;
+            let ref_tag = &tag[..=end];
+            if !ref_tag.ends_with("/>") {
+                return None;
+            }
+            signatures.push(MarkerSignature {
+                id: extract_marker_id(ref_tag)?,
+                shape: MarkerShape::EmptyRef,
+            });
+            rest = &tag[end + 1..];
+        } else if tag.starts_with("</m>") || tag.starts_with("</keep>") {
+            let expected = if tag.starts_with("</m>") { "m" } else { "keep" };
+            if open_stack.pop() != Some(expected) {
+                return None;
+            }
+            rest = if expected == "m" {
+                &tag["</m>".len()..]
+            } else {
+                &tag["</keep>".len()..]
+            };
+        } else {
+            rest = &tag[1..];
+        }
+    }
+
+    if open_stack.is_empty() {
+        Some(signatures)
+    } else {
+        None
+    }
 }
 
 fn mark_unfinished_segments_failed(
@@ -2254,6 +2355,105 @@ case_sensitive = true
 
         assert_eq!(changed, vec!["seg_a".to_string()]);
         assert_eq!(translations[0].blocks[0].text, "testo corretto");
+    }
+
+    #[test]
+    fn suspicious_qa_ignores_matching_inline_markers() {
+        let segment = marked_segment("seg_marker", 0, "<m id=\"m000000_000\">Hello</m>");
+        let translation = translation_for(
+            &segment,
+            "<m id=\"m000000_000\">Ciao</m>",
+            "stored",
+            SegmentStatus::Succeeded,
+        );
+
+        let candidates = suspicious_qa_candidates(&[segment], &[translation]);
+
+        assert!(
+            candidates.is_empty(),
+            "matching inline markers alone should not make a segment suspicious"
+        );
+    }
+
+    #[test]
+    fn suspicious_qa_includes_marker_id_mismatch() {
+        let segment = marked_segment("seg_marker", 0, "<m id=\"m000000_000\">Hello</m>");
+        let translation = translation_for(
+            &segment,
+            "<m id=\"m000000_999\">Ciao</m>",
+            "stored",
+            SegmentStatus::Succeeded,
+        );
+
+        let candidates = suspicious_qa_candidates(&[segment], &[translation]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].segment_id.0, "seg_marker");
+    }
+
+    #[test]
+    fn suspicious_qa_includes_marker_shape_mismatch() {
+        let segment = marked_segment("seg_marker", 0, "<m id=\"m000000_000\">Hello</m>");
+        let translation = translation_for(
+            &segment,
+            "<ref id=\"m000000_000\"/>",
+            "stored",
+            SegmentStatus::Succeeded,
+        );
+
+        let candidates = suspicious_qa_candidates(&[segment], &[translation]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].segment_id.0, "seg_marker");
+    }
+
+    #[test]
+    fn suspicious_qa_includes_malformed_marker() {
+        let segment = marked_segment("seg_marker", 0, "<m id=\"m000000_000\">Hello</m>");
+        let translation = translation_for(
+            &segment,
+            "<m id=\"m000000_000\">Ciao",
+            "stored",
+            SegmentStatus::Succeeded,
+        );
+
+        let candidates = suspicious_qa_candidates(&[segment], &[translation]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].segment_id.0, "seg_marker");
+    }
+
+    fn marked_segment(id: &str, ordinal: usize, text: &str) -> Segment {
+        let mut segment = segment(id, ordinal);
+        segment.source.text = text.to_string();
+        segment.source.blocks[0].text = text.to_string();
+        segment.constraints.preserve_markers = bookforge_core::marker::marker_ids_in_text(text);
+        segment
+    }
+
+    fn translation_for(
+        segment: &Segment,
+        text: &str,
+        template: &str,
+        status: SegmentStatus,
+    ) -> SegmentTranslation {
+        SegmentTranslation {
+            segment_id: segment.id.clone(),
+            ordinal: segment.ordinal,
+            block_ids: segment.block_ids.clone(),
+            blocks: vec![BlockTranslation {
+                block_id: segment.source.blocks[0].block_id.clone(),
+                text: text.to_string(),
+            }],
+            checksum: segment.checksum.clone(),
+            status,
+            template: template.to_string(),
+            error: None,
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            tokens_estimated: false,
+        }
     }
 
     fn segment(id: &str, ordinal: usize) -> Segment {
