@@ -91,9 +91,9 @@ fn validate_report(path: &PathBuf) -> Result<()> {
         .and_then(Value::as_array)
         .map(|warnings| {
             warnings.iter().any(|w| {
-                w.get("level")
+                w.get("severity")
                     .and_then(Value::as_str)
-                    .map(|level| level == "error")
+                    .map(|severity| severity == "error")
                     .unwrap_or(false)
             })
         })
@@ -103,4 +103,62 @@ fn validate_report(path: &PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_report_rejects_error_severity_warning() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let report = temp.path().join("report.json");
+        fs::write(
+            &report,
+            serde_json::json!({
+                "qa_warnings": [{
+                    "severity": "error",
+                    "kind": "qa_review",
+                    "segment_id": "seg_a",
+                    "message": "bad translation"
+                }],
+                "failed_segments": 0,
+                "needs_review_segments": 0,
+                "retry_pending_segments": 0
+            })
+            .to_string(),
+        )
+        .expect("report should write");
+
+        let err = validate_report(&report).expect_err("error severity should fail");
+
+        assert!(
+            err.to_string()
+                .contains("report contains QA warning(s) with severity 'error'")
+        );
+    }
+
+    #[test]
+    fn validate_report_allows_non_error_warnings() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let report = temp.path().join("report.json");
+        fs::write(
+            &report,
+            serde_json::json!({
+                "qa_warnings": [{
+                    "severity": "warning",
+                    "kind": "untranslated",
+                    "segment_id": "seg_a",
+                    "message": "same title"
+                }],
+                "failed_segments": 0,
+                "needs_review_segments": 0,
+                "retry_pending_segments": 0
+            })
+            .to_string(),
+        )
+        .expect("report should write");
+
+        validate_report(&report).expect("warning-only report should pass");
+    }
 }
