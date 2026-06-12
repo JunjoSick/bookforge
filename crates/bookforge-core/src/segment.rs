@@ -15,7 +15,9 @@ pub const SEGMENT_SCHEMA_VERSION: u32 = 1;
 /// v2: depth-anchored block closing, lazily anchored text blocks for
 /// non-whitelist elements, addressable stray text nodes — block ordinals
 /// and marker assignments differ from v1 on affected books.
-pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 2;
+/// v3: short per-block inline marker tags (`<m1>...</m1>`, `<r1/>`)
+/// replace verbose global ids (`<m id="m000000_000">...</m>`).
+pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 3;
 
 /// Compute a cache namespace that scopes lookups to a single set of
 /// schema and segmentation parameters. Cached rows from a different

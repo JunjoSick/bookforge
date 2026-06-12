@@ -1834,15 +1834,8 @@ mod tests {
 
     #[tokio::test]
     async fn inline_marker_failure_is_marked_needs_review() {
-        let mut segment = segment(
-            "seg_a",
-            0,
-            vec![("b0", "Hello <m id=\"m000000_000\">world</m>!")],
-        );
-        segment
-            .constraints
-            .preserve_markers
-            .push("m000000_000".to_string());
+        let mut segment = segment("seg_a", 0, vec![("b0", "Hello <m1>world</m1>!")]);
+        segment.constraints.preserve_markers.push("m1".to_string());
 
         let translations = translate_segments(
             MockProvider::new(MockMode::Uppercase, "Italian"),
@@ -1853,10 +1846,7 @@ mod tests {
         .expect("marker validation failure should not propagate");
 
         assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
-        assert_eq!(
-            translations[0].blocks[0].text,
-            "Hello <m id=\"m000000_000\">world</m>!"
-        );
+        assert_eq!(translations[0].blocks[0].text, "Hello <m1>world</m1>!");
         assert!(
             translations[0]
                 .error
@@ -1867,11 +1857,7 @@ mod tests {
 
     #[tokio::test]
     async fn marker_failure_falls_back_to_run_preserving_mode() {
-        let mut segment = segment(
-            "seg_a",
-            0,
-            vec![("b0", "Hello <m id=\"m000000_000\">world</m>!")],
-        );
+        let mut segment = segment("seg_a", 0, vec![("b0", "Hello <m1>world</m1>!")]);
         segment.source.blocks[0].text_runs = vec![
             SegmentTextRun {
                 id: "r0".to_string(),
@@ -1879,7 +1865,7 @@ mod tests {
             },
             SegmentTextRun {
                 id: "r1".to_string(),
-                text: "<m id=\"m000000_000\">".to_string(),
+                text: "<m1>".to_string(),
             },
             SegmentTextRun {
                 id: "r2".to_string(),
@@ -1887,17 +1873,14 @@ mod tests {
             },
             SegmentTextRun {
                 id: "r3".to_string(),
-                text: "</m>".to_string(),
+                text: "</m1>".to_string(),
             },
             SegmentTextRun {
                 id: "r4".to_string(),
                 text: "!".to_string(),
             },
         ];
-        segment
-            .constraints
-            .preserve_markers
-            .push("m000000_000".to_string());
+        segment.constraints.preserve_markers.push("m1".to_string());
 
         let mut config = config();
         config.scheduler.max_attempts = 1;
@@ -1911,10 +1894,7 @@ mod tests {
 
         assert_eq!(translations[0].status, SegmentStatus::Succeeded);
         assert_eq!(translations[0].template, "translate_run_preserving");
-        assert_eq!(
-            translations[0].blocks[0].text,
-            "HELLO <m id=\"m000000_000\">WORLD</m>!"
-        );
+        assert_eq!(translations[0].blocks[0].text, "HELLO <m1>WORLD</m1>!");
     }
 
     #[tokio::test]

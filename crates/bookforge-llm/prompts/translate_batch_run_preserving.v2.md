@@ -1,4 +1,4 @@
-# translate_batch_run_preserving.v1.md
+﻿# translate_batch_run_preserving.v2.md
 
 ## System
 
@@ -36,7 +36,7 @@ Entity grammatical agreement (use for adjective/article concord across all items
 {{entity_agreement_block}}
 ```
 
-Already-translated prior segments from the same chapter (use for pronoun, gender, and voice consistency only — do not retranslate):
+Already-translated prior segments from the same chapter (use for pronoun, gender, and voice consistency only â€” do not retranslate):
 
 ```txt
 {{context_translation_pairs}}

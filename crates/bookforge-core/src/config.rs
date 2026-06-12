@@ -32,6 +32,8 @@ impl Default for SegmentationConfig {
 pub enum PromptVersion {
     V1,
     BatchV1,
+    V2,
+    BatchV2,
 }
 
 impl PromptVersion {
@@ -39,6 +41,8 @@ impl PromptVersion {
         match self {
             PromptVersion::V1 => "v1",
             PromptVersion::BatchV1 => "batch_v1",
+            PromptVersion::V2 => "v2",
+            PromptVersion::BatchV2 => "batch_v2",
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -174,26 +174,26 @@ fn json_escape_inner(value: &str) -> String {
     serialized[1..serialized.len() - 1].to_string()
 }
 
-const PLAIN_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_segment.v1.md");
-const MARKER_SAFE_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_marker_safe.v1.md");
+const PLAIN_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_segment.v2.md");
+const MARKER_SAFE_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_marker_safe.v2.md");
 const RUN_PRESERVING_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_run_preserving.v1.md");
+    include_str!("../prompts/translate_run_preserving.v2.md");
 const QA_TEMPLATE_SOURCE: &str = include_str!("../prompts/qa_segment.v1.md");
 
-const BATCH_PLAIN_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_plain.v1.md");
+const BATCH_PLAIN_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_plain.v2.md");
 const BATCH_MARKER_SAFE_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_marker_safe.v1.md");
+    include_str!("../prompts/translate_batch_marker_safe.v2.md");
 const BATCH_RUN_PRESERVING_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_run_preserving.v1.md");
-const BATCH_REPAIR_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_repair.v1.md");
+    include_str!("../prompts/translate_batch_run_preserving.v2.md");
+const BATCH_REPAIR_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_repair.v2.md");
 const BATCH_PLAIN_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_plain_compact.v1.md");
+    include_str!("../prompts/translate_batch_plain_compact.v2.md");
 const BATCH_MARKER_SAFE_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_marker_safe_compact.v1.md");
+    include_str!("../prompts/translate_batch_marker_safe_compact.v2.md");
 const BATCH_RUN_PRESERVING_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_run_preserving_compact.v1.md");
+    include_str!("../prompts/translate_batch_run_preserving_compact.v2.md");
 const BATCH_REPAIR_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_repair_compact.v1.md");
+    include_str!("../prompts/translate_batch_repair_compact.v2.md");
 const QA_BATCH_TEMPLATE_SOURCE: &str = include_str!("../prompts/qa_batch.v1.md");
 const DOUBLE_CHECK_BATCH_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/double_check_batch.v1.md");
@@ -226,14 +226,14 @@ impl PromptLibrary {
     }
 
     pub fn embedded() -> Self {
-        let plain = PromptTemplate::parse("translate_segment", "v1", PLAIN_TEMPLATE_SOURCE)
+        let plain = PromptTemplate::parse("translate_segment", "v2", PLAIN_TEMPLATE_SOURCE)
             .expect("embedded plain template must parse");
         let marker_safe =
-            PromptTemplate::parse("translate_marker_safe", "v1", MARKER_SAFE_TEMPLATE_SOURCE)
+            PromptTemplate::parse("translate_marker_safe", "v2", MARKER_SAFE_TEMPLATE_SOURCE)
                 .expect("embedded marker-safe template must parse");
         let run_preserving = PromptTemplate::parse(
             "translate_run_preserving",
-            "v1",
+            "v2",
             RUN_PRESERVING_TEMPLATE_SOURCE,
         )
         .expect("embedded run-preserving template must parse");
@@ -241,44 +241,44 @@ impl PromptLibrary {
             .expect("embedded QA template must parse");
 
         let batch_plain =
-            PromptTemplate::parse("translate_batch_plain", "v1", BATCH_PLAIN_TEMPLATE_SOURCE)
+            PromptTemplate::parse("translate_batch_plain", "v2", BATCH_PLAIN_TEMPLATE_SOURCE)
                 .expect("embedded batch plain template must parse");
         let batch_marker_safe = PromptTemplate::parse(
             "translate_batch_marker_safe",
-            "v1",
+            "v2",
             BATCH_MARKER_SAFE_TEMPLATE_SOURCE,
         )
         .expect("embedded batch marker-safe template must parse");
         let batch_run_preserving = PromptTemplate::parse(
             "translate_batch_run_preserving",
-            "v1",
+            "v2",
             BATCH_RUN_PRESERVING_TEMPLATE_SOURCE,
         )
         .expect("embedded batch run-preserving template must parse");
         let batch_repair =
-            PromptTemplate::parse("translate_batch_repair", "v1", BATCH_REPAIR_TEMPLATE_SOURCE)
+            PromptTemplate::parse("translate_batch_repair", "v2", BATCH_REPAIR_TEMPLATE_SOURCE)
                 .expect("embedded batch repair template must parse");
         let batch_plain_compact = PromptTemplate::parse(
             "translate_batch_plain_compact",
-            "v1",
+            "v2",
             BATCH_PLAIN_COMPACT_TEMPLATE_SOURCE,
         )
         .expect("embedded batch plain compact template must parse");
         let batch_marker_safe_compact = PromptTemplate::parse(
             "translate_batch_marker_safe_compact",
-            "v1",
+            "v2",
             BATCH_MARKER_SAFE_COMPACT_TEMPLATE_SOURCE,
         )
         .expect("embedded batch marker-safe compact template must parse");
         let batch_run_preserving_compact = PromptTemplate::parse(
             "translate_batch_run_preserving_compact",
-            "v1",
+            "v2",
             BATCH_RUN_PRESERVING_COMPACT_TEMPLATE_SOURCE,
         )
         .expect("embedded batch run-preserving compact template must parse");
         let batch_repair_compact = PromptTemplate::parse(
             "translate_batch_repair_compact",
-            "v1",
+            "v2",
             BATCH_REPAIR_COMPACT_TEMPLATE_SOURCE,
         )
         .expect("embedded batch repair compact template must parse");
@@ -393,7 +393,7 @@ mod tests {
     fn embedded_library_loads_all_templates() {
         let library = PromptLibrary::embedded();
         assert_eq!(library.plain.name, "translate_segment");
-        assert_eq!(library.plain.version, "v1");
+        assert_eq!(library.plain.version, "v2");
         assert!(library.plain.system.contains("Translate"));
         assert!(library.plain.user.contains("{{segment_id}}"));
         assert_eq!(library.marker_safe.name, "translate_marker_safe");
