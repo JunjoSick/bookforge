@@ -31,6 +31,49 @@ pub struct EpubInspection {
     pub xhtml_spine_count: usize,
 }
 
+/// How much of the document's visible text the reader actually captures
+/// into translatable blocks. Text that lives outside the recognized block
+/// elements (for example directly inside `<div>`) is parsed over but never
+/// extracted, and ships untranslated; this metric makes that visible
+/// before any tokens are spent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TextCoverage {
+    pub total_chars: usize,
+    pub captured_chars: usize,
+    pub files: Vec<FileTextCoverage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTextCoverage {
+    pub href: String,
+    pub total_chars: usize,
+    pub captured_chars: usize,
+}
+
+impl TextCoverage {
+    pub fn percent(&self) -> f64 {
+        coverage_percent(self.captured_chars, self.total_chars)
+    }
+}
+
+impl FileTextCoverage {
+    pub fn percent(&self) -> f64 {
+        coverage_percent(self.captured_chars, self.total_chars)
+    }
+
+    pub fn uncaptured_chars(&self) -> usize {
+        self.total_chars.saturating_sub(self.captured_chars)
+    }
+}
+
+fn coverage_percent(captured: usize, total: usize) -> f64 {
+    if total == 0 {
+        100.0
+    } else {
+        (captured.min(total) as f64 / total as f64) * 100.0
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PackageDocument {
     metadata: Metadata,
@@ -175,6 +218,101 @@ pub fn inspect_epub(path: &Path) -> Result<EpubInspection> {
         package_path,
         xhtml_spine_count,
     })
+}
+
+/// Measure how much visible body text each XHTML spine document contributes
+/// versus how much the block extractor captures. Counts non-whitespace
+/// characters so block boundaries and indentation do not skew the ratio.
+pub fn text_coverage(path: &Path) -> Result<TextCoverage> {
+    let mut archive = open_archive(path)?;
+    validate_mimetype(&mut archive)?;
+    let package_path = locate_package(&mut archive)?;
+    let package_xml = read_archive_text(&mut archive, &package_path)?;
+    let package = parse_package(&package_xml)?;
+    let package_dir = package_base_dir(&package_path);
+    let manifest_by_id = package
+        .manifest
+        .iter()
+        .map(|item| (item.id.as_str(), item))
+        .collect::<HashMap<_, _>>();
+
+    let mut coverage = TextCoverage::default();
+    for (spine_index, spine_item) in package.spine.iter().enumerate() {
+        let Some(resource) = manifest_by_id.get(spine_item.idref.as_str()) else {
+            return Err(BookforgeError::InvalidInput(format!(
+                "spine item references missing manifest id '{}'",
+                spine_item.idref
+            )));
+        };
+        if !is_xhtml_media_type(&resource.media_type) {
+            continue;
+        }
+
+        let href = join_epub_path(&package_dir, &resource.href);
+        let xhtml = read_archive_text(&mut archive, &href)?;
+        let section_id = SectionId(format!("sec_{spine_index:06}"));
+        let blocks = extract_blocks(&xhtml, &href, &section_id, 0)?;
+        let captured_chars = blocks
+            .iter()
+            .map(|block| non_whitespace_chars(&block_visible_text(block)))
+            .sum::<usize>();
+        let total_chars = visible_body_chars(&xhtml)?;
+
+        coverage.total_chars += total_chars;
+        coverage.captured_chars += captured_chars;
+        coverage.files.push(FileTextCoverage {
+            href,
+            total_chars,
+            captured_chars,
+        });
+    }
+
+    Ok(coverage)
+}
+
+/// Non-whitespace character count of all text inside `<body>`, excluding
+/// `<script>` and `<style>` content.
+fn visible_body_chars(xhtml: &str) -> Result<usize> {
+    let mut reader = Reader::from_str(xhtml);
+    reader.config_mut().trim_text(false);
+    let mut in_body = false;
+    let mut skip_depth = 0usize;
+    let mut count = 0usize;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) => match local_name(element.name().as_ref()) {
+                b"body" => in_body = true,
+                b"script" | b"style" if in_body => skip_depth += 1,
+                _ => {}
+            },
+            Event::End(element) => match local_name(element.name().as_ref()) {
+                b"body" => in_body = false,
+                b"script" | b"style" if skip_depth > 0 => skip_depth -= 1,
+                _ => {}
+            },
+            Event::Text(text) if in_body && skip_depth == 0 => {
+                let value = text
+                    .decode()
+                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                count += non_whitespace_chars(&value);
+            }
+            Event::CData(text) if in_body && skip_depth == 0 => {
+                let value = text
+                    .decode()
+                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                count += non_whitespace_chars(&value);
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(count)
+}
+
+fn non_whitespace_chars(text: &str) -> usize {
+    text.chars().filter(|ch| !ch.is_whitespace()).count()
 }
 
 fn open_archive(path: &Path) -> Result<ZipArchive<File>> {
@@ -516,21 +654,14 @@ fn extract_blocks(
             }
             Event::Empty(element) => {
                 let name = local_name(element.name().as_ref()).to_vec();
-                let path = next_child_path(&mut element_stack);
+                // Sibling bookkeeping must advance even though self-closing
+                // block elements (<p/>, <td/>) carry no text and therefore
+                // produce no block — emitting one would send an empty
+                // source to the model and invite hallucinated output.
+                next_child_path(&mut element_stack);
 
                 if let Some(block) = active_block.as_mut() {
                     block.push_inline_empty(&name);
-                } else if let Some(kind) = block_kind(&name, &element)? {
-                    let block = build_block(
-                        section_id,
-                        initial_block_count + blocks.len(),
-                        kind,
-                        DomPath(path),
-                        Vec::new(),
-                        Vec::new(),
-                        String::new(),
-                    );
-                    blocks.push(block);
                 }
             }
             Event::Text(text) => {
@@ -931,6 +1062,36 @@ mod tests {
         assert_eq!(block_text(&blocks[0]), "Line<ref id=\"r000004_000\"/>break");
         assert_eq!(blocks[0].inline_marks[0].id, "r000004_000");
         assert_eq!(blocks[0].inline_marks[0].kind, "br");
+    }
+
+    #[test]
+    fn visible_body_chars_counts_text_outside_recognized_blocks() {
+        let xhtml = r#"<html><head><title>Ignored</title><style>p { color: red; }</style></head>
+<body><p>captured</p><div>dropped text</div></body></html>"#;
+        let total = visible_body_chars(xhtml).expect("count should succeed");
+        // "captured" (8) + "droppedtext" (11); head and style are excluded.
+        assert_eq!(total, 19);
+    }
+
+    #[test]
+    fn coverage_reports_uncaptured_div_text() {
+        let section_id = SectionId("sec_000000".to_string());
+        let xhtml =
+            "<html><body><p>in a block</p><div>only in a div</div></body></html>".to_string();
+        let blocks =
+            extract_blocks(&xhtml, "chapter.xhtml", &section_id, 0).expect("blocks should parse");
+        let captured = blocks
+            .iter()
+            .map(|block| non_whitespace_chars(&block_visible_text(block)))
+            .sum::<usize>();
+        let total = visible_body_chars(&xhtml).expect("count should succeed");
+
+        assert_eq!(captured, non_whitespace_chars("in a block"));
+        assert_eq!(
+            total,
+            non_whitespace_chars("in a block") + non_whitespace_chars("only in a div")
+        );
+        assert!(captured < total, "div text must register as uncaptured");
     }
 
     #[test]

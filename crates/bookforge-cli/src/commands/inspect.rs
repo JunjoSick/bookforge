@@ -4,7 +4,7 @@ use bookforge_core::{
     ir::{BlockKind, Book},
     segment::{Segment, build_segments},
 };
-use bookforge_epub::{inspect_epub, read_epub};
+use bookforge_epub::{inspect_epub, read_epub, text_coverage};
 use clap::Args;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -42,6 +42,41 @@ pub async fn run(args: InspectArgs) -> Result<()> {
         status(inspection.has_toc)
     );
     println!("Resource count: {}", inspection.resource_count);
+
+    let coverage = text_coverage(&args.input)?;
+    println!(
+        "Text coverage: {:.1}% ({} of {} visible characters in translatable blocks)",
+        coverage.percent(),
+        coverage.captured_chars,
+        coverage.total_chars
+    );
+    let mut low = coverage
+        .files
+        .iter()
+        .filter(|file| file.uncaptured_chars() > 0 && file.percent() < 99.0)
+        .collect::<Vec<_>>();
+    low.sort_by(|left, right| {
+        left.percent()
+            .partial_cmp(&right.percent())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if !low.is_empty() {
+        println!(
+            "Low-coverage files (text the translator will never see, {} total):",
+            low.len()
+        );
+        for file in low.iter().take(10) {
+            println!(
+                "  {}: {:.1}% ({} uncaptured characters)",
+                file.href,
+                file.percent(),
+                file.uncaptured_chars()
+            );
+        }
+        if low.len() > 10 {
+            println!("  ... and {} more", low.len() - 10);
+        }
+    }
 
     if args.structure || args.segments {
         let book = read_epub(&args.input)?;
