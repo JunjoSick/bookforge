@@ -11,6 +11,7 @@ use bookforge_core::{
         Block, BlockId, BlockKind, Book, BookFormat, BookId, DomPath, InlineMark, Metadata,
         ProtectedSpan, ProtectedSpanKind, Resource, Section, SectionId, SpineItem, TextRun,
     },
+    marker::{is_marker_token, strip_marker_tokens},
 };
 use quick_xml::{
     Reader,
@@ -96,6 +97,57 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         .collect::<HashMap<_, _>>();
     let mut sections = Vec::new();
     let mut blocks = Vec::new();
+
+    let package_section_id = SectionId("sec_metadata_opf".to_string());
+    let mut package_blocks =
+        extract_package_title_blocks(&package_xml, &package_section_id, blocks.len())?;
+    if !package_blocks.is_empty() {
+        let block_ids = package_blocks
+            .iter()
+            .map(|block| block.id.clone())
+            .collect::<Vec<_>>();
+        sections.push(Section {
+            id: package_section_id,
+            href: package_path.clone(),
+            spine_index: 0,
+            title: Some("OPF metadata".to_string()),
+            heading_level: None,
+            block_ids,
+            prev: None,
+            next: None,
+        });
+        blocks.append(&mut package_blocks);
+    }
+
+    for (toc_index, resource) in package
+        .manifest
+        .iter()
+        .filter(|item| item.media_type == "application/x-dtbncx+xml")
+        .enumerate()
+    {
+        let href = join_epub_path(&package_dir, &resource.href);
+        let ncx = read_archive_text(&mut archive, &href)?;
+        let section_id = SectionId(format!("sec_toc_{toc_index:06}"));
+        let mut toc_blocks = extract_ncx_text_blocks(&ncx, &section_id, blocks.len())?;
+        if toc_blocks.is_empty() {
+            continue;
+        }
+        let block_ids = toc_blocks
+            .iter()
+            .map(|block| block.id.clone())
+            .collect::<Vec<_>>();
+        sections.push(Section {
+            id: section_id,
+            href,
+            spine_index: 0,
+            title: Some("NCX table of contents".to_string()),
+            heading_level: None,
+            block_ids,
+            prev: None,
+            next: None,
+        });
+        blocks.append(&mut toc_blocks);
+    }
 
     for (spine_index, spine_item) in package.spine.iter_mut().enumerate() {
         let Some(resource) = manifest_by_id.get(spine_item.idref.as_str()) else {
@@ -270,40 +322,47 @@ pub fn text_coverage(path: &Path) -> Result<TextCoverage> {
     Ok(coverage)
 }
 
-/// Non-whitespace character count of all text inside `<body>`, excluding
-/// `<script>` and `<style>` content.
+/// Non-whitespace character count of all reader-visible text: everything
+/// inside `<body>` (minus `<script>`/`<style>` content) plus the document
+/// `<title>`, which the extractor also captures and translates. Keeping
+/// the numerator and denominator in sync stops per-file coverage from
+/// exceeding 100% on title-bearing chapters.
 fn visible_body_chars(xhtml: &str) -> Result<usize> {
     let mut reader = Reader::from_str(xhtml);
     reader.config_mut().trim_text(false);
     let mut in_body = false;
+    let mut in_title = false;
     let mut skip_depth = 0usize;
     let mut count = 0usize;
 
     loop {
+        let counting = (in_body || in_title) && skip_depth == 0;
         match reader.read_event()? {
             Event::Start(element) => match local_name(element.name().as_ref()) {
                 b"body" => in_body = true,
+                b"title" if !in_body => in_title = true,
                 b"script" | b"style" if in_body => skip_depth += 1,
                 _ => {}
             },
             Event::End(element) => match local_name(element.name().as_ref()) {
                 b"body" => in_body = false,
+                b"title" => in_title = false,
                 b"script" | b"style" if skip_depth > 0 => skip_depth -= 1,
                 _ => {}
             },
-            Event::Text(text) if in_body && skip_depth == 0 => {
+            Event::Text(text) if counting => {
                 let value = text
                     .html_content()
                     .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
                 count += non_whitespace_chars(&value);
             }
-            Event::CData(text) if in_body && skip_depth == 0 => {
+            Event::CData(text) if counting => {
                 let value = text
                     .decode()
                     .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
                 count += non_whitespace_chars(&value);
             }
-            Event::GeneralRef(reference) if in_body && skip_depth == 0 => {
+            Event::GeneralRef(reference) if counting => {
                 if let Some(value) = resolve_general_ref(&reference)? {
                     count += non_whitespace_chars(&value);
                 }
@@ -513,6 +572,111 @@ struct ElementFrame {
     text_count: usize,
 }
 
+struct TextCapture {
+    depth: usize,
+    path: Vec<usize>,
+    text: String,
+}
+
+fn extract_package_title_blocks(
+    xml: &str,
+    section_id: &SectionId,
+    initial_block_count: usize,
+) -> Result<Vec<Block>> {
+    extract_xml_text_element_blocks(xml, section_id, initial_block_count, |name| {
+        name == b"title"
+    })
+}
+
+fn extract_ncx_text_blocks(
+    xml: &str,
+    section_id: &SectionId,
+    initial_block_count: usize,
+) -> Result<Vec<Block>> {
+    extract_xml_text_element_blocks(xml, section_id, initial_block_count, |name| name == b"text")
+}
+
+fn extract_xml_text_element_blocks(
+    xml: &str,
+    section_id: &SectionId,
+    initial_block_count: usize,
+    should_capture: impl Fn(&[u8]) -> bool,
+) -> Result<Vec<Block>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    let mut element_stack = Vec::<ElementFrame>::new();
+    let mut active_capture: Option<TextCapture> = None;
+    let mut blocks = Vec::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) => {
+                let name = local_name(element.name().as_ref()).to_vec();
+                let path = enter_element(&mut element_stack, &name);
+                if active_capture.is_none() && should_capture(&name) {
+                    active_capture = Some(TextCapture {
+                        depth: element_stack.len(),
+                        path,
+                        text: String::new(),
+                    });
+                }
+            }
+            Event::Empty(_) => {
+                next_child_path(&mut element_stack);
+            }
+            Event::Text(text) => {
+                if let Some(capture) = active_capture.as_mut() {
+                    let value = text
+                        .html_content()
+                        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                    capture.text.push_str(&value);
+                }
+            }
+            Event::CData(text) => {
+                if let Some(capture) = active_capture.as_mut() {
+                    let value = text
+                        .decode()
+                        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                    capture.text.push_str(&value);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if let Some(capture) = active_capture.as_mut()
+                    && let Some(value) = resolve_general_ref(&reference)?
+                {
+                    capture.text.push_str(&value);
+                }
+            }
+            Event::End(_) => {
+                if active_capture
+                    .as_ref()
+                    .is_some_and(|capture| element_stack.len() == capture.depth)
+                {
+                    let capture = active_capture.take().expect("checked above");
+                    let visible = normalize_space(&capture.text);
+                    if !visible.is_empty() {
+                        blocks.push(build_block(
+                            section_id,
+                            initial_block_count + blocks.len(),
+                            BlockKind::Paragraph,
+                            DomPath(capture.path),
+                            Vec::new(),
+                            Vec::new(),
+                            visible,
+                        ));
+                    }
+                }
+                element_stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(blocks)
+}
+
 #[derive(Debug)]
 struct BlockBuilder {
     /// Stack depth of the element this block is anchored to. The block
@@ -584,29 +748,29 @@ impl BlockBuilder {
     }
 
     fn push_inline_start(&mut self, name: &[u8]) {
-        let id = marker_id(b"m", self.ordinal, self.next_marker);
+        let id = marker_id("m", self.next_marker);
         self.next_marker += 1;
         self.inline_marks.push(InlineMark {
             id: id.clone(),
             kind: String::from_utf8_lossy(name).into_owned(),
         });
         self.inline_stack.push(id.clone());
-        self.push_run(format!("<m id=\"{id}\">"));
+        self.push_run(format!("<{id}>"));
     }
 
     fn push_inline_empty(&mut self, name: &[u8]) {
-        let id = marker_id(b"r", self.ordinal, self.next_marker);
+        let id = marker_id("r", self.next_marker);
         self.next_marker += 1;
         self.inline_marks.push(InlineMark {
             id: id.clone(),
             kind: String::from_utf8_lossy(name).into_owned(),
         });
-        self.push_run(format!("<ref id=\"{id}\"/>"));
+        self.push_run(format!("<{id}/>"));
     }
 
     fn push_inline_end(&mut self) {
-        if self.inline_stack.pop().is_some() {
-            self.push_run("</m>".to_string());
+        if let Some(id) = self.inline_stack.pop() {
+            self.push_run(format!("</{id}>"));
         }
     }
 
@@ -866,10 +1030,7 @@ fn handle_text(
 
 /// Elements whose text must never be translated.
 fn never_translate_element(name: &[u8]) -> bool {
-    matches!(
-        name,
-        b"script" | b"style" | b"head" | b"title" | b"svg" | b"math"
-    )
+    matches!(name, b"script" | b"style" | b"svg" | b"math")
 }
 
 /// Elements safe to anchor a lazily-started text block on. Structural
@@ -885,6 +1046,7 @@ fn anchors_text_block(name: &[u8]) -> bool {
             | b"article"
             | b"main"
             | b"nav"
+            | b"head"
             | b"header"
             | b"footer"
             | b"aside"
@@ -1034,41 +1196,11 @@ fn block_visible_text(block: &Block) -> String {
         .map(|run| run.text.as_str())
         .collect::<Vec<_>>()
         .join("");
-    strip_marker_tokens(&marked)
+    normalize_space(&strip_marker_tokens(&marked))
 }
 
-fn strip_marker_tokens(text: &str) -> String {
-    let mut output = String::new();
-    let mut rest = text;
-
-    while let Some(index) = rest.find('<') {
-        output.push_str(&rest[..index]);
-        let tag = &rest[index..];
-
-        if (tag.starts_with("<m id=\"") || tag.starts_with("<ref id=\"") || tag.starts_with("</m>"))
-            && let Some(end) = tag.find('>')
-        {
-            rest = &tag[end + 1..];
-            continue;
-        }
-
-        output.push('<');
-        rest = &tag[1..];
-    }
-
-    output.push_str(rest);
-    normalize_space(&output)
-}
-
-fn is_marker_token(text: &str) -> bool {
-    matches!(text, "</m>") || text.starts_with("<m id=\"") || text.starts_with("<ref id=\"")
-}
-
-fn marker_id(prefix: &[u8], block_ordinal: usize, marker_ordinal: usize) -> String {
-    format!(
-        "{}{block_ordinal:06}_{marker_ordinal:03}",
-        String::from_utf8_lossy(prefix)
-    )
+fn marker_id(prefix: &str, marker_ordinal: usize) -> String {
+    format!("{prefix}{}", marker_ordinal + 1)
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -1236,9 +1368,9 @@ mod tests {
 
         assert_eq!(blocks.len(), 1);
         let text = block_text(&blocks[0]);
-        assert_eq!(text, "Hello <m id=\"m000000_000\">world</m>!");
+        assert_eq!(text, "Hello <m1>world</m1>!");
         assert_eq!(blocks[0].inline_marks.len(), 1);
-        assert_eq!(blocks[0].inline_marks[0].id, "m000000_000");
+        assert_eq!(blocks[0].inline_marks[0].id, "m1");
         assert_eq!(blocks[0].inline_marks[0].kind, "em");
         assert_eq!(blocks[0].token_estimate, estimate_tokens("Hello world!"));
     }
@@ -1256,8 +1388,8 @@ mod tests {
 
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].id.0, "b_000004");
-        assert_eq!(block_text(&blocks[0]), "Line<ref id=\"r000004_000\"/>break");
-        assert_eq!(blocks[0].inline_marks[0].id, "r000004_000");
+        assert_eq!(block_text(&blocks[0]), "Line<r1/>break");
+        assert_eq!(blocks[0].inline_marks[0].id, "r1");
         assert_eq!(blocks[0].inline_marks[0].kind, "br");
     }
 
@@ -1275,7 +1407,7 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(
             block_text(&blocks[0]),
-            "Bare div text with <m id=\"m000000_000\">emphasis</m>."
+            "Bare div text with <m1>emphasis</m1>."
         );
         assert_eq!(blocks[0].kind, BlockKind::Paragraph);
     }
@@ -1370,17 +1502,20 @@ mod tests {
         )
         .expect("block extraction should succeed");
 
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(block_text(&blocks[0]), "Real");
+        let texts = blocks.iter().map(block_text).collect::<Vec<_>>();
+        assert_eq!(texts, vec!["Meta", "Real"]);
+        assert!(!texts.iter().any(|text| text.contains("color")));
+        assert!(!texts.iter().any(|text| text.contains("var x")));
     }
 
     #[test]
-    fn visible_body_chars_counts_text_outside_recognized_blocks() {
-        let xhtml = r#"<html><head><title>Ignored</title><style>p { color: red; }</style></head>
-<body><p>captured</p><div>dropped text</div></body></html>"#;
+    fn visible_body_chars_counts_body_and_title_but_not_style() {
+        let xhtml = r#"<html><head><title>Heading</title><style>p { color: red; }</style></head>
+<body><p>captured</p><div>div text</div></body></html>"#;
         let total = visible_body_chars(xhtml).expect("count should succeed");
-        // "captured" (8) + "droppedtext" (11); head and style are excluded.
-        assert_eq!(total, 19);
+        // "Heading" (7) + "captured" (8) + "divtext" (7); style is excluded.
+        // The head title counts because the extractor translates it too.
+        assert_eq!(total, 22);
     }
 
     #[test]

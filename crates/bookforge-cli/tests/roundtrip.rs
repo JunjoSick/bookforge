@@ -64,6 +64,67 @@ fn opf(chapter_files: &[&str]) -> String {
     )
 }
 
+fn opf_with_ncx(chapter_files: &[&str]) -> String {
+    let manifest = chapter_files
+        .iter()
+        .enumerate()
+        .map(|(i, href)| {
+            format!(r#"    <item id="ch{i}" href="{href}" media-type="application/xhtml+xml"/>"#)
+        })
+        .chain(std::iter::once(
+            r#"    <item id="toc" href="toc.ncx" media-type="application/x-dtbncx+xml"/>"#
+                .to_string(),
+        ))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let spine = chapter_files
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!(r#"    <itemref idref="ch{i}"/>"#))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">roundtrip-fixture</dc:identifier>
+    <dc:title>Roundtrip Fixture</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+{manifest}
+  </manifest>
+  <spine toc="toc">
+{spine}
+  </spine>
+</package>"#
+    )
+}
+
+fn ncx(chapter_files: &[&str]) -> String {
+    let nav_points = chapter_files
+        .iter()
+        .enumerate()
+        .map(|(i, href)| {
+            format!(
+                r##"    <navPoint id="nav{i}" playOrder="{}"><navLabel><text>Chapter</text></navLabel><content src="{href}"/></navPoint>"##,
+                i + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head><meta name="dtb:uid" content="roundtrip-fixture"/></head>
+  <docTitle><text>Roundtrip Fixture</text></docTitle>
+  <navMap>
+{nav_points}
+  </navMap>
+</ncx>"#
+    )
+}
+
 fn chapter(body: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -100,6 +161,31 @@ fn build_epub(dir: &Path, name: &str, chapters: &[(&str, &str)]) -> PathBuf {
     path
 }
 
+fn build_epub_with_ncx(dir: &Path, name: &str, chapters: &[(&str, &str)]) -> PathBuf {
+    let path = dir.join(name);
+    let file = File::create(&path).expect("fixture EPUB should be creatable");
+    let mut zip = ZipWriter::new(file);
+
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    zip.start_file("mimetype", stored).unwrap();
+    zip.write_all(b"application/epub+zip").unwrap();
+    zip.start_file("META-INF/container.xml", deflated).unwrap();
+    zip.write_all(CONTAINER_XML.as_bytes()).unwrap();
+    let hrefs = chapters.iter().map(|(href, _)| *href).collect::<Vec<_>>();
+    zip.start_file("content.opf", deflated).unwrap();
+    zip.write_all(opf_with_ncx(&hrefs).as_bytes()).unwrap();
+    zip.start_file("toc.ncx", deflated).unwrap();
+    zip.write_all(ncx(&hrefs).as_bytes()).unwrap();
+    for (href, body) in chapters {
+        zip.start_file(*href, deflated).unwrap();
+        zip.write_all(chapter(body).as_bytes()).unwrap();
+    }
+    zip.finish().unwrap();
+    path
+}
+
 struct RoundtripRun {
     _temp: TempDir,
     output: PathBuf,
@@ -109,6 +195,38 @@ struct RoundtripRun {
 fn translate(chapters: &[(&str, &str)], model: &str) -> RoundtripRun {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let input = build_epub(temp.path(), "in.epub", chapters);
+    let output = temp.path().join("out.epub");
+    Command::cargo_bin("bookforge")
+        .expect("bookforge binary should be built")
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--source",
+            "English",
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            model,
+            "--ui",
+            "quiet",
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert!(output.exists(), "translated EPUB should exist");
+    RoundtripRun {
+        _temp: temp,
+        output,
+    }
+}
+
+fn translate_with_ncx(chapters: &[(&str, &str)], model: &str) -> RoundtripRun {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = build_epub_with_ncx(temp.path(), "in.epub", chapters);
     let output = temp.path().join("out.epub");
     Command::cargo_bin("bookforge")
         .expect("bookforge binary should be built")
@@ -386,6 +504,34 @@ fn ingestion_survives_named_html_entities() {
     let run = translate(&[("ch1.xhtml", body)], "mock-prefix-target");
     let text = body_text(&run.output, "ch1.xhtml");
     assert_translated(&text, "ENTITY_SENTINEL");
+}
+
+#[test]
+fn coverage_opf_ncx_and_head_titles() {
+    let body = r#"<h1>BODY_TITLE_SENTINEL</h1><p>BODY_SENTINEL text.</p>"#;
+    let run = translate_with_ncx(&[("ch1.xhtml", body)], "mock-prefix-target");
+
+    let opf = read_zip_text(&run.output, "content.opf");
+    assert!(
+        opf.contains("<dc:title>[Italian] Roundtrip Fixture</dc:title>"),
+        "OPF dc:title should be translated, got: {opf}"
+    );
+
+    let chapter = read_zip_text(&run.output, "ch1.xhtml");
+    assert!(
+        chapter.contains("<title>[Italian] Chapter</title>"),
+        "XHTML head title should be translated, got: {chapter}"
+    );
+
+    let toc = read_zip_text(&run.output, "toc.ncx");
+    assert!(
+        toc.contains("<text>[Italian] Roundtrip Fixture</text>"),
+        "NCX docTitle should be translated, got: {toc}"
+    );
+    assert!(
+        toc.contains("<text>[Italian] Chapter</text>"),
+        "NCX navLabel should be translated, got: {toc}"
+    );
 }
 
 // ---------------------------------------------------------------------------
