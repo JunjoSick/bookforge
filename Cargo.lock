@@ -175,6 +175,7 @@ dependencies = [
  "clap",
  "console",
  "indicatif",
+ "quick-xml",
  "serde",
  "serde_json",
  "sha2",
@@ -184,6 +185,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]
