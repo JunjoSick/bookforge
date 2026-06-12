@@ -25,15 +25,14 @@ use clap::Args;
 
 use crate::{
     QaMode,
-    checkpoint::CheckpointWriter,
     cost::estimate_cost_usd,
     performance::performance_summary_from_events,
     report::{ReportInput, write_report},
 };
 
 use super::translate::{
-    CacheContext, CheckpointContext, apply_cached_translations, mock_mode, qa_reviews_for_mode,
-    translate_and_checkpoint, translate_and_checkpoint_batch,
+    CacheContext, CheckpointRunContext, apply_cached_translations, mock_mode, qa_reviews_for_mode,
+    run_checkpointed_translation,
 };
 
 #[derive(Debug, Args)]
@@ -344,90 +343,49 @@ async fn run_inner(
     let fresh_translations = if pending_segments.is_empty() {
         Vec::new()
     } else {
-        let writer = CheckpointWriter::spawn(store.path().to_path_buf(), progress.clone());
-        let sender = writer.sender();
-        let result = match job.provider.as_str() {
+        match job.provider.as_str() {
             "mock" => {
                 let provider =
                     MockProvider::new(mock_mode(&snapshot.model), &snapshot.target_language);
-                if settings.batch.enabled {
-                    let batch_run_config = batch_run_config(&run_config, &settings);
-                    translate_and_checkpoint_batch(
-                        provider.clone(),
-                        &pending_segments,
-                        &batch_run_config,
-                        &settings,
-                        CheckpointContext {
-                            store: &store,
-                            job_id: &job.id,
-                            provider: &snapshot.provider,
-                            model: &snapshot.model,
-                            prompt_version,
-                            sender: &sender,
-                        },
-                        progress.clone(),
-                    )
-                    .await
-                } else {
-                    translate_and_checkpoint(
-                        provider.clone(),
-                        &pending_segments,
-                        &run_config,
-                        CheckpointContext {
-                            store: &store,
-                            job_id: &job.id,
-                            provider: &snapshot.provider,
-                            model: &snapshot.model,
-                            prompt_version,
-                            sender: &sender,
-                        },
-                    )
-                    .await
-                }
+                run_checkpointed_translation(
+                    provider,
+                    &pending_segments,
+                    &run_config,
+                    &settings,
+                    CheckpointRunContext {
+                        store: &store,
+                        job_id: &job.id,
+                        provider: &snapshot.provider,
+                        model: &snapshot.model,
+                        prompt_version,
+                    },
+                    progress.clone(),
+                    settings.batch.enabled,
+                )
+                .await
             }
             "deepseek" | "openrouter" | "openai-compatible" => {
                 let provider_config = openai_compatible_config(&job, snapshot, &settings)?;
                 let provider = OpenAiCompatibleProvider::new(provider_config)?;
-                if settings.batch.enabled {
-                    let batch_run_config = batch_run_config(&run_config, &settings);
-                    translate_and_checkpoint_batch(
-                        provider.clone(),
-                        &pending_segments,
-                        &batch_run_config,
-                        &settings,
-                        CheckpointContext {
-                            store: &store,
-                            job_id: &job.id,
-                            provider: &snapshot.provider,
-                            model: &snapshot.model,
-                            prompt_version,
-                            sender: &sender,
-                        },
-                        progress.clone(),
-                    )
-                    .await
-                } else {
-                    translate_and_checkpoint(
-                        provider.clone(),
-                        &pending_segments,
-                        &run_config,
-                        CheckpointContext {
-                            store: &store,
-                            job_id: &job.id,
-                            provider: &snapshot.provider,
-                            model: &snapshot.model,
-                            prompt_version,
-                            sender: &sender,
-                        },
-                    )
-                    .await
-                }
+                run_checkpointed_translation(
+                    provider,
+                    &pending_segments,
+                    &run_config,
+                    &settings,
+                    CheckpointRunContext {
+                        store: &store,
+                        job_id: &job.id,
+                        provider: &snapshot.provider,
+                        model: &snapshot.model,
+                        prompt_version,
+                    },
+                    progress.clone(),
+                    settings.batch.enabled,
+                )
+                .await
             }
             provider => anyhow::bail!("cannot resume unsupported provider '{provider}'"),
-        };
-        drop(sender);
-        writer.shutdown().await?;
-        result?
+        }?
     };
 
     cached_translations.extend(fresh_translations);
@@ -670,34 +628,6 @@ fn openai_compatible_config_from_parts(
     })
 }
 
-fn batch_run_config(
-    run_config: &TranslationRunConfig,
-    settings: &ResolvedRunSettings,
-) -> TranslationRunConfig {
-    TranslationRunConfig {
-        source_language: run_config.source_language.clone(),
-        target_language: run_config.target_language.clone(),
-        provider: run_config.provider.clone(),
-        model: run_config.model.clone(),
-        prompt_version: run_config.prompt_version.clone(),
-        temperature: run_config.temperature,
-        scheduler: bookforge_core::SchedulerConfig {
-            concurrency: run_config.scheduler.concurrency,
-            max_attempts: settings.provider.provider_max_attempts,
-        },
-        profile: settings.profile,
-        model_context_tokens: settings.provider.model_context_tokens,
-        max_output_tokens: settings.provider.max_output_tokens,
-        batch_max_output_tokens: settings.provider.batch_max_output_tokens,
-        compact_prompts: settings.compact_prompts,
-        glossary: run_config.glossary.clone(),
-        context: run_config.context,
-        context_registry: run_config.context_registry.clone(),
-        style: run_config.style.clone(),
-        entities: run_config.entities.clone(),
-    }
-}
-
 fn snapshot_context_run_config(snapshot: &RunConfigSnapshot) -> ContextRunConfig {
     ContextRunConfig {
         window: snapshot.context_window,
@@ -927,7 +857,13 @@ mod tests {
         },
     };
     use bookforge_store::{CreateJob, SaveNeedsReview, SaveTranslation};
-    use std::sync::Mutex;
+    use std::{
+        io::Write,
+        path::Path,
+        sync::Mutex,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
     struct RecordingSink {
         events: Arc<Mutex<Vec<ProgressEvent>>>,
@@ -953,9 +889,7 @@ mod tests {
         settings.batch.enabled = false;
         settings.segmentation.max_segment_tokens = 1377;
         settings.segmentation.context_tokens = 77;
-        let Some(mut fixture) = resume_fixture(settings, 1) else {
-            return;
-        };
+        let mut fixture = resume_fixture(settings, 1);
 
         run_fixture(&mut fixture)
             .await
@@ -975,9 +909,7 @@ mod tests {
         let mut settings = TranslationProfile::Safe.resolve();
         settings.batch.enabled = false;
         settings.compact_prompts = true;
-        let Some(mut fixture) = resume_fixture(settings, 1) else {
-            return;
-        };
+        let mut fixture = resume_fixture(settings, 1);
 
         let events = run_fixture(&mut fixture)
             .await
@@ -994,9 +926,7 @@ mod tests {
         settings.batch.enabled = false;
         settings.provider.json_mode = JsonMode::PromptOnly;
         settings.provider.provider_max_attempts = 4;
-        let Some(mut fixture) = resume_fixture(settings.clone(), 1) else {
-            return;
-        };
+        let mut fixture = resume_fixture(settings.clone(), 1);
 
         let config = openai_compatible_config_from_parts(
             "openrouter",
@@ -1021,9 +951,7 @@ mod tests {
     #[tokio::test]
     async fn resume_missing_config_snapshot_fails_clearly() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let Some(input) = fixture_input_or_skip() else {
-            return;
-        };
+        let input = fixture_input();
         let output = tempdir.path().join("out.epub");
         let store = JobStore::open(tempdir.path().join("jobs.sqlite")).expect("store should open");
         let job = store
@@ -1056,9 +984,7 @@ mod tests {
     async fn resume_reuses_checkpointed_segments_and_translates_only_resumable_segments() {
         let mut settings = TranslationProfile::V1Fast.resolve();
         settings.batch.enabled = false;
-        let Some(mut fixture) = resume_fixture(settings, 2) else {
-            return;
-        };
+        let mut fixture = resume_fixture(settings, 2);
         save_succeeded(
             &fixture.store,
             &fixture.job.id,
@@ -1089,9 +1015,7 @@ mod tests {
     async fn resume_retry_pending_bypasses_cache() {
         let mut settings = TranslationProfile::V1Fast.resolve();
         settings.batch.enabled = false;
-        let Some(mut fixture) = resume_fixture(settings, 1) else {
-            return;
-        };
+        let mut fixture = resume_fixture(settings, 1);
         let cache_job = fixture
             .store
             .create_job(CreateJob {
@@ -1159,9 +1083,7 @@ mod tests {
     async fn resume_skips_needs_review_by_default() {
         let mut settings = TranslationProfile::V1Fast.resolve();
         settings.batch.enabled = false;
-        let Some(mut fixture) = resume_fixture(settings, 2) else {
-            return;
-        };
+        let mut fixture = resume_fixture(settings, 2);
         for segment in &fixture.segments {
             save_needs_review(&fixture.store, &fixture.job.id, segment);
         }
@@ -1230,9 +1152,7 @@ mod tests {
     async fn resume_errors_on_cache_namespace_mismatch() {
         let mut settings = TranslationProfile::V1Fast.resolve();
         settings.batch.enabled = false;
-        let Some(mut fixture) = resume_fixture(settings, 1) else {
-            return;
-        };
+        let mut fixture = resume_fixture(settings, 1);
         fixture.snapshot.cache_namespace = "wrong-cache-namespace".to_string();
 
         let error = run_fixture(&mut fixture)
@@ -1250,9 +1170,7 @@ mod tests {
     async fn resume_accepts_legacy_v1_snapshot_without_glossary_metadata() {
         let mut settings = TranslationProfile::V1Fast.resolve();
         settings.batch.enabled = false;
-        let Some(mut fixture) = resume_fixture(settings.clone(), 1) else {
-            return;
-        };
+        let mut fixture = resume_fixture(settings.clone(), 1);
         fixture.snapshot.glossary_fingerprint.clear();
         fixture.snapshot.glossary_terms.clear();
         fixture.snapshot.cache_namespace = compute_cache_namespace_v1(
@@ -1290,12 +1208,9 @@ mod tests {
         assert!(error.to_string().contains("seg_missing"));
     }
 
-    fn resume_fixture(
-        settings: ResolvedRunSettings,
-        segment_count: usize,
-    ) -> Option<ResumeFixture> {
+    fn resume_fixture(settings: ResolvedRunSettings, segment_count: usize) -> ResumeFixture {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let input = fixture_input_or_skip()?;
+        let input = fixture_input();
         let output = tempdir.path().join("translated.epub");
         let events = tempdir.path().join("events.jsonl");
         let store = JobStore::open(tempdir.path().join("jobs.sqlite")).expect("store should open");
@@ -1389,13 +1304,13 @@ mod tests {
             .update_job_config_snapshot(&job.id, &snapshot)
             .expect("snapshot should persist");
 
-        Some(ResumeFixture {
+        ResumeFixture {
             _tempdir: tempdir,
             store,
             job,
             snapshot,
             segments,
-        })
+        }
     }
 
     async fn run_fixture(fixture: &mut ResumeFixture) -> Result<Vec<ProgressEvent>> {
@@ -1537,23 +1452,82 @@ mod tests {
             .collect()
     }
 
-    // Returns the path to test/test.epub if present, otherwise prints a skip
-    // line and returns None. The fixture is gitignored (private to the
-    // maintainer), so CI and contributor checkouts must skip these tests
-    // rather than fail. See CLAUDE.md and CONTRIBUTING.md.
-    fn fixture_input_or_skip() -> Option<PathBuf> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("cli crate should be under crates/bookforge-cli")
-            .join("test/test.epub");
-        if !path.exists() {
-            let name = std::thread::current().name().unwrap_or("?").to_string();
-            eprintln!("[skip] {name}: requires test/test.epub fixture");
-            return None;
-        }
-        Some(path)
+    // Builds a synthetic EPUB so resume tests exercise the EPUB path in CI
+    // without relying on local, gitignored book fixtures.
+    fn fixture_input() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "bookforge-resume-fixture-{}-{nanos}.epub",
+            std::process::id()
+        ));
+        build_resume_epub(&path);
+        path
     }
+
+    fn build_resume_epub(path: &Path) {
+        let file = std::fs::File::create(path).expect("fixture EPUB should be creatable");
+        let mut zip = ZipWriter::new(file);
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+        zip.start_file("mimetype", stored).unwrap();
+        zip.write_all(b"application/epub+zip").unwrap();
+        zip.start_file("META-INF/container.xml", deflated).unwrap();
+        zip.write_all(RESUME_CONTAINER_XML.as_bytes()).unwrap();
+        zip.start_file("content.opf", deflated).unwrap();
+        zip.write_all(RESUME_OPF.as_bytes()).unwrap();
+        zip.start_file("chapter1.xhtml", deflated).unwrap();
+        zip.write_all(RESUME_CHAPTER_ONE.as_bytes()).unwrap();
+        zip.start_file("chapter2.xhtml", deflated).unwrap();
+        zip.write_all(RESUME_CHAPTER_TWO.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    const RESUME_CONTAINER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+
+    const RESUME_OPF: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">resume-fixture</dc:identifier>
+    <dc:title>Resume Fixture</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="chapter2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch1"/>
+    <itemref idref="ch2"/>
+  </spine>
+</package>"#;
+
+    const RESUME_CHAPTER_ONE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Resume Chapter One</title></head>
+<body>
+<h1>Resume Chapter One</h1>
+<p>First resume paragraph with <em>inline emphasis</em> and a <a href="https://example.com">link</a>.</p>
+<p>Second resume paragraph gives the fixture enough blocks for retry and cache tests.</p>
+</body>
+</html>"#;
+
+    const RESUME_CHAPTER_TWO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Resume Chapter Two</title></head>
+<body>
+<h1>Resume Chapter Two</h1>
+<p>Another section keeps segmentation boundaries stable across resume tests.</p>
+</body>
+</html>"#;
 
     fn test_segment(id: &str, ordinal: usize) -> Segment {
         let block_id = BlockId(format!("b_{ordinal:06}"));
