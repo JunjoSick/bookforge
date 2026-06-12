@@ -27,8 +27,13 @@ pub struct PromptTemplate {
 
 impl PromptTemplate {
     pub fn parse(name: &str, version: &str, source: &str) -> Result<Self> {
-        let system = extract_section(name, source, "System")?;
-        let user = extract_section(name, source, "User")?;
+        // include_str! embeds whatever line endings the checkout produced;
+        // on Windows with git autocrlf that is CRLF. Normalize so rendered
+        // prompts (and everything parsed back out of them) are LF-only on
+        // every platform.
+        let source = source.replace("\r\n", "\n");
+        let system = extract_section(name, &source, "System")?;
+        let user = extract_section(name, &source, "User")?;
         Ok(Self {
             name: name.to_string(),
             version: version.to_string(),
