@@ -3,6 +3,7 @@
 /.codex
 /.claude/
 /test/
+/tests/
 *.tmp
 *.log
 *.env
