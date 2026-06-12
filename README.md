@@ -43,6 +43,23 @@ cargo run -p bookforge-cli -- <command>
 
 ## Commands
 
+Convert a PDF to a translatable EPUB (requires [poppler](https://poppler.freedesktop.org/)
+command-line tools on PATH, or `POPPLER_PATH` pointing at their bin
+directory; on Windows use the poppler-windows release zip):
+
+```bash
+cargo run -p bookforge-cli -- convert paper.pdf --out paper.epub
+```
+
+The converter detects two-column layouts per page (scientific papers),
+repairs hyphenated line breaks, joins paragraphs across pages, and maps
+oversized fonts to headings. It prints a fidelity report comparing the
+reconstructed text against the raw `pdftotext` baseline — check that
+coverage number (and `inspect` on the result) before spending tokens.
+Figures, tables-as-images, and low-confidence page fallbacks are
+roadmap items (ROADMAP §9b, phases P2–P4); for image-heavy PDFs expect
+text-only output for now.
+
 Inspect an EPUB:
 
 ```bash

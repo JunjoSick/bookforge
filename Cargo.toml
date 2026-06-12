@@ -4,6 +4,7 @@ members = [
     "crates/bookforge-core",
     "crates/bookforge-epub",
     "crates/bookforge-llm",
+    "crates/bookforge-pdf",
     "crates/bookforge-store",
 ]
 resolver = "3"

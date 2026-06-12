@@ -8,8 +8,8 @@ mod report;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use commands::{
-    doctor, entity, estimate, glossary, ingest_flags, inspect, resume, retry, review, status,
-    style, tail, translate, validate,
+    convert, doctor, entity, estimate, glossary, ingest_flags, inspect, resume, retry, review,
+    status, style, tail, translate, validate,
 };
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
@@ -28,6 +28,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Convert(convert::ConvertArgs),
     Inspect(inspect::InspectArgs),
     Estimate(estimate::EstimateArgs),
     Translate(Box<translate::TranslateArgs>),
@@ -58,6 +59,7 @@ async fn main() -> Result<()> {
     });
 
     match Cli::parse().command {
+        Command::Convert(args) => convert::run(args).await,
         Command::Inspect(args) => inspect::run(args).await,
         Command::Estimate(args) => estimate::run(args).await,
         Command::Translate(args) => translate::run(*args, cancel_token).await,
