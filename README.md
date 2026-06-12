@@ -49,6 +49,12 @@ Inspect an EPUB:
 cargo run -p bookforge-cli -- inspect book.epub
 ```
 
+The inspect output includes a text-coverage metric: the percentage of
+visible body text that lands in translatable blocks. Files with low
+coverage (text in unsupported markup such as bare `<div>`s) are listed
+individually — that text would ship untranslated, so check coverage
+before spending tokens on a full run.
+
 Estimate tokens and approximate cost:
 
 ```bash
@@ -211,6 +217,16 @@ Translation always runs hard validators before committing a segment. The optiona
 
 `off` is the default. Reports still include deterministic soft warnings such as changed URLs, changed numbers, suspicious length ratios, model commentary, and repeated text.
 
+Two structural defaults to know about:
+
+- `pre`/`code` blocks are never sent to the model. They are copied through
+  to the output byte-for-byte, preserving internal whitespace.
+- The sliding context window (`--context-window`, default 3) is
+  best-effort: a segment uses whichever predecessors have already
+  finished and never waits for them. Pass `--context-strict` to restore
+  the v1.3 fence behavior, which guarantees a complete context block but
+  serializes segments within the context scope.
+
 ## Checkpoints And Cache
 
 Runtime state is stored in:
@@ -288,5 +304,4 @@ crates/bookforge-llm/prompts  Versioned prompt templates
 crates/bookforge-store  SQLite checkpoint store
 crates/bookforge-cli    CLI commands and reports
 docs/                   Architecture notes
-tests/fixtures/         Committed minimal fixture only
 ```
