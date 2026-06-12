@@ -236,6 +236,13 @@ pub fn build_segments(book: &Book, config: &SegmentationConfig) -> Result<Vec<Se
         let section_segments_start = segments.len();
 
         for block in section_blocks {
+            // pre/code content is layout and syntax, not prose: sending it
+            // to the model both mistranslates it and destroys intentional
+            // whitespace. Excluded blocks are never patched, so the
+            // original markup survives rebuild byte-for-byte.
+            if matches!(block.kind, BlockKind::Code) {
+                continue;
+            }
             let block_tokens = block.token_estimate.max(1);
             let should_flush = !current.is_empty()
                 && current_tokens + block_tokens > config.max_segment_tokens
@@ -467,6 +474,29 @@ mod tests {
         assert_eq!(first[1].section_id.0, "sec_000000");
         assert_eq!(first[2].section_id.0, "sec_000001");
         assert_eq!(first[2].block_ids, vec![BlockId("b_000003".to_string())]);
+    }
+
+    #[test]
+    fn code_blocks_are_excluded_from_segments() {
+        let mut book = book_with_two_sections();
+        book.blocks[1].kind = BlockKind::Code;
+        let config = SegmentationConfig {
+            max_segment_tokens: 100,
+            context_tokens: 0,
+        };
+
+        let segments = build_segments(&book, &config).expect("segments should build");
+        let segmented_blocks: Vec<&str> = segments
+            .iter()
+            .flat_map(|segment| segment.block_ids.iter().map(|id| id.0.as_str()))
+            .collect();
+
+        assert!(
+            !segmented_blocks.contains(&"b_000001"),
+            "code block must not be segmented for translation"
+        );
+        assert!(segmented_blocks.contains(&"b_000000"));
+        assert!(segmented_blocks.contains(&"b_000002"));
     }
 
     #[test]
