@@ -7,7 +7,7 @@ use std::{
 
 use bookforge_core::{
     BookforgeError, Result,
-    ir::{Block, Book, DomPath},
+    ir::{Block, Book, DomPath, TEXT_NODE_PATH_BASE},
     marker::extract_marker_id,
     segment::BlockTranslation,
 };
@@ -155,6 +155,7 @@ struct PatchSpec<'a> {
 struct ElementFrame {
     path: Vec<usize>,
     child_count: usize,
+    text_count: usize,
 }
 
 #[derive(Debug)]
@@ -262,6 +263,36 @@ fn patch_xhtml_with_specs(xhtml: &str, patches: &[PatchSpec<'_>]) -> Result<Patc
             Event::End(element) => {
                 writer.write_event(Event::End(element.borrow()))?;
                 stack.pop();
+            }
+            // Text nodes are addressable patch targets: the reader emits
+            // standalone blocks for non-whitespace text the block
+            // whitelist missed, addressed as parent path plus
+            // TEXT_NODE_PATH_BASE + n. Counting must mirror the reader:
+            // every text node that is non-whitespace after entity
+            // decoding consumes one index in its parent frame.
+            Event::Text(text) => {
+                let non_whitespace = text
+                    .html_content()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(true);
+                match text_node_patch(&patch_map, &mut stack, non_whitespace) {
+                    Some(translation) => {
+                        writer.write_event(Event::Text(BytesText::new(translation)))?
+                    }
+                    None => writer.write_event(Event::Text(text.borrow()))?,
+                }
+            }
+            Event::CData(text) => {
+                let non_whitespace = text
+                    .decode()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(true);
+                match text_node_patch(&patch_map, &mut stack, non_whitespace) {
+                    Some(translation) => {
+                        writer.write_event(Event::Text(BytesText::new(translation)))?
+                    }
+                    None => writer.write_event(Event::CData(text.borrow()))?,
+                }
             }
             Event::Eof => break,
             event => {
@@ -618,11 +649,32 @@ pub(crate) fn validate_xml(xml: &str) -> Result<()> {
     }
 }
 
+/// Consume one text-node index in the enclosing frame and return the
+/// matching patch translation, if any. Whitespace-only nodes consume no
+/// index, mirroring the reader's counting rule.
+fn text_node_patch<'a>(
+    patch_map: &HashMap<&[usize], PatchSpec<'a>>,
+    stack: &mut [ElementFrame],
+    non_whitespace: bool,
+) -> Option<&'a str> {
+    if !non_whitespace {
+        return None;
+    }
+    let frame = stack.last_mut()?;
+    let mut path = frame.path.clone();
+    path.push(TEXT_NODE_PATH_BASE + frame.text_count);
+    frame.text_count += 1;
+    patch_map
+        .get(path.as_slice())
+        .map(|patch| patch.translation)
+}
+
 fn enter_element(stack: &mut Vec<ElementFrame>) -> Vec<usize> {
     let path = next_child_path(stack);
     stack.push(ElementFrame {
         path: path.clone(),
         child_count: 0,
+        text_count: 0,
     });
     path
 }
@@ -729,6 +781,28 @@ mod tests {
         assert!(
             outcome.xhtml.contains("<p>Other</p>"),
             "untargeted block must be untouched"
+        );
+        validate_xml(&outcome.xhtml).expect("output should re-parse");
+    }
+
+    #[test]
+    fn patches_stray_text_node() {
+        let xhtml = "<root><p>Para</p>tail text<p>Other</p></root>";
+        let path = DomPath(vec![0, TEXT_NODE_PATH_BASE]);
+        let outcome =
+            patch_xhtml(xhtml, &[(&path, "coda tradotta")]).expect("patch should succeed");
+
+        assert_eq!(outcome.skipped_blocks, 0);
+        assert!(
+            outcome.xhtml.contains("coda tradotta"),
+            "stray text node should be replaced, got: {}",
+            outcome.xhtml,
+        );
+        assert!(!outcome.xhtml.contains("tail text"));
+        assert!(
+            outcome.xhtml.contains("<p>Para</p>") && outcome.xhtml.contains("<p>Other</p>"),
+            "sibling elements must be untouched, got: {}",
+            outcome.xhtml,
         );
         validate_xml(&outcome.xhtml).expect("output should re-parse");
     }

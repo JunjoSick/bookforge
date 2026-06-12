@@ -339,7 +339,6 @@ fn coverage_paragraphs_headings_lists_quotes() {
 }
 
 #[test]
-#[ignore = "known bug: text directly inside <div>/<dt>/<dd>/<figure>/naked <body> is never extracted and ships untranslated (block_kind whitelist in bookforge-epub/src/reader.rs)"]
 fn coverage_div_and_naked_body_text() {
     let body = r#"<div class="ccru-fragment">DIV_SENTINEL hyperstition node</div>
 <dl><dt>DT_SENTINEL</dt><dd>DD_SENTINEL definition</dd></dl>
@@ -360,7 +359,6 @@ NAKED_SENTINEL floating in body"#;
 }
 
 #[test]
-#[ignore = "known bug: nested same-name blocks (li>ul>li) close the outer block at the first matching end tag; inner patches are silently dropped (reader.rs End handling vs writer.rs depth-tracked buffering)"]
 fn coverage_nested_lists() {
     let body = r#"<ul>
 <li>OUTER_SENTINEL intro
@@ -383,7 +381,6 @@ tail text TAIL_SENTINEL</li>
 }
 
 #[test]
-#[ignore = "known bug: named HTML entities (&nbsp; &mdash;) are not resolvable by quick-xml without a custom resolver; ingestion fails on books that use them"]
 fn ingestion_survives_named_html_entities() {
     let body = "<p>ENTITY_SENTINEL one&nbsp;two&mdash;three</p>";
     let run = translate(&[("ch1.xhtml", body)], "mock-prefix-target");

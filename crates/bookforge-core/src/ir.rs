@@ -91,6 +91,14 @@ pub enum BlockKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomPath(pub Vec<usize>);
 
+/// Path component base for addressing text nodes. Element children are
+/// indexed 0, 1, 2, ...; the N-th non-whitespace text node inside an
+/// element is addressed as `TEXT_NODE_PATH_BASE + N` in the final path
+/// component. The offset keeps text-node addresses from ever colliding
+/// with element indices. Reader and writer must count the same set of
+/// text nodes (non-whitespace after entity decoding) for paths to align.
+pub const TEXT_NODE_PATH_BASE: usize = usize::MAX / 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextRun {
     pub id: String,

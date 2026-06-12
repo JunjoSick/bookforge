@@ -12,7 +12,10 @@ pub const CACHE_KEY_SCHEMA_VERSION: u32 = 2;
 /// Bumped when Segment / SegmentBlock layout changes incompatibly.
 pub const SEGMENT_SCHEMA_VERSION: u32 = 1;
 /// Bumped when inline marker extraction (m/keep/ref) changes incompatibly.
-pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 1;
+/// v2: depth-anchored block closing, lazily anchored text blocks for
+/// non-whitelist elements, addressable stray text nodes — block ordinals
+/// and marker assignments differ from v1 on affected books.
+pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 2;
 
 /// Compute a cache namespace that scopes lookups to a single set of
 /// schema and segmentation parameters. Cached rows from a different
