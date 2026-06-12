@@ -89,10 +89,17 @@ pub struct TranslateArgs {
     pub context_budget_tokens: usize,
 
     /// Scope of the sliding context. `chapter` (default) limits context to
-    /// the same chapter; `book` walks the entire book and materially
-    /// reduces cross-chapter concurrency.
+    /// the same chapter; `book` walks the entire book and, in strict mode,
+    /// materially reduces cross-chapter concurrency.
     #[arg(long, value_enum, default_value_t = ContextScope::Chapter)]
     pub context_scope: ContextScope,
+
+    /// Wait for all predecessor segments before translating, guaranteeing
+    /// a complete sliding-context block at the cost of serializing
+    /// segments within the context scope. Off by default: context is
+    /// best-effort and segments never wait on each other.
+    #[arg(long, default_value_t = false)]
+    pub context_strict: bool,
 
     /// Style sheet TOML to merge into prompts (repeatable). Sheets merge
     /// with `book > series > global` precedence.

@@ -703,6 +703,10 @@ fn snapshot_context_run_config(snapshot: &RunConfigSnapshot) -> ContextRunConfig
         window: snapshot.context_window,
         budget_tokens: snapshot.context_budget_tokens,
         scope: snapshot.context_scope,
+        // Strictness is a scheduling choice, not part of the cached
+        // translation contract, so it is not persisted in the snapshot.
+        // Resumed jobs use the best-effort default.
+        strict: false,
     }
 }
 

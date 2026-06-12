@@ -765,16 +765,35 @@ fn batch_token_estimate(
             .sum::<usize>()
 }
 
-fn restore_missing_tokens(mut translation: String, required: &[String]) -> String {
-    for token in required {
-        if !translation.contains(token) {
-            if !translation.is_empty() && !translation.ends_with(char::is_whitespace) {
-                translation.push(' ');
-            }
-            translation.push_str(token);
+/// Deterministic per-item validation for text-mode batch responses. The
+/// markers that must survive are the ones present in THIS block's source
+/// (`item.required_markers` is segment-wide and would wrongly demand
+/// sibling blocks' markers); protected spans are already block-scoped.
+/// Failures flow into the normal repair/failure pipeline instead of the
+/// translation being silently patched up.
+fn batch_item_validation_error(item: &TranslationBatchItem, translation: &str) -> Option<String> {
+    let expected = bookforge_core::marker::marker_ids_in_text(&item.source_text);
+    let actual = bookforge_core::marker::marker_ids_in_text(translation);
+    for marker in &expected {
+        let count = actual.iter().filter(|found| *found == marker).count();
+        if count == 0 {
+            return Some(format!("inline marker missing: {marker}"));
+        }
+        if count > 1 {
+            return Some(format!("inline marker duplicated: {marker}"));
         }
     }
-    translation
+    for marker in &actual {
+        if !expected.contains(marker) {
+            return Some(format!("unknown inline marker: {marker}"));
+        }
+    }
+    for span in &item.protected_spans {
+        if !span.trim().is_empty() && !translation.contains(span) {
+            return Some(format!("protected span missing: {span}"));
+        }
+    }
+    None
 }
 
 impl TranslationBatchItem {
@@ -881,10 +900,18 @@ fn parse_text_batch_response(
             continue;
         }
 
-        let mut translation = item.translation.clone();
-        if !turbo {
-            translation = restore_missing_tokens(translation, &request_item.required_markers);
-            translation = restore_missing_tokens(translation, &request_item.protected_spans);
+        let translation = item.translation.clone();
+        if !turbo && let Some(error) = batch_item_validation_error(request_item, &translation) {
+            failures.push(BatchItemFailure {
+                item_id: item.id.clone(),
+                segment_id: request_item.segment_id.clone(),
+                error,
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                tokens_estimated: false,
+            });
+            continue;
         }
 
         translations.push(BatchItemTranslation {
@@ -1297,7 +1324,15 @@ where
                 let request_semaphore = request_semaphore.clone();
 
                 tasks.spawn(async move {
-                    let context_pairs = context_pairs_for_batch(&batch, &config).await;
+                    // Strict context must be awaited before any permit is
+                    // held (waiters would starve prerequisite batches);
+                    // best-effort context is snapshotted after permits so
+                    // earlier batches have had time to publish.
+                    let strict_context_pairs = if config.context.strict {
+                        Some(context_pairs_for_batch(&batch, &config).await)
+                    } else {
+                        None
+                    };
                     let request_permit = match request_semaphore.acquire_owned().await {
                         Ok(permit) => permit,
                         Err(_) => {
@@ -1329,6 +1364,11 @@ where
                             }
                         },
                         None => None,
+                    };
+
+                    let context_pairs = match strict_context_pairs {
+                        Some(pairs) => pairs,
+                        None => context_pairs_for_batch(&batch, &config).await,
                     };
 
                     let started = std::time::Instant::now();
@@ -2238,9 +2278,11 @@ async fn context_pairs_for_batch(
     // section boundary, so awaiting the batch's earliest segment is safe:
     // its prior-N dependencies are necessarily in *earlier* batches of
     // the same section (or earlier sections, depending on scope) and
-    // can't deadlock on a sibling item in this same batch. The scheduler
-    // calls this before acquiring request concurrency so context waiters
-    // cannot starve prerequisite split batches.
+    // can't deadlock on a sibling item in this same batch. In strict mode
+    // the scheduler calls this before acquiring request concurrency so
+    // context waiters cannot starve prerequisite split batches; in
+    // best-effort mode it is called after permits are held and returns
+    // without waiting.
     match (config.context_registry.as_deref(), batch.kind) {
         (Some(registry), BatchKind::Translation) if config.context.enabled() => {
             let earliest = batch
@@ -2838,7 +2880,7 @@ mod tests {
     }
 
     #[test]
-    fn restores_missing_protected_tokens_in_batch_response() {
+    fn missing_protected_span_fails_batch_item_instead_of_appending() {
         let seg = make_segment(
             "seg1",
             vec![protected_block("Chapter 4th", vec!["4th".to_string()])],
@@ -2863,11 +2905,56 @@ mod tests {
         })
         .to_string();
 
+        // The dropped span must surface as an item failure feeding the
+        // repair pipeline — never be glued onto the translated text.
+        let result = parse_batch_response(batch, &response).expect("parse");
+        assert_eq!(result.translations.len(), 0);
+        assert_eq!(result.failures.len(), 1);
+        assert!(
+            result.failures[0]
+                .error
+                .contains("protected span missing: 4th"),
+            "got: {}",
+            result.failures[0].error
+        );
+    }
+
+    #[test]
+    fn intact_protected_span_passes_batch_validation_unmodified() {
+        let seg = make_segment(
+            "seg1",
+            vec![protected_block("Chapter 4th", vec!["4th".to_string()])],
+            // Segment-wide marker list intentionally names a marker that is
+            // NOT in this block's source; per-block validation must not
+            // demand it (and must never append it).
+            vec!["<bf:keep/>".to_string()],
+        );
+        let config = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&[seg], &config, TranslationProfile::Balanced);
+        let batch = &batches[0];
+        let id = &batch.items[0].item_id;
+
+        let response = serde_json::json!({
+            "items": [
+                {"id": id, "translation": "Capitolo 4th"},
+            ]
+        })
+        .to_string();
+
         let result = parse_batch_response(batch, &response).expect("parse");
         assert_eq!(result.failures.len(), 0);
         assert_eq!(result.translations.len(), 1);
-        assert!(result.translations[0].text.contains("4th"));
-        assert!(result.translations[0].text.contains("<bf:keep/>"));
+        assert_eq!(
+            result.translations[0].text, "Capitolo 4th",
+            "translation must pass through without appended tokens"
+        );
     }
 
     #[test]
@@ -3472,6 +3559,7 @@ mod tests {
             window: 1,
             budget_tokens: 1000,
             scope: bookforge_core::config::ContextScope::Book,
+            strict: true,
         };
         config.context_registry = Some(Arc::new(crate::ContextRegistry::new(&segments)));
 

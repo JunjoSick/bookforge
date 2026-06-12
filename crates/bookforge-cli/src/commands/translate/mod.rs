@@ -161,6 +161,7 @@ pub(crate) fn context_run_config_from_args(cli_args: &TranslateArgs) -> ContextR
         window: cli_args.context_window,
         budget_tokens: cli_args.context_budget_tokens,
         scope: cli_args.context_scope,
+        strict: cli_args.context_strict,
     }
 }
 
@@ -2602,6 +2603,7 @@ case_sensitive = true
             context_window: 0,
             context_budget_tokens: 1200,
             context_scope: bookforge_core::config::ContextScope::Chapter,
+            context_strict: false,
             style: Vec::new(),
             entities: Vec::new(),
             qa: QaMode::Off,
