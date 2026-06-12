@@ -81,13 +81,12 @@ cargo run -p bookforge-cli -- translate book.epub \
   --out book.it.epub
 ```
 
-Translate with the v1 fast preset:
+Translate with the default fast profile:
 
 ```bash
 cargo run -p bookforge-cli -- translate book.epub \
   --target Italian \
   --provider-preset openrouter-paid-fast \
-  --profile v1-fast \
   --ui progress \
   --out book.it.epub
 ```

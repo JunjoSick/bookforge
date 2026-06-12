@@ -145,3 +145,21 @@ fn default_output_path(input: &std::path::Path, target: &str) -> PathBuf {
     let target = target.trim_matches('-');
     input.with_file_name(format!("{stem}.{target}.epub"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bookforge_core::config::TranslationProfile;
+
+    #[test]
+    fn translate_defaults_to_v1_fast_profile() {
+        let cli = Cli::parse_from(["bookforge", "translate", "book.epub", "--target", "Italian"]);
+
+        match cli.command {
+            Command::Translate(args) => {
+                assert_eq!(args.profile, TranslationProfile::V1Fast);
+            }
+            _ => panic!("expected translate command"),
+        }
+    }
+}

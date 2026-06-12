@@ -18,7 +18,7 @@ pub struct TranslateArgs {
     #[command(flatten)]
     pub provider: CliProviderArgs,
 
-    #[arg(long, value_enum, default_value_t = TranslationProfile::Balanced)]
+    #[arg(long, value_enum, default_value_t = TranslationProfile::V1Fast)]
     pub profile: TranslationProfile,
 
     #[arg(long)]
