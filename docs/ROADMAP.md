@@ -2131,6 +2131,30 @@ reconstruct badly are *flagged*, not hidden.
   reliable and honest for scientific papers; inline math glyph runs
   become protected spans. HTML table reconstruction is a later, separate
   decision.
+- **P3.5 — figure/table layout hardening.** Real BERT read-through after
+  P2/P3 exposed remaining defects to fix before calling scientific-paper
+  PDF ingestion polished:
+  1. **Caption-safe figure crops.** A figure raster must not include the
+     source caption text when the EPUB also emits a translatable
+     `<figcaption>`. Crop boundaries should snap above the detected
+     caption baseline, and the report should warn when text overlap
+     suggests a duplicated caption inside the image.
+  2. **Media-aware paragraph continuation.** Figures/tables/equations
+     should act as layout separators without breaking prose continuity.
+     Lowercase or suffix continuations after a media block should be
+     joined to the preceding paragraph or flagged as orphan continuations.
+  3. **Tighter equation/table crop detection.** Do not rasterize ordinary
+     prose fragments, model-parameter snippets, or table-adjacent labels
+     merely because they contain numbers, parentheses, or `=`.
+     Display-equation detection needs stronger math-density and geometry
+     tests; inline math should remain protected text where possible.
+  4. **Visual regression fixtures.** Add committed BERT-derived
+     `pdftohtml` XML/page fixtures for the known hard pages: Figure 1
+     caption boundary, Figure 4 multi-panel crop, Figure 5 vector chart,
+     and nearby model-parameter/equation false positives. CI should prove
+     the generated EPUB has one logical figure per caption, no duplicated
+     caption inside crops, no orphan lowercase paragraph starts, and no
+     over-broad equation crop count.
 - **P4 — degraded-layout fallback.** Pages whose reconstruction
   confidence is low (coverage gap vs `pdftotext`, column chaos) are
   handled per `--low-confidence preserve|linearize`: `preserve` embeds

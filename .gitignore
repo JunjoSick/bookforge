@@ -4,6 +4,7 @@
 /.claude/
 /test/
 /tests/
+/tmp/
 *.tmp
 *.log
 *.env

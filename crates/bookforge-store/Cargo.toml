@@ -1,6 +1,6 @@
 [package]
 name = "bookforge-store"
-version = "1.4.0"
+version = "1.5.0"
 description = "SQLite checkpoint and job store for BookForge."
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bookforge-core = { version = "1.4.0", path = "../bookforge-core" }
+bookforge-core = { version = "1.5.0", path = "../bookforge-core" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
