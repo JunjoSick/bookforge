@@ -3,8 +3,10 @@ use anyhow::Result;
 use bookforge_core::config::TranslationProfile;
 use bookforge_core::{
     GlossaryFormat, GlossaryTerm, NullProgressSink,
-    config::{DoubleCheckMode, FallbackScope, ResolvedRunSettings, TranslationConfig},
-    marker::extract_marker_id,
+    config::{
+        DoubleCheckMode, FallbackScope, PromptVersion, ResolvedRunSettings, TranslationConfig,
+    },
+    marker::{parse_empty_marker, parse_marker_close, parse_paired_marker_open},
     merge_scope_terms,
     scheduler::SchedulerConfig,
     segment::{Segment, SegmentStatus, build_segments, compute_cache_namespace},
@@ -39,6 +41,7 @@ use crate::{
 pub mod args;
 mod cache;
 mod checkpointing;
+mod engine;
 mod reporting;
 mod settings;
 mod snapshot;
@@ -46,6 +49,7 @@ mod snapshot;
 pub use args::TranslateArgs;
 pub(crate) use cache::{CacheContext, apply_cached_translations, pending_segments_for_job};
 use checkpointing::finalize_writer;
+pub(crate) use engine::{CheckpointRunContext, run_checkpointed_translation};
 use reporting::print_summary_rebuild_and_report;
 use settings::{apply_provider_preset, resolve_settings, retry_amplification_warning};
 use snapshot::persist_snapshot;
@@ -161,6 +165,7 @@ pub(crate) fn context_run_config_from_args(cli_args: &TranslateArgs) -> ContextR
         window: cli_args.context_window,
         budget_tokens: cli_args.context_budget_tokens,
         scope: cli_args.context_scope,
+        strict: cli_args.context_strict,
     }
 }
 
@@ -454,7 +459,7 @@ async fn run_mock_translation(
         .model
         .clone()
         .unwrap_or_else(|| "mock-prefix-target".to_string());
-    let prompt_version = "v1";
+    let prompt_version = PromptVersion::V2.as_str();
     let store = JobStore::open_default()?;
     let glossary = prepare_glossary_run_config(
         &store,
@@ -596,23 +601,22 @@ async fn run_mock_translation(
         misses: pending_segments.len(),
         timestamp_ms: bookforge_core::progress::now_ms(),
     });
-    let writer = CheckpointWriter::spawn(store.path().to_path_buf(), progress.clone());
-    let sender = writer.sender();
-    let translation_result = translate_and_checkpoint(
+    let fresh_translations = run_checkpointed_translation(
         provider.clone(),
         &pending_segments,
         &run_config,
-        CheckpointContext {
+        settings,
+        CheckpointRunContext {
             store: &store,
             job_id: &job.id,
             provider: "mock",
             model: &model,
             prompt_version,
-            sender: &sender,
         },
+        progress.clone(),
+        false,
     )
-    .await;
-    let fresh_translations = finalize_writer(translation_result, sender, writer).await?;
+    .await?;
     translations.extend(fresh_translations);
     translations.sort_by_key(|translation| translation.ordinal);
     let qa_reviews = qa_reviews_for_mode(
@@ -749,9 +753,9 @@ async fn run_openai_compatible_translation(
         timestamp_ms: bookforge_core::progress::now_ms(),
     });
     let run_prompt_version = if settings.batch.enabled {
-        "batch_v1"
+        PromptVersion::BatchV2.as_str()
     } else {
-        "v1"
+        PromptVersion::V2.as_str()
     };
     let store = JobStore::open_default()?;
     let glossary = prepare_glossary_run_config(
@@ -873,151 +877,63 @@ async fn run_openai_compatible_translation(
         style: style.run_config.clone(),
         entities: entities.run_config.clone(),
     };
-    // batch_run_config
+    let mut translations = apply_cached_translations(
+        &segments,
+        CacheContext {
+            store: &store,
+            job_id: &job.id,
+            prompt_version: run_prompt_version,
+            provider: &config.provider,
+            model: &model,
+            source_lang: config.source_language.as_deref(),
+            target_lang: &config.target_language,
+            cache_namespace: &cache_namespace,
+        },
+    )?;
+    let hits = translations.len();
+    let pending_count = segments.len().saturating_sub(hits);
+    progress.emit(bookforge_core::ProgressEvent::CacheScanFinished {
+        hits,
+        misses: pending_count,
+        timestamp_ms: bookforge_core::progress::now_ms(),
+    });
+    let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
+    prepopulate_context_registry(context_registry.as_ref(), &segments, &translations);
+    let fresh_translations = run_checkpointed_translation(
+        provider.clone(),
+        &pending_segments,
+        &run_config,
+        settings,
+        CheckpointRunContext {
+            store: &store,
+            job_id: &job.id,
+            provider: &config.provider,
+            model: &model,
+            prompt_version: run_prompt_version,
+        },
+        progress.clone(),
+        settings.batch.enabled,
+    )
+    .await?;
+    translations.extend(fresh_translations);
 
-    if settings.batch.enabled {
-        let batch_run_config = TranslationRunConfig {
-            source_language: run_config.source_language.clone(),
-            target_language: run_config.target_language.clone(),
-            provider: run_config.provider.clone(),
-            model: run_config.model.clone(),
-            prompt_version: run_prompt_version.to_string(),
-            temperature: run_config.temperature,
-            scheduler: SchedulerConfig {
-                concurrency: run_config.scheduler.concurrency,
-                max_attempts: settings.provider.provider_max_attempts,
-            },
-            profile: settings.profile,
-            model_context_tokens: settings.provider.model_context_tokens,
-            max_output_tokens: settings.provider.max_output_tokens,
-            batch_max_output_tokens: settings.provider.batch_max_output_tokens,
-            compact_prompts: settings.compact_prompts,
-            glossary: run_config.glossary.clone(),
-            context: run_config.context,
-            context_registry: run_config.context_registry.clone(),
-            style: run_config.style.clone(),
-            entities: run_config.entities.clone(),
-        };
-        let mut translations = apply_cached_translations(
-            &segments,
-            CacheContext {
-                store: &store,
-                job_id: &job.id,
-                prompt_version: run_prompt_version,
-                provider: &config.provider,
-                model: &model,
-                source_lang: config.source_language.as_deref(),
-                target_lang: &config.target_language,
-                cache_namespace: &cache_namespace,
-            },
-        )?;
-        let hits = translations.len();
-        let pending_count = segments.len().saturating_sub(hits);
-        progress.emit(bookforge_core::ProgressEvent::CacheScanFinished {
-            hits,
-            misses: pending_count,
-            timestamp_ms: bookforge_core::progress::now_ms(),
-        });
-        let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
-        prepopulate_context_registry(context_registry.as_ref(), &segments, &translations);
-        let writer = CheckpointWriter::spawn(store.path().to_path_buf(), progress.clone());
-        let sender = writer.sender();
-        let translation_result = translate_and_checkpoint_batch(
-            provider.clone(),
-            &pending_segments,
-            &batch_run_config,
-            settings,
-            CheckpointContext {
-                store: &store,
-                job_id: &job.id,
-                provider: &config.provider,
-                model: &model,
-                prompt_version: run_prompt_version,
-                sender: &sender,
-            },
-            progress.clone(),
-        )
-        .await;
-        let fresh_translations = finalize_writer(translation_result, sender, writer).await?;
-        translations.extend(fresh_translations);
-
-        finish_translation_pipeline(
-            &provider,
-            cancel_token,
-            cli_args,
-            &segments,
-            &mut translations,
-            &store,
-            &job,
-            run_prompt_version,
-            settings,
-            &run_config,
-            config,
-            &book,
-            progress.clone(),
-            started,
-        )
-        .await?;
-    } else {
-        let mut translations = apply_cached_translations(
-            &segments,
-            CacheContext {
-                store: &store,
-                job_id: &job.id,
-                prompt_version: run_prompt_version,
-                provider: &config.provider,
-                model: &model,
-                source_lang: config.source_language.as_deref(),
-                target_lang: &config.target_language,
-                cache_namespace: &cache_namespace,
-            },
-        )?;
-        let hits = translations.len();
-        let pending_count = segments.len().saturating_sub(hits);
-        progress.emit(bookforge_core::ProgressEvent::CacheScanFinished {
-            hits,
-            misses: pending_count,
-            timestamp_ms: bookforge_core::progress::now_ms(),
-        });
-        let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
-        prepopulate_context_registry(context_registry.as_ref(), &segments, &translations);
-        let writer = CheckpointWriter::spawn(store.path().to_path_buf(), progress.clone());
-        let sender = writer.sender();
-        let translation_result = translate_and_checkpoint(
-            provider.clone(),
-            &pending_segments,
-            &run_config,
-            CheckpointContext {
-                store: &store,
-                job_id: &job.id,
-                provider: &config.provider,
-                model: &model,
-                prompt_version: run_prompt_version,
-                sender: &sender,
-            },
-        )
-        .await;
-        let fresh_translations = finalize_writer(translation_result, sender, writer).await?;
-        translations.extend(fresh_translations);
-
-        finish_translation_pipeline(
-            &provider,
-            cancel_token,
-            cli_args,
-            &segments,
-            &mut translations,
-            &store,
-            &job,
-            run_prompt_version,
-            settings,
-            &run_config,
-            config,
-            &book,
-            progress.clone(),
-            started,
-        )
-        .await?;
-    }
+    finish_translation_pipeline(
+        &provider,
+        cancel_token,
+        cli_args,
+        &segments,
+        &mut translations,
+        &store,
+        &job,
+        run_prompt_version,
+        settings,
+        &run_config,
+        config,
+        &book,
+        progress.clone(),
+        started,
+    )
+    .await?;
 
     if cancel_token.is_cancelled() {
         let _ = store.mark_job_interrupted(&job.id);
@@ -1777,6 +1693,7 @@ fn suspicious_qa_candidates(
 
 #[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
 struct MarkerSignature {
+    block_index: usize,
     id: String,
     shape: MarkerShape,
 }
@@ -1812,57 +1729,44 @@ fn marker_signatures_for_blocks<'a>(
     blocks: impl Iterator<Item = &'a str>,
 ) -> Option<Vec<MarkerSignature>> {
     let mut signatures = Vec::new();
-    for text in blocks {
-        signatures.extend(marker_signatures_in_text(text)?);
+    for (block_index, text) in blocks.enumerate() {
+        signatures.extend(marker_signatures_in_text(block_index, text)?);
     }
     Some(signatures)
 }
 
-fn marker_signatures_in_text(text: &str) -> Option<Vec<MarkerSignature>> {
+fn marker_signatures_in_text(block_index: usize, text: &str) -> Option<Vec<MarkerSignature>> {
     let mut signatures = Vec::new();
-    let mut open_stack: Vec<&'static str> = Vec::new();
+    let mut open_stack: Vec<String> = Vec::new();
     let mut rest = text;
 
     while let Some(index) = rest.find('<') {
         let tag = &rest[index..];
-        if tag.starts_with("<m ") || tag.starts_with("<keep ") {
-            let end = tag.find('>')?;
-            let open_tag = &tag[..=end];
-            if open_tag.ends_with("/>") {
-                return None;
-            }
-            let (tag_name, shape) = if tag.starts_with("<m ") {
-                ("m", MarkerShape::PairedM)
+        if let Some(open) = parse_paired_marker_open(tag) {
+            let shape = if open.tag_name == "keep" {
+                MarkerShape::PairedKeep
             } else {
-                ("keep", MarkerShape::PairedKeep)
+                MarkerShape::PairedM
             };
             signatures.push(MarkerSignature {
-                id: extract_marker_id(open_tag)?,
+                block_index,
+                id: open.id,
                 shape,
             });
-            open_stack.push(tag_name);
-            rest = &tag[end + 1..];
-        } else if tag.starts_with("<ref ") {
-            let end = tag.find('>')?;
-            let ref_tag = &tag[..=end];
-            if !ref_tag.ends_with("/>") {
-                return None;
-            }
+            open_stack.push(open.tag_name);
+            rest = &tag[open.len..];
+        } else if let Some(empty) = parse_empty_marker(tag) {
             signatures.push(MarkerSignature {
-                id: extract_marker_id(ref_tag)?,
+                block_index,
+                id: empty.id,
                 shape: MarkerShape::EmptyRef,
             });
-            rest = &tag[end + 1..];
-        } else if tag.starts_with("</m>") || tag.starts_with("</keep>") {
-            let expected = if tag.starts_with("</m>") { "m" } else { "keep" };
-            if open_stack.pop() != Some(expected) {
+            rest = &tag[empty.len..];
+        } else if let Some(close) = parse_marker_close(tag) {
+            if open_stack.pop().as_deref() != Some(close.tag_name.as_str()) {
                 return None;
             }
-            rest = if expected == "m" {
-                &tag["</m>".len()..]
-            } else {
-                &tag["</keep>".len()..]
-            };
+            rest = &tag[close.len..];
         } else {
             rest = &tag[1..];
         }
@@ -2359,10 +2263,10 @@ case_sensitive = true
 
     #[test]
     fn suspicious_qa_ignores_matching_inline_markers() {
-        let segment = marked_segment("seg_marker", 0, "<m id=\"m000000_000\">Hello</m>");
+        let segment = marked_segment("seg_marker", 0, "<m1>Hello</m1>");
         let translation = translation_for(
             &segment,
-            "<m id=\"m000000_000\">Ciao</m>",
+            "<m1>Ciao</m1>",
             "stored",
             SegmentStatus::Succeeded,
         );
@@ -2377,10 +2281,10 @@ case_sensitive = true
 
     #[test]
     fn suspicious_qa_includes_marker_id_mismatch() {
-        let segment = marked_segment("seg_marker", 0, "<m id=\"m000000_000\">Hello</m>");
+        let segment = marked_segment("seg_marker", 0, "<m1>Hello</m1>");
         let translation = translation_for(
             &segment,
-            "<m id=\"m000000_999\">Ciao</m>",
+            "<m2>Ciao</m2>",
             "stored",
             SegmentStatus::Succeeded,
         );
@@ -2393,13 +2297,8 @@ case_sensitive = true
 
     #[test]
     fn suspicious_qa_includes_marker_shape_mismatch() {
-        let segment = marked_segment("seg_marker", 0, "<m id=\"m000000_000\">Hello</m>");
-        let translation = translation_for(
-            &segment,
-            "<ref id=\"m000000_000\"/>",
-            "stored",
-            SegmentStatus::Succeeded,
-        );
+        let segment = marked_segment("seg_marker", 0, "<m1>Hello</m1>");
+        let translation = translation_for(&segment, "<m1/>", "stored", SegmentStatus::Succeeded);
 
         let candidates = suspicious_qa_candidates(&[segment], &[translation]);
 
@@ -2409,13 +2308,8 @@ case_sensitive = true
 
     #[test]
     fn suspicious_qa_includes_malformed_marker() {
-        let segment = marked_segment("seg_marker", 0, "<m id=\"m000000_000\">Hello</m>");
-        let translation = translation_for(
-            &segment,
-            "<m id=\"m000000_000\">Ciao",
-            "stored",
-            SegmentStatus::Succeeded,
-        );
+        let segment = marked_segment("seg_marker", 0, "<m1>Hello</m1>");
+        let translation = translation_for(&segment, "<m1>Ciao", "stored", SegmentStatus::Succeeded);
 
         let candidates = suspicious_qa_candidates(&[segment], &[translation]);
 
@@ -2602,6 +2496,7 @@ case_sensitive = true
             context_window: 0,
             context_budget_tokens: 1200,
             context_scope: bookforge_core::config::ContextScope::Chapter,
+            context_strict: false,
             style: Vec::new(),
             entities: Vec::new(),
             qa: QaMode::Off,

@@ -1,4 +1,4 @@
-# translate_run_preserving.v1.md
+﻿# translate_run_preserving.v2.md
 
 ## System
 
@@ -69,7 +69,7 @@ Context after this segment:
 {{context_after}}
 ```
 
-Already-translated prior segments (use for pronoun, gender, and voice consistency only — do not retranslate):
+Already-translated prior segments (use for pronoun, gender, and voice consistency only â€” do not retranslate):
 
 ```txt
 {{context_translation_pairs}}

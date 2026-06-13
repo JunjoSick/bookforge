@@ -7,7 +7,7 @@ use std::{
 
 use bookforge_core::{
     config::SegmentationConfig,
-    ir::{BlockId, BlockKind},
+    ir::BlockKind,
     segment::{BlockTranslation, build_segments},
 };
 use bookforge_epub::{inspect_epub, read_epub, rebuild_epub};
@@ -36,10 +36,17 @@ fn builds_basic_ir_from_minimal_epub() {
     let fixture = create_minimal_epub();
     let book = read_epub(&fixture).expect("fixture should parse into IR");
 
-    assert_eq!(book.sections.len(), 1);
-    assert_eq!(book.blocks.len(), 1);
-    assert_eq!(book.blocks[0].kind, BlockKind::Paragraph);
-    assert_eq!(book.blocks[0].text_runs[0].text, "Hello from chapter 1.");
+    assert_eq!(book.sections.len(), 2);
+    assert_eq!(book.blocks.len(), 3);
+    assert!(book.blocks.iter().any(|block| {
+        block.kind == BlockKind::Paragraph && block_text(block) == "Generated Bookforge Fixture"
+    }));
+    assert!(book.blocks.iter().any(
+        |block| block.kind == BlockKind::Paragraph && block_text(block) == "Generated Fixture"
+    ));
+    assert!(book.blocks.iter().any(|block| {
+        block.kind == BlockKind::Paragraph && block_text(block) == "Hello from chapter 1."
+    }));
     assert!(book.blocks.iter().all(|block| block.token_estimate > 0));
 }
 
@@ -55,15 +62,18 @@ fn builds_stable_segments_from_minimal_epub() {
     let first = build_segments(&book, &config).expect("segments should build");
     let second = build_segments(&book, &config).expect("segments should be repeatable");
 
-    assert_eq!(first.len(), 1);
+    assert_eq!(first.len(), 2);
     assert_eq!(first[0].id, second[0].id);
     assert_eq!(first[0].checksum, second[0].checksum);
-    assert_eq!(first[0].section_id.0, "sec_000000");
+    assert_eq!(first[0].section_id.0, "sec_metadata_opf");
     assert_eq!(first[0].block_ids.len(), 1);
-    assert!(first[0].source.text.contains("Hello from chapter 1."));
+    assert!(first[0].source.text.contains("Generated Bookforge Fixture"));
+    assert_eq!(first[1].section_id.0, "sec_000000");
+    assert!(first[1].source.text.contains("Generated Fixture"));
+    assert!(first[1].source.text.contains("Hello from chapter 1."));
     assert!(first[0].source.token_estimate > 0);
     assert!(first[0].context.before.is_none());
-    assert!(first[0].context.after.is_none());
+    assert!(first[0].context.after.is_some());
 }
 
 #[test]
@@ -73,11 +83,16 @@ fn rebuilds_epub_with_patched_xhtml_and_preserved_resources() {
     let output =
         std::env::temp_dir().join(format!("bookforge-rebuilt-{}.epub", std::process::id()));
     let _ = std::fs::remove_file(&output);
+    let body_block = book
+        .blocks
+        .iter()
+        .find(|block| block_text(block) == "Hello from chapter 1.")
+        .expect("body paragraph should be extracted");
 
     rebuild_epub(
         &book,
         &[BlockTranslation {
-            block_id: BlockId("b_000000".to_string()),
+            block_id: body_block.id.clone(),
             text: "Ciao da un EPUB minimo.".to_string(),
         }],
         &output,
@@ -141,8 +156,8 @@ fn parses_complex_generated_fixture_shapes() {
     let paragraph = book
         .blocks
         .iter()
-        .find(|block| block.kind == BlockKind::Paragraph)
-        .expect("fixture should contain a paragraph");
+        .find(|block| block.kind == BlockKind::Paragraph && block_text(block).contains("formatted"))
+        .expect("fixture should contain the body paragraph");
     assert!(paragraph.text_runs.len() > 1);
     assert!(paragraph.inline_marks.iter().any(|mark| mark.kind == "em"));
     assert!(paragraph.inline_marks.iter().any(|mark| mark.kind == "a"));
@@ -150,7 +165,7 @@ fn parses_complex_generated_fixture_shapes() {
         paragraph
             .text_runs
             .iter()
-            .any(|run| run.text.contains("<m id="))
+            .any(|run| run.text.contains("<m"))
     );
 
     let table_row_text = book
@@ -199,7 +214,7 @@ fn parses_huge_paragraph_generated_fixture() {
     let paragraph = book
         .blocks
         .iter()
-        .find(|block| block.kind == BlockKind::Paragraph)
+        .find(|block| block.kind == BlockKind::Paragraph && block_text(block).contains("word1499"))
         .expect("fixture should contain a huge paragraph");
 
     assert_eq!(paragraph.text_runs.len(), 1);
@@ -222,6 +237,14 @@ fn parses_huge_paragraph_generated_fixture() {
 
 fn create_minimal_epub() -> PathBuf {
     create_epub_fixture("minimal", "<p>Hello from chapter 1.</p>")
+}
+
+fn block_text(block: &bookforge_core::ir::Block) -> String {
+    block
+        .text_runs
+        .iter()
+        .map(|run| run.text.as_str())
+        .collect::<String>()
 }
 
 fn create_epub_fixture(name: &str, body: &str) -> PathBuf {

@@ -98,10 +98,17 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v1.2 | Glossary, manual | 8–12 days | none (development quiet) | shipped |
 | v1.2.x | Glossary, auto-extraction | 4–6 days | none | shipped |
 | v1.3 | Context + style | 8–12 days | none (explicit "no promotion" rule) | shipped |
-| v1.4 | Distribution + writeup | 5–7 days | one technical post, two or three venues; cargo-dist binaries land here | planned |
-| v1.5 | Structural credibility | 10–14 days | README final rewrite citing corpus | planned |
+| v1.4 | Distribution + writeup | 5–7 days | one technical post, two or three venues; cargo-dist binaries land here | shipped |
+| v1.5 | Extraction + scheduling overhaul (shipped scope; see §8 post-ship note) | — | none | shipped 2026-06-12 |
 | v1.6 | Bilingual output | 5–8 days | passive (release notes only) | planned |
-| v2 | Open-ended | not committed | recompute from v1.4/v1.5 feedback | planned |
+| v1.7 | PDF ingestion (§9b) | 8–14 days | release notes; maybe a short writeup if the layout-reconstruction part turns out interesting | **next — pulled ahead of v1.6 per owner priority, 2026-06** |
+| v1.8 | Structural credibility (EPUBCheck + corpus; was the planned v1.5 scope, §8) | 10–14 days | README final rewrite citing corpus | planned |
+| v2 | Open-ended | not committed | recompute from v1.4/v1.7 feedback | planned |
+
+Priority note (2026-06): the owner needs PDF translation more than
+bilingual output — scientific papers (figures/tables must survive) and
+unorthodox-layout books (CCRU-style scans/conversions). v1.7 therefore
+executes before v1.6 and v1.8 despite the numbering.
 
 Total v1.x roadmap is roughly 45–70 person-days of focused work; in calendar
 terms, with a maintainer who has limited evenings and weekends and a
@@ -1770,6 +1777,20 @@ including the manifest curation, fetch script, and CI plumbing.
 
 v1.4 (distribution). The CI changes need a working release pipeline.
 
+### 8.13 Implementation notes (post-ship, 2026-06-12)
+
+What actually shipped under the v1.5 tag diverged from this spec. Real-book
+testing surfaced extraction and scheduling defects that outranked external
+validation, so v1.5 became an extraction/scheduling overhaul instead:
+depth-anchored block extraction (div/dt/dd/stray text, nested same-name
+blocks), HTML entity resolution, code-block passthrough, best-effort sliding
+context (strict fence behind `--context-strict`), short per-block markers
+(`<m1>`, prompt contract v2, marker schema v3), NCX/OPF/head-title
+translation, a shared translate/resume run engine, v1-fast as the default
+profile, an identity-roundtrip harness, a text-coverage metric in `inspect`,
+and synthetic CI fixtures. The EPUBCheck + Standard Ebooks corpus scope in
+§8.4–§8.8 is still wanted and moves to v1.8, after PDF ingestion (§9b).
+
 ---
 
 ## 9. v1.6 — Bilingual output
@@ -2033,6 +2054,140 @@ v1.5 (EPUBCheck integration is required to verify correctness).
 
 ---
 
+## 9b. v1.7 — PDF ingestion
+
+Executes before v1.6 and v1.8 (owner priority, 2026-06).
+
+### 9b.1 Goal
+
+Translate the PDFs the owner actually has and cannot translate today:
+
+1. **Scientific papers** — usually two-column, dense with figures,
+   tables, equations, and references. Figures and tables must survive
+   visually; prose must translate; nothing may silently disappear.
+2. **Unorthodox-layout books** — CCRU-style material: scanned or
+   converted PDFs with non-standard typography, mixed layouts, decorative
+   text. These must degrade *visibly and gracefully*, never silently.
+
+Output is a **translated reflowable EPUB** (readable on the same devices
+all other BookForge output targets). Re-laying-out translated text into
+the original PDF geometry is explicitly out of scope: it is a research
+problem, it cannot be done deterministically, and it violates §1.2.
+
+### 9b.2 Architectural rationale
+
+PDF has no DOM. There are no blocks to own — only positioned glyphs. The
+invariants survive by splitting the problem in two:
+
+- **Layout extraction** is delegated to proven external tooling
+  (poppler's `pdftohtml -xml`, `pdfimages`, `pdftoppm`, `pdftotext`),
+  exactly the precedent §8.4 set for EPUBCheck-via-java: external
+  binaries are acceptable; embedded runtimes are not. `doctor` learns to
+  report their presence and version.
+- **Document reconstruction** is deterministic Rust: poppler's XML gives
+  per-line text with x/y/width/height/font; BookForge clusters lines
+  into columns, columns into reading order, lines into paragraphs,
+  font-size outliers into headings — and emits a synthetic EPUB through
+  the existing writer machinery.
+
+From that point on, **nothing is new**: the produced EPUB flows through
+the same segmentation, markers, cache, checkpoints, validation, QA,
+review, and rebuild as any other book. The PDF milestone is an ingestion
+front-end, not a parallel pipeline.
+
+The quality gate is the same one that already exists: the `inspect`
+text-coverage metric, plus a conversion report comparing reconstructed
+text volume against a raw `pdftotext` baseline, per page. Pages that
+reconstruct badly are *flagged*, not hidden.
+
+### 9b.3 Deliverables
+
+- `bookforge-pdf` crate: poppler XML parsing + layout reconstruction +
+  synthetic EPUB assembly. No C dependencies; talks to poppler binaries
+  via subprocess only.
+- `bookforge convert input.pdf --out book.epub` CLI command with a
+  conversion report (text coverage vs `pdftotext` baseline, per-page
+  anomalies, image/figure count).
+- `doctor` reports poppler tool availability and versions.
+- Committed poppler-XML fixtures so all reconstruction logic is
+  unit-testable in CI without poppler installed; end-to-end tests gated
+  on tool presence (skip with a printed reason, mirroring the EPUBCheck
+  pattern).
+
+### 9b.4 Phases
+
+- **P0 — plumbing.** Tool discovery (`POPPLER_PATH` env override, PATH
+  fallback), `convert` command skeleton, `pdftohtml -xml` invocation and
+  XML parse into a page/line IR. Unit-testable from fixtures.
+- **P1 — reconstruction.** Line merge → per-page column detection
+  (x-gutter clustering) → reading order → paragraph clustering (leading,
+  indent, font continuity) → heading heuristic (font-size percentile) →
+  block emission → EPUB assembly → conversion report.
+- **P2 — figures.** `pdfimages` extraction, placement by page anchor,
+  caption detection ("Figure N", "Fig.", "Table N" prefixes near the
+  image) feeding `Caption` blocks.
+- **P3 — tables and equations.** v1 policy: detected table/equation
+  regions are preserved as page-crop raster images (`pdftoppm` crops) —
+  reliable and honest for scientific papers; inline math glyph runs
+  become protected spans. HTML table reconstruction is a later, separate
+  decision.
+- **P4 — degraded-layout fallback.** Pages whose reconstruction
+  confidence is low (coverage gap vs `pdftotext`, column chaos) are
+  handled per `--low-confidence preserve|linearize`: `preserve` embeds
+  the page as a full-page image (CCRU scan posture: keep the artifact,
+  skip translation); `linearize` emits best-effort text order and lets
+  translation proceed. Either way the report names every affected page.
+- **P5 (optional, post-MVP) — pluggable ML backend.** `--pdf-backend
+  marker` for layout models (marker/nougat) when installed, emitting
+  into the same page/line IR. Never a hard dependency.
+
+### 9b.5 CLI surface
+
+```bash
+bookforge doctor --pdf
+bookforge convert paper.pdf --out paper.epub \
+  [--columns auto|1|2] [--low-confidence preserve|linearize] \
+  [--report paper.convert.json]
+# then the standard flow:
+bookforge translate paper.epub --target Italian ...
+```
+
+`translate input.pdf` (implicit convert) is deliberately deferred until
+the convert step has earned trust on real papers.
+
+### 9b.6 Out of scope (within milestone)
+
+- PDF output / translated-PDF re-layout (see §12).
+- OCR for image-only scans (`preserve` posture handles them; OCR is a
+  separate decision with separate tooling).
+- HTML table reconstruction (raster crops first; reassess after real use).
+- DRM'd PDFs.
+
+### 9b.7 Acceptance criteria
+
+- A real two-column arXiv paper converts to an EPUB with ≥95% text
+  coverage against the `pdftotext` baseline, correct reading order on
+  manual inspection, and every embedded figure present.
+- A CCRU-style PDF converts with every low-confidence page either
+  preserved as an image or linearized — and each one named in the report.
+- The converted EPUB passes the identity-roundtrip harness (mock
+  translate → visible text unchanged).
+- All reconstruction logic runs in CI from committed XML fixtures with
+  poppler absent.
+- `cargo test`, `cargo fmt`, `cargo clippy` clean.
+
+### 9b.8 Effort
+
+8–14 days total. P0+P1 are the load-bearing 3–5 days; P2–P4 are
+incremental; P5 only if real books demand it.
+
+### 9b.9 Dependencies
+
+None on other milestones. Requires poppler binaries on the user's
+machine (documented per-OS install one-liners in README).
+
+---
+
 ## 10. v2 — open-ended (sketched, not committed)
 
 The v2 list is what's interesting *as of writing*. The real v2
@@ -2059,9 +2214,9 @@ So this section is a **sketch**, not a commitment. Re-evaluate after v1.6 ships.
 - **Native Anthropic and Gemini providers.** Only if quality measurements
   prove the OpenRouter detour is hurting.
 - **Streaming translation output** for live token meters during long jobs.
-- **Format-adjacent sibling tools**: `bookforge-pdf2epub`, `bookforge-docx2epub`.
-  Strictly siblings, not engine surface. PDF is the most-requested adjacent
-  format and has good prior art (PDF Craft from oomol-lab).
+- **Format-adjacent sibling tools**: `bookforge-docx2epub` and similar.
+  Strictly siblings, not engine surface. PDF graduated out of this bullet:
+  it is now mainline ingestion, spec'd as v1.7 in §9b (decision 2026-06).
 - **Glossary auto-extraction (v1.2.x)** — already mentioned, file here as
   a reminder if it didn't ship as a point release.
 
@@ -2221,7 +2376,7 @@ considered and rejected.
 | Multi-agent debate QA | Poor cost/quality profile for translation |
 | Hosted demo / SaaS | Wrong scope for one-maintainer project |
 | Native Anthropic/Gemini providers (pre-v2) | OpenRouter routes to both; prove necessity first |
-| PDF/DOCX/MOBI/AZW3 input | Sibling tools, not engine surface |
+| DOCX/MOBI/AZW3 input | Sibling tools, not engine surface. (PDF input was on this list until 2026-06; owner priority moved it mainline as v1.7, §9b. PDF *output* — re-laying-out translated text into the original PDF geometry — remains out of scope.) |
 | Manga / comic translation | Different engine entirely |
 | Trilingual+ output | YAGNI |
 | Comparison matrices in README | Hard to keep current, not honest |

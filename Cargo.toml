@@ -4,6 +4,7 @@ members = [
     "crates/bookforge-core",
     "crates/bookforge-epub",
     "crates/bookforge-llm",
+    "crates/bookforge-pdf",
     "crates/bookforge-store",
 ]
 resolver = "3"
@@ -28,7 +29,7 @@ console = "0.16"
 indicatif = "0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-quick-xml = "0.38"
+quick-xml = { version = "0.38", features = ["escape-html"] }
 zip = "6.0"
 rusqlite = { version = "0.37", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip", "brotli"], default-features = false }

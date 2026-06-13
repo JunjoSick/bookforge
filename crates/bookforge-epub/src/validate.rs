@@ -1,7 +1,10 @@
 use std::io::Read;
 use std::path::Path;
 
-use bookforge_core::segment::{BlockTranslation, Segment};
+use bookforge_core::{
+    marker::marker_ids_in_text,
+    segment::{BlockTranslation, Segment},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpubValidationReport {
@@ -132,8 +135,9 @@ fn validate_xhtml_content(
                 .copied()
                 .unwrap_or(&block.text);
 
-            for marker in &segment.constraints.preserve_markers {
-                if block.text.contains(marker) && !translated.contains(marker) {
+            let translated_markers = marker_ids_in_text(translated);
+            for marker in marker_ids_in_text(&block.text) {
+                if !translated_markers.contains(&marker) {
                     report.issues.push(EpubValidationIssue {
                         severity: ValidationSeverity::Error,
                         kind: "missing_marker".to_string(),

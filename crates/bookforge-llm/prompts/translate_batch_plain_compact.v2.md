@@ -1,4 +1,4 @@
-# translate_batch_plain_compact.v1.md
+﻿# translate_batch_plain_compact.v2.md
 
 ## System
 

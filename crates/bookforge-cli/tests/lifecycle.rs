@@ -1,6 +1,8 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use assert_cmd::Command;
@@ -8,38 +10,95 @@ use bookforge_core::{GlossaryCategory, GlossaryStatus, GlossaryTerm};
 use bookforge_store::{GlossaryFilter, JobStore, NewGlossaryCandidate};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 fn bookforge() -> Command {
     Command::cargo_bin("bookforge").expect("bookforge binary should be built")
 }
 
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("cli crate should be under crates/bookforge-cli")
-        .to_path_buf()
+// Builds a synthetic EPUB so lifecycle tests run in CI and contributor
+// checkouts without relying on local, gitignored book fixtures.
+fn fixture_input() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "bookforge-lifecycle-fixture-{}-{nanos}.epub",
+        std::process::id()
+    ));
+    build_lifecycle_epub(&path);
+    path
 }
 
-// Returns the path to test/test.epub if present, otherwise prints a skip line
-// and returns None. The fixture is gitignored; CI and contributor checkouts
-// must skip these tests rather than fail. See CLAUDE.md and CONTRIBUTING.md.
-fn fixture_input_or_skip() -> Option<PathBuf> {
-    let path = workspace_root().join("test/test.epub");
-    if !path.exists() {
-        let name = std::thread::current().name().unwrap_or("?").to_string();
-        eprintln!("[skip] {name}: requires test/test.epub fixture");
-        return None;
-    }
-    Some(path)
+fn build_lifecycle_epub(path: &Path) {
+    let file = fs::File::create(path).expect("fixture EPUB should be creatable");
+    let mut zip = ZipWriter::new(file);
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    zip.start_file("mimetype", stored).unwrap();
+    zip.write_all(b"application/epub+zip").unwrap();
+    zip.start_file("META-INF/container.xml", deflated).unwrap();
+    zip.write_all(LIFECYCLE_CONTAINER_XML.as_bytes()).unwrap();
+    zip.start_file("content.opf", deflated).unwrap();
+    zip.write_all(LIFECYCLE_OPF.as_bytes()).unwrap();
+    zip.start_file("chapter1.xhtml", deflated).unwrap();
+    zip.write_all(LIFECYCLE_CHAPTER_ONE.as_bytes()).unwrap();
+    zip.start_file("chapter2.xhtml", deflated).unwrap();
+    zip.write_all(LIFECYCLE_CHAPTER_TWO.as_bytes()).unwrap();
+    zip.finish().unwrap();
 }
+
+const LIFECYCLE_CONTAINER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+
+const LIFECYCLE_OPF: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">lifecycle-fixture</dc:identifier>
+    <dc:title>Lifecycle Fixture</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="chapter2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch1"/>
+    <itemref idref="ch2"/>
+  </spine>
+</package>"#;
+
+const LIFECYCLE_CHAPTER_ONE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Lifecycle Chapter One</title></head>
+<body>
+<h1>Lifecycle Chapter One</h1>
+<p>Ivan Ilych met Peter Ivanovich near Mount Doom. Ivan Ilych carried the Ring while Aragorn watched Mount Doom.</p>
+<p>Galadriel named Ivan Ilych and Ivan Ilych again. Mount Doom appeared, and Mount Doom remained in sight.</p>
+<p>Hello <em>formatted</em> link text with <a href="https://example.com">Example Link</a>.</p>
+</body>
+</html>"#;
+
+const LIFECYCLE_CHAPTER_TWO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Lifecycle Chapter Two</title></head>
+<body>
+<h1>Lifecycle Chapter Two</h1>
+<p>Aragorn and Gandalf returned to Mount Doom. Ivan Ilych remembered Peter Ivanovich and Galadriel.</p>
+<p>The Shire, Mount Doom, and Ivan Ilych are repeated here so glossary extraction has stable candidates.</p>
+</body>
+</html>"#;
 
 #[test]
 fn cli_translate_mock_quiet_writes_output_report_and_events() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(run) = translate_quiet(&temp, "mock-prefix-target") else {
-        return;
-    };
+    let run = translate_quiet(&temp, "mock-prefix-target");
 
     assert!(run.output.exists(), "translated EPUB should exist");
     assert!(run.events.exists(), "event log should exist");
@@ -49,9 +108,7 @@ fn cli_translate_mock_quiet_writes_output_report_and_events() {
 #[test]
 fn cli_translate_context_window_persists_snapshot_settings() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(input) = fixture_input_or_skip() else {
-        return;
-    };
+    let input = fixture_input();
     let output = temp.path().join("out.epub");
     let events = temp.path().join("events.jsonl");
     bookforge()
@@ -100,9 +157,7 @@ fn cli_translate_context_window_persists_snapshot_settings() {
 #[test]
 fn cli_translate_with_style_sheet_persists_rendered_block_in_snapshot() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(input) = fixture_input_or_skip() else {
-        return;
-    };
+    let input = fixture_input();
     let style_path = temp.path().join("style.toml");
     fs::write(
         &style_path,
@@ -189,9 +244,7 @@ instructions = "Maintain a literary register typical of Italian fiction translat
 #[test]
 fn cli_translate_with_entities_persists_agreement_block_in_snapshot() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(input) = fixture_input_or_skip() else {
-        return;
-    };
+    let input = fixture_input();
     let entities_path = temp.path().join("entities.toml");
     fs::write(
         &entities_path,
@@ -290,9 +343,7 @@ fn cli_translate_batch_mode_with_sliding_context_completes_without_deadlock() {
     // happy path completes — the value is "doesn't hang", which the
     // 60-second test timeout enforces by failure.
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(input) = fixture_input_or_skip() else {
-        return;
-    };
+    let input = fixture_input();
     let output = temp.path().join("out.epub");
     let events = temp.path().join("events.jsonl");
     bookforge()
@@ -332,9 +383,7 @@ fn cli_translate_with_full_v1_3_stack_persists_all_three_blocks() {
     // PRs interoperate end-to-end (PR1 sliding context + PR2 style +
     // PR3 entities + PR4 plumbing).
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(input) = fixture_input_or_skip() else {
-        return;
-    };
+    let input = fixture_input();
     let style_path = temp.path().join("style.toml");
     fs::write(
         &style_path,
@@ -538,9 +587,7 @@ narration = "neutral"
 #[test]
 fn cli_translate_mock_with_same_glossary_is_bit_identical() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(input) = fixture_input_or_skip() else {
-        return;
-    };
+    let input = fixture_input();
     let glossary = temp.path().join("glossary.toml");
     fs::write(
         &glossary,
@@ -707,9 +754,7 @@ source_count = 2
 #[test]
 fn cli_glossary_extract_candidates_stores_auto_candidates() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(input) = fixture_input_or_skip() else {
-        return;
-    };
+    let input = fixture_input();
 
     bookforge()
         .current_dir(temp.path())
@@ -751,9 +796,7 @@ fn cli_glossary_extract_candidates_stores_auto_candidates() {
 #[test]
 fn cli_glossary_review_candidates_accepts_sets_and_rejects() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(input) = fixture_input_or_skip() else {
-        return;
-    };
+    let input = fixture_input();
     let store_path = temp.path().join(".bookforge/jobs.sqlite");
     let store = JobStore::open(&store_path).expect("store opens");
     store
@@ -891,9 +934,7 @@ fn cli_glossary_review_candidates_requires_language_when_ambiguous() {
 #[test]
 fn cli_translate_json_mode_emits_valid_jsonl_stdout_and_file_log() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(input) = fixture_input_or_skip() else {
-        return;
-    };
+    let input = fixture_input();
     let output = temp.path().join("json.epub");
     let events = temp.path().join("json-events.jsonl");
     let assert = bookforge()
@@ -978,9 +1019,7 @@ fn normalized_terms(mut terms: Vec<GlossaryTerm>) -> Vec<GlossaryTerm> {
 #[test]
 fn cli_status_after_translate_reports_succeeded_job() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(run) = translate_quiet(&temp, "mock-prefix-target") else {
-        return;
-    };
+    let run = translate_quiet(&temp, "mock-prefix-target");
 
     let assert = bookforge()
         .current_dir(temp.path())
@@ -1001,9 +1040,7 @@ fn cli_status_after_translate_reports_succeeded_job() {
 #[test]
 fn cli_tail_after_translate_prints_recent_events() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(run) = translate_quiet(&temp, "mock-prefix-target") else {
-        return;
-    };
+    let run = translate_quiet(&temp, "mock-prefix-target");
 
     let assert = bookforge()
         .current_dir(temp.path())
@@ -1019,9 +1056,7 @@ fn cli_tail_after_translate_prints_recent_events() {
 #[test]
 fn cli_tail_json_outputs_valid_jsonl() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(run) = translate_quiet(&temp, "mock-prefix-target") else {
-        return;
-    };
+    let run = translate_quiet(&temp, "mock-prefix-target");
 
     let assert = bookforge()
         .current_dir(temp.path())
@@ -1056,9 +1091,7 @@ fn cli_resume_missing_job_fails_clearly() {
 #[test]
 fn cli_resume_reuses_checkpointed_segments() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(run) = translate_quiet(&temp, "mock-prefix-target") else {
-        return;
-    };
+    let run = translate_quiet(&temp, "mock-prefix-target");
     let resume_events = temp.path().join("resume-events.jsonl");
     let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
     let segment_ids = store
@@ -1111,9 +1144,7 @@ fn cli_resume_reuses_checkpointed_segments() {
 #[test]
 fn cli_resume_uses_input_snapshot_after_original_is_moved() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(fixture) = fixture_input_or_skip() else {
-        return;
-    };
+    let fixture = fixture_input();
     let input = temp.path().join("source.epub");
     let moved = temp.path().join("source-moved.epub");
     fs::copy(&fixture, &input).expect("fixture should copy");
@@ -1161,9 +1192,7 @@ fn cli_resume_uses_input_snapshot_after_original_is_moved() {
 #[test]
 fn cli_review_generates_artifacts_and_ingest_flags_marks_retry() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let Some(run) = translate_quiet(&temp, "mock-prefix-target") else {
-        return;
-    };
+    let run = translate_quiet(&temp, "mock-prefix-target");
     let review_dir = temp.path().join("review-out");
 
     bookforge()
@@ -1274,9 +1303,9 @@ struct TranslateRun {
     report: PathBuf,
 }
 
-fn translate_quiet(temp: &TempDir, model: &str) -> Option<TranslateRun> {
-    let input = fixture_input_or_skip()?;
-    Some(translate_quiet_input(temp, &input, model))
+fn translate_quiet(temp: &TempDir, model: &str) -> TranslateRun {
+    let input = fixture_input();
+    translate_quiet_input(temp, &input, model)
 }
 
 fn translate_quiet_input(temp: &TempDir, input: &Path, model: &str) -> TranslateRun {

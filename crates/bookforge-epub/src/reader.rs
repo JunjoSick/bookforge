@@ -11,6 +11,7 @@ use bookforge_core::{
         Block, BlockId, BlockKind, Book, BookFormat, BookId, DomPath, InlineMark, Metadata,
         ProtectedSpan, ProtectedSpanKind, Resource, Section, SectionId, SpineItem, TextRun,
     },
+    marker::{is_marker_token, strip_marker_tokens},
 };
 use quick_xml::{
     Reader,
@@ -29,6 +30,49 @@ pub struct EpubInspection {
     pub resource_count: usize,
     pub package_path: String,
     pub xhtml_spine_count: usize,
+}
+
+/// How much of the document's visible text the reader actually captures
+/// into translatable blocks. Text that lives outside the recognized block
+/// elements (for example directly inside `<div>`) is parsed over but never
+/// extracted, and ships untranslated; this metric makes that visible
+/// before any tokens are spent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TextCoverage {
+    pub total_chars: usize,
+    pub captured_chars: usize,
+    pub files: Vec<FileTextCoverage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTextCoverage {
+    pub href: String,
+    pub total_chars: usize,
+    pub captured_chars: usize,
+}
+
+impl TextCoverage {
+    pub fn percent(&self) -> f64 {
+        coverage_percent(self.captured_chars, self.total_chars)
+    }
+}
+
+impl FileTextCoverage {
+    pub fn percent(&self) -> f64 {
+        coverage_percent(self.captured_chars, self.total_chars)
+    }
+
+    pub fn uncaptured_chars(&self) -> usize {
+        self.total_chars.saturating_sub(self.captured_chars)
+    }
+}
+
+fn coverage_percent(captured: usize, total: usize) -> f64 {
+    if total == 0 {
+        100.0
+    } else {
+        (captured.min(total) as f64 / total as f64) * 100.0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +97,57 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         .collect::<HashMap<_, _>>();
     let mut sections = Vec::new();
     let mut blocks = Vec::new();
+
+    let package_section_id = SectionId("sec_metadata_opf".to_string());
+    let mut package_blocks =
+        extract_package_title_blocks(&package_xml, &package_section_id, blocks.len())?;
+    if !package_blocks.is_empty() {
+        let block_ids = package_blocks
+            .iter()
+            .map(|block| block.id.clone())
+            .collect::<Vec<_>>();
+        sections.push(Section {
+            id: package_section_id,
+            href: package_path.clone(),
+            spine_index: 0,
+            title: Some("OPF metadata".to_string()),
+            heading_level: None,
+            block_ids,
+            prev: None,
+            next: None,
+        });
+        blocks.append(&mut package_blocks);
+    }
+
+    for (toc_index, resource) in package
+        .manifest
+        .iter()
+        .filter(|item| item.media_type == "application/x-dtbncx+xml")
+        .enumerate()
+    {
+        let href = join_epub_path(&package_dir, &resource.href);
+        let ncx = read_archive_text(&mut archive, &href)?;
+        let section_id = SectionId(format!("sec_toc_{toc_index:06}"));
+        let mut toc_blocks = extract_ncx_text_blocks(&ncx, &section_id, blocks.len())?;
+        if toc_blocks.is_empty() {
+            continue;
+        }
+        let block_ids = toc_blocks
+            .iter()
+            .map(|block| block.id.clone())
+            .collect::<Vec<_>>();
+        sections.push(Section {
+            id: section_id,
+            href,
+            spine_index: 0,
+            title: Some("NCX table of contents".to_string()),
+            heading_level: None,
+            block_ids,
+            prev: None,
+            next: None,
+        });
+        blocks.append(&mut toc_blocks);
+    }
 
     for (spine_index, spine_item) in package.spine.iter_mut().enumerate() {
         let Some(resource) = manifest_by_id.get(spine_item.idref.as_str()) else {
@@ -177,6 +272,113 @@ pub fn inspect_epub(path: &Path) -> Result<EpubInspection> {
     })
 }
 
+/// Measure how much visible body text each XHTML spine document contributes
+/// versus how much the block extractor captures. Counts non-whitespace
+/// characters so block boundaries and indentation do not skew the ratio.
+pub fn text_coverage(path: &Path) -> Result<TextCoverage> {
+    let mut archive = open_archive(path)?;
+    validate_mimetype(&mut archive)?;
+    let package_path = locate_package(&mut archive)?;
+    let package_xml = read_archive_text(&mut archive, &package_path)?;
+    let package = parse_package(&package_xml)?;
+    let package_dir = package_base_dir(&package_path);
+    let manifest_by_id = package
+        .manifest
+        .iter()
+        .map(|item| (item.id.as_str(), item))
+        .collect::<HashMap<_, _>>();
+
+    let mut coverage = TextCoverage::default();
+    for (spine_index, spine_item) in package.spine.iter().enumerate() {
+        let Some(resource) = manifest_by_id.get(spine_item.idref.as_str()) else {
+            return Err(BookforgeError::InvalidInput(format!(
+                "spine item references missing manifest id '{}'",
+                spine_item.idref
+            )));
+        };
+        if !is_xhtml_media_type(&resource.media_type) {
+            continue;
+        }
+
+        let href = join_epub_path(&package_dir, &resource.href);
+        let xhtml = read_archive_text(&mut archive, &href)?;
+        let section_id = SectionId(format!("sec_{spine_index:06}"));
+        let blocks = extract_blocks(&xhtml, &href, &section_id, 0)?;
+        let captured_chars = blocks
+            .iter()
+            .map(|block| non_whitespace_chars(&block_visible_text(block)))
+            .sum::<usize>();
+        let total_chars = visible_body_chars(&xhtml)?;
+
+        coverage.total_chars += total_chars;
+        coverage.captured_chars += captured_chars;
+        coverage.files.push(FileTextCoverage {
+            href,
+            total_chars,
+            captured_chars,
+        });
+    }
+
+    Ok(coverage)
+}
+
+/// Non-whitespace character count of all reader-visible text: everything
+/// inside `<body>` (minus `<script>`/`<style>` content) plus the document
+/// `<title>`, which the extractor also captures and translates. Keeping
+/// the numerator and denominator in sync stops per-file coverage from
+/// exceeding 100% on title-bearing chapters.
+fn visible_body_chars(xhtml: &str) -> Result<usize> {
+    let mut reader = Reader::from_str(xhtml);
+    reader.config_mut().trim_text(false);
+    let mut in_body = false;
+    let mut in_title = false;
+    let mut skip_depth = 0usize;
+    let mut count = 0usize;
+
+    loop {
+        let counting = (in_body || in_title) && skip_depth == 0;
+        match reader.read_event()? {
+            Event::Start(element) => match local_name(element.name().as_ref()) {
+                b"body" => in_body = true,
+                b"title" if !in_body => in_title = true,
+                b"script" | b"style" if in_body => skip_depth += 1,
+                _ => {}
+            },
+            Event::End(element) => match local_name(element.name().as_ref()) {
+                b"body" => in_body = false,
+                b"title" => in_title = false,
+                b"script" | b"style" if skip_depth > 0 => skip_depth -= 1,
+                _ => {}
+            },
+            Event::Text(text) if counting => {
+                let value = text
+                    .html_content()
+                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                count += non_whitespace_chars(&value);
+            }
+            Event::CData(text) if counting => {
+                let value = text
+                    .decode()
+                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                count += non_whitespace_chars(&value);
+            }
+            Event::GeneralRef(reference) if counting => {
+                if let Some(value) = resolve_general_ref(&reference)? {
+                    count += non_whitespace_chars(&value);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(count)
+}
+
+fn non_whitespace_chars(text: &str) -> usize {
+    text.chars().filter(|ch| !ch.is_whitespace()).count()
+}
+
 fn open_archive(path: &Path) -> Result<ZipArchive<File>> {
     let file = File::open(path)?;
     Ok(ZipArchive::new(file)?)
@@ -251,7 +453,7 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
             Event::Text(text) => {
                 if let Some(name) = current_text_element.as_deref() {
                     let value = text
-                        .decode()
+                        .html_content()
                         .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?
                         .trim()
                         .to_string();
@@ -364,13 +566,125 @@ fn attr_value(
 
 #[derive(Debug)]
 struct ElementFrame {
+    name: Vec<u8>,
     path: Vec<usize>,
     child_count: usize,
+    text_count: usize,
+}
+
+struct TextCapture {
+    depth: usize,
+    path: Vec<usize>,
+    text: String,
+}
+
+fn extract_package_title_blocks(
+    xml: &str,
+    section_id: &SectionId,
+    initial_block_count: usize,
+) -> Result<Vec<Block>> {
+    extract_xml_text_element_blocks(xml, section_id, initial_block_count, |name| {
+        name == b"title"
+    })
+}
+
+fn extract_ncx_text_blocks(
+    xml: &str,
+    section_id: &SectionId,
+    initial_block_count: usize,
+) -> Result<Vec<Block>> {
+    extract_xml_text_element_blocks(xml, section_id, initial_block_count, |name| name == b"text")
+}
+
+fn extract_xml_text_element_blocks(
+    xml: &str,
+    section_id: &SectionId,
+    initial_block_count: usize,
+    should_capture: impl Fn(&[u8]) -> bool,
+) -> Result<Vec<Block>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    let mut element_stack = Vec::<ElementFrame>::new();
+    let mut active_capture: Option<TextCapture> = None;
+    let mut blocks = Vec::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) => {
+                let name = local_name(element.name().as_ref()).to_vec();
+                let path = enter_element(&mut element_stack, &name);
+                if active_capture.is_none() && should_capture(&name) {
+                    active_capture = Some(TextCapture {
+                        depth: element_stack.len(),
+                        path,
+                        text: String::new(),
+                    });
+                }
+            }
+            Event::Empty(_) => {
+                next_child_path(&mut element_stack);
+            }
+            Event::Text(text) => {
+                if let Some(capture) = active_capture.as_mut() {
+                    let value = text
+                        .html_content()
+                        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                    capture.text.push_str(&value);
+                }
+            }
+            Event::CData(text) => {
+                if let Some(capture) = active_capture.as_mut() {
+                    let value = text
+                        .decode()
+                        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                    capture.text.push_str(&value);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if let Some(capture) = active_capture.as_mut()
+                    && let Some(value) = resolve_general_ref(&reference)?
+                {
+                    capture.text.push_str(&value);
+                }
+            }
+            Event::End(_) => {
+                if active_capture
+                    .as_ref()
+                    .is_some_and(|capture| element_stack.len() == capture.depth)
+                {
+                    let capture = active_capture.take().expect("checked above");
+                    let visible = normalize_space(&capture.text);
+                    if !visible.is_empty() {
+                        blocks.push(build_block(
+                            section_id,
+                            initial_block_count + blocks.len(),
+                            BlockKind::Paragraph,
+                            DomPath(capture.path),
+                            Vec::new(),
+                            Vec::new(),
+                            visible,
+                        ));
+                    }
+                }
+                element_stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(blocks)
 }
 
 #[derive(Debug)]
 struct BlockBuilder {
-    element_name: Vec<u8>,
+    /// Stack depth of the element this block is anchored to. The block
+    /// closes when an End event arrives while the stack is exactly this
+    /// deep — name-independent, so nested same-name elements (li > ul >
+    /// li, nested blockquotes) stay inside the block as inline markers
+    /// instead of ending it early.
+    anchor_depth: usize,
     kind: BlockKind,
     dom_path: DomPath,
     ordinal: usize,
@@ -383,9 +697,9 @@ struct BlockBuilder {
 }
 
 impl BlockBuilder {
-    fn new(element_name: Vec<u8>, kind: BlockKind, dom_path: DomPath, ordinal: usize) -> Self {
+    fn new(anchor_depth: usize, kind: BlockKind, dom_path: DomPath, ordinal: usize) -> Self {
         Self {
-            element_name,
+            anchor_depth,
             kind,
             dom_path,
             ordinal,
@@ -400,6 +714,24 @@ impl BlockBuilder {
 
     fn push_text(&mut self, text: &str) {
         let Some(mut text) = normalize_text_fragment(text) else {
+            // Whitespace-only fragment (e.g. a resolved &nbsp; entity
+            // reference): it still separates words, so keep one space
+            // between non-empty neighbors instead of dropping the
+            // boundary.
+            if !text.is_empty()
+                && !self.visible_text.is_empty()
+                && !self.visible_text.ends_with(' ')
+            {
+                self.visible_text.push(' ');
+                if let Some(run) = self
+                    .text_runs
+                    .iter_mut()
+                    .rev()
+                    .find(|run| !is_marker_token(&run.text))
+                {
+                    run.text.push(' ');
+                }
+            }
             return;
         };
 
@@ -416,29 +748,29 @@ impl BlockBuilder {
     }
 
     fn push_inline_start(&mut self, name: &[u8]) {
-        let id = marker_id(b"m", self.ordinal, self.next_marker);
+        let id = marker_id("m", self.next_marker);
         self.next_marker += 1;
         self.inline_marks.push(InlineMark {
             id: id.clone(),
             kind: String::from_utf8_lossy(name).into_owned(),
         });
         self.inline_stack.push(id.clone());
-        self.push_run(format!("<m id=\"{id}\">"));
+        self.push_run(format!("<{id}>"));
     }
 
     fn push_inline_empty(&mut self, name: &[u8]) {
-        let id = marker_id(b"r", self.ordinal, self.next_marker);
+        let id = marker_id("r", self.next_marker);
         self.next_marker += 1;
         self.inline_marks.push(InlineMark {
             id: id.clone(),
             kind: String::from_utf8_lossy(name).into_owned(),
         });
-        self.push_run(format!("<ref id=\"{id}\"/>"));
+        self.push_run(format!("<{id}/>"));
     }
 
     fn push_inline_end(&mut self) {
-        if self.inline_stack.pop().is_some() {
-            self.push_run("</m>".to_string());
+        if let Some(id) = self.inline_stack.pop() {
+            self.push_run(format!("</{id}>"));
         }
     }
 
@@ -494,18 +826,24 @@ fn extract_blocks(
     let mut element_stack = Vec::<ElementFrame>::new();
     let mut active_block: Option<BlockBuilder> = None;
     let mut blocks = Vec::new();
+    // Depth of never-translate ancestors (script/style/head/svg/...).
+    // While positive, loose text is not captured into lazy blocks.
+    let mut suppress_depth = 0usize;
 
     loop {
         match reader.read_event()? {
             Event::Start(element) => {
                 let name = local_name(element.name().as_ref()).to_vec();
                 let path = enter_element(&mut element_stack, &name);
+                if never_translate_element(&name) {
+                    suppress_depth += 1;
+                }
 
                 if active_block.is_none()
                     && let Some(kind) = block_kind(&name, &element)?
                 {
                     active_block = Some(BlockBuilder::new(
-                        name,
+                        element_stack.len(),
                         kind,
                         DomPath(path),
                         initial_block_count + blocks.len(),
@@ -516,44 +854,70 @@ fn extract_blocks(
             }
             Event::Empty(element) => {
                 let name = local_name(element.name().as_ref()).to_vec();
-                let path = next_child_path(&mut element_stack);
+                // Sibling bookkeeping must advance even though self-closing
+                // block elements (<p/>, <td/>) carry no text and therefore
+                // produce no block — emitting one would send an empty
+                // source to the model and invite hallucinated output.
+                next_child_path(&mut element_stack);
 
                 if let Some(block) = active_block.as_mut() {
                     block.push_inline_empty(&name);
-                } else if let Some(kind) = block_kind(&name, &element)? {
-                    let block = build_block(
-                        section_id,
-                        initial_block_count + blocks.len(),
-                        kind,
-                        DomPath(path),
-                        Vec::new(),
-                        Vec::new(),
-                        String::new(),
-                    );
-                    blocks.push(block);
                 }
             }
             Event::Text(text) => {
-                if let Some(block) = active_block.as_mut() {
-                    let value = text
-                        .decode()
-                        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-                    block.push_text(&value);
-                }
+                let value = text
+                    .html_content()
+                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                handle_text(
+                    &value,
+                    &mut active_block,
+                    &mut element_stack,
+                    &mut blocks,
+                    section_id,
+                    initial_block_count,
+                    suppress_depth > 0,
+                    true,
+                );
             }
             Event::CData(text) => {
-                if let Some(block) = active_block.as_mut() {
-                    let value = text
-                        .decode()
-                        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-                    block.push_text(&value);
+                let value = text
+                    .decode()
+                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                handle_text(
+                    &value,
+                    &mut active_block,
+                    &mut element_stack,
+                    &mut blocks,
+                    section_id,
+                    initial_block_count,
+                    suppress_depth > 0,
+                    true,
+                );
+            }
+            // quick-xml surfaces entity references (&nbsp; &mdash; ...) as
+            // separate events rather than resolving them inside Text.
+            // Resolve numeric and HTML5 named references; the resolved
+            // text joins the active block or may anchor a lazy one, but
+            // never consumes a stray text-node index — the writer counts
+            // Text events only, and indices must stay aligned.
+            Event::GeneralRef(reference) => {
+                if let Some(value) = resolve_general_ref(&reference)? {
+                    handle_text(
+                        &value,
+                        &mut active_block,
+                        &mut element_stack,
+                        &mut blocks,
+                        section_id,
+                        initial_block_count,
+                        suppress_depth > 0,
+                        false,
+                    );
                 }
             }
-            Event::End(element) => {
-                let name = local_name(element.name().as_ref()).to_vec();
+            Event::End(_) => {
                 let should_finish = active_block
                     .as_ref()
-                    .is_some_and(|block| block.element_name == name);
+                    .is_some_and(|block| element_stack.len() == block.anchor_depth);
 
                 if should_finish {
                     let block = active_block.take().expect("checked above");
@@ -564,7 +928,12 @@ fn extract_blocks(
                     block.push_inline_end();
                 }
 
-                element_stack.pop();
+                if element_stack
+                    .pop()
+                    .is_some_and(|frame| never_translate_element(&frame.name))
+                {
+                    suppress_depth = suppress_depth.saturating_sub(1);
+                }
             }
             Event::Eof => break,
             _ => {}
@@ -574,11 +943,132 @@ fn extract_blocks(
     Ok(blocks)
 }
 
-fn enter_element(stack: &mut Vec<ElementFrame>, _name: &[u8]) -> Vec<usize> {
+/// Resolve a general entity reference to its replacement text: numeric
+/// character references and the HTML5 named set. Unknown entities are
+/// dropped with a warning rather than failing the whole book.
+fn resolve_general_ref(reference: &quick_xml::events::BytesRef<'_>) -> Result<Option<String>> {
+    if let Some(ch) = reference
+        .resolve_char_ref()
+        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?
+    {
+        return Ok(Some(ch.to_string()));
+    }
+    let name = reference
+        .decode()
+        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+    let resolved = quick_xml::escape::resolve_html5_entity(&name).map(ToString::to_string);
+    if resolved.is_none() {
+        tracing::warn!(entity = %name, "dropping unresolvable entity reference");
+    }
+    Ok(resolved)
+}
+
+/// Route a decoded text fragment: into the active block if there is one,
+/// otherwise — for non-whitespace text the block whitelist missed — start
+/// a block anchored on the enclosing element (text-bearing `<div>`,
+/// `<dt>`, `<dd>`, ...) or, when earlier element children make whole-
+/// element patching unsafe, record a standalone text-node block the
+/// writer can address directly. Without this fallback such text silently
+/// shipped untranslated.
+#[allow(clippy::too_many_arguments)]
+fn handle_text(
+    value: &str,
+    active_block: &mut Option<BlockBuilder>,
+    element_stack: &mut [ElementFrame],
+    blocks: &mut Vec<Block>,
+    section_id: &SectionId,
+    initial_block_count: usize,
+    suppressed: bool,
+    allow_stray: bool,
+) {
+    if let Some(block) = active_block.as_mut() {
+        block.push_text(value);
+        return;
+    }
+    if suppressed || value.trim().is_empty() {
+        return;
+    }
+    let depth = element_stack.len();
+    let Some(frame) = element_stack.last_mut() else {
+        return;
+    };
+    if frame.child_count == 0 && anchors_text_block(&frame.name) {
+        let mut block = BlockBuilder::new(
+            depth,
+            BlockKind::Paragraph,
+            DomPath(frame.path.clone()),
+            initial_block_count + blocks.len(),
+        );
+        block.push_text(value);
+        *active_block = Some(block);
+        return;
+    }
+    if !allow_stray {
+        return;
+    }
+    // Stray text node: prior element siblings (or a wrapper element)
+    // make whole-element patching unsafe, so the text node itself
+    // becomes the patch target. The writer counts non-whitespace text
+    // nodes per frame with the same rule.
+    let mut path = frame.path.clone();
+    path.push(bookforge_core::ir::TEXT_NODE_PATH_BASE + frame.text_count);
+    frame.text_count += 1;
+    let visible = normalize_space(value);
+    if visible.is_empty() {
+        return;
+    }
+    blocks.push(build_block(
+        section_id,
+        initial_block_count + blocks.len(),
+        BlockKind::Paragraph,
+        DomPath(path),
+        Vec::new(),
+        Vec::new(),
+        visible,
+    ));
+}
+
+/// Elements whose text must never be translated.
+fn never_translate_element(name: &[u8]) -> bool {
+    matches!(name, b"script" | b"style" | b"svg" | b"math")
+}
+
+/// Elements safe to anchor a lazily-started text block on. Structural
+/// wrappers are excluded: anchoring on them would swallow every nested
+/// block element into one giant marker-laden block. Their direct text is
+/// handled as stray text nodes instead.
+fn anchors_text_block(name: &[u8]) -> bool {
+    !matches!(
+        name,
+        b"body"
+            | b"html"
+            | b"section"
+            | b"article"
+            | b"main"
+            | b"nav"
+            | b"head"
+            | b"header"
+            | b"footer"
+            | b"aside"
+            | b"figure"
+            | b"ul"
+            | b"ol"
+            | b"dl"
+            | b"table"
+            | b"thead"
+            | b"tbody"
+            | b"tfoot"
+            | b"colgroup"
+    )
+}
+
+fn enter_element(stack: &mut Vec<ElementFrame>, name: &[u8]) -> Vec<usize> {
     let path = next_child_path(stack);
     stack.push(ElementFrame {
+        name: name.to_vec(),
         path: path.clone(),
         child_count: 0,
+        text_count: 0,
     });
     path
 }
@@ -706,41 +1196,11 @@ fn block_visible_text(block: &Block) -> String {
         .map(|run| run.text.as_str())
         .collect::<Vec<_>>()
         .join("");
-    strip_marker_tokens(&marked)
+    normalize_space(&strip_marker_tokens(&marked))
 }
 
-fn strip_marker_tokens(text: &str) -> String {
-    let mut output = String::new();
-    let mut rest = text;
-
-    while let Some(index) = rest.find('<') {
-        output.push_str(&rest[..index]);
-        let tag = &rest[index..];
-
-        if (tag.starts_with("<m id=\"") || tag.starts_with("<ref id=\"") || tag.starts_with("</m>"))
-            && let Some(end) = tag.find('>')
-        {
-            rest = &tag[end + 1..];
-            continue;
-        }
-
-        output.push('<');
-        rest = &tag[1..];
-    }
-
-    output.push_str(rest);
-    normalize_space(&output)
-}
-
-fn is_marker_token(text: &str) -> bool {
-    matches!(text, "</m>") || text.starts_with("<m id=\"") || text.starts_with("<ref id=\"")
-}
-
-fn marker_id(prefix: &[u8], block_ordinal: usize, marker_ordinal: usize) -> String {
-    format!(
-        "{}{block_ordinal:06}_{marker_ordinal:03}",
-        String::from_utf8_lossy(prefix)
-    )
+fn marker_id(prefix: &str, marker_ordinal: usize) -> String {
+    format!("{prefix}{}", marker_ordinal + 1)
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -908,9 +1368,9 @@ mod tests {
 
         assert_eq!(blocks.len(), 1);
         let text = block_text(&blocks[0]);
-        assert_eq!(text, "Hello <m id=\"m000000_000\">world</m>!");
+        assert_eq!(text, "Hello <m1>world</m1>!");
         assert_eq!(blocks[0].inline_marks.len(), 1);
-        assert_eq!(blocks[0].inline_marks[0].id, "m000000_000");
+        assert_eq!(blocks[0].inline_marks[0].id, "m1");
         assert_eq!(blocks[0].inline_marks[0].kind, "em");
         assert_eq!(blocks[0].token_estimate, estimate_tokens("Hello world!"));
     }
@@ -928,9 +1388,160 @@ mod tests {
 
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].id.0, "b_000004");
-        assert_eq!(block_text(&blocks[0]), "Line<ref id=\"r000004_000\"/>break");
-        assert_eq!(blocks[0].inline_marks[0].id, "r000004_000");
+        assert_eq!(block_text(&blocks[0]), "Line<r1/>break");
+        assert_eq!(blocks[0].inline_marks[0].id, "r1");
         assert_eq!(blocks[0].inline_marks[0].kind, "br");
+    }
+
+    #[test]
+    fn extracts_text_anchored_block_from_div() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            "<html><body><div class=\"x\">Bare div text with <em>emphasis</em>.</div></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            block_text(&blocks[0]),
+            "Bare div text with <m1>emphasis</m1>."
+        );
+        assert_eq!(blocks[0].kind, BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn extracts_dt_and_dd_text() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            "<html><body><dl><dt>Term</dt><dd>Definition</dd></dl></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        let texts: Vec<String> = blocks.iter().map(block_text).collect();
+        assert_eq!(texts, vec!["Term".to_string(), "Definition".to_string()]);
+    }
+
+    #[test]
+    fn stray_text_after_children_becomes_addressable_block() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            "<html><body><p>Captured</p>Naked tail text</body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(block_text(&blocks[1]), "Naked tail text");
+        let last = *blocks[1]
+            .dom_path
+            .0
+            .last()
+            .expect("path should not be empty");
+        assert!(
+            last >= bookforge_core::ir::TEXT_NODE_PATH_BASE,
+            "stray text block must use a text-node path component, got {last}"
+        );
+    }
+
+    #[test]
+    fn nested_same_name_blocks_stay_in_one_block() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            "<html><body><ul><li>Outer <ul><li>Inner</li></ul> tail</li><li>Sibling</li></ul></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 2, "outer li (with nested list) + sibling li");
+        let outer = block_text(&blocks[0]);
+        assert!(outer.contains("Outer"), "got: {outer}");
+        assert!(
+            outer.contains("Inner"),
+            "nested li text stays inside the outer block: {outer}"
+        );
+        assert!(
+            outer.contains("tail"),
+            "text after the nested list must not be lost: {outer}"
+        );
+        assert_eq!(block_text(&blocks[1]), "Sibling");
+    }
+
+    #[test]
+    fn named_html_entities_decode_in_text() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            "<html><body><p>one&nbsp;two&mdash;three</p></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("named entities must not fail extraction");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(block_text(&blocks[0]), "one two\u{2014}three");
+    }
+
+    #[test]
+    fn script_and_style_text_is_never_extracted() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            "<html><head><title>Meta</title><style>p { color: red; }</style></head><body><script>var x = 1;</script><div>Real</div></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        let texts = blocks.iter().map(block_text).collect::<Vec<_>>();
+        assert_eq!(texts, vec!["Meta", "Real"]);
+        assert!(!texts.iter().any(|text| text.contains("color")));
+        assert!(!texts.iter().any(|text| text.contains("var x")));
+    }
+
+    #[test]
+    fn visible_body_chars_counts_body_and_title_but_not_style() {
+        let xhtml = r#"<html><head><title>Heading</title><style>p { color: red; }</style></head>
+<body><p>captured</p><div>div text</div></body></html>"#;
+        let total = visible_body_chars(xhtml).expect("count should succeed");
+        // "Heading" (7) + "captured" (8) + "divtext" (7); style is excluded.
+        // The head title counts because the extractor translates it too.
+        assert_eq!(total, 22);
+    }
+
+    #[test]
+    fn coverage_captures_div_text_and_reports_svg_labels_uncaptured() {
+        let section_id = SectionId("sec_000000".to_string());
+        let xhtml =
+            "<html><body><p>in a block</p><div>also in a div</div><svg><text>diagram label</text></svg></body></html>"
+                .to_string();
+        let blocks =
+            extract_blocks(&xhtml, "chapter.xhtml", &section_id, 0).expect("blocks should parse");
+        let captured = blocks
+            .iter()
+            .map(|block| non_whitespace_chars(&block_visible_text(block)))
+            .sum::<usize>();
+        let total = visible_body_chars(&xhtml).expect("count should succeed");
+
+        assert_eq!(
+            captured,
+            non_whitespace_chars("in a block") + non_whitespace_chars("also in a div"),
+            "prose in p and div must both be captured"
+        );
+        assert_eq!(
+            total - captured,
+            non_whitespace_chars("diagram label"),
+            "svg text stays uncaptured and visible in the coverage gap"
+        );
     }
 
     #[test]

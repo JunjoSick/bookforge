@@ -43,11 +43,34 @@ cargo run -p bookforge-cli -- <command>
 
 ## Commands
 
+Convert a PDF to a translatable EPUB (requires [poppler](https://poppler.freedesktop.org/)
+command-line tools on PATH, or `POPPLER_PATH` pointing at their bin
+directory; on Windows use the poppler-windows release zip):
+
+```bash
+cargo run -p bookforge-cli -- convert paper.pdf --out paper.epub
+```
+
+The converter detects two-column layouts per page (scientific papers),
+repairs hyphenated line breaks, joins paragraphs across pages, and maps
+oversized fonts to headings. It prints a fidelity report comparing the
+reconstructed text against the raw `pdftotext` baseline — check that
+coverage number (and `inspect` on the result) before spending tokens.
+Figures, tables-as-images, and low-confidence page fallbacks are
+roadmap items (ROADMAP §9b, phases P2–P4); for image-heavy PDFs expect
+text-only output for now.
+
 Inspect an EPUB:
 
 ```bash
 cargo run -p bookforge-cli -- inspect book.epub
 ```
+
+The inspect output includes a text-coverage metric: the percentage of
+visible body text that lands in translatable blocks. Files with low
+coverage (text in unsupported markup such as bare `<div>`s) are listed
+individually — that text would ship untranslated, so check coverage
+before spending tokens on a full run.
 
 Estimate tokens and approximate cost:
 
@@ -75,13 +98,12 @@ cargo run -p bookforge-cli -- translate book.epub \
   --out book.it.epub
 ```
 
-Translate with the v1 fast preset:
+Translate with the default fast profile:
 
 ```bash
 cargo run -p bookforge-cli -- translate book.epub \
   --target Italian \
   --provider-preset openrouter-paid-fast \
-  --profile v1-fast \
   --ui progress \
   --out book.it.epub
 ```
@@ -211,6 +233,16 @@ Translation always runs hard validators before committing a segment. The optiona
 
 `off` is the default. Reports still include deterministic soft warnings such as changed URLs, changed numbers, suspicious length ratios, model commentary, and repeated text.
 
+Two structural defaults to know about:
+
+- `pre`/`code` blocks are never sent to the model. They are copied through
+  to the output byte-for-byte, preserving internal whitespace.
+- The sliding context window (`--context-window`, default 3) is
+  best-effort: a segment uses whichever predecessors have already
+  finished and never waits for them. Pass `--context-strict` to restore
+  the v1.3 fence behavior, which guarantees a complete context block but
+  serializes segments within the context scope.
+
 ## Checkpoints And Cache
 
 Runtime state is stored in:
@@ -288,5 +320,4 @@ crates/bookforge-llm/prompts  Versioned prompt templates
 crates/bookforge-store  SQLite checkpoint store
 crates/bookforge-cli    CLI commands and reports
 docs/                   Architecture notes
-tests/fixtures/         Committed minimal fixture only
 ```

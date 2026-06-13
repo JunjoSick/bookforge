@@ -7,8 +7,8 @@ use std::{
 
 use bookforge_core::{
     BookforgeError, Result,
-    ir::{Block, Book, DomPath},
-    marker::extract_marker_id,
+    ir::{Block, Book, DomPath, TEXT_NODE_PATH_BASE},
+    marker::{parse_empty_marker, parse_paired_marker_open},
     segment::BlockTranslation,
 };
 use quick_xml::{
@@ -155,6 +155,7 @@ struct PatchSpec<'a> {
 struct ElementFrame {
     path: Vec<usize>,
     child_count: usize,
+    text_count: usize,
 }
 
 #[derive(Debug)]
@@ -262,6 +263,36 @@ fn patch_xhtml_with_specs(xhtml: &str, patches: &[PatchSpec<'_>]) -> Result<Patc
             Event::End(element) => {
                 writer.write_event(Event::End(element.borrow()))?;
                 stack.pop();
+            }
+            // Text nodes are addressable patch targets: the reader emits
+            // standalone blocks for non-whitespace text the block
+            // whitelist missed, addressed as parent path plus
+            // TEXT_NODE_PATH_BASE + n. Counting must mirror the reader:
+            // every text node that is non-whitespace after entity
+            // decoding consumes one index in its parent frame.
+            Event::Text(text) => {
+                let non_whitespace = text
+                    .html_content()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(true);
+                match text_node_patch(&patch_map, &mut stack, non_whitespace) {
+                    Some(translation) => {
+                        writer.write_event(Event::Text(BytesText::new(translation)))?
+                    }
+                    None => writer.write_event(Event::Text(text.borrow()))?,
+                }
+            }
+            Event::CData(text) => {
+                let non_whitespace = text
+                    .decode()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(true);
+                match text_node_patch(&patch_map, &mut stack, non_whitespace) {
+                    Some(translation) => {
+                        writer.write_event(Event::Text(BytesText::new(translation)))?
+                    }
+                    None => writer.write_event(Event::CData(text.borrow()))?,
+                }
             }
             Event::Eof => break,
             event => {
@@ -381,7 +412,6 @@ fn collect_inline_templates(
     block: &Block,
     events: &[Event<'static>],
 ) -> Result<HashMap<String, InlineTemplate>> {
-    let block_ordinal = block_ordinal(block)?;
     let mut marker_ordinal = 0usize;
     let mut templates = HashMap::new();
     let mut stack = Vec::<(String, Event<'static>)>::new();
@@ -389,12 +419,12 @@ fn collect_inline_templates(
     for event in events {
         match event {
             Event::Start(element) => {
-                let id = marker_id("m", block_ordinal, marker_ordinal);
+                let id = marker_id("m", marker_ordinal);
                 marker_ordinal += 1;
                 stack.push((id, Event::Start(element.clone())));
             }
             Event::Empty(element) => {
-                let id = marker_id("r", block_ordinal, marker_ordinal);
+                let id = marker_id("r", marker_ordinal);
                 marker_ordinal += 1;
                 templates.insert(id, InlineTemplate::Empty(Event::Empty(element.clone())));
             }
@@ -436,15 +466,17 @@ fn push_marked_fragment(
         push_text_event(&text[..index], output);
         let tag = &text[index..];
 
-        if let Some((tag_name, id, open_len)) = parse_paired_marker_open(tag) {
+        if let Some(open) = parse_paired_marker_open(tag) {
+            let tag_name = open.tag_name;
+            let id = open.id;
             if used.iter().any(|seen| seen == &id) {
                 return Err(BookforgeError::InvalidInput(format!(
                     "translation contains a duplicate formatting marker '{id}'. The LLM copied the marker twice."
                 )));
             }
 
-            let after_open = &tag[open_len..];
-            let close_start = find_matching_marker_close(after_open, tag_name)?;
+            let after_open = &tag[open.len..];
+            let close_start = find_matching_marker_close(after_open, &tag_name)?;
             let close_len = format!("</{tag_name}>").len();
             let inner = &after_open[..close_start];
             let after_close = &after_open[close_start + close_len..];
@@ -469,7 +501,8 @@ fn push_marked_fragment(
             }
 
             text = after_close;
-        } else if let Some((id, marker_len)) = parse_empty_marker(tag) {
+        } else if let Some(empty) = parse_empty_marker(tag) {
+            let id = empty.id;
             if used.iter().any(|seen| seen == &id) {
                 return Err(BookforgeError::InvalidInput(format!(
                     "translation contains a duplicate formatting marker '{id}'. The LLM copied the marker twice."
@@ -493,7 +526,7 @@ fn push_marked_fragment(
                 }
             }
 
-            text = &tag[marker_len..];
+            text = &tag[empty.len..];
         } else {
             push_text_event("<", output);
             text = &tag[1..];
@@ -510,46 +543,14 @@ fn push_text_event(text: &str, output: &mut Vec<Event<'static>>) {
     }
 }
 
-fn parse_paired_marker_open(text: &str) -> Option<(&'static str, String, usize)> {
-    for tag_name in ["m", "keep"] {
-        let prefix = format!("<{tag_name} ");
-        if !text.starts_with(&prefix) {
-            continue;
-        }
-        let open_end = text.find('>')?;
-        if text[..open_end].ends_with('/') {
-            return None;
-        }
-        let id = extract_marker_id(&text[..=open_end])?;
-        return Some((tag_name, id, open_end + 1));
-    }
-    None
-}
-
-fn parse_empty_marker(text: &str) -> Option<(String, usize)> {
-    for tag_name in ["ref", "m", "keep"] {
-        if !text.starts_with(&format!("<{tag_name} ")) {
-            continue;
-        }
-        if let Some(end) = text.find("/>") {
-            let tag = &text[..end + 2];
-            if let Some(id) = extract_marker_id(tag) {
-                return Some((id, end + 2));
-            }
-        }
-    }
-    None
-}
-
 fn find_matching_marker_close(text: &str, tag_name: &str) -> Result<usize> {
-    let open_prefix = format!("<{tag_name} ");
     let close = format!("</{tag_name}>");
     let mut depth = 0usize;
     let mut offset = 0usize;
 
     loop {
         let remaining = &text[offset..];
-        let next_open = remaining.find(&open_prefix);
+        let next_open = find_marker_open(remaining, tag_name);
         let next_close = remaining.find(&close);
 
         match (next_open, next_close) {
@@ -589,22 +590,16 @@ fn find_matching_marker_close(text: &str, tag_name: &str) -> Result<usize> {
     }
 }
 
-fn block_ordinal(block: &Block) -> Result<usize> {
-    block
-        .id
-        .0
-        .strip_prefix("b_")
-        .and_then(|value| value.parse::<usize>().ok())
-        .ok_or_else(|| {
-            BookforgeError::InvalidInput(format!(
-                "block id '{}' does not use the expected b_000000 shape",
-                block.id.0
-            ))
-        })
+fn find_marker_open(text: &str, tag_name: &str) -> Option<usize> {
+    if matches!(tag_name, "m" | "keep") {
+        text.find(&format!("<{tag_name} "))
+    } else {
+        text.find(&format!("<{tag_name}>"))
+    }
 }
 
-fn marker_id(prefix: &str, block_ordinal: usize, marker_ordinal: usize) -> String {
-    format!("{prefix}{block_ordinal:06}_{marker_ordinal:03}")
+fn marker_id(prefix: &str, marker_ordinal: usize) -> String {
+    format!("{prefix}{}", marker_ordinal + 1)
 }
 
 pub(crate) fn validate_xml(xml: &str) -> Result<()> {
@@ -618,11 +613,32 @@ pub(crate) fn validate_xml(xml: &str) -> Result<()> {
     }
 }
 
+/// Consume one text-node index in the enclosing frame and return the
+/// matching patch translation, if any. Whitespace-only nodes consume no
+/// index, mirroring the reader's counting rule.
+fn text_node_patch<'a>(
+    patch_map: &HashMap<&[usize], PatchSpec<'a>>,
+    stack: &mut [ElementFrame],
+    non_whitespace: bool,
+) -> Option<&'a str> {
+    if !non_whitespace {
+        return None;
+    }
+    let frame = stack.last_mut()?;
+    let mut path = frame.path.clone();
+    path.push(TEXT_NODE_PATH_BASE + frame.text_count);
+    frame.text_count += 1;
+    patch_map
+        .get(path.as_slice())
+        .map(|patch| patch.translation)
+}
+
 fn enter_element(stack: &mut Vec<ElementFrame>) -> Vec<usize> {
     let path = next_child_path(stack);
     stack.push(ElementFrame {
         path: path.clone(),
         child_count: 0,
+        text_count: 0,
     });
     path
 }
@@ -691,7 +707,7 @@ mod tests {
             "b_000000",
             DomPath(vec![0, 0]),
             vec![InlineMark {
-                id: "m000000_000".to_string(),
+                id: "m1".to_string(),
                 kind: "em".to_string(),
             }],
         );
@@ -699,7 +715,7 @@ mod tests {
             xhtml,
             &[BlockPatch {
                 block: &block,
-                translation: "Ciao <m id=\"m000000_000\">mondo</m>!",
+                translation: "Ciao <m1>mondo</m1>!",
             }],
         )
         .expect("patch should succeed");
@@ -734,6 +750,28 @@ mod tests {
     }
 
     #[test]
+    fn patches_stray_text_node() {
+        let xhtml = "<root><p>Para</p>tail text<p>Other</p></root>";
+        let path = DomPath(vec![0, TEXT_NODE_PATH_BASE]);
+        let outcome =
+            patch_xhtml(xhtml, &[(&path, "coda tradotta")]).expect("patch should succeed");
+
+        assert_eq!(outcome.skipped_blocks, 0);
+        assert!(
+            outcome.xhtml.contains("coda tradotta"),
+            "stray text node should be replaced, got: {}",
+            outcome.xhtml,
+        );
+        assert!(!outcome.xhtml.contains("tail text"));
+        assert!(
+            outcome.xhtml.contains("<p>Para</p>") && outcome.xhtml.contains("<p>Other</p>"),
+            "sibling elements must be untouched, got: {}",
+            outcome.xhtml,
+        );
+        validate_xml(&outcome.xhtml).expect("output should re-parse");
+    }
+
+    #[test]
     fn validate_xml_rejects_malformed_input() {
         assert!(validate_xml("<root><p>oops</root>").is_err());
     }
@@ -746,7 +784,7 @@ mod tests {
             dom_path,
             text_runs: vec![TextRun {
                 id: "r000000_000".to_string(),
-                text: "Hello <m id=\"m000000_000\">world</m>!".to_string(),
+                text: "Hello <m1>world</m1>!".to_string(),
             }],
             inline_marks,
             protected_spans: Vec::<ProtectedSpan>::new(),

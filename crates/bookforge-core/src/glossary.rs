@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ir::Block, marker::extract_marker_id, segment::Segment};
+use crate::{ir::Block, marker::parse_paired_marker_open, segment::Segment};
 
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -541,23 +541,25 @@ fn collect_quoted_italic_candidates(
     let mut sources = HashSet::new();
     let marked = marked_block_text(block);
     let mut offset = 0usize;
-    while let Some(relative_start) = marked[offset..].find("<m ") {
+    while let Some(relative_start) = marked[offset..].find('<') {
         let tag_start = offset + relative_start;
-        let Some(relative_tag_end) = marked[tag_start..].find('>') else {
-            break;
-        };
-        let tag_end = tag_start + relative_tag_end + 1;
-        let tag = &marked[tag_start..tag_end];
-        let Some(marker_id) = extract_marker_id(tag) else {
-            offset = tag_end;
+        let tag = &marked[tag_start..];
+        let Some(open) = parse_paired_marker_open(tag) else {
+            offset = tag_start + 1;
             continue;
         };
-        let Some(relative_close) = marked[tag_end..].find("</m>") else {
+        if !open.id.starts_with('m') {
+            offset = tag_start + open.len;
+            continue;
+        }
+        let tag_end = tag_start + open.len;
+        let close = format!("</{}>", open.tag_name);
+        let Some(relative_close) = marked[tag_end..].find(&close) else {
             break;
         };
         let close_start = tag_end + relative_close;
-        let close_end = close_start + "</m>".len();
-        if italic_ids.contains(marker_id.as_str()) {
+        let close_end = close_start + close.len();
+        if italic_ids.contains(open.id.as_str()) {
             let raw_content = &marked[tag_end..close_start];
             if let Some(phrase) = quoted_italic_phrase(&marked, tag_start, close_end, raw_content) {
                 sources.insert(phrase.to_lowercase());
@@ -684,24 +686,7 @@ fn block_visible_text(block: &Block) -> String {
 }
 
 fn strip_marker_tokens(text: &str) -> String {
-    let mut output = String::new();
-    let mut rest = text;
-
-    while let Some(index) = rest.find('<') {
-        output.push_str(&rest[..index]);
-        let tag = &rest[index..];
-        if (tag.starts_with("<m ") || tag.starts_with("<ref ") || tag.starts_with("</m>"))
-            && let Some(end) = tag.find('>')
-        {
-            rest = &tag[end + 1..];
-            continue;
-        }
-        output.push('<');
-        rest = &tag[1..];
-    }
-
-    output.push_str(rest);
-    output
+    crate::marker::strip_marker_tokens(text)
 }
 
 fn previous_visible_char(text: &str) -> Option<char> {
@@ -909,13 +894,9 @@ mod tests {
     #[test]
     fn extraction_discovers_quoted_italic_invented_phrases() {
         let blocks = vec![marked_block(
-            vec![
-                "He whispered “",
-                "<m id=\"m000000_000\">Lukh</m>",
-                "” once.",
-            ],
+            vec!["He whispered “", "<m1>Lukh</m1>", "” once."],
             vec![InlineMark {
-                id: "m000000_000".to_string(),
+                id: "m1".to_string(),
                 kind: "em".to_string(),
             }],
         )];

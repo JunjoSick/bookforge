@@ -171,10 +171,12 @@ dependencies = [
  "bookforge-core",
  "bookforge-epub",
  "bookforge-llm",
+ "bookforge-pdf",
  "bookforge-store",
  "clap",
  "console",
  "indicatif",
+ "quick-xml",
  "serde",
  "serde_json",
  "sha2",
@@ -184,6 +186,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]
@@ -221,6 +224,21 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "bookforge-pdf"
+version = "1.4.0"
+dependencies = [
+ "bookforge-core",
+ "bookforge-epub",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "zip",
 ]
 
 [[package]]

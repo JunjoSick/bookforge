@@ -72,11 +72,19 @@ pub struct EntityRunConfig {
 /// entirely; existing cache entries stay valid because the context block
 /// is rendered as an empty string and the rendered prompt itself is not
 /// part of the cache key.
+///
+/// `strict` controls the completion fence. When `true`, a segment waits
+/// until all `window` predecessors have finished, which guarantees a full
+/// context block but serializes segments within the scope (a one-file
+/// EPUB translates strictly one segment at a time). When `false` (the
+/// default), the segment takes whatever predecessors have already
+/// completed at the moment it starts and never waits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextRunConfig {
     pub window: usize,
     pub budget_tokens: usize,
     pub scope: ContextScope,
+    pub strict: bool,
 }
 
 impl Default for ContextRunConfig {
@@ -85,6 +93,7 @@ impl Default for ContextRunConfig {
             window: 0,
             budget_tokens: 1200,
             scope: ContextScope::Chapter,
+            strict: false,
         }
     }
 }
@@ -230,10 +239,14 @@ impl ContextRegistry {
         });
     }
 
-    /// Wait for the prior `config.window` segments (scoped per `config.scope`)
-    /// to complete, then return their `CompletedContext` entries in
-    /// closest-first order, filtered to successful translations and
-    /// truncated to fit `config.budget_tokens`.
+    /// Return the prior `config.window` segments' `CompletedContext`
+    /// entries (scoped per `config.scope`) in closest-first order, filtered
+    /// to successful translations and truncated to fit
+    /// `config.budget_tokens`.
+    ///
+    /// In strict mode this waits until every prior segment has completed.
+    /// In best-effort mode (the default) it returns immediately with
+    /// whatever predecessors happen to be done.
     pub async fn await_context_for(
         &self,
         segment_id: &SegmentId,
@@ -258,6 +271,24 @@ impl ContextRegistry {
         };
         if prior.is_empty() {
             return Vec::new();
+        }
+        if !config.strict {
+            let map = self
+                .inner
+                .completed
+                .lock()
+                .expect("context registry mutex poisoned");
+            let succeeded: Vec<CompletedContext> = prior
+                .iter()
+                .filter_map(|id| map.get(id).cloned())
+                .filter(|ctx| {
+                    matches!(
+                        ctx.status,
+                        SegmentStatus::Succeeded | SegmentStatus::SkippedCached
+                    )
+                })
+                .collect();
+            return apply_context_budget(succeeded, config.budget_tokens);
         }
         loop {
             let notified = self.inner.notify.notified();
@@ -494,7 +525,15 @@ where
 
         tasks.spawn(async move {
             let mode = select_mode(&segment);
-            let context_pairs = context_pairs_for_segment(&segment, &config).await;
+            // Strict mode must wait for predecessors BEFORE taking a permit,
+            // otherwise waiters occupy the whole pool and deadlock. Best-
+            // effort mode snapshots AFTER taking a permit so predecessors
+            // have had as long as possible to finish.
+            let strict_context_pairs = if config.context.strict {
+                Some(context_pairs_for_segment(&segment, &config).await)
+            } else {
+                None
+            };
             let Ok(_permit) = semaphore.acquire_owned().await else {
                 let failed = failed_translation_with_tokens(
                     &segment,
@@ -508,6 +547,10 @@ where
                     registry.pre_populate(&segment, &failed);
                 }
                 return failed;
+            };
+            let context_pairs = match strict_context_pairs {
+                Some(pairs) => pairs,
+                None => context_pairs_for_segment(&segment, &config).await,
             };
             let translation =
                 translate_one(provider, library, segment.clone(), &config, context_pairs).await;
@@ -1167,15 +1210,7 @@ fn parse_and_validate(
                 .first()
                 .map(|block| block.protected_spans.as_slice())
                 .unwrap_or(&[]);
-            let (translation, repaired) =
-                repair_missing_protected_spans(expected_spans, parsed.translation);
-            if !repaired.is_empty() {
-                tracing::warn!(
-                    segment_id = %segment.id.0,
-                    "re-inserted missing protected spans: {:?}",
-                    repaired
-                );
-            }
+            let translation = parsed.translation;
             validate_protected_spans(segment, expected_spans, &translation)?;
             let block_id = segment
                 .block_ids
@@ -1231,16 +1266,6 @@ fn parse_and_validate(
                                 segment.id.0, source_block.block_id.0
                             ))
                         })?;
-                let (translation, repaired) =
-                    repair_missing_protected_spans(&source_block.protected_spans, translation);
-                if !repaired.is_empty() {
-                    tracing::warn!(
-                        segment_id = %segment.id.0,
-                        block_id = %source_block.block_id.0,
-                        "re-inserted missing protected spans: {:?}",
-                        repaired
-                    );
-                }
                 let expected_markers = marker_ids_in_text(&source_block.text);
                 validate_markers(segment, &expected_markers, &translation)?;
                 validate_protected_spans(segment, &source_block.protected_spans, &translation)?;
@@ -1292,16 +1317,6 @@ fn parse_and_validate(
                         ))
                     })?;
                 let text = validate_and_join_runs(segment, source_block, block.translated_runs)?;
-                let (text, repaired) =
-                    repair_missing_protected_spans(&source_block.protected_spans, text);
-                if !repaired.is_empty() {
-                    tracing::warn!(
-                        segment_id = %segment.id.0,
-                        block_id = %source_block.block_id.0,
-                        "re-inserted missing protected spans in run-preserving: {:?}",
-                        repaired
-                    );
-                }
                 let expected_markers = marker_ids_in_text(&source_block.text);
                 validate_markers(segment, &expected_markers, &text)?;
                 validate_protected_spans(segment, &source_block.protected_spans, &text)?;
@@ -1419,24 +1434,6 @@ fn validation_retry_appendix(segment: &Segment, mode: TranslationMode, error: &s
          Required markers:\n{markers}\n",
         mode.template_name()
     )
-}
-
-fn repair_missing_protected_spans(
-    spans: &[String],
-    mut translation: String,
-) -> (String, Vec<String>) {
-    let mut reinserted = Vec::new();
-    for span in spans {
-        if span.trim().is_empty() || translation.contains(span) {
-            continue;
-        }
-        if !translation.is_empty() && !translation.ends_with(char::is_whitespace) {
-            translation.push(' ');
-        }
-        translation.push_str(span);
-        reinserted.push(span.clone());
-    }
-    (translation, reinserted)
 }
 
 fn validate_protected_spans(segment: &Segment, spans: &[String], translation: &str) -> Result<()> {
@@ -1648,6 +1645,7 @@ mod tests {
             window: 1,
             budget_tokens: 1000,
             scope: ContextScope::Book,
+            strict: true,
         };
         cfg.context_registry = Some(Arc::new(ContextRegistry::new(&segments)));
 
@@ -1698,7 +1696,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protected_span_failure_is_repaired() {
+    async fn protected_span_failure_surfaces_as_needs_review() {
+        // The uppercase mock destroys the URL's casing on every attempt;
+        // that is a genuine translation defect and must be flagged for
+        // review with the source preserved, not papered over by appending
+        // the original URL after the mangled one.
         let mut segment = segment("seg_a", 0, vec![("b0", "Visit https://example.com")]);
         segment.source.blocks[0]
             .protected_spans
@@ -1716,16 +1718,23 @@ mod tests {
         .await
         .expect("validation failure should not propagate");
 
-        assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+        assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
         assert!(
-            translations[0].blocks[0]
-                .text
-                .contains("https://example.com")
+            translations[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("protected span missing")),
+            "error should name the missing span, got: {:?}",
+            translations[0].error
+        );
+        assert_eq!(
+            translations[0].blocks[0].text, "Visit https://example.com",
+            "needs-review fallback must preserve the source text"
         );
     }
 
     #[tokio::test]
-    async fn missing_protected_span_is_reinserted_before_validation() {
+    async fn missing_protected_span_fails_validation_instead_of_appending() {
         let mut segment = segment("seg_a", 0, vec![("b0", "The 4th day")]);
         segment.source.blocks[0]
             .protected_spans
@@ -1734,10 +1743,24 @@ mod tests {
 
         let translations = translate_segments(MissingProtectedSpanProvider, &[segment], &config())
             .await
-            .expect("protected span repair should keep segment successful");
+            .expect("validation failure should not propagate");
 
-        assert_eq!(translations[0].status, SegmentStatus::Succeeded);
-        assert!(translations[0].blocks[0].text.contains("4th"));
+        // A dropped protected span must surface as needs-review with the
+        // source text preserved — never be silently glued onto the end of
+        // the translated paragraph.
+        assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
+        assert!(
+            translations[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("protected span missing")),
+            "error should name the missing span, got: {:?}",
+            translations[0].error
+        );
+        assert_eq!(
+            translations[0].blocks[0].text, "The 4th day",
+            "needs-review fallback must preserve the source text"
+        );
     }
 
     #[tokio::test]
@@ -1811,15 +1834,8 @@ mod tests {
 
     #[tokio::test]
     async fn inline_marker_failure_is_marked_needs_review() {
-        let mut segment = segment(
-            "seg_a",
-            0,
-            vec![("b0", "Hello <m id=\"m000000_000\">world</m>!")],
-        );
-        segment
-            .constraints
-            .preserve_markers
-            .push("m000000_000".to_string());
+        let mut segment = segment("seg_a", 0, vec![("b0", "Hello <m1>world</m1>!")]);
+        segment.constraints.preserve_markers.push("m1".to_string());
 
         let translations = translate_segments(
             MockProvider::new(MockMode::Uppercase, "Italian"),
@@ -1830,10 +1846,7 @@ mod tests {
         .expect("marker validation failure should not propagate");
 
         assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
-        assert_eq!(
-            translations[0].blocks[0].text,
-            "Hello <m id=\"m000000_000\">world</m>!"
-        );
+        assert_eq!(translations[0].blocks[0].text, "Hello <m1>world</m1>!");
         assert!(
             translations[0]
                 .error
@@ -1844,11 +1857,7 @@ mod tests {
 
     #[tokio::test]
     async fn marker_failure_falls_back_to_run_preserving_mode() {
-        let mut segment = segment(
-            "seg_a",
-            0,
-            vec![("b0", "Hello <m id=\"m000000_000\">world</m>!")],
-        );
+        let mut segment = segment("seg_a", 0, vec![("b0", "Hello <m1>world</m1>!")]);
         segment.source.blocks[0].text_runs = vec![
             SegmentTextRun {
                 id: "r0".to_string(),
@@ -1856,7 +1865,7 @@ mod tests {
             },
             SegmentTextRun {
                 id: "r1".to_string(),
-                text: "<m id=\"m000000_000\">".to_string(),
+                text: "<m1>".to_string(),
             },
             SegmentTextRun {
                 id: "r2".to_string(),
@@ -1864,17 +1873,14 @@ mod tests {
             },
             SegmentTextRun {
                 id: "r3".to_string(),
-                text: "</m>".to_string(),
+                text: "</m1>".to_string(),
             },
             SegmentTextRun {
                 id: "r4".to_string(),
                 text: "!".to_string(),
             },
         ];
-        segment
-            .constraints
-            .preserve_markers
-            .push("m000000_000".to_string());
+        segment.constraints.preserve_markers.push("m1".to_string());
 
         let mut config = config();
         config.scheduler.max_attempts = 1;
@@ -1888,10 +1894,7 @@ mod tests {
 
         assert_eq!(translations[0].status, SegmentStatus::Succeeded);
         assert_eq!(translations[0].template, "translate_run_preserving");
-        assert_eq!(
-            translations[0].blocks[0].text,
-            "HELLO <m id=\"m000000_000\">WORLD</m>!"
-        );
+        assert_eq!(translations[0].blocks[0].text, "HELLO <m1>WORLD</m1>!");
     }
 
     #[tokio::test]
@@ -2123,6 +2126,7 @@ mod tests {
             window: 3,
             budget_tokens: 10_000,
             scope: ContextScope::Chapter,
+            strict: false,
         };
         let pairs = registry.await_context_for(&segs[3].id, cfg).await;
         let ids: Vec<&str> = pairs.iter().map(|p| p.segment_id.0.as_str()).collect();
@@ -2149,6 +2153,7 @@ mod tests {
             window: 3,
             budget_tokens: 10_000,
             scope: ContextScope::Chapter,
+            strict: false,
         };
         let pairs = registry.await_context_for(&segs[2].id, cfg).await;
         let ids: Vec<&str> = pairs.iter().map(|p| p.segment_id.0.as_str()).collect();
@@ -2181,6 +2186,7 @@ mod tests {
             window: 3,
             budget_tokens: 10_000,
             scope: ContextScope::Chapter,
+            strict: false,
         };
         let pairs = registry.await_context_for(&segs[2].id, cfg).await;
         let ids: Vec<&str> = pairs.iter().map(|p| p.segment_id.0.as_str()).collect();
@@ -2213,6 +2219,7 @@ mod tests {
             window: 3,
             budget_tokens: 10_000,
             scope: ContextScope::Book,
+            strict: false,
         };
         let pairs = registry.await_context_for(&segs[2].id, cfg).await;
         let ids: Vec<&str> = pairs.iter().map(|p| p.segment_id.0.as_str()).collect();
@@ -2246,6 +2253,7 @@ mod tests {
             window: 3,
             budget_tokens: 30, // intentionally tight
             scope: ContextScope::Chapter,
+            strict: false,
         };
         let pairs = registry.await_context_for(&segs[3].id, cfg).await;
         assert!(
@@ -2274,6 +2282,7 @@ mod tests {
             window: 0,
             budget_tokens: 1200,
             scope: ContextScope::Chapter,
+            strict: false,
         };
         let pairs = registry.await_context_for(&segs[1].id, cfg).await;
         assert!(pairs.is_empty());
@@ -2299,6 +2308,7 @@ mod tests {
             window: 3,
             budget_tokens: 10_000,
             scope: ContextScope::Chapter,
+            strict: true,
         };
         let pairs = tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -2308,6 +2318,37 @@ mod tests {
         .expect("fence must unblock once segment a publishes");
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].translated_text, "[T]Alpha-late");
+    }
+
+    #[tokio::test]
+    async fn best_effort_context_returns_partial_pairs_without_waiting() {
+        let segs = vec![
+            segment_in_section("a", "s1", 0, "Alpha"),
+            segment_in_section("b", "s1", 1, "Bravo"),
+            segment_in_section("c", "s1", 2, "Charlie"),
+            segment_in_section("d", "s1", 3, "Delta"),
+        ];
+        let registry = ContextRegistry::new(&segs);
+        // Only the closest predecessor has completed; a and b are still
+        // in flight.
+        registry.pre_populate(
+            &segs[2],
+            &translation_for(&segs[2], "[T]Charlie", SegmentStatus::Succeeded),
+        );
+        let cfg = ContextRunConfig {
+            window: 3,
+            budget_tokens: 10_000,
+            scope: ContextScope::Chapter,
+            strict: false,
+        };
+        let pairs = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            registry.await_context_for(&segs[3].id, cfg),
+        )
+        .await
+        .expect("best-effort context must not block on missing predecessors");
+        let ids: Vec<&str> = pairs.iter().map(|p| p.segment_id.0.as_str()).collect();
+        assert_eq!(ids, vec!["c"], "only completed predecessors are returned");
     }
 
     #[test]
@@ -2409,6 +2450,7 @@ mod tests {
             window: 3,
             budget_tokens: 10_000,
             scope: ContextScope::Chapter,
+            strict: true,
         };
         cfg.context_registry = Some(registry.clone());
 
