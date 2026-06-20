@@ -1,4 +1,5 @@
 use clap::Args;
+use serde_json::Value;
 
 use bookforge_llm::{
     CompletionRequest, LlmProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
@@ -119,6 +120,11 @@ async fn run_provider_doctor(
     println!("Provider doctor: {provider}");
     println!();
 
+    if matches!(provider, "local-ollama" | "local-llamacpp") {
+        return run_local_provider_doctor(provider, model, base_url, api_key_env, timeout_seconds)
+            .await;
+    }
+
     // 1. Determine config
     let (default_url, default_key_env, default_model) = match provider {
         "deepseek" => (
@@ -131,9 +137,14 @@ async fn run_provider_doctor(
             "OPENROUTER_API_KEY",
             "openrouter/auto",
         ),
+        "openai-compatible" if base_url.is_some() => (
+            base_url.expect("checked above"),
+            api_key_env.unwrap_or("OPENAI_API_KEY"),
+            model.unwrap_or("local-model"),
+        ),
         _ => {
             anyhow::bail!(
-                "Provider '{provider}' is not supported for doctor checks. Use --provider deepseek or --provider openrouter, or pass --base-url and --api-key-env for custom endpoints."
+                "Provider '{provider}' is not supported for doctor checks. Use deepseek, openrouter, local-ollama, local-llamacpp, or openai-compatible with --base-url."
             );
         }
     };
@@ -152,12 +163,7 @@ async fn run_provider_doctor(
     // 2. Check API key
     let _api_key = match std::env::var(effective_key_env) {
         Ok(key) => {
-            let masked = if key.len() > 8 {
-                format!("{}...{}", &key[..4], &key[key.len() - 4..])
-            } else {
-                "***".to_string()
-            };
-            println!("  API key ({effective_key_env}): present ({masked})");
+            println!("  API key ({effective_key_env}): present");
             key
         }
         Err(_) => {
@@ -257,5 +263,86 @@ async fn run_provider_doctor(
         "  Recommended preset: --profile v1-fast --provider {provider_name} --model {effective_model}"
     );
 
+    Ok(())
+}
+
+async fn run_local_provider_doctor(
+    provider: &str,
+    model: Option<&str>,
+    base_url: Option<&str>,
+    api_key_env: Option<&str>,
+    timeout_seconds: u64,
+) -> anyhow::Result<()> {
+    let (default_url, default_key_env, default_model) = match provider {
+        "local-ollama" => ("http://localhost:11434/v1", "OLLAMA_API_KEY", "qwen2.5:14b"),
+        "local-llamacpp" => (
+            "http://localhost:8080/v1",
+            "LLAMACPP_API_KEY",
+            "local-model",
+        ),
+        _ => unreachable!("caller filters local providers"),
+    };
+    let effective_url = base_url.unwrap_or(default_url).trim_end_matches('/');
+    let effective_key_env = api_key_env.unwrap_or(default_key_env);
+    let effective_model = model.unwrap_or(default_model);
+    let models_url = format!("{effective_url}/models");
+
+    println!("  Base URL: {effective_url}");
+    println!("  Model: {effective_model}");
+    println!("  Models endpoint: {models_url}");
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
+        .build()?;
+    let mut request = client.get(&models_url);
+    match std::env::var(effective_key_env) {
+        Ok(key) if !key.is_empty() => {
+            println!("  API key ({effective_key_env}): present");
+            request = request.bearer_auth(key);
+        }
+        _ => println!("  API key ({effective_key_env}): not set (optional for local endpoints)"),
+    }
+
+    let started = std::time::Instant::now();
+    let response = request
+        .send()
+        .await
+        .map_err(|error| anyhow::anyhow!("local models endpoint is unavailable: {error}"))?;
+    let status = response.status();
+    let body = response.text().await?;
+    println!("  Latency: {}ms", started.elapsed().as_millis());
+    if !status.is_success() {
+        anyhow::bail!(
+            "local models endpoint returned HTTP {}: {}",
+            status.as_u16(),
+            body.chars().take(300).collect::<String>()
+        );
+    }
+
+    let parsed: Value = serde_json::from_str(&body)
+        .map_err(|error| anyhow::anyhow!("models endpoint returned invalid JSON: {error}"))?;
+    let models = parsed
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("models response is missing the 'data' array"))?
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+
+    println!("  Loaded models: {}", models.len());
+    if !models.contains(&effective_model) {
+        anyhow::bail!(
+            "model '{effective_model}' is not loaded; available models: {}",
+            if models.is_empty() {
+                "(none)".to_string()
+            } else {
+                models.join(", ")
+            }
+        );
+    }
+    println!("  Model loaded: yes");
+    println!();
+    println!("  Recommended preset: --provider-preset {provider} --model {effective_model}");
     Ok(())
 }

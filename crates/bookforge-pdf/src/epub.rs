@@ -32,6 +32,8 @@ pub fn write_epub(blocks: &[DocBlock], title: &str, language: &str, output: &Pat
     zip.write_all(opf(title, language).as_bytes())?;
     zip.start_file("content.xhtml", deflated)?;
     zip.write_all(chapter_xhtml(blocks, title).as_bytes())?;
+    zip.start_file("nav.xhtml", deflated)?;
+    zip.write_all(nav_xhtml(title).as_bytes())?;
     zip.finish()?;
     Ok(())
 }
@@ -44,9 +46,11 @@ fn opf(title: &str, language: &str) -> String {
     <dc:identifier id="uid">bookforge-pdf-conversion</dc:identifier>
     <dc:title>{}</dc:title>
     <dc:language>{}</dc:language>
+    <meta property="dcterms:modified">1970-01-01T00:00:00Z</meta>
   </metadata>
   <manifest>
     <item id="content" href="content.xhtml" media-type="application/xhtml+xml"/>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
   </manifest>
   <spine>
     <itemref idref="content"/>
@@ -54,6 +58,22 @@ fn opf(title: &str, language: &str) -> String {
 </package>"#,
         escape_text(title),
         escape_text(language)
+    )
+}
+
+fn nav_xhtml(title: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Contents</title></head>
+<body>
+<nav epub:type="toc" id="toc">
+<h1>Contents</h1>
+<ol><li><a href="content.xhtml">{}</a></li></ol>
+</nav>
+</body>
+</html>"#,
+        escape_text(title)
     )
 }
 
@@ -112,6 +132,8 @@ fn escape_text(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::Span;
+    use std::io::Read;
+    use zip::ZipArchive;
 
     fn span(text: &str) -> Span {
         Span {
@@ -154,5 +176,23 @@ mod tests {
         );
         let coverage = bookforge_epub::text_coverage(&path).expect("coverage");
         assert_eq!(coverage.percent(), 100.0, "all text must be translatable");
+
+        let mut archive = ZipArchive::new(File::open(&path).expect("epub opens")).expect("zip");
+        let mut opf = String::new();
+        archive
+            .by_name("content.opf")
+            .expect("opf exists")
+            .read_to_string(&mut opf)
+            .expect("opf reads");
+        assert!(opf.contains("property=\"dcterms:modified\""));
+        assert!(opf.contains("properties=\"nav\""));
+        let mut nav = String::new();
+        archive
+            .by_name("nav.xhtml")
+            .expect("nav exists")
+            .read_to_string(&mut nav)
+            .expect("nav reads");
+        assert!(nav.contains("epub:type=\"toc\""));
+        assert!(nav.contains("<a href=\"content.xhtml\">Paper Title</a>"));
     }
 }

@@ -1,0 +1,96 @@
+schema_version = 1
+description = """
+Curated Standard Ebooks fixtures for BookForge structural regression testing.
+The files are downloaded on demand and are not committed to this repository.
+Hashes were recorded on 2026-06-20.
+"""
+
+[[book]]
+id = "stevenson-treasure-island"
+title = "Treasure Island"
+author = "Robert Louis Stevenson"
+url = "https://standardebooks.org/ebooks/robert-louis-stevenson/treasure-island/downloads/robert-louis-stevenson_treasure-island.epub?source=download"
+sha256 = "a762348479bd8099680c8b7751446abceb2d0b6fc0acb7cd80206e83a7ce15c2"
+size_bytes = 645829
+features = ["dialogue_heavy", "italics", "verse_excerpts"]
+ci_tier = "small"
+
+[[book]]
+id = "shelley-frankenstein"
+title = "Frankenstein"
+author = "Mary Shelley"
+url = "https://standardebooks.org/ebooks/mary-shelley/frankenstein/downloads/mary-shelley_frankenstein.epub?source=download"
+sha256 = "17189c3000a4a8bffcedf77310844c9b0e017af6decbb186e465565107a33c52"
+size_bytes = 633853
+features = ["letters", "nested_quotes", "roman_numerals"]
+ci_tier = "small"
+
+[[book]]
+id = "wilde-dorian-gray"
+title = "The Picture of Dorian Gray"
+author = "Oscar Wilde"
+url = "https://standardebooks.org/ebooks/oscar-wilde/the-picture-of-dorian-gray/downloads/oscar-wilde_the-picture-of-dorian-gray.epub?source=download"
+sha256 = "0e8270daa8d87daaf48932a6989acc2755db073c697248a272a4342f120a9e43"
+size_bytes = 556798
+features = ["dialogue_heavy", "epigraph", "italics"]
+ci_tier = "small"
+
+[[book]]
+id = "austen-pride-and-prejudice"
+title = "Pride and Prejudice"
+author = "Jane Austen"
+url = "https://standardebooks.org/ebooks/jane-austen/pride-and-prejudice/downloads/jane-austen_pride-and-prejudice.epub?source=download"
+sha256 = "071b7edbfcdaa1d4a2abb438f430ff61d4f0b4f0e38e27118effa687f5a7106a"
+size_bytes = 771052
+features = ["dialogue_heavy", "letters", "large_novel"]
+ci_tier = "medium"
+
+[[book]]
+id = "du-bois-souls"
+title = "The Souls of Black Folk"
+author = "W. E. B. Du Bois"
+url = "https://standardebooks.org/ebooks/w-e-b-du-bois/the-souls-of-black-folk/downloads/w-e-b-du-bois_the-souls-of-black-folk.epub?source=download"
+sha256 = "d3f66ce5169a22262223e01de7a7dd5ad91555e888f3e27a398c13ab0a5ec71e"
+size_bytes = 1102372
+features = ["footnotes", "music", "epigraphs"]
+ci_tier = "medium"
+
+[[book]]
+id = "abbott-flatland"
+title = "Flatland"
+author = "Edwin A. Abbott"
+url = "https://standardebooks.org/ebooks/edwin-a-abbott/flatland/downloads/edwin-a-abbott_flatland.epub?source=download"
+sha256 = "7789e5ec418936aa1d406e4161f8c7347e14f07cb6203717cd223e7fe34b0a7f"
+size_bytes = 723354
+features = ["illustrations", "geometry", "tables"]
+ci_tier = "medium"
+
+[[book]]
+id = "carroll-alice"
+title = "Alice's Adventures in Wonderland"
+author = "Lewis Carroll"
+url = "https://standardebooks.org/ebooks/lewis-carroll/alices-adventures-in-wonderland/john-tenniel/downloads/lewis-carroll_alices-adventures-in-wonderland_john-tenniel.epub?source=download"
+sha256 = "843c2c34b5660ebf71bd4d72bebeba867b2bdab4fe82b5326f174e0cf20d09ea"
+size_bytes = 10635757
+features = ["illustrations", "verse", "dialogue", "drop_caps"]
+ci_tier = "large"
+
+[[book]]
+id = "melville-moby-dick"
+title = "Moby Dick"
+author = "Herman Melville"
+url = "https://standardebooks.org/ebooks/herman-melville/moby-dick/downloads/herman-melville_moby-dick.epub?source=download"
+sha256 = "3d1000d220a6c95b01dc0cf1d134c8b3077dd7562ecab27a6c74323455d99886"
+size_bytes = 1107114
+features = ["large_novel", "footnotes", "tables", "foreign_language"]
+ci_tier = "large"
+
+[[book]]
+id = "tolstoy-war-and-peace"
+title = "War and Peace"
+author = "Leo Tolstoy"
+url = "https://standardebooks.org/ebooks/leo-tolstoy/war-and-peace/louise-maude_aylmer-maude/downloads/leo-tolstoy_war-and-peace_louise-maude_aylmer-maude.epub?source=download"
+sha256 = "87b6dd4a56d94fe12c0e0ab6eaac92a1c53c21eb8d3147bb28ccd6f3524f6220"
+size_bytes = 2326877
+features = ["very_large_novel", "footnotes", "french_passages", "nested_sections"]
+ci_tier = "large"

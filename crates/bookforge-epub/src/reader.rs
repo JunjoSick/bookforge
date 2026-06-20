@@ -839,7 +839,17 @@ fn extract_blocks(
                     suppress_depth += 1;
                 }
 
+                // EPUB navigation list items have a constrained content
+                // model: the label must remain inside the child <a> or
+                // <span>, followed optionally by a nested <ol>. Anchoring a
+                // translation on the <li> itself can move translated text
+                // before the link and produce EPUBCheck RSC-005 errors.
+                let navigation_list_item = name == b"li"
+                    && element_stack[..element_stack.len().saturating_sub(1)]
+                        .iter()
+                        .any(|frame| frame.name == b"nav");
                 if active_block.is_none()
+                    && !navigation_list_item
                     && let Some(kind) = block_kind(&name, &element)?
                 {
                     active_block = Some(BlockBuilder::new(
@@ -1506,6 +1516,28 @@ mod tests {
         assert_eq!(texts, vec!["Meta", "Real"]);
         assert!(!texts.iter().any(|text| text.contains("color")));
         assert!(!texts.iter().any(|text| text.contains("var x")));
+    }
+
+    #[test]
+    fn navigation_list_labels_anchor_inside_links_not_on_list_items() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<nav><ol><li><a href="chapter.xhtml">Cover</a></li>
+<li><a href="part.xhtml"><span>Part One</span></a><ol><li><a href="one.xhtml"><span>1</span> Chapter One</a></li></ol></li></ol></nav>
+</body></html>"#,
+            "toc.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("navigation should parse");
+
+        let texts = blocks.iter().map(block_text).collect::<Vec<_>>();
+        assert_eq!(texts, vec!["Cover", "Part One", "1", "Chapter One"]);
+        assert!(
+            blocks.iter().all(|block| block.dom_path.0.len() >= 6),
+            "navigation labels should not be anchored on their li elements"
+        );
     }
 
     #[test]

@@ -637,6 +637,8 @@ async fn run_mock_translation(
         &translations,
         &qa_reviews,
         config,
+        cli_args.validate_output,
+        cli_args.strict_epubcheck,
         human_stdout_enabled(cli_args.ui),
     )?;
     let summary = store
@@ -1016,6 +1018,8 @@ async fn finish_translation_pipeline(
         translations,
         &qa_reviews,
         config,
+        cli_args.validate_output,
+        cli_args.strict_epubcheck,
         human_stdout_enabled(cli_args.ui),
     )?;
     let summary = store
@@ -2487,6 +2491,8 @@ case_sensitive = true
             provider_max_attempts: None,
             validation_max_attempts: None,
             out: None,
+            validate_output: false,
+            strict_epubcheck: false,
             book_id: None,
             series_id: None,
             glossary: Vec::new(),

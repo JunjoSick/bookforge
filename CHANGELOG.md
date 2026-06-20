@@ -1,5 +1,38 @@
 # Changelog
 
+## v1.8.0 - 2026-06-20
+
+BookForge v1.8 adds the structural-credibility layer planned in ROADMAP
+section 8.
+
+### Highlights
+
+- Added EPUBCheck-backed `validate` reports with structured messages,
+  graceful unavailable-tool handling, and strict warning mode.
+- Added `translate --validate-output [--strict-epubcheck]`.
+- Added a pinned nine-book Standard Ebooks corpus, fetch/smoke tooling,
+  pull-request coverage, and nightly/manual full-corpus CI.
+- Added `local-ollama` and `local-llamacpp` presets plus `/models`
+  health checks.
+- Moved provider/model prices to bundled JSON with `--pricing` and
+  `BOOKFORGE_PRICING_PATH` overrides.
+- Kept the compile-time pricing copy inside the CLI crate so crates.io
+  packages contain the same bundled catalog as workspace builds.
+- Rewrote the README around the deterministic structure boundary and
+  documented corpus and local-model workflows.
+- Fixed navigation-list translation so labels stay inside EPUB nav links.
+- Made PDF-converted EPUBs EPUB 3 conforming with a nav document and
+  `dcterms:modified` metadata.
+- Accounted for per-item JSON overhead in batch output budgets and enabled
+  extended DeepSeek output budgets, reducing avoidable truncation/splitting.
+- Disabled DeepSeek thinking mode in translation presets to avoid spending
+  output budget and latency on hidden reasoning.
+- Stopped provider doctor output from revealing partial API-key characters.
+- Staged EPUB rebuilds beside the destination and swapped them into place only
+  after ZIP finalization, including safe in-place source replacement.
+- Added balanced/mis-nested marker validation before checkpointing so a job
+  cannot report success while the writer silently preserves source blocks.
+
 ## v1.7.0 - 2026-06-20
 
 BookForge v1.7.0 aligns the workspace packages, CLI version, and GitHub

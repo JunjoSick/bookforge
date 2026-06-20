@@ -116,6 +116,37 @@ fn rebuilds_epub_with_patched_xhtml_and_preserved_resources() {
 }
 
 #[test]
+fn rebuild_can_safely_replace_the_source_path() {
+    let fixture = create_minimal_epub();
+    let book = read_epub(&fixture).expect("fixture should parse into IR");
+    let body_block = book
+        .blocks
+        .iter()
+        .find(|block| block_text(block) == "Hello from chapter 1.")
+        .expect("body paragraph should be extracted");
+
+    rebuild_epub(
+        &book,
+        &[BlockTranslation {
+            block_id: body_block.id.clone(),
+            text: "Safely replaced in place.".to_string(),
+        }],
+        &fixture,
+    )
+    .expect("staged rebuild should replace the source path");
+
+    let mut archive =
+        ZipArchive::new(File::open(&fixture).expect("replaced EPUB should exist")).expect("zip");
+    let mut chapter = String::new();
+    archive
+        .by_name("OEBPS/chapter1.xhtml")
+        .expect("chapter should remain present")
+        .read_to_string(&mut chapter)
+        .expect("chapter should read");
+    assert!(chapter.contains("Safely replaced in place."));
+}
+
+#[test]
 fn parses_complex_generated_fixture_shapes() {
     let fixture = create_epub_fixture(
         "complex",

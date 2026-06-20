@@ -13,3 +13,12 @@
 key.txt
 bookforge_fixes*.md
 merged_bookforge.txt
+
+# Keep the corpus manifest while leaving downloaded books and outputs local.
+!/tests/
+/tests/*
+!/tests/corpus/
+/tests/corpus/*
+!/tests/corpus/standard-ebooks/
+/tests/corpus/standard-ebooks/*
+!/tests/corpus/standard-ebooks/manifest.toml

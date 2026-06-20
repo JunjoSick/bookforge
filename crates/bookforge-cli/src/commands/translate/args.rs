@@ -60,6 +60,14 @@ pub struct TranslateArgs {
     #[arg(long)]
     pub out: Option<PathBuf>,
 
+    /// Run BookForge validators and EPUBCheck on the rebuilt EPUB.
+    #[arg(long, default_value_t = false)]
+    pub validate_output: bool,
+
+    /// Treat EPUBCheck warnings as errors. Implies --validate-output.
+    #[arg(long, default_value_t = false)]
+    pub strict_epubcheck: bool,
+
     #[arg(long)]
     pub book_id: Option<String>,
 

@@ -772,6 +772,9 @@ fn batch_token_estimate(
 /// Failures flow into the normal repair/failure pipeline instead of the
 /// translation being silently patched up.
 fn batch_item_validation_error(item: &TranslationBatchItem, translation: &str) -> Option<String> {
+    if let Some(error) = bookforge_core::marker::marker_structure_error(translation) {
+        return Some(error);
+    }
     let expected = bookforge_core::marker::marker_ids_in_text(&item.source_text);
     let actual = bookforge_core::marker::marker_ids_in_text(translation);
     for marker in &expected {
@@ -2133,6 +2136,7 @@ fn batch_max_output_tokens(
     batch: &TranslationBatch,
     profile: TranslationProfile,
     reasoning: bool,
+    extended_output: bool,
 ) -> u32 {
     let base_multiplier = match batch.mode {
         BatchMode::Plain => 3,
@@ -2145,9 +2149,18 @@ fn batch_max_output_tokens(
     } else {
         base_multiplier
     };
-    let estimate = batch.token_estimate as u32 * multiplier;
+    // JSON output has a fixed envelope per item (ID, keys, quoting, commas)
+    // that source-token estimates do not capture. Without this allowance,
+    // batches of many short labels can receive a 512-token budget and
+    // repeatedly truncate even though their prose payload is tiny.
+    let envelope = 128u32.saturating_add((batch.items.len() as u32).saturating_mul(64));
+    let estimate = (batch.token_estimate as u32)
+        .saturating_mul(multiplier)
+        .saturating_add(envelope);
     let max = if profile == TranslationProfile::FreeTier {
         if reasoning { 8_192 } else { 4_096 }
+    } else if extended_output {
+        32_768
     } else {
         if reasoning { 32_768 } else { 16_384 }
     };
@@ -2159,7 +2172,8 @@ fn capped_batch_max_output_tokens(
     config: &TranslationRunConfig,
     reasoning: bool,
 ) -> u32 {
-    let computed = batch_max_output_tokens(batch, config.profile, reasoning);
+    let extended_output = config.provider.eq_ignore_ascii_case("deepseek");
+    let computed = batch_max_output_tokens(batch, config.profile, reasoning, extended_output);
     let user_cap = config.batch_max_output_tokens.or(config.max_output_tokens);
     bookforge_core::config::cap_output_tokens(
         computed,
@@ -2815,6 +2829,50 @@ mod tests {
     }
 
     #[test]
+    fn batch_output_budget_accounts_for_many_short_json_items() {
+        let items = (0..13)
+            .map(|index| batch_item(&format!("item-{index}"), "label"))
+            .collect::<Vec<_>>();
+        let batch = TranslationBatch {
+            id: "short-labels".to_string(),
+            ordinal: 0,
+            mode: BatchMode::Plain,
+            kind: BatchKind::Translation,
+            token_estimate: 52,
+            items,
+            section_id: bookforge_core::ir::SectionId("test_section".to_string()),
+        };
+
+        let budget = batch_max_output_tokens(&batch, TranslationProfile::V1Fast, false, false);
+
+        assert!(
+            budget >= 1_000,
+            "per-item JSON overhead should prevent a 512-token under-budget, got {budget}"
+        );
+    }
+
+    #[test]
+    fn deepseek_batches_can_use_extended_output_budget() {
+        let batch = TranslationBatch {
+            id: "large".to_string(),
+            ordinal: 0,
+            mode: BatchMode::RunPreserving,
+            kind: BatchKind::Translation,
+            token_estimate: 6_000,
+            items: (0..30)
+                .map(|index| batch_item(&format!("item-{index}"), "longer source text"))
+                .collect(),
+            section_id: bookforge_core::ir::SectionId("test_section".to_string()),
+        };
+
+        assert_eq!(
+            batch_max_output_tokens(&batch, TranslationProfile::V1Fast, false, false),
+            16_384
+        );
+        assert!(batch_max_output_tokens(&batch, TranslationProfile::V1Fast, false, true) > 16_384);
+    }
+
+    #[test]
     fn batch_sizer_shrink_affects_later_pending_batches() {
         let mut sizer = BatchSizer::new(16_000, 128);
         sizer.on_truncation_for_mode(BatchMode::MarkerSafe);
@@ -2955,6 +3013,17 @@ mod tests {
             result.translations[0].text, "Capitolo 4th",
             "translation must pass through without appended tokens"
         );
+    }
+
+    #[test]
+    fn missing_marker_close_fails_batch_item_validation() {
+        let mut item = batch_item("marked", "<m1>source</m1>");
+        item.required_markers = vec!["m1".to_string()];
+
+        let error = batch_item_validation_error(&item, "<m1>translated")
+            .expect("missing marker close should fail");
+
+        assert!(error.contains("missing closing tag"), "got: {error}");
     }
 
     #[test]

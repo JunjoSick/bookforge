@@ -17,8 +17,6 @@ use serde::Serialize;
 #[cfg(test)]
 use serde_json::json;
 
-use crate::cost::estimate_cost_usd;
-
 #[derive(Debug, Args)]
 pub struct ReviewArgs {
     pub job_id: String,
@@ -283,10 +281,11 @@ fn build_review_document(
             tokens_input: summary.input_tokens,
             tokens_input_cached: summary.input_cached_tokens,
             tokens_output: summary.output_tokens,
-            estimated_cost_usd: estimate_cost_usd(
+            estimated_cost_usd: crate::cost::estimate_cost_usd_with_cached(
                 &job.provider,
                 &job.model,
                 summary.input_tokens,
+                summary.input_cached_tokens,
                 summary.output_tokens,
             ),
         },

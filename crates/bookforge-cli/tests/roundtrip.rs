@@ -548,3 +548,22 @@ fn code_blocks_are_not_sent_to_the_model() {
     assert_translated(&text, "PROSE_SENTINEL");
     assert_untranslated(&text, "CODE_SENTINEL");
 }
+
+#[test]
+fn navigation_list_translation_stays_inside_link_content() {
+    let body = r#"<nav><h1>Contents</h1><ol>
+<li><a href="ch1.xhtml">Cover</a></li>
+<li><a href="ch1.xhtml"><span>1</span> Chapter One</a></li>
+</ol></nav>"#;
+    let run = translate(&[("ch1.xhtml", body)], "mock-prefix-target");
+    let xhtml = read_zip_text(&run.output, "ch1.xhtml");
+
+    assert!(
+        !xhtml.contains("<li>[Italian]"),
+        "translation before a navigation link violates the EPUB nav content model: {xhtml}"
+    );
+    assert!(
+        xhtml.contains(r#"<a href="ch1.xhtml">[Italian] Cover</a>"#),
+        "plain navigation label should be translated inside its link: {xhtml}"
+    );
+}

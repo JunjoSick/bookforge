@@ -41,6 +41,49 @@ pub fn marker_ids_in_text(text: &str) -> Vec<String> {
     ids
 }
 
+/// Return a deterministic error when paired inline markers are unbalanced,
+/// mis-nested, or closed by the wrong marker tag. ID-presence checks alone
+/// cannot detect `<m1>text` with a missing `</m1>`, which is valid prose JSON
+/// but cannot be reassembled into the original inline structure.
+pub fn marker_structure_error(text: &str) -> Option<String> {
+    let mut stack = Vec::<PairedMarkerOpen>::new();
+    let mut rest = text;
+
+    while let Some(index) = rest.find('<') {
+        let tag = &rest[index..];
+        if let Some(open) = parse_paired_marker_open(tag) {
+            let len = open.len;
+            stack.push(open);
+            rest = &tag[len..];
+        } else if let Some(empty) = parse_empty_marker(tag) {
+            rest = &tag[empty.len..];
+        } else if let Some(close) = parse_marker_close(tag) {
+            let Some(open) = stack.pop() else {
+                return Some(format!(
+                    "unexpected inline marker close </{}>",
+                    close.tag_name
+                ));
+            };
+            if open.tag_name != close.tag_name {
+                return Some(format!(
+                    "inline marker <{}> is closed by </{}>",
+                    open.tag_name, close.tag_name
+                ));
+            }
+            rest = &tag[close.len..];
+        } else {
+            rest = &tag[1..];
+        }
+    }
+
+    stack.last().map(|open| {
+        format!(
+            "inline marker <{}> is missing closing tag </{}>",
+            open.tag_name, open.tag_name
+        )
+    })
+}
+
 pub fn extract_marker_id(tag: &str) -> Option<String> {
     extract_marker_id_attr(tag).or_else(|| short_marker_name(tag).map(ToString::to_string))
 }
@@ -254,5 +297,33 @@ mod tests {
         );
 
         assert_eq!(stripped, "Hello wide  world and old.");
+    }
+
+    #[test]
+    fn marker_structure_accepts_balanced_nested_and_empty_markers() {
+        assert_eq!(
+            marker_structure_error("<m1>outer <m2>inner</m2><r1/></m1>"),
+            None
+        );
+        assert_eq!(marker_structure_error(r#"<m id="legacy">text</m>"#), None);
+    }
+
+    #[test]
+    fn marker_structure_rejects_missing_mismatched_and_orphan_closes() {
+        assert!(
+            marker_structure_error("<m1>text")
+                .expect("missing close should fail")
+                .contains("missing closing tag")
+        );
+        assert!(
+            marker_structure_error("<m1><m2>text</m1></m2>")
+                .expect("mis-nesting should fail")
+                .contains("closed by")
+        );
+        assert!(
+            marker_structure_error("text</m1>")
+                .expect("orphan close should fail")
+                .contains("unexpected")
+        );
     }
 }

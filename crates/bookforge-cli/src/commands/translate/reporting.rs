@@ -8,7 +8,8 @@ use bookforge_llm::{QaSegmentReview, SegmentTranslation};
 use bookforge_store::{JobRecord, JobStore};
 
 use crate::{
-    cost::estimate_cost_usd,
+    commands::validate,
+    cost::estimate_cost_usd_with_cached,
     performance::performance_summary_from_events,
     report::{ReportInput, write_report},
 };
@@ -29,6 +30,8 @@ pub fn print_summary_rebuild_and_report(
     translations: &[SegmentTranslation],
     qa_reviews: &[QaSegmentReview],
     config: &TranslationConfig,
+    validate_output: bool,
+    strict_epubcheck: bool,
     print_stdout: bool,
 ) -> Result<()> {
     let block_translations = block_translations(translations);
@@ -56,6 +59,22 @@ pub fn print_summary_rebuild_and_report(
     })?;
     store.update_job_report_paths(&job.id, &report.json, &report.markdown)?;
 
+    if validate_output || strict_epubcheck {
+        let validation_path = validate::default_report_path(&config.output);
+        let validation =
+            validate::validate_and_write(&config.output, &validation_path, strict_epubcheck)?;
+        if print_stdout {
+            println!("Validation report: {}", validation_path.display());
+        }
+        if validation.failed {
+            store.mark_job_failed(&job.id)?;
+            anyhow::bail!(
+                "rebuilt EPUB failed validation; see {}",
+                validation_path.display()
+            );
+        }
+    }
+
     if print_stdout {
         println!(
             "Translated: {}/{} segments",
@@ -67,10 +86,11 @@ pub fn print_summary_rebuild_and_report(
         println!("Failed: {}", summary.failed);
         println!("Input tokens: {}", summary.input_tokens);
         println!("Output tokens: {}", summary.output_tokens);
-        if let Some(cost) = estimate_cost_usd(
+        if let Some(cost) = estimate_cost_usd_with_cached(
             &job.provider,
             &job.model,
             summary.input_tokens,
+            summary.input_cached_tokens,
             summary.output_tokens,
         ) {
             println!("Estimated cost: ${cost:.6}");

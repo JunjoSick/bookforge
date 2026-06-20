@@ -102,7 +102,7 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v1.5 | Extraction + scheduling overhaul (shipped scope; see §8 post-ship note) | — | none | shipped 2026-06-12 |
 | v1.6 | PDF ingestion hardening (§9) | 8–14 days | release notes; maybe a short writeup if layout reconstruction turns out interesting | **next** |
 | v1.7 | Bilingual output (§9b) | 5–8 days | passive (release notes only) | planned |
-| v1.8 | Structural credibility (EPUBCheck + corpus; was the planned v1.5 scope, §8) | 10–14 days | README final rewrite citing corpus | planned |
+| v1.8 | Structural credibility (EPUBCheck + corpus; was the planned v1.5 scope, §8) | 10–14 days | README final rewrite citing corpus | **shipped 2026-06-20** |
 | v2 | Open-ended | not committed | recompute from v1.4/v1.6/v1.7/v1.8 feedback | planned |
 
 Priority note (2026-06): the owner needs PDF translation more than
@@ -1493,7 +1493,7 @@ cargo-dist setup itself moved here.
 
 ---
 
-## 8. v1.5 — Structural credibility
+## 8. v1.8 — Structural credibility
 
 ### 8.1 Goal
 
@@ -1790,6 +1790,20 @@ translation, a shared translate/resume run engine, v1-fast as the default
 profile, an identity-roundtrip harness, a text-coverage metric in `inspect`,
 and synthetic CI fixtures. The EPUBCheck + Standard Ebooks corpus scope in
 §8.4–§8.8 is still wanted and moves to v1.8, after PDF ingestion (§9).
+
+### 8.14 v1.8 implementation notes (2026-06-20)
+
+The deferred structural-credibility scope shipped in v1.8. EPUBCheck is
+invoked directly or through a configured JAR and emits a separate schema-v2
+validation report so translation QA reports are never overwritten. The pinned
+corpus contains nine Standard Ebooks across small, medium, and large tiers;
+all nine passed source validation, identity round-trip translation, structural
+metric comparison, and EPUBCheck 5.3.0.
+
+Real-book testing also fixed two structural cases outside the curated corpus:
+navigation-list labels are now patched inside their links instead of as direct
+`li` text, and PDF-converted EPUBs now include the EPUB 3 navigation document
+and modified-date metadata required by EPUBCheck.
 
 ---
 
@@ -2425,7 +2439,7 @@ Six intentional moments across the v1.x cycle:
 3. **v1.4 — One technical writeup, two or three venues**. Not a launch;
    a record of architecture. Optimize for the comments from the few
    people who know more than you, not for upvotes.
-4. **v1.5 — README final rewrite citing the corpus**. The single most
+4. **v1.8 — README final rewrite citing the corpus**. The single most
    credible sentence ("Tested EPUBCheck-clean against the Standard Ebooks
    corpus") replaces a thousand comparison matrices.
 5. **v1.6 — PDF release notes**. Maybe a short technical note if the

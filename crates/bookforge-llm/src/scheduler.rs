@@ -1449,6 +1449,12 @@ fn validate_protected_spans(segment: &Segment, spans: &[String], translation: &s
 }
 
 fn validate_markers(segment: &Segment, expected: &[String], translation: &str) -> Result<()> {
+    if let Some(error) = bookforge_core::marker::marker_structure_error(translation) {
+        return Err(LlmError::InvalidResponse(format!(
+            "invalid inline marker structure in segment '{}': {error}",
+            segment.id.0
+        )));
+    }
     let actual = marker_ids_in_text(translation);
 
     for marker in expected {

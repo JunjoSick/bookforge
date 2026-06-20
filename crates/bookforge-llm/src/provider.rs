@@ -523,12 +523,16 @@ impl OpenAiCompatibleProvider {
 
 impl LlmProvider for OpenAiCompatibleProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
-        let api_key = std::env::var(&self.config.api_key_env).map_err(|_| {
-            LlmError::Provider(format!(
-                "environment variable '{}' is not set",
-                self.config.api_key_env
-            ))
-        })?;
+        let api_key = match std::env::var(&self.config.api_key_env) {
+            Ok(value) => Some(value),
+            Err(_) if local_api_key_is_optional(&self.config.api_key_env) => None,
+            Err(_) => {
+                return Err(LlmError::Provider(format!(
+                    "environment variable '{}' is not set",
+                    self.config.api_key_env
+                )));
+            }
+        };
         let started = Instant::now();
         let endpoint = format!(
             "{}/chat/completions",
@@ -573,12 +577,11 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let mut tried_response_format_fallback = false;
         let mut attempt = 0usize;
         while attempt < max_attempts {
-            let send_future = self
-                .client
-                .post(&endpoint)
-                .bearer_auth(&api_key)
-                .json(&body)
-                .send();
+            let mut request_builder = self.client.post(&endpoint).json(&body);
+            if let Some(api_key) = api_key.as_deref() {
+                request_builder = request_builder.bearer_auth(api_key);
+            }
+            let send_future = request_builder.send();
 
             let response = match cancelable(&self.cancel_token, send_future).await {
                 Ok(Ok(resp)) => resp,
@@ -945,6 +948,10 @@ fn model_name_is_reasoning(model: &str) -> bool {
         || lower.starts_with("o4")
 }
 
+fn local_api_key_is_optional(name: &str) -> bool {
+    matches!(name, "OLLAMA_API_KEY" | "LLAMACPP_API_KEY")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,6 +965,13 @@ mod tests {
             delay.is_none(),
             "RetryAfterPolicy::None must return None delay"
         );
+    }
+
+    #[test]
+    fn local_provider_keys_are_optional_only_for_known_presets() {
+        assert!(local_api_key_is_optional("OLLAMA_API_KEY"));
+        assert!(local_api_key_is_optional("LLAMACPP_API_KEY"));
+        assert!(!local_api_key_is_optional("OPENAI_API_KEY"));
     }
 
     #[test]

@@ -4,15 +4,31 @@ BookForge is the EPUB translation engine that keeps the LLM away from your docum
 
 I built this to translate books for my partner. It's MIT-licensed in case it's useful to you.
 
+## Why BookForge
+
+EPUB structure is program-owned. Models receive prose-only JSON payloads and
+never see or regenerate raw XHTML. Inline markers, protected spans, package
+metadata, resources, and document ordering are validated and reassembled by
+deterministic Rust code.
+
+That boundary is the point of the project: malformed model output can be
+retried without asking another model to repair the book. The result is a
+checkpointed translation workflow whose structure can be tested independently
+of translation quality.
+
 ## Status
 
-MVP functionality is implemented:
+BookForge v1.8 is usable for EPUB translation and PDF-to-EPUB ingestion:
 
 - EPUB inspect, parse, segment, and rebuild
+- EPUBCheck-backed standalone and post-translation validation
+- EPUBCheck-clean structural regression against a pinned nine-book Standard
+  Ebooks corpus; see [docs/corpus.md](docs/corpus.md)
 - Plain, marker-safe, and run-preserving translation contracts
 - Mock provider for deterministic tests
 - OpenAI-compatible provider
 - DeepSeek and OpenRouter presets
+- Ollama and llama.cpp local-model presets
 - Bounded parallel segment translation with `--concurrency`
 - SQLite checkpoint store
 - Resume and retry commands
@@ -22,8 +38,17 @@ MVP functionality is implemented:
 - QA reports in JSON and Markdown
 - Optional LLM QA review pass
 - Cost estimates for known provider/model pairs
+- Externalized, overridable provider pricing
 
 ## Install
+
+Install from crates.io:
+
+```bash
+cargo install bookforge-cli
+```
+
+Or build the current checkout:
 
 ```bash
 cargo build --release
@@ -40,6 +65,18 @@ For development, use:
 ```bash
 cargo run -p bookforge-cli -- <command>
 ```
+
+## Quick start
+
+```bash
+export DEEPSEEK_API_KEY=...
+bookforge inspect book.epub
+bookforge translate book.epub --target Italian --provider-preset deep-seek-paid --validate-output
+```
+
+Use `cargo run -p bookforge-cli --` in front of commands when running from a
+source checkout. Provider preset names are shown by `bookforge translate
+--help`.
 
 ## Commands
 
@@ -82,6 +119,9 @@ cargo run -p bookforge-cli -- estimate book.epub \
   --model deepseek/deepseek-v4-flash
 ```
 
+Pricing is loaded from the bundled `pricing/providers.json`. Override it with
+`--pricing custom.json` or `BOOKFORGE_PRICING_PATH`.
+
 Translate with OpenRouter:
 
 ```bash
@@ -103,7 +143,7 @@ Translate with the default fast profile:
 ```bash
 cargo run -p bookforge-cli -- translate book.epub \
   --target Italian \
-  --provider-preset openrouter-paid-fast \
+  --provider-preset open-router-paid-fast \
   --ui progress \
   --out book.it.epub
 ```
@@ -115,7 +155,7 @@ cargo run -p bookforge-cli -- glossary import glossary.series.toml
 cargo run -p bookforge-cli -- translate book.epub \
   --source English \
   --target Italian \
-  --provider-preset openrouter-paid-fast \
+  --provider-preset open-router-paid-fast \
   --book-id fellowship \
   --series-id lord-of-the-rings \
   --glossary glossary.series.toml \
@@ -163,6 +203,9 @@ cargo run -p bookforge-cli -- translate book.epub \
   --timeout-seconds 120 \
   --out book.it.epub
 ```
+
+Local Ollama and llama.cpp recipes are documented in
+[docs/local-models.md](docs/local-models.md).
 
 Resume a job:
 
@@ -218,8 +261,14 @@ cargo run -p bookforge-cli -- retry <job-id> --only all
 Validate a translated EPUB and report:
 
 ```bash
-cargo run -p bookforge-cli -- validate book.it.epub --report book.it.report.json
+cargo run -p bookforge-cli -- validate book.it.epub \
+  --report book.it.validation.json
 ```
+
+BookForge invokes EPUBCheck when it is available. Set
+`BOOKFORGE_EPUBCHECK` to an executable, its containing directory, or an
+`epubcheck.jar`. Missing EPUBCheck is reported as `status: unavailable` and is
+non-fatal. Use `--strict-epubcheck` to make warnings fail validation.
 
 ## QA Modes
 
@@ -266,7 +315,9 @@ cargo run -p bookforge-cli -- translate book.epub \
 
 Review artifacts contain the full source and translated text of the book. They are written locally under `.bookforge/runs/<job-id>/review/`; treat them as private user data.
 
-Known limitations: provider API keys are read from environment variables, and validation is intentionally pragmatic rather than a full EPUBCheck replacement.
+Known limitations: provider API keys are read from environment variables.
+PDF ingestion currently prioritizes text reconstruction; complex figures and
+tables may require review of the conversion report.
 
 ## Benchmarks
 
@@ -277,6 +328,13 @@ scripts/bench-mock.sh
 ```
 
 See `docs/benchmarks.md` for metrics to capture in real-provider runs.
+
+Run the pinned structural corpus with:
+
+```bash
+bash scripts/corpus-fetch.sh small
+bash scripts/corpus-smoke.sh small
+```
 
 ## Secrets And Local Tests
 
@@ -320,4 +378,11 @@ crates/bookforge-llm/prompts  Versioned prompt templates
 crates/bookforge-store  SQLite checkpoint store
 crates/bookforge-cli    CLI commands and reports
 docs/                   Architecture notes
+pricing/                bundled provider/model pricing
+tests/corpus/            pinned Standard Ebooks corpus manifest
 ```
+
+BookForge remains a tool built for one reader and shared under MIT. Bug reports
+should include the BookForge version, operating system, provider/model, and a
+redacted validation or QA report where possible. The sequenced project plan is
+in [docs/ROADMAP.md](docs/ROADMAP.md).

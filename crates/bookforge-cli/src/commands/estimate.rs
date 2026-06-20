@@ -5,7 +5,10 @@ use bookforge_epub::read_epub;
 use clap::Args;
 use std::path::PathBuf;
 
-use crate::{LanguageArgs, ProviderArgs, cost::estimate_cost_usd};
+use crate::{
+    LanguageArgs, ProviderArgs,
+    cost::{estimate_cost_usd_with_pricing, load_pricing},
+};
 
 #[derive(Debug, Args)]
 pub struct EstimateArgs {
@@ -16,6 +19,11 @@ pub struct EstimateArgs {
 
     #[command(flatten)]
     pub provider: ProviderArgs,
+
+    /// Override the bundled pricing catalog. BOOKFORGE_PRICING_PATH is
+    /// used when this flag is omitted.
+    #[arg(long)]
+    pub pricing: Option<PathBuf>,
 }
 
 pub async fn run(args: EstimateArgs) -> Result<()> {
@@ -31,6 +39,7 @@ pub async fn run(args: EstimateArgs) -> Result<()> {
         .model
         .as_deref()
         .unwrap_or_else(|| default_model(&args.provider.provider));
+    let pricing = load_pricing(args.pricing.as_deref())?;
 
     println!("Input: {}", args.input.display());
     println!("Target: {}", args.language.target);
@@ -39,8 +48,16 @@ pub async fn run(args: EstimateArgs) -> Result<()> {
     println!("Segments: {}", segments.len());
     println!("Estimated input tokens: {input_tokens}");
     println!("Estimated output tokens: {output_tokens}");
+    println!("Pricing: {}", pricing.source_label());
 
-    match estimate_cost_usd(&args.provider.provider, model, input_tokens, output_tokens) {
+    match estimate_cost_usd_with_pricing(
+        &pricing,
+        &args.provider.provider,
+        model,
+        input_tokens,
+        0,
+        output_tokens,
+    ) {
         Some(cost) => println!("Estimated cost: ${cost:.6}"),
         None => println!("Estimated cost: unavailable for this provider/model"),
     }

@@ -10,7 +10,7 @@ use bookforge_llm::{QaSegmentReview, SegmentTranslation};
 use bookforge_store::{JobRecord, JobSummary, SegmentRecord};
 use serde::Serialize;
 
-use crate::cost::estimate_cost_usd;
+use crate::cost::estimate_cost_usd_with_cached;
 use crate::performance::RunPerformanceSummary;
 
 #[derive(Debug, Clone)]
@@ -48,6 +48,7 @@ struct QaReport {
     needs_review_segments: usize,
     retry_pending_segments: usize,
     input_tokens: u64,
+    input_cached_tokens: u64,
     output_tokens: u64,
     estimated_cost: Option<f64>,
     qa_reviewed_segments: usize,
@@ -81,11 +82,13 @@ pub(crate) fn write_report(input: ReportInput<'_>) -> Result<ReportFiles> {
         needs_review_segments: input.summary.needs_review,
         retry_pending_segments: input.summary.retry_pending,
         input_tokens: input.summary.input_tokens,
+        input_cached_tokens: input.summary.input_cached_tokens,
         output_tokens: input.summary.output_tokens,
-        estimated_cost: estimate_cost_usd(
+        estimated_cost: estimate_cost_usd_with_cached(
             &input.job.provider,
             &input.job.model,
             input.summary.input_tokens,
+            input.summary.input_cached_tokens,
             input.summary.output_tokens,
         ),
         qa_reviewed_segments: input.qa_reviews.len(),
@@ -383,6 +386,10 @@ fn render_markdown(report: &QaReport) -> String {
         report.retry_pending_segments
     ));
     output.push_str(&format!("- Input tokens: {}\n", report.input_tokens));
+    output.push_str(&format!(
+        "- Cached input tokens: {}\n",
+        report.input_cached_tokens
+    ));
     output.push_str(&format!("- Output tokens: {}\n", report.output_tokens));
     output.push_str(&format!(
         "- QA reviewed segments: {}\n",

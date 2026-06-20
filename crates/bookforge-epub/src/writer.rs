@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
-    fs::File,
+    fs::{self, File},
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use bookforge_core::{
@@ -18,6 +19,35 @@ use quick_xml::{
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 pub fn rebuild_epub(book: &Book, translations: &[BlockTranslation], output: &Path) -> Result<()> {
+    let staged = sibling_work_path(output, "tmp");
+    let result = write_rebuilt_epub(book, translations, &staged);
+    let skipped = match result {
+        Ok(skipped) => skipped,
+        Err(error) => {
+            let _ = fs::remove_file(&staged);
+            return Err(error);
+        }
+    };
+    if let Err(error) = commit_staged_output(&staged, output) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+
+    if skipped > 0 {
+        tracing::warn!(
+            skipped_blocks = skipped,
+            "rebuild left {skipped} block(s) untranslated to preserve inline structure"
+        );
+    }
+
+    Ok(())
+}
+
+fn write_rebuilt_epub(
+    book: &Book,
+    translations: &[BlockTranslation],
+    output: &Path,
+) -> Result<usize> {
     let source_path = book.source_path.as_deref().ok_or_else(|| {
         BookforgeError::InvalidInput("book IR does not include a source EPUB path".to_string())
     })?;
@@ -84,14 +114,48 @@ pub fn rebuild_epub(book: &Book, translations: &[BlockTranslation], output: &Pat
 
     writer.finish()?;
 
-    if total_skipped > 0 {
-        tracing::warn!(
-            skipped_blocks = total_skipped,
-            "rebuild left {total_skipped} block(s) untranslated to preserve inline structure"
-        );
+    Ok(total_skipped)
+}
+
+fn commit_staged_output(staged: &Path, output: &Path) -> Result<()> {
+    if !output.exists() {
+        fs::rename(staged, output)?;
+        return Ok(());
     }
 
-    Ok(())
+    let backup = sibling_work_path(output, "backup");
+    fs::rename(output, &backup)?;
+    match fs::rename(staged, output) {
+        Ok(()) => {
+            if let Err(error) = fs::remove_file(&backup) {
+                tracing::warn!(
+                    backup = %backup.display(),
+                    error = %error,
+                    "rebuilt EPUB is committed but its backup could not be removed"
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::rename(&backup, output);
+            Err(error.into())
+        }
+    }
+}
+
+fn sibling_work_path(output: &Path, label: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let name = output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("book.epub");
+    output.with_file_name(format!(
+        ".{name}.bookforge-{label}-{}-{nonce}",
+        std::process::id()
+    ))
 }
 
 fn write_mimetype_first(source: &mut ZipArchive<File>, writer: &mut ZipWriter<File>) -> Result<()> {

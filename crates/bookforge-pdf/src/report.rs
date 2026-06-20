@@ -70,7 +70,7 @@ impl ConversionReport {
 
     pub fn summary(&self) -> String {
         let mut out = format!(
-            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nText coverage vs pdftotext: {:.1}% ({} of {} characters)\n",
+            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nText coverage vs pdftotext: {:.1}% ({} reconstructed / {} baseline characters)\n",
             self.pages,
             self.blocks,
             self.two_column_pages,
@@ -87,5 +87,23 @@ impl ConversionReport {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_does_not_describe_over_baseline_reconstruction_as_of_total() {
+        let report = ConversionReport::build("in.pdf", "out.epub", Vec::new(), 1, 101, 100);
+
+        assert_eq!(report.coverage_percent, 100.0);
+        assert!(
+            report
+                .summary()
+                .contains("101 reconstructed / 100 baseline characters")
+        );
+        assert!(!report.summary().contains("101 of 100"));
     }
 }

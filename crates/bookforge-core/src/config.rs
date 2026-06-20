@@ -589,6 +589,8 @@ pub enum ProviderPreset {
     DeepSeekFree,
     DeepSeekPaid,
     GeminiFlashLite,
+    LocalOllama,
+    LocalLlamacpp,
     Custom,
 }
 
@@ -692,7 +694,7 @@ impl ProviderPreset {
                     adaptive_batch_sizing: Some(true),
                     compact_prompts: Some(true),
                     adaptive_concurrency: Some(true),
-                    thinking_disabled: Some(false),
+                    thinking_disabled: Some(true),
                     json_mode: Some(JsonMode::Auto),
                     max_idle_per_host: Some(16),
                     ..Default::default()
@@ -721,6 +723,54 @@ impl ProviderPreset {
                     thinking_disabled: Some(true),
                     json_mode: Some(JsonMode::Auto),
                     max_idle_per_host: Some(64),
+                    ..Default::default()
+                },
+            }),
+            ProviderPreset::LocalOllama => Some(ProviderPresetResolved {
+                endpoint: ModelEndpoint {
+                    provider: "openai-compatible".to_string(),
+                    model: "qwen2.5:14b".to_string(),
+                    base_url: Some("http://localhost:11434/v1".to_string()),
+                    api_key_env: Some("OLLAMA_API_KEY".to_string()),
+                },
+                runtime: ProviderPresetRuntimeOverrides {
+                    scheduler_concurrency: Some(1),
+                    provider_max_attempts: Some(1),
+                    validation_max_attempts: Some(1),
+                    retry_after_policy: Some(RetryAfterPolicy::None),
+                    timeout_seconds: Some(300),
+                    batch_enabled: Some(true),
+                    batch_target_tokens: Some(4_000),
+                    batch_max_items: Some(24),
+                    compact_prompts: Some(true),
+                    adaptive_concurrency: Some(false),
+                    thinking_disabled: Some(true),
+                    json_mode: Some(JsonMode::Auto),
+                    max_idle_per_host: Some(2),
+                    ..Default::default()
+                },
+            }),
+            ProviderPreset::LocalLlamacpp => Some(ProviderPresetResolved {
+                endpoint: ModelEndpoint {
+                    provider: "openai-compatible".to_string(),
+                    model: "local-model".to_string(),
+                    base_url: Some("http://localhost:8080/v1".to_string()),
+                    api_key_env: Some("LLAMACPP_API_KEY".to_string()),
+                },
+                runtime: ProviderPresetRuntimeOverrides {
+                    scheduler_concurrency: Some(1),
+                    provider_max_attempts: Some(1),
+                    validation_max_attempts: Some(1),
+                    retry_after_policy: Some(RetryAfterPolicy::None),
+                    timeout_seconds: Some(300),
+                    batch_enabled: Some(true),
+                    batch_target_tokens: Some(4_000),
+                    batch_max_items: Some(24),
+                    compact_prompts: Some(true),
+                    adaptive_concurrency: Some(false),
+                    thinking_disabled: Some(true),
+                    json_mode: Some(JsonMode::Auto),
+                    max_idle_per_host: Some(2),
                     ..Default::default()
                 },
             }),
@@ -870,6 +920,48 @@ mod tests {
             Some(RetryAfterPolicy::RespectHeader)
         );
         assert_eq!(resolved.runtime.max_idle_per_host, Some(8));
+    }
+
+    #[test]
+    fn local_presets_use_openai_compatible_loopback_endpoints() {
+        let ollama = ProviderPreset::LocalOllama
+            .resolve()
+            .expect("Ollama preset should resolve");
+        assert_eq!(ollama.endpoint.provider, "openai-compatible");
+        assert_eq!(
+            ollama.endpoint.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+        assert_eq!(
+            ollama.endpoint.api_key_env.as_deref(),
+            Some("OLLAMA_API_KEY")
+        );
+        assert_eq!(ollama.runtime.scheduler_concurrency, Some(1));
+
+        let llamacpp = ProviderPreset::LocalLlamacpp
+            .resolve()
+            .expect("llama.cpp preset should resolve");
+        assert_eq!(llamacpp.endpoint.provider, "openai-compatible");
+        assert_eq!(
+            llamacpp.endpoint.base_url.as_deref(),
+            Some("http://localhost:8080/v1")
+        );
+        assert_eq!(
+            llamacpp.endpoint.api_key_env.as_deref(),
+            Some("LLAMACPP_API_KEY")
+        );
+    }
+
+    #[test]
+    fn deepseek_translation_presets_disable_thinking() {
+        for preset in [ProviderPreset::DeepSeekFree, ProviderPreset::DeepSeekPaid] {
+            let resolved = preset.resolve().expect("preset should resolve");
+            assert_eq!(
+                resolved.runtime.thinking_disabled,
+                Some(true),
+                "translation presets should reserve output tokens for translated prose"
+            );
+        }
     }
 
     #[test]
