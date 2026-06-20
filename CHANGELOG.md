@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.7.0 - 2026-06-20
+
+BookForge v1.7.0 aligns the workspace packages, CLI version, and GitHub
+release metadata on the current application version. It also publishes
+the latest roadmap, repository ignore rules, and project handoff notes.
+
+The executable feature set remains the extraction, scheduling, and
+initial poppler-based PDF-to-EPUB conversion work already present on
+`main`; bilingual output remains planned and is not claimed by this
+release.
+
+### Validation
+
+- `cargo fmt --all --check`
+- `RUSTFLAGS="-D warnings" cargo test --workspace --locked`
+- `RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features -- -A clippy::too_many_arguments -D warnings`
+- `RUSTFLAGS="-D warnings" cargo build --release --locked`
+
 ## v1.5.0 - 2026-06-13
 
 BookForge v1.5 is the extraction and scheduling hardening release. It

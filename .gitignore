@@ -5,6 +5,7 @@
 /test/
 /tests/
 /tmp/
+/.tools/
 *.tmp
 *.log
 *.env
