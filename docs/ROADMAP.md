@@ -1,7 +1,7 @@
 # BookForge — Technical Roadmap, v1.0.1 through v2
 
 **Document version:** 1.1
-**Last updated:** 2026-05-12
+**Last updated:** 2026-06-14
 **Status:** active planning document
 **Audience:** project maintainer + Claude Code (or any other coding agent) implementing
 the milestones below.
@@ -100,15 +100,15 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v1.3 | Context + style | 8–12 days | none (explicit "no promotion" rule) | shipped |
 | v1.4 | Distribution + writeup | 5–7 days | one technical post, two or three venues; cargo-dist binaries land here | shipped |
 | v1.5 | Extraction + scheduling overhaul (shipped scope; see §8 post-ship note) | — | none | shipped 2026-06-12 |
-| v1.6 | Bilingual output | 5–8 days | passive (release notes only) | planned |
-| v1.7 | PDF ingestion (§9b) | 8–14 days | release notes; maybe a short writeup if the layout-reconstruction part turns out interesting | **next — pulled ahead of v1.6 per owner priority, 2026-06** |
+| v1.6 | PDF ingestion hardening (§9) | 8–14 days | release notes; maybe a short writeup if layout reconstruction turns out interesting | **next** |
+| v1.7 | Bilingual output (§9b) | 5–8 days | passive (release notes only) | planned |
 | v1.8 | Structural credibility (EPUBCheck + corpus; was the planned v1.5 scope, §8) | 10–14 days | README final rewrite citing corpus | planned |
-| v2 | Open-ended | not committed | recompute from v1.4/v1.7 feedback | planned |
+| v2 | Open-ended | not committed | recompute from v1.4/v1.6/v1.7/v1.8 feedback | planned |
 
 Priority note (2026-06): the owner needs PDF translation more than
 bilingual output — scientific papers (figures/tables must survive) and
-unorthodox-layout books (CCRU-style scans/conversions). v1.7 therefore
-executes before v1.6 and v1.8 despite the numbering.
+unorthodox-layout books (CCRU-style scans/conversions). PDF therefore becomes
+v1.6, while bilingual output moves to v1.7.
 
 Total v1.x roadmap is roughly 45–70 person-days of focused work; in calendar
 terms, with a maintainer who has limited evenings and weekends and a
@@ -1789,276 +1789,17 @@ context (strict fence behind `--context-strict`), short per-block markers
 translation, a shared translate/resume run engine, v1-fast as the default
 profile, an identity-roundtrip harness, a text-coverage metric in `inspect`,
 and synthetic CI fixtures. The EPUBCheck + Standard Ebooks corpus scope in
-§8.4–§8.8 is still wanted and moves to v1.8, after PDF ingestion (§9b).
+§8.4–§8.8 is still wanted and moves to v1.8, after PDF ingestion (§9).
 
 ---
 
-## 9. v1.6 — Bilingual output
+## 9. v1.6 — PDF ingestion hardening
+
+This is the next milestone after v1.5. PDF P0/P1 shipped in v1.5;
+v1.6 finishes the practical PDF ingestion work with media preservation,
+hardening, and degraded-layout fallback.
 
 ### 9.1 Goal
-
-Add a `--mode` flag that lets the user produce bilingual EPUBs:
-translation appended after the original (block or inline) instead of
-replacing it. Default behavior is unchanged (`replace`).
-
-### 9.2 Architectural rationale
-
-This is the one product idea worth borrowing from oomol-lab/epub-translator,
-absorbed cleanly into BookForge's architecture without any compromise.
-For language learners, bilingual readers, and anyone who wants a
-verification safety net, this is a high-value mode that's surprisingly
-cheap to implement on top of v1.x.
-
-This must come *after* v1.5 because EPUBCheck regression-testing is
-what catches the failure modes of cleanly inserting sibling blocks
-into XHTML while keeping documents valid.
-
-### 9.3 Deliverables
-
-- `--mode replace|append-text|append-block` flag (default: `replace`).
-- Two new **reassembly modes** in `bookforge-epub`: `append-block` and
-  `append-text`. (No new LLM contracts; see §9.7 for why.)
-- Stable CSS classes on translation elements: `bookforge-translation`
-  and (optionally) `bookforge-source`.
-- Default stylesheet, configurable.
-- Per-element-type append policy.
-- All existing features (glossary, context, style, validation) work
-  unchanged in bilingual modes.
-
-### 9.4 The three modes
-
-#### `replace` (default, current behavior)
-
-Original element is replaced with the translation. Single-language output.
-
-```html
-<!-- Source -->
-<p>It was a bright cold day in April, and the clocks were striking thirteen.</p>
-
-<!-- After translate --target Italian --mode replace -->
-<p>Era un giorno freddo e luminoso d'aprile, e gli orologi battevano le tredici.</p>
-```
-
-#### `append-block`
-
-Translation is appended as a sibling block element with a stable class.
-Both languages remain visible. Recommended bilingual mode.
-
-```html
-<!-- After translate --target Italian --mode append-block -->
-<p>It was a bright cold day in April, and the clocks were striking thirteen.</p>
-<p class="bookforge-translation" lang="it">Era un giorno freddo e luminoso d'aprile, e gli orologi battevano le tredici.</p>
-```
-
-#### `append-text`
-
-Translation is appended as inline text within the same block, separated
-by a configurable separator (default: ` / `).
-
-```html
-<!-- After translate --target Italian --mode append-text -->
-<p>It was a bright cold day in April, and the clocks were striking thirteen. / <span class="bookforge-translation" lang="it">Era un giorno freddo e luminoso d'aprile, e gli orologi battevano le tredici.</span></p>
-```
-
-`append-text` is appropriate for short-form content (aphorisms, captions,
-poetry where line-by-line bilingual is desired). `append-block` is appropriate
-for prose.
-
-### 9.5 Per-element-type append policy
-
-Not every element should be appended to. Default policy table:
-
-| Element | append-block | append-text |
-|---------|--------------|-------------|
-| `<p>` | append after | append inline |
-| `<blockquote>` | append after | append inline within last `<p>` |
-| `<li>` | append after (as nested `<p>`) | append inline |
-| `<h1>` – `<h6>` | append after (as `<p>` with same class plus heading-translation class) | append inline |
-| `<figcaption>` | append after | append inline |
-| `<aside>` | append after | append inline within last `<p>` |
-| `<a>` (inline) | not appended | not appended |
-| `<code>`, `<pre>` | not appended | not appended |
-| `<table>`, `<th>`, `<td>` | append in cell as nested `<p>` | append inline within cell |
-| Empty / whitespace-only blocks | skipped | skipped |
-
-This policy is hardcoded for v1.6. Make it configurable via a TOML file
-(`--bilingual-policy <file>`) only if real users ask for it.
-
-### 9.6 CSS
-
-Default stylesheet (injected into the EPUB if not already present):
-
-```css
-.bookforge-translation {
-  color: #555;
-  font-style: italic;
-  margin-top: 0.2em;
-}
-
-.bookforge-translation[lang="ja"],
-.bookforge-translation[lang="zh"],
-.bookforge-translation[lang="ko"] {
-  font-style: normal;  /* italic is awkward for CJK */
-}
-
-p.bookforge-translation {
-  /* block-level translation paragraphs */
-}
-
-span.bookforge-translation {
-  /* inline-level translation spans */
-}
-```
-
-CLI:
-
-```
---bilingual-css <file.css>          # inject custom stylesheet
---bilingual-style minimal|prominent|inline-only
-                                    # picks one of three bundled stylesheets
---bilingual-separator " / "         # used in append-text mode (default " / ")
-```
-
-### 9.7 Bilingual reassembly modes
-
-Critically, **bilingual mode is a reassembly concern, not a model-output
-concern**. The LLM is *not* asked to emit both source and target. The
-program already owns the source; asking the model to echo it back would
-violate §1.1 (the structure-sacred invariant: model translates prose only).
-
-The translation contract used in bilingual mode is the existing
-`marker-safe` or `run-preserving` contract — same prompt, same payload,
-same response shape, same single target string per segment. The model
-emits only the target translation. The reassembler in `bookforge-epub`
-then inserts the original source (which it already has, in its IR) and
-the translated target according to the selected `--mode` value.
-
-So v1.6 introduces:
-
-- **Two new reassembly modes** in `bookforge-epub`: `append-block` and
-  `append-text`. (Plus the existing `replace`, kept as default.)
-- **No new translation contracts** in `bookforge-llm`. The contracts
-  used during translation remain marker-safe / run-preserving exactly
-  as in v1.0–v1.5.
-- The reassembly modes consume the same translated-segment data structure
-  the existing `replace` mode consumes; they differ only in how they
-  splice the result into the output XHTML tree.
-
-For `append-block` reassembly: insert the translated target as a sibling
-block element with class `bookforge-translation`, immediately after the
-original block, with `lang` attribute set to the target language.
-
-For `append-text` reassembly: insert the translated target as an inline
-`<span class="bookforge-translation" lang="...">` immediately after the
-original text run, separated by the configured separator string.
-
-The model never sees these decisions and never receives bilingual-specific
-prompts. Same prompt, same translation payload; the difference lives
-entirely in the deterministic reassembly layer.
-
-### 9.8 Edge cases
-
-- **EPUB metadata**: `<dc:language>` should reflect bilingual content.
-  Add the target language as a secondary `<dc:language>` entry.
-- **Table of contents**: chapter titles might be bilingual; default
-  policy is to translate chapter titles in `replace` mode and to use
-  source-only titles in append modes (so the TOC remains readable in
-  the original language; the bilingual content is inside the chapter).
-- **Cover image**: untouched.
-- **Existing `bookforge-translation` or `bookforge-source` classes**:
-  if the source EPUB already uses these class names (extremely unlikely
-  but possible from a prior BookForge run), append a generation suffix:
-  `bookforge-translation-2`. Not a concern for a long while.
-- **Right-to-left target languages**: bilingual blocks need
-  `dir="rtl"` on the translated element; default policy handles common cases
-  (ar, he, fa).
-- **Footnotes**: footnote text appears in the target language as an
-  appended block, but the *footnote reference* (the superscript link)
-  remains in its original position. Two-pass: translate the body, then
-  translate the footnote contents at the end of the document.
-
-### 9.9 Validation in bilingual modes
-
-EPUBCheck must pass in every mode. The most likely failure modes:
-
-- Inserting a `<p>` as a sibling of an element that doesn't allow `<p>`
-  siblings (e.g. inside `<h1>`'s parent has constraints). Per-element-type
-  policy handles this.
-- Duplicate `id` attributes if the LLM somehow returns content with
-  IDs (shouldn't happen because the LLM only sees prose). Validators
-  catch this.
-- Missing `lang` attribute on translation elements (accessibility issue,
-  EPUBCheck warns). Always set `lang` on inserted elements.
-
-### 9.10 CLI examples
-
-```
-# Bilingual block (recommended)
-bookforge translate origin.epub \
-  --target Italian \
-  --provider openrouter \
-  --model deepseek/deepseek-v4-flash \
-  --mode append-block \
-  --out origin.bilingual.epub
-
-# Bilingual inline (poetry, short-form)
-bookforge translate poems.epub \
-  --target Italian \
-  --mode append-text \
-  --bilingual-separator " — " \
-  --out poems.bilingual.epub
-
-# Custom stylesheet
-bookforge translate origin.epub \
-  --target Italian \
-  --mode append-block \
-  --bilingual-css ~/styles/bilingual.css \
-  --out origin.bilingual.epub
-```
-
-### 9.11 Out of scope (within milestone)
-
-- A side-by-side two-column rendering inside the EPUB (this requires
-  CSS that few readers support; append-block looks the same on every reader).
-- Per-paragraph highlighting (clicking source highlights target).
-  Out of scope; the review UI is the editorial tool, not the EPUB itself.
-- Trilingual or N-lingual modes.
-- Auto-detection of "should I use append-block or append-text" based
-  on content. The user picks.
-
-### 9.12 Acceptance criteria
-
-1. `bookforge translate book.epub --target Italian --mode append-block`
-   produces an EPUB where each source paragraph is followed by an
-   Italian-translated `<p class="bookforge-translation" lang="it">...</p>` sibling.
-2. The output passes EPUBCheck.
-3. `bookforge translate book.epub --target Italian --mode append-text`
-   produces inline bilingual content with `<span class="bookforge-translation"
-   lang="it">...</span>` after each source text run.
-4. `--mode replace` produces output identical to v1.5 (no behavior regression).
-5. Glossary, context, and style sheets all apply in bilingual modes.
-6. Token usage in bilingual modes is roughly equal to that in replace
-   mode (the LLM still translates each segment once; the difference is
-   in reassembly).
-7. Opening the bilingual EPUB in Apple Books, Calibre, and a standard
-   ePub.js viewer shows both languages legibly.
-
-### 9.13 Effort
-
-5–8 days. Most of the work is the per-element-type policy and the
-CSS/`lang`-attribute correctness; the contracts themselves are straightforward.
-
-### 9.14 Dependencies
-
-v1.5 (EPUBCheck integration is required to verify correctness).
-
----
-
-## 9b. v1.7 — PDF ingestion
-
-Executes before v1.6 and v1.8 (owner priority, 2026-06).
-
-### 9b.1 Goal
 
 Translate the PDFs the owner actually has and cannot translate today:
 
@@ -2074,7 +1815,7 @@ all other BookForge output targets). Re-laying-out translated text into
 the original PDF geometry is explicitly out of scope: it is a research
 problem, it cannot be done deterministically, and it violates §1.2.
 
-### 9b.2 Architectural rationale
+### 9.2 Architectural rationale
 
 PDF has no DOM. There are no blocks to own — only positioned glyphs. The
 invariants survive by splitting the problem in two:
@@ -2100,7 +1841,7 @@ text-coverage metric, plus a conversion report comparing reconstructed
 text volume against a raw `pdftotext` baseline, per page. Pages that
 reconstruct badly are *flagged*, not hidden.
 
-### 9b.3 Deliverables
+### 9.3 Deliverables
 
 - `bookforge-pdf` crate: poppler XML parsing + layout reconstruction +
   synthetic EPUB assembly. No C dependencies; talks to poppler binaries
@@ -2114,7 +1855,7 @@ reconstruct badly are *flagged*, not hidden.
   on tool presence (skip with a printed reason, mirroring the EPUBCheck
   pattern).
 
-### 9b.4 Phases
+### 9.4 Phases
 
 - **P0 — plumbing.** Tool discovery (`POPPLER_PATH` env override, PATH
   fallback), `convert` command skeleton, `pdftohtml -xml` invocation and
@@ -2165,7 +1906,7 @@ reconstruct badly are *flagged*, not hidden.
   marker` for layout models (marker/nougat) when installed, emitting
   into the same page/line IR. Never a hard dependency.
 
-### 9b.5 CLI surface
+### 9.5 CLI surface
 
 ```bash
 bookforge doctor --pdf
@@ -2179,7 +1920,7 @@ bookforge translate paper.epub --target Italian ...
 `translate input.pdf` (implicit convert) is deliberately deferred until
 the convert step has earned trust on real papers.
 
-### 9b.6 Out of scope (within milestone)
+### 9.6 Out of scope (within milestone)
 
 - PDF output / translated-PDF re-layout (see §12).
 - OCR for image-only scans (`preserve` posture handles them; OCR is a
@@ -2187,7 +1928,7 @@ the convert step has earned trust on real papers.
 - HTML table reconstruction (raster crops first; reassess after real use).
 - DRM'd PDFs.
 
-### 9b.7 Acceptance criteria
+### 9.7 Acceptance criteria
 
 - A real two-column arXiv paper converts to an EPUB with ≥95% text
   coverage against the `pdftotext` baseline, correct reading order on
@@ -2200,15 +1941,278 @@ the convert step has earned trust on real papers.
   poppler absent.
 - `cargo test`, `cargo fmt`, `cargo clippy` clean.
 
-### 9b.8 Effort
+### 9.8 Effort
 
 8–14 days total. P0+P1 are the load-bearing 3–5 days; P2–P4 are
 incremental; P5 only if real books demand it.
 
-### 9b.9 Dependencies
+### 9.9 Dependencies
 
 None on other milestones. Requires poppler binaries on the user's
 machine (documented per-OS install one-liners in README).
+
+---
+
+## 9b. v1.7 — Bilingual output
+
+### 9b.1 Goal
+
+Add a `--mode` flag that lets the user produce bilingual EPUBs:
+translation appended after the original (block or inline) instead of
+replacing it. Default behavior is unchanged (`replace`).
+
+### 9b.2 Architectural rationale
+
+This is the one product idea worth borrowing from oomol-lab/epub-translator,
+absorbed cleanly into BookForge's architecture without any compromise.
+For language learners, bilingual readers, and anyone who wants a
+verification safety net, this is a high-value mode that's surprisingly
+cheap to implement on top of v1.x.
+
+This must come *after* v1.5 because EPUBCheck regression-testing is
+what catches the failure modes of cleanly inserting sibling blocks
+into XHTML while keeping documents valid.
+
+### 9b.3 Deliverables
+
+- `--mode replace|append-text|append-block` flag (default: `replace`).
+- Two new **reassembly modes** in `bookforge-epub`: `append-block` and
+  `append-text`. (No new LLM contracts; see §9b.7 for why.)
+- Stable CSS classes on translation elements: `bookforge-translation`
+  and (optionally) `bookforge-source`.
+- Default stylesheet, configurable.
+- Per-element-type append policy.
+- All existing features (glossary, context, style, validation) work
+  unchanged in bilingual modes.
+
+### 9b.4 The three modes
+
+#### `replace` (default, current behavior)
+
+Original element is replaced with the translation. Single-language output.
+
+```html
+<!-- Source -->
+<p>It was a bright cold day in April, and the clocks were striking thirteen.</p>
+
+<!-- After translate --target Italian --mode replace -->
+<p>Era un giorno freddo e luminoso d'aprile, e gli orologi battevano le tredici.</p>
+```
+
+#### `append-block`
+
+Translation is appended as a sibling block element with a stable class.
+Both languages remain visible. Recommended bilingual mode.
+
+```html
+<!-- After translate --target Italian --mode append-block -->
+<p>It was a bright cold day in April, and the clocks were striking thirteen.</p>
+<p class="bookforge-translation" lang="it">Era un giorno freddo e luminoso d'aprile, e gli orologi battevano le tredici.</p>
+```
+
+#### `append-text`
+
+Translation is appended as inline text within the same block, separated
+by a configurable separator (default: ` / `).
+
+```html
+<!-- After translate --target Italian --mode append-text -->
+<p>It was a bright cold day in April, and the clocks were striking thirteen. / <span class="bookforge-translation" lang="it">Era un giorno freddo e luminoso d'aprile, e gli orologi battevano le tredici.</span></p>
+```
+
+`append-text` is appropriate for short-form content (aphorisms, captions,
+poetry where line-by-line bilingual is desired). `append-block` is appropriate
+for prose.
+
+### 9b.5 Per-element-type append policy
+
+Not every element should be appended to. Default policy table:
+
+| Element | append-block | append-text |
+|---------|--------------|-------------|
+| `<p>` | append after | append inline |
+| `<blockquote>` | append after | append inline within last `<p>` |
+| `<li>` | append after (as nested `<p>`) | append inline |
+| `<h1>` – `<h6>` | append after (as `<p>` with same class plus heading-translation class) | append inline |
+| `<figcaption>` | append after | append inline |
+| `<aside>` | append after | append inline within last `<p>` |
+| `<a>` (inline) | not appended | not appended |
+| `<code>`, `<pre>` | not appended | not appended |
+| `<table>`, `<th>`, `<td>` | append in cell as nested `<p>` | append inline within cell |
+| Empty / whitespace-only blocks | skipped | skipped |
+
+This policy is hardcoded for v1.7. Make it configurable via a TOML file
+(`--bilingual-policy <file>`) only if real users ask for it.
+
+### 9b.6 CSS
+
+Default stylesheet (injected into the EPUB if not already present):
+
+```css
+.bookforge-translation {
+  color: #555;
+  font-style: italic;
+  margin-top: 0.2em;
+}
+
+.bookforge-translation[lang="ja"],
+.bookforge-translation[lang="zh"],
+.bookforge-translation[lang="ko"] {
+  font-style: normal;  /* italic is awkward for CJK */
+}
+
+p.bookforge-translation {
+  /* block-level translation paragraphs */
+}
+
+span.bookforge-translation {
+  /* inline-level translation spans */
+}
+```
+
+CLI:
+
+```
+--bilingual-css <file.css>          # inject custom stylesheet
+--bilingual-style minimal|prominent|inline-only
+                                    # picks one of three bundled stylesheets
+--bilingual-separator " / "         # used in append-text mode (default " / ")
+```
+
+### 9b.7 Bilingual reassembly modes
+
+Critically, **bilingual mode is a reassembly concern, not a model-output
+concern**. The LLM is *not* asked to emit both source and target. The
+program already owns the source; asking the model to echo it back would
+violate §1.1 (the structure-sacred invariant: model translates prose only).
+
+The translation contract used in bilingual mode is the existing
+`marker-safe` or `run-preserving` contract — same prompt, same payload,
+same response shape, same single target string per segment. The model
+emits only the target translation. The reassembler in `bookforge-epub`
+then inserts the original source (which it already has, in its IR) and
+the translated target according to the selected `--mode` value.
+
+So v1.7 introduces:
+
+- **Two new reassembly modes** in `bookforge-epub`: `append-block` and
+  `append-text`. (Plus the existing `replace`, kept as default.)
+- **No new translation contracts** in `bookforge-llm`. The contracts
+  used during translation remain marker-safe / run-preserving exactly
+  as in v1.0–v1.6.
+- The reassembly modes consume the same translated-segment data structure
+  the existing `replace` mode consumes; they differ only in how they
+  splice the result into the output XHTML tree.
+
+For `append-block` reassembly: insert the translated target as a sibling
+block element with class `bookforge-translation`, immediately after the
+original block, with `lang` attribute set to the target language.
+
+For `append-text` reassembly: insert the translated target as an inline
+`<span class="bookforge-translation" lang="...">` immediately after the
+original text run, separated by the configured separator string.
+
+The model never sees these decisions and never receives bilingual-specific
+prompts. Same prompt, same translation payload; the difference lives
+entirely in the deterministic reassembly layer.
+
+### 9b.8 Edge cases
+
+- **EPUB metadata**: `<dc:language>` should reflect bilingual content.
+  Add the target language as a secondary `<dc:language>` entry.
+- **Table of contents**: chapter titles might be bilingual; default
+  policy is to translate chapter titles in `replace` mode and to use
+  source-only titles in append modes (so the TOC remains readable in
+  the original language; the bilingual content is inside the chapter).
+- **Cover image**: untouched.
+- **Existing `bookforge-translation` or `bookforge-source` classes**:
+  if the source EPUB already uses these class names (extremely unlikely
+  but possible from a prior BookForge run), append a generation suffix:
+  `bookforge-translation-2`. Not a concern for a long while.
+- **Right-to-left target languages**: bilingual blocks need
+  `dir="rtl"` on the translated element; default policy handles common cases
+  (ar, he, fa).
+- **Footnotes**: footnote text appears in the target language as an
+  appended block, but the *footnote reference* (the superscript link)
+  remains in its original position. Two-pass: translate the body, then
+  translate the footnote contents at the end of the document.
+
+### 9b.9 Validation in bilingual modes
+
+EPUBCheck must pass in every mode. The most likely failure modes:
+
+- Inserting a `<p>` as a sibling of an element that doesn't allow `<p>`
+  siblings (e.g. inside `<h1>`'s parent has constraints). Per-element-type
+  policy handles this.
+- Duplicate `id` attributes if the LLM somehow returns content with
+  IDs (shouldn't happen because the LLM only sees prose). Validators
+  catch this.
+- Missing `lang` attribute on translation elements (accessibility issue,
+  EPUBCheck warns). Always set `lang` on inserted elements.
+
+### 9b.10 CLI examples
+
+```
+# Bilingual block (recommended)
+bookforge translate origin.epub \
+  --target Italian \
+  --provider openrouter \
+  --model deepseek/deepseek-v4-flash \
+  --mode append-block \
+  --out origin.bilingual.epub
+
+# Bilingual inline (poetry, short-form)
+bookforge translate poems.epub \
+  --target Italian \
+  --mode append-text \
+  --bilingual-separator " — " \
+  --out poems.bilingual.epub
+
+# Custom stylesheet
+bookforge translate origin.epub \
+  --target Italian \
+  --mode append-block \
+  --bilingual-css ~/styles/bilingual.css \
+  --out origin.bilingual.epub
+```
+
+### 9b.11 Out of scope (within milestone)
+
+- A side-by-side two-column rendering inside the EPUB (this requires
+  CSS that few readers support; append-block looks the same on every reader).
+- Per-paragraph highlighting (clicking source highlights target).
+  Out of scope; the review UI is the editorial tool, not the EPUB itself.
+- Trilingual or N-lingual modes.
+- Auto-detection of "should I use append-block or append-text" based
+  on content. The user picks.
+
+### 9b.12 Acceptance criteria
+
+1. `bookforge translate book.epub --target Italian --mode append-block`
+   produces an EPUB where each source paragraph is followed by an
+   Italian-translated `<p class="bookforge-translation" lang="it">...</p>` sibling.
+2. The output passes EPUBCheck.
+3. `bookforge translate book.epub --target Italian --mode append-text`
+   produces inline bilingual content with `<span class="bookforge-translation"
+   lang="it">...</span>` after each source text run.
+4. `--mode replace` produces output identical to v1.5 (no behavior regression).
+5. Glossary, context, and style sheets all apply in bilingual modes.
+6. Token usage in bilingual modes is roughly equal to that in replace
+   mode (the LLM still translates each segment once; the difference is
+   in reassembly).
+7. Opening the bilingual EPUB in Apple Books, Calibre, and a standard
+   ePub.js viewer shows both languages legibly.
+
+### 9b.13 Effort
+
+5–8 days. Most of the work is the per-element-type policy and the
+CSS/`lang`-attribute correctness; the contracts themselves are straightforward.
+
+### 9b.14 Dependencies
+
+v1.6 is scheduled first because PDF translation is the owner priority.
+Bilingual output has no hard dependency on PDF internals, but it should
+wait until the PDF ingestion surface is useful on real documents.
 
 ---
 
@@ -2217,11 +2221,11 @@ machine (documented per-OS install one-liners in README).
 The v2 list is what's interesting *as of writing*. The real v2
 priorities will be informed by:
 
-- What v1.5's corpus regression surfaces (likely: long-tail EPUB edge cases).
+- What v1.8's corpus regression surfaces (likely: long-tail EPUB edge cases).
 - Feedback from the v1.4 writeup (likely: feature requests we can't predict).
 - What flags accumulate after using BookForge on 5–10 real books in v1.x.
 
-So this section is a **sketch**, not a commitment. Re-evaluate after v1.6 ships.
+So this section is a **sketch**, not a commitment. Re-evaluate after v1.8 ships.
 
 ### 10.1 Sketched candidates
 
@@ -2240,7 +2244,7 @@ So this section is a **sketch**, not a commitment. Re-evaluate after v1.6 ships.
 - **Streaming translation output** for live token meters during long jobs.
 - **Format-adjacent sibling tools**: `bookforge-docx2epub` and similar.
   Strictly siblings, not engine surface. PDF graduated out of this bullet:
-  it is now mainline ingestion, spec'd as v1.7 in §9b (decision 2026-06).
+  it is now mainline ingestion, spec'd as v1.6 in §9 (decision 2026-06).
 - **Glossary auto-extraction (v1.2.x)** — already mentioned, file here as
   a reminder if it didn't ship as a point release.
 
@@ -2285,7 +2289,7 @@ crates/bookforge-store/migrations/
   0004_v1_2_glossary.sql
   0005_v1_3_entities.sql
   0006_v1_5_pricing_cache.sql
-  0007_v1_6_bilingual_metadata.sql
+  0007_v1_7_bilingual_metadata.sql
 ```
 
 Each migration is a `.sql` file with idempotent `CREATE TABLE IF NOT EXISTS`,
@@ -2350,9 +2354,9 @@ New fields on existing events are additive and optional.
 - **Mock provider determinism**: the mock provider must produce
   identical output for identical input. Useful for snapshot testing
   EPUB rebuild output (assert on the SHA256 of the rebuilt EPUB).
-- **Corpus regression** (v1.5+): `scripts/corpus-smoke.sh small`
+- **Corpus regression** (v1.8+): `scripts/corpus-smoke.sh small`
   on every PR; full corpus nightly.
-- **EPUBCheck verification** (v1.5+): every translated output in
+- **EPUBCheck verification** (v1.8+): every translated output in
   corpus tests must be EPUBCheck-clean (or, in `--strict-epubcheck`-
   off mode, free of errors with warnings logged).
 - **Real-provider smoke**: manual, before each tagged release. Translate
@@ -2400,7 +2404,7 @@ considered and rejected.
 | Multi-agent debate QA | Poor cost/quality profile for translation |
 | Hosted demo / SaaS | Wrong scope for one-maintainer project |
 | Native Anthropic/Gemini providers (pre-v2) | OpenRouter routes to both; prove necessity first |
-| DOCX/MOBI/AZW3 input | Sibling tools, not engine surface. (PDF input was on this list until 2026-06; owner priority moved it mainline as v1.7, §9b. PDF *output* — re-laying-out translated text into the original PDF geometry — remains out of scope.) |
+| DOCX/MOBI/AZW3 input | Sibling tools, not engine surface. (PDF input was on this list until 2026-06; owner priority moved it mainline as v1.6, §9. PDF *output* — re-laying-out translated text into the original PDF geometry — remains out of scope.) |
 | Manga / comic translation | Different engine entirely |
 | Trilingual+ output | YAGNI |
 | Comparison matrices in README | Hard to keep current, not honest |
@@ -2413,7 +2417,7 @@ considered and rejected.
 
 ## 13. Marketing and release posture
 
-Five intentional moments across the v1.x cycle:
+Six intentional moments across the v1.x cycle:
 
 1. **v1.1 — Honest README opening**. Not marketing; truth. One paragraph.
 2. **v1.1 — crates.io publish + GitHub topics**. Passive discoverability.
@@ -2424,7 +2428,9 @@ Five intentional moments across the v1.x cycle:
 4. **v1.5 — README final rewrite citing the corpus**. The single most
    credible sentence ("Tested EPUBCheck-clean against the Standard Ebooks
    corpus") replaces a thousand comparison matrices.
-5. **v1.6 — Release notes only**. No promotion. Bilingual mode is a
+5. **v1.6 — PDF release notes**. Maybe a short technical note if the
+   layout reconstruction and media preservation are interesting enough.
+6. **v1.7 — Release notes only**. No promotion. Bilingual mode is a
    feature for those who already use the tool.
 
 Total marketing surface: roughly 5% of project effort, episodic, never

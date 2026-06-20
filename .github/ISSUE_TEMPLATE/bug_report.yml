@@ -16,7 +16,7 @@ body:
     attributes:
       label: BookForge version
       description: Output of `bookforge --version`.
-      placeholder: bookforge 1.4.0
+      placeholder: bookforge 1.7.0
     validations:
       required: true
   - type: input
