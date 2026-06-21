@@ -544,7 +544,7 @@ pub fn build_translation_batches(
             } else {
                 (
                     block.text.clone(),
-                    segment.constraints.preserve_markers.clone(),
+                    bookforge_core::marker::marker_ids_in_text(&block.text),
                     block.protected_spans.clone(),
                 )
             };
@@ -766,12 +766,16 @@ fn batch_token_estimate(
 }
 
 /// Deterministic per-item validation for text-mode batch responses. The
-/// markers that must survive are the ones present in THIS block's source
-/// (`item.required_markers` is segment-wide and would wrongly demand
-/// sibling blocks' markers); protected spans are already block-scoped.
+/// markers that must survive are the ones present in THIS block's source;
+/// protected spans are already block-scoped.
 /// Failures flow into the normal repair/failure pipeline instead of the
 /// translation being silently patched up.
-fn batch_item_validation_error(item: &TranslationBatchItem, translation: &str) -> Option<String> {
+fn batch_item_validation_error(
+    item: &TranslationBatchItem,
+    translation: &str,
+    validate_source_copy: bool,
+    section_title: Option<&str>,
+) -> Option<String> {
     if let Some(error) = bookforge_core::marker::marker_structure_error(translation) {
         return Some(error);
     }
@@ -796,7 +800,22 @@ fn batch_item_validation_error(item: &TranslationBatchItem, translation: &str) -
             return Some(format!("protected span missing: {span}"));
         }
     }
+    if let Some(error) = source_copy_error(item, translation, validate_source_copy, section_title) {
+        return Some(error);
+    }
     None
+}
+
+fn source_copy_error(
+    item: &TranslationBatchItem,
+    translation: &str,
+    validate_source_copy: bool,
+    section_title: Option<&str>,
+) -> Option<String> {
+    if !validate_source_copy {
+        return None;
+    }
+    crate::validation::source_copy_validation_error(&item.source_text, translation, section_title)
 }
 
 impl TranslationBatchItem {
@@ -843,13 +862,30 @@ pub fn parse_batch_response(
     batch: &TranslationBatch,
     response_json: &str,
 ) -> Result<BatchTranslationResult, String> {
+    parse_batch_response_with_validation(batch, response_json, false, None)
+}
+
+fn parse_batch_response_with_validation(
+    batch: &TranslationBatch,
+    response_json: &str,
+    validate_source_copy: bool,
+    section_titles: Option<&HashMap<String, String>>,
+) -> Result<BatchTranslationResult, String> {
     let content = response_json.trim();
 
     match batch.mode {
         BatchMode::Plain | BatchMode::MarkerSafe | BatchMode::TurboTextOnly => {
-            parse_text_batch_response(batch, content, batch.mode == BatchMode::TurboTextOnly)
+            parse_text_batch_response(
+                batch,
+                content,
+                batch.mode == BatchMode::TurboTextOnly,
+                validate_source_copy,
+                section_titles,
+            )
         }
-        BatchMode::RunPreserving => parse_run_batch_response(batch, content),
+        BatchMode::RunPreserving => {
+            parse_run_batch_response(batch, content, validate_source_copy, section_titles)
+        }
     }
 }
 
@@ -857,6 +893,8 @@ fn parse_text_batch_response(
     batch: &TranslationBatch,
     content: &str,
     turbo: bool,
+    validate_source_copy: bool,
+    section_titles: Option<&HashMap<String, String>>,
 ) -> Result<BatchTranslationResult, String> {
     let parsed: BatchTextResponse =
         serde_json::from_str(content).map_err(|e| format!("invalid batch JSON: {e}"))?;
@@ -904,7 +942,25 @@ fn parse_text_batch_response(
         }
 
         let translation = item.translation.clone();
-        if !turbo && let Some(error) = batch_item_validation_error(request_item, &translation) {
+        let section_title = section_titles
+            .and_then(|titles| titles.get(&request_item.segment_id.0))
+            .map(String::as_str);
+        let validation_error = if turbo {
+            source_copy_error(
+                request_item,
+                &translation,
+                validate_source_copy,
+                section_title,
+            )
+        } else {
+            batch_item_validation_error(
+                request_item,
+                &translation,
+                validate_source_copy,
+                section_title,
+            )
+        };
+        if let Some(error) = validation_error {
             failures.push(BatchItemFailure {
                 item_id: item.id.clone(),
                 segment_id: request_item.segment_id.clone(),
@@ -955,6 +1011,8 @@ fn parse_text_batch_response(
 fn parse_run_batch_response(
     batch: &TranslationBatch,
     content: &str,
+    validate_source_copy: bool,
+    section_titles: Option<&HashMap<String, String>>,
 ) -> Result<BatchTranslationResult, String> {
     let parsed: BatchRunResponse =
         serde_json::from_str(content).map_err(|e| format!("invalid batch JSON: {e}"))?;
@@ -1027,10 +1085,31 @@ fn parse_run_batch_response(
         }
 
         let joined: Vec<String> = item.runs.iter().map(|r| r.text.clone()).collect();
+        let translation = joined.join("");
+        let section_title = section_titles
+            .and_then(|titles| titles.get(&request_item.segment_id.0))
+            .map(String::as_str);
+        if let Some(error) = batch_item_validation_error(
+            request_item,
+            &translation,
+            validate_source_copy,
+            section_title,
+        ) {
+            failures.push(BatchItemFailure {
+                item_id: item.id.clone(),
+                segment_id: request_item.segment_id.clone(),
+                error,
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                tokens_estimated: false,
+            });
+            continue;
+        }
         translations.push(BatchItemTranslation {
             item_id: item.id.clone(),
             segment_id: request_item.segment_id.clone(),
-            text: joined.join(""),
+            text: translation,
             input_tokens: None,
             input_cached_tokens: None,
             output_tokens: None,
@@ -1260,6 +1339,23 @@ where
 {
     let library = Arc::new(PromptLibrary::global().clone());
     let provider = Arc::new(provider);
+    let validate_source_copy = crate::validation::should_validate_source_copy(
+        &config.provider,
+        config.source_language.as_deref(),
+        &config.target_language,
+    );
+    let section_titles = Arc::new(
+        segments
+            .iter()
+            .filter_map(|segment| {
+                segment
+                    .metadata
+                    .section_title
+                    .as_ref()
+                    .map(|title| (segment.id.0.clone(), title.clone()))
+            })
+            .collect::<HashMap<_, _>>(),
+    );
     let config = Arc::new(config.clone());
     let concurrency = config.scheduler.concurrency.max(1);
     let request_semaphore = Arc::new(Semaphore::new(concurrency));
@@ -1325,6 +1421,7 @@ where
                 let rate_controller = rate_controller.clone();
                 let progress = progress.clone();
                 let request_semaphore = request_semaphore.clone();
+                let section_titles = section_titles.clone();
 
                 tasks.spawn(async move {
                     // Strict context must be awaited before any permit is
@@ -1405,6 +1502,8 @@ where
                         batch.clone(),
                         &config,
                         context_pairs,
+                        validate_source_copy,
+                        &section_titles,
                     )
                     .await;
                     let latency_ms = started.elapsed().as_millis() as u64;
@@ -1879,6 +1978,7 @@ where
                 let config = config.clone();
                 let repair_errors = repair_errors.clone();
                 let progress = progress.clone();
+                let section_titles = section_titles.clone();
 
                 repair_tasks.spawn(async move {
                     let started = std::time::Instant::now();
@@ -1959,7 +2059,12 @@ where
                                 .await
                             {
                                 Ok(response) => {
-                                    match parse_batch_response(&repair_batch, &response.content) {
+                                    match parse_batch_response_with_validation(
+                                        &repair_batch,
+                                        &response.content,
+                                        validate_source_copy,
+                                        Some(&section_titles),
+                                    ) {
                                         Ok(mut repaired) => {
                                             repaired.input_tokens = response.input_tokens;
                                             repaired.output_tokens = response.output_tokens;
@@ -2189,6 +2294,8 @@ async fn translate_one_batch(
     batch: TranslationBatch,
     config: &TranslationRunConfig,
     context_pairs: Vec<crate::scheduler::CompletedContext>,
+    validate_source_copy: bool,
+    section_titles: &HashMap<String, String>,
 ) -> Result<BatchTranslationResult, LlmError> {
     let context_block = crate::scheduler::render_context_pairs(&context_pairs);
     let items_json = render_batch_items(&batch, config);
@@ -2271,8 +2378,13 @@ async fn translate_one_batch(
                 ));
             }
 
-            let mut result =
-                parse_batch_response(&batch, &resp.content).map_err(LlmError::InvalidResponse)?;
+            let mut result = parse_batch_response_with_validation(
+                &batch,
+                &resp.content,
+                validate_source_copy,
+                Some(section_titles),
+            )
+            .map_err(LlmError::InvalidResponse)?;
             result.input_tokens = resp.input_tokens;
             result.input_cached_tokens = resp.input_cached_tokens;
             result.output_tokens = resp.output_tokens;
@@ -2594,6 +2706,41 @@ mod tests {
             build_translation_batches(&[seg1, seg2], &config, TranslationProfile::Balanced);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].items.len(), 2);
+    }
+
+    #[test]
+    fn batch_construction_uses_only_block_local_markers() {
+        let seg = make_segment(
+            "seg1",
+            vec![plain_block("<m1>Marked</m1>"), plain_block("Plain sibling")],
+            vec!["m1".to_string()],
+        );
+        let config = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+
+        let batches = build_translation_batches(&[seg], &config, TranslationProfile::Balanced);
+        let items = batches
+            .iter()
+            .flat_map(|batch| batch.items.iter())
+            .collect::<Vec<_>>();
+        let marked = items
+            .iter()
+            .find(|item| item.source_text.contains("Marked"))
+            .expect("marked block");
+        let plain = items
+            .iter()
+            .find(|item| item.source_text.contains("Plain sibling"))
+            .expect("plain block");
+
+        assert_eq!(marked.required_markers, vec!["m1"]);
+        assert!(plain.required_markers.is_empty());
+        assert_eq!(plain.mode(), BatchMode::Plain);
     }
 
     #[test]
@@ -3020,10 +3167,108 @@ mod tests {
         let mut item = batch_item("marked", "<m1>source</m1>");
         item.required_markers = vec!["m1".to_string()];
 
-        let error = batch_item_validation_error(&item, "<m1>translated")
+        let error = batch_item_validation_error(&item, "<m1>translated", false, None)
             .expect("missing marker close should fail");
 
         assert!(error.contains("missing closing tag"), "got: {error}");
+    }
+
+    #[test]
+    fn copied_source_prose_fails_batch_item_validation() {
+        let source = "This deliberately long English paragraph contains enough ordinary prose to \
+            exercise untranslated-copy detection in a real batch response. The provider returned \
+            the entire source paragraph unchanged instead of translating it into the requested \
+            target language, so this item must enter the normal retry and review pipeline.";
+        let item = batch_item("copied", source);
+
+        let error = batch_item_validation_error(&item, source, true, Some("Chapter 1"))
+            .expect("long unchanged source prose should fail");
+
+        assert!(error.contains("unchanged from the source-language prose"));
+    }
+
+    #[test]
+    fn copied_source_prose_fails_internal_batch_response_validation() {
+        let source = "This deliberately long English paragraph contains enough ordinary prose to \
+            exercise untranslated-copy detection in a real batch response. The provider returned \
+            the entire source paragraph unchanged instead of translating it into the requested \
+            target language, so this item must enter the normal retry and review pipeline.";
+        let item = batch_item("copied-response", source);
+        let response = serde_json::json!({
+            "items": [{
+                "id": item.item_id,
+                "translation": source,
+            }]
+        })
+        .to_string();
+        let batch = TranslationBatch {
+            id: "copied-response".to_string(),
+            ordinal: 0,
+            mode: BatchMode::Plain,
+            kind: BatchKind::Translation,
+            token_estimate: 100,
+            section_id: item.section_id.clone(),
+            items: vec![item.clone()],
+        };
+        let section_titles = HashMap::from([(item.segment_id.0.clone(), "Chapter 1".to_string())]);
+
+        let result =
+            parse_batch_response_with_validation(&batch, &response, true, Some(&section_titles))
+                .expect("valid JSON should parse");
+
+        assert!(result.translations.is_empty());
+        assert_eq!(result.failures.len(), 1);
+        assert!(
+            result.failures[0]
+                .error
+                .contains("unchanged from the source-language prose")
+        );
+    }
+
+    #[test]
+    fn run_preserving_batch_rejects_malformed_joined_marker_structure() {
+        let mut item = batch_item("marked-runs", "<m1>source</m1>");
+        item.text_runs = (0..13)
+            .map(|index| SegmentTextRun {
+                id: format!("r{index}"),
+                text: String::new(),
+            })
+            .collect();
+        item.required_markers = vec!["m1".to_string()];
+        let batch = TranslationBatch {
+            id: "run-preserving".to_string(),
+            ordinal: 0,
+            mode: BatchMode::RunPreserving,
+            kind: BatchKind::Translation,
+            token_estimate: 100,
+            items: vec![item.clone()],
+            section_id: item.section_id.clone(),
+        };
+        let runs = (0..13)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("r{index}"),
+                    "text": if index == 0 { "<m1>translated" } else { "" },
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = serde_json::json!({
+            "items": [{
+                "id": item.item_id,
+                "runs": runs,
+            }]
+        })
+        .to_string();
+
+        let result = parse_batch_response(&batch, &response).expect("parse");
+
+        assert_eq!(result.translations.len(), 0);
+        assert_eq!(result.failures.len(), 1);
+        assert!(
+            result.failures[0].error.contains("missing closing tag"),
+            "got: {}",
+            result.failures[0].error
+        );
     }
 
     #[test]
@@ -3293,7 +3538,16 @@ mod tests {
         let library = Arc::new(PromptLibrary::global().clone());
         let config = test_run_config();
 
-        let result = translate_one_batch(provider, library, batch, &config, Vec::new()).await;
+        let result = translate_one_batch(
+            provider,
+            library,
+            batch,
+            &config,
+            Vec::new(),
+            false,
+            &HashMap::new(),
+        )
+        .await;
         match result {
             Err(LlmError::InvalidResponse(msg)) => {
                 assert!(msg.contains("truncated"), "unexpected msg: {msg}")
@@ -3311,7 +3565,16 @@ mod tests {
         let library = Arc::new(PromptLibrary::global().clone());
         let config = test_run_config();
 
-        let result = translate_one_batch(provider, library, batch, &config, Vec::new()).await;
+        let result = translate_one_batch(
+            provider,
+            library,
+            batch,
+            &config,
+            Vec::new(),
+            false,
+            &HashMap::new(),
+        )
+        .await;
         match result {
             Err(LlmError::InvalidResponse(msg)) => {
                 assert!(msg.contains("truncated"), "unexpected msg: {msg}")

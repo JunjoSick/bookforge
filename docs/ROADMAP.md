@@ -1,7 +1,7 @@
 # BookForge — Technical Roadmap, v1.0.1 through v2
 
-**Document version:** 1.1
-**Last updated:** 2026-06-14
+**Document version:** 1.1.1
+**Last updated:** 2026-06-22
 **Status:** active planning document
 **Audience:** project maintainer + Claude Code (or any other coding agent) implementing
 the milestones below.
@@ -1804,6 +1804,16 @@ Real-book testing also fixed two structural cases outside the curated corpus:
 navigation-list labels are now patched inside their links instead of as direct
 `li` text, and PDF-converted EPUBs now include the EPUB 3 navigation document
 and modified-date metadata required by EPUBCheck.
+
+### 8.15 v1.8.1 patch notes (2026-06-22)
+
+Full-book DeepSeek retries exposed two post-v1.8 validation gaps. Joined
+run-preserving batch responses could contain malformed per-block marker
+structure, and long source-language blocks could be returned unchanged or
+nearly unchanged without failing the normal translation path. v1.8.1 validates
+joined runs per block, uses block-local marker requirements, detects copied
+source prose before checkpointing, and hardens optional double-check correction
+validation. Cached translations are included in double-check audits.
 
 ---
 

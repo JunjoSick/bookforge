@@ -1,6 +1,6 @@
 [package]
 name = "bookforge-cli"
-version = "1.8.0"
+version = "1.8.1"
 description = "CLI-first EPUB translation engine with deterministic structure rebuild and review loop."
 readme = "../../README.md"
 edition.workspace = true
@@ -14,11 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-bookforge-core = { version = "1.8.0", path = "../bookforge-core", features = ["cli"] }
-bookforge-epub = { version = "1.8.0", path = "../bookforge-epub" }
-bookforge-llm = { version = "1.8.0", path = "../bookforge-llm" }
-bookforge-pdf = { version = "1.8.0", path = "../bookforge-pdf" }
-bookforge-store = { version = "1.8.0", path = "../bookforge-store" }
+bookforge-core = { version = "1.8.1", path = "../bookforge-core", features = ["cli"] }
+bookforge-epub = { version = "1.8.1", path = "../bookforge-epub" }
+bookforge-llm = { version = "1.8.1", path = "../bookforge-llm" }
+bookforge-pdf = { version = "1.8.1", path = "../bookforge-pdf" }
+bookforge-store = { version = "1.8.1", path = "../bookforge-store" }
 clap.workspace = true
 console.workspace = true
 indicatif.workspace = true

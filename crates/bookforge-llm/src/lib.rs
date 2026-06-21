@@ -7,6 +7,7 @@ pub mod qa_batch;
 pub mod rate_controller;
 pub mod scheduler;
 pub mod telemetry;
+mod validation;
 
 pub use batch::{
     BatchItemFailure, BatchItemTranslation, BatchKind, BatchMode, BatchSizer,

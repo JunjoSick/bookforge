@@ -935,7 +935,12 @@ where
             "output was truncated: max_output_tokens limit reached".to_string(),
         ));
     }
-    let blocks = parse_and_validate(&response.content, segment, mode)?;
+    let validate_source_copy = crate::validation::should_validate_source_copy(
+        &config.provider,
+        config.source_language.as_deref(),
+        &config.target_language,
+    );
+    let blocks = parse_and_validate(&response.content, segment, mode, validate_source_copy)?;
 
     Ok(SegmentTranslation {
         segment_id: segment.id.clone(),
@@ -1194,6 +1199,7 @@ fn parse_and_validate(
     content: &str,
     segment: &Segment,
     mode: TranslationMode,
+    validate_source_copy: bool,
 ) -> Result<Vec<BlockTranslation>> {
     match mode {
         TranslationMode::Plain => {
@@ -1212,6 +1218,15 @@ fn parse_and_validate(
                 .unwrap_or(&[]);
             let translation = parsed.translation;
             validate_protected_spans(segment, expected_spans, &translation)?;
+            if validate_source_copy
+                && let Some(error) = crate::validation::source_copy_validation_error(
+                    &segment.source.text,
+                    &translation,
+                    segment.metadata.section_title.as_deref(),
+                )
+            {
+                return Err(LlmError::InvalidResponse(error));
+            }
             let block_id = segment
                 .block_ids
                 .first()
@@ -1269,6 +1284,18 @@ fn parse_and_validate(
                 let expected_markers = marker_ids_in_text(&source_block.text);
                 validate_markers(segment, &expected_markers, &translation)?;
                 validate_protected_spans(segment, &source_block.protected_spans, &translation)?;
+                if validate_source_copy
+                    && let Some(error) = crate::validation::source_copy_validation_error(
+                        &source_block.text,
+                        &translation,
+                        segment.metadata.section_title.as_deref(),
+                    )
+                {
+                    return Err(LlmError::InvalidResponse(format!(
+                        "segment '{}' block '{}': {error}",
+                        segment.id.0, source_block.block_id.0
+                    )));
+                }
                 translations.push(BlockTranslation {
                     block_id: source_block.block_id.clone(),
                     text: translation,
@@ -1320,6 +1347,18 @@ fn parse_and_validate(
                 let expected_markers = marker_ids_in_text(&source_block.text);
                 validate_markers(segment, &expected_markers, &text)?;
                 validate_protected_spans(segment, &source_block.protected_spans, &text)?;
+                if validate_source_copy
+                    && let Some(error) = crate::validation::source_copy_validation_error(
+                        &source_block.text,
+                        &text,
+                        segment.metadata.section_title.as_deref(),
+                    )
+                {
+                    return Err(LlmError::InvalidResponse(format!(
+                        "segment '{}' block '{}': {error}",
+                        segment.id.0, source_block.block_id.0
+                    )));
+                }
                 translations.push(BlockTranslation {
                     block_id: source_block.block_id.clone(),
                     text,
@@ -1616,6 +1655,25 @@ mod tests {
             translations[0].blocks[1].text,
             "[Italian] Second paragraph."
         );
+    }
+
+    #[test]
+    fn non_batch_parser_rejects_copied_source_prose() {
+        let source = "This deliberately long English paragraph contains enough ordinary prose to \
+            exercise untranslated-copy detection in a non-batch response. The provider returned \
+            the entire source paragraph unchanged instead of translating it into the requested \
+            target language, so validation must reject the response before checkpointing it.";
+        let segment = segment("seg_a", 0, vec![("b0", source)]);
+        let response = serde_json::json!({
+            "segment_id": "seg_a",
+            "translation": source,
+        })
+        .to_string();
+
+        let error = parse_and_validate(&response, &segment, TranslationMode::Plain, true)
+            .expect_err("long unchanged source prose should fail");
+
+        assert!(error.to_string().contains("source-language prose"));
     }
 
     #[tokio::test]

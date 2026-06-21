@@ -1,6 +1,7 @@
 use bookforge_core::{
     config::DoubleCheckConfig,
     ir::BlockId,
+    marker::{marker_ids_in_text, marker_structure_error, strip_marker_tokens},
     segment::{Segment, SegmentId, SegmentStatus},
 };
 use serde::Deserialize;
@@ -112,17 +113,30 @@ where
         .collect::<std::collections::HashMap<_, _>>();
 
     let mut items = Vec::new();
+    let mut deterministic_issues = Vec::new();
+    let validate_source_copy = crate::validation::should_validate_source_copy(
+        &config.provider,
+        config.source_language.as_deref(),
+        &config.target_language,
+    );
     for translation in translations {
         let Some(segment) = by_segment.get(translation.segment_id.0.as_str()) else {
             continue;
         };
-        if translation.status != SegmentStatus::Succeeded {
+        if !matches!(
+            translation.status,
+            SegmentStatus::Succeeded | SegmentStatus::SkippedCached
+        ) {
             continue;
         }
 
-        for (i, block_t) in translation.blocks.iter().enumerate() {
-            let block = segment.source.blocks.get(i);
-            items.push(DoubleCheckItem {
+        for block_t in &translation.blocks {
+            let block = segment
+                .source
+                .blocks
+                .iter()
+                .find(|block| block.block_id == block_t.block_id);
+            let item = DoubleCheckItem {
                 id: format!("{}:{}", segment.id.0, block_t.block_id.0),
                 segment_id: segment.id.0.clone(),
                 block_id: block_t.block_id.0.clone(),
@@ -130,17 +144,50 @@ where
                 kind: block.map(|b| b.kind.clone()).unwrap_or_default(),
                 source: block.map(|b| b.text.clone()).unwrap_or_default(),
                 translation: block_t.text.clone(),
-                required_markers: segment.constraints.preserve_markers.clone(),
+                required_markers: block
+                    .map(|block| marker_ids_in_text(&block.text))
+                    .unwrap_or_default(),
                 protected_spans: block.map(|b| b.protected_spans.clone()).unwrap_or_default(),
                 deterministic_warnings: Vec::new(),
-            });
+            };
+
+            let copied_message = if validate_source_copy {
+                crate::validation::source_copy_validation_error(
+                    &item.source,
+                    &item.translation,
+                    item.section_title.as_deref(),
+                )
+            } else {
+                None
+            };
+            if let Some(message) = copied_message {
+                deterministic_issues.push(CorrectionItem {
+                    item_id: item.id.clone(),
+                    segment_id: SegmentId(item.segment_id.clone()),
+                    block_id: BlockId(item.block_id.clone()),
+                    source: item.source.clone(),
+                    current_translation: item.translation.clone(),
+                    required_markers: item.required_markers.clone(),
+                    protected_spans: item.protected_spans.clone(),
+                    issues: vec![DoubleCheckIssue {
+                        severity: "high".to_string(),
+                        kind: "untranslated".to_string(),
+                        message,
+                        source_excerpt: None,
+                        translation_excerpt: None,
+                        needs_correction: true,
+                    }],
+                });
+            } else {
+                items.push(item);
+            }
         }
     }
 
     let chunk_size = double_check_config.batch_target_tokens.max(1);
     let chunks = chunk_double_check_items(&items, chunk_size);
 
-    let mut all_issues = Vec::new();
+    let mut all_issues = deterministic_issues;
     for chunk in &chunks {
         let audit_result =
             run_audit_chunk_resilient(&provider, library, chunk, config, double_check_config)
@@ -183,7 +230,11 @@ where
         .filter(|item| item.issues.iter().any(|i| i.needs_correction))
         .collect();
 
-    for corr_chunk in chunk_correction_items(&correction_items, chunk_size) {
+    // Correction responses are much more marker-sensitive than audit
+    // responses. Keep substantial prose blocks isolated even when the audit
+    // itself uses a large token budget.
+    let correction_chunk_size = chunk_size.min(800);
+    for corr_chunk in chunk_correction_items(&correction_items, correction_chunk_size) {
         let original_by_id: HashMap<&str, &CorrectionItem> = corr_chunk
             .iter()
             .map(|item| (item.item_id.as_str(), item))
@@ -595,12 +646,18 @@ fn validate_correction(item: &CorrectionItem) -> CorrectionStatus {
         );
     }
 
-    for marker in &item.required_markers {
-        if !text.contains(marker) {
-            return CorrectionStatus::RejectedValidationFailed(format!(
-                "missing required marker: {marker}"
-            ));
-        }
+    if let Some(error) = marker_structure_error(text) {
+        return CorrectionStatus::RejectedValidationFailed(error);
+    }
+
+    let mut expected_markers = item.required_markers.clone();
+    expected_markers.sort();
+    let mut actual_markers = marker_ids_in_text(text);
+    actual_markers.sort();
+    if actual_markers != expected_markers {
+        return CorrectionStatus::RejectedValidationFailed(format!(
+            "inline marker mismatch: expected {expected_markers:?}, got {actual_markers:?}"
+        ));
     }
 
     for span in &item.protected_spans {
@@ -611,7 +668,22 @@ fn validate_correction(item: &CorrectionItem) -> CorrectionStatus {
         }
     }
 
+    if item.issues.iter().any(|issue| issue.needs_correction)
+        && normalized_prose(&item.source) == normalized_prose(text)
+    {
+        return CorrectionStatus::RejectedValidationFailed(
+            "corrected translation is unchanged from the source".to_string(),
+        );
+    }
+
     CorrectionStatus::Applied
+}
+
+fn normalized_prose(text: &str) -> String {
+    strip_marker_tokens(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn double_check_mode_str(mode: bookforge_core::config::DoubleCheckMode) -> &'static str {
@@ -815,6 +887,199 @@ mod tests {
         assert_eq!(record.original_translation, "errato");
         assert_eq!(record.corrected_translation.as_deref(), Some("corretto"));
         assert!(matches!(record.status, CorrectionStatus::Applied));
+    }
+
+    #[tokio::test]
+    async fn cached_translations_are_included_in_double_check() {
+        let provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg:b","verdict":"pass","issues":[]}]}"#.to_string(),
+        ]);
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: false,
+            correction_rounds: 1,
+        };
+        let mut cached = translation();
+        cached.status = SegmentStatus::SkippedCached;
+
+        let records = run_double_check(
+            provider,
+            &[segment()],
+            &[cached],
+            &run_config(),
+            &double_check,
+        )
+        .await
+        .expect("cached translation should be audited");
+
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_long_source_copy_is_corrected_without_audit_detection() {
+        let source = "This is a deliberately long English paragraph that remains identical in the \
+            translation output, so the deterministic untranslated-prose guard must send it directly \
+            to correction even when the selected audit mode is formatting only.";
+        let provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg:b","corrected_translation":"Questo lungo paragrafo inglese è stato tradotto correttamente in italiano."}]}"#
+                .to_string(),
+        ]);
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: true,
+            correction_rounds: 1,
+        };
+        let mut source_segment = segment();
+        source_segment.source.text = source.to_string();
+        source_segment.source.blocks[0].text = source.to_string();
+        let copied = translation_with_id("seg", "b", source);
+
+        let records = run_double_check(
+            provider,
+            &[source_segment],
+            &[copied],
+            &run_config(),
+            &double_check,
+        )
+        .await
+        .expect("exact source copy should be corrected");
+
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0].status, CorrectionStatus::Applied));
+    }
+
+    #[tokio::test]
+    async fn same_language_double_check_allows_unchanged_prose() {
+        let source = "This is a deliberately long paragraph used for a same-language editing run, \
+            where unchanged prose is valid and must still be sent through the configured audit \
+            instead of being classified as an untranslated cross-language response.";
+        let provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg:b","verdict":"pass","issues":[]}]}"#.to_string(),
+        ]);
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: false,
+            correction_rounds: 1,
+        };
+        let mut source_segment = segment();
+        source_segment.source.text = source.to_string();
+        source_segment.source.blocks[0].text = source.to_string();
+        let copied = translation_with_id("seg", "b", source);
+        let mut same_language = run_config();
+        same_language.target_language = "English".to_string();
+
+        let records = run_double_check(
+            provider,
+            &[source_segment],
+            &[copied],
+            &same_language,
+            &double_check,
+        )
+        .await
+        .expect("same-language prose should be audited normally");
+
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn correction_validates_only_the_markers_from_its_source_block() {
+        let prose = "This long English source paragraph contains one inline marker and enough prose \
+            to trigger deterministic correction because it was copied unchanged by the translator.";
+        let source = format!("<m1>{prose}</m1>");
+        let provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg:b","corrected_translation":"<m1>Questo paragrafo è ora tradotto in italiano.</m1>"}]}"#
+                .to_string(),
+        ]);
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: true,
+            correction_rounds: 1,
+        };
+        let mut source_segment = segment();
+        source_segment.source.text = source.clone();
+        source_segment.source.blocks[0].text = source.clone();
+        source_segment.constraints.preserve_markers = vec!["m1".into(), "m2".into()];
+        let copied = translation_with_id("seg", "b", &source);
+
+        let records = run_double_check(
+            provider,
+            &[source_segment],
+            &[copied],
+            &run_config(),
+            &double_check,
+        )
+        .await
+        .expect("block-local marker correction should succeed");
+
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0].status, CorrectionStatus::Applied));
+    }
+
+    #[tokio::test]
+    async fn malformed_corrected_marker_structure_is_rejected() {
+        let prose = "This long English source paragraph contains one inline marker and enough prose \
+            to trigger deterministic correction because it was copied unchanged by the translator.";
+        let source = format!("<m1>{prose}</m1>");
+        let provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg:b","corrected_translation":"<m1>Traduzione senza chiusura"}]}"#
+                .to_string(),
+        ]);
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: true,
+            correction_rounds: 1,
+        };
+        let mut source_segment = segment();
+        source_segment.source.text = source.clone();
+        source_segment.source.blocks[0].text = source.clone();
+        source_segment.constraints.preserve_markers = vec!["m1".into()];
+        let copied = translation_with_id("seg", "b", &source);
+
+        let records = run_double_check(
+            provider,
+            &[source_segment],
+            &[copied],
+            &run_config(),
+            &double_check,
+        )
+        .await
+        .expect("malformed correction should be recorded");
+
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records[0].status,
+            CorrectionStatus::RejectedValidationFailed(_)
+        ));
     }
 
     #[tokio::test]

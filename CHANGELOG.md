@@ -1,5 +1,35 @@
 # Changelog
 
+## v1.8.1 - 2026-06-22
+
+BookForge v1.8.1 hardens translation-response validation after full-book
+DeepSeek testing exposed malformed markers and untranslated prose that could
+otherwise reach a checkpoint and be preserved by the EPUB writer.
+
+### Fixes
+
+- Validate each run-preserving batch item after its runs are joined, rejecting
+  malformed, missing, duplicated, or unknown inline markers before
+  checkpointing.
+- Use block-local markers throughout batch construction and double-checking
+  instead of requiring markers that belong to sibling blocks.
+- Reject long unchanged or nearly unchanged source-language prose in normal
+  batch, turbo, and non-batch translation paths, while exempting
+  notes/bibliography-style sections and same-language/mock runs.
+- Include cached translations in double-check audits and match source blocks
+  by stable block ID instead of array position.
+- Route deterministic untranslated-copy findings directly to correction, use
+  smaller correction batches, and reject malformed-marker or unchanged
+  corrections.
+
+### Validation
+
+- Full locked workspace tests, formatting, clippy, and release build.
+- Package contents verified for all six crates; the `bookforge-core` package
+  also completed registry-resolution and compile verification.
+- EPUBCheck 5.3.0 and BookForge validation of both full EPUB fixtures.
+- Structural and text-coverage verification of the available PDF fixture.
+
 ## v1.8.0 - 2026-06-20
 
 BookForge v1.8 adds the structural-credibility layer planned in ROADMAP
