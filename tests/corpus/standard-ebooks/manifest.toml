@@ -20,8 +20,8 @@ id = "shelley-frankenstein"
 title = "Frankenstein"
 author = "Mary Shelley"
 url = "https://standardebooks.org/ebooks/mary-shelley/frankenstein/downloads/mary-shelley_frankenstein.epub?source=download"
-sha256 = "17189c3000a4a8bffcedf77310844c9b0e017af6decbb186e465565107a33c52"
-size_bytes = 633853
+sha256 = "a58d516b6535e0e00ef3a9845711da7ca3ea7d3573257412faeb5a8b912189ea"
+size_bytes = 633890
 features = ["letters", "nested_quotes", "roman_numerals"]
 ci_tier = "small"
 
@@ -30,8 +30,8 @@ id = "wilde-dorian-gray"
 title = "The Picture of Dorian Gray"
 author = "Oscar Wilde"
 url = "https://standardebooks.org/ebooks/oscar-wilde/the-picture-of-dorian-gray/downloads/oscar-wilde_the-picture-of-dorian-gray.epub?source=download"
-sha256 = "0e8270daa8d87daaf48932a6989acc2755db073c697248a272a4342f120a9e43"
-size_bytes = 556798
+sha256 = "765c9a9b1cdab4b7a52f4fbd790ccd31a758ab60bee2f9924cee25054d1e43fd"
+size_bytes = 556835
 features = ["dialogue_heavy", "epigraph", "italics"]
 ci_tier = "small"
 
