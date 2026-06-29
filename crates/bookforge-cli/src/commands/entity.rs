@@ -218,6 +218,7 @@ fn list_entities(store: &JobStore, args: ListArgs) -> Result<()> {
 }
 
 fn clear_entities(store: &JobStore, args: ClearArgs) -> Result<()> {
+    validate_scope(args.scope, args.scope_id.as_deref())?;
     let count = store.clear_entities_scope(args.scope, args.scope_id.as_deref())?;
     println!("Cleared {count} entity rows.");
     Ok(())

@@ -1477,7 +1477,7 @@ fn validation_retry_appendix(segment: &Segment, mode: TranslationMode, error: &s
 
 fn validate_protected_spans(segment: &Segment, spans: &[String], translation: &str) -> Result<()> {
     for span in spans {
-        if !protected_span_present(span, translation) {
+        if !crate::validation::protected_span_present(span, translation) {
             return Err(LlmError::InvalidResponse(format!(
                 "protected span missing from segment '{}': {}",
                 segment.id.0, span
@@ -1485,136 +1485,6 @@ fn validate_protected_spans(segment: &Segment, spans: &[String], translation: &s
         }
     }
     Ok(())
-}
-
-fn protected_span_present(span: &str, translation: &str) -> bool {
-    dangling_numeric_span(span)
-        || translation.contains(span)
-        || compact_numeric_punctuation_span(span)
-            .is_some_and(|expected| compact_ascii_whitespace(translation).contains(&expected))
-        || canonical_decimal_number(span).is_some_and(|expected| {
-            numeric_runs(translation)
-                .iter()
-                .any(|candidate| canonical_decimal_number(candidate).as_deref() == Some(&expected))
-        })
-}
-
-fn dangling_numeric_span(value: &str) -> bool {
-    let normalized = normalize_number_signs(value);
-    let trimmed = normalized.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
-        )
-    });
-    trimmed.ends_with('-') && trimmed.chars().any(|ch| ch.is_ascii_digit())
-}
-
-fn compact_numeric_punctuation_span(value: &str) -> Option<String> {
-    let normalized = normalize_number_signs(value);
-    let trimmed = normalized.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
-        )
-    });
-    let digits = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
-    if digits < 2 {
-        return None;
-    }
-    if !trimmed.chars().all(|ch| {
-        ch.is_ascii_digit()
-            || ch.is_ascii_whitespace()
-            || matches!(
-                ch,
-                '.' | ',' | ';' | ':' | '/' | '-' | '+' | '%' | '$' | '(' | ')'
-            )
-    }) {
-        return None;
-    }
-    Some(compact_ascii_whitespace(trimmed))
-}
-
-fn compact_ascii_whitespace(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace())
-        .collect()
-}
-
-fn canonical_decimal_number(value: &str) -> Option<String> {
-    let normalized = normalize_number_signs(value);
-    let trimmed = normalized.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
-        )
-    });
-    if trimmed.is_empty() || !trimmed.chars().any(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    let percent = trimmed.ends_with('%');
-    let numeric = trimmed.strip_suffix('%').unwrap_or(trimmed);
-    if !numeric
-        .chars()
-        .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+'))
-    {
-        return None;
-    }
-    if numeric.matches('.').count() + numeric.matches(',').count() > 1 {
-        return None;
-    }
-    let separator = numeric.find('.').or_else(|| numeric.find(','));
-    let mut canonical = match separator {
-        Some(index) => {
-            let (whole, fractional_with_separator) = numeric.split_at(index);
-            let fractional = &fractional_with_separator[1..];
-            if whole.is_empty()
-                || fractional.is_empty()
-                || !whole
-                    .trim_start_matches(['-', '+'])
-                    .chars()
-                    .all(|ch| ch.is_ascii_digit())
-                || !fractional.chars().all(|ch| ch.is_ascii_digit())
-            {
-                return None;
-            }
-            format!("{whole}.{fractional}")
-        }
-        None => numeric.to_string(),
-    };
-    if percent {
-        canonical.push('%');
-    }
-    Some(canonical)
-}
-
-fn numeric_runs(text: &str) -> Vec<String> {
-    let mut runs = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        if ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+' | '%' | '−' | '–' | '—')
-        {
-            current.push(normalize_number_sign(ch));
-        } else if !current.is_empty() {
-            runs.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        runs.push(current);
-    }
-    runs
-}
-
-fn normalize_number_signs(value: &str) -> String {
-    value.chars().map(normalize_number_sign).collect()
-}
-
-fn normalize_number_sign(ch: char) -> char {
-    match ch {
-        '−' | '–' | '—' => '-',
-        _ => ch,
-    }
 }
 
 fn validate_markers(segment: &Segment, expected: &[String], translation: &str) -> Result<()> {

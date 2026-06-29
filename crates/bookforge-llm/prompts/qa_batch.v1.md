@@ -24,6 +24,18 @@ Return JSON only:
 
 Review these items:
 
+Active style guide:
+
+```txt
+{{style_guide_block}}
+```
+
+Entity grammatical agreement:
+
+```txt
+{{entity_agreement_block}}
+```
+
 {{items_json}}
 
 Return JSON only.

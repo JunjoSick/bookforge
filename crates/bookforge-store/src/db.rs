@@ -1382,7 +1382,25 @@ impl JobStore {
     pub fn upsert_style_sheet(&self, record: &NewStyleSheet<'_>) -> Result<i64> {
         let conn = self.conn.borrow();
         let now = timestamp_string();
-        conn.execute(
+        let updated = conn.execute(
+            "UPDATE style_sheets
+             SET content_toml = ?1,
+                 fingerprint = ?2,
+                 updated_at = ?3
+             WHERE scope_kind = ?4
+               AND ((?5 IS NULL AND scope_id IS NULL) OR scope_id = ?5)
+               AND target_language = ?6",
+            params![
+                record.content_toml,
+                record.fingerprint,
+                &now,
+                record.scope_kind.as_str(),
+                record.scope_id,
+                record.target_language,
+            ],
+        )?;
+        if updated == 0 {
+            conn.execute(
             "INSERT INTO style_sheets
                 (scope_kind, scope_id, target_language, content_toml, fingerprint, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
@@ -1396,9 +1414,10 @@ impl JobStore {
                 record.target_language,
                 record.content_toml,
                 record.fingerprint,
-                now,
+                    &now,
             ],
-        )?;
+            )?;
+        }
         let id: i64 = conn.query_row(
             "SELECT id FROM style_sheets
                 WHERE scope_kind = ?1 AND IFNULL(scope_id, '') = IFNULL(?2, '')
@@ -1500,18 +1519,44 @@ impl JobStore {
         let now = timestamp_string();
         let mut changed = 0usize;
         for entity in entities {
-            conn.execute(
-                "INSERT INTO entities
-                    (scope_kind, scope_id, source_name, target_name, gender_target,
-                     role, notes, source_language, target_language, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
-                 ON CONFLICT(scope_kind, scope_id, source_name, source_language, target_language)
-                 DO UPDATE SET
-                    target_name = excluded.target_name,
-                    gender_target = excluded.gender_target,
-                    role = excluded.role,
-                    notes = excluded.notes,
-                    updated_at = excluded.updated_at",
+            let updated = conn.execute(
+                "UPDATE entities
+                 SET target_name = ?1,
+                     gender_target = ?2,
+                     role = ?3,
+                     notes = ?4,
+                     updated_at = ?5
+                 WHERE scope_kind = ?6
+                   AND ((?7 IS NULL AND scope_id IS NULL) OR scope_id = ?7)
+                   AND source_name = ?8
+                   AND source_language = ?9
+                   AND target_language = ?10",
+                params![
+                    entity.target_name,
+                    entity.gender_target.map(|g| g.as_short()),
+                    entity.role,
+                    entity.notes,
+                    &now,
+                    entity.scope_kind.as_str(),
+                    entity.scope_id,
+                    entity.source_name,
+                    entity.source_language,
+                    entity.target_language,
+                ],
+            )?;
+            if updated == 0 {
+                conn.execute(
+                    "INSERT INTO entities
+                        (scope_kind, scope_id, source_name, target_name, gender_target,
+                         role, notes, source_language, target_language, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+                     ON CONFLICT(scope_kind, scope_id, source_name, source_language, target_language)
+                     DO UPDATE SET
+                        target_name = excluded.target_name,
+                        gender_target = excluded.gender_target,
+                        role = excluded.role,
+                        notes = excluded.notes,
+                        updated_at = excluded.updated_at",
                 params![
                     entity.scope_kind.as_str(),
                     entity.scope_id,
@@ -1522,9 +1567,10 @@ impl JobStore {
                     entity.notes,
                     entity.source_language,
                     entity.target_language,
-                    now,
+                        &now,
                 ],
-            )?;
+                )?;
+            }
             changed += 1;
         }
         Ok(changed)
@@ -2561,6 +2607,87 @@ mod tests {
             std::process::id(),
             unix_timestamp_nanos()
         ))
+    }
+
+    #[test]
+    fn global_style_sheet_upsert_updates_null_scope_row() {
+        let db_path = temp_path("style_global_upsert.sqlite");
+        let store = JobStore::open(&db_path).expect("store opens");
+        let first = NewStyleSheet {
+            scope_kind: bookforge_core::GlossaryScopeKind::Global,
+            scope_id: None,
+            target_language: "Italian",
+            content_toml: "first",
+            fingerprint: "fp1",
+        };
+        let second = NewStyleSheet {
+            content_toml: "second",
+            fingerprint: "fp2",
+            ..first
+        };
+
+        let first_id = store
+            .upsert_style_sheet(&first)
+            .expect("first style upsert");
+        let second_id = store
+            .upsert_style_sheet(&second)
+            .expect("second style upsert");
+
+        assert_eq!(first_id, second_id);
+        let rows = store
+            .list_style_sheets(
+                Some("Italian"),
+                Some(bookforge_core::GlossaryScopeKind::Global),
+                None,
+            )
+            .expect("style rows list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content_toml, "second");
+        assert_eq!(rows[0].fingerprint, "fp2");
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn global_entity_upsert_updates_null_scope_row() {
+        let db_path = temp_path("entity_global_upsert.sqlite");
+        let store = JobStore::open(&db_path).expect("store opens");
+        let first = NewEntity {
+            scope_kind: bookforge_core::GlossaryScopeKind::Global,
+            scope_id: None,
+            source_name: "Ivan",
+            target_name: "Ivan",
+            gender_target: Some(bookforge_core::entity::EntityGender::Masculine),
+            role: Some("first"),
+            notes: Some("old"),
+            source_language: "English",
+            target_language: "Italian",
+        };
+        let second = NewEntity {
+            target_name: "Giovanni",
+            role: Some("second"),
+            notes: Some("new"),
+            ..first
+        };
+
+        assert_eq!(store.upsert_entities(&[first]).expect("first entity"), 1);
+        assert_eq!(store.upsert_entities(&[second]).expect("second entity"), 1);
+
+        let rows = store
+            .list_entities(
+                Some("English"),
+                Some("Italian"),
+                Some(bookforge_core::GlossaryScopeKind::Global),
+                None,
+            )
+            .expect("entity rows list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_name, "Ivan");
+        assert_eq!(rows[0].target_name, "Giovanni");
+        assert_eq!(rows[0].role.as_deref(), Some("second"));
+        assert_eq!(rows[0].notes.as_deref(), Some("new"));
+
+        let _ = fs::remove_file(db_path);
     }
 
     fn build_seeded_store_with_translation(

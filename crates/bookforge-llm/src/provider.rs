@@ -137,10 +137,6 @@ impl MockProvider {
 impl LlmProvider for MockProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let started = Instant::now();
-        let segment_id =
-            request.metadata.segment_id.clone().ok_or_else(|| {
-                LlmError::Provider("mock request is missing segment_id".to_string())
-            })?;
 
         if self.mode == MockMode::MalformedJson {
             return Ok(CompletionResponse {
@@ -154,11 +150,6 @@ impl LlmProvider for MockProvider {
             });
         }
 
-        let response_segment_id = if self.mode == MockMode::WrongSegmentId {
-            "wrong_segment".to_string()
-        } else {
-            segment_id
-        };
         let template = request
             .metadata
             .prompt_template
@@ -166,73 +157,102 @@ impl LlmProvider for MockProvider {
             .unwrap_or("translate_segment");
         let block_ids = &request.metadata.block_ids;
 
-        let content = match template {
-            "translate_marker_safe" => {
-                let block_sources = extract_block_sources_from_json(&request.user, block_ids);
-                let blocks = block_ids
-                    .iter()
-                    .map(|block_id| {
-                        let source = block_sources
-                            .get(block_id.as_str())
-                            .cloned()
-                            .unwrap_or_default();
-                        let translated = transform_text(self.mode, &self.target_language, &source);
-                        json!({
-                            "block_id": block_id,
-                            "translation": translated,
-                        })
+        let content = if template == "qa_batch" {
+            let reviews = extract_qa_batch_item_ids(&request.user)
+                .into_iter()
+                .map(|id| {
+                    let review_id = if self.mode == MockMode::WrongSegmentId {
+                        "wrong_segment".to_string()
+                    } else {
+                        id
+                    };
+                    json!({
+                        "id": review_id,
+                        "verdict": "pass",
+                        "issues": [],
                     })
-                    .collect::<Vec<_>>();
-                serde_json::to_string(&json!({
-                    "segment_id": response_segment_id,
-                    "blocks": blocks,
-                }))?
-            }
-            "translate_run_preserving" => {
-                let run_sources = extract_run_sources_from_json(&request.user, block_ids);
-                let blocks = block_ids
-                    .iter()
-                    .map(|block_id| {
-                        let runs = run_sources
-                            .get(block_id.as_str())
-                            .cloned()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|(id, source)| {
-                                json!({
-                                    "id": id,
-                                    "text": transform_run_text(
-                                        self.mode,
-                                        &self.target_language,
-                                        &source,
-                                    ),
-                                })
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string(&json!({ "reviews": reviews }))?
+        } else {
+            let segment_id = request.metadata.segment_id.clone().ok_or_else(|| {
+                LlmError::Provider("mock request is missing segment_id".to_string())
+            })?;
+            let response_segment_id = if self.mode == MockMode::WrongSegmentId {
+                "wrong_segment".to_string()
+            } else {
+                segment_id
+            };
+
+            match template {
+                "translate_marker_safe" => {
+                    let block_sources = extract_block_sources_from_json(&request.user, block_ids);
+                    let blocks = block_ids
+                        .iter()
+                        .map(|block_id| {
+                            let source = block_sources
+                                .get(block_id.as_str())
+                                .cloned()
+                                .unwrap_or_default();
+                            let translated =
+                                transform_text(self.mode, &self.target_language, &source);
+                            json!({
+                                "block_id": block_id,
+                                "translation": translated,
                             })
-                            .collect::<Vec<_>>();
-                        json!({
-                            "block_id": block_id,
-                            "translated_runs": runs,
                         })
-                    })
-                    .collect::<Vec<_>>();
-                serde_json::to_string(&json!({
+                        .collect::<Vec<_>>();
+                    serde_json::to_string(&json!({
+                        "segment_id": response_segment_id,
+                        "blocks": blocks,
+                    }))?
+                }
+                "translate_run_preserving" => {
+                    let run_sources = extract_run_sources_from_json(&request.user, block_ids);
+                    let blocks = block_ids
+                        .iter()
+                        .map(|block_id| {
+                            let runs = run_sources
+                                .get(block_id.as_str())
+                                .cloned()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|(id, source)| {
+                                    json!({
+                                        "id": id,
+                                        "text": transform_run_text(
+                                            self.mode,
+                                            &self.target_language,
+                                            &source,
+                                        ),
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            json!({
+                                "block_id": block_id,
+                                "translated_runs": runs,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    serde_json::to_string(&json!({
+                        "segment_id": response_segment_id,
+                        "blocks": blocks,
+                    }))?
+                }
+                "qa_segment" => serde_json::to_string(&json!({
                     "segment_id": response_segment_id,
-                    "blocks": blocks,
-                }))?
-            }
-            "qa_segment" => serde_json::to_string(&json!({
-                "segment_id": response_segment_id,
-                "verdict": "pass",
-                "issues": [],
-            }))?,
-            _ => {
-                let source =
-                    extract_plain_source(&request.user).unwrap_or_else(|| request.user.clone());
-                let translation = transform_text(self.mode, &self.target_language, &source);
-                serde_json::to_string(&json!({
-                    "segment_id": response_segment_id,
-                    "translation": translation,
-                }))?
+                    "verdict": "pass",
+                    "issues": [],
+                }))?,
+                _ => {
+                    let source =
+                        extract_plain_source(&request.user).unwrap_or_else(|| request.user.clone());
+                    let translation = transform_text(self.mode, &self.target_language, &source);
+                    serde_json::to_string(&json!({
+                        "segment_id": response_segment_id,
+                        "translation": translation,
+                    }))?
+                }
             }
         };
 
@@ -394,6 +414,30 @@ fn extract_run_sources_from_json<'a>(
     }
 
     sources
+}
+
+fn extract_qa_batch_item_ids(user_prompt: &str) -> Vec<String> {
+    user_prompt
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('[') {
+                return None;
+            }
+            let parsed: Vec<serde_json::Value> = serde_json::from_str(trimmed).ok()?;
+            let ids = parsed
+                .into_iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .collect::<Vec<_>>();
+            if ids.is_empty() { None } else { Some(ids) }
+        })
+        .unwrap_or_default()
 }
 
 /// Recover the plain-mode source segment from a rendered prompt by reading

@@ -213,7 +213,7 @@ where
 
     let mut records: Vec<CorrectionRecord> = all_issues
         .iter()
-        .filter(|item| is_audit_unresolved_item(item))
+        .filter(|item| !item.issues.iter().any(|issue| issue.needs_correction))
         .map(|item| CorrectionRecord {
             item_id: item.item_id.clone(),
             segment_id: item.segment_id.clone(),
@@ -376,6 +376,7 @@ fn is_json_shape_error(error: &LlmError) -> bool {
 }
 
 const AUDIT_UNRESOLVED_KIND: &str = "audit_unavailable";
+const AUDIT_OMITTED_KIND: &str = "audit_omitted";
 
 fn audit_unresolved_issue(error: &LlmError) -> DoubleCheckIssue {
     DoubleCheckIssue {
@@ -388,10 +389,15 @@ fn audit_unresolved_issue(error: &LlmError) -> DoubleCheckIssue {
     }
 }
 
-fn is_audit_unresolved_item(item: &CorrectionItem) -> bool {
-    item.issues
-        .iter()
-        .any(|issue| issue.kind == AUDIT_UNRESOLVED_KIND)
+fn audit_omitted_issue() -> DoubleCheckIssue {
+    DoubleCheckIssue {
+        severity: "minor".to_string(),
+        kind: AUDIT_OMITTED_KIND.to_string(),
+        message: "double-check audit provider response omitted this item".to_string(),
+        source_excerpt: None,
+        translation_excerpt: None,
+        needs_correction: false,
+    }
 }
 
 async fn run_audit_chunk_resilient<P>(
@@ -482,10 +488,14 @@ where
     let item_map: std::collections::HashMap<&str, &DoubleCheckItem> =
         items.iter().map(|item| (item.id.as_str(), item)).collect();
 
+    let mut seen_ids = BTreeSet::new();
     for result in &parsed.items {
         let Some(source_item) = item_map.get(result.id.as_str()) else {
             continue;
         };
+        if !seen_ids.insert(result.id.clone()) {
+            continue;
+        }
         if result.verdict == "pass" && result.issues.is_empty() {
             continue;
         }
@@ -498,6 +508,22 @@ where
             required_markers: source_item.required_markers.clone(),
             protected_spans: source_item.protected_spans.clone(),
             issues: result.issues.clone(),
+        });
+    }
+
+    for source_item in items {
+        if seen_ids.contains(source_item.id.as_str()) {
+            continue;
+        }
+        corrections.push(CorrectionItem {
+            item_id: source_item.id.clone(),
+            segment_id: bookforge_core::segment::SegmentId(source_item.segment_id.clone()),
+            block_id: BlockId(source_item.block_id.clone()),
+            source: source_item.source.clone(),
+            current_translation: source_item.translation.clone(),
+            required_markers: source_item.required_markers.clone(),
+            protected_spans: source_item.protected_spans.clone(),
+            issues: vec![audit_omitted_issue()],
         });
     }
 
@@ -1113,6 +1139,77 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].corrected_translation, None);
         assert!(matches!(records[0].status, CorrectionStatus::Unresolved));
+    }
+
+    #[tokio::test]
+    async fn auto_correct_keeps_non_corrective_audit_warnings() {
+        let provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg:b","verdict":"fail","issues":[{"severity":"minor","kind":"style","message":"awkward phrasing","source_excerpt":null,"translation_excerpt":null,"needs_correction":false}]}]}"#.to_string(),
+        ]);
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: true,
+            correction_rounds: 1,
+        };
+
+        let records = run_double_check(
+            provider,
+            &[segment()],
+            &[translation()],
+            &run_config(),
+            &double_check,
+        )
+        .await
+        .expect("non-corrective audit warning should be recorded");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].item_id, "seg:b");
+        assert_eq!(records[0].corrected_translation, None);
+        assert!(matches!(records[0].status, CorrectionStatus::Unresolved));
+        assert_eq!(records[0].issues[0].kind, "style");
+    }
+
+    #[tokio::test]
+    async fn omitted_audit_items_are_recorded_unresolved() {
+        let provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg_a:a","verdict":"pass","issues":[]}]}"#.to_string(),
+        ]);
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: false,
+            correction_rounds: 1,
+        };
+
+        let records = run_double_check(
+            provider,
+            &[segment_with_id("seg_a", "a"), segment_with_id("seg_b", "b")],
+            &[
+                translation_with_id("seg_a", "a", "corretto a"),
+                translation_with_id("seg_b", "b", "corretto b"),
+            ],
+            &run_config(),
+            &double_check,
+        )
+        .await
+        .expect("omitted audit item should be recorded");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].item_id, "seg_b:b");
+        assert_eq!(records[0].corrected_translation, None);
+        assert!(matches!(records[0].status, CorrectionStatus::Unresolved));
+        assert_eq!(records[0].issues[0].kind, "audit_omitted");
     }
 
     #[tokio::test]

@@ -9,4 +9,4 @@ pub use validate::{
     EpubValidationIssue, EpubValidationReport, ValidationSeverity, validate_block_translations,
     validate_translated_epub,
 };
-pub use writer::rebuild_epub;
+pub use writer::{rebuild_epub, rebuild_epub_with_language};

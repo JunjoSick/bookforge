@@ -1,8 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::Read,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use bookforge_core::{
@@ -149,6 +149,12 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         blocks.append(&mut toc_blocks);
     }
 
+    let spine_idrefs = package
+        .spine
+        .iter()
+        .map(|item| item.idref.clone())
+        .collect::<HashSet<_>>();
+
     for (spine_index, spine_item) in package.spine.iter_mut().enumerate() {
         let Some(resource) = manifest_by_id.get(spine_item.idref.as_str()) else {
             return Err(BookforgeError::InvalidInput(format!(
@@ -187,6 +193,37 @@ pub fn read_epub(path: &Path) -> Result<Book> {
             next: None,
         });
         blocks.append(&mut section_blocks);
+    }
+
+    let spine_len = package.spine.len();
+    for (nav_index, resource) in package
+        .manifest
+        .iter()
+        .filter(|item| is_nav_item(item) && !spine_idrefs.contains(&item.id))
+        .enumerate()
+    {
+        let href = join_epub_path(&package_dir, &resource.href);
+        let xhtml = read_archive_text(&mut archive, &href)?;
+        let section_id = SectionId(format!("sec_nav_{nav_index:06}"));
+        let mut nav_blocks = extract_blocks(&xhtml, &href, &section_id, blocks.len())?;
+        if nav_blocks.is_empty() {
+            continue;
+        }
+        let block_ids = nav_blocks
+            .iter()
+            .map(|block| block.id.clone())
+            .collect::<Vec<_>>();
+        sections.push(Section {
+            id: section_id,
+            href,
+            spine_index: spine_len + nav_index,
+            title: Some("EPUB navigation".to_string()),
+            heading_level: None,
+            block_ids,
+            prev: None,
+            next: None,
+        });
+        blocks.append(&mut nav_blocks);
     }
 
     link_sections(&mut sections);
@@ -437,6 +474,7 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
                 b"title" | b"creator" | b"language" => {
                     current_text_element = Some(local_name(element.name().as_ref()).to_vec());
                 }
+                b"item" => manifest.push(parse_manifest_item(&reader, &element)?),
                 b"spine" => {
                     toc_id = attr_value(&reader, &element, b"toc")?;
                 }
@@ -1342,19 +1380,66 @@ fn package_base_dir(package_path: &str) -> String {
 }
 
 fn join_epub_path(base: &str, href: &str) -> String {
+    let href = href
+        .split('#')
+        .next()
+        .unwrap_or(href)
+        .split('?')
+        .next()
+        .unwrap_or(href);
+    let href = percent_decode_epub_path(href);
     if base.is_empty() {
-        normalize_epub_path(href)
+        normalize_epub_path(&href)
     } else {
         normalize_epub_path(&format!("{base}/{href}"))
     }
 }
 
 fn normalize_epub_path(path: &str) -> String {
-    let mut normalized = PathBuf::new();
+    let mut normalized = Vec::new();
     for component in Path::new(path).components() {
-        normalized.push(component.as_os_str());
+        match component {
+            std::path::Component::Normal(value) => {
+                normalized.push(value.to_string_lossy().to_string());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+        }
     }
-    normalized.to_string_lossy().replace('\\', "/")
+    normalized.join("/")
+}
+
+fn percent_decode_epub_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).to_string())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn local_name(name: &[u8]) -> &[u8] {
@@ -1364,6 +1449,41 @@ fn local_name(name: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opf_manifest_items_can_use_start_end_tags() {
+        let package = parse_package(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Title</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="Text/ch1.xhtml" media-type="application/xhtml+xml"></item>
+  </manifest>
+  <spine>
+    <itemref idref="ch1"></itemref>
+  </spine>
+</package>"#,
+        )
+        .expect("package should parse");
+
+        assert_eq!(package.manifest.len(), 1);
+        assert_eq!(package.manifest[0].href, "Text/ch1.xhtml");
+        assert_eq!(package.spine.len(), 1);
+    }
+
+    #[test]
+    fn opf_href_paths_are_percent_decoded_and_normalized() {
+        assert_eq!(
+            join_epub_path("OPS", "Text/../Text/Chapter%201.xhtml#frag"),
+            "OPS/Text/Chapter 1.xhtml"
+        );
+        assert_eq!(
+            join_epub_path("OPS/package", "../Text/%E2%82%AC.xhtml"),
+            "OPS/Text/\u{20ac}.xhtml"
+        );
+    }
 
     #[test]
     fn extracts_inline_marks_and_marker_text_runs() {

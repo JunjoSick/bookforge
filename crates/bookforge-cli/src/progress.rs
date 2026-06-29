@@ -412,8 +412,9 @@ impl ProgressBars {
                 failed,
                 ..
             } => {
-                let done = *succeeded + *c;
-                self.seg_bar.set_position(done as u64);
+                let done = *succeeded + *c + *needs_review + *failed;
+                self.done_segments = done;
+                self.seg_bar.set_position(self.done_segments as u64);
                 self.seg_bar.finish_with_message(format!(
                     "{done} done, {} needs review, {} failed",
                     *needs_review, *failed
@@ -492,6 +493,31 @@ mod tests {
     fn ui_quiet_always_uses_quiet() {
         assert_eq!(resolve_render_mode(UiMode::Quiet, false), RenderMode::Quiet);
         assert_eq!(resolve_render_mode(UiMode::Quiet, true), RenderMode::Quiet);
+    }
+
+    #[test]
+    fn translation_finished_counts_all_terminal_segments() {
+        let mut bars = ProgressBars::new().expect("progress bars should initialize");
+        bars.handle_event(&ProgressEvent::SegmentationFinished {
+            segment_count: 4,
+            timestamp_ms: 0,
+        })
+        .expect("segmentation event should render");
+
+        bars.handle_event(&ProgressEvent::TranslationFinished {
+            succeeded: 1,
+            cached: 1,
+            needs_review: 1,
+            failed: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            elapsed_ms: 0,
+            timestamp_ms: 0,
+        })
+        .expect("translation finished event should render");
+
+        assert_eq!(bars.done_segments, 4);
+        assert_eq!(bars.seg_bar.position(), 4);
     }
 
     /// With --progress-jsonl set, events are written to file regardless of

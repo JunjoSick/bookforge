@@ -36,8 +36,8 @@ fn builds_basic_ir_from_minimal_epub() {
     let fixture = create_minimal_epub();
     let book = read_epub(&fixture).expect("fixture should parse into IR");
 
-    assert_eq!(book.sections.len(), 2);
-    assert_eq!(book.blocks.len(), 3);
+    assert_eq!(book.sections.len(), 3);
+    assert_eq!(book.blocks.len(), 5);
     assert!(book.blocks.iter().any(|block| {
         block.kind == BlockKind::Paragraph && block_text(block) == "Generated Bookforge Fixture"
     }));
@@ -47,6 +47,11 @@ fn builds_basic_ir_from_minimal_epub() {
     assert!(book.blocks.iter().any(|block| {
         block.kind == BlockKind::Paragraph && block_text(block) == "Hello from chapter 1."
     }));
+    assert!(
+        book.blocks
+            .iter()
+            .any(|block| block.kind == BlockKind::Paragraph && block_text(block) == "Navigation")
+    );
     assert!(book.blocks.iter().all(|block| block.token_estimate > 0));
 }
 
@@ -62,7 +67,7 @@ fn builds_stable_segments_from_minimal_epub() {
     let first = build_segments(&book, &config).expect("segments should build");
     let second = build_segments(&book, &config).expect("segments should be repeatable");
 
-    assert_eq!(first.len(), 2);
+    assert_eq!(first.len(), 3);
     assert_eq!(first[0].id, second[0].id);
     assert_eq!(first[0].checksum, second[0].checksum);
     assert_eq!(first[0].section_id.0, "sec_metadata_opf");
@@ -71,6 +76,9 @@ fn builds_stable_segments_from_minimal_epub() {
     assert_eq!(first[1].section_id.0, "sec_000000");
     assert!(first[1].source.text.contains("Generated Fixture"));
     assert!(first[1].source.text.contains("Hello from chapter 1."));
+    assert_eq!(first[2].section_id.0, "sec_nav_000000");
+    assert!(first[2].source.text.contains("Navigation"));
+    assert!(first[2].source.text.contains("Generated Fixture"));
     assert!(first[0].source.token_estimate > 0);
     assert!(first[0].context.before.is_none());
     assert!(first[0].context.after.is_some());

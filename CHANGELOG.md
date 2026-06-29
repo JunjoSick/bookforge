@@ -1,5 +1,38 @@
 # Changelog
 
+## v1.8.5 - 2026-06-29
+
+BookForge v1.8.5 is a hardening release for translation reliability,
+validation accuracy, EPUB rebuild coverage, checkpoint reporting, and PDF
+conversion safety.
+
+- LLM batch translation now caps transient retries, preserves document block
+  order during finalization, rejects unknown or duplicate run IDs, and keeps
+  provider-level failures out of item repair.
+- QA and double-check passes now preserve non-corrective warnings, report
+  provider-omitted audit items, and use the QA batch prompt with the configured
+  batch token budget.
+- EPUB ingestion/rebuild now handles non-spine EPUB3 navigation documents,
+  start/end OPF manifest items, normalized/percent-decoded OPF hrefs, and
+  target-language `dc:language` updates.
+- EPUB validation now performs marker and protected-span checks once per
+  translated block instead of duplicating them for every XML file.
+- CLI lifecycle handling now fails unsupported providers correctly, writes
+  failed reports after strict validation failures, emits checkpoint progress
+  after persistence, counts all terminal segment states, and keeps queued jobs
+  in `needs_review`.
+- Style/entity global upserts and scoped clear commands now handle NULL/global
+  scopes correctly.
+- PDF conversion now obtains the `pdftotext` baseline before writing the EPUB,
+  avoiding orphan output files when baseline extraction fails.
+
+Validation:
+
+- `cargo test --workspace`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo clippy --workspace --all-targets --all-features`
+
 ## v1.8.1 - 2026-06-22
 
 BookForge v1.8.1 hardens translation-response validation after full-book

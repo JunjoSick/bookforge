@@ -106,6 +106,128 @@ fn cli_translate_mock_quiet_writes_output_report_and_events() {
 }
 
 #[test]
+fn cli_translate_unsupported_provider_exits_failure() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = fixture_input();
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "not-a-provider",
+            "--ui",
+            "quiet",
+        ])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("unsupported translation provider 'not-a-provider'"),
+        "stderr should explain unsupported provider, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_translate_strict_validation_failure_updates_report_status() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = fixture_input();
+    let output = temp.path().join("out.epub");
+    let fake_epubcheck = temp.path().join("fake-epubcheck.sh");
+    fs::write(
+        &fake_epubcheck,
+        r#"#!/usr/bin/env sh
+report=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--json" ]; then
+    shift
+    report="$1"
+  fi
+  shift
+done
+cat > "$report" <<'JSON'
+{"checker":{"checkerVersion":"test","nFatal":0,"nError":0,"nWarning":1},"messages":[{"severity":"WARNING","ID":"TEST","message":"strict warning"}]}
+JSON
+exit 0
+"#,
+    )
+    .expect("fake epubcheck script should be writable");
+    let mut permissions = fs::metadata(&fake_epubcheck)
+        .expect("fake epubcheck metadata")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(&fake_epubcheck, permissions).expect("fake epubcheck should be executable");
+
+    bookforge()
+        .current_dir(temp.path())
+        .env("BOOKFORGE_EPUBCHECK", &fake_epubcheck)
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--strict-epubcheck",
+            "--ui",
+            "quiet",
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+
+    let report_path = temp.path().join("out.report.json");
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&report_path).expect("QA report should be written"),
+    )
+    .expect("QA report should be JSON");
+    assert_eq!(report["status"], "failed");
+    assert!(
+        temp.path().join("out.validation.json").exists(),
+        "validation report should be written"
+    );
+}
+
+#[test]
+fn cli_style_clear_book_scope_requires_scope_id() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args(["style", "clear", "--scope", "book"])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("requires a non-empty scope.id"),
+        "stderr should explain missing style scope id, got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_entities_clear_book_scope_requires_scope_id() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args(["entities", "clear", "--scope", "book"])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("requires a non-empty scope.id"),
+        "stderr should explain missing entity scope id, got: {stderr}"
+    );
+}
+
+#[test]
 fn cli_translate_context_window_persists_snapshot_settings() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let input = fixture_input();

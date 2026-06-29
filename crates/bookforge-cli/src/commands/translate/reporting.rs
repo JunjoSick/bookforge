@@ -3,7 +3,7 @@ use bookforge_core::{
     config::TranslationConfig,
     segment::{BlockTranslation, Segment},
 };
-use bookforge_epub::rebuild_epub;
+use bookforge_epub::rebuild_epub_with_language;
 use bookforge_llm::{QaSegmentReview, SegmentTranslation};
 use bookforge_store::{JobRecord, JobStore};
 
@@ -35,7 +35,26 @@ pub fn print_summary_rebuild_and_report(
     print_stdout: bool,
 ) -> Result<()> {
     let block_translations = block_translations(translations);
-    rebuild_epub(book, &block_translations, &config.output)?;
+    rebuild_epub_with_language(
+        book,
+        &block_translations,
+        &config.output,
+        Some(&config.target_language),
+    )?;
+    let mut validation_failure = None;
+    if validate_output || strict_epubcheck {
+        let validation_path = validate::default_report_path(&config.output);
+        let validation =
+            validate::validate_and_write(&config.output, &validation_path, strict_epubcheck)?;
+        if print_stdout {
+            println!("Validation report: {}", validation_path.display());
+        }
+        if validation.failed {
+            store.mark_job_failed(&job.id)?;
+            validation_failure = Some(validation_path);
+        }
+    }
+
     let summary = store
         .summary(&job.id)?
         .ok_or_else(|| anyhow::anyhow!("job '{}' was not found after translation", job.id))?;
@@ -59,20 +78,11 @@ pub fn print_summary_rebuild_and_report(
     })?;
     store.update_job_report_paths(&job.id, &report.json, &report.markdown)?;
 
-    if validate_output || strict_epubcheck {
-        let validation_path = validate::default_report_path(&config.output);
-        let validation =
-            validate::validate_and_write(&config.output, &validation_path, strict_epubcheck)?;
-        if print_stdout {
-            println!("Validation report: {}", validation_path.display());
-        }
-        if validation.failed {
-            store.mark_job_failed(&job.id)?;
-            anyhow::bail!(
-                "rebuilt EPUB failed validation; see {}",
-                validation_path.display()
-            );
-        }
+    if let Some(validation_path) = validation_failure {
+        anyhow::bail!(
+            "rebuilt EPUB failed validation; see {}",
+            validation_path.display()
+        );
     }
 
     if print_stdout {

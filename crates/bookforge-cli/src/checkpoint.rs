@@ -72,7 +72,6 @@ impl CheckpointSender {
         cmd: CheckpointCommand,
     ) -> std::result::Result<(), bookforge_llm::LlmError> {
         let queued = self.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
-        let segment_finished = cmd.segment_finished_event();
 
         match self.tx.send(cmd).await {
             Ok(()) => {
@@ -80,9 +79,6 @@ impl CheckpointSender {
                     queued,
                     timestamp_ms: now_ms(),
                 });
-                if let Some(event) = segment_finished {
-                    self.progress.emit(event);
-                }
                 Ok(())
             }
             Err(_) => {
@@ -131,10 +127,14 @@ impl CheckpointWriter {
                 writer_depth.fetch_sub(1, Ordering::AcqRel);
 
                 let segment_id = cmd.segment_id_for_progress();
+                let segment_finished = cmd.segment_finished_event();
                 let started = std::time::Instant::now();
 
                 apply(&store, cmd)?;
 
+                if let Some(event) = segment_finished {
+                    writer_progress.emit(event);
+                }
                 flushed += 1;
                 writer_progress.emit(ProgressEvent::CheckpointFlushed {
                     segment_id,
@@ -259,7 +259,24 @@ mod tests {
         },
     };
     use bookforge_store::CreateJob;
-    use std::{fs, time::SystemTime};
+    use std::{fs, sync::Mutex, time::SystemTime};
+
+    #[derive(Default)]
+    struct RecordingProgressSink {
+        events: Mutex<Vec<ProgressEvent>>,
+    }
+
+    impl RecordingProgressSink {
+        fn events(&self) -> Vec<ProgressEvent> {
+            self.events.lock().expect("events mutex").clone()
+        }
+    }
+
+    impl ProgressSink for RecordingProgressSink {
+        fn emit(&self, event: ProgressEvent) {
+            self.events.lock().expect("events mutex").push(event);
+        }
+    }
 
     fn test_translation(
         segment_id: &str,
@@ -393,6 +410,113 @@ mod tests {
         assert_eq!(summary.succeeded, 1, "one succeeded");
         assert_eq!(summary.needs_review, 1, "one needs review");
         assert_eq!(summary.total_segments, 2);
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_send_does_not_emit_segment_finished_before_persistence() {
+        let (tx, mut rx) = mpsc::channel::<CheckpointCommand>(CHECKPOINT_QUEUE_CAPACITY);
+        let progress = Arc::new(RecordingProgressSink::default());
+        let sender = CheckpointSender {
+            tx,
+            queue_depth: Arc::new(AtomicUsize::new(0)),
+            progress: progress.clone(),
+        };
+
+        sender
+            .send(CheckpointCommand::SaveTranslation {
+                job_id: "job".to_string(),
+                translation: Box::new(test_translation("seg_a", 0, SegmentStatus::Succeeded)),
+                provider: "mock".to_string(),
+                model: "mock-model".to_string(),
+                prompt_version: "v1".to_string(),
+            })
+            .await
+            .expect("send ok");
+
+        let _queued = rx.try_recv().expect("command should be queued");
+        let events = progress.events();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProgressEvent::CheckpointQueued { .. })),
+            "send should still report queued checkpoint work"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProgressEvent::SegmentFinished { .. })),
+            "SegmentFinished must wait until the writer persists the command"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_writer_emits_segment_finished_after_persistence() {
+        let db_path = temp_path("progress_after_persist.sqlite");
+        let input_path = temp_path("input_progress.epub");
+        let store = JobStore::open(&db_path).expect("store open for setup");
+        fs::write(&input_path, b"epub bytes").expect("input fixture writable");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output_progress.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-model",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job created");
+        store
+            .insert_segments(
+                &job.id,
+                &[test_segment("seg_a", 0)],
+                "v1",
+                "mock",
+                "mock-model",
+                "test_ns",
+            )
+            .expect("segments inserted");
+        drop(store);
+
+        let progress = Arc::new(RecordingProgressSink::default());
+        let writer = CheckpointWriter::spawn(db_path.clone(), progress.clone());
+        let sender = writer.sender();
+        sender
+            .send(CheckpointCommand::SaveTranslation {
+                job_id: job.id.clone(),
+                translation: Box::new(test_translation("seg_a", 0, SegmentStatus::Succeeded)),
+                provider: "mock".to_string(),
+                model: "mock-model".to_string(),
+                prompt_version: "v1".to_string(),
+            })
+            .await
+            .expect("send ok");
+
+        drop(sender);
+        writer.shutdown().await.expect("writer shutdown");
+
+        let store = JobStore::open(&db_path).expect("re-open ok");
+        let summary = store.summary(&job.id).unwrap().expect("summary exists");
+        assert_eq!(summary.succeeded, 1);
+        let events = progress.events();
+        let segment_finished_pos = events
+            .iter()
+            .position(|event| matches!(event, ProgressEvent::SegmentFinished { .. }))
+            .expect("segment finished event");
+        let checkpoint_flushed_pos = events
+            .iter()
+            .position(|event| matches!(event, ProgressEvent::CheckpointFlushed { .. }))
+            .expect("checkpoint flushed event");
+        assert!(
+            segment_finished_pos < checkpoint_flushed_pos,
+            "SegmentFinished should be emitted by the writer after apply and before flush bookkeeping"
+        );
 
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(input_path);

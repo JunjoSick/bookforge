@@ -90,13 +90,7 @@ pub fn validate_translated_epub(
                 {
                     let mut content = String::new();
                     if entry.read_to_string(&mut content).is_ok() {
-                        validate_xhtml_content(
-                            &mut report,
-                            name,
-                            &content,
-                            segments,
-                            block_translations,
-                        );
+                        validate_xhtml_content(&mut report, name, &content);
                     }
                 }
             }
@@ -114,60 +108,13 @@ pub fn validate_translated_epub(
     }
 
     report
+        .issues
+        .extend(validate_block_translations(segments, block_translations));
+
+    report
 }
 
-fn validate_xhtml_content(
-    report: &mut EpubValidationReport,
-    href: &str,
-    content: &str,
-    segments: &[Segment],
-    block_translations: &[BlockTranslation],
-) {
-    let by_block_id = block_translations
-        .iter()
-        .map(|bt| (bt.block_id.0.as_str(), bt.text.as_str()))
-        .collect::<std::collections::HashMap<_, _>>();
-
-    for segment in segments {
-        for block in &segment.source.blocks {
-            let translated = by_block_id
-                .get(block.block_id.0.as_str())
-                .copied()
-                .unwrap_or(&block.text);
-
-            let translated_markers = marker_ids_in_text(translated);
-            for marker in marker_ids_in_text(&block.text) {
-                if !translated_markers.contains(&marker) {
-                    report.issues.push(EpubValidationIssue {
-                        severity: ValidationSeverity::Error,
-                        kind: "missing_marker".to_string(),
-                        href: Some(href.to_string()),
-                        block_id: Some(block.block_id.0.clone()),
-                        message: format!(
-                            "Required marker '{marker}' missing in translation of block {}",
-                            block.block_id.0
-                        ),
-                    });
-                }
-            }
-
-            for span in &block.protected_spans {
-                if block.text.contains(span) && !translated.contains(span) {
-                    report.issues.push(EpubValidationIssue {
-                        severity: ValidationSeverity::Warning,
-                        kind: "missing_protected_span".to_string(),
-                        href: Some(href.to_string()),
-                        block_id: Some(block.block_id.0.clone()),
-                        message: format!(
-                            "Protected span '{}' may be missing in block {}",
-                            span, block.block_id.0
-                        ),
-                    });
-                }
-            }
-        }
-    }
-
+fn validate_xhtml_content(report: &mut EpubValidationReport, href: &str, content: &str) {
     if has_broken_xml(content) {
         report.issues.push(EpubValidationIssue {
             severity: ValidationSeverity::Error,
@@ -214,6 +161,37 @@ pub fn validate_block_translations(
                 continue;
             }
 
+            let translated_markers = marker_ids_in_text(translated);
+            for marker in marker_ids_in_text(&block.text) {
+                if !translated_markers.contains(&marker) {
+                    issues.push(EpubValidationIssue {
+                        severity: ValidationSeverity::Error,
+                        kind: "missing_marker".to_string(),
+                        href: None,
+                        block_id: Some(block.block_id.0.clone()),
+                        message: format!(
+                            "Required marker '{marker}' missing in translation of block {}",
+                            block.block_id.0
+                        ),
+                    });
+                }
+            }
+
+            for span in &block.protected_spans {
+                if block.text.contains(span) && !translated.contains(span) {
+                    issues.push(EpubValidationIssue {
+                        severity: ValidationSeverity::Warning,
+                        kind: "missing_protected_span".to_string(),
+                        href: None,
+                        block_id: Some(block.block_id.0.clone()),
+                        message: format!(
+                            "Protected span '{}' may be missing in block {}",
+                            span, block.block_id.0
+                        ),
+                    });
+                }
+            }
+
             if translated.is_empty() && !block.text.is_empty() {
                 issues.push(EpubValidationIssue {
                     severity: ValidationSeverity::Error,
@@ -248,6 +226,46 @@ pub fn validate_block_translations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn segment_with_block(
+        block_text: &str,
+        protected_spans: Vec<String>,
+    ) -> (Segment, bookforge_core::ir::BlockId) {
+        use bookforge_core::ir::{BlockId, SectionId};
+        use bookforge_core::segment::{
+            SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
+            SegmentSource, SegmentTextRun,
+        };
+
+        let block_id = BlockId("b_01".to_string());
+        let segment = Segment {
+            id: SegmentId("seg_01".to_string()),
+            section_id: SectionId("sec_01".to_string()),
+            ordinal: 0,
+            block_ids: vec![block_id.clone()],
+            source: SegmentSource {
+                text: block_text.to_string(),
+                blocks: vec![SegmentBlock {
+                    block_id: block_id.clone(),
+                    kind: "p".to_string(),
+                    text: block_text.to_string(),
+                    text_runs: vec![SegmentTextRun {
+                        id: "r0".to_string(),
+                        text: block_text.to_string(),
+                    }],
+                    protected_spans,
+                }],
+                token_estimate: 1,
+            },
+            context: SegmentContext::default(),
+            metadata: SegmentMetadata::default(),
+            constraints: SegmentConstraints::default(),
+            checksum: "abc".to_string(),
+        };
+
+        (segment, block_id)
+    }
+
     #[test]
     fn rejects_broken_xml() {
         assert!(has_broken_xml("<p><b>text</p></b>"));
@@ -279,37 +297,7 @@ mod tests {
 
     #[test]
     fn detects_empty_translation() {
-        use bookforge_core::ir::SectionId;
-        use bookforge_core::segment::{
-            Segment, SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
-            SegmentSource, SegmentTextRun,
-        };
-
-        let block_id = bookforge_core::ir::BlockId("b_01".to_string());
-        let segment = Segment {
-            id: SegmentId("seg_01".to_string()),
-            section_id: SectionId("sec_01".to_string()),
-            ordinal: 0,
-            block_ids: vec![block_id.clone()],
-            source: SegmentSource {
-                text: "Hello".to_string(),
-                blocks: vec![SegmentBlock {
-                    block_id: block_id.clone(),
-                    kind: "p".to_string(),
-                    text: "Hello".to_string(),
-                    text_runs: vec![SegmentTextRun {
-                        id: "r0".to_string(),
-                        text: "Hello".to_string(),
-                    }],
-                    protected_spans: vec![],
-                }],
-                token_estimate: 1,
-            },
-            context: SegmentContext::default(),
-            metadata: SegmentMetadata::default(),
-            constraints: SegmentConstraints::default(),
-            checksum: "abc".to_string(),
-        };
+        let (segment, block_id) = segment_with_block("Hello", vec![]);
         let issues = validate_block_translations(
             &[segment],
             &[BlockTranslation {
@@ -318,5 +306,45 @@ mod tests {
             }],
         );
         assert!(!issues.is_empty());
+    }
+
+    #[test]
+    fn missing_marker_is_reported_once_without_epub_href() {
+        let (segment, block_id) = segment_with_block("<m1>Hello</m1>", vec![]);
+        let issues = validate_block_translations(
+            &[segment],
+            &[BlockTranslation {
+                block_id: block_id.clone(),
+                text: "Ciao".to_string(),
+            }],
+        );
+        let marker_issues = issues
+            .iter()
+            .filter(|issue| issue.kind == "missing_marker")
+            .collect::<Vec<_>>();
+
+        assert_eq!(marker_issues.len(), 1);
+        assert_eq!(marker_issues[0].href, None);
+        assert_eq!(marker_issues[0].block_id.as_deref(), Some("b_01"));
+    }
+
+    #[test]
+    fn missing_protected_span_is_reported_once_without_epub_href() {
+        let (segment, block_id) = segment_with_block("Price 1,234", vec!["1,234".to_string()]);
+        let issues = validate_block_translations(
+            &[segment],
+            &[BlockTranslation {
+                block_id,
+                text: "Prezzo".to_string(),
+            }],
+        );
+        let span_issues = issues
+            .iter()
+            .filter(|issue| issue.kind == "missing_protected_span")
+            .collect::<Vec<_>>();
+
+        assert_eq!(span_issues.len(), 1);
+        assert_eq!(span_issues[0].href, None);
+        assert_eq!(span_issues[0].block_id.as_deref(), Some("b_01"));
     }
 }

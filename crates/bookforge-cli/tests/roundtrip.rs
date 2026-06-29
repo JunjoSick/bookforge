@@ -101,6 +101,43 @@ fn opf_with_ncx(chapter_files: &[&str]) -> String {
     )
 }
 
+fn opf_with_nav(chapter_files: &[&str]) -> String {
+    let manifest = chapter_files
+        .iter()
+        .enumerate()
+        .map(|(i, href)| {
+            format!(r#"    <item id="ch{i}" href="{href}" media-type="application/xhtml+xml"/>"#)
+        })
+        .chain(std::iter::once(
+            r#"    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>"#
+                .to_string(),
+        ))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let spine = chapter_files
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!(r#"    <itemref idref="ch{i}"/>"#))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">roundtrip-fixture</dc:identifier>
+    <dc:title>Roundtrip Fixture</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+{manifest}
+  </manifest>
+  <spine>
+{spine}
+  </spine>
+</package>"#
+    )
+}
+
 fn ncx(chapter_files: &[&str]) -> String {
     let nav_points = chapter_files
         .iter()
@@ -123,6 +160,17 @@ fn ncx(chapter_files: &[&str]) -> String {
   </navMap>
 </ncx>"#
     )
+}
+
+fn nav_xhtml() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Navigation</title></head>
+<body><nav epub:type="toc"><h1>Contents</h1><ol>
+<li><a href="ch1.xhtml">Chapter One</a></li>
+</ol></nav></body>
+</html>"#
+        .to_string()
 }
 
 fn chapter(body: &str) -> String {
@@ -186,6 +234,31 @@ fn build_epub_with_ncx(dir: &Path, name: &str, chapters: &[(&str, &str)]) -> Pat
     path
 }
 
+fn build_epub_with_nav(dir: &Path, name: &str, chapters: &[(&str, &str)]) -> PathBuf {
+    let path = dir.join(name);
+    let file = File::create(&path).expect("fixture EPUB should be creatable");
+    let mut zip = ZipWriter::new(file);
+
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    zip.start_file("mimetype", stored).unwrap();
+    zip.write_all(b"application/epub+zip").unwrap();
+    zip.start_file("META-INF/container.xml", deflated).unwrap();
+    zip.write_all(CONTAINER_XML.as_bytes()).unwrap();
+    let hrefs = chapters.iter().map(|(href, _)| *href).collect::<Vec<_>>();
+    zip.start_file("content.opf", deflated).unwrap();
+    zip.write_all(opf_with_nav(&hrefs).as_bytes()).unwrap();
+    zip.start_file("nav.xhtml", deflated).unwrap();
+    zip.write_all(nav_xhtml().as_bytes()).unwrap();
+    for (href, body) in chapters {
+        zip.start_file(*href, deflated).unwrap();
+        zip.write_all(chapter(body).as_bytes()).unwrap();
+    }
+    zip.finish().unwrap();
+    path
+}
+
 struct RoundtripRun {
     _temp: TempDir,
     output: PathBuf,
@@ -227,6 +300,38 @@ fn translate(chapters: &[(&str, &str)], model: &str) -> RoundtripRun {
 fn translate_with_ncx(chapters: &[(&str, &str)], model: &str) -> RoundtripRun {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let input = build_epub_with_ncx(temp.path(), "in.epub", chapters);
+    let output = temp.path().join("out.epub");
+    Command::cargo_bin("bookforge")
+        .expect("bookforge binary should be built")
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--source",
+            "English",
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            model,
+            "--ui",
+            "quiet",
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert!(output.exists(), "translated EPUB should exist");
+    RoundtripRun {
+        _temp: temp,
+        output,
+    }
+}
+
+fn translate_with_nav(chapters: &[(&str, &str)], model: &str) -> RoundtripRun {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = build_epub_with_nav(temp.path(), "in.epub", chapters);
     let output = temp.path().join("out.epub");
     Command::cargo_bin("bookforge")
         .expect("bookforge binary should be built")
@@ -516,6 +621,10 @@ fn coverage_opf_ncx_and_head_titles() {
         opf.contains("<dc:title>[Italian] Roundtrip Fixture</dc:title>"),
         "OPF dc:title should be translated, got: {opf}"
     );
+    assert!(
+        opf.contains("<dc:language>it</dc:language>"),
+        "OPF dc:language should be updated to the target language tag, got: {opf}"
+    );
 
     let chapter = read_zip_text(&run.output, "ch1.xhtml");
     assert!(
@@ -531,6 +640,22 @@ fn coverage_opf_ncx_and_head_titles() {
     assert!(
         toc.contains("<text>[Italian] Chapter</text>"),
         "NCX navLabel should be translated, got: {toc}"
+    );
+}
+
+#[test]
+fn coverage_epub3_nav_document_not_in_spine() {
+    let body = r#"<h1>BODY_TITLE_SENTINEL</h1><p>BODY_SENTINEL text.</p>"#;
+    let run = translate_with_nav(&[("ch1.xhtml", body)], "mock-prefix-target");
+
+    let nav = read_zip_text(&run.output, "nav.xhtml");
+    assert!(
+        nav.contains("<h1>[Italian] Contents</h1>"),
+        "EPUB3 nav heading should be translated even when nav is not in spine, got: {nav}"
+    );
+    assert!(
+        nav.contains(r#"<a href="ch1.xhtml">[Italian] Chapter One</a>"#),
+        "EPUB3 nav link label should be translated even when nav is not in spine, got: {nav}"
     );
 }
 

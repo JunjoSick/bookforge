@@ -5,7 +5,7 @@ use bookforge_core::{
     segment::{BlockTranslation, Segment, SegmentId, SegmentStatus, SegmentTextRun},
 };
 use serde::Deserialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, hash_map::Entry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::{
@@ -796,7 +796,8 @@ fn batch_item_validation_error(
         }
     }
     for span in &item.protected_spans {
-        if !span.trim().is_empty() && !translation.contains(span) {
+        if !span.trim().is_empty() && !crate::validation::protected_span_present(span, translation)
+        {
             return Some(format!("protected span missing: {span}"));
         }
     }
@@ -1063,28 +1064,64 @@ fn parse_run_batch_response(
             continue;
         }
 
-        let expected_ids: HashMap<&str, ()> = request_item
+        let expected_ids: HashMap<&str, &SegmentTextRun> = request_item
             .text_runs
             .iter()
-            .map(|r| (r.id.as_str(), ()))
+            .map(|run| (run.id.as_str(), run))
             .collect();
-
+        let mut run_by_id = HashMap::with_capacity(item.runs.len());
+        let mut run_error = None;
         for run in &item.runs {
             if !expected_ids.contains_key(run.id.as_str()) {
-                failures.push(BatchItemFailure {
-                    item_id: item.id.clone(),
-                    segment_id: request_item.segment_id.clone(),
-                    error: format!("unknown run ID in response: {}", run.id),
-                    input_tokens: None,
-                    input_cached_tokens: None,
-                    output_tokens: None,
-                    tokens_estimated: false,
-                });
+                run_error = Some(format!("unknown run ID in response: {}", run.id));
+                break;
+            }
+            if run_by_id
+                .insert(run.id.as_str(), run.text.as_str())
+                .is_some()
+            {
+                run_error = Some(format!("duplicate run ID in response: {}", run.id));
                 break;
             }
         }
+        if run_error.is_none() {
+            for expected in &request_item.text_runs {
+                if !run_by_id.contains_key(expected.id.as_str()) {
+                    run_error = Some(format!("missing run ID in response: {}", expected.id));
+                    break;
+                }
+                if bookforge_core::marker::is_marker_token(&expected.text)
+                    && run_by_id.get(expected.id.as_str()).copied() != Some(expected.text.as_str())
+                {
+                    run_error = Some(format!("changed marker run '{}'", expected.id));
+                    break;
+                }
+            }
+        }
+        if let Some(error) = run_error {
+            failures.push(BatchItemFailure {
+                item_id: item.id.clone(),
+                segment_id: request_item.segment_id.clone(),
+                error,
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                tokens_estimated: false,
+            });
+            continue;
+        }
 
-        let joined: Vec<String> = item.runs.iter().map(|r| r.text.clone()).collect();
+        let joined: Vec<String> = request_item
+            .text_runs
+            .iter()
+            .map(|run| {
+                run_by_id
+                    .get(run.id.as_str())
+                    .copied()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
         let translation = joined.join("");
         let section_title = section_titles
             .and_then(|titles| titles.get(&request_item.segment_id.0))
@@ -1379,12 +1416,13 @@ where
         .iter()
         .map(|s| (s.id.0.clone(), s.block_ids.len()))
         .collect();
-    let mut pending_segment_blocks: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pending_segment_blocks: HashMap<String, HashMap<BlockId, String>> = HashMap::new();
 
     let mut all_results: Vec<BatchTranslationResult> = Vec::new();
     let mut pending: Vec<TranslationBatch> = batches;
     let max_rounds = 3usize;
     let mut single_invalid_attempts: HashMap<String, usize> = HashMap::new();
+    let mut transient_attempts: HashMap<String, usize> = HashMap::new();
 
     for _round in 0..max_rounds {
         if pending.is_empty() {
@@ -1595,10 +1633,13 @@ where
                     {
                         for item in &batch_result.translations {
                             let key = item.segment_id.0.clone();
+                            let Some(source_item) = all_items.get(&item.item_id) else {
+                                continue;
+                            };
                             pending_segment_blocks
                                 .entry(key.clone())
                                 .or_default()
-                                .push(item.text.clone());
+                                .insert(source_item.block_id.clone(), item.text.clone());
                             let expected = segment_block_expected
                                 .get(&key)
                                 .copied()
@@ -1607,7 +1648,13 @@ where
                                 && let Some(segment) = segments_by_id.get(&key)
                             {
                                 let blocks = pending_segment_blocks.remove(&key).unwrap();
-                                let joined = blocks.join("\n\n");
+                                let joined = segment
+                                    .block_ids
+                                    .iter()
+                                    .filter_map(|block_id| blocks.get(block_id))
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n");
                                 registry.pre_populate_text(
                                     segment,
                                     joined,
@@ -1748,12 +1795,55 @@ where
                     pending_queue.extend(split);
                 }
                 Err(ref error) if is_transient(error) && batch.kind == BatchKind::Translation => {
-                    progress.emit(bookforge_core::ProgressEvent::Warning {
-                        kind: "batch_transient_retry".to_string(),
-                        message: format!("batch {} transient error, retrying: {error}", batch.id),
-                        timestamp_ms: bookforge_core::progress::now_ms(),
-                    });
-                    pending_queue.push_back(batch);
+                    let attempts = transient_attempts
+                        .entry(batch.id.clone())
+                        .and_modify(|count| *count += 1)
+                        .or_insert(1);
+                    if *attempts < config.scheduler.max_attempts.max(1) {
+                        progress.emit(bookforge_core::ProgressEvent::Warning {
+                            kind: "batch_transient_retry".to_string(),
+                            message: format!(
+                                "batch {} transient error on attempt {}; retrying: {error}",
+                                batch.id, attempts
+                            ),
+                            timestamp_ms: bookforge_core::progress::now_ms(),
+                        });
+                        pending_queue.push_back(batch);
+                    } else {
+                        progress.emit(bookforge_core::ProgressEvent::Warning {
+                            kind: "batch_transient_exhausted".to_string(),
+                            message: format!(
+                                "batch {} failed after {} transient attempts: {error}",
+                                batch.id, attempts
+                            ),
+                            timestamp_ms: bookforge_core::progress::now_ms(),
+                        });
+                        unblock_fence_for_batch_failure(
+                            config.context_registry.as_deref(),
+                            &segments_by_id,
+                            &batch.items,
+                        );
+                        all_results.push(BatchTranslationResult {
+                            batch_id: batch.id.clone(),
+                            translations: Vec::new(),
+                            failures: batch
+                                .items
+                                .iter()
+                                .map(|item| BatchItemFailure {
+                                    item_id: item.item_id.clone(),
+                                    segment_id: item.segment_id.clone(),
+                                    error: format!("{error}"),
+                                    input_tokens: None,
+                                    input_cached_tokens: None,
+                                    output_tokens: None,
+                                    tokens_estimated: false,
+                                })
+                                .collect(),
+                            input_tokens: None,
+                            input_cached_tokens: None,
+                            output_tokens: None,
+                        });
+                    }
                 }
                 Err(error) => {
                     progress.emit(bookforge_core::ProgressEvent::Warning {
@@ -1883,19 +1973,23 @@ where
 
         for failure in &batch_result.failures {
             let seg_id = failure.segment_id.0.clone();
-            let entry = segment_translations
-                .entry(seg_id.clone())
-                .or_insert_with(|| {
-                    make_entry(
-                        &seg_id,
-                        SegmentStatus::NeedsReview,
-                        Some(failure.error.clone()),
-                        None,
-                        None,
-                        None,
-                        false,
-                    )
-                });
+            let entry = match segment_translations.entry(seg_id.clone()) {
+                Entry::Occupied(entry) => {
+                    let entry = entry.into_mut();
+                    entry.status = SegmentStatus::NeedsReview;
+                    append_translation_error(entry, &failure.error);
+                    entry
+                }
+                Entry::Vacant(entry) => entry.insert(make_entry(
+                    &seg_id,
+                    SegmentStatus::NeedsReview,
+                    Some(failure.error.clone()),
+                    None,
+                    None,
+                    None,
+                    false,
+                )),
+            };
             add_failure_usage(entry, failure);
         }
     }
@@ -1904,6 +1998,7 @@ where
         .iter()
         .flat_map(|r| &r.failures)
         .filter(|f| f.segment_id.0 != "unknown")
+        .filter(|f| repairable_batch_failure(f))
         .filter_map(|f| {
             all_items
                 .get(f.item_id.as_str())
@@ -2194,25 +2289,20 @@ where
     let mut translations: Vec<SegmentTranslation> = segment_translations.into_values().collect();
 
     for translation in &mut translations {
-        let expected: std::collections::HashSet<&str> = translation
-            .block_ids
-            .iter()
-            .map(|id| id.0.as_str())
-            .collect();
-        let actual: std::collections::HashSet<&str> = translation
-            .blocks
-            .iter()
-            .map(|block| block.block_id.0.as_str())
-            .collect();
+        let (ordered_blocks, missing, extra, duplicate) = order_blocks_by_segment(
+            &translation.block_ids,
+            std::mem::take(&mut translation.blocks),
+        );
+        translation.blocks = ordered_blocks;
 
-        if expected != actual {
-            let mut missing: Vec<&str> = expected.difference(&actual).copied().collect();
-            missing.sort_unstable();
+        if (!missing.is_empty() || !extra.is_empty() || !duplicate.is_empty())
+            && (translation.status == SegmentStatus::Succeeded || !translation.blocks.is_empty())
+        {
             translation.status = SegmentStatus::NeedsReview;
-            translation.error = Some(format!(
-                "batch translation missing block translations: {:?}",
-                missing
-            ));
+            let error = format!(
+                "batch translation block mismatch: missing={missing:?}, extra={extra:?}, duplicate={duplicate:?}",
+            );
+            append_translation_error(translation, &error);
         }
     }
 
@@ -2549,6 +2639,63 @@ fn add_failure_usage(entry: &mut SegmentTranslation, item: &BatchItemFailure) {
     entry.tokens_estimated |= item.tokens_estimated;
 }
 
+fn append_translation_error(entry: &mut SegmentTranslation, error: &str) {
+    match entry.error.as_mut() {
+        Some(existing) if existing == error => {}
+        Some(existing) => {
+            existing.push_str("; ");
+            existing.push_str(error);
+        }
+        None => entry.error = Some(error.to_string()),
+    }
+}
+
+fn repairable_batch_failure(failure: &BatchItemFailure) -> bool {
+    !matches!(
+        failure.error.as_str(),
+        error if error.starts_with("HTTP status ")
+            || error.starts_with("HTTP error:")
+            || error.starts_with("provider error:")
+            || error.contains("semaphore closed")
+            || error.contains("concurrency limiter closed")
+    )
+}
+
+fn order_blocks_by_segment(
+    block_ids: &[BlockId],
+    blocks: Vec<BlockTranslation>,
+) -> (Vec<BlockTranslation>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut by_id: HashMap<BlockId, Vec<BlockTranslation>> = HashMap::new();
+    for block in blocks {
+        by_id.entry(block.block_id.clone()).or_default().push(block);
+    }
+
+    let mut ordered = Vec::with_capacity(block_ids.len());
+    let mut missing = Vec::new();
+    let mut duplicate = Vec::new();
+    for block_id in block_ids {
+        match by_id.remove(block_id) {
+            Some(mut matches) => {
+                if matches.len() > 1 {
+                    duplicate.push(block_id.0.clone());
+                }
+                ordered.push(matches.remove(0));
+            }
+            None => missing.push(block_id.0.clone()),
+        }
+    }
+
+    let mut extra = by_id.keys().map(|id| id.0.clone()).collect::<Vec<_>>();
+    extra.sort();
+    for mut extras in by_id.into_values() {
+        ordered.append(&mut extras);
+    }
+
+    missing.sort();
+    duplicate.sort();
+    (ordered, missing, extra, duplicate)
+}
+
 fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.saturating_add(right)),
@@ -2674,6 +2821,26 @@ mod tests {
         }
     }
 
+    fn single_item_batch_with_protected_span(span: &str) -> TranslationBatch {
+        let seg = make_segment(
+            "seg1",
+            vec![protected_block("Protected number", vec![span.to_string()])],
+            vec![],
+        );
+        let config = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        build_translation_batches(&[seg], &config, TranslationProfile::Balanced)
+            .into_iter()
+            .next()
+            .expect("single batch")
+    }
+
     fn batch_item(id: &str, source_text: &str) -> TranslationBatchItem {
         TranslationBatchItem {
             item_id: id.to_string(),
@@ -2687,6 +2854,27 @@ mod tests {
             protected_spans: Vec::new(),
             required_markers: Vec::new(),
             checksum: format!("checksum_{id}"),
+        }
+    }
+
+    fn run_preserving_batch_with_runs(run_texts: &[&str]) -> TranslationBatch {
+        let mut item = batch_item("runs", &run_texts.join(""));
+        item.text_runs = run_texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| SegmentTextRun {
+                id: format!("r{index}"),
+                text: (*text).to_string(),
+            })
+            .collect();
+        TranslationBatch {
+            id: "run-preserving".to_string(),
+            ordinal: 0,
+            mode: BatchMode::RunPreserving,
+            kind: BatchKind::Translation,
+            token_estimate: 100,
+            items: vec![item.clone()],
+            section_id: item.section_id,
         }
     }
 
@@ -3163,6 +3351,57 @@ mod tests {
     }
 
     #[test]
+    fn localized_numeric_protected_spans_pass_batch_validation() {
+        for (span, translation) in [
+            ("0.1", "diametro da 0,1 a 1 mm"),
+            ("-63.5", "il potenziale era circa –63,5 mV"),
+            ("1957,1989", "Skou (1957, 1989) isolò una ATPasi"),
+            ("10-", "7,3 × 10⁻⁷ mol cm⁻²"),
+        ] {
+            let batch = single_item_batch_with_protected_span(span);
+            let id = &batch.items[0].item_id;
+            let response = serde_json::json!({
+                "items": [
+                    {"id": id, "translation": translation},
+                ]
+            })
+            .to_string();
+
+            let result = parse_batch_response(&batch, &response).expect("parse");
+            assert_eq!(
+                result.failures.len(),
+                0,
+                "localized numeric form should pass for span {span}"
+            );
+            assert_eq!(result.translations.len(), 1);
+            assert_eq!(result.translations[0].text, translation);
+        }
+    }
+
+    #[test]
+    fn absent_numeric_protected_span_still_fails_batch_validation() {
+        let batch = single_item_batch_with_protected_span("5.16");
+        let id = &batch.items[0].item_id;
+        let response = serde_json::json!({
+            "items": [
+                {"id": id, "translation": "Si noti che questa forma di rettificazione deriva dai canali aperti."},
+            ]
+        })
+        .to_string();
+
+        let result = parse_batch_response(&batch, &response).expect("parse");
+        assert_eq!(result.translations.len(), 0);
+        assert_eq!(result.failures.len(), 1);
+        assert!(
+            result.failures[0]
+                .error
+                .contains("protected span missing: 5.16"),
+            "got: {}",
+            result.failures[0].error
+        );
+    }
+
+    #[test]
     fn missing_marker_close_fails_batch_item_validation() {
         let mut item = batch_item("marked", "<m1>source</m1>");
         item.required_markers = vec!["m1".to_string()];
@@ -3223,6 +3462,72 @@ mod tests {
                 .error
                 .contains("unchanged from the source-language prose")
         );
+    }
+
+    #[test]
+    fn run_preserving_batch_rejects_unknown_run_id_without_success() {
+        let batch = run_preserving_batch_with_runs(&["Hello ", "world"]);
+        let item = &batch.items[0];
+        let response = serde_json::json!({
+            "items": [{
+                "id": item.item_id,
+                "runs": [
+                    {"id": "r0", "text": "Ciao "},
+                    {"id": "unknown", "text": "mondo"},
+                ],
+            }]
+        })
+        .to_string();
+
+        let result = parse_batch_response(&batch, &response).expect("parse");
+
+        assert_eq!(result.translations.len(), 0);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].error.contains("unknown run ID"));
+    }
+
+    #[test]
+    fn run_preserving_batch_rejects_duplicate_run_id_without_success() {
+        let batch = run_preserving_batch_with_runs(&["Hello ", "world"]);
+        let item = &batch.items[0];
+        let response = serde_json::json!({
+            "items": [{
+                "id": item.item_id,
+                "runs": [
+                    {"id": "r0", "text": "Ciao "},
+                    {"id": "r0", "text": "mondo"},
+                ],
+            }]
+        })
+        .to_string();
+
+        let result = parse_batch_response(&batch, &response).expect("parse");
+
+        assert_eq!(result.translations.len(), 0);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].error.contains("duplicate run ID"));
+    }
+
+    #[test]
+    fn run_preserving_batch_joins_in_source_run_order() {
+        let batch = run_preserving_batch_with_runs(&["Hello ", "world"]);
+        let item = &batch.items[0];
+        let response = serde_json::json!({
+            "items": [{
+                "id": item.item_id,
+                "runs": [
+                    {"id": "r1", "text": "mondo"},
+                    {"id": "r0", "text": "Ciao "},
+                ],
+            }]
+        })
+        .to_string();
+
+        let result = parse_batch_response(&batch, &response).expect("parse");
+
+        assert_eq!(result.failures.len(), 0);
+        assert_eq!(result.translations.len(), 1);
+        assert_eq!(result.translations[0].text, "Ciao mondo");
     }
 
     #[test]
@@ -3359,7 +3664,10 @@ mod tests {
         CompletionRequest, CompletionResponse, LlmProvider as LlmProviderTrait,
         ProviderCapabilities, Result as ProviderResult,
     };
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     enum StubBehavior {
         FinishLength,
@@ -3731,6 +4039,84 @@ mod tests {
         }
     }
 
+    struct AlwaysTransientProvider {
+        calls: AtomicUsize,
+    }
+
+    impl AlwaysTransientProvider {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl LlmProviderTrait for Arc<AlwaysTransientProvider> {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> ProviderResult<CompletionResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(LlmError::HttpStatus {
+                status: 503,
+                body: "unavailable".to_string(),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    struct DelayedPromptEchoProvider;
+
+    impl LlmProviderTrait for DelayedPromptEchoProvider {
+        async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+            let item_ids = item_ids_from_batch_prompt(&request.user);
+            if item_ids.iter().any(|id| id.contains("First")) {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            let json = serde_json::json!({
+                "items": item_ids
+                    .into_iter()
+                    .map(|id| {
+                        let text = if id.contains("First") {
+                            "[it] First"
+                        } else if id.contains("Second") {
+                            "[it] Second"
+                        } else {
+                            "[it] Unknown"
+                        };
+                        serde_json::json!({"id": id, "translation": text})
+                    })
+                    .collect::<Vec<_>>(),
+            });
+            Ok(CompletionResponse {
+                content: json.to_string(),
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(1),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 0,
+                raw: serde_json::json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
     fn item_ids_from_batch_prompt(user_prompt: &str) -> Vec<String> {
         let Some(after_input) = user_prompt.split("Input:\n").nth(1) else {
             return Vec::new();
@@ -3861,6 +4247,106 @@ mod tests {
         assert_eq!(translations.len(), 1);
         assert_eq!(translations[0].status, SegmentStatus::Succeeded);
         assert_eq!(translations[0].joined_text(), "[it] Hello");
+    }
+
+    #[tokio::test]
+    async fn transient_batch_errors_stop_after_max_attempts() {
+        let segment = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+        let segments = vec![segment];
+        let cfg = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 1,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+        let provider = Arc::new(AlwaysTransientProvider::new());
+        let telemetry = Arc::new(TelemetryLog::new());
+        let mut config = test_run_config();
+        config.scheduler.max_attempts = 2;
+
+        let translations = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            translate_batches_with_callback(
+                provider.clone(),
+                batches,
+                &segments,
+                &config,
+                telemetry,
+                None,
+                None,
+                Arc::new(bookforge_core::NullProgressSink),
+                None,
+                |_| Ok(()),
+            ),
+        )
+        .await
+        .expect("transient retries must be capped")
+        .expect("batch run should return needs-review translations");
+
+        assert_eq!(provider.calls(), 2);
+        assert_eq!(translations.len(), 1);
+        assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
+        assert!(
+            translations[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("HTTP status 503")),
+            "got: {:?}",
+            translations[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_finalization_preserves_source_block_order() {
+        let segment = make_segment(
+            "seg1",
+            vec![plain_block("First"), plain_block("Second")],
+            vec![],
+        );
+        let segments = vec![segment];
+        let cfg = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 1,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+        assert_eq!(batches.len(), 2);
+        let telemetry = Arc::new(TelemetryLog::new());
+        let mut config = test_run_config();
+        config.scheduler.concurrency = 2;
+
+        let translations = translate_batches_with_callback(
+            DelayedPromptEchoProvider,
+            batches,
+            &segments,
+            &config,
+            telemetry,
+            None,
+            None,
+            Arc::new(bookforge_core::NullProgressSink),
+            None,
+            |_| Ok(()),
+        )
+        .await
+        .expect("translation should complete");
+
+        assert_eq!(translations.len(), 1);
+        assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+        assert_eq!(
+            translations[0]
+                .blocks
+                .iter()
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["[it] First", "[it] Second"]
+        );
+        assert_eq!(translations[0].joined_text(), "[it] First\n\n[it] Second");
     }
 
     #[tokio::test]

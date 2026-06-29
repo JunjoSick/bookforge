@@ -130,13 +130,7 @@ pub async fn run(
                 .await
             }
             _ => {
-                if human_stdout_enabled(args.ui) {
-                    println!(
-                        "Translation provider '{}' is not implemented yet.",
-                        config.provider
-                    );
-                }
-                Ok(())
+                anyhow::bail!("unsupported translation provider '{}'", config.provider)
             }
         }
     }
@@ -1802,6 +1796,15 @@ pub(crate) fn mark_job_finished(
     job_id: &str,
     translations: &[SegmentTranslation],
 ) -> Result<()> {
+    let Some(summary) = store.summary(job_id)? else {
+        anyhow::bail!("job '{job_id}' was not found");
+    };
+    let terminal_segments =
+        summary.succeeded + summary.cached + summary.failed + summary.needs_review;
+    if terminal_segments < summary.total_segments || summary.retry_pending > 0 {
+        store.mark_job_needs_review(job_id)?;
+        return Ok(());
+    }
     if translations
         .iter()
         .any(|translation| translation.status == SegmentStatus::Failed)
@@ -2090,6 +2093,65 @@ mod tests {
             .expect("job should exist");
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.succeeded, 1);
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn mark_job_finished_keeps_queued_segments_needs_review() {
+        let db_path = temp_path("queued_finish.sqlite");
+        let input_path = temp_path("queued_finish_input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("queued_finish_output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job should be created");
+        let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
+        store
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "test_ns")
+            .expect("segments should insert");
+        let translation = translation_for(
+            &segments[0],
+            "Gia fatto",
+            "translate_segment",
+            SegmentStatus::Succeeded,
+        );
+        store
+            .save_translation(bookforge_store::SaveTranslation {
+                job_id: &job.id,
+                segment_id: &translation.segment_id.0,
+                translated_text: &translation.joined_text(),
+                blocks: &translation.blocks,
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(2),
+                tokens_estimated: false,
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+            })
+            .expect("completed segment should save");
+
+        mark_job_finished(&store, &job.id, &[translation]).expect("job finish should succeed");
+
+        let job = store
+            .get_job(&job.id)
+            .expect("job should load")
+            .expect("job should exist");
+        assert_eq!(job.status, "needs_review");
 
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(input_path);

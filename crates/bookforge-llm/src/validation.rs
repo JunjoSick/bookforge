@@ -59,6 +59,18 @@ pub(crate) fn source_copy_validation_error(
     None
 }
 
+pub(crate) fn protected_span_present(span: &str, translation: &str) -> bool {
+    dangling_numeric_span(span)
+        || translation.contains(span)
+        || compact_numeric_punctuation_span(span)
+            .is_some_and(|expected| compact_ascii_whitespace(translation).contains(&expected))
+        || canonical_decimal_number(span).is_some_and(|expected| {
+            numeric_runs(translation)
+                .iter()
+                .any(|candidate| canonical_decimal_number(candidate).as_deref() == Some(&expected))
+        })
+}
+
 fn normalized_prose(text: &str) -> String {
     strip_marker_tokens(text)
         .split_whitespace()
@@ -129,6 +141,124 @@ fn looks_like_page_reference(text: &str) -> bool {
 fn looks_like_bilingual_gloss(text: &str) -> bool {
     let text = text.to_lowercase();
     text.contains("or in english:") || text.contains("in english:")
+}
+
+fn dangling_numeric_span(value: &str) -> bool {
+    let normalized = normalize_number_signs(value);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    });
+    trimmed.ends_with('-') && trimmed.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn compact_numeric_punctuation_span(value: &str) -> Option<String> {
+    let normalized = normalize_number_signs(value);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    });
+    let digits = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
+    if digits < 2 {
+        return None;
+    }
+    if !trimmed.chars().all(|ch| {
+        ch.is_ascii_digit()
+            || ch.is_ascii_whitespace()
+            || matches!(
+                ch,
+                '.' | ',' | ';' | ':' | '/' | '-' | '+' | '%' | '$' | '(' | ')'
+            )
+    }) {
+        return None;
+    }
+    Some(compact_ascii_whitespace(trimmed))
+}
+
+fn compact_ascii_whitespace(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect()
+}
+
+fn canonical_decimal_number(value: &str) -> Option<String> {
+    let normalized = normalize_number_signs(value);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    });
+    if trimmed.is_empty() || !trimmed.chars().any(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let percent = trimmed.ends_with('%');
+    let numeric = trimmed.strip_suffix('%').unwrap_or(trimmed);
+    if !numeric
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+'))
+    {
+        return None;
+    }
+    if numeric.matches('.').count() + numeric.matches(',').count() > 1 {
+        return None;
+    }
+    let separator = numeric.find('.').or_else(|| numeric.find(','));
+    let mut canonical = match separator {
+        Some(index) => {
+            let (whole, fractional_with_separator) = numeric.split_at(index);
+            let fractional = &fractional_with_separator[1..];
+            if whole.is_empty()
+                || fractional.is_empty()
+                || !whole
+                    .trim_start_matches(['-', '+'])
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit())
+                || !fractional.chars().all(|ch| ch.is_ascii_digit())
+            {
+                return None;
+            }
+            format!("{whole}.{fractional}")
+        }
+        None => numeric.to_string(),
+    };
+    if percent {
+        canonical.push('%');
+    }
+    Some(canonical)
+}
+
+fn numeric_runs(text: &str) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+' | '%' | '−' | '–' | '—')
+        {
+            current.push(normalize_number_sign(ch));
+        } else if !current.is_empty() {
+            runs.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
+fn normalize_number_signs(value: &str) -> String {
+    value.chars().map(normalize_number_sign).collect()
+}
+
+fn normalize_number_sign(ch: char) -> char {
+    match ch {
+        '−' | '–' | '—' => '-',
+        _ => ch,
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +341,28 @@ mod tests {
             "mock",
             Some("English"),
             "Italian"
+        ));
+    }
+
+    #[test]
+    fn protected_span_presence_accepts_localized_numeric_forms() {
+        assert!(protected_span_present("0.1", "diametro da 0,1 a 1 mm"));
+        assert!(protected_span_present(
+            "-63.5",
+            "il potenziale era circa –63,5 mV"
+        ));
+        assert!(protected_span_present(
+            "1957,1989",
+            "Skou (1957, 1989) isolò una ATPasi"
+        ));
+        assert!(protected_span_present("10-", "7,3 × 10⁻⁷ mol cm⁻²"));
+    }
+
+    #[test]
+    fn protected_span_presence_still_rejects_absent_numbers() {
+        assert!(!protected_span_present(
+            "5.16",
+            "Si noti che questa forma di rettificazione deriva dai canali aperti."
         ));
     }
 }

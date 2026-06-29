@@ -226,6 +226,7 @@ fn export_style(store: &JobStore, args: ExportArgs) -> Result<()> {
 }
 
 fn clear_style(store: &JobStore, args: ClearArgs) -> Result<()> {
+    validate_scope(args.scope, args.scope_id.as_deref())?;
     let count = store.clear_style_scope(args.scope, args.scope_id.as_deref())?;
     println!("Cleared {count} style sheets.");
     Ok(())

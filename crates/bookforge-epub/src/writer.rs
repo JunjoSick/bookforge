@@ -19,8 +19,17 @@ use quick_xml::{
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 pub fn rebuild_epub(book: &Book, translations: &[BlockTranslation], output: &Path) -> Result<()> {
+    rebuild_epub_with_language(book, translations, output, None)
+}
+
+pub fn rebuild_epub_with_language(
+    book: &Book,
+    translations: &[BlockTranslation],
+    output: &Path,
+    target_language: Option<&str>,
+) -> Result<()> {
     let staged = sibling_work_path(output, "tmp");
-    let result = write_rebuilt_epub(book, translations, &staged);
+    let result = write_rebuilt_epub(book, translations, &staged, target_language);
     let skipped = match result {
         Ok(skipped) => skipped,
         Err(error) => {
@@ -47,6 +56,7 @@ fn write_rebuilt_epub(
     book: &Book,
     translations: &[BlockTranslation],
     output: &Path,
+    target_language: Option<&str>,
 ) -> Result<usize> {
     let source_path = book.source_path.as_deref().ok_or_else(|| {
         BookforgeError::InvalidInput("book IR does not include a source EPUB path".to_string())
@@ -98,12 +108,38 @@ fn write_rebuilt_epub(
             })?;
             let outcome = patch_xhtml_blocks(&xhtml, file_patches)?;
             total_skipped += outcome.skipped_blocks;
-            validate_xml(&outcome.xhtml).map_err(|err| {
+            let xhtml = if name == book.id.0 {
+                if let Some(target_language) = target_language {
+                    patch_opf_language(&outcome.xhtml, target_language)?
+                } else {
+                    outcome.xhtml
+                }
+            } else {
+                outcome.xhtml
+            };
+            validate_xml(&xhtml).map_err(|err| {
                 BookforgeError::InvalidInput(format!(
                     "patched XHTML '{name}' failed validation: {err}"
                 ))
             })?;
-            outcome.xhtml.into_bytes()
+            xhtml.into_bytes()
+        } else if name == book.id.0 {
+            if let Some(target_language) = target_language {
+                let opf = String::from_utf8(bytes).map_err(|err| {
+                    BookforgeError::InvalidInput(format!(
+                        "OPF resource '{name}' is not UTF-8: {err}"
+                    ))
+                })?;
+                let opf = patch_opf_language(&opf, target_language)?;
+                validate_xml(&opf).map_err(|err| {
+                    BookforgeError::InvalidInput(format!(
+                        "patched OPF '{name}' failed validation: {err}"
+                    ))
+                })?;
+                opf.into_bytes()
+            } else {
+                bytes
+            }
         } else {
             bytes
         };
@@ -200,6 +236,99 @@ fn patches_by_href<'a>(
     }
 
     by_href
+}
+
+fn patch_opf_language(opf: &str, target_language: &str) -> Result<String> {
+    let language_tag = epub_language_tag(target_language);
+    let mut reader = Reader::from_str(opf);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut in_language = false;
+    let mut wrote_language = false;
+    let mut found_language = false;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) if local_name(element.name().as_ref()) == b"language" => {
+                found_language = true;
+                in_language = true;
+                wrote_language = false;
+                writer.write_event(Event::Start(element))?;
+            }
+            Event::Empty(element) if local_name(element.name().as_ref()) == b"language" => {
+                found_language = true;
+                writer.write_event(Event::Start(element.to_owned()))?;
+                writer.write_event(Event::Text(BytesText::new(&language_tag)))?;
+                writer.write_event(Event::End(element.to_end()))?;
+            }
+            Event::Text(_) | Event::CData(_) | Event::GeneralRef(_) if in_language => {
+                if !wrote_language {
+                    writer.write_event(Event::Text(BytesText::new(&language_tag)))?;
+                    wrote_language = true;
+                }
+            }
+            Event::End(element)
+                if in_language && local_name(element.name().as_ref()) == b"language" =>
+            {
+                if !wrote_language {
+                    writer.write_event(Event::Text(BytesText::new(&language_tag)))?;
+                }
+                in_language = false;
+                writer.write_event(Event::End(element))?;
+            }
+            Event::Eof => break,
+            event => writer.write_event(event)?,
+        }
+    }
+
+    if !found_language {
+        return Ok(opf.to_string());
+    }
+
+    String::from_utf8(writer.into_inner()).map_err(|err| {
+        BookforgeError::InvalidInput(format!("patched OPF language is not valid UTF-8: {err}"))
+    })
+}
+
+fn epub_language_tag(language: &str) -> String {
+    let trimmed = language.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        && (lower.len() <= 3 || lower.contains('-'))
+    {
+        return lower;
+    }
+    match lower.as_str() {
+        "english" => "en",
+        "italian" => "it",
+        "french" => "fr",
+        "german" => "de",
+        "spanish" => "es",
+        "portuguese" => "pt",
+        "brazilian portuguese" | "portuguese (brazil)" => "pt-BR",
+        "japanese" => "ja",
+        "chinese" => "zh",
+        "korean" => "ko",
+        "russian" => "ru",
+        "arabic" => "ar",
+        "dutch" => "nl",
+        "polish" => "pl",
+        "swedish" => "sv",
+        "norwegian" => "no",
+        "danish" => "da",
+        "finnish" => "fi",
+        _ => trimmed,
+    }
+    .to_string()
+}
+
+fn local_name(name: &[u8]) -> &[u8] {
+    name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -722,6 +851,21 @@ fn next_child_path(stack: &mut [ElementFrame]) -> Vec<usize> {
 mod tests {
     use super::*;
     use bookforge_core::ir::{BlockId, BlockKind, InlineMark, ProtectedSpan, SectionId, TextRun};
+
+    #[test]
+    fn patch_opf_language_sets_target_language_tag() {
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:language>en</dc:language>
+  </metadata>
+</package>"#;
+
+        let patched = patch_opf_language(opf, "Italian").expect("language should patch");
+
+        assert!(patched.contains("<dc:language>it</dc:language>"));
+        validate_xml(&patched).expect("patched OPF should remain XML");
+    }
 
     #[test]
     fn escapes_xml_special_characters_in_translation() {
