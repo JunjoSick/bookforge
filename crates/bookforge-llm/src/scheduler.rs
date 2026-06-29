@@ -1477,7 +1477,7 @@ fn validation_retry_appendix(segment: &Segment, mode: TranslationMode, error: &s
 
 fn validate_protected_spans(segment: &Segment, spans: &[String], translation: &str) -> Result<()> {
     for span in spans {
-        if !translation.contains(span) {
+        if !protected_span_present(span, translation) {
             return Err(LlmError::InvalidResponse(format!(
                 "protected span missing from segment '{}': {}",
                 segment.id.0, span
@@ -1485,6 +1485,136 @@ fn validate_protected_spans(segment: &Segment, spans: &[String], translation: &s
         }
     }
     Ok(())
+}
+
+fn protected_span_present(span: &str, translation: &str) -> bool {
+    dangling_numeric_span(span)
+        || translation.contains(span)
+        || compact_numeric_punctuation_span(span)
+            .is_some_and(|expected| compact_ascii_whitespace(translation).contains(&expected))
+        || canonical_decimal_number(span).is_some_and(|expected| {
+            numeric_runs(translation)
+                .iter()
+                .any(|candidate| canonical_decimal_number(candidate).as_deref() == Some(&expected))
+        })
+}
+
+fn dangling_numeric_span(value: &str) -> bool {
+    let normalized = normalize_number_signs(value);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    });
+    trimmed.ends_with('-') && trimmed.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn compact_numeric_punctuation_span(value: &str) -> Option<String> {
+    let normalized = normalize_number_signs(value);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    });
+    let digits = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
+    if digits < 2 {
+        return None;
+    }
+    if !trimmed.chars().all(|ch| {
+        ch.is_ascii_digit()
+            || ch.is_ascii_whitespace()
+            || matches!(
+                ch,
+                '.' | ',' | ';' | ':' | '/' | '-' | '+' | '%' | '$' | '(' | ')'
+            )
+    }) {
+        return None;
+    }
+    Some(compact_ascii_whitespace(trimmed))
+}
+
+fn compact_ascii_whitespace(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect()
+}
+
+fn canonical_decimal_number(value: &str) -> Option<String> {
+    let normalized = normalize_number_signs(value);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    });
+    if trimmed.is_empty() || !trimmed.chars().any(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let percent = trimmed.ends_with('%');
+    let numeric = trimmed.strip_suffix('%').unwrap_or(trimmed);
+    if !numeric
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+'))
+    {
+        return None;
+    }
+    if numeric.matches('.').count() + numeric.matches(',').count() > 1 {
+        return None;
+    }
+    let separator = numeric.find('.').or_else(|| numeric.find(','));
+    let mut canonical = match separator {
+        Some(index) => {
+            let (whole, fractional_with_separator) = numeric.split_at(index);
+            let fractional = &fractional_with_separator[1..];
+            if whole.is_empty()
+                || fractional.is_empty()
+                || !whole
+                    .trim_start_matches(['-', '+'])
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit())
+                || !fractional.chars().all(|ch| ch.is_ascii_digit())
+            {
+                return None;
+            }
+            format!("{whole}.{fractional}")
+        }
+        None => numeric.to_string(),
+    };
+    if percent {
+        canonical.push('%');
+    }
+    Some(canonical)
+}
+
+fn numeric_runs(text: &str) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+' | '%' | '−' | '–' | '—')
+        {
+            current.push(normalize_number_sign(ch));
+        } else if !current.is_empty() {
+            runs.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
+fn normalize_number_signs(value: &str) -> String {
+    value.chars().map(normalize_number_sign).collect()
+}
+
+fn normalize_number_sign(ch: char) -> char {
+    match ch {
+        '−' | '–' | '—' => '-',
+        _ => ch,
+    }
 }
 
 fn validate_markers(segment: &Segment, expected: &[String], translation: &str) -> Result<()> {
@@ -1825,6 +1955,60 @@ mod tests {
             translations[0].blocks[0].text, "The 4th day",
             "needs-review fallback must preserve the source text"
         );
+    }
+
+    #[test]
+    fn localized_decimal_protected_span_passes_validation() {
+        let segment = segment("seg_a", 0, vec![("b0", "diameter 0.1 to 1 mm")]);
+
+        validate_protected_spans(&segment, &["0.1".to_string()], "diametro da 0,1 a 1 mm")
+            .expect("decimal comma localization should preserve numeric value");
+    }
+
+    #[test]
+    fn localized_negative_decimal_protected_span_passes_validation() {
+        let segment = segment("seg_a", 0, vec![("b0", "potential -63.5 mV")]);
+
+        validate_protected_spans(
+            &segment,
+            &["-63.5".to_string()],
+            "il potenziale era circa –63,5 mV",
+        )
+        .expect("localized minus and decimal comma should preserve numeric value");
+    }
+
+    #[test]
+    fn citation_spacing_protected_span_passes_validation() {
+        let segment = segment("seg_a", 0, vec![("b0", "Skou (1957,1989)")]);
+
+        validate_protected_spans(
+            &segment,
+            &["1957,1989".to_string()],
+            "Skou (1957, 1989) isolò una ATPasi",
+        )
+        .expect("citation spacing should not count as a dropped numeric span");
+    }
+
+    #[test]
+    fn dangling_numeric_protected_span_passes_validation() {
+        let segment = segment("seg_a", 0, vec![("b0", "The value was 10-")]);
+
+        validate_protected_spans(&segment, &["10-".to_string()], "7,3 × 10⁻⁷ mol cm⁻²")
+            .expect("dangling numeric extraction artifacts should not force review");
+    }
+
+    #[test]
+    fn missing_numeric_protected_span_still_fails_validation() {
+        let segment = segment("seg_a", 0, vec![("b0", "See section 5.16")]);
+
+        let error = validate_protected_spans(
+            &segment,
+            &["5.16".to_string()],
+            "Si noti che questa forma di rettificazione deriva dai canali aperti.",
+        )
+        .expect_err("absent numeric spans still need review");
+
+        assert!(error.to_string().contains("protected span missing"));
     }
 
     #[tokio::test]

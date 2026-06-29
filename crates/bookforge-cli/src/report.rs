@@ -317,7 +317,10 @@ fn numbers(text: &str) -> Vec<String> {
             (digits >= 2
                 && value.chars().all(|ch| {
                     ch.is_ascii_digit()
-                        || matches!(ch, '.' | ',' | ':' | '/' | '-' | '+' | '%' | '$')
+                        || matches!(
+                            ch,
+                            '.' | ',' | ':' | '/' | '-' | '+' | '%' | '$' | '−' | '–' | '—'
+                        )
                 }))
             .then(|| value.to_string())
         })
@@ -327,10 +330,134 @@ fn numbers(text: &str) -> Vec<String> {
 fn missing_tokens_message(label: &str, source: &[String], translated: &[String]) -> Option<String> {
     let missing = source
         .iter()
-        .filter(|token| !translated.contains(token))
+        .filter(|token| !token_present(token, translated))
         .cloned()
         .collect::<Vec<_>>();
     (!missing.is_empty()).then(|| format!("missing preserved {label}(s): {}", missing.join(", ")))
+}
+
+fn token_present(token: &str, translated: &[String]) -> bool {
+    dangling_numeric_span(token)
+        || translated.iter().any(|candidate| candidate == token)
+        || compact_numeric_punctuation_span(token).is_some_and(|expected| {
+            compact_ascii_whitespace(&translated.join("")).contains(&expected)
+        })
+        || digits_only_numeric_punctuation_span(token)
+            .is_some_and(|expected| digits_only(&translated.join("")).contains(&expected))
+        || canonical_decimal_number(token).is_some_and(|expected| {
+            translated
+                .iter()
+                .any(|candidate| canonical_decimal_number(candidate).as_deref() == Some(&expected))
+        })
+}
+
+fn dangling_numeric_span(value: &str) -> bool {
+    let normalized = normalize_number_signs(value);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    });
+    trimmed.ends_with('-') && trimmed.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn digits_only_numeric_punctuation_span(value: &str) -> Option<String> {
+    compact_numeric_punctuation_span(value).map(|compact| digits_only(&compact))
+}
+
+fn digits_only(value: &str) -> String {
+    value.chars().filter(|ch| ch.is_ascii_digit()).collect()
+}
+
+fn compact_numeric_punctuation_span(value: &str) -> Option<String> {
+    let normalized = normalize_number_signs(value);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    });
+    let digits = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
+    if digits < 2 {
+        return None;
+    }
+    if !trimmed.chars().all(|ch| {
+        ch.is_ascii_digit()
+            || ch.is_ascii_whitespace()
+            || matches!(
+                ch,
+                '.' | ',' | ';' | ':' | '/' | '-' | '+' | '%' | '$' | '(' | ')'
+            )
+    }) {
+        return None;
+    }
+    Some(compact_ascii_whitespace(trimmed))
+}
+
+fn compact_ascii_whitespace(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect()
+}
+
+fn canonical_decimal_number(value: &str) -> Option<String> {
+    let normalized = normalize_number_signs(value);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    });
+    if trimmed.is_empty() || !trimmed.chars().any(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let percent = trimmed.ends_with('%');
+    let numeric = trimmed.strip_suffix('%').unwrap_or(trimmed);
+    if !numeric
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+'))
+    {
+        return None;
+    }
+    if numeric.matches('.').count() + numeric.matches(',').count() > 1 {
+        return None;
+    }
+    let separator = numeric.find('.').or_else(|| numeric.find(','));
+    let mut canonical = match separator {
+        Some(index) => {
+            let (whole, fractional_with_separator) = numeric.split_at(index);
+            let fractional = &fractional_with_separator[1..];
+            if whole.is_empty()
+                || fractional.is_empty()
+                || !whole
+                    .trim_start_matches(['-', '+'])
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit())
+                || !fractional.chars().all(|ch| ch.is_ascii_digit())
+            {
+                return None;
+            }
+            format!("{whole}.{fractional}")
+        }
+        None => numeric.to_string(),
+    };
+    if percent {
+        canonical.push('%');
+    }
+    Some(canonical)
+}
+
+fn normalize_number_signs(value: &str) -> String {
+    value.chars().map(normalize_number_sign).collect()
+}
+
+fn normalize_number_sign(ch: char) -> char {
+    match ch {
+        '−' | '–' | '—' => '-',
+        _ => ch,
+    }
 }
 
 fn looks_like_model_commentary(text: &str) -> bool {
@@ -455,4 +582,44 @@ fn optional_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "n/a".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_number_message_accepts_decimal_comma_localization() {
+        let source = numbers("diameter 0.1 mm and potential -63.5 mV");
+        let translated = numbers("diametro 0,1 mm e potenziale –63,5 mV");
+
+        assert!(missing_tokens_message("number", &source, &translated).is_none());
+    }
+
+    #[test]
+    fn missing_number_message_accepts_citation_spacing() {
+        let source = numbers("Skou (1957,1989) isolated an ATPase");
+        let translated = numbers("Skou (1957, 1989) isolò una ATPasi");
+
+        assert!(missing_tokens_message("number", &source, &translated).is_none());
+    }
+
+    #[test]
+    fn missing_number_message_ignores_dangling_numeric_artifacts() {
+        let source = numbers("The value was 10-");
+        let translated = numbers("Il valore era 7,3 × 10⁻⁷");
+
+        assert!(missing_tokens_message("number", &source, &translated).is_none());
+    }
+
+    #[test]
+    fn missing_number_message_still_reports_absent_numbers() {
+        let source = numbers("diameter 0.1 mm and potential -63.5 mV");
+        let translated = numbers("diametro 0,1 mm");
+
+        let message = missing_tokens_message("number", &source, &translated)
+            .expect("missing number should be reported");
+
+        assert!(message.contains("-63.5"));
+    }
 }
