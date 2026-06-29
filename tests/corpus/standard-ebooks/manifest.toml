@@ -10,8 +10,8 @@ id = "stevenson-treasure-island"
 title = "Treasure Island"
 author = "Robert Louis Stevenson"
 url = "https://standardebooks.org/ebooks/robert-louis-stevenson/treasure-island/downloads/robert-louis-stevenson_treasure-island.epub?source=download"
-sha256 = "a762348479bd8099680c8b7751446abceb2d0b6fc0acb7cd80206e83a7ce15c2"
-size_bytes = 645829
+sha256 = "0a8cca387b87ec1d785721b314c26489f0b6d2cc302ebbfefaeb74dbf77aa6c7"
+size_bytes = 645859
 features = ["dialogue_heavy", "italics", "verse_excerpts"]
 ci_tier = "small"
 
