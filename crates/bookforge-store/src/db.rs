@@ -897,6 +897,31 @@ impl JobStore {
         Ok(Some(summary))
     }
 
+    /// All job ids, most-recently-created first.
+    pub fn list_job_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare("SELECT id FROM jobs ORDER BY created_at DESC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
+    /// Every job paired with its aggregated segment [`JobSummary`], newest
+    /// first. Powers the `watch` job picker and any dashboard job list.
+    pub fn list_job_summaries(&self) -> Result<Vec<(JobRecord, JobSummary)>> {
+        let ids = self.list_job_ids()?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let (Some(job), Some(summary)) = (self.get_job(&id)?, self.summary(&id)?) {
+                out.push((job, summary));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn retry_segments(&self, job_id: &str, scope: RetryScope) -> Result<usize> {
         let where_status = match scope {
             RetryScope::Failed => "status = 'failed'",

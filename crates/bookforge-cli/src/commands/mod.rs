@@ -13,3 +13,5 @@ pub mod style;
 pub mod tail;
 pub mod translate;
 pub mod validate;
+#[cfg(feature = "tui")]
+pub mod watch;

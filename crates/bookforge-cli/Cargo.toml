@@ -22,6 +22,7 @@ bookforge-store = { version = "1.8.5", path = "../bookforge-store" }
 clap.workspace = true
 console.workspace = true
 indicatif.workspace = true
+ratatui = { version = "0.30.2", optional = true, default-features = false, features = ["crossterm"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -31,6 +32,12 @@ tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[features]
+default = ["tui"]
+# Terminal UI (`--ui tui` and the `watch` command). Default-on; build with
+# --no-default-features to drop the ratatui dependency for a minimal binary.
+tui = ["dep:ratatui"]
 
 [dev-dependencies]
 assert_cmd = "2"

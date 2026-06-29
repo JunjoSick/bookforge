@@ -477,7 +477,11 @@ async fn run_inner(
 fn human_stdout_enabled(ui: Option<crate::progress::UiMode>) -> bool {
     !matches!(
         ui,
-        Some(crate::progress::UiMode::Json | crate::progress::UiMode::Quiet)
+        Some(
+            crate::progress::UiMode::Json
+                | crate::progress::UiMode::Quiet
+                | crate::progress::UiMode::Tui
+        )
     )
 }
 

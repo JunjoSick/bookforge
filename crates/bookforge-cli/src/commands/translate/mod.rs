@@ -92,7 +92,12 @@ pub async fn run(
         }
     }
 
-    let reporter = crate::progress::ProgressReporter::spawn(args.ui, args.progress_jsonl.clone());
+    let reporter = crate::progress::ProgressReporter::spawn_with_options(
+        args.ui,
+        args.progress_jsonl.clone(),
+        false,
+        Some(cancel_token.clone()),
+    );
     let progress_sink = reporter.sink();
 
     if let Some(message) = retry_amplification_warning(&settings) {
@@ -140,9 +145,13 @@ pub async fn run(
 }
 
 fn human_stdout_enabled(ui: crate::progress::UiMode) -> bool {
+    // The TUI owns the screen, so suppress plain stdout/stderr prints that would
+    // corrupt it; the dashboard surfaces the same information.
     !matches!(
         ui,
-        crate::progress::UiMode::Json | crate::progress::UiMode::Quiet
+        crate::progress::UiMode::Json
+            | crate::progress::UiMode::Quiet
+            | crate::progress::UiMode::Tui
     )
 }
 
