@@ -33,6 +33,8 @@ BookForge v1.8 is usable for EPUB translation and PDF-to-EPUB ingestion:
 - SQLite checkpoint store
 - Resume and retry commands
 - Status and tail commands for persisted jobs
+- Live monitoring: terminal dashboard (`watch` / `--ui tui`) and a local web
+  dashboard (`serve`) over a shared, replayable run-state layer
 - Segment-level cache reuse for compatible prior translations
 - Static side-by-side review HTML with flag export/import
 - QA reports in JSON and Markdown
@@ -249,6 +251,24 @@ Inspect persisted job state and recent events:
 cargo run -p bookforge-cli -- status <job-id>
 cargo run -p bookforge-cli -- tail <job-id> --lines 40
 ```
+
+Monitor a run live — in the terminal or in a browser. Both follow a job's
+`events.jsonl` and fold it into the same shared run state, so a run started in
+another process (or already finished) replays identically:
+
+```bash
+# Full-screen terminal dashboard (omit the id to pick from recent jobs).
+# Press `r` to mark failed / needs-review segments for retry, `q` to quit.
+cargo run -p bookforge-cli -- watch <job-id>
+
+# Local web dashboard for non-developers — job list, live progress over SSE,
+# and a retry button. Binds 127.0.0.1 only; the book text is private.
+cargo run -p bookforge-cli -- serve --open
+```
+
+Attach the terminal dashboard directly to a run you start with `--ui tui`.
+`watch` and `serve` are default-on build features (`tui` / `serve`); build with
+`--no-default-features` for a minimal binary without them.
 
 Retry failed or review-needed segments:
 

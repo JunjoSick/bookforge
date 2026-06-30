@@ -1,10 +1,27 @@
-# v2 Non-Developer UI — Local Web Dashboard (deferred)
+# v2 Non-Developer UI — Local Web Dashboard
 
-> **Status:** planned, not built. The *terminal* half of v2 (shared `RunState`
-> view layer + ratatui TUI + `watch`) ships on branch **`feat/tui-monitoring`**
-> (PR against `main`). This document is the plan for the remaining half — the
-> browser UI for non-developers — which gates the actual **v2** release/tag.
-> Written 2026-06-29.
+> **Status: BUILT** (2026-06-30) on branch **`feat/tui-monitoring`** alongside
+> the terminal half of v2. The `bookforge serve` command implements the
+> monitor + retry scope below; launch-from-browser remains the deferred v2.1
+> fast-follow. This document is kept as the design record — see
+> `crates/bookforge-cli/src/commands/serve.rs` for the implementation and
+> `crates/bookforge-cli/src/eventlog.rs` for the shared tailer.
+>
+> What shipped vs. this plan:
+> - `bookforge serve [--bind 127.0.0.1:8765] [--open] [--refresh-ms N]`.
+> - Endpoints `GET /`, `GET /api/jobs`, `GET /api/jobs/{id}`,
+>   `GET /api/jobs/{id}/events` (SSE, server-folded `RunState`),
+>   `POST /api/jobs/{id}/retry` — exactly as designed.
+> - `serve` is a **default-on** cargo feature (the plan floated opt-in first);
+>   flipped to default-on so release binaries are dogfoodable out of the box.
+> - The `pump_file` tailer + path resolution were extracted to
+>   `eventlog.rs` (`EventLogTailer`) and `watch` now shares it.
+> - Side fix required to make replay correct: the JSONL writer now buffers
+>   events emitted before `JobCreated` (e.g. `SegmentationFinished`) so the
+>   persisted log carries the segment total — without it both `watch` and
+>   `serve` showed a 0% progress bar.
+>
+> Original plan (written 2026-06-29) follows.
 
 ## Context / why
 

@@ -262,12 +262,20 @@ fn resolve_render_mode(ui_mode: UiMode, stderr_is_tty: bool) -> RenderMode {
     }
 }
 
+/// Upper bound on events buffered before the lazy log path is known. Real runs
+/// emit only a handful of events before `JobCreated`; the cap just guards a
+/// job-less stream from growing unbounded.
+const PENDING_EVENTS_CAP: usize = 1024;
+
 struct JsonlFileWriter {
     path: Option<PathBuf>,
     writer: Option<BufWriter<std::fs::File>>,
     failed: bool,
     last_flush: Instant,
     append: bool,
+    /// Events emitted before the lazy log path opens (i.e. before `JobCreated`),
+    /// held so they still land in the persisted log once it is created.
+    pending: Vec<ProgressEvent>,
 }
 
 impl JsonlFileWriter {
@@ -278,6 +286,7 @@ impl JsonlFileWriter {
             failed: false,
             last_flush: Instant::now(),
             append,
+            pending: Vec::new(),
         }
     }
 
@@ -314,22 +323,36 @@ impl JsonlFileWriter {
     }
 
     fn write_event(&mut self, event: &ProgressEvent) -> Result<()> {
-        // Lazy open: if no path was explicitly provided, use default
-        // job-based path when JobCreated arrives.
-        if self.path.is_none()
-            && self.writer.is_none()
-            && !self.failed
-            && let ProgressEvent::JobCreated { job_id, .. } = event
-        {
-            let run_dir = PathBuf::from(".bookforge/runs").join(job_id);
-            std::fs::create_dir_all(&run_dir)?;
-            self.path = Some(run_dir.join("events.jsonl"));
+        // Lazy open: if no path was explicitly provided, derive the default
+        // job-based path when JobCreated arrives. Events emitted *before*
+        // JobCreated (early stages, segmentation) are buffered so the persisted
+        // log is complete for replay-based consumers (`watch`, `serve`, `tail`).
+        if self.path.is_none() && self.writer.is_none() && !self.failed {
+            if let ProgressEvent::JobCreated { job_id, .. } = event {
+                let run_dir = PathBuf::from(".bookforge/runs").join(job_id);
+                std::fs::create_dir_all(&run_dir)?;
+                self.path = Some(run_dir.join("events.jsonl"));
+            } else {
+                if self.pending.len() < PENDING_EVENTS_CAP {
+                    self.pending.push(event.clone());
+                }
+                return Ok(());
+            }
         }
 
         self.ensure_open()?;
         let Some(writer) = self.writer.as_mut() else {
             return Ok(());
         };
+
+        // Flush any events buffered before the log path was known, in order.
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            for buffered in &pending {
+                writeln!(writer, "{}", serde_json::to_string(buffered)?)?;
+            }
+        }
+
         writeln!(writer, "{}", serde_json::to_string(event)?)?;
         if is_important_event(event)
             || self.last_flush.elapsed() >= std::time::Duration::from_secs(2)
@@ -672,6 +695,45 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("StageStarted"));
         assert!(content.contains("StageFinished"));
+    }
+
+    /// Events emitted before the log path opens (e.g. `SegmentationFinished`,
+    /// which the translate flow emits before `JobCreated`) must still land in
+    /// the persisted log, in order, so replay consumers see the segment total.
+    #[test]
+    fn jsonl_writer_flushes_events_buffered_before_open() {
+        let path = std::env::temp_dir().join(format!(
+            "bookforge-test-pending-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut writer = JsonlFileWriter::new(Some(path.clone()), false);
+        // Simulate an event emitted before the log destination was known.
+        writer.pending.push(ProgressEvent::SegmentationFinished {
+            segment_count: 7,
+            timestamp_ms: 1,
+        });
+        writer
+            .write_event(&ProgressEvent::JobCreated {
+                job_id: "pending-test".to_string(),
+                input_path: "in.epub".to_string(),
+                output_path: "out.epub".to_string(),
+                timestamp_ms: 2,
+            })
+            .unwrap();
+        writer.flush().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let first_line = content.lines().next().unwrap_or_default();
+        assert!(
+            first_line.contains("SegmentationFinished"),
+            "buffered pre-open event must be written first, got: {first_line}"
+        );
+        assert!(content.contains("JobCreated"));
+        assert!(writer.pending.is_empty());
     }
 
     /// With --progress-jsonl and --ui json, both stdout JSON and file are emitted.

@@ -1,6 +1,8 @@
 mod checkpoint;
 mod commands;
 mod cost;
+#[cfg(any(feature = "tui", feature = "serve"))]
+mod eventlog;
 mod performance;
 mod progress;
 mod report;
@@ -9,6 +11,8 @@ mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(feature = "serve")]
+use commands::serve;
 #[cfg(feature = "tui")]
 use commands::watch;
 use commands::{
@@ -50,6 +54,8 @@ enum Command {
     Tail(tail::TailArgs),
     #[cfg(feature = "tui")]
     Watch(watch::WatchArgs),
+    #[cfg(feature = "serve")]
+    Serve(serve::ServeArgs),
 }
 
 #[tokio::main]
@@ -83,6 +89,8 @@ async fn main() -> Result<()> {
         Command::Tail(args) => tail::run(args).await,
         #[cfg(feature = "tui")]
         Command::Watch(args) => watch::run(args).await,
+        #[cfg(feature = "serve")]
+        Command::Serve(args) => serve::run(args).await,
     }
 }
 

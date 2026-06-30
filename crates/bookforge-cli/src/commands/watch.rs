@@ -6,17 +6,12 @@
 //! [`bookforge_core::RunState`]. With no job id it shows a picker over recent
 //! jobs. Pressing `r` marks failed/needs-review segments for retry.
 
-use std::{
-    fs::File,
-    io::Read,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
 
 use anyhow::Result;
-use bookforge_core::ProgressEvent;
-use bookforge_store::{JobRecord, JobStore, RetryScope};
+use bookforge_store::{JobStore, RetryScope};
 
+use crate::eventlog::{EventLogTailer, events_path_for};
 use crate::tui::{JobPickerEntry, TuiAction, TuiApp, TuiMode, pick_job};
 
 #[derive(Debug, clap::Args)]
@@ -93,11 +88,6 @@ fn job_picker_entries(store: &JobStore) -> Result<Vec<JobPickerEntry>> {
         .collect())
 }
 
-fn events_path_for(job: Option<&JobRecord>, job_id: &str) -> PathBuf {
-    job.and_then(|j| j.events_path.clone())
-        .unwrap_or_else(|| PathBuf::from(format!(".bookforge/runs/{job_id}/events.jsonl")))
-}
-
 async fn watch_job(store: &JobStore, job_id: &str, path: &Path, refresh: Duration) -> Result<()> {
     let mut app = TuiApp::new(TuiMode::Watch)?;
     let result = drive_watch(&mut app, store, job_id, path, refresh).await;
@@ -112,18 +102,21 @@ async fn drive_watch(
     path: &Path,
     refresh: Duration,
 ) -> Result<()> {
-    let mut file: Option<File> = None;
-    let mut buf: Vec<u8> = Vec::new();
+    let mut tailer = EventLogTailer::new(path.to_path_buf());
     let mut tick = tokio::time::interval(refresh);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Show the current state immediately, before waiting on the first tick.
-    pump_file(&mut file, path, &mut buf, app)?;
+    for event in tailer.poll()? {
+        app.fold(&event);
+    }
     app.draw()?;
 
     loop {
         tick.tick().await;
-        pump_file(&mut file, path, &mut buf, app)?;
+        for event in tailer.poll()? {
+            app.fold(&event);
+        }
         if app.pump_input()? {
             break;
         }
@@ -140,46 +133,5 @@ async fn drive_watch(
         }
         app.draw()?;
     }
-    Ok(())
-}
-
-/// Read newly-appended bytes and fold each complete JSONL event into the app.
-/// Tolerates a partial trailing line (kept in `buf` until the newline arrives)
-/// and a not-yet-created log file (retried on the next tick).
-fn pump_file(
-    file: &mut Option<File>,
-    path: &Path,
-    buf: &mut Vec<u8>,
-    app: &mut TuiApp,
-) -> Result<()> {
-    if file.is_none() {
-        match File::open(path) {
-            Ok(opened) => *file = Some(opened),
-            Err(_) => return Ok(()),
-        }
-    }
-    let Some(handle) = file.as_mut() else {
-        return Ok(());
-    };
-
-    let mut chunk = Vec::new();
-    handle.read_to_end(&mut chunk)?;
-    if chunk.is_empty() {
-        return Ok(());
-    }
-    buf.extend_from_slice(&chunk);
-
-    let mut start = 0;
-    while let Some(offset) = buf[start..].iter().position(|&b| b == b'\n') {
-        let end = start + offset;
-        let line = &buf[start..end];
-        if !line.is_empty()
-            && let Ok(event) = serde_json::from_slice::<ProgressEvent>(line)
-        {
-            app.fold(&event);
-        }
-        start = end + 1;
-    }
-    buf.drain(..start);
     Ok(())
 }
