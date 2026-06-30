@@ -13,12 +13,15 @@
 //! - Frontend is inline string consts (no build step), mirroring `review.rs`.
 //! - Binds `127.0.0.1` by default; the book text is private.
 
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf, process::Command, time::Duration};
+use std::{
+    collections::HashMap, convert::Infallible, net::SocketAddr, path::PathBuf, process::Command,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State},
     http::StatusCode,
     response::{
         Html, IntoResponse, Response,
@@ -26,12 +29,18 @@ use axum::{
     },
     routing::{get, post},
 };
-use bookforge_core::RunState;
+use bookforge_core::{RunState, now_ms};
 use bookforge_store::{JobRecord, JobStore, JobSummary, RetryScope};
 use serde::Serialize;
 use serde_json::json;
 
 use crate::eventlog::{EventLogTailer, events_path_for};
+
+/// Where browser-launched uploads and their outputs are written.
+const UPLOAD_DIR: &str = ".bookforge/serve-uploads";
+
+/// Cap on a multipart upload body (EPUBs in the regression corpus reach ~11 MB).
+const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, clap::Args)]
 pub struct ServeArgs {
@@ -70,6 +79,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .route("/api/jobs/{id}", get(job_detail))
         .route("/api/jobs/{id}/events", get(job_events))
         .route("/api/jobs/{id}/retry", post(retry_job))
+        .route("/api/translate", post(launch_translate))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -199,6 +210,126 @@ async fn retry_job(AxumPath(id): AxumPath<String>) -> Result<Json<serde_json::Va
     Ok(Json(json!({ "retried": retried })))
 }
 
+/// Launch a new translation from an uploaded EPUB.
+///
+/// Runs the translation as a detached `bookforge translate` subprocess. The
+/// child inherits this process's environment, so provider API keys come from the
+/// same env vars the CLI uses (`OPENROUTER_API_KEY`, etc.) — the browser never
+/// handles secrets. The job is matched back to the dashboard by its unique input
+/// path (returned to the client), since the run generates its own job id.
+async fn launch_translate(mut multipart: Multipart) -> Result<Response, AppError> {
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name = "upload.epub".to_string();
+    let mut fields: HashMap<String, String> = HashMap::new();
+
+    while let Some(field) = multipart.next_field().await? {
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "file" {
+            if let Some(fname) = field.file_name()
+                && !fname.is_empty()
+            {
+                file_name = fname.to_string();
+            }
+            file_bytes = Some(field.bytes().await?.to_vec());
+        } else {
+            fields.insert(name, field.text().await?);
+        }
+    }
+
+    let Some(bytes) = file_bytes.filter(|b| !b.is_empty()) else {
+        return Ok(bad_request("upload an EPUB file"));
+    };
+    let Some(target) = field_value(&fields, "target") else {
+        return Ok(bad_request("target language is required"));
+    };
+
+    let stem = sanitize_component(strip_epub_suffix(&file_name));
+    let tag = format!("{}-{stem}", now_ms());
+    let upload_dir = PathBuf::from(UPLOAD_DIR);
+    std::fs::create_dir_all(&upload_dir)?;
+    let input_path = upload_dir.join(format!("{tag}.epub"));
+    std::fs::write(&input_path, &bytes)?;
+    let out_path = upload_dir.join(format!("{tag}.{}.epub", sanitize_component(&target)));
+
+    let provider = field_value(&fields, "provider").unwrap_or_else(|| "mock".to_string());
+    let exe = std::env::current_exe()?;
+    let mut command = tokio::process::Command::new(exe);
+    command
+        .arg("translate")
+        .arg(&input_path)
+        .arg("--target")
+        .arg(&target)
+        .arg("--provider")
+        .arg(&provider)
+        .arg("--ui")
+        .arg("quiet")
+        .arg("--out")
+        .arg(&out_path);
+    if let Some(source) = field_value(&fields, "source") {
+        command.arg("--source").arg(source);
+    }
+    // Offline mock runs are identity translations unless told otherwise.
+    let model = field_value(&fields, "model")
+        .or_else(|| (provider == "mock").then(|| "mock-identity".to_string()));
+    if let Some(model) = model {
+        command.arg("--model").arg(model);
+    }
+    if let Some(profile) = field_value(&fields, "profile") {
+        command.arg("--profile").arg(profile);
+    }
+
+    // Detached: the run outlives this request. Errors surface in the serve
+    // console (inherited stdio) and as failure status on the job itself.
+    command
+        .spawn()
+        .context("failed to spawn translation process")?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "input_path": input_path.display().to_string(),
+        "provider": provider,
+    }))
+    .into_response())
+}
+
+fn field_value(fields: &HashMap<String, String>, key: &str) -> Option<String> {
+    fields
+        .get(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn strip_epub_suffix(name: &str) -> &str {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    base.strip_suffix(".epub")
+        .or_else(|| base.strip_suffix(".EPUB"))
+        .unwrap_or(base)
+}
+
+/// Reduce arbitrary user text to a safe single path component.
+fn sanitize_component(input: &str) -> String {
+    let cleaned: String = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    if trimmed.is_empty() {
+        "book".to_string()
+    } else {
+        trimmed.chars().take(60).collect()
+    }
+}
+
+fn bad_request(message: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+}
+
 /// Resolve a job's event-log path off the async runtime (sqlite is blocking).
 async fn resolve_events_path(id: String) -> PathBuf {
     let fallback = PathBuf::from(format!(".bookforge/runs/{id}/events.jsonl"));
@@ -224,6 +355,7 @@ struct JobListItem {
     provider: String,
     model: String,
     target_lang: String,
+    input_path: String,
     total_segments: usize,
     done: usize,
     succeeded: usize,
@@ -244,6 +376,7 @@ impl JobListItem {
             provider: job.provider.clone(),
             model: job.model.clone(),
             target_lang: job.target_lang.clone(),
+            input_path: job.input_path.display().to_string(),
             total_segments: summary.total_segments,
             done,
             succeeded: summary.succeeded,
@@ -444,6 +577,17 @@ button.retry:disabled { opacity: .5; cursor: default; }
 .line { padding: 3px 14px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .line.warn { color: var(--warn); } .line.bad { color: var(--bad); }
 .line .t { color: var(--muted); margin-right: 8px; }
+.newrun { border-bottom: 1px solid var(--line); }
+.newrun > summary { padding: 10px 14px; cursor: pointer; color: var(--accent); font-size: 13px; user-select: none; list-style: none; }
+.newrun > summary::-webkit-details-marker { display: none; }
+.newrun > summary:hover { background: var(--panel-2); }
+#launchform { display: flex; flex-direction: column; gap: 8px; padding: 2px 14px 14px; }
+#launchform label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--muted); }
+#launchform input, #launchform select { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 5px; padding: 6px 8px; font-size: 13px; }
+#launchform input[type=file] { padding: 5px; }
+#launchform button { margin-top: 4px; }
+#launchform .hint { font-size: 10px; color: var(--muted); margin: 2px 0 0; line-height: 1.4; }
+#launchstatus { font-size: 11px; min-height: 14px; }
 </style>
 </head>
 <body>
@@ -453,7 +597,35 @@ button.retry:disabled { opacity: .5; cursor: default; }
   <span class="live"><span class="dot" id="livedot"></span><span id="livetxt">idle</span></span>
 </header>
 <main>
-  <div id="sidebar"><div class="head">Jobs</div><div id="jobs"></div></div>
+  <div id="sidebar">
+    <details id="newrun" class="newrun">
+      <summary>＋ New translation</summary>
+      <form id="launchform" onsubmit="return launch(event)">
+        <label>EPUB file<input type="file" name="file" accept=".epub" required></label>
+        <label>Target language<input type="text" name="target" placeholder="Italian" required></label>
+        <label>Source language (optional)<input type="text" name="source" placeholder="auto-detect"></label>
+        <label>Provider<select name="provider">
+          <option value="mock">mock (offline test)</option>
+          <option value="deepseek">deepseek</option>
+          <option value="openrouter">openrouter</option>
+          <option value="openai-compatible">openai-compatible</option>
+        </select></label>
+        <label>Model (optional)<input type="text" name="model" placeholder="e.g. deepseek/deepseek-v4-flash"></label>
+        <label>Profile<select name="profile">
+          <option value="v1-fast">v1-fast</option>
+          <option value="safe">safe</option>
+          <option value="balanced">balanced</option>
+          <option value="fastest">fastest</option>
+          <option value="free-tier">free-tier</option>
+          <option value="turbo-text-only">turbo-text-only</option>
+        </select></label>
+        <button type="submit" class="retry">Launch translation</button>
+        <span class="toast" id="launchstatus"></span>
+        <p class="hint">Provider API keys are read from the environment of the <code>bookforge serve</code> process (e.g. <code>OPENROUTER_API_KEY</code>).</p>
+      </form>
+    </details>
+    <div class="head">Jobs</div><div id="jobs"></div>
+  </div>
   <div id="detail"><div class="empty">Select a job to monitor.</div></div>
 </main>
 <script>
@@ -609,6 +781,41 @@ async function retry(id) {
   } catch (e) { toast.textContent = "retry failed"; }
   btn.disabled = false;
   loadJobs();
+}
+
+let pendingInput = null;
+async function launch(ev) {
+  ev.preventDefault();
+  const form = ev.target;
+  const status = $("#launchstatus");
+  status.textContent = "uploading…";
+  try {
+    const r = await fetch("/api/translate", { method: "POST", body: new FormData(form) });
+    const j = await r.json();
+    if (!r.ok) { status.textContent = j.error || "launch failed"; return false; }
+    status.textContent = "started — locating job…";
+    pendingInput = j.input_path;
+    form.reset();
+    $("#newrun").open = false;
+    await loadJobs();
+    setTimeout(() => trySelectPending(0), 800);
+  } catch (e) { status.textContent = "launch failed"; }
+  return false;
+}
+
+async function trySelectPending(attempt) {
+  if (!pendingInput || attempt > 25) { pendingInput = null; return; }
+  let jobs = [];
+  try { jobs = await (await fetch("/api/jobs")).json(); } catch (e) {}
+  const match = jobs.find(j => j.input_path === pendingInput);
+  if (match) {
+    pendingInput = null;
+    $("#launchstatus").textContent = "";
+    await loadJobs();
+    selectJob(match.id);
+  } else {
+    setTimeout(() => trySelectPending(attempt + 1), 900);
+  }
 }
 
 loadJobs();

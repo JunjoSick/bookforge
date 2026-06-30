@@ -261,8 +261,10 @@ another process (or already finished) replays identically:
 # Press `r` to mark failed / needs-review segments for retry, `q` to quit.
 cargo run -p bookforge-cli -- watch <job-id>
 
-# Local web dashboard for non-developers — job list, live progress over SSE,
-# and a retry button. Binds 127.0.0.1 only; the book text is private.
+# Local web dashboard for non-developers — start a translation (upload an EPUB),
+# watch the job list and live progress over SSE, and retry from a button. Binds
+# 127.0.0.1 only; the book text is private. Provider API keys are read from the
+# serve process's environment, so the browser never handles secrets.
 cargo run -p bookforge-cli -- serve --open
 ```
 

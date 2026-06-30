@@ -1,9 +1,9 @@
 # v2 Non-Developer UI — Local Web Dashboard
 
 > **Status: BUILT** (2026-06-30) on branch **`feat/tui-monitoring`** alongside
-> the terminal half of v2. The `bookforge serve` command implements the
-> monitor + retry scope below; launch-from-browser remains the deferred v2.1
-> fast-follow. This document is kept as the design record — see
+> the terminal half of v2. `bookforge serve` implements monitoring, retry, **and
+> launch-from-browser** — the last was pulled into v2.0 rather than deferred to
+> v2.1. This document is kept as the design record — see
 > `crates/bookforge-cli/src/commands/serve.rs` for the implementation and
 > `crates/bookforge-cli/src/eventlog.rs` for the shared tailer.
 >
@@ -12,6 +12,13 @@
 > - Endpoints `GET /`, `GET /api/jobs`, `GET /api/jobs/{id}`,
 >   `GET /api/jobs/{id}/events` (SSE, server-folded `RunState`),
 >   `POST /api/jobs/{id}/retry` — exactly as designed.
+> - `POST /api/translate` (multipart) — **launch-from-browser**, brought forward
+>   into v2.0. A "New translation" form uploads an EPUB + target/provider/profile
+>   and spawns a detached `bookforge translate` subprocess. The child inherits the
+>   serve process's environment, so **API keys come from the same env vars the CLI
+>   uses — the browser never handles secrets**, which resolves the deferral's main
+>   concern. The new job is matched back to the dashboard by its unique input path
+>   and auto-selected. Bound to localhost; upload body cap 64 MB.
 > - `serve` is a **default-on** cargo feature (the plan floated opt-in first);
 >   flipped to default-on so release binaries are dogfoodable out of the box.
 > - The `pump_file` tailer + path resolution were extracted to
@@ -21,7 +28,9 @@
 >   persisted log carries the segment total — without it both `watch` and
 >   `serve` showed a 0% progress bar.
 >
-> Original plan (written 2026-06-29) follows.
+> Still deferred: in-browser provider/secret *configuration* and any
+> authentication — launching uses whatever env the operator started `serve` with,
+> and the bind stays localhost-only. Original plan (written 2026-06-29) follows.
 
 ## Context / why
 

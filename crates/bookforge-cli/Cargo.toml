@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 async-stream = { version = "0.3", optional = true }
-axum = { version = "0.8", optional = true }
+axum = { version = "0.8", optional = true, features = ["multipart"] }
 bookforge-core = { version = "1.8.5", path = "../bookforge-core", features = ["cli"] }
 bookforge-epub = { version = "1.8.5", path = "../bookforge-epub" }
 bookforge-llm = { version = "1.8.5", path = "../bookforge-llm" }
@@ -44,7 +44,13 @@ tui = ["dep:ratatui"]
 # Local web dashboard (the `serve` command). Default-on so release binaries can
 # be dogfooded by non-developers; build with --no-default-features to drop the
 # axum/hyper dependency for a minimal binary.
-serve = ["dep:axum", "dep:async-stream", "dep:futures-core", "tokio/net"]
+serve = [
+    "dep:axum",
+    "dep:async-stream",
+    "dep:futures-core",
+    "tokio/net",
+    "tokio/process",
+]
 
 [dev-dependencies]
 assert_cmd = "2"
