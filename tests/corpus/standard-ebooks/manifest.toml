@@ -2,14 +2,22 @@ schema_version = 1
 description = """
 Curated Standard Ebooks fixtures for BookForge structural regression testing.
 The files are downloaded on demand and are not committed to this repository.
-Hashes were recorded on 2026-06-20.
+
+To keep CI stable, the `url` of each book points at an immutable snapshot
+mirrored as a GitHub Release asset (tag `corpus-fixtures-v1`), not at the
+mutable Standard Ebooks "latest" download. The original public-domain source
+is recorded in `source_url` for provenance. Hashes pin those exact snapshots
+and were recorded on 2026-06-30. To refresh the corpus, re-download from
+`source_url`, upload to a new `corpus-fixtures-vN` release, and update `url`
+plus the hashes here.
 """
 
 [[book]]
 id = "stevenson-treasure-island"
 title = "Treasure Island"
 author = "Robert Louis Stevenson"
-url = "https://standardebooks.org/ebooks/robert-louis-stevenson/treasure-island/downloads/robert-louis-stevenson_treasure-island.epub?source=download"
+url = "https://github.com/JunjoSick/bookforge/releases/download/corpus-fixtures-v1/stevenson-treasure-island.epub"
+source_url = "https://standardebooks.org/ebooks/robert-louis-stevenson/treasure-island/downloads/robert-louis-stevenson_treasure-island.epub?source=download"
 sha256 = "0a8cca387b87ec1d785721b314c26489f0b6d2cc302ebbfefaeb74dbf77aa6c7"
 size_bytes = 645859
 features = ["dialogue_heavy", "italics", "verse_excerpts"]
@@ -19,7 +27,8 @@ ci_tier = "small"
 id = "shelley-frankenstein"
 title = "Frankenstein"
 author = "Mary Shelley"
-url = "https://standardebooks.org/ebooks/mary-shelley/frankenstein/downloads/mary-shelley_frankenstein.epub?source=download"
+url = "https://github.com/JunjoSick/bookforge/releases/download/corpus-fixtures-v1/shelley-frankenstein.epub"
+source_url = "https://standardebooks.org/ebooks/mary-shelley/frankenstein/downloads/mary-shelley_frankenstein.epub?source=download"
 sha256 = "a58d516b6535e0e00ef3a9845711da7ca3ea7d3573257412faeb5a8b912189ea"
 size_bytes = 633890
 features = ["letters", "nested_quotes", "roman_numerals"]
@@ -29,7 +38,8 @@ ci_tier = "small"
 id = "wilde-dorian-gray"
 title = "The Picture of Dorian Gray"
 author = "Oscar Wilde"
-url = "https://standardebooks.org/ebooks/oscar-wilde/the-picture-of-dorian-gray/downloads/oscar-wilde_the-picture-of-dorian-gray.epub?source=download"
+url = "https://github.com/JunjoSick/bookforge/releases/download/corpus-fixtures-v1/wilde-dorian-gray.epub"
+source_url = "https://standardebooks.org/ebooks/oscar-wilde/the-picture-of-dorian-gray/downloads/oscar-wilde_the-picture-of-dorian-gray.epub?source=download"
 sha256 = "765c9a9b1cdab4b7a52f4fbd790ccd31a758ab60bee2f9924cee25054d1e43fd"
 size_bytes = 556835
 features = ["dialogue_heavy", "epigraph", "italics"]
@@ -39,9 +49,10 @@ ci_tier = "small"
 id = "austen-pride-and-prejudice"
 title = "Pride and Prejudice"
 author = "Jane Austen"
-url = "https://standardebooks.org/ebooks/jane-austen/pride-and-prejudice/downloads/jane-austen_pride-and-prejudice.epub?source=download"
-sha256 = "071b7edbfcdaa1d4a2abb438f430ff61d4f0b4f0e38e27118effa687f5a7106a"
-size_bytes = 771052
+url = "https://github.com/JunjoSick/bookforge/releases/download/corpus-fixtures-v1/austen-pride-and-prejudice.epub"
+source_url = "https://standardebooks.org/ebooks/jane-austen/pride-and-prejudice/downloads/jane-austen_pride-and-prejudice.epub?source=download"
+sha256 = "329909d41c40809a16c4cafe5a55ff6875b1b831b35ca5ec11c4025490025303"
+size_bytes = 771092
 features = ["dialogue_heavy", "letters", "large_novel"]
 ci_tier = "medium"
 
@@ -49,9 +60,10 @@ ci_tier = "medium"
 id = "du-bois-souls"
 title = "The Souls of Black Folk"
 author = "W. E. B. Du Bois"
-url = "https://standardebooks.org/ebooks/w-e-b-du-bois/the-souls-of-black-folk/downloads/w-e-b-du-bois_the-souls-of-black-folk.epub?source=download"
-sha256 = "d3f66ce5169a22262223e01de7a7dd5ad91555e888f3e27a398c13ab0a5ec71e"
-size_bytes = 1102372
+url = "https://github.com/JunjoSick/bookforge/releases/download/corpus-fixtures-v1/du-bois-souls.epub"
+source_url = "https://standardebooks.org/ebooks/w-e-b-du-bois/the-souls-of-black-folk/downloads/w-e-b-du-bois_the-souls-of-black-folk.epub?source=download"
+sha256 = "65cff275c829665af35c2d80711d9b1effc03d92ea4bd1328030292b76816278"
+size_bytes = 1102404
 features = ["footnotes", "music", "epigraphs"]
 ci_tier = "medium"
 
@@ -59,9 +71,10 @@ ci_tier = "medium"
 id = "abbott-flatland"
 title = "Flatland"
 author = "Edwin A. Abbott"
-url = "https://standardebooks.org/ebooks/edwin-a-abbott/flatland/downloads/edwin-a-abbott_flatland.epub?source=download"
-sha256 = "7789e5ec418936aa1d406e4161f8c7347e14f07cb6203717cd223e7fe34b0a7f"
-size_bytes = 723354
+url = "https://github.com/JunjoSick/bookforge/releases/download/corpus-fixtures-v1/abbott-flatland.epub"
+source_url = "https://standardebooks.org/ebooks/edwin-a-abbott/flatland/downloads/edwin-a-abbott_flatland.epub?source=download"
+sha256 = "b49ce0a5d5fea5a46dd988ff8107d365bf95643b9a8b8d568538e38f13dd2e33"
+size_bytes = 723385
 features = ["illustrations", "geometry", "tables"]
 ci_tier = "medium"
 
@@ -69,9 +82,10 @@ ci_tier = "medium"
 id = "carroll-alice"
 title = "Alice's Adventures in Wonderland"
 author = "Lewis Carroll"
-url = "https://standardebooks.org/ebooks/lewis-carroll/alices-adventures-in-wonderland/john-tenniel/downloads/lewis-carroll_alices-adventures-in-wonderland_john-tenniel.epub?source=download"
-sha256 = "843c2c34b5660ebf71bd4d72bebeba867b2bdab4fe82b5326f174e0cf20d09ea"
-size_bytes = 10635757
+url = "https://github.com/JunjoSick/bookforge/releases/download/corpus-fixtures-v1/carroll-alice.epub"
+source_url = "https://standardebooks.org/ebooks/lewis-carroll/alices-adventures-in-wonderland/john-tenniel/downloads/lewis-carroll_alices-adventures-in-wonderland_john-tenniel.epub?source=download"
+sha256 = "c32b1437b7cf2ce3868d3bae9238c284164bf92aa0785dd81d18b82807088ca9"
+size_bytes = 10635802
 features = ["illustrations", "verse", "dialogue", "drop_caps"]
 ci_tier = "large"
 
@@ -79,9 +93,10 @@ ci_tier = "large"
 id = "melville-moby-dick"
 title = "Moby Dick"
 author = "Herman Melville"
-url = "https://standardebooks.org/ebooks/herman-melville/moby-dick/downloads/herman-melville_moby-dick.epub?source=download"
-sha256 = "3d1000d220a6c95b01dc0cf1d134c8b3077dd7562ecab27a6c74323455d99886"
-size_bytes = 1107114
+url = "https://github.com/JunjoSick/bookforge/releases/download/corpus-fixtures-v1/melville-moby-dick.epub"
+source_url = "https://standardebooks.org/ebooks/herman-melville/moby-dick/downloads/herman-melville_moby-dick.epub?source=download"
+sha256 = "c868643288c30d56ce6f1d4be44e0e7917a3b1610abe6409587bb244876e121b"
+size_bytes = 1107138
 features = ["large_novel", "footnotes", "tables", "foreign_language"]
 ci_tier = "large"
 
@@ -89,8 +104,9 @@ ci_tier = "large"
 id = "tolstoy-war-and-peace"
 title = "War and Peace"
 author = "Leo Tolstoy"
-url = "https://standardebooks.org/ebooks/leo-tolstoy/war-and-peace/louise-maude_aylmer-maude/downloads/leo-tolstoy_war-and-peace_louise-maude_aylmer-maude.epub?source=download"
-sha256 = "87b6dd4a56d94fe12c0e0ab6eaac92a1c53c21eb8d3147bb28ccd6f3524f6220"
-size_bytes = 2326877
+url = "https://github.com/JunjoSick/bookforge/releases/download/corpus-fixtures-v1/tolstoy-war-and-peace.epub"
+source_url = "https://standardebooks.org/ebooks/leo-tolstoy/war-and-peace/louise-maude_aylmer-maude/downloads/leo-tolstoy_war-and-peace_louise-maude_aylmer-maude.epub?source=download"
+sha256 = "0a3c7fec9debffdcddbab85ee59063fab1ac9386163f185dd361b18e5db8c20a"
+size_bytes = 2326924
 features = ["very_large_novel", "footnotes", "french_passages", "nested_sections"]
 ci_tier = "large"
