@@ -289,7 +289,7 @@ fn qa_warnings(input: &ReportInput<'_>) -> Vec<QaWarning> {
     warnings
 }
 
-fn urls(text: &str) -> Vec<String> {
+pub(crate) fn urls(text: &str) -> Vec<String> {
     text.split_whitespace()
         .filter_map(|token| {
             let value = token.trim_matches(|ch: char| {
@@ -304,7 +304,7 @@ fn urls(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn numbers(text: &str) -> Vec<String> {
+pub(crate) fn numbers(text: &str) -> Vec<String> {
     let chars = text.chars().collect::<Vec<_>>();
     let mut out = Vec::new();
     let mut index = 0;
@@ -384,7 +384,7 @@ fn missing_tokens_message(label: &str, source: &[String], translated: &[String])
     (!missing.is_empty()).then(|| format!("missing preserved {label}(s): {}", missing.join(", ")))
 }
 
-fn token_present(token: &str, translated: &[String]) -> bool {
+pub(crate) fn token_present(token: &str, translated: &[String]) -> bool {
     dangling_numeric_span(token)
         || translated.iter().any(|candidate| candidate == token)
         || compact_numeric_punctuation_span(token).is_some_and(|expected| {
@@ -508,7 +508,7 @@ fn normalize_number_sign(ch: char) -> char {
     }
 }
 
-fn looks_like_model_commentary(text: &str) -> bool {
+pub(crate) fn looks_like_model_commentary(text: &str) -> bool {
     let lower = text.trim_start().to_ascii_lowercase();
     lower.starts_with("here is ")
         || lower.starts_with("here's ")

@@ -106,6 +106,10 @@ const OPENAI_COMPATIBLE_MODELS: &[&str] = &["gpt-4o-mini", "gpt-4o"];
 const CSRF_HEADER: &str = "x-bookforge-csrf";
 const CSRF_TOKEN_PLACEHOLDER: &str = "__BOOKFORGE_CSRF_TOKEN__";
 
+/// Monotonic suffix for estimate temp files, so two uploads landing in the same
+/// millisecond never collide on a path (and delete each other's input mid-parse).
+static ESTIMATE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug, clap::Args)]
 pub struct ServeArgs {
     /// Address to bind. Must be loopback because the dashboard is unauthenticated
@@ -322,19 +326,23 @@ async fn job_validate(
         return Ok(response);
     }
 
-    let outcome = tokio::task::spawn_blocking(move || -> Result<Option<super::validate::ValidationReport>> {
-        let store = JobStore::open_default()?;
-        let Some(job) = store.get_job(&id)? else {
-            return Ok(None);
-        };
-        if !job.output_path.exists() {
-            anyhow::bail!(
-                "translated EPUB not found at {} — finish the run first",
-                job.output_path.display()
-            );
-        }
-        Ok(Some(super::validate::validate_path(&job.output_path, false).report))
-    })
+    let outcome = tokio::task::spawn_blocking(
+        move || -> Result<Option<super::validate::ValidationReport>> {
+            let store = JobStore::open_default()?;
+            let Some(job) = store.get_job(&id)? else {
+                return Ok(None);
+            };
+            if !job.output_path.exists() {
+                anyhow::bail!(
+                    "translated EPUB not found at {} — finish the run first",
+                    job.output_path.display()
+                );
+            }
+            Ok(Some(
+                super::validate::validate_path(&job.output_path, false).report,
+            ))
+        },
+    )
     .await?;
 
     match outcome {
@@ -568,10 +576,12 @@ async fn estimate_translate(
     let model = field_value(&fields, "model");
 
     let result = tokio::task::spawn_blocking(move || {
+        let seq = ESTIMATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "bookforge-estimate-{}-{}.epub",
+            "bookforge-estimate-{}-{}-{}.epub",
             std::process::id(),
-            now_ms()
+            now_ms(),
+            seq
         ));
         std::fs::write(&path, &bytes)?;
         let outcome = super::estimate::estimate_epub(&path, &provider, model.as_deref(), None);
@@ -1183,7 +1193,7 @@ main{min-height:calc(100vh - 60px)}
 
 .badge{display:inline-block;font:600 10.5px var(--sans);padding:3px 9px;border-radius:20px;color:var(--muted);background:var(--chip)}
 .badge.running,.badge.translating{color:var(--accent);background:var(--accentsoft)}
-.badge.done,.badge.completed{color:var(--good);background:var(--goodbg)}
+.badge.done,.badge.completed,.badge.succeeded{color:var(--good);background:var(--goodbg)}
 .badge.failed,.badge.error{color:var(--danger);background:var(--accentsoft)}
 
 /* wizard */
@@ -1468,19 +1478,25 @@ function render() {
 }
 
 /* ---------------- Library ---------------- */
+function jobDone(st) { return st === "succeeded" || st === "done" || st === "completed"; }
 async function renderLibrary(stage) {
   stage.innerHTML = `<div class="wrap">
     <div class="pagehead"><div><h1>Your library</h1><p>Pick up a translation, review a finished book, or start a new one.</p></div>
       <button class="btn btn-primary" onclick="bfStartNew()">+ New translation</button></div>
     <div class="book-grid" id="grid"><div class="empty">Loading…</div></div></div>`;
+  loadLibraryJobs();
+}
+async function loadLibraryJobs() {
   let jobs = [];
   try { jobs = await (await fetch("/api/jobs")).json(); } catch (e) { jobs = []; }
   App.jobs = jobs;
-  const grid = $("#grid"); if (!grid) return;
+  const grid = $("#grid");
+  if (!grid || App.screen !== "library") return;
   const cards = jobs.map(j => {
     const p = pct(j.done, j.total_segments);
     const st = badgeClass(j.status);
-    const action = (st === "done" || st === "completed") ? "Review →" : (st === "failed" || st === "error") ? "Inspect →" : (p > 0 ? "View progress →" : "Open →");
+    const done = jobDone(st);
+    const action = done ? "Review →" : (st === "failed" || st === "error") ? "Inspect →" : (p > 0 ? "View progress →" : "Open →");
     const title = titleFromPath(j.input_path);
     return `<div class="book-card" onclick="bfOpenJob('${esc(j.id)}','${st}')">
       <div class="cover">${esc(title.charAt(0))}</div>
@@ -1488,7 +1504,7 @@ async function renderLibrary(stage) {
         <div class="book-title">${esc(title)}</div>
         <div class="book-sub">${esc(j.provider)} / ${esc(j.model)}</div>
         <div class="book-meta"><span class="badge ${st}">${esc(j.status)}</span><span class="mono">${j.done}/${j.total_segments} · ${esc(j.target_lang)}</span></div>
-        <div class="bar-track" ${p?"":'style="opacity:0"'}><div class="bar-fill" style="width:${p}%;${st==="done"||st==="completed"?"background:var(--good)":""}"></div></div>
+        <div class="bar-track" ${p?"":'style="opacity:0"'}><div class="bar-fill" style="width:${p}%;${done?"background:var(--good)":""}"></div></div>
       </div>
       <div class="book-action">${action}</div></div>`;
   }).join("");
@@ -1496,7 +1512,7 @@ async function renderLibrary(stage) {
       <div class="plus">＋</div><b>Translate a new book</b><span>Drop an EPUB to begin</span></div>`;
 }
 function bfOpenJob(id, st) {
-  if (st === "done" || st === "completed") bfGo("review", { selected: id });
+  if (jobDone(st)) bfGo("review", { selected: id });
   else bfGo("progress", { selected: id });
 }
 
@@ -1533,7 +1549,7 @@ function renderWizard(stage) {
       <div class="wizfoot">
         <button class="btn btn-ghost" onclick="bfWizBack()" ${w.step===0?"hidden":""}>Back</button>
         <span class="grow"></span><span class="launchstatus" id="launchstatus">${esc(w.status||"")}</span>
-        <button class="btn btn-primary" style="padding:13px 26px;font-size:14px" onclick="bfWizNext()">${w.step===3?"Start translation":"Continue"}</button>
+        <button class="btn btn-primary" id="wiznext" style="padding:13px 26px;font-size:14px" onclick="bfWizNext()">${w.step===3?"Start translation":"Continue"}</button>
       </div></div></div>`;
   renderWizBody();
 }
@@ -1578,6 +1594,7 @@ function syncWizInputs() {
   const key = $("#w_key"); if (key) w.apiKey = key.value;
   const base = $("#w_base"); if (base) w.baseUrl = base.value.trim();
   const conc = $("#w_conc"); if (conc) w.concurrency = Math.max(1, Math.min(16, parseInt(conc.value,10) || 1));
+  const mid = $("#w_modelid"); if (mid && mid.value.trim()) w.model = mid.value.trim();
 }
 function bfPickFile(input) {
   const f = input.files && input.files[0];
@@ -1623,6 +1640,9 @@ function renderReviewStep(body) {
       ${needsKey?`<div class="field-label">API key</div><input class="inp" id="w_key" type="password" autocomplete="off" placeholder="Paste once for this session" value="${esc(w.apiKey)}"><div class="keyline">Read from the server environment or remembered for this server session.</div>`:""}
       <div class="field-label" style="margin-top:15px">Model · ${esc((opt.label||opt.id))}</div>
       <div class="modelcards">${models||`<div style="color:var(--faint);font-size:12px;padding:8px">No preset models</div>`}</div>
+      <div style="display:flex;align-items:center;gap:8px;margin:2px 0 6px">
+        <span style="font:400 11px var(--sans);color:var(--faint);white-space:nowrap">Or type any ID</span>
+        <input class="inp" id="w_modelid" placeholder="provider/model-name" value="${esc(w.model)}" oninput="App.wizard.model=this.value.trim();App.wizard.estimate=null" onchange="requestEstimate()"></div>
       <div class="adv-grid" style="margin-top:6px">
         <div class="adv-cell"><span>Concurrency</span><div class="stepper">
           <div class="stepbtn" onclick="bfConc(-1)">−</div>
@@ -1675,6 +1695,11 @@ async function launchTranslation() {
   const w = App.wizard;
   const opt = providerOption(w.provider);
   if (opt.requires_base_url && !w.baseUrl) { w.advancedOpen = true; renderWizBody(); return toastWiz("base URL is required for this provider"); }
+  if (w.launching) return;
+  w.launching = true;
+  const btn = $("#wiznext");
+  const reenable = () => { w.launching = false; if (btn) { btn.disabled = false; btn.style.opacity = ""; btn.textContent = "Start translation"; } };
+  if (btn) { btn.disabled = true; btn.style.opacity = ".6"; btn.textContent = "Starting…"; }
   toastWiz("uploading…");
   const fd = new FormData();
   fd.append("file", w.file);
@@ -1692,11 +1717,11 @@ async function launchTranslation() {
   try {
     const r = await fetch("/api/translate", { method: "POST", headers: { [CSRF_HEADER]: CSRF_TOKEN }, body: fd });
     const j = await r.json();
-    if (!r.ok) { toastWiz(j.error || "launch failed"); return; }
+    if (!r.ok) { reenable(); toastWiz(j.error || "launch failed"); return; }
     toastWiz("started — locating job…");
     await loadProviderStatus();
     trySelectPending(j.input_path, 0);
-  } catch (e) { toastWiz("launch failed"); }
+  } catch (e) { reenable(); toastWiz("launch failed"); }
 }
 async function trySelectPending(inputPath, attempt) {
   if (attempt > 25) return;
@@ -2016,6 +2041,8 @@ async function boot() {
   applyTheme();
   await Promise.all([loadOptions(), loadProviderStatus()]);
   render();
+  // Keep the library list live while it's on screen (statuses/progress advance).
+  setInterval(() => { if (App.screen === "library") loadLibraryJobs(); }, 4000);
 }
 boot();
 </script>
@@ -2132,7 +2159,8 @@ mod tests {
 
         // A well-formed multipart body so the Multipart extractor succeeds and
         // the handler's own CSRF check is what rejects the request.
-        let body = "--B\r\nContent-Disposition: form-data; name=\"provider\"\r\n\r\nmock\r\n--B--\r\n";
+        let body =
+            "--B\r\nContent-Disposition: form-data; name=\"provider\"\r\n\r\nmock\r\n--B--\r\n";
         let response = dashboard_router(test_state("token-123"))
             .oneshot(
                 Request::builder()

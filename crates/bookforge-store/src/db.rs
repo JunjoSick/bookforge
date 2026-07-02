@@ -808,35 +808,40 @@ impl JobStore {
         Ok(updated)
     }
 
+    /// Column list for `jobs` in the exact order [`job_record_from_row`] reads.
+    /// Shared by `get_job` and `list_job_summaries` so the SELECT and the mapper
+    /// never drift.
+    const JOB_COLUMNS: &'static str = "id, input_path, input_snapshot_path, input_sha256, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, status, events_path, report_json_path, report_markdown_path, book_id, series_id";
+
+    fn job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
+        Ok(JobRecord {
+            id: row.get(0)?,
+            input_path: PathBuf::from(row.get::<_, String>(1)?),
+            input_snapshot_path: row.get::<_, Option<String>>(2)?.map(PathBuf::from),
+            input_sha256: row.get(3)?,
+            output_path: PathBuf::from(row.get::<_, String>(4)?),
+            input_hash: row.get(5)?,
+            source_lang: row.get(6)?,
+            target_lang: row.get(7)?,
+            provider: row.get(8)?,
+            model: row.get(9)?,
+            base_url: row.get(10)?,
+            api_key_env: row.get(11)?,
+            status: row.get(12)?,
+            events_path: row.get::<_, Option<String>>(13)?.map(PathBuf::from),
+            report_json_path: row.get::<_, Option<String>>(14)?.map(PathBuf::from),
+            report_markdown_path: row.get::<_, Option<String>>(15)?.map(PathBuf::from),
+            book_id: row.get(16)?,
+            series_id: row.get(17)?,
+        })
+    }
+
     pub fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>> {
         let conn = self.conn.borrow();
         conn.query_row(
-            "SELECT id, input_path, input_snapshot_path, input_sha256, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, status,
-                    events_path, report_json_path, report_markdown_path, book_id, series_id
-             FROM jobs WHERE id = ?1",
+            &format!("SELECT {} FROM jobs WHERE id = ?1", Self::JOB_COLUMNS),
             params![job_id],
-            |row| {
-                Ok(JobRecord {
-                    id: row.get(0)?,
-                    input_path: PathBuf::from(row.get::<_, String>(1)?),
-                    input_snapshot_path: row.get::<_, Option<String>>(2)?.map(PathBuf::from),
-                    input_sha256: row.get(3)?,
-                    output_path: PathBuf::from(row.get::<_, String>(4)?),
-                    input_hash: row.get(5)?,
-                    source_lang: row.get(6)?,
-                    target_lang: row.get(7)?,
-                    provider: row.get(8)?,
-                    model: row.get(9)?,
-                    base_url: row.get(10)?,
-                    api_key_env: row.get(11)?,
-                    status: row.get(12)?,
-                    events_path: row.get::<_, Option<String>>(13)?.map(PathBuf::from),
-                    report_json_path: row.get::<_, Option<String>>(14)?.map(PathBuf::from),
-                    report_markdown_path: row.get::<_, Option<String>>(15)?.map(PathBuf::from),
-                    book_id: row.get(16)?,
-                    series_id: row.get(17)?,
-                })
-            },
+            Self::job_record_from_row,
         )
         .optional()
         .map_err(StoreError::from)
@@ -911,15 +916,79 @@ impl JobStore {
 
     /// Every job paired with its aggregated segment [`JobSummary`], newest
     /// first. Powers the `watch` job picker and any dashboard job list.
+    ///
+    /// Runs in three queries total (jobs, per-`(job, status)` segment
+    /// aggregates, retried counts) rather than a per-job N+1 of `get_job` +
+    /// `summary`, which each scanned the segments table again for every job.
     pub fn list_job_summaries(&self) -> Result<Vec<(JobRecord, JobSummary)>> {
-        let ids = self.list_job_ids()?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let (Some(job), Some(summary)) = (self.get_job(&id)?, self.summary(&id)?) {
-                out.push((job, summary));
+        let conn = self.conn.borrow();
+
+        let mut job_stmt = conn.prepare(&format!(
+            "SELECT {} FROM jobs ORDER BY created_at DESC",
+            Self::JOB_COLUMNS
+        ))?;
+        let jobs = job_stmt
+            .query_map([], Self::job_record_from_row)?
+            .collect::<rusqlite::Result<Vec<JobRecord>>>()?;
+
+        // One pass over the segments table, aggregated per (job, status).
+        let mut aggregates: HashMap<String, JobSummary> = HashMap::new();
+        let mut seg_stmt = conn.prepare(
+            "SELECT job_id, status,
+                    COUNT(*),
+                    COALESCE(SUM(COALESCE(tokens_input, input_tokens)), 0),
+                    COALESCE(SUM(tokens_input_cached), 0),
+                    COALESCE(SUM(COALESCE(tokens_output, output_tokens)), 0)
+             FROM segments GROUP BY job_id, status",
+        )?;
+        let seg_rows = seg_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        for row in seg_rows {
+            let (job_id, status, count, input_tokens, input_cached_tokens, output_tokens) = row?;
+            let summary = aggregates.entry(job_id).or_default();
+            let count = count as usize;
+            summary.total_segments += count;
+            summary.input_tokens += input_tokens as u64;
+            summary.input_cached_tokens += input_cached_tokens as u64;
+            summary.output_tokens += output_tokens as u64;
+            match status.as_str() {
+                "succeeded" => summary.succeeded += count,
+                "failed" => summary.failed += count,
+                "needs_review" => summary.needs_review += count,
+                "retry_pending" => summary.retry_pending += count,
+                "skipped_cached" => summary.cached += count,
+                _ => {}
             }
         }
-        Ok(out)
+
+        // Retried counts, again in one grouped pass.
+        let mut retried_stmt = conn
+            .prepare("SELECT job_id, COUNT(*) FROM segments WHERE attempts > 1 GROUP BY job_id")?;
+        let retried_rows = retried_stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in retried_rows {
+            let (job_id, retried) = row?;
+            aggregates.entry(job_id).or_default().retried = retried as usize;
+        }
+
+        Ok(jobs
+            .into_iter()
+            .map(|job| {
+                let mut summary = aggregates.remove(&job.id).unwrap_or_default();
+                summary.id = job.id.clone();
+                summary.status = job.status.clone();
+                (job, summary)
+            })
+            .collect())
     }
 
     pub fn retry_segments(&self, job_id: &str, scope: RetryScope) -> Result<usize> {

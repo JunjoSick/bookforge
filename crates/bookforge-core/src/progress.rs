@@ -275,8 +275,13 @@ pub struct RunState {
     pub finished: bool,
     pub finished_elapsed_ms: Option<u64>,
 
-    // Bounded log surfaces for the TUI / web panels.
+    // Bounded log surfaces for the TUI / web panels. The full ring is kept in
+    // memory for in-process renderers (TUI/indicatif read it directly), but only
+    // the most recent slice is serialized — the web dashboard streams this state
+    // as JSON on every change, and shipping the whole ring each frame is wasteful.
+    #[serde(serialize_with = "serialize_recent_tail")]
     pub recent_events: VecDeque<ProgressEvent>,
+    #[serde(serialize_with = "serialize_recent_tail")]
     pub recent_issues: VecDeque<IssueEntry>,
     pub failed_segments: Vec<String>,
     pub needs_review_segments: Vec<String>,
@@ -380,9 +385,14 @@ impl RunState {
                 }
             }
             ProgressEvent::RequestStarted {
-                target_concurrency, ..
+                active_requests,
+                target_concurrency,
+                ..
             } => {
-                self.active_requests += 1;
+                // Sync to the event's authoritative in-flight count rather than
+                // incrementing, so a dropped/missed event self-corrects on the
+                // next start instead of leaving the gauge permanently skewed.
+                self.active_requests = *active_requests;
                 self.target_concurrency = *target_concurrency;
             }
             ProgressEvent::RequestFinished { .. } => {
@@ -482,6 +492,22 @@ impl RunState {
         }
         self.remaining() as f64 / (per_min / 60.0)
     }
+}
+
+/// How many of the most recent log entries to include when a `RunState` is
+/// serialized (e.g. streamed to the web dashboard). The in-memory ring is
+/// larger; consumers that need full history read the deque directly.
+const SERIALIZED_RECENT_TAIL: usize = 80;
+
+/// Serialize only the last [`SERIALIZED_RECENT_TAIL`] entries of a ring buffer,
+/// preserving order. Keeps SSE frames small without shrinking the in-memory ring.
+fn serialize_recent_tail<S, T>(items: &VecDeque<T>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    T: Serialize,
+{
+    let skip = items.len().saturating_sub(SERIALIZED_RECENT_TAIL);
+    serializer.collect_seq(items.iter().skip(skip))
 }
 
 fn push_capped_vec<T>(items: &mut Vec<T>, item: T, cap: usize) {
@@ -641,5 +667,49 @@ mod tests {
         let mut state = RunState::default();
         state.fold(&parsed);
         assert_eq!(state.succeeded, 1);
+    }
+
+    #[test]
+    fn serialized_recent_events_are_capped_to_tail() {
+        let mut state = RunState::default();
+        let n = SERIALIZED_RECENT_TAIL + 40;
+        for i in 0..n {
+            state.fold(&seg_finished(&format!("s{i}"), "succeeded", i as u64 + 1));
+        }
+        // The in-memory ring keeps everything (well under RECENT_EVENTS_CAP)...
+        assert_eq!(state.recent_events.len(), n);
+        // ...but the serialized view (what the dashboard streams) is the tail only.
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(
+            json["recent_events"].as_array().unwrap().len(),
+            SERIALIZED_RECENT_TAIL
+        );
+    }
+
+    #[test]
+    fn request_started_syncs_authoritative_active_count() {
+        // A missed RequestFinished must not permanently skew the gauge: the next
+        // RequestStarted resets it to the event's own active_requests value.
+        let mut state = RunState::default();
+        let started = |active: usize, ts: u64| ProgressEvent::RequestStarted {
+            request_id: format!("r{ts}"),
+            batch_id: None,
+            segment_id: None,
+            provider: None,
+            model: None,
+            prompt_template: None,
+            items: 1,
+            estimated_input_tokens: 0,
+            max_output_tokens: None,
+            active_requests: active,
+            target_concurrency: 4,
+            timestamp_ms: ts,
+        };
+        state.fold(&started(3, 1));
+        assert_eq!(state.active_requests, 3);
+        // No RequestFinished folded (dropped); next start still reports the truth.
+        state.fold(&started(2, 2));
+        assert_eq!(state.active_requests, 2);
     }
 }

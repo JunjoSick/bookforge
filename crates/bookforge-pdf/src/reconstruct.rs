@@ -71,20 +71,13 @@ pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
 
 fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut heading_like = HashSet::new();
     for page in pages {
         let mut seen_on_page = HashSet::new();
         for line in merge_fragments_into_lines(page) {
-            let normalized = normalize_running_text(&line.text());
-            if normalized.len() >= 4
-                && normalized.chars().any(|ch| ch.is_alphabetic())
-                && is_heading_like_line(&line, body_size)
-            {
-                heading_like.insert(normalized.clone());
-            }
             if line.font_size > body_size + 1 || !near_vertical_margin(page, &line) {
                 continue;
             }
+            let normalized = normalize_running_text(&line.text());
             if normalized.len() >= 4 && normalized.chars().any(|ch| ch.is_alphabetic()) {
                 seen_on_page.insert(normalized);
             }
@@ -93,12 +86,14 @@ fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<String> {
             *counts.entry(text).or_default() += 1;
         }
     }
-    let mut running = counts
+    // Only treat a near-margin line as a running header/footer when the same
+    // text repeats near the margins on at least two pages. Removing a one-off
+    // line just because it is bold or larger (heading-like) silently deleted
+    // legitimate body text that merely sat near a page margin.
+    counts
         .into_iter()
         .filter_map(|(text, count)| (count >= 2).then_some(text))
-        .collect::<HashSet<_>>();
-    running.extend(heading_like);
-    running
+        .collect()
 }
 
 fn is_running_margin_line(
@@ -122,10 +117,6 @@ fn normalize_running_text(text: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase()
-}
-
-fn is_heading_like_line(line: &Line, body_size: u32) -> bool {
-    line.font_size > body_size + 1 || line.spans.iter().any(|span| span.bold)
 }
 
 /// Group fragments that share a baseline into one visual line, joining
