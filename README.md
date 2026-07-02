@@ -53,45 +53,51 @@ local browser-based translation runs:
 
 ### For non-technical users
 
-BookForge v2 ships prebuilt release installers for macOS, Linux, and Windows.
-You do not need Rust or Cargo for the normal install path.
+BookForge v2 ships prebuilt installers for macOS, Linux, and Windows. You do
+not need Rust, Cargo, Git, Python, Node, or a source-code checkout.
 
-1. Open the latest release:
-   <https://github.com/JunjoSick/bookforge/releases/latest>
-2. Use the installer for your operating system. The release page lists the
-   exact commands; they follow this shape:
+**What you need before starting:**
 
-   macOS or Linux:
+- A computer running macOS, Windows, or Linux.
+- An `.epub` book file.
+- An API key for the provider you want to use, unless you are doing a mock dry
+  run.
+- About two minutes.
 
-   ```bash
-   curl --proto '=https' --tlsv1.2 -LsSf https://github.com/JunjoSick/bookforge/releases/latest/download/bookforge-installer.sh | sh
-   ```
+**Install on macOS or Linux**
 
-   Windows PowerShell:
-
-   ```powershell
-   powershell -ExecutionPolicy Bypass -c "irm https://github.com/JunjoSick/bookforge/releases/latest/download/bookforge-installer.ps1 | iex"
-   ```
-
-3. Close and reopen your terminal after installation.
-4. Check that BookForge installed:
+1. Open **Terminal**.
+2. Copy this whole line, paste it into Terminal, and press Enter:
 
 ```bash
-bookforge --version
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/JunjoSick/bookforge/releases/latest/download/bookforge-installer.sh | sh
 ```
 
-If `bookforge` is not found after reopening the terminal, the installer
-probably succeeded but your PATH was not refreshed. The binary is installed
-under your Cargo bin directory, usually `~/.cargo/bin` on macOS/Linux or
-`%USERPROFILE%\.cargo\bin` on Windows.
-
-Start the local web app:
+3. Close Terminal and open it again.
+4. Type:
 
 ```bash
-bookforge serve --open
+bookforge
 ```
 
-If the browser does not open automatically, go to:
+**Install on Windows**
+
+1. Open **PowerShell** from the Start menu.
+2. Copy this whole line, paste it into PowerShell, and press Enter:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/JunjoSick/bookforge/releases/latest/download/bookforge-installer.ps1 | iex"
+```
+
+3. Close PowerShell and open it again.
+4. Type:
+
+```powershell
+bookforge
+```
+
+Running `bookforge` with no extra words opens the local web app. If the browser
+does not open automatically, go to:
 
 ```txt
 http://127.0.0.1:8765
@@ -99,6 +105,10 @@ http://127.0.0.1:8765
 
 The dashboard is intentionally local-only. It binds to `127.0.0.1`, so it is
 for the person sitting at this computer, not a public website.
+
+If the terminal says `bookforge` is not found, the install probably worked but
+the terminal did not refresh its command list. Close the terminal completely,
+open a new one, and try `bookforge` again.
 
 ### First Translation In The Browser
 
@@ -119,8 +129,8 @@ Outputs, uploads, checkpoints, review data, and validation reports are stored
 locally under `.bookforge/` in the folder where you started BookForge. Do not
 share `.bookforge/` if the book or translation is private.
 
-To stop the web app, return to the terminal running `bookforge serve` and press
-`Ctrl+C`.
+To stop the web app, return to the terminal running `bookforge` and press
+`Ctrl+C`. The translation data stays on disk and can be opened again later.
 
 ### API Key Setup
 
@@ -363,10 +373,11 @@ another process (or already finished) replays identically:
 # Press `r` to mark failed / needs-review segments for retry, `q` to quit.
 cargo run -p bookforge-cli -- watch <job-id>
 
-# Local web dashboard for non-developers — start a translation (upload an EPUB),
-# watch the job list and live progress over SSE, and retry from a button. Binds
-# 127.0.0.1 only; pasted provider keys are held only in server memory and passed
-# to child runs through the provider's normal environment variable.
+# Local web dashboard for non-developers. Running without a subcommand is the
+# easy launch path; it opens the browser and binds 127.0.0.1 only.
+bookforge
+
+# Equivalent explicit form:
 bookforge serve --open
 
 # From a source checkout, this helper uses an installed/local binary when one is

@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.0.1 - 2026-07-02
+
+BookForge v2.0.1 is a usability patch for the new local browser workflow.
+It makes the release binary friendlier for non-technical users who do not have
+Rust or Cargo installed.
+
+- Running `bookforge` with no subcommand now opens the local browser dashboard
+  in default release builds.
+- The README install guide now leads with prebuilt installers and plain
+  `bookforge` startup instructions instead of Cargo-oriented setup.
+- Minimal `--no-default-features` builds still omit the dashboard and print CLI
+  help when run without a subcommand.
+
+Validation:
+
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo test -p bookforge-cli --features serve`
+- `cargo test -p bookforge-cli --no-default-features`
+- `cargo clippy --workspace --all-targets --all-features -- -A clippy::too_many_arguments -D warnings`
+- `cargo run -p bookforge-cli --features serve -- --help`
+
 ## v1.8.5 - 2026-06-29
 
 BookForge v1.8.5 is a hardening release for translation reliability,

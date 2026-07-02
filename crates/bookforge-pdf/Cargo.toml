@@ -1,6 +1,6 @@
 [package]
 name = "bookforge-pdf"
-version = "2.0.0"
+version = "2.0.1"
 description = "PDF ingestion for BookForge: poppler-based layout extraction and deterministic reconstruction into a translatable EPUB."
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,6 @@ tracing.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
-bookforge-core = { version = "2.0.0", path = "../bookforge-core" }
-bookforge-epub = { version = "2.0.0", path = "../bookforge-epub" }
+bookforge-core = { version = "2.0.1", path = "../bookforge-core" }
+bookforge-epub = { version = "2.0.1", path = "../bookforge-epub" }
 tempfile = "3"

@@ -10,6 +10,8 @@ mod report;
 mod tui;
 
 use anyhow::Result;
+#[cfg(any(test, not(feature = "serve")))]
+use clap::CommandFactory;
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "serve")]
 use commands::serve;
@@ -29,9 +31,17 @@ use tracing_subscriber::{EnvFilter, fmt};
     version,
     about = "EPUB-first AI book translation tool"
 )]
+#[cfg_attr(
+    feature = "serve",
+    command(after_help = "Run `bookforge` without a command to open the local browser dashboard.")
+)]
+#[cfg_attr(
+    not(feature = "serve"),
+    command(after_help = "This build was compiled without the local browser dashboard.")
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -71,6 +81,13 @@ async fn main() -> Result<()> {
     });
 
     match Cli::parse().command {
+        Some(command) => run_command(command, cancel_token).await,
+        None => run_default().await,
+    }
+}
+
+async fn run_command(command: Command, cancel_token: CancellationToken) -> Result<()> {
+    match command {
         Command::Convert(args) => convert::run(args).await,
         Command::Inspect(args) => inspect::run(args).await,
         Command::Estimate(args) => estimate::run(args).await,
@@ -92,6 +109,23 @@ async fn main() -> Result<()> {
         #[cfg(feature = "serve")]
         Command::Serve(args) => serve::run(args).await,
     }
+}
+
+#[cfg(feature = "serve")]
+async fn run_default() -> Result<()> {
+    serve::run(serve::ServeArgs {
+        bind: "127.0.0.1:8765".to_string(),
+        open: true,
+        refresh_ms: 250,
+    })
+    .await
+}
+
+#[cfg(not(feature = "serve"))]
+async fn run_default() -> Result<()> {
+    Cli::command().print_help()?;
+    println!();
+    Ok(())
 }
 
 fn init_tracing() {
@@ -174,10 +208,29 @@ mod tests {
         let cli = Cli::parse_from(["bookforge", "translate", "book.epub", "--target", "Italian"]);
 
         match cli.command {
-            Command::Translate(args) => {
+            Some(Command::Translate(args)) => {
                 assert_eq!(args.profile, TranslationProfile::V1Fast);
             }
             _ => panic!("expected translate command"),
         }
+    }
+
+    #[test]
+    fn no_subcommand_selects_default_dashboard_entrypoint() {
+        let cli = Cli::parse_from(["bookforge"]);
+
+        assert!(cli.command.is_none());
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn help_mentions_default_dashboard_entrypoint() {
+        let mut help = Vec::new();
+        Cli::command()
+            .write_long_help(&mut help)
+            .expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf-8");
+
+        assert!(help.contains("Run `bookforge` without a command"));
     }
 }
