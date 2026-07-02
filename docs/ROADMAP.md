@@ -1,10 +1,17 @@
-# BookForge — Technical Roadmap, v1.0.1 through v2
+# BookForge — Technical Roadmap, v1.0.1 through v2.0
 
-**Document version:** 1.1.1
-**Last updated:** 2026-06-22
-**Status:** active planning document
+**Document version:** 1.1.2
+**Last updated:** 2026-07-02
+**Status:** historical roadmap plus active follow-up notes
 **Audience:** project maintainer + Claude Code (or any other coding agent) implementing
 the milestones below.
+
+> **Current status:** v2.0 has shipped; the current release line is v2.0.2
+> as of 2026-07-02. This document is kept for architectural invariants,
+> shipped-milestone context, and deferred follow-up work. For current user
+> behavior, start with `README.md`, `CHANGELOG.md`, and
+> `docs/v2-web-dashboard-plan.md`; older milestone sections below are
+> historical unless explicitly marked as follow-up.
 
 ---
 
@@ -103,7 +110,7 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v1.6 | PDF ingestion hardening (§9) | 8–14 days | release notes; maybe a short writeup if layout reconstruction turns out interesting | **next** |
 | v1.7 | Bilingual output (§9b) | 5–8 days | passive (release notes only) | planned |
 | v1.8 | Structural credibility (EPUBCheck + corpus; was the planned v1.5 scope, §8) | 10–14 days | README final rewrite citing corpus | **shipped 2026-06-20** |
-| v2 | Monitoring UI (`RunState`, `watch`, `--ui tui`, local `serve`) | shipped scope | release notes | in PR #21 |
+| v2.0 | Monitoring UI (`RunState`, `watch`, `--ui tui`, local `serve`) | shipped scope | release notes | shipped; current patch v2.0.2 (2026-07-02) |
 
 Priority note (2026-06): the owner needs PDF translation more than
 bilingual output — scientific papers (figures/tables must survive) and

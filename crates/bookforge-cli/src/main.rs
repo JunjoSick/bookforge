@@ -21,7 +21,12 @@ use commands::{
     convert, doctor, entity, estimate, glossary, ingest_flags, inspect, resume, retry, review,
     status, style, tail, translate, validate,
 };
-use std::path::PathBuf;
+#[cfg(any(test, not(feature = "serve")))]
+use std::io::Write;
+use std::{
+    io::{self, ErrorKind},
+    path::PathBuf,
+};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -80,9 +85,24 @@ async fn main() -> Result<()> {
         cancel.cancel();
     });
 
-    match Cli::parse().command {
+    match parse_cli()?.command {
         Some(command) => run_command(command, cancel_token).await,
         None => run_default().await,
+    }
+}
+
+fn parse_cli() -> Result<Cli> {
+    match Cli::try_parse() {
+        Ok(cli) => Ok(cli),
+        Err(err) => {
+            let exit_code = err.exit_code();
+            if let Err(print_err) = err.print()
+                && !is_broken_pipe(&print_err)
+            {
+                return Err(print_err.into());
+            }
+            std::process::exit(exit_code);
+        }
     }
 }
 
@@ -123,9 +143,22 @@ async fn run_default() -> Result<()> {
 
 #[cfg(not(feature = "serve"))]
 async fn run_default() -> Result<()> {
-    Cli::command().print_help()?;
-    println!();
+    match write_default_help(io::stdout().lock()) {
+        Ok(()) => Ok(()),
+        Err(err) if is_broken_pipe(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(any(test, not(feature = "serve")))]
+fn write_default_help(mut writer: impl Write) -> io::Result<()> {
+    Cli::command().write_help(&mut writer)?;
+    writeln!(writer)?;
     Ok(())
+}
+
+fn is_broken_pipe(err: &io::Error) -> bool {
+    err.kind() == ErrorKind::BrokenPipe
 }
 
 fn init_tracing() {
@@ -220,6 +253,31 @@ mod tests {
         let cli = Cli::parse_from(["bookforge"]);
 
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn broken_pipe_errors_are_recognized() {
+        let err = io::Error::new(ErrorKind::BrokenPipe, "closed pipe");
+        assert!(is_broken_pipe(&err));
+    }
+
+    #[test]
+    fn default_help_writer_propagates_broken_pipe_for_caller_to_ignore() {
+        struct BrokenPipeWriter;
+
+        impl Write for BrokenPipeWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(ErrorKind::BrokenPipe, "closed pipe"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let err = write_default_help(BrokenPipeWriter)
+            .expect_err("broken pipe should be returned to run_default");
+        assert!(is_broken_pipe(&err));
     }
 
     #[cfg(feature = "serve")]

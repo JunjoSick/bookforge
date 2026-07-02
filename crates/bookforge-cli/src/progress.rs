@@ -8,7 +8,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bookforge_core::{ProgressEvent, ProgressSink, RunState};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -433,7 +433,7 @@ impl ProgressBars {
             ProgressBar::new_spinner()
                 .with_style(
                     ProgressStyle::with_template("{spinner:.green} {msg}")
-                        .unwrap()
+                        .context("invalid stage progress template")?
                         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
                 )
                 .with_message("Starting..."),
@@ -444,7 +444,7 @@ impl ProgressBars {
                     ProgressStyle::with_template(
                         "  Segments: [{bar:20.cyan/blue}] {pos}/{len} ({msg})",
                     )
-                    .unwrap(),
+                    .context("invalid segment progress template")?,
                 )
                 .with_message("0 cached"),
         );
@@ -452,19 +452,25 @@ impl ProgressBars {
             ProgressBar::new_spinner()
                 .with_style(
                     ProgressStyle::with_template("{spinner:.yellow} Batches: {msg}")
-                        .unwrap()
+                        .context("invalid batch progress template")?
                         .tick_strings(&["-", "\\", "|", "/"]),
                 )
                 .with_message("queuing..."),
         );
         let rate_bar = multi.add(
             ProgressBar::new_spinner()
-                .with_style(ProgressStyle::with_template("  {msg}").unwrap())
+                .with_style(
+                    ProgressStyle::with_template("  {msg}")
+                        .context("invalid rate progress template")?,
+                )
                 .with_message(""),
         );
         let checkpoint_bar = multi.add(
             ProgressBar::new_spinner()
-                .with_style(ProgressStyle::with_template("  Checkpoint: {msg}").unwrap())
+                .with_style(
+                    ProgressStyle::with_template("  Checkpoint: {msg}")
+                        .context("invalid checkpoint progress template")?,
+                )
                 .with_message("flushed 0"),
         );
 
