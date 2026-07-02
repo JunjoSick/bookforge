@@ -26,7 +26,10 @@ pub use glossary::{
     GlossaryStatus, GlossaryTerm, SegmentGlossarySelections, extract_glossary_candidates,
     merge_scope_terms, select_glossary_for_segments, target_matches, term_matches,
 };
-pub use progress::{NullProgressSink, ProgressEvent, ProgressSink, now_ms};
+pub use progress::{
+    IssueEntry, IssueLevel, NullProgressSink, ProgressEvent, ProgressSink, RunState,
+    event_timestamp_ms, now_ms,
+};
 pub use run_snapshot::{ResolvedRunSettingsSnapshot, RunConfigSnapshot};
 pub use scheduler::SchedulerConfig;
 pub use style::{

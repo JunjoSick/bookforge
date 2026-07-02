@@ -9,8 +9,9 @@ use std::{
 };
 
 use anyhow::Result;
-use bookforge_core::{ProgressEvent, ProgressSink};
+use bookforge_core::{ProgressEvent, ProgressSink, RunState};
 use tokio::{sync::mpsc, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 pub const PROGRESS_EVENT_QUEUE_CAPACITY: usize = 2048;
 
@@ -20,6 +21,8 @@ pub enum UiMode {
     Progress,
     Json,
     Quiet,
+    /// Full-screen terminal dashboard (requires the `tui` build feature and a TTY).
+    Tui,
 }
 
 /// A progress sink that sends events over a bounded mpsc channel using
@@ -60,16 +63,32 @@ pub struct ProgressReporter {
 }
 
 impl ProgressReporter {
-    pub fn spawn(ui_mode: UiMode, jsonl_path: Option<PathBuf>) -> Self {
-        Self::spawn_with_append(ui_mode, jsonl_path, false)
+    pub fn spawn_with_append(ui_mode: UiMode, jsonl_path: Option<PathBuf>, append: bool) -> Self {
+        Self::spawn_with_options(ui_mode, jsonl_path, append, None)
     }
 
-    pub fn spawn_with_append(ui_mode: UiMode, jsonl_path: Option<PathBuf>, append: bool) -> Self {
+    /// Spawn the reporter, optionally passing a cancellation token. The token
+    /// is only consulted by the attached TUI renderer (`--ui tui`), which
+    /// cancels it when the user quits before the run has finished — because in
+    /// raw mode Ctrl-C does not reach the process's SIGINT handler.
+    pub fn spawn_with_options(
+        ui_mode: UiMode,
+        jsonl_path: Option<PathBuf>,
+        append: bool,
+        cancel: Option<CancellationToken>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<ProgressEvent>(PROGRESS_EVENT_QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicUsize::new(0));
         let dropped_clone = dropped.clone();
 
-        let join = tokio::spawn(render_loop(rx, ui_mode, jsonl_path, append, dropped_clone));
+        let join = tokio::spawn(render_loop(
+            rx,
+            ui_mode,
+            jsonl_path,
+            append,
+            dropped_clone,
+            cancel,
+        ));
 
         Self { tx, join, dropped }
     }
@@ -96,9 +115,36 @@ async fn render_loop(
     jsonl_path: Option<PathBuf>,
     append: bool,
     dropped: Arc<AtomicUsize>,
+    cancel: Option<CancellationToken>,
 ) -> Result<()> {
     let render_mode = resolve_render_mode(ui_mode, std::io::stderr().is_terminal());
     let mut file_writer = JsonlFileWriter::new(jsonl_path, append);
+
+    #[cfg(feature = "tui")]
+    if render_mode == RenderMode::Tui {
+        // The TUI takes over stdout, so it needs a real terminal there. When
+        // stdout is redirected (pipes, CI), fall back to a static renderer
+        // while still persisting the JSONL log.
+        if std::io::stdout().is_terminal() {
+            return run_tui_attached(rx, file_writer, dropped, cancel).await;
+        }
+        let fallback = if std::io::stderr().is_terminal() {
+            RenderMode::Progress
+        } else {
+            RenderMode::Quiet
+        };
+        let mut renderer = Renderer::new(fallback)?;
+        while let Some(event) = rx.recv().await {
+            file_writer.write_event(&event)?;
+            renderer.handle_event(&event)?;
+        }
+        file_writer.flush()?;
+        renderer.finish()?;
+        return Ok(());
+    }
+    // `cancel` is only meaningful for the attached TUI path above.
+    let _ = &cancel;
+
     let mut renderer = Renderer::new(render_mode)?;
 
     while let Some(event) = rx.recv().await {
@@ -117,11 +163,80 @@ async fn render_loop(
     Ok(())
 }
 
+/// Run the attached full-screen dashboard, persisting events to the JSONL log
+/// as they arrive. Restores the terminal on every exit path.
+#[cfg(feature = "tui")]
+async fn run_tui_attached(
+    mut rx: mpsc::Receiver<ProgressEvent>,
+    mut file_writer: JsonlFileWriter,
+    dropped: Arc<AtomicUsize>,
+    cancel: Option<CancellationToken>,
+) -> Result<()> {
+    use crate::tui::{TuiApp, TuiMode};
+
+    let mut app = TuiApp::new(TuiMode::Attached)?;
+    let loop_result =
+        drive_attached_tui(&mut app, &mut rx, &mut file_writer, cancel.as_ref()).await;
+    let restore_result = app.restore();
+    file_writer.flush().ok();
+    loop_result.and(restore_result)?;
+
+    let d = dropped.load(Ordering::Relaxed);
+    if d > 0 {
+        eprintln!("({d} progress events dropped)");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tui")]
+async fn drive_attached_tui(
+    app: &mut crate::tui::TuiApp,
+    rx: &mut mpsc::Receiver<ProgressEvent>,
+    file_writer: &mut JsonlFileWriter,
+    cancel: Option<&CancellationToken>,
+) -> Result<()> {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    app.draw()?;
+
+    loop {
+        tokio::select! {
+            maybe_event = rx.recv() => {
+                match maybe_event {
+                    Some(event) => {
+                        file_writer.write_event(&event)?;
+                        app.fold(&event);
+                    }
+                    None => {
+                        app.draw()?;
+                        break;
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                if app.pump_input()? {
+                    // Quitting before the run finishes aborts it (Ctrl-C cannot
+                    // reach the SIGINT handler while the terminal is in raw mode).
+                    if !app.state.finished && let Some(token) = cancel {
+                        token.cancel();
+                    }
+                    app.draw().ok();
+                    break;
+                }
+                app.draw()?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderMode {
     Quiet,
     Progress,
     JsonStdout,
+    #[cfg(feature = "tui")]
+    Tui,
 }
 
 fn resolve_render_mode(ui_mode: UiMode, stderr_is_tty: bool) -> RenderMode {
@@ -131,8 +246,28 @@ fn resolve_render_mode(ui_mode: UiMode, stderr_is_tty: bool) -> RenderMode {
         UiMode::Progress => RenderMode::Progress,
         UiMode::Json => RenderMode::JsonStdout,
         UiMode::Quiet => RenderMode::Quiet,
+        UiMode::Tui => {
+            #[cfg(feature = "tui")]
+            {
+                RenderMode::Tui
+            }
+            // Without the `tui` feature, behave like the closest static mode.
+            #[cfg(not(feature = "tui"))]
+            {
+                if stderr_is_tty {
+                    RenderMode::Progress
+                } else {
+                    RenderMode::Quiet
+                }
+            }
+        }
     }
 }
+
+/// Upper bound on events buffered before the lazy log path is known. Real runs
+/// emit only a handful of events before `JobCreated`; the cap just guards a
+/// job-less stream from growing unbounded.
+const PENDING_EVENTS_CAP: usize = 1024;
 
 struct JsonlFileWriter {
     path: Option<PathBuf>,
@@ -140,6 +275,9 @@ struct JsonlFileWriter {
     failed: bool,
     last_flush: Instant,
     append: bool,
+    /// Events emitted before the lazy log path opens (i.e. before `JobCreated`),
+    /// held so they still land in the persisted log once it is created.
+    pending: Vec<ProgressEvent>,
 }
 
 impl JsonlFileWriter {
@@ -150,6 +288,7 @@ impl JsonlFileWriter {
             failed: false,
             last_flush: Instant::now(),
             append,
+            pending: Vec::new(),
         }
     }
 
@@ -186,22 +325,36 @@ impl JsonlFileWriter {
     }
 
     fn write_event(&mut self, event: &ProgressEvent) -> Result<()> {
-        // Lazy open: if no path was explicitly provided, use default
-        // job-based path when JobCreated arrives.
-        if self.path.is_none()
-            && self.writer.is_none()
-            && !self.failed
-            && let ProgressEvent::JobCreated { job_id, .. } = event
-        {
-            let run_dir = PathBuf::from(".bookforge/runs").join(job_id);
-            std::fs::create_dir_all(&run_dir)?;
-            self.path = Some(run_dir.join("events.jsonl"));
+        // Lazy open: if no path was explicitly provided, derive the default
+        // job-based path when JobCreated arrives. Events emitted *before*
+        // JobCreated (early stages, segmentation) are buffered so the persisted
+        // log is complete for replay-based consumers (`watch`, `serve`, `tail`).
+        if self.path.is_none() && self.writer.is_none() && !self.failed {
+            if let ProgressEvent::JobCreated { job_id, .. } = event {
+                let run_dir = PathBuf::from(".bookforge/runs").join(job_id);
+                std::fs::create_dir_all(&run_dir)?;
+                self.path = Some(run_dir.join("events.jsonl"));
+            } else {
+                if self.pending.len() < PENDING_EVENTS_CAP {
+                    self.pending.push(event.clone());
+                }
+                return Ok(());
+            }
         }
 
         self.ensure_open()?;
         let Some(writer) = self.writer.as_mut() else {
             return Ok(());
         };
+
+        // Flush any events buffered before the log path was known, in order.
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            for buffered in &pending {
+                writeln!(writer, "{}", serde_json::to_string(buffered)?)?;
+            }
+        }
+
         writeln!(writer, "{}", serde_json::to_string(event)?)?;
         if is_important_event(event)
             || self.last_flush.elapsed() >= std::time::Duration::from_secs(2)
@@ -223,7 +376,8 @@ impl JsonlFileWriter {
 enum Renderer {
     Quiet,
     JsonStdout,
-    Progress(ProgressBars),
+    // Boxed: `ProgressBars` is far larger than the other variants.
+    Progress(Box<ProgressBars>),
 }
 
 impl Renderer {
@@ -231,7 +385,11 @@ impl Renderer {
         match mode {
             RenderMode::Quiet => Ok(Renderer::Quiet),
             RenderMode::JsonStdout => Ok(Renderer::JsonStdout),
-            RenderMode::Progress => Ok(Renderer::Progress(ProgressBars::new()?)),
+            RenderMode::Progress => Ok(Renderer::Progress(Box::new(ProgressBars::new()?))),
+            #[cfg(feature = "tui")]
+            RenderMode::Tui => {
+                unreachable!("tui render mode is handled before constructing a Renderer")
+            }
         }
     }
 
@@ -261,12 +419,9 @@ struct ProgressBars {
     batch_bar: indicatif::ProgressBar,
     rate_bar: indicatif::ProgressBar,
     checkpoint_bar: indicatif::ProgressBar,
-    start: Instant,
-    total_segments: usize,
-    done_segments: usize,
-    cached: usize,
-    active_requests: usize,
-    _checkpoint_flushed: usize,
+    /// Renderer-agnostic state, kept in sync by folding each event. The bars
+    /// below only render numbers sourced from here.
+    state: RunState,
 }
 
 impl ProgressBars {
@@ -320,16 +475,14 @@ impl ProgressBars {
             batch_bar,
             rate_bar,
             checkpoint_bar,
-            start: Instant::now(),
-            total_segments: 0,
-            done_segments: 0,
-            cached: 0,
-            active_requests: 0,
-            _checkpoint_flushed: 0,
+            state: RunState::default(),
         })
     }
 
     fn handle_event(&mut self, event: &ProgressEvent) -> Result<()> {
+        // Fold first so the bars below render numbers from a single source of
+        // truth; the match only handles indicatif-specific presentation.
+        self.state.fold(event);
         match event {
             ProgressEvent::StageStarted { stage, .. } => {
                 self.stage_bar.set_message(format!("{stage}..."));
@@ -339,57 +492,36 @@ impl ProgressBars {
                 self.stage_bar
                     .enable_steady_tick(std::time::Duration::from_millis(80));
             }
-            ProgressEvent::SegmentationFinished { segment_count, .. } => {
-                self.total_segments = *segment_count;
-                self.seg_bar.set_length(self.total_segments as u64);
-                self.seg_bar.set_message(format!("{} cached", self.cached));
+            ProgressEvent::SegmentationFinished { .. } => {
+                self.seg_bar.set_length(self.state.total_segments as u64);
+                self.seg_bar
+                    .set_message(format!("{} cached", self.state.cached));
             }
-            ProgressEvent::CacheScanFinished { hits, .. } => {
-                self.cached = *hits;
-                self.done_segments = *hits;
-                self.seg_bar.set_position(self.done_segments as u64);
-                self.seg_bar.set_message(format!("{} cached", self.cached));
+            ProgressEvent::CacheScanFinished { .. } => {
+                self.seg_bar.set_position(self.state.done_segments as u64);
+                self.seg_bar
+                    .set_message(format!("{} cached", self.state.cached));
             }
             ProgressEvent::SegmentFinished { status, .. } => match status.as_str() {
                 "succeeded" | "skipped_cached" | "needs_review" | "failed" => {
-                    self.done_segments += 1;
-                    self.seg_bar.set_position(self.done_segments as u64);
-                    let elapsed = self.start.elapsed().as_secs_f64().max(0.1);
-                    let rate_per_min = self.done_segments as f64 / elapsed * 60.0;
-                    let remaining = self.total_segments.saturating_sub(self.done_segments);
-                    let eta_secs = if rate_per_min > 0.0 {
-                        remaining as f64 / (rate_per_min / 60.0)
-                    } else {
-                        0.0
-                    };
-                    let eta_str = if eta_secs > 3600.0 {
-                        format!("{:.1}h", eta_secs / 3600.0)
-                    } else if eta_secs > 60.0 {
-                        format!("{:.0}m", eta_secs / 60.0)
-                    } else {
-                        format!("{:.0}s", eta_secs)
-                    };
+                    self.seg_bar.set_position(self.state.done_segments as u64);
                     self.rate_bar.set_message(format!(
-                        "{}/{} done, {:.1} seg/min, ETA {eta_str}",
-                        self.done_segments, self.total_segments, rate_per_min
+                        "{}/{} done, {:.1} seg/min, ETA {}",
+                        self.state.done_segments,
+                        self.state.total_segments,
+                        self.state.segments_per_minute(),
+                        format_eta(self.state.eta_secs()),
                     ));
                 }
                 _ => {}
             },
-            ProgressEvent::RequestStarted { .. } => {
-                self.active_requests += 1;
+            ProgressEvent::RequestStarted { .. } | ProgressEvent::RequestFinished { .. } => {
                 self.batch_bar
-                    .set_message(format!("{} active", self.active_requests));
+                    .set_message(format!("{} active", self.state.active_requests));
             }
-            ProgressEvent::RequestFinished { .. } => {
-                self.active_requests = self.active_requests.saturating_sub(1);
-                self.batch_bar
-                    .set_message(format!("{} active", self.active_requests));
-            }
-            ProgressEvent::CheckpointFlushed { flushed_count, .. } => {
-                self._checkpoint_flushed = *flushed_count;
+            ProgressEvent::CheckpointFlushed { .. } => {
                 self.checkpoint_bar
-                    .set_message(format!("flushed {}", self._checkpoint_flushed));
+                    .set_message(format!("flushed {}", self.state.checkpoint_flushed));
             }
             ProgressEvent::BatchQueued { batch_id, .. } => {
                 self.batch_bar
@@ -406,18 +538,14 @@ impl ProgressBars {
                 self.multi.println(format!("  [error] {message}")).ok();
             }
             ProgressEvent::TranslationFinished {
-                succeeded,
-                cached: c,
                 needs_review,
                 failed,
                 ..
             } => {
-                let done = *succeeded + *c + *needs_review + *failed;
-                self.done_segments = done;
-                self.seg_bar.set_position(self.done_segments as u64);
+                self.seg_bar.set_position(self.state.done_segments as u64);
                 self.seg_bar.finish_with_message(format!(
-                    "{done} done, {} needs review, {} failed",
-                    *needs_review, *failed
+                    "{} done, {} needs review, {} failed",
+                    self.state.done_segments, *needs_review, *failed
                 ));
                 self.stage_bar.finish_and_clear();
                 self.batch_bar.finish_and_clear();
@@ -432,6 +560,16 @@ impl ProgressBars {
     fn finish(&mut self) -> Result<()> {
         self.multi.clear().ok();
         Ok(())
+    }
+}
+
+fn format_eta(eta_secs: f64) -> String {
+    if eta_secs > 3600.0 {
+        format!("{:.1}h", eta_secs / 3600.0)
+    } else if eta_secs > 60.0 {
+        format!("{:.0}m", eta_secs / 60.0)
+    } else {
+        format!("{:.0}s", eta_secs)
     }
 }
 
@@ -516,7 +654,7 @@ mod tests {
         })
         .expect("translation finished event should render");
 
-        assert_eq!(bars.done_segments, 4);
+        assert_eq!(bars.state.done_segments, 4);
         assert_eq!(bars.seg_bar.position(), 4);
     }
 
@@ -536,6 +674,7 @@ mod tests {
             Some(path.clone()),
             false,
             Arc::new(AtomicUsize::new(0)),
+            None,
         );
         let handle = tokio::spawn(reporter_task);
 
@@ -560,6 +699,45 @@ mod tests {
         assert!(content.contains("StageFinished"));
     }
 
+    /// Events emitted before the log path opens (e.g. `SegmentationFinished`,
+    /// which the translate flow emits before `JobCreated`) must still land in
+    /// the persisted log, in order, so replay consumers see the segment total.
+    #[test]
+    fn jsonl_writer_flushes_events_buffered_before_open() {
+        let path = std::env::temp_dir().join(format!(
+            "bookforge-test-pending-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut writer = JsonlFileWriter::new(Some(path.clone()), false);
+        // Simulate an event emitted before the log destination was known.
+        writer.pending.push(ProgressEvent::SegmentationFinished {
+            segment_count: 7,
+            timestamp_ms: 1,
+        });
+        writer
+            .write_event(&ProgressEvent::JobCreated {
+                job_id: "pending-test".to_string(),
+                input_path: "in.epub".to_string(),
+                output_path: "out.epub".to_string(),
+                timestamp_ms: 2,
+            })
+            .unwrap();
+        writer.flush().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let first_line = content.lines().next().unwrap_or_default();
+        assert!(
+            first_line.contains("SegmentationFinished"),
+            "buffered pre-open event must be written first, got: {first_line}"
+        );
+        assert!(content.contains("JobCreated"));
+        assert!(writer.pending.is_empty());
+    }
+
     /// With --progress-jsonl and --ui json, both stdout JSON and file are emitted.
     #[tokio::test]
     async fn progress_jsonl_writes_file_in_json_stdout_mode() {
@@ -574,6 +752,7 @@ mod tests {
             Some(path.clone()),
             false,
             Arc::new(AtomicUsize::new(0)),
+            None,
         );
         let handle = tokio::spawn(reporter_task);
 
@@ -607,6 +786,7 @@ mod tests {
             Some(path.clone()),
             false,
             Arc::new(AtomicUsize::new(0)),
+            None,
         );
         let handle = tokio::spawn(reporter_task);
 

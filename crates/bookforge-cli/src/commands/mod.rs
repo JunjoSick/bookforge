@@ -8,8 +8,12 @@ pub mod inspect;
 pub mod resume;
 pub mod retry;
 pub mod review;
+#[cfg(feature = "serve")]
+pub mod serve;
 pub mod status;
 pub mod style;
 pub mod tail;
 pub mod translate;
 pub mod validate;
+#[cfg(feature = "tui")]
+pub mod watch;

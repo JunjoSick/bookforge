@@ -10,6 +10,17 @@ if [[ ! -f "${DEFAULT_INPUT}" && -f "${ROOT_DIR}/test/test.epub" ]]; then
 fi
 INPUT_PATH="${BOOKFORGE_BENCH_INPUT:-${DEFAULT_INPUT}}"
 
+now_ms() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import time; print(time.time_ns() // 1_000_000)'
+  elif command -v perl >/dev/null 2>&1; then
+    perl -MTime::HiRes=time -e 'printf "%.0f\n", time() * 1000'
+  else
+    # POSIX fallback: second precision, still numeric on BSD/macOS.
+    printf '%s000\n' "$(date +%s)"
+  fi
+}
+
 if [[ ! -f "${INPUT_PATH}" ]]; then
   echo "Missing benchmark input: ${INPUT_PATH}" >&2
   echo "Set BOOKFORGE_BENCH_INPUT to a tiny EPUB fixture." >&2
@@ -18,7 +29,7 @@ fi
 
 rm -f "${EVENTS_PATH}" "${OUTPUT_PATH}"
 
-start_ms="$(date +%s%3N)"
+start_ms="$(now_ms)"
 cargo run --release -p bookforge-cli -- translate "${INPUT_PATH}" \
   --target Italian \
   --provider mock \
@@ -27,7 +38,7 @@ cargo run --release -p bookforge-cli -- translate "${INPUT_PATH}" \
   --ui quiet \
   --progress-jsonl "${EVENTS_PATH}" \
   --out "${OUTPUT_PATH}"
-end_ms="$(date +%s%3N)"
+end_ms="$(now_ms)"
 
 elapsed_ms="$((end_ms - start_ms))"
 if [[ -f "${EVENTS_PATH}" ]]; then

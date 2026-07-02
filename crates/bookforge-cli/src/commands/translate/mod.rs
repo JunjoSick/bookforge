@@ -92,7 +92,12 @@ pub async fn run(
         }
     }
 
-    let reporter = crate::progress::ProgressReporter::spawn(args.ui, args.progress_jsonl.clone());
+    let reporter = crate::progress::ProgressReporter::spawn_with_options(
+        args.ui,
+        args.progress_jsonl.clone(),
+        false,
+        Some(cancel_token.clone()),
+    );
     let progress_sink = reporter.sink();
 
     if let Some(message) = retry_amplification_warning(&settings) {
@@ -140,9 +145,13 @@ pub async fn run(
 }
 
 fn human_stdout_enabled(ui: crate::progress::UiMode) -> bool {
+    // The TUI owns the screen, so suppress plain stdout/stderr prints that would
+    // corrupt it; the dashboard surfaces the same information.
     !matches!(
         ui,
-        crate::progress::UiMode::Json | crate::progress::UiMode::Quiet
+        crate::progress::UiMode::Json
+            | crate::progress::UiMode::Quiet
+            | crate::progress::UiMode::Tui
     )
 }
 
@@ -676,7 +685,7 @@ async fn run_openai_compatible_translation(
     progress: Arc<dyn bookforge_core::ProgressSink>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
-    let mut provider_config = match provider_config(
+    let mut provider_config = provider_config(
         &config.provider,
         config.model.as_deref(),
         provider_args.base_url.as_deref(),
@@ -688,17 +697,7 @@ async fn run_openai_compatible_translation(
         settings.provider.max_backoff_seconds,
         settings.provider.max_idle_per_host,
         settings.provider.json_mode,
-    ) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            if config.provider == "openai-compatible" {
-                return Err(anyhow::anyhow!(
-                    "--base-url is required for --provider openai-compatible"
-                ));
-            }
-            return Err(e);
-        }
-    };
+    )?;
     provider_config.json_mode = settings.provider.json_mode;
     let provider =
         OpenAiCompatibleProvider::new_with_cancel(provider_config.clone(), cancel_token.clone())?;
@@ -1062,9 +1061,18 @@ fn provider_config(
             "OPENROUTER_API_KEY",
             "openrouter/auto",
         ),
+        "openai-compatible" => (
+            base_url.ok_or_else(|| {
+                anyhow::anyhow!("--base-url is required for --provider openai-compatible")
+            })?,
+            "OPENAI_API_KEY",
+            model.ok_or_else(|| {
+                anyhow::anyhow!("--model is required for --provider openai-compatible")
+            })?,
+        ),
         _ => {
             return Err(anyhow::anyhow!(
-                "--base-url is required for --provider {provider}"
+                "unsupported translation provider '{provider}'"
             ));
         }
     };
@@ -2509,6 +2517,67 @@ case_sensitive = true
         .expect("provider_config should build");
 
         assert_eq!(cfg.json_mode, bookforge_core::JsonMode::PromptOnly);
+    }
+
+    #[test]
+    fn provider_config_accepts_openai_compatible_with_model_and_base_url() {
+        let cfg = provider_config(
+            "openai-compatible",
+            Some("provider/model"),
+            Some("https://api.example.com/v1"),
+            Some("OPENAI_API_KEY"),
+            120,
+            1,
+            false,
+            bookforge_core::RetryAfterPolicy::JitteredExponential,
+            15,
+            64,
+            bookforge_core::JsonMode::Auto,
+        )
+        .expect("openai-compatible should build with model and base URL");
+
+        assert_eq!(cfg.base_url, "https://api.example.com/v1");
+        assert_eq!(cfg.model, "provider/model");
+        assert_eq!(cfg.api_key_env, "OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn provider_config_requires_openai_compatible_base_url_and_model() {
+        let missing_base_url = provider_config(
+            "openai-compatible",
+            Some("provider/model"),
+            None,
+            None,
+            120,
+            1,
+            false,
+            bookforge_core::RetryAfterPolicy::JitteredExponential,
+            15,
+            64,
+            bookforge_core::JsonMode::Auto,
+        )
+        .expect_err("missing base URL should fail");
+        assert!(
+            missing_base_url
+                .to_string()
+                .contains("--base-url is required")
+        );
+
+        let missing_model = provider_config(
+            "openai-compatible",
+            None,
+            Some("https://api.example.com/v1"),
+            None,
+            120,
+            1,
+            false,
+            bookforge_core::RetryAfterPolicy::JitteredExponential,
+            15,
+            64,
+            bookforge_core::JsonMode::Auto,
+        )
+        .expect_err("missing model should fail");
+        assert!(missing_model.to_string().contains("--model is required"));
     }
 
     #[test]

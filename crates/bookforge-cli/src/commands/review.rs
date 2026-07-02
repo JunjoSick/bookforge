@@ -14,6 +14,10 @@ use bookforge_epub::read_epub;
 use bookforge_store::{JobRecord, JobStore};
 use clap::Args;
 use serde::Serialize;
+
+// QA token/number/URL matching is shared with the run-time report so the two
+// stay in lock-step (see `crate::report`).
+use crate::report::{looks_like_model_commentary, numbers, token_present, urls};
 #[cfg(test)]
 use serde_json::json;
 
@@ -29,7 +33,7 @@ pub struct ReviewArgs {
 }
 
 #[derive(Debug, Serialize)]
-struct ReviewDocument {
+pub(crate) struct ReviewDocument {
     schema_version: u32,
     job_id: String,
     source_language: Option<String>,
@@ -45,7 +49,7 @@ struct ReviewDocument {
 }
 
 #[derive(Debug, Serialize)]
-struct ReviewTotals {
+pub(crate) struct ReviewTotals {
     segments: usize,
     tokens_input: u64,
     tokens_input_cached: u64,
@@ -54,7 +58,7 @@ struct ReviewTotals {
 }
 
 #[derive(Debug, Serialize)]
-struct ReviewSegment {
+pub(crate) struct ReviewSegment {
     segment_id: String,
     chapter_id: String,
     chapter_title: Option<String>,
@@ -67,7 +71,7 @@ struct ReviewSegment {
 }
 
 #[derive(Debug, Serialize)]
-struct ReviewWarning {
+pub(crate) struct ReviewWarning {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     term_id: Option<i64>,
@@ -90,22 +94,24 @@ struct ReviewWarning {
 }
 
 #[derive(Debug, Serialize)]
-struct ReviewTokens {
+pub(crate) struct ReviewTokens {
     input: u64,
     input_cached: u64,
     output: u64,
     estimated: bool,
 }
 
-pub async fn run(args: ReviewArgs) -> Result<()> {
-    let store = JobStore::open_default()?;
-    let Some(job) = store.get_job(&args.job_id)? else {
-        anyhow::bail!("job '{}' was not found", args.job_id);
+/// Load a job's translation state from the store and fold it into a
+/// [`ReviewDocument`]. Shared by the CLI `review` command (which then renders
+/// HTML/JSON to disk) and the web dashboard's `GET /api/jobs/{id}/review`.
+pub(crate) fn generate_review_document(store: &JobStore, job_id: &str) -> Result<ReviewDocument> {
+    let Some(job) = store.get_job(job_id)? else {
+        anyhow::bail!("job '{}' was not found", job_id);
     };
-    let Some(snapshot) = store.load_job_config_snapshot(&args.job_id)? else {
+    let Some(snapshot) = store.load_job_config_snapshot(job_id)? else {
         anyhow::bail!(
             "job '{}' does not have a run configuration snapshot; review cannot be regenerated",
-            args.job_id
+            job_id
         );
     };
 
@@ -129,7 +135,7 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
         snapshot.glossary_terms.clone()
     };
 
-    let document = build_review_document(
+    Ok(build_review_document(
         &job,
         &snapshot,
         &book,
@@ -138,11 +144,16 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
         &translations,
         &summary,
         &glossary_terms,
-    );
+    ))
+}
+
+pub async fn run(args: ReviewArgs) -> Result<()> {
+    let store = JobStore::open_default()?;
+    let document = generate_review_document(&store, &args.job_id)?;
 
     let out_dir = args.out.unwrap_or_else(|| {
         PathBuf::from(".bookforge/runs")
-            .join(&job.id)
+            .join(&document.job_id)
             .join("review")
     });
     fs::create_dir_all(&out_dir)?;
@@ -408,7 +419,7 @@ fn warning_message(kind: &str, message: &str) -> ReviewWarning {
 fn missing_tokens(kind: &str, source: &[String], target: &[String]) -> Vec<ReviewWarning> {
     source
         .iter()
-        .filter(|token| !target.contains(token))
+        .filter(|token| !token_present(token, target))
         .map(|token| ReviewWarning {
             kind: kind.to_string(),
             term_id: None,
@@ -422,50 +433,6 @@ fn missing_tokens(kind: &str, source: &[String], target: &[String]) -> Vec<Revie
             message: Some(format!("preserved token missing: {token}")),
         })
         .collect()
-}
-
-fn urls(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .filter_map(|token| {
-            let value = token.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    ',' | ';' | ':' | '.' | '!' | '?' | ')' | ']' | '"' | '\''
-                )
-            });
-            (value.starts_with("http://") || value.starts_with("https://"))
-                .then(|| value.to_string())
-        })
-        .collect()
-}
-
-fn numbers(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .filter_map(|token| {
-            let value = token.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
-                )
-            });
-            let digits = value.chars().filter(|ch| ch.is_ascii_digit()).count();
-            (digits >= 2
-                && value.chars().all(|ch| {
-                    ch.is_ascii_digit()
-                        || matches!(ch, '.' | ',' | ':' | '/' | '-' | '+' | '%' | '$')
-                }))
-            .then(|| value.to_string())
-        })
-        .collect()
-}
-
-fn looks_like_model_commentary(text: &str) -> bool {
-    let lower = text.trim_start().to_ascii_lowercase();
-    lower.starts_with("here is ")
-        || lower.starts_with("here's ")
-        || lower.starts_with("certainly")
-        || lower.starts_with("translation:")
-        || lower.contains("as an ai")
 }
 
 fn render_html(review_json: &str) -> String {
@@ -994,5 +961,36 @@ mod tests {
         assert_eq!(warnings[0].kind, "glossary_mismatch");
         assert_eq!(warnings[0].term_id, Some(42));
         assert_eq!(warnings[0].expected_target.as_deref(), Some("Aragorn"));
+    }
+
+    #[test]
+    fn number_warning_accepts_localized_decimal_and_thousands_formats() {
+        let source = numbers("from $50,000 to 80.3 percent and 400,000 members");
+        let target = numbers("da «$50,000» all'80,3 per cento e 400.000 membri");
+
+        let warnings = missing_tokens("number_changed", &source, &target);
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn number_warning_accepts_localized_date_order_without_english_comma() {
+        let source = numbers("official act on November 8, 1917");
+        let target = numbers("atto ufficiale l'8 novembre 1917");
+
+        let warnings = missing_tokens("number_changed", &source, &target);
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn number_warning_still_reports_truly_missing_numbers() {
+        let source = numbers("from $50,000 to 80.3 percent");
+        let target = numbers("da «$50,000» percento");
+
+        let warnings = missing_tokens("number_changed", &source, &target);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].from.as_deref(), Some("80.3"));
     }
 }
