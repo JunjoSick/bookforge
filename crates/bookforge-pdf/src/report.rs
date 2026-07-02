@@ -22,6 +22,7 @@ pub struct ConversionReport {
     pub two_column_pages: usize,
     pub images: usize,
     pub figures: usize,
+    pub low_confidence_pages: usize,
     pub page_stats: Vec<PageStats>,
     pub warnings: Vec<String>,
 }
@@ -55,7 +56,14 @@ impl ConversionReport {
             ));
         }
         for page in &page_stats {
-            if page.chars == 0 && page.baseline_chars > 0 {
+            if page.low_confidence {
+                let action = page.low_confidence_action.as_deref().unwrap_or("linearize");
+                let page_coverage = page_coverage_percent(page.chars, page.baseline_chars);
+                warnings.push(format!(
+                    "page {}: low-confidence reconstruction ({page_coverage:.1}% of pdftotext baseline, {} reconstructed / {} baseline characters); action={action}",
+                    page.page, page.chars, page.baseline_chars
+                ));
+            } else if page.chars == 0 && page.baseline_chars > 0 {
                 warnings.push(format!(
                     "page {}: no text reconstructed, but pdftotext found {} baseline characters",
                     page.page, page.baseline_chars
@@ -74,6 +82,7 @@ impl ConversionReport {
             two_column_pages: page_stats.iter().filter(|page| page.two_column).count(),
             images: metrics.images,
             figures: metrics.figures,
+            low_confidence_pages: page_stats.iter().filter(|page| page.low_confidence).count(),
             page_stats,
             warnings,
         }
@@ -81,12 +90,13 @@ impl ConversionReport {
 
     pub fn summary(&self) -> String {
         let mut out = format!(
-            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nImages: {} extracted, {} figure block(s)\nText coverage vs pdftotext: {:.1}% ({} reconstructed / {} baseline characters)\n",
+            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nImages: {} extracted, {} figure block(s)\nLow-confidence pages: {}\nText coverage vs pdftotext: {:.1}% ({} reconstructed / {} baseline characters)\n",
             self.pages,
             self.blocks,
             self.two_column_pages,
             self.images,
             self.figures,
+            self.low_confidence_pages,
             self.coverage_percent,
             self.reconstructed_chars,
             self.baseline_chars,
@@ -100,6 +110,14 @@ impl ConversionReport {
             }
         }
         out
+    }
+}
+
+fn page_coverage_percent(chars: usize, baseline_chars: usize) -> f64 {
+    if baseline_chars == 0 {
+        100.0
+    } else {
+        (chars as f64 / baseline_chars as f64 * 100.0).min(100.0)
     }
 }
 
@@ -142,6 +160,8 @@ mod tests {
                 chars: 0,
                 baseline_chars: 0,
                 two_column: false,
+                low_confidence: false,
+                low_confidence_action: None,
             }],
             ReportMetrics {
                 blocks: 0,
@@ -167,6 +187,8 @@ mod tests {
                 chars: 0,
                 baseline_chars: 42,
                 two_column: false,
+                low_confidence: false,
+                low_confidence_action: None,
             }],
             ReportMetrics {
                 blocks: 0,
@@ -181,5 +203,39 @@ mod tests {
         assert!(
             report.warnings[1].contains("page 7: no text reconstructed, but pdftotext found 42")
         );
+    }
+
+    #[test]
+    fn low_confidence_pages_warn_with_action() {
+        let report = ConversionReport::build(
+            "in.pdf",
+            "out.epub",
+            vec![PageStats {
+                page: 4,
+                lines: 1,
+                chars: 4,
+                baseline_chars: 100,
+                two_column: false,
+                low_confidence: true,
+                low_confidence_action: Some("preserve".to_string()),
+            }],
+            ReportMetrics {
+                blocks: 0,
+                reconstructed_chars: 4,
+                baseline_chars: 100,
+                images: 0,
+                figures: 1,
+            },
+        );
+
+        assert_eq!(report.low_confidence_pages, 1);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("page 4: low-confidence")
+                    && warning.contains("action=preserve"))
+        );
+        assert!(report.summary().contains("Low-confidence pages: 1"));
     }
 }

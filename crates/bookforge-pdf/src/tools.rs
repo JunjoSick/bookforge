@@ -35,6 +35,7 @@ pub struct PopplerTools {
     pub pdftohtml: PathBuf,
     pub pdftotext: PathBuf,
     pub pdfimages: PathBuf,
+    pub pdftoppm: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +55,7 @@ impl PopplerTools {
             pdftohtml: find_tool("pdftohtml")?,
             pdftotext: find_tool("pdftotext")?,
             pdfimages: find_tool("pdfimages")?,
+            pdftoppm: find_tool("pdftoppm")?,
         })
     }
 
@@ -157,6 +159,39 @@ impl PopplerTools {
                 }
             })
             .collect())
+    }
+
+    pub fn render_page_png(
+        &self,
+        pdf: &Path,
+        page: u32,
+        output_dir: &Path,
+    ) -> Result<PathBuf, ToolError> {
+        fs::create_dir_all(output_dir)?;
+        let root = output_dir.join(format!("page-{page:04}"));
+        let page_arg = page.to_string();
+        let output = Command::new(&self.pdftoppm)
+            .args([
+                "-f",
+                &page_arg,
+                "-l",
+                &page_arg,
+                "-singlefile",
+                "-png",
+                "-r",
+                "150",
+            ])
+            .arg(pdf)
+            .arg(&root)
+            .output()?;
+        if !output.status.success() {
+            return Err(ToolError::Failed {
+                tool: "pdftoppm",
+                code: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        Ok(root.with_extension("png"))
     }
 
     fn list_images(&self, pdf: &Path) -> Result<Vec<ListedImage>, ToolError> {

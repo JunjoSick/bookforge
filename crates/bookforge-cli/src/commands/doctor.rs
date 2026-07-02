@@ -78,6 +78,7 @@ fn run_pdf_doctor() -> anyhow::Result<()> {
             println!("  pdftohtml: {}", tools.pdftohtml.display());
             println!("  pdftotext: {}", tools.pdftotext.display());
             println!("  pdfimages: {}", tools.pdfimages.display());
+            println!("  pdftoppm: {}", tools.pdftoppm.display());
             if let Some(version) = tools.version() {
                 println!("  version: {version}");
             }
@@ -85,7 +86,9 @@ fn run_pdf_doctor() -> anyhow::Result<()> {
         Err(err) => {
             println!("  MISSING: {err}");
             println!();
-            println!("  Install poppler and add pdftohtml, pdftotext, and pdfimages to PATH.");
+            println!(
+                "  Install poppler and add pdftohtml, pdftotext, pdfimages, and pdftoppm to PATH."
+            );
         }
     }
     Ok(())

@@ -16,7 +16,9 @@ pub mod report;
 pub mod tools;
 
 pub use convert::{ConvertOptions, ConvertOutcome, convert_pdf};
-pub use model::{ColumnMode, DocBlock, ImageAsset, ImageRegion, Line, Page, Span};
+pub use model::{
+    ColumnMode, DocBlock, ImageAsset, ImageRegion, Line, LowConfidenceMode, Page, Span,
+};
 pub use parse::parse_pdf2xml;
 pub use reconstruct::reconstruct;
 pub use report::ConversionReport;

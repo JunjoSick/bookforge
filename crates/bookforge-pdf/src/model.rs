@@ -102,6 +102,13 @@ pub enum ColumnMode {
     Two,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LowConfidenceMode {
+    Preserve,
+    #[default]
+    Linearize,
+}
+
 /// A reconstructed, reading-ordered document block ready for XHTML
 /// emission.
 #[derive(Debug, Clone, PartialEq, Eq)]

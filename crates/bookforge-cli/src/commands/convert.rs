@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use bookforge_pdf::{ColumnMode, ConvertOptions, convert_pdf};
+use bookforge_pdf::{ColumnMode, ConvertOptions, LowConfidenceMode, convert_pdf};
 use clap::Args;
 
 #[derive(Debug, Args)]
@@ -25,6 +25,10 @@ pub struct ConvertArgs {
     #[arg(long)]
     pub title: Option<String>,
 
+    /// Low-confidence page handling: preserve as page image or keep best-effort text.
+    #[arg(long, value_enum, default_value_t = LowConfidenceArg::Linearize)]
+    pub low_confidence: LowConfidenceArg,
+
     /// Where to write the JSON conversion report. Defaults to
     /// `<out>.convert.json`.
     #[arg(long)]
@@ -40,12 +44,27 @@ pub enum ColumnsArg {
     Two,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum LowConfidenceArg {
+    Preserve,
+    Linearize,
+}
+
 impl From<ColumnsArg> for ColumnMode {
     fn from(value: ColumnsArg) -> Self {
         match value {
             ColumnsArg::Auto => ColumnMode::Auto,
             ColumnsArg::Single => ColumnMode::Single,
             ColumnsArg::Two => ColumnMode::Two,
+        }
+    }
+}
+
+impl From<LowConfidenceArg> for LowConfidenceMode {
+    fn from(value: LowConfidenceArg) -> Self {
+        match value {
+            LowConfidenceArg::Preserve => LowConfidenceMode::Preserve,
+            LowConfidenceArg::Linearize => LowConfidenceMode::Linearize,
         }
     }
 }
@@ -65,6 +84,7 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
 
     let options = ConvertOptions {
         columns: args.columns.into(),
+        low_confidence: args.low_confidence.into(),
         language: args.language.clone(),
         title: args.title.clone().unwrap_or_default(),
     };

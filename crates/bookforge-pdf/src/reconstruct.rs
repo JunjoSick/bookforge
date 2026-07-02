@@ -19,6 +19,8 @@ pub struct PageStats {
     pub chars: usize,
     pub baseline_chars: usize,
     pub two_column: bool,
+    pub low_confidence: bool,
+    pub low_confidence_action: Option<String>,
 }
 
 pub struct Reconstruction {
@@ -71,6 +73,8 @@ pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
             chars: ordered.iter().map(Line::char_count).sum(),
             baseline_chars: 0,
             two_column,
+            low_confidence: false,
+            low_confidence_action: None,
         });
 
         let page_blocks = cluster_paragraphs(&ordered, body_size, &heading_levels);

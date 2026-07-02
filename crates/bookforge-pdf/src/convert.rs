@@ -11,16 +11,19 @@ use std::{
 use crate::{
     Result,
     epub::write_epub,
-    model::{ColumnMode, DocBlock, ImageAsset, ImageRegion, Page, Span},
+    model::{ColumnMode, DocBlock, ImageAsset, ImageRegion, LowConfidenceMode, Page, Span},
     parse::parse_pdf2xml,
-    reconstruct::{BlockAnchor, reconstruct},
+    reconstruct::{BlockAnchor, PageStats, reconstruct},
     report::{ConversionReport, ReportMetrics},
     tools::{ExtractedImage, PopplerTools},
 };
 
+const LOW_CONFIDENCE_COVERAGE: f64 = 0.95;
+
 #[derive(Debug, Clone)]
 pub struct ConvertOptions {
     pub columns: ColumnMode,
+    pub low_confidence: LowConfidenceMode,
     /// dc:language for the produced EPUB (source language of the PDF).
     pub language: String,
     /// dc:title; defaults to the input file stem when empty.
@@ -31,6 +34,7 @@ impl Default for ConvertOptions {
     fn default() -> Self {
         Self {
             columns: ColumnMode::Auto,
+            low_confidence: LowConfidenceMode::Linearize,
             language: "en".to_string(),
             title: String::new(),
         }
@@ -65,12 +69,31 @@ fn convert_pdf_with_tools(
     let figure_blocks = figure_blocks_from_images(&pages, &extracted_images)?;
     let mut blocks = reconstruction.blocks;
     let mut block_anchors = reconstruction.block_anchors;
-    let figure_count = insert_figure_blocks(&mut blocks, &mut block_anchors, figure_blocks);
+    insert_figure_blocks(&mut blocks, &mut block_anchors, figure_blocks);
     let _ = fs::remove_dir_all(&image_dir);
     let baseline = tools.pdf_to_text(input)?;
     let baseline_chars = baseline.chars().filter(|ch| !ch.is_whitespace()).count();
     let baseline_page_chars = baseline_page_char_counts(&baseline, reconstruction.pages.len());
+    let mut page_stats = reconstruction.pages;
+    for (stats, chars) in page_stats.iter_mut().zip(baseline_page_chars) {
+        stats.baseline_chars = chars;
+    }
+    let low_confidence_pages = mark_low_confidence_pages(&mut page_stats, options.low_confidence);
+    if options.low_confidence == LowConfidenceMode::Preserve {
+        preserve_low_confidence_pages(
+            input,
+            &pages,
+            tools,
+            &mut blocks,
+            &mut block_anchors,
+            &low_confidence_pages,
+        )?;
+    }
     let reconstructed_chars: usize = blocks.iter().map(DocBlock::char_count).sum();
+    let figure_count = blocks
+        .iter()
+        .filter(|block| matches!(block, DocBlock::Figure { .. }))
+        .count();
 
     let title = if options.title.is_empty() {
         input
@@ -81,11 +104,6 @@ fn convert_pdf_with_tools(
         options.title.clone()
     };
     write_epub(&blocks, &title, &options.language, output)?;
-
-    let mut page_stats = reconstruction.pages;
-    for (stats, chars) in page_stats.iter_mut().zip(baseline_page_chars) {
-        stats.baseline_chars = chars;
-    }
 
     let report = ConversionReport::build(
         &input.to_string_lossy(),
@@ -104,6 +122,111 @@ fn convert_pdf_with_tools(
         output: output.to_path_buf(),
         report,
     })
+}
+
+fn mark_low_confidence_pages(page_stats: &mut [PageStats], mode: LowConfidenceMode) -> Vec<u32> {
+    let action = low_confidence_action(mode);
+    let mut pages = Vec::new();
+    for stats in page_stats {
+        if is_low_confidence_page(stats) {
+            stats.low_confidence = true;
+            stats.low_confidence_action = Some(action.to_string());
+            pages.push(stats.page);
+        }
+    }
+    pages
+}
+
+fn is_low_confidence_page(stats: &PageStats) -> bool {
+    stats.baseline_chars > 0
+        && (stats.chars as f64 / stats.baseline_chars as f64) < LOW_CONFIDENCE_COVERAGE
+}
+
+fn low_confidence_action(mode: LowConfidenceMode) -> &'static str {
+    match mode {
+        LowConfidenceMode::Preserve => "preserve",
+        LowConfidenceMode::Linearize => "linearize",
+    }
+}
+
+fn preserve_low_confidence_pages(
+    input: &Path,
+    pages: &[Page],
+    tools: &PopplerTools,
+    blocks: &mut Vec<DocBlock>,
+    block_anchors: &mut Vec<BlockAnchor>,
+    low_confidence_pages: &[u32],
+) -> Result<()> {
+    if low_confidence_pages.is_empty() {
+        return Ok(());
+    }
+
+    let page_dir = scoped_temp_dir("bookforge-pdf-pages")?;
+    let result = (|| {
+        for page_number in low_confidence_pages {
+            let rendered = tools.render_page_png(input, *page_number, &page_dir)?;
+            let source_page = pages.iter().find(|page| page.number == *page_number);
+            let asset = page_image_asset(*page_number, source_page, &rendered)?;
+            replace_page_with_preserved_image(blocks, block_anchors, *page_number, asset);
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&page_dir);
+    result
+}
+
+fn page_image_asset(page_number: u32, page: Option<&Page>, path: &Path) -> Result<ImageAsset> {
+    let bytes = fs::read(path)?;
+    Ok(ImageAsset {
+        id: format!("pdf-page-{page_number:04}"),
+        href: format!("images/pdf-page-{page_number:04}.png"),
+        media_type: "image/png".to_string(),
+        bytes,
+        page: page_number,
+        top: Some(0),
+        left: Some(0),
+        width: page.map(|page| page.width),
+        height: page.map(|page| page.height),
+    })
+}
+
+fn replace_page_with_preserved_image(
+    blocks: &mut Vec<DocBlock>,
+    block_anchors: &mut Vec<BlockAnchor>,
+    page_number: u32,
+    image: ImageAsset,
+) {
+    let old_blocks = std::mem::take(blocks);
+    let old_anchors = std::mem::take(block_anchors);
+    let mut insert_at = None;
+
+    for (block, anchor) in old_blocks.into_iter().zip(old_anchors) {
+        if anchor.page == page_number {
+            insert_at.get_or_insert(blocks.len());
+            continue;
+        }
+        if anchor.page > page_number {
+            insert_at.get_or_insert(blocks.len());
+        }
+        blocks.push(block);
+        block_anchors.push(anchor);
+    }
+
+    let insert_at = insert_at.unwrap_or(blocks.len());
+    blocks.insert(
+        insert_at,
+        DocBlock::Figure {
+            image,
+            caption: None,
+        },
+    );
+    block_anchors.insert(
+        insert_at,
+        BlockAnchor {
+            page: page_number,
+            top: 0,
+        },
+    );
 }
 
 struct AnchoredFigure {
@@ -332,6 +455,32 @@ echo "$last-000-000.png"
     }
 
     #[cfg(unix)]
+    fn fake_pdfimages_empty(path: &Path) {
+        write_executable(
+            path,
+            r#"#!/bin/sh
+if [ "$1" = "-list" ]; then
+cat <<'LIST'
+page   num  type   width height color comp bpc  enc interp  object ID x-ppi y-ppi size ratio
+--------------------------------------------------------------------------------------------
+LIST
+fi
+"#,
+        );
+    }
+
+    #[cfg(unix)]
+    fn fake_pdftoppm(path: &Path) {
+        write_executable(
+            path,
+            r#"#!/bin/sh
+for last do :; done
+printf 'fake-page' > "$last.png"
+"#,
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn convert_pdf_does_not_write_epub_when_baseline_fails() {
         use std::fs;
@@ -366,11 +515,14 @@ exit 9
         );
         let pdfimages = dir.path().join("pdfimages");
         fake_pdfimages(&pdfimages);
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
 
         let tools = PopplerTools {
             pdftohtml,
             pdftotext,
             pdfimages,
+            pdftoppm,
         };
 
         let result = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools);
@@ -421,11 +573,14 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
         );
         let pdfimages = dir.path().join("pdfimages");
         fake_pdfimages(&pdfimages);
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
 
         let tools = PopplerTools {
             pdftohtml,
             pdftotext,
             pdfimages,
+            pdftoppm,
         };
         let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
             .expect("conversion should succeed");
@@ -460,5 +615,168 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
                 .any(|block| matches!(block.kind, bookforge_core::ir::BlockKind::Caption)),
             "figcaption should remain a normal translatable caption block"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn low_confidence_pages_linearize_by_default() {
+        use std::{fs, io::Read};
+        use zip::ZipArchive;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.pdf");
+        let output = dir.path().join("output.epub");
+        fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+
+        let pdftohtml = dir.path().join("pdftohtml");
+        write_executable(
+            &pdftohtml,
+            r##"#!/bin/sh
+cat <<'XML'
+<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="100" left="100" width="20" height="12" font="0">Tiny</text>
+  </page>
+</pdf2xml>
+XML
+"##,
+        );
+
+        let pdftotext = dir.path().join("pdftotext");
+        write_executable(
+            &pdftotext,
+            r#"#!/bin/sh
+printf 'Tiny plus many baseline characters that the XML reconstruction did not recover.\n'
+"#,
+        );
+        let pdfimages = dir.path().join("pdfimages");
+        fake_pdfimages_empty(&pdfimages);
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
+
+        let tools = PopplerTools {
+            pdftohtml,
+            pdftotext,
+            pdfimages,
+            pdftoppm,
+        };
+        let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+            .expect("conversion should succeed");
+
+        assert_eq!(outcome.report.low_confidence_pages, 1);
+        assert_eq!(
+            outcome.report.page_stats[0]
+                .low_confidence_action
+                .as_deref(),
+            Some("linearize")
+        );
+        assert!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("page 1: low-confidence")
+                    && warning.contains("action=linearize"))
+        );
+
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("Tiny"));
+        assert!(!content.contains("pdf-page-0001.png"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn low_confidence_pages_can_be_preserved_as_page_images() {
+        use std::{fs, io::Read};
+        use zip::ZipArchive;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.pdf");
+        let output = dir.path().join("output.epub");
+        fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+
+        let pdftohtml = dir.path().join("pdftohtml");
+        write_executable(
+            &pdftohtml,
+            r##"#!/bin/sh
+cat <<'XML'
+<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="100" left="100" width="20" height="12" font="0">Tiny</text>
+  </page>
+</pdf2xml>
+XML
+"##,
+        );
+
+        let pdftotext = dir.path().join("pdftotext");
+        write_executable(
+            &pdftotext,
+            r#"#!/bin/sh
+printf 'Tiny plus many baseline characters that the XML reconstruction did not recover.\n'
+"#,
+        );
+        let pdfimages = dir.path().join("pdfimages");
+        fake_pdfimages_empty(&pdfimages);
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
+
+        let tools = PopplerTools {
+            pdftohtml,
+            pdftotext,
+            pdfimages,
+            pdftoppm,
+        };
+        let options = ConvertOptions {
+            low_confidence: LowConfidenceMode::Preserve,
+            ..ConvertOptions::default()
+        };
+        let outcome = convert_pdf_with_tools(&input, &output, &options, &tools)
+            .expect("conversion should succeed");
+
+        assert_eq!(outcome.report.low_confidence_pages, 1);
+        assert_eq!(
+            outcome.report.page_stats[0]
+                .low_confidence_action
+                .as_deref(),
+            Some("preserve")
+        );
+        assert!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("page 1: low-confidence")
+                    && warning.contains("action=preserve"))
+        );
+
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("<figure id=\"pdf-page-0001\">"));
+        assert!(content.contains("images/pdf-page-0001.png"));
+        assert!(!content.contains("Tiny"));
+
+        let mut image = Vec::new();
+        archive
+            .by_name("images/pdf-page-0001.png")
+            .expect("preserved page image exists")
+            .read_to_end(&mut image)
+            .expect("image reads");
+        assert_eq!(image, b"fake-page");
     }
 }
