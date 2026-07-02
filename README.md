@@ -70,7 +70,7 @@ not need Rust, Cargo, Git, Python, Node, or a source-code checkout.
 2. Copy this whole line, paste it into Terminal, and press Enter:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/JunjoSick/bookforge/releases/latest/download/bookforge-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/JunjoSick/bookforge/releases/latest/download/bookforge-cli-installer.sh | sh
 ```
 
 3. Close Terminal and open it again.
@@ -86,7 +86,7 @@ bookforge
 2. Copy this whole line, paste it into PowerShell, and press Enter:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/JunjoSick/bookforge/releases/latest/download/bookforge-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/JunjoSick/bookforge/releases/latest/download/bookforge-cli-installer.ps1 | iex"
 ```
 
 3. Close PowerShell and open it again.

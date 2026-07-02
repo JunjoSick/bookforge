@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.0.2 - 2026-07-02
+
+BookForge v2.0.2 corrects the non-technical install commands so they point to
+the installer asset names produced by the release workflow.
+
+- macOS/Linux documentation now downloads `bookforge-cli-installer.sh`.
+- Windows documentation now downloads `bookforge-cli-installer.ps1`.
+
+Validation:
+
+- `cargo metadata --no-deps --format-version 1`
+- `cargo fmt --all --check`
+- `git diff --check`
+
 ## v2.0.1 - 2026-07-02
 
 BookForge v2.0.1 is a usability patch for the new local browser workflow.
