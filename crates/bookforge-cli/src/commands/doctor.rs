@@ -5,6 +5,7 @@ use bookforge_llm::{
     CompletionRequest, LlmProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
     RequestMetadata, ResponseFormat,
 };
+use bookforge_pdf::PopplerTools;
 use bookforge_store::run_doctor;
 
 #[derive(Debug, Args)]
@@ -12,6 +13,10 @@ pub struct DoctorArgs {
     /// Check storage health
     #[arg(long)]
     pub storage: bool,
+
+    /// Check PDF conversion tooling
+    #[arg(long)]
+    pub pdf: bool,
 
     /// Check provider health
     #[arg(long)]
@@ -42,6 +47,11 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
         run_storage_doctor().await?;
     }
 
+    if args.pdf {
+        ran = true;
+        run_pdf_doctor()?;
+    }
+
     if let Some(provider) = &args.provider {
         ran = true;
         run_provider_doctor(
@@ -58,6 +68,26 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
         run_storage_doctor().await?;
     }
 
+    Ok(())
+}
+
+fn run_pdf_doctor() -> anyhow::Result<()> {
+    println!("PDF conversion tooling:");
+    match PopplerTools::discover() {
+        Ok(tools) => {
+            println!("  pdftohtml: {}", tools.pdftohtml.display());
+            println!("  pdftotext: {}", tools.pdftotext.display());
+            println!("  pdfimages: {}", tools.pdfimages.display());
+            if let Some(version) = tools.version() {
+                println!("  version: {version}");
+            }
+        }
+        Err(err) => {
+            println!("  MISSING: {err}");
+            println!();
+            println!("  Install poppler and add pdftohtml, pdftotext, and pdfimages to PATH.");
+        }
+    }
     Ok(())
 }
 

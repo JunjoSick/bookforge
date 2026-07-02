@@ -20,8 +20,19 @@ pub struct ConversionReport {
     /// dropped content and the page list below says where.
     pub coverage_percent: f64,
     pub two_column_pages: usize,
+    pub images: usize,
+    pub figures: usize,
     pub page_stats: Vec<PageStats>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReportMetrics {
+    pub blocks: usize,
+    pub reconstructed_chars: usize,
+    pub baseline_chars: usize,
+    pub images: usize,
+    pub figures: usize,
 }
 
 impl ConversionReport {
@@ -29,14 +40,12 @@ impl ConversionReport {
         input: &str,
         output: &str,
         page_stats: Vec<PageStats>,
-        blocks: usize,
-        reconstructed_chars: usize,
-        baseline_chars: usize,
+        metrics: ReportMetrics,
     ) -> Self {
-        let coverage_percent = if baseline_chars == 0 {
+        let coverage_percent = if metrics.baseline_chars == 0 {
             100.0
         } else {
-            (reconstructed_chars as f64 / baseline_chars as f64 * 100.0).min(100.0)
+            (metrics.reconstructed_chars as f64 / metrics.baseline_chars as f64 * 100.0).min(100.0)
         };
 
         let mut warnings = Vec::new();
@@ -58,11 +67,13 @@ impl ConversionReport {
             input: input.to_string(),
             output: output.to_string(),
             pages: page_stats.len(),
-            blocks,
-            reconstructed_chars,
-            baseline_chars,
+            blocks: metrics.blocks,
+            reconstructed_chars: metrics.reconstructed_chars,
+            baseline_chars: metrics.baseline_chars,
             coverage_percent,
             two_column_pages: page_stats.iter().filter(|page| page.two_column).count(),
+            images: metrics.images,
+            figures: metrics.figures,
             page_stats,
             warnings,
         }
@@ -70,10 +81,12 @@ impl ConversionReport {
 
     pub fn summary(&self) -> String {
         let mut out = format!(
-            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nText coverage vs pdftotext: {:.1}% ({} reconstructed / {} baseline characters)\n",
+            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nImages: {} extracted, {} figure block(s)\nText coverage vs pdftotext: {:.1}% ({} reconstructed / {} baseline characters)\n",
             self.pages,
             self.blocks,
             self.two_column_pages,
+            self.images,
+            self.figures,
             self.coverage_percent,
             self.reconstructed_chars,
             self.baseline_chars,
@@ -96,7 +109,18 @@ mod tests {
 
     #[test]
     fn summary_does_not_describe_over_baseline_reconstruction_as_of_total() {
-        let report = ConversionReport::build("in.pdf", "out.epub", Vec::new(), 1, 101, 100);
+        let report = ConversionReport::build(
+            "in.pdf",
+            "out.epub",
+            Vec::new(),
+            ReportMetrics {
+                blocks: 1,
+                reconstructed_chars: 101,
+                baseline_chars: 100,
+                images: 0,
+                figures: 0,
+            },
+        );
 
         assert_eq!(report.coverage_percent, 100.0);
         assert!(
@@ -119,9 +143,13 @@ mod tests {
                 baseline_chars: 0,
                 two_column: false,
             }],
-            0,
-            0,
-            0,
+            ReportMetrics {
+                blocks: 0,
+                reconstructed_chars: 0,
+                baseline_chars: 0,
+                images: 0,
+                figures: 0,
+            },
         );
 
         assert!(report.warnings.is_empty());
@@ -140,9 +168,13 @@ mod tests {
                 baseline_chars: 42,
                 two_column: false,
             }],
-            0,
-            0,
-            42,
+            ReportMetrics {
+                blocks: 0,
+                reconstructed_chars: 0,
+                baseline_chars: 42,
+                images: 0,
+                figures: 0,
+            },
         );
 
         assert_eq!(report.warnings.len(), 2);

@@ -23,7 +23,20 @@ pub struct PageStats {
 
 pub struct Reconstruction {
     pub blocks: Vec<DocBlock>,
+    pub block_anchors: Vec<BlockAnchor>,
     pub pages: Vec<PageStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockAnchor {
+    pub page: u32,
+    pub top: i32,
+}
+
+#[derive(Debug, Clone)]
+struct AnchoredBlock {
+    block: DocBlock,
+    top: i32,
 }
 
 pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
@@ -32,6 +45,7 @@ pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
     let running_margin_texts = running_margin_texts(pages, body_size);
 
     let mut blocks: Vec<DocBlock> = Vec::new();
+    let mut block_anchors = Vec::new();
     let mut stats = Vec::new();
 
     for page in pages {
@@ -60,11 +74,12 @@ pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
         });
 
         let page_blocks = cluster_paragraphs(&ordered, body_size, &heading_levels);
-        append_with_continuation(&mut blocks, page_blocks);
+        append_with_continuation(&mut blocks, &mut block_anchors, page.number, page_blocks);
     }
 
     Reconstruction {
         blocks,
+        block_anchors,
         pages: stats,
     }
 }
@@ -323,22 +338,30 @@ fn cluster_paragraphs(
     lines: &[Line],
     body_size: u32,
     heading_levels: &HashMap<u32, u8>,
-) -> Vec<DocBlock> {
+) -> Vec<AnchoredBlock> {
     let median_gap = median_line_gap(lines);
     let mut blocks = Vec::new();
     let mut current: Vec<Span> = Vec::new();
     let mut current_heading: Option<u8> = None;
+    let mut current_top: Option<i32> = None;
     let mut previous: Option<&Line> = None;
 
-    let flush = |spans: &mut Vec<Span>, heading: &mut Option<u8>, blocks: &mut Vec<DocBlock>| {
+    let flush = |spans: &mut Vec<Span>,
+                 heading: &mut Option<u8>,
+                 top: &mut Option<i32>,
+                 blocks: &mut Vec<AnchoredBlock>| {
         if spans.is_empty() {
             return;
         }
         let spans = std::mem::take(spans);
-        match heading.take() {
-            Some(level) => blocks.push(DocBlock::Heading { level, spans }),
-            None => blocks.push(DocBlock::Paragraph { spans }),
-        }
+        let block = match heading.take() {
+            Some(level) => DocBlock::Heading { level, spans },
+            None => DocBlock::Paragraph { spans },
+        };
+        blocks.push(AnchoredBlock {
+            block,
+            top: top.take().unwrap_or_default(),
+        });
     };
 
     for line in lines {
@@ -359,13 +382,24 @@ fn cluster_paragraphs(
         };
 
         if new_block {
-            flush(&mut current, &mut current_heading, &mut blocks);
+            flush(
+                &mut current,
+                &mut current_heading,
+                &mut current_top,
+                &mut blocks,
+            );
             current_heading = heading;
+            current_top = Some(line.top);
         }
         join_line_into(&mut current, line);
         previous = Some(line);
     }
-    flush(&mut current, &mut current_heading, &mut blocks);
+    flush(
+        &mut current,
+        &mut current_heading,
+        &mut current_top,
+        &mut blocks,
+    );
 
     blocks
 }
@@ -426,9 +460,19 @@ fn median_line_gap(lines: &[Line]) -> i32 {
 /// Cross-page paragraph continuation: a page's first paragraph continues
 /// the previous page's last one when the earlier text does not end a
 /// sentence and the new text starts lowercase.
-fn append_with_continuation(blocks: &mut Vec<DocBlock>, mut incoming: Vec<DocBlock>) {
-    if let (Some(DocBlock::Paragraph { spans: tail }), Some(DocBlock::Paragraph { spans: head })) =
-        (blocks.last_mut(), incoming.first_mut())
+fn append_with_continuation(
+    blocks: &mut Vec<DocBlock>,
+    block_anchors: &mut Vec<BlockAnchor>,
+    page: u32,
+    mut incoming: Vec<AnchoredBlock>,
+) {
+    if let (
+        Some(DocBlock::Paragraph { spans: tail }),
+        Some(AnchoredBlock {
+            block: DocBlock::Paragraph { spans: head },
+            ..
+        }),
+    ) = (blocks.last_mut(), incoming.first_mut())
     {
         let tail_text: String = tail.iter().map(|span| span.text.as_str()).collect();
         let head_text: String = head.iter().map(|span| span.text.as_str()).collect();
@@ -452,7 +496,13 @@ fn append_with_continuation(blocks: &mut Vec<DocBlock>, mut incoming: Vec<DocBlo
             incoming.remove(0);
         }
     }
-    blocks.append(&mut incoming);
+    for anchored in incoming {
+        block_anchors.push(BlockAnchor {
+            page,
+            top: anchored.top,
+        });
+        blocks.push(anchored.block);
+    }
 }
 
 #[cfg(test)]
