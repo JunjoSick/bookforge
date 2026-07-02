@@ -319,6 +319,7 @@ pub(crate) fn prepopulate_context_registry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_glossary_run_config(
     store: &JobStore,
     glossary_files: &[PathBuf],

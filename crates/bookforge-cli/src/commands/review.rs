@@ -213,6 +213,7 @@ fn resolve_review_input(job: &JobRecord, snapshot: &RunConfigSnapshot) -> Result
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_review_document(
     job: &JobRecord,
     snapshot: &RunConfigSnapshot,

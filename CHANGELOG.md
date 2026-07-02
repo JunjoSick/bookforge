@@ -1,5 +1,42 @@
 # Changelog
 
+## v2.0.3 - 2026-07-02
+
+BookForge v2.0.3 hardens the local browser dashboard, fixes inline-marker
+spacing in translated EPUBs, and cleans up release quality gates for the v2
+line.
+
+- Dashboard requests now validate the `Host` header against the loopback host
+  and bound port, closing DNS-rebinding access to the unauthenticated local UI.
+- Browser-launched `openai-compatible` runs now require an `https://` base URL,
+  CSRF token comparison no longer uses direct string equality, and detached
+  translation launches get a short early-exit check before the dashboard reports
+  success.
+- The dashboard library, wizard, and progress grids now adapt to narrow windows,
+  including a mobile breakpoint that stacks the wizard rail above the panel.
+- EPUB extraction now keeps whitespace-only text nodes between adjacent inline
+  elements as their own marker-boundary runs, and EPUB rebuild re-inserts a
+  deterministic space when a model strips whitespace at an originally spaced
+  inline boundary.
+- CLI help/error printing now treats broken pipes as clean exits, including
+  minimal builds that print help when run without the dashboard feature.
+- Established long-argument helper APIs now carry targeted clippy allows so
+  the exact workspace clippy gate is quiet.
+- `docs/ROADMAP.md` now marks v2.0 as shipped and points readers to current
+  docs for live behavior.
+
+Validation:
+
+- `cargo check -p bookforge-cli --all-features`
+- `cargo test -p bookforge-cli`
+- `cargo test -p bookforge-epub`
+- `cargo check --workspace --all-features`
+- `cargo test --workspace`
+- `cargo clippy --workspace --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -p bookforge-cli --features serve -- serve --bind 127.0.0.1:0`
+
 ## v2.0.2 - 2026-07-02
 
 BookForge v2.0.2 corrects the non-technical install commands so they point to
