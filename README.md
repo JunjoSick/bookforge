@@ -18,7 +18,8 @@ of translation quality.
 
 ## Status
 
-BookForge v1.8 is usable for EPUB translation and PDF-to-EPUB ingestion:
+BookForge v2.0 is usable for EPUB translation, PDF-to-EPUB ingestion, and
+local browser-based translation runs:
 
 - EPUB inspect, parse, segment, and rebuild
 - EPUBCheck-backed standalone and post-translation validation
@@ -33,8 +34,14 @@ BookForge v1.8 is usable for EPUB translation and PDF-to-EPUB ingestion:
 - SQLite checkpoint store
 - Resume and retry commands
 - Status and tail commands for persisted jobs
-- Live monitoring: terminal dashboard (`watch` / `--ui tui`) and a local web
-  dashboard (`serve`) over a shared, replayable run-state layer
+- Live monitoring: terminal dashboard (`watch` / `--ui tui`) and a local
+  browser dashboard (`serve`) over a shared, replayable run-state layer
+- Browser workflow for non-developers: upload an EPUB, pick languages,
+  choose provider/model, estimate cost, start translation, review, validate,
+  and retry from `http://127.0.0.1:8765`
+- Local-only secret handling for browser runs: pasted provider keys stay in
+  server memory for the session and are never written to disk or placed on the
+  command line
 - Segment-level cache reuse for compatible prior translations
 - Static side-by-side review HTML with flag export/import
 - QA reports in JSON and Markdown
@@ -42,9 +49,104 @@ BookForge v1.8 is usable for EPUB translation and PDF-to-EPUB ingestion:
 - Cost estimates for known provider/model pairs
 - Externalized, overridable provider pricing
 
-## Install
+## Install And Setup
 
-Install from crates.io:
+### For non-technical users
+
+BookForge v2 ships prebuilt release installers for macOS, Linux, and Windows.
+You do not need Rust or Cargo for the normal install path.
+
+1. Open the latest release:
+   <https://github.com/JunjoSick/bookforge/releases/latest>
+2. Use the installer for your operating system. The release page lists the
+   exact commands; they follow this shape:
+
+   macOS or Linux:
+
+   ```bash
+   curl --proto '=https' --tlsv1.2 -LsSf https://github.com/JunjoSick/bookforge/releases/latest/download/bookforge-installer.sh | sh
+   ```
+
+   Windows PowerShell:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -c "irm https://github.com/JunjoSick/bookforge/releases/latest/download/bookforge-installer.ps1 | iex"
+   ```
+
+3. Close and reopen your terminal after installation.
+4. Check that BookForge installed:
+
+```bash
+bookforge --version
+```
+
+If `bookforge` is not found after reopening the terminal, the installer
+probably succeeded but your PATH was not refreshed. The binary is installed
+under your Cargo bin directory, usually `~/.cargo/bin` on macOS/Linux or
+`%USERPROFILE%\.cargo\bin` on Windows.
+
+Start the local web app:
+
+```bash
+bookforge serve --open
+```
+
+If the browser does not open automatically, go to:
+
+```txt
+http://127.0.0.1:8765
+```
+
+The dashboard is intentionally local-only. It binds to `127.0.0.1`, so it is
+for the person sitting at this computer, not a public website.
+
+### First Translation In The Browser
+
+1. Click **New translation**.
+2. Choose an `.epub` file.
+3. Pick the source language, or leave it blank to auto-detect.
+4. Pick the target language from the list.
+5. Choose a quality tier, or open **Advanced** to choose the provider and model.
+6. If the provider needs an API key, paste it into the password field. The key
+   is remembered only while this `bookforge serve` process is running.
+7. Review the estimate and click **Start translation**.
+8. Watch progress in the **Progress** screen.
+9. When it finishes, use **Review** to compare source and translation, and
+   **Validation** to check the output EPUB.
+10. If segments fail or need review, use **Retry failed / needs-review**.
+
+Outputs, uploads, checkpoints, review data, and validation reports are stored
+locally under `.bookforge/` in the folder where you started BookForge. Do not
+share `.bookforge/` if the book or translation is private.
+
+To stop the web app, return to the terminal running `bookforge serve` and press
+`Ctrl+C`.
+
+### API Key Setup
+
+BookForge can use several providers:
+
+- **DeepSeek**: use a DeepSeek API key. In the browser dashboard, choose the
+  DeepSeek provider or a DeepSeek-backed quality tier.
+- **OpenRouter**: use an OpenRouter API key. This is useful when you want to
+  choose from many hosted models.
+- **OpenAI-compatible**: use a server or hosted provider that exposes an
+  OpenAI-style `/v1` API. In **Advanced**, enter the base URL and model ID.
+- **Mock**: no API key, no network provider, useful for a dry run.
+
+For browser-launched runs, pasting a key into the dashboard is the simplest
+path. For terminal use, you can also set environment variables before starting
+BookForge:
+
+```bash
+export DEEPSEEK_API_KEY=...
+export OPENROUTER_API_KEY=...
+export OPENAI_API_KEY=...
+```
+
+### Advanced Install From Cargo
+
+Install from crates.io when you already have Rust installed:
 
 ```bash
 cargo install bookforge-cli
@@ -68,7 +170,7 @@ For development, use:
 cargo run -p bookforge-cli -- <command>
 ```
 
-## Quick start
+## CLI Quick Start
 
 ```bash
 export DEEPSEEK_API_KEY=...
@@ -344,9 +446,10 @@ cargo run -p bookforge-cli -- translate book.epub \
 
 Review artifacts contain the full source and translated text of the book. They are written locally under `.bookforge/runs/<job-id>/review/`; treat them as private user data.
 
-Known limitations: provider API keys are read from environment variables.
-PDF ingestion currently prioritizes text reconstruction; complex figures and
-tables may require review of the conversion report.
+Known limitations: terminal commands read provider API keys from environment
+variables, while the browser dashboard can also accept a session-only pasted
+key. PDF ingestion currently prioritizes text reconstruction; complex figures
+and tables may require review of the conversion report.
 
 ## Benchmarks
 
@@ -388,9 +491,9 @@ export OPENROUTER_API_KEY=...
 ## Development Checks
 
 ```bash
-cargo fmt
-cargo test
-cargo clippy --all-targets --all-features
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for what's expected in issues
