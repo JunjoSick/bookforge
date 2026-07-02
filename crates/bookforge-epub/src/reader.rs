@@ -753,22 +753,16 @@ impl BlockBuilder {
     fn push_text(&mut self, text: &str) {
         let Some(mut text) = normalize_text_fragment(text) else {
             // Whitespace-only fragment (e.g. a resolved &nbsp; entity
-            // reference): it still separates words, so keep one space
-            // between non-empty neighbors instead of dropping the
-            // boundary.
+            // reference): it still separates words. Keep it as a
+            // standalone run so spaces between adjacent inline markers
+            // stay between those markers instead of moving inside the
+            // previous inline element.
             if !text.is_empty()
                 && !self.visible_text.is_empty()
                 && !self.visible_text.ends_with(' ')
             {
                 self.visible_text.push(' ');
-                if let Some(run) = self
-                    .text_runs
-                    .iter_mut()
-                    .rev()
-                    .find(|run| !is_marker_token(&run.text))
-                {
-                    run.text.push(' ');
-                }
+                self.push_run(" ".to_string());
             }
             return;
         };
@@ -1503,6 +1497,42 @@ mod tests {
         assert_eq!(blocks[0].inline_marks[0].id, "m1");
         assert_eq!(blocks[0].inline_marks[0].kind, "em");
         assert_eq!(blocks[0].token_estimate, estimate_tokens("Hello world!"));
+    }
+
+    #[test]
+    fn keeps_inter_inline_whitespace_between_marker_runs() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            "<html><body><p><span>a</span> <span>b</span></p></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(block_text(&blocks[0]), "<m1>a</m1> <m2>b</m2>");
+        let runs = blocks[0]
+            .text_runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(runs, vec!["<m1>", "a", "</m1>", " ", "<m2>", "b", "</m2>"]);
+    }
+
+    #[test]
+    fn keeps_nbsp_only_inline_boundary_between_marker_runs() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            "<html><body><p><span>a</span>&nbsp;<span>b</span></p></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(block_text(&blocks[0]), "<m1>a</m1> <m2>b</m2>");
     }
 
     #[test]

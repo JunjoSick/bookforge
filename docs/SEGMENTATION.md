@@ -25,5 +25,4 @@ Each segment records:
 - required markers and protected spans;
 - a checksum/source hash used by checkpointing and cache lookup.
 
-The cache namespace includes segmentation settings, profile namespace, batch mode, prompt version, glossary/style/entity fingerprints, and the inline marker schema version. Marker schema version `3` corresponds to the short per-block marker syntax.
-
+The cache namespace includes segmentation settings, profile namespace, batch mode, prompt version, glossary/style/entity fingerprints, and the inline marker schema version. Marker schema version `4` corresponds to the short per-block marker syntax plus stable whitespace boundaries between adjacent inline markers.

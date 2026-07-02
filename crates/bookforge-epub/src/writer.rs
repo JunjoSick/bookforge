@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -556,6 +556,37 @@ enum InlineTemplate {
     Empty(Event<'static>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InlineWhitespaceBoundary {
+    left: String,
+    right: String,
+}
+
+#[derive(Debug, Clone)]
+struct RenderedEvent {
+    event: Event<'static>,
+    edge: Option<MarkerEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MarkerEdge {
+    Start(String),
+    End(String),
+}
+
+impl RenderedEvent {
+    fn plain(event: Event<'static>) -> Self {
+        Self { event, edge: None }
+    }
+
+    fn marker(event: Event<'static>, edge: MarkerEdge) -> Self {
+        Self {
+            event,
+            edge: Some(edge),
+        }
+    }
+}
+
 fn normalize_marker_whitespace(text: &str) -> String {
     text.replace("</ m>", "</m>")
         .replace("</m >", "</m>")
@@ -576,6 +607,7 @@ fn render_marked_translation(
     if templates.is_empty() {
         return Ok(vec![Event::Text(BytesText::new(translation).into_owned())]);
     }
+    let inline_whitespace_boundaries = collect_inline_whitespace_boundaries(original_events)?;
 
     let mut rendered = Vec::new();
     let mut used = Vec::new();
@@ -598,7 +630,11 @@ fn render_marked_translation(
         )));
     }
 
-    Ok(rendered)
+    restore_inline_boundary_spaces(&mut rendered, &inline_whitespace_boundaries);
+    Ok(rendered
+        .into_iter()
+        .map(|rendered| rendered.event)
+        .collect())
 }
 
 fn collect_inline_templates(
@@ -649,10 +685,184 @@ fn collect_inline_templates(
     Ok(templates)
 }
 
+fn collect_inline_whitespace_boundaries(
+    events: &[Event<'static>],
+) -> Result<HashSet<InlineWhitespaceBoundary>> {
+    let mut marker_ordinal = 0usize;
+    let mut stack = Vec::<String>::new();
+    let mut boundaries = HashSet::new();
+    let mut pending_left = None::<String>;
+    let mut saw_whitespace = false;
+
+    for event in events {
+        match event {
+            Event::Start(_) => {
+                let id = marker_id("m", marker_ordinal);
+                marker_ordinal += 1;
+                insert_pending_boundary(&mut boundaries, pending_left.take(), saw_whitespace, &id);
+                saw_whitespace = false;
+                stack.push(id);
+            }
+            Event::Empty(_) => {
+                let id = marker_id("r", marker_ordinal);
+                marker_ordinal += 1;
+                insert_pending_boundary(&mut boundaries, pending_left.take(), saw_whitespace, &id);
+                pending_left = Some(id);
+                saw_whitespace = false;
+            }
+            Event::End(_) => {
+                let Some(id) = stack.pop() else {
+                    return Err(BookforgeError::InvalidInput(
+                        "inline whitespace stack underflow while collecting original boundaries"
+                            .to_string(),
+                    ));
+                };
+                pending_left = Some(id);
+                saw_whitespace = false;
+            }
+            _ => {
+                if let Some(is_whitespace) = event_text_is_whitespace(event)?
+                    && pending_left.is_some()
+                {
+                    if is_whitespace {
+                        saw_whitespace = true;
+                    } else {
+                        pending_left = None;
+                        saw_whitespace = false;
+                    }
+                }
+            }
+        }
+    }
+
+    if !stack.is_empty() {
+        return Err(BookforgeError::InvalidInput(
+            "inline whitespace stack was not empty after collecting original boundaries"
+                .to_string(),
+        ));
+    }
+
+    Ok(boundaries)
+}
+
+fn insert_pending_boundary(
+    boundaries: &mut HashSet<InlineWhitespaceBoundary>,
+    left: Option<String>,
+    saw_whitespace: bool,
+    right: &str,
+) {
+    if let Some(left) = left
+        && saw_whitespace
+    {
+        boundaries.insert(InlineWhitespaceBoundary {
+            left,
+            right: right.to_string(),
+        });
+    }
+}
+
+fn event_text_is_whitespace(event: &Event<'static>) -> Result<Option<bool>> {
+    let value = match event {
+        Event::Text(text) => text
+            .html_content()
+            .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?
+            .into_owned(),
+        Event::CData(text) => text
+            .decode()
+            .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?
+            .into_owned(),
+        Event::GeneralRef(reference) => {
+            if let Some(ch) = reference
+                .resolve_char_ref()
+                .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?
+            {
+                ch.to_string()
+            } else {
+                let name = reference
+                    .decode()
+                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                quick_xml::escape::resolve_html5_entity(&name)
+                    .unwrap_or(&name)
+                    .to_string()
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(value.chars().all(char::is_whitespace)))
+}
+
+fn restore_inline_boundary_spaces(
+    rendered: &mut Vec<RenderedEvent>,
+    boundaries: &HashSet<InlineWhitespaceBoundary>,
+) {
+    if boundaries.is_empty() {
+        return;
+    }
+
+    let mut index = 0usize;
+    while index + 1 < rendered.len() {
+        let boundary = match (&rendered[index].edge, &rendered[index + 1].edge) {
+            (Some(MarkerEdge::End(left)), Some(MarkerEdge::Start(right))) => {
+                InlineWhitespaceBoundary {
+                    left: left.clone(),
+                    right: right.clone(),
+                }
+            }
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+
+        if boundaries.contains(&boundary) && boundary_needs_space(rendered, index) {
+            rendered.insert(
+                index + 1,
+                RenderedEvent::plain(Event::Text(BytesText::new(" ").into_owned())),
+            );
+            index += 1;
+        }
+        index += 1;
+    }
+}
+
+fn boundary_needs_space(rendered: &[RenderedEvent], left_edge_index: usize) -> bool {
+    let previous = last_visible_char_before(rendered, left_edge_index);
+    let next = first_visible_char_after(rendered, left_edge_index + 1);
+
+    previous.is_some_and(is_word_char) && next.is_some_and(is_word_char)
+}
+
+fn last_visible_char_before(rendered: &[RenderedEvent], index: usize) -> Option<char> {
+    rendered
+        .iter()
+        .take(index + 1)
+        .rev()
+        .find_map(|rendered| event_text(&rendered.event).and_then(|text| text.chars().next_back()))
+}
+
+fn first_visible_char_after(rendered: &[RenderedEvent], index: usize) -> Option<char> {
+    rendered
+        .iter()
+        .skip(index)
+        .find_map(|rendered| event_text(&rendered.event).and_then(|text| text.chars().next()))
+}
+
+fn event_text(event: &Event<'static>) -> Option<String> {
+    match event {
+        Event::Text(text) => text.decode().ok().map(|text| text.into_owned()),
+        Event::CData(text) => text.decode().ok().map(|text| text.into_owned()),
+        _ => None,
+    }
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric()
+}
+
 fn push_marked_fragment(
     mut text: &str,
     templates: &HashMap<String, InlineTemplate>,
-    output: &mut Vec<Event<'static>>,
+    output: &mut Vec<RenderedEvent>,
     used: &mut Vec<String>,
 ) -> Result<()> {
     while let Some(index) = text.find('<') {
@@ -676,10 +886,16 @@ fn push_marked_fragment(
 
             match templates.get(&id) {
                 Some(InlineTemplate::Paired { start, end }) => {
-                    output.push(start.clone());
-                    used.push(id);
+                    output.push(RenderedEvent::marker(
+                        start.clone(),
+                        MarkerEdge::Start(id.clone()),
+                    ));
+                    used.push(id.clone());
                     push_marked_fragment(inner, templates, output, used)?;
-                    output.push(Event::End(end.clone()));
+                    output.push(RenderedEvent::marker(
+                        Event::End(end.clone()),
+                        MarkerEdge::End(id),
+                    ));
                 }
                 Some(InlineTemplate::Empty(_)) => {
                     return Err(BookforgeError::InvalidInput(format!(
@@ -704,8 +920,8 @@ fn push_marked_fragment(
 
             match templates.get(&id) {
                 Some(InlineTemplate::Empty(event)) => {
-                    used.push(id);
-                    output.push(event.clone());
+                    used.push(id.clone());
+                    output.push(RenderedEvent::plain(event.clone()));
                 }
                 Some(InlineTemplate::Paired { .. }) => {
                     return Err(BookforgeError::InvalidInput(format!(
@@ -730,9 +946,11 @@ fn push_marked_fragment(
     Ok(())
 }
 
-fn push_text_event(text: &str, output: &mut Vec<Event<'static>>) {
+fn push_text_event(text: &str, output: &mut Vec<RenderedEvent>) {
     if !text.is_empty() {
-        output.push(Event::Text(BytesText::new(text).into_owned()));
+        output.push(RenderedEvent::plain(Event::Text(
+            BytesText::new(text).into_owned(),
+        )));
     }
 }
 
@@ -937,6 +1155,113 @@ mod tests {
         assert!(
             !outcome.xhtml.contains("world"),
             "original inline text should be replaced, got: {}",
+            outcome.xhtml,
+        );
+        validate_xml(&outcome.xhtml).expect("marked output should re-parse");
+    }
+
+    #[test]
+    fn restores_space_between_adjacent_span_markers() {
+        let xhtml = "<root><p><span>a</span> <span>b</span></p></root>";
+        let block = block(
+            "b_000000",
+            DomPath(vec![0, 0]),
+            vec![
+                InlineMark {
+                    id: "m1".to_string(),
+                    kind: "span".to_string(),
+                },
+                InlineMark {
+                    id: "m2".to_string(),
+                    kind: "span".to_string(),
+                },
+            ],
+        );
+        let outcome = patch_xhtml_blocks(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "<m1>verso</m1><m2>Thanatos</m2>",
+            }],
+        )
+        .expect("patch should succeed");
+
+        assert_eq!(outcome.skipped_blocks, 0);
+        assert!(
+            outcome
+                .xhtml
+                .contains("<span>verso</span> <span>Thanatos</span>"),
+            "writer should restore the source inter-span space, got: {}",
+            outcome.xhtml,
+        );
+        validate_xml(&outcome.xhtml).expect("marked output should re-parse");
+    }
+
+    #[test]
+    fn restores_space_between_adjacent_italic_markers() {
+        let xhtml = "<root><p><i>a</i> <i>b</i></p></root>";
+        let block = block(
+            "b_000000",
+            DomPath(vec![0, 0]),
+            vec![
+                InlineMark {
+                    id: "m1".to_string(),
+                    kind: "i".to_string(),
+                },
+                InlineMark {
+                    id: "m2".to_string(),
+                    kind: "i".to_string(),
+                },
+            ],
+        );
+        let outcome = patch_xhtml_blocks(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "<m1>a</m1><m2>b</m2>",
+            }],
+        )
+        .expect("patch should succeed");
+
+        assert_eq!(outcome.skipped_blocks, 0);
+        assert!(
+            outcome.xhtml.contains("<i>a</i> <i>b</i>"),
+            "writer should restore the source inter-italic space, got: {}",
+            outcome.xhtml,
+        );
+        validate_xml(&outcome.xhtml).expect("marked output should re-parse");
+    }
+
+    #[test]
+    fn restores_space_for_nbsp_only_inline_boundary() {
+        let xhtml = "<root><p><span>a</span>&nbsp;<span>b</span></p></root>";
+        let block = block(
+            "b_000000",
+            DomPath(vec![0, 0]),
+            vec![
+                InlineMark {
+                    id: "m1".to_string(),
+                    kind: "span".to_string(),
+                },
+                InlineMark {
+                    id: "m2".to_string(),
+                    kind: "span".to_string(),
+                },
+            ],
+        );
+        let outcome = patch_xhtml_blocks(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "<m1>a</m1><m2>b</m2>",
+            }],
+        )
+        .expect("patch should succeed");
+
+        assert_eq!(outcome.skipped_blocks, 0);
+        assert!(
+            outcome.xhtml.contains("<span>a</span> <span>b</span>"),
+            "writer should restore the source non-breaking inter-span boundary, got: {}",
             outcome.xhtml,
         );
         validate_xml(&outcome.xhtml).expect("marked output should re-parse");

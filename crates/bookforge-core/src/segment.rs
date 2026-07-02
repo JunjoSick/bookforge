@@ -17,7 +17,9 @@ pub const SEGMENT_SCHEMA_VERSION: u32 = 1;
 /// and marker assignments differ from v1 on affected books.
 /// v3: short per-block inline marker tags (`<m1>...</m1>`, `<r1/>`)
 /// replace verbose global ids (`<m id="m000000_000">...</m>`).
-pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 3;
+/// v4: whitespace-only text nodes between adjacent inline elements stay
+/// between marker tokens instead of moving inside the preceding marker.
+pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 4;
 
 /// Compute a cache namespace that scopes lookups to a single set of
 /// schema and segmentation parameters. Cached rows from a different
@@ -29,6 +31,7 @@ pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 3;
 /// rendered prompt actually changes. The two slots use distinct domain
 /// separators so a style fingerprint can never collide with an entity
 /// fingerprint of the same content.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_cache_namespace(
     max_segment_tokens: usize,
     context_tokens: usize,
@@ -80,6 +83,7 @@ pub fn compute_cache_namespace_v1(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_cache_namespace_inner(
     cache_key_schema_version: u32,
     max_segment_tokens: usize,
