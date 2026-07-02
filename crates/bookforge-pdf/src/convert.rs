@@ -57,6 +57,7 @@ fn convert_pdf_with_tools(
     let reconstruction = reconstruct(&pages, options.columns);
     let baseline = tools.pdf_to_text(input)?;
     let baseline_chars = baseline.chars().filter(|ch| !ch.is_whitespace()).count();
+    let baseline_page_chars = baseline_page_char_counts(&baseline, reconstruction.pages.len());
     let reconstructed_chars: usize = reconstruction.blocks.iter().map(DocBlock::char_count).sum();
 
     let title = if options.title.is_empty() {
@@ -69,10 +70,15 @@ fn convert_pdf_with_tools(
     };
     write_epub(&reconstruction.blocks, &title, &options.language, output)?;
 
+    let mut page_stats = reconstruction.pages;
+    for (stats, chars) in page_stats.iter_mut().zip(baseline_page_chars) {
+        stats.baseline_chars = chars;
+    }
+
     let report = ConversionReport::build(
         &input.to_string_lossy(),
         &output.to_string_lossy(),
-        reconstruction.pages,
+        page_stats,
         reconstruction.blocks.len(),
         reconstructed_chars,
         baseline_chars,
@@ -82,6 +88,18 @@ fn convert_pdf_with_tools(
         output: output.to_path_buf(),
         report,
     })
+}
+
+fn baseline_page_char_counts(text: &str, pages: usize) -> Vec<usize> {
+    let mut counts = text
+        .split('\x0c')
+        .map(|page| page.chars().filter(|ch| !ch.is_whitespace()).count())
+        .collect::<Vec<_>>();
+    while counts.last() == Some(&0) && counts.len() > pages {
+        counts.pop();
+    }
+    counts.resize(pages, 0);
+    counts
 }
 
 #[cfg(test)]

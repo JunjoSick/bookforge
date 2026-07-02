@@ -24,6 +24,7 @@ bookforge-store = { version = "1.8.5", path = "../bookforge-store" }
 clap.workspace = true
 console.workspace = true
 futures-core = { version = "0.3", optional = true }
+getrandom.workspace = true
 indicatif.workspace = true
 ratatui = { version = "0.30.2", optional = true, default-features = false, features = ["crossterm"] }
 reqwest.workspace = true
@@ -56,4 +57,5 @@ serve = [
 assert_cmd = "2"
 quick-xml.workspace = true
 tempfile = "3"
+tower = "0.5"
 zip.workspace = true

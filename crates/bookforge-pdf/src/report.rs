@@ -46,10 +46,10 @@ impl ConversionReport {
             ));
         }
         for page in &page_stats {
-            if page.chars == 0 {
+            if page.chars == 0 && page.baseline_chars > 0 {
                 warnings.push(format!(
-                    "page {}: no text reconstructed (image-only page, or extraction failure)",
-                    page.page
+                    "page {}: no text reconstructed, but pdftotext found {} baseline characters",
+                    page.page, page.baseline_chars
                 ));
             }
         }
@@ -105,5 +105,49 @@ mod tests {
                 .contains("101 reconstructed / 100 baseline characters")
         );
         assert!(!report.summary().contains("101 of 100"));
+    }
+
+    #[test]
+    fn blank_pages_without_baseline_text_do_not_warn() {
+        let report = ConversionReport::build(
+            "in.pdf",
+            "out.epub",
+            vec![PageStats {
+                page: 2,
+                lines: 0,
+                chars: 0,
+                baseline_chars: 0,
+                two_column: false,
+            }],
+            0,
+            0,
+            0,
+        );
+
+        assert!(report.warnings.is_empty());
+        assert!(report.summary().contains("Warnings: none"));
+    }
+
+    #[test]
+    fn pages_with_baseline_text_but_no_reconstruction_warn() {
+        let report = ConversionReport::build(
+            "in.pdf",
+            "out.epub",
+            vec![PageStats {
+                page: 7,
+                lines: 0,
+                chars: 0,
+                baseline_chars: 42,
+                two_column: false,
+            }],
+            0,
+            0,
+            42,
+        );
+
+        assert_eq!(report.warnings.len(), 2);
+        assert!(
+            report.warnings[1].contains("page 7: no text reconstructed, but pdftotext found 42")
+        );
     }
 }

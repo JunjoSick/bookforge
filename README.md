@@ -263,8 +263,15 @@ cargo run -p bookforge-cli -- watch <job-id>
 
 # Local web dashboard for non-developers — start a translation (upload an EPUB),
 # watch the job list and live progress over SSE, and retry from a button. Binds
-# 127.0.0.1 only; the book text is private. Provider API keys are read from the
-# serve process's environment, so the browser never handles secrets.
+# 127.0.0.1 only; pasted provider keys are held only in server memory and passed
+# to child runs through the provider's normal environment variable.
+bookforge serve --open
+
+# From a source checkout, this helper uses an installed/local binary when one is
+# available and falls back to Cargo for developers.
+./scripts/launch-dashboard.sh
+
+# Equivalent direct command from a checkout:
 cargo run -p bookforge-cli -- serve --open
 ```
 

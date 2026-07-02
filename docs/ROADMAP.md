@@ -103,7 +103,7 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v1.6 | PDF ingestion hardening (§9) | 8–14 days | release notes; maybe a short writeup if layout reconstruction turns out interesting | **next** |
 | v1.7 | Bilingual output (§9b) | 5–8 days | passive (release notes only) | planned |
 | v1.8 | Structural credibility (EPUBCheck + corpus; was the planned v1.5 scope, §8) | 10–14 days | README final rewrite citing corpus | **shipped 2026-06-20** |
-| v2 | Open-ended | not committed | recompute from v1.4/v1.6/v1.7/v1.8 feedback | planned |
+| v2 | Monitoring UI (`RunState`, `watch`, `--ui tui`, local `serve`) | shipped scope | release notes | in PR #21 |
 
 Priority note (2026-06): the owner needs PDF translation more than
 bilingual output — scientific papers (figures/tables must survive) and
@@ -2261,8 +2261,8 @@ So this section is a **sketch**, not a commitment. Re-evaluate after v1.8 ships.
 - **`bookforge-engine` library extraction** — a stable, semver'd public
   API for embedding the engine in other Rust applications. The C ABI
   shim is even later.
-- **`bookforge serve`** — HTTP/JSON-RPC engine surface. Same operations
-  as the CLI, exposed as endpoints. Enables future GUIs.
+- **Broader engine API surface** — HTTP/JSON-RPC beyond the local dashboard,
+  with an auth model suitable for non-local clients.
 - **Native Anthropic and Gemini providers.** Only if quality measurements
   prove the OpenRouter detour is hurting.
 - **Streaming translation output** for live token meters during long jobs.
@@ -2271,14 +2271,29 @@ So this section is a **sketch**, not a commitment. Re-evaluate after v1.8 ships.
   it is now mainline ingestion, spec'd as v1.6 in §9 (decision 2026-06).
 - **Glossary auto-extraction (v1.2.x)** — already mentioned, file here as
   a reminder if it didn't ship as a point release.
+- **Proper Pause + Stop for in-flight translations.** The v2 web redesign
+  (`bookforge serve`, `BookForge App` UI) exposes Library/Wizard/Progress/
+  Review/Validation/Glossary at CLI parity, but the Progress screen is
+  **monitor-only** because the engine has no live control surface:
+  - *Stop* — runs are spawned **detached** (`serve` drops the child handle) and
+    CLI runs aren't `serve`'s children at all, so there is no PID to signal.
+    Needs `serve` to track child handles (and/or a store-recorded PID) so a Stop
+    can terminate the run; the existing per-chapter checkpoints already make the
+    stopped job resumable via `bookforge resume`.
+  - *Pause* — there is **no cooperative pause primitive** in `bookforge-core`'s
+    run loop. Needs a real pause/resume signal (cooperative checkpoint-and-halt
+    at a segment boundary) plumbed through the engine, then surfaced as
+    `POST /api/jobs/{id}/pause|resume|cancel` and wired into the Progress screen's
+    Pause/Stop/Resume controls. Until then the UI omits these controls rather
+    than faking them.
 
 ### 10.2 Explicit non-goals (still)
 
 - LLM-driven DOM repair. Architectural invariant violation.
 - Dual-LLM "fill" pattern. Architectural smell.
 - RocksDB/Sled migration. Premature optimization.
-- ratatui dashboard. Wrong layer; the engine emits JSONL, others can build dashboards.
-- GUI. Engine + JSON-RPC; UIs are separate projects.
+- General-purpose GUI/Tauri/Electron application. The shipped local web
+  dashboard is intentionally a localhost operator UI, not a hosted app.
 - Multi-agent debate QA. Poor cost/quality profile for translation.
 - Hosted SaaS demo. Wrong scope.
 - Manga / comic book translation. Different engine entirely.
@@ -2354,17 +2369,9 @@ not reused; they can be GC'd via a future `bookforge gc` command.
 
 ### 11.4 Event schema stability
 
-The JSONL event format is documented in `docs/events.md`:
-
-```jsonl
-{"type":"job.started","job_id":"...","timestamp":"...","schema_version":1, ...}
-{"type":"segment.queued","job_id":"...","segment_id":"...","timestamp":"...", ...}
-{"type":"segment.completed","job_id":"...","segment_id":"...","timestamp":"...","tokens":{...}, ...}
-{"type":"segment.failed","job_id":"...","segment_id":"...","timestamp":"...","error":"...","retryable":true, ...}
-{"type":"segment.needs_review","job_id":"...","segment_id":"...","timestamp":"...","reason":"...", ...}
-{"type":"job.completed","job_id":"...","timestamp":"...","totals":{...}, ...}
-{"type":"job.failed","job_id":"...","timestamp":"...","error":"...", ...}
-```
+The JSONL event format is documented in `docs/events.md`. Events serialize as
+externally tagged `ProgressEvent` variants such as `JobCreated`,
+`RequestFinished`, `SegmentFinished`, and `TranslationFinished`.
 
 Within v1.x, event types are not removed. New event types are additive.
 New fields on existing events are additive and optional.
@@ -2423,8 +2430,7 @@ considered and rejected.
 | LLM-driven DOM repair | Violates §1.1 architectural invariant |
 | Dual-LLM "fill" pattern | Architectural smell; deterministic fill is better |
 | RocksDB / Sled storage backend | Premature optimization; SQLite handles this load trivially |
-| ratatui dashboard | Wrong layer; engine emits JSONL, others build dashboards |
-| GUI / Tauri / Electron | Wrong scope; engine + JSON-RPC, UIs are separate |
+| General-purpose GUI / Tauri / Electron | Wrong scope; the shipped web dashboard is a local operator UI |
 | Multi-agent debate QA | Poor cost/quality profile for translation |
 | Hosted demo / SaaS | Wrong scope for one-maintainer project |
 | Native Anthropic/Gemini providers (pre-v2) | OpenRouter routes to both; prove necessity first |

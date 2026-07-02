@@ -14,11 +14,13 @@
 >   `POST /api/jobs/{id}/retry` — exactly as designed.
 > - `POST /api/translate` (multipart) — **launch-from-browser**, brought forward
 >   into v2.0. A "New translation" form uploads an EPUB + target/provider/profile
->   and spawns a detached `bookforge translate` subprocess. The child inherits the
->   serve process's environment, so **API keys come from the same env vars the CLI
->   uses — the browser never handles secrets**, which resolves the deferral's main
->   concern. The new job is matched back to the dashboard by its unique input path
->   and auto-selected. Bound to localhost; upload body cap 64 MB.
+>   and spawns a detached `bookforge translate` subprocess. API keys can come from
+>   the serve process environment or be pasted once into the local form; pasted
+>   keys are held only in server memory for the session and passed to child runs
+>   through the provider's normal env var (`DEEPSEEK_API_KEY`,
+>   `OPENROUTER_API_KEY`, or `OPENAI_API_KEY`), never on the command line. The
+>   new job is matched back to the dashboard by its unique input path and
+>   auto-selected. Bound to localhost; upload body cap 64 MB.
 > - `serve` is a **default-on** cargo feature (the plan floated opt-in first);
 >   flipped to default-on so release binaries are dogfoodable out of the box.
 > - The `pump_file` tailer + path resolution were extracted to
@@ -28,9 +30,51 @@
 >   persisted log carries the segment total — without it both `watch` and
 >   `serve` showed a 0% progress bar.
 >
-> Still deferred: in-browser provider/secret *configuration* and any
-> authentication — launching uses whatever env the operator started `serve` with,
-> and the bind stays localhost-only. Original plan (written 2026-06-29) follows.
+> Still deferred: persistent provider/secret configuration and user
+> authentication. Launching uses environment keys or session-memory pasted keys,
+> mutating requests require a per-server dashboard token, and the bind stays
+> localhost-only. The archived original plan (written 2026-06-29) follows.
+
+## Update (2026-07): full redesign to CLI parity ("BookForge App" UI)
+
+The single-page monitoring dashboard was replaced by a multi-screen, warm
+"paper"-themed SPA (light/dark, Spectral + IBM Plex) ported from the Claude
+Design project *Book Forge UI Design* (`BookForge App.dc.html`). It is still one
+inline `DASHBOARD_HTML` const in `serve.rs` (no build step) and keeps every
+security contract: loopback-only bind, per-server CSRF token on all mutations,
+HTML-escaping of dynamic text, and in-memory-only API keys.
+
+The goal was **web UI at CLI parity** — every screen backs onto a command that
+already existed, newly exposed over HTTP:
+
+- **Library** ← `GET /api/jobs` (job cards, filename-derived titles, progress).
+- **Wizard** (Book → Languages → Quality tier → Review + Advanced) ←
+  `GET /api/options`/`/api/providers`, **`POST /api/estimate`** (new; shares
+  `estimate::estimate_epub` with the CLI `estimate` command for a live token/cost
+  preview), then `POST /api/translate`. The launch now also forwards the wizard's
+  Advanced fields — `--concurrency`, `--qa`, `--context-window`, `--validate-output`
+  — each validated before reaching the child argv.
+- **Progress** ← `GET /api/jobs/{id}` + SSE. Monitor-only (see below).
+- **Review** ← **`GET /api/jobs/{id}/review`** (new; shares
+  `review::generate_review_document` with the CLI `review` command): side-by-side
+  source/target, soft-warning badges, client-side flags in `localStorage`.
+- **Validation** ← **`POST /api/jobs/{id}/validate`** (new; shares
+  `validate::validate_path`): BookForge structural validators + EPUBCheck on the
+  job's output EPUB. EPUBCheck may report `unavailable` — surfaced, not an error.
+- **Glossary** ← **`GET/POST/DELETE /api/glossary`** (new; wraps the `JobStore`
+  glossary methods): list/add/remove terms by language pair and scope (default
+  global).
+
+**Deferred to the roadmap (§10.1):** the Progress screen's **Pause/Stop**. Runs
+are spawned detached and the engine has no cooperative pause primitive, so the
+controls are omitted rather than faked; checkpoints already make a run resumable
+via `bookforge resume`.
+
+## Archived Original Plan
+
+The remainder of this file is the original planning note. It is intentionally
+kept for design history, but status statements below may describe work that has
+since shipped.
 
 ## Context / why
 
@@ -131,7 +175,9 @@ browser (`xdg-open`/`open`, or the `webbrowser` crate).
 - Server folds and pushes `RunState` snapshots (vs. shipping raw events for the
   client to fold) — simplest; bandwidth is fine at book-translation event rates.
 - `serve` feature opt-in first; consider default-on for the release.
-- Launch-from-browser deferred behind auth/upload/secrets considerations.
+- Original note deferred launch-from-browser behind auth/upload/secrets
+  considerations; the built version ships it with localhost-only bind,
+  per-server mutation token, and session-memory keys.
 
 ## Files to add / modify
 

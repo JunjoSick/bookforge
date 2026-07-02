@@ -7,7 +7,7 @@
 //! heuristics get wrong shows up in the conversion report as a per-page
 //! coverage gap, never as silently dropped text.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::model::{ColumnMode, DocBlock, Fragment, Line, Page, Span};
 
@@ -17,6 +17,7 @@ pub struct PageStats {
     pub page: u32,
     pub lines: usize,
     pub chars: usize,
+    pub baseline_chars: usize,
     pub two_column: bool,
 }
 
@@ -28,6 +29,7 @@ pub struct Reconstruction {
 pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
     let body_size = body_font_size(pages);
     let heading_levels = heading_levels(pages, body_size);
+    let running_margin_texts = running_margin_texts(pages, body_size);
 
     let mut blocks: Vec<DocBlock> = Vec::new();
     let mut stats = Vec::new();
@@ -39,18 +41,21 @@ pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
             ColumnMode::Two => true,
             ColumnMode::Auto => detect_two_columns(page, &lines),
         };
-        let ordered = if two_column {
+        let mut ordered = if two_column {
             order_two_column(page, &lines)
         } else {
             let mut ordered = lines.clone();
             ordered.sort_by_key(|line| (line.top, line.left));
             ordered
         };
+        ordered
+            .retain(|line| !is_running_margin_line(page, line, body_size, &running_margin_texts));
 
         stats.push(PageStats {
             page: page.number,
             lines: ordered.len(),
             chars: ordered.iter().map(Line::char_count).sum(),
+            baseline_chars: 0,
             two_column,
         });
 
@@ -62,6 +67,65 @@ pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
         blocks,
         pages: stats,
     }
+}
+
+fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut heading_like = HashSet::new();
+    for page in pages {
+        let mut seen_on_page = HashSet::new();
+        for line in merge_fragments_into_lines(page) {
+            let normalized = normalize_running_text(&line.text());
+            if normalized.len() >= 4
+                && normalized.chars().any(|ch| ch.is_alphabetic())
+                && is_heading_like_line(&line, body_size)
+            {
+                heading_like.insert(normalized.clone());
+            }
+            if line.font_size > body_size + 1 || !near_vertical_margin(page, &line) {
+                continue;
+            }
+            if normalized.len() >= 4 && normalized.chars().any(|ch| ch.is_alphabetic()) {
+                seen_on_page.insert(normalized);
+            }
+        }
+        for text in seen_on_page {
+            *counts.entry(text).or_default() += 1;
+        }
+    }
+    let mut running = counts
+        .into_iter()
+        .filter_map(|(text, count)| (count >= 2).then_some(text))
+        .collect::<HashSet<_>>();
+    running.extend(heading_like);
+    running
+}
+
+fn is_running_margin_line(
+    page: &Page,
+    line: &Line,
+    body_size: u32,
+    running_margin_texts: &HashSet<String>,
+) -> bool {
+    line.font_size <= body_size + 1
+        && near_vertical_margin(page, line)
+        && running_margin_texts.contains(&normalize_running_text(&line.text()))
+}
+
+fn near_vertical_margin(page: &Page, line: &Line) -> bool {
+    let margin = (page.height / 8).max(line.height * 3);
+    line.top <= margin || line.top + line.height >= page.height - margin
+}
+
+fn normalize_running_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn is_heading_like_line(line: &Line, body_size: u32) -> bool {
+    line.font_size > body_size + 1 || line.spans.iter().any(|span| span.bold)
 }
 
 /// Group fragments that share a baseline into one visual line, joining
@@ -564,6 +628,51 @@ mod tests {
         assert_eq!(
             texts,
             vec!["This sentence does not end until the following page.".to_string()]
+        );
+    }
+
+    #[test]
+    fn repeated_running_headers_are_removed_before_paragraph_clustering() {
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<fontspec id="1" size="24" family="T"/>
+<text top="60" left="80" width="180" height="12" font="0">THIS SOVIET WORLD</text>
+<text top="88" left="120" width="360" height="26" font="1">THIS SOVIET WORLD</text>
+<text top="150" left="80" width="440" height="12" font="0">First page prose starts here</text>
+</page>
+<page number="2" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<fontspec id="1" size="24" family="T"/>
+<text top="60" left="80" width="180" height="12" font="0">THIS SOVIET WORLD</text>
+<text top="120" left="80" width="440" height="12" font="0">second page body continues.</text>
+</page>
+<page number="3" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<fontspec id="1" size="24" family="T"/>
+<text top="60" left="80" width="180" height="12" font="0">THIS SOVIET WORLD</text>
+<text top="120" left="80" width="440" height="12" font="0">Third page body starts here.</text>
+</page>
+</pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        let texts: Vec<String> = result.blocks.iter().map(DocBlock::text).collect();
+
+        assert_eq!(texts[0], "THIS SOVIET WORLD");
+        assert_eq!(
+            texts[1],
+            "First page prose starts here second page body continues."
+        );
+        assert_eq!(texts[2], "Third page body starts here.");
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| text.as_str() == "THIS SOVIET WORLD")
+                .count(),
+            1,
+            "only the real title should remain: {texts:?}"
         );
     }
 }

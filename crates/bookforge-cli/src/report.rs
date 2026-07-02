@@ -305,26 +305,74 @@ fn urls(text: &str) -> Vec<String> {
 }
 
 fn numbers(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .filter_map(|token| {
-            let value = token.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
-                )
-            });
-            let digits = value.chars().filter(|ch| ch.is_ascii_digit()).count();
-            (digits >= 2
-                && value.chars().all(|ch| {
-                    ch.is_ascii_digit()
-                        || matches!(
-                            ch,
-                            '.' | ',' | ':' | '/' | '-' | '+' | '%' | '$' | '−' | '–' | '—'
-                        )
-                }))
-            .then(|| value.to_string())
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if !is_number_start(&chars, index) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while index < chars.len() && is_number_body(chars[index]) {
+            index += 1;
+        }
+        let value = trim_number_token(&chars[start..index]);
+        let digits = value.chars().filter(|ch| ch.is_ascii_digit()).count();
+        if digits >= 2 {
+            out.push(value);
+        }
+    }
+    out
+}
+
+fn is_number_start(chars: &[char], index: usize) -> bool {
+    chars[index].is_ascii_digit()
+        || (matches!(chars[index], '$' | '+' | '-' | '−' | '–' | '—')
+            && chars
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_digit()))
+}
+
+fn is_number_body(ch: char) -> bool {
+    ch.is_ascii_digit()
+        || matches!(
+            ch,
+            '.' | ',' | ':' | '/' | '-' | '+' | '%' | '$' | '−' | '–' | '—'
+        )
+}
+
+fn trim_number_token(chars: &[char]) -> String {
+    chars
+        .iter()
+        .collect::<String>()
+        .trim()
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | ';'
+                    | ':'
+                    | '.'
+                    | '!'
+                    | '?'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '"'
+                    | '\''
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+                    | '«'
+                    | '»'
+            )
         })
-        .collect()
+        .to_string()
 }
 
 fn missing_tokens_message(label: &str, source: &[String], translated: &[String]) -> Option<String> {
@@ -597,9 +645,33 @@ mod tests {
     }
 
     #[test]
+    fn missing_number_message_accepts_localized_thousands_separators() {
+        let source = numbers("including 400,000 members and 112,000 co-judges");
+        let translated = numbers("compresi 400.000 membri e 112.000 co-giudici");
+
+        assert!(missing_tokens_message("number", &source, &translated).is_none());
+    }
+
+    #[test]
+    fn missing_number_message_finds_numbers_attached_to_quotes_or_elisions() {
+        let source = numbers("from $50,000 to 80.3 percent");
+        let translated = numbers("da «$50,000» all'80,3 per cento");
+
+        assert!(missing_tokens_message("number", &source, &translated).is_none());
+    }
+
+    #[test]
     fn missing_number_message_accepts_citation_spacing() {
         let source = numbers("Skou (1957,1989) isolated an ATPase");
         let translated = numbers("Skou (1957, 1989) isolò una ATPasi");
+
+        assert!(missing_tokens_message("number", &source, &translated).is_none());
+    }
+
+    #[test]
+    fn missing_number_message_accepts_localized_date_without_english_comma() {
+        let source = numbers("official act on November 8, 1917");
+        let translated = numbers("atto ufficiale l'8 novembre 1917");
 
         assert!(missing_tokens_message("number", &source, &translated).is_none());
     }

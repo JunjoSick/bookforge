@@ -199,16 +199,18 @@ async fn drive_attached_tui(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     app.draw()?;
 
-    let mut channel_open = true;
     loop {
         tokio::select! {
-            maybe_event = rx.recv(), if channel_open => {
+            maybe_event = rx.recv() => {
                 match maybe_event {
                     Some(event) => {
                         file_writer.write_event(&event)?;
                         app.fold(&event);
                     }
-                    None => channel_open = false,
+                    None => {
+                        app.draw()?;
+                        break;
+                    }
                 }
             }
             _ = tick.tick() => {

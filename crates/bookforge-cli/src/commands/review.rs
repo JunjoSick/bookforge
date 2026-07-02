@@ -29,7 +29,7 @@ pub struct ReviewArgs {
 }
 
 #[derive(Debug, Serialize)]
-struct ReviewDocument {
+pub(crate) struct ReviewDocument {
     schema_version: u32,
     job_id: String,
     source_language: Option<String>,
@@ -45,7 +45,7 @@ struct ReviewDocument {
 }
 
 #[derive(Debug, Serialize)]
-struct ReviewTotals {
+pub(crate) struct ReviewTotals {
     segments: usize,
     tokens_input: u64,
     tokens_input_cached: u64,
@@ -54,7 +54,7 @@ struct ReviewTotals {
 }
 
 #[derive(Debug, Serialize)]
-struct ReviewSegment {
+pub(crate) struct ReviewSegment {
     segment_id: String,
     chapter_id: String,
     chapter_title: Option<String>,
@@ -67,7 +67,7 @@ struct ReviewSegment {
 }
 
 #[derive(Debug, Serialize)]
-struct ReviewWarning {
+pub(crate) struct ReviewWarning {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     term_id: Option<i64>,
@@ -90,22 +90,24 @@ struct ReviewWarning {
 }
 
 #[derive(Debug, Serialize)]
-struct ReviewTokens {
+pub(crate) struct ReviewTokens {
     input: u64,
     input_cached: u64,
     output: u64,
     estimated: bool,
 }
 
-pub async fn run(args: ReviewArgs) -> Result<()> {
-    let store = JobStore::open_default()?;
-    let Some(job) = store.get_job(&args.job_id)? else {
-        anyhow::bail!("job '{}' was not found", args.job_id);
+/// Load a job's translation state from the store and fold it into a
+/// [`ReviewDocument`]. Shared by the CLI `review` command (which then renders
+/// HTML/JSON to disk) and the web dashboard's `GET /api/jobs/{id}/review`.
+pub(crate) fn generate_review_document(store: &JobStore, job_id: &str) -> Result<ReviewDocument> {
+    let Some(job) = store.get_job(job_id)? else {
+        anyhow::bail!("job '{}' was not found", job_id);
     };
-    let Some(snapshot) = store.load_job_config_snapshot(&args.job_id)? else {
+    let Some(snapshot) = store.load_job_config_snapshot(job_id)? else {
         anyhow::bail!(
             "job '{}' does not have a run configuration snapshot; review cannot be regenerated",
-            args.job_id
+            job_id
         );
     };
 
@@ -129,7 +131,7 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
         snapshot.glossary_terms.clone()
     };
 
-    let document = build_review_document(
+    Ok(build_review_document(
         &job,
         &snapshot,
         &book,
@@ -138,11 +140,16 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
         &translations,
         &summary,
         &glossary_terms,
-    );
+    ))
+}
+
+pub async fn run(args: ReviewArgs) -> Result<()> {
+    let store = JobStore::open_default()?;
+    let document = generate_review_document(&store, &args.job_id)?;
 
     let out_dir = args.out.unwrap_or_else(|| {
         PathBuf::from(".bookforge/runs")
-            .join(&job.id)
+            .join(&document.job_id)
             .join("review")
     });
     fs::create_dir_all(&out_dir)?;
@@ -408,7 +415,7 @@ fn warning_message(kind: &str, message: &str) -> ReviewWarning {
 fn missing_tokens(kind: &str, source: &[String], target: &[String]) -> Vec<ReviewWarning> {
     source
         .iter()
-        .filter(|token| !target.contains(token))
+        .filter(|token| !token_present(token, target))
         .map(|token| ReviewWarning {
             kind: kind.to_string(),
             term_id: None,
@@ -440,23 +447,197 @@ fn urls(text: &str) -> Vec<String> {
 }
 
 fn numbers(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .filter_map(|token| {
-            let value = token.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
-                )
-            });
-            let digits = value.chars().filter(|ch| ch.is_ascii_digit()).count();
-            (digits >= 2
-                && value.chars().all(|ch| {
-                    ch.is_ascii_digit()
-                        || matches!(ch, '.' | ',' | ':' | '/' | '-' | '+' | '%' | '$')
-                }))
-            .then(|| value.to_string())
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if !is_number_start(&chars, index) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while index < chars.len() && is_number_body(chars[index]) {
+            index += 1;
+        }
+        let value = trim_number_token(&chars[start..index]);
+        let digits = value.chars().filter(|ch| ch.is_ascii_digit()).count();
+        if digits >= 2 {
+            out.push(value);
+        }
+    }
+    out
+}
+
+fn token_present(token: &str, target: &[String]) -> bool {
+    dangling_numeric_span(token)
+        || target.iter().any(|candidate| candidate == token)
+        || compact_numeric_punctuation_span(token)
+            .is_some_and(|expected| compact_ascii_whitespace(&target.join("")).contains(&expected))
+        || digits_only_numeric_punctuation_span(token)
+            .is_some_and(|expected| digits_only(&target.join("")).contains(&expected))
+        || canonical_decimal_number(token).is_some_and(|expected| {
+            target
+                .iter()
+                .any(|candidate| canonical_decimal_number(candidate).as_deref() == Some(&expected))
         })
+}
+
+fn is_number_start(chars: &[char], index: usize) -> bool {
+    chars[index].is_ascii_digit()
+        || (matches!(chars[index], '$' | '+' | '-' | '−' | '–' | '—')
+            && chars
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_digit()))
+}
+
+fn is_number_body(ch: char) -> bool {
+    ch.is_ascii_digit()
+        || matches!(
+            ch,
+            '.' | ',' | ':' | '/' | '-' | '+' | '%' | '$' | '−' | '–' | '—'
+        )
+}
+
+fn trim_number_token(chars: &[char]) -> String {
+    chars
+        .iter()
+        .collect::<String>()
+        .trim()
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | ';'
+                    | ':'
+                    | '.'
+                    | '!'
+                    | '?'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '"'
+                    | '\''
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+                    | '«'
+                    | '»'
+            )
+        })
+        .to_string()
+}
+
+fn dangling_numeric_span(value: &str) -> bool {
+    let normalized = normalize_number_signs(value);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    });
+    trimmed.ends_with('-') && trimmed.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn digits_only_numeric_punctuation_span(value: &str) -> Option<String> {
+    compact_numeric_punctuation_span(value).map(|compact| digits_only(&compact))
+}
+
+fn digits_only(value: &str) -> String {
+    value.chars().filter(|ch| ch.is_ascii_digit()).collect()
+}
+
+fn compact_numeric_punctuation_span(value: &str) -> Option<String> {
+    let normalized = normalize_number_signs(value);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    });
+    let digits = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
+    if digits < 2 {
+        return None;
+    }
+    if !trimmed.chars().all(|ch| {
+        ch.is_ascii_digit()
+            || ch.is_ascii_whitespace()
+            || matches!(
+                ch,
+                '.' | ',' | ';' | ':' | '/' | '-' | '+' | '%' | '$' | '(' | ')'
+            )
+    }) {
+        return None;
+    }
+    Some(compact_ascii_whitespace(trimmed))
+}
+
+fn compact_ascii_whitespace(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
         .collect()
+}
+
+fn canonical_decimal_number(value: &str) -> Option<String> {
+    let normalized = normalize_number_signs(value);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
+        )
+    });
+    if trimmed.is_empty() || !trimmed.chars().any(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let percent = trimmed.ends_with('%');
+    let numeric = trimmed.strip_suffix('%').unwrap_or(trimmed);
+    if !numeric
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+'))
+    {
+        return None;
+    }
+    if numeric.matches('.').count() + numeric.matches(',').count() > 1 {
+        return None;
+    }
+    let separator = numeric.find('.').or_else(|| numeric.find(','));
+    let mut canonical = match separator {
+        Some(index) => {
+            let (whole, fractional_with_separator) = numeric.split_at(index);
+            let fractional = &fractional_with_separator[1..];
+            if whole.is_empty()
+                || fractional.is_empty()
+                || !whole
+                    .trim_start_matches(['-', '+'])
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit())
+                || !fractional.chars().all(|ch| ch.is_ascii_digit())
+            {
+                return None;
+            }
+            format!("{whole}.{fractional}")
+        }
+        None => numeric.to_string(),
+    };
+    if percent {
+        canonical.push('%');
+    }
+    Some(canonical)
+}
+
+fn normalize_number_signs(value: &str) -> String {
+    value.chars().map(normalize_number_sign).collect()
+}
+
+fn normalize_number_sign(ch: char) -> char {
+    match ch {
+        '−' | '–' | '—' => '-',
+        _ => ch,
+    }
 }
 
 fn looks_like_model_commentary(text: &str) -> bool {
@@ -994,5 +1175,36 @@ mod tests {
         assert_eq!(warnings[0].kind, "glossary_mismatch");
         assert_eq!(warnings[0].term_id, Some(42));
         assert_eq!(warnings[0].expected_target.as_deref(), Some("Aragorn"));
+    }
+
+    #[test]
+    fn number_warning_accepts_localized_decimal_and_thousands_formats() {
+        let source = numbers("from $50,000 to 80.3 percent and 400,000 members");
+        let target = numbers("da «$50,000» all'80,3 per cento e 400.000 membri");
+
+        let warnings = missing_tokens("number_changed", &source, &target);
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn number_warning_accepts_localized_date_order_without_english_comma() {
+        let source = numbers("official act on November 8, 1917");
+        let target = numbers("atto ufficiale l'8 novembre 1917");
+
+        let warnings = missing_tokens("number_changed", &source, &target);
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn number_warning_still_reports_truly_missing_numbers() {
+        let source = numbers("from $50,000 to 80.3 percent");
+        let target = numbers("da «$50,000» percento");
+
+        let warnings = missing_tokens("number_changed", &source, &target);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].from.as_deref(), Some("80.3"));
     }
 }

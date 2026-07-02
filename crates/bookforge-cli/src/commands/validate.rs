@@ -120,7 +120,7 @@ pub(crate) fn default_report_path(input: &Path) -> PathBuf {
     input.with_file_name(format!("{stem}.validation.json"))
 }
 
-fn validate_path(input: &Path, strict_epubcheck: bool) -> ValidationOutcome {
+pub(crate) fn validate_path(input: &Path, strict_epubcheck: bool) -> ValidationOutcome {
     let bookforge_validators = run_bookforge_validators(input);
     let epubcheck = run_epubcheck(input);
     let failed = validation_failed(
