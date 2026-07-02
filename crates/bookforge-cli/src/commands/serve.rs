@@ -18,16 +18,17 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
-    process::Command,
-    sync::{Arc, Mutex},
+    process::{Command, ExitStatus},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, Request, State},
+    http::{HeaderMap, StatusCode, header::HOST},
+    middleware::{self, Next},
     response::{
         Html, IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -49,6 +50,9 @@ const UPLOAD_DIR: &str = ".bookforge/serve-uploads";
 
 /// Cap on a multipart upload body (EPUBs in the regression corpus reach ~11 MB).
 const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Briefly check a detached translation child before reporting launch success.
+const CHILD_STARTUP_CHECK: Duration = Duration::from_millis(150);
 
 /// Cloud providers the dashboard form offers, paired with the env var their
 /// runs read a key from when one is configured in the operator's environment.
@@ -130,6 +134,7 @@ pub struct ServeArgs {
 struct AppState {
     refresh: Duration,
     csrf_token: String,
+    host_port: u16,
     /// Provider → API key, supplied via the dashboard. Held only in memory for
     /// the lifetime of the server: never written to disk, never logged, and
     /// only injected into spawned runs through the child's environment.
@@ -143,18 +148,18 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .with_context(|| format!("invalid --bind address '{}'", args.bind))?;
     require_loopback_bind(addr)?;
 
-    let state = AppState {
-        refresh: Duration::from_millis(args.refresh_ms.clamp(50, 5_000)),
-        csrf_token: generate_csrf_token()?,
-        keys: Arc::new(Mutex::new(HashMap::new())),
-    };
-
-    let app = dashboard_router(state);
-
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
     let local = listener.local_addr().unwrap_or(addr);
+    let state = AppState {
+        refresh: Duration::from_millis(args.refresh_ms.clamp(50, 5_000)),
+        csrf_token: generate_csrf_token()?,
+        host_port: local.port(),
+        keys: Arc::new(Mutex::new(HashMap::new())),
+    };
+
+    let app = dashboard_router(state);
     let url = format!("http://{local}/");
 
     println!("BookForge dashboard listening on {url}");
@@ -174,6 +179,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
 }
 
 fn dashboard_router(state: AppState) -> Router {
+    let host_state = state.clone();
     Router::new()
         .route("/", get(index))
         .route("/api/jobs", get(list_jobs))
@@ -189,7 +195,55 @@ fn dashboard_router(state: AppState) -> Router {
         .route("/api/glossary", get(list_glossary).post(add_glossary))
         .route("/api/glossary/{id}", delete(remove_glossary))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        .layer(middleware::from_fn_with_state(
+            host_state,
+            validate_dashboard_host,
+        ))
         .with_state(state)
+}
+
+async fn validate_dashboard_host(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if dashboard_host_allowed(request.headers(), state.host_port) {
+        return next.run(request).await;
+    }
+    forbidden("dashboard host header rejected")
+}
+
+fn dashboard_host_allowed(headers: &HeaderMap, port: u16) -> bool {
+    headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| dashboard_host_value_allowed(host, port))
+}
+
+fn dashboard_host_value_allowed(host: &str, port: u16) -> bool {
+    if host.is_empty()
+        || host
+            .bytes()
+            .any(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        return false;
+    }
+
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some((addr, suffix)) = rest.split_once(']') else {
+            return false;
+        };
+        return addr == "::1" && suffix == format!(":{port}");
+    }
+
+    let Some((name, host_port)) = host.rsplit_once(':') else {
+        return false;
+    };
+    if name.contains(':') || host_port != port.to_string() {
+        return false;
+    }
+
+    name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost")
 }
 
 fn require_loopback_bind(addr: SocketAddr) -> Result<()> {
@@ -421,14 +475,22 @@ async fn launch_translate(
     if !supported_provider(&provider) {
         return Ok(bad_request("unsupported provider"));
     }
-    if provider == "openai-compatible" {
-        if field_value(&fields, "base_url").is_none() {
+    let openai_base_url = if provider == "openai-compatible" {
+        let Some(base_url) = field_value(&fields, "base_url") else {
             return Ok(bad_request("base URL is required for openai-compatible"));
+        };
+        if !dashboard_base_url_uses_https(&base_url) {
+            return Ok(bad_request(
+                "base URL must use https:// for openai-compatible",
+            ));
         }
         if field_value(&fields, "model").is_none() {
             return Ok(bad_request("model is required for openai-compatible"));
         }
-    }
+        Some(base_url)
+    } else {
+        None
+    };
 
     // Resolve the API key: a freshly-supplied one is remembered for the session;
     // otherwise reuse one already remembered for this provider. A blank key falls
@@ -437,19 +499,10 @@ async fn launch_translate(
         .then(|| field_value(&fields, "api_key"))
         .flatten();
     let key = if let Some(supplied) = supplied_key {
-        state
-            .keys
-            .lock()
-            .expect("keys mutex poisoned")
-            .insert(provider.clone(), supplied.clone());
+        lock_keys(&state)?.insert(provider.clone(), supplied.clone());
         Some(supplied)
     } else {
-        state
-            .keys
-            .lock()
-            .expect("keys mutex poisoned")
-            .get(&provider)
-            .cloned()
+        lock_keys(&state)?.get(&provider).cloned()
     };
     if provider != "mock" && key.is_none() && !provider_env_has_key(&provider) {
         return Ok(bad_request("provider API key is required"));
@@ -512,9 +565,7 @@ async fn launch_translate(
     {
         command.arg("--validate-output");
     }
-    if provider == "openai-compatible"
-        && let Some(base_url) = field_value(&fields, "base_url")
-    {
+    if let Some(base_url) = openai_base_url {
         command.arg("--base-url").arg(base_url);
     }
     // Inject the key through the environment (never argv), pointing the run at a
@@ -528,18 +579,44 @@ async fn launch_translate(
         command.env(env, key);
     }
 
-    // Detached: the run outlives this request. Errors surface in the serve
-    // console (inherited stdio) and as failure status on the job itself.
-    command
+    // Detached: the run outlives this request. The short startup check catches
+    // immediate argv/binary failures before the dashboard reports success.
+    let mut child = command
         .spawn()
         .context("failed to spawn translation process")?;
+    let pid = child.id();
+    let completed_immediately = if let Some(status) =
+        child_exit_status_after(&mut child, CHILD_STARTUP_CHECK).await?
+    {
+        if !status.success() {
+            return Err(anyhow::anyhow!(
+                    "translation process exited immediately with {status}; check the serve console for details"
+                )
+                .into());
+        }
+        true
+    } else {
+        false
+    };
 
     Ok(Json(json!({
         "ok": true,
         "input_path": input_path.display().to_string(),
         "provider": provider,
+        "pid": pid,
+        "completed_immediately": completed_immediately,
     }))
     .into_response())
+}
+
+async fn child_exit_status_after(
+    child: &mut tokio::process::Child,
+    delay: Duration,
+) -> Result<Option<ExitStatus>> {
+    tokio::time::sleep(delay).await;
+    child
+        .try_wait()
+        .context("failed to check translation process status")
 }
 
 /// Estimate tokens and cost for an uploaded EPUB before the user commits to a
@@ -606,15 +683,17 @@ async fn estimate_translate(
 /// Report which providers already have a usable key — either remembered in this
 /// session or present in the server's environment — so the UI only prompts when
 /// a key is actually needed. Never returns key material.
-async fn provider_status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let remembered = state.keys.lock().expect("keys mutex poisoned");
+async fn provider_status(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let remembered = lock_keys(&state)?;
     let mut status = serde_json::Map::new();
     for (provider, env) in PROVIDER_KEY_ENVS {
         let configured = remembered.contains_key(*provider)
             || std::env::var(env).map(|v| !v.is_empty()).unwrap_or(false);
         status.insert((*provider).to_string(), json!(configured));
     }
-    Json(serde_json::Value::Object(status))
+    Ok(Json(serde_json::Value::Object(status)))
 }
 
 // ---------------------------------------------------------------------------
@@ -782,6 +861,10 @@ fn supported_provider(provider: &str) -> bool {
     provider == "mock" || provider_key_env(provider).is_some()
 }
 
+fn dashboard_base_url_uses_https(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url).is_ok_and(|url| url.scheme() == "https" && url.host().is_some())
+}
+
 fn provider_key_env(provider: &str) -> Option<&'static str> {
     PROVIDER_KEY_ENVS
         .iter()
@@ -792,6 +875,13 @@ fn provider_env_has_key(provider: &str) -> bool {
     provider_key_env(provider)
         .and_then(|env| std::env::var(env).ok())
         .is_some_and(|value| !value.is_empty())
+}
+
+fn lock_keys(state: &AppState) -> Result<MutexGuard<'_, HashMap<String, String>>> {
+    state
+        .keys
+        .lock()
+        .map_err(|_| anyhow::anyhow!("dashboard API key store is unavailable"))
 }
 
 fn dashboard_options_payload() -> DashboardOptions {
@@ -885,9 +975,21 @@ fn reject_mutation(headers: &HeaderMap, state: &AppState) -> Option<Response> {
         .get(CSRF_HEADER)
         .and_then(|value| value.to_str().ok())
     {
-        Some(token) if token == state.csrf_token => None,
+        Some(token) if constant_time_eq(token.as_bytes(), state.csrf_token.as_bytes()) => None,
         _ => Some(forbidden("missing or invalid dashboard token")),
     }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (left, right) in left.iter().zip(right.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 fn is_cross_site_browser_request(headers: &HeaderMap) -> bool {
@@ -1168,13 +1270,13 @@ a{color:var(--accent)}
 
 main{min-height:calc(100vh - 60px)}
 .wrap{max-width:1000px;margin:0 auto;padding:38px 26px 80px;animation:bf-fade .4s ease both}
-.pagehead{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:24px;gap:16px}
+.pagehead{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;margin-bottom:24px;gap:16px}
 .pagehead h1{font:600 28px/1.1 var(--serif);margin:0;color:var(--ink)}
 .pagehead p{font:400 13.5px var(--sans);color:var(--muted);margin:5px 0 0}
 .empty{color:var(--muted);text-align:center;margin-top:60px;font-size:14px}
 
 /* library */
-.book-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.book-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
 .book-card{display:flex;gap:15px;padding:16px;background:var(--card);border:1px solid var(--line);border-radius:14px;cursor:pointer}
 .book-card:hover{border-color:var(--accentline)}
 .cover{width:56px;height:80px;flex:none;border-radius:6px;display:flex;align-items:center;justify-content:center;font:600 24px var(--serif);color:var(--accentink);background:linear-gradient(150deg,var(--accent),var(--danger));box-shadow:0 6px 14px -6px rgba(0,0,0,.4)}
@@ -1186,7 +1288,7 @@ main{min-height:calc(100vh - 60px)}
 .bar-track{height:5px;border-radius:3px;background:var(--chip);overflow:hidden}
 .bar-fill{height:100%;border-radius:3px;background:var(--accent)}
 .book-action{font:500 12.5px var(--sans);color:var(--accent);white-space:nowrap;align-self:flex-start}
-.add-card{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:22px;border:1.5px dashed var(--line);border-radius:14px;cursor:pointer;background:var(--soft);min-height:140px;text-align:center}
+.add-card{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:22px;border:1.5px dashed var(--line);border-radius:14px;cursor:pointer;background:var(--soft);min-height:112px;text-align:center}
 .add-card .plus{font-size:26px;line-height:1;color:var(--accent)}
 .add-card b{font:600 14px var(--sans);color:var(--ink);margin-top:8px}
 .add-card span{font:400 12px var(--sans);color:var(--muted);margin-top:3px}
@@ -1240,7 +1342,7 @@ main{min-height:calc(100vh - 60px)}
 .tier .tn{font:600 14px var(--sans);color:var(--ink);margin-bottom:4px}
 .tier .td{font:400 11.5px/1.4 var(--sans);color:var(--muted);margin-bottom:13px;min-height:48px}
 .tier .tm{font:400 10.5px var(--mono);color:var(--faint);margin-top:4px}
-.facts{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-bottom:13px}
+.facts{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:11px;margin-bottom:13px}
 .fact{padding:14px 15px;border:1px solid var(--line);border-radius:11px;background:var(--card)}
 .fact .k{font:500 10px var(--sans);text-transform:uppercase;letter-spacing:.05em;color:var(--faint);margin-bottom:6px}
 .fact .v{font:600 15px var(--sans);color:var(--ink)}
@@ -1251,14 +1353,14 @@ main{min-height:calc(100vh - 60px)}
 .costbox .cm{text-align:right;font:400 12px/1.7 var(--mono);color:var(--muted)}
 .advtoggle{display:flex;align-items:center;justify-content:space-between;padding:13px 4px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);cursor:pointer;font:500 13px var(--sans);color:var(--muted)}
 .advbody{padding:16px 2px}
-.adv-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.adv-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
 .adv-cell{display:flex;align-items:center;justify-content:space-between;padding:11px 13px;border:1px solid var(--line);border-radius:10px}
 .adv-cell span{font:500 12.5px var(--sans);color:var(--muted)}
 .adv-cell .val{font:600 12.5px var(--mono);color:var(--accent);cursor:pointer}
 .stepper{display:flex;align-items:center;gap:6px}
 .stepbtn{width:24px;height:24px;border-radius:6px;background:var(--chip);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--ink)}
 .numin{width:44px;text-align:center;border:1px solid var(--line);border-radius:7px;padding:4px;background:var(--card);color:var(--ink);font:600 12.5px var(--mono)}
-.modelcards{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:9px}
+.modelcards{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:9px}
 .modelcard{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:11px 13px;border-radius:11px;cursor:pointer;background:var(--card);border:1.5px solid var(--line)}
 .modelcard.on{background:var(--accentsoft);border-color:var(--accent)}
 .modelcard .ml{font:600 13px var(--sans);color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1283,7 +1385,7 @@ main{min-height:calc(100vh - 60px)}
 .prog-bar > i{display:block;height:100%;border-radius:6px;background:repeating-linear-gradient(45deg,var(--accent) 0 10px,color-mix(in srgb,var(--accent) 78%,#000) 10px 20px);background-size:40px 40px;animation:bf-stripe 1s linear infinite;transition:width .3s ease}
 .prog-bar.done > i{background:var(--good);animation:none}
 .prog-actions{display:flex;gap:10px;margin-top:18px;align-items:center}
-.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:11px;margin-bottom:16px}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:11px;margin-bottom:16px}
 .stat{padding:14px 15px;border:1px solid var(--line);border-radius:12px;background:var(--card)}
 .stat .k{font:500 10px var(--sans);text-transform:uppercase;letter-spacing:.05em;color:var(--faint);margin-bottom:6px}
 .stat .v{font:600 17px var(--mono);color:var(--ink)}
@@ -1295,6 +1397,8 @@ main{min-height:calc(100vh - 60px)}
 .live{display:flex;align-items:center;gap:6px;font:400 12px var(--sans);color:var(--muted)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--faint)}
 .dot.on{background:var(--good);box-shadow:0 0 8px var(--good)}
+
+@media (max-width:720px){.wrap{padding:28px 18px 70px}.book-grid{grid-template-columns:1fr}.wiz{display:block;min-height:0}.rail{width:auto;border-right:none;border-bottom:1px solid var(--line);padding:18px 20px}.steps{flex-direction:row;overflow:auto}.step{flex:none}.wizsummary{display:none}.wizpanel{padding:24px 20px 34px}.lang-row{flex-wrap:wrap}.swap{margin-bottom:0}.tiers{flex-direction:column}.prog-top{display:block}.prog-eta{text-align:left;margin-top:8px}.prog-actions{flex-wrap:wrap}}
 
 /* review */
 .review{display:flex;height:calc(100vh - 60px)}
@@ -2055,10 +2159,13 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
+    const TEST_HOST: &str = "127.0.0.1:8765";
+
     fn test_state(token: &str) -> AppState {
         AppState {
             refresh: Duration::from_millis(250),
             csrf_token: token.to_string(),
+            host_port: 8765,
             keys: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -2070,6 +2177,41 @@ mod tests {
 
         assert!(require_loopback_bind(local).is_ok());
         assert!(require_loopback_bind(remote).is_err());
+    }
+
+    #[test]
+    fn dashboard_host_header_allows_only_loopback_names_on_bound_port() {
+        for host in [
+            "127.0.0.1:8765",
+            "localhost:8765",
+            "LOCALHOST:8765",
+            "[::1]:8765",
+        ] {
+            assert!(
+                dashboard_host_value_allowed(host, 8765),
+                "{host} should be allowed"
+            );
+        }
+
+        for host in [
+            "",
+            "127.0.0.1",
+            "127.0.0.1:8766",
+            " 127.0.0.1:8765",
+            "127.0.0.1:8765 ",
+            "127.0.0.1.evil.test:8765",
+            "localhost.evil.test:8765",
+            "evil.test:8765",
+            "127.0.0.1:8765.evil.test",
+            "127.0.0.1:08765",
+            "[::1]:8766",
+            "[::ffff:127.0.0.1]:8765",
+        ] {
+            assert!(
+                !dashboard_host_value_allowed(host, 8765),
+                "{host} should be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2113,6 +2255,30 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_openai_compatible_base_url_must_be_https() {
+        assert!(dashboard_base_url_uses_https("https://api.example.com/v1"));
+        assert!(!dashboard_base_url_uses_https("http://api.example.com/v1"));
+        assert!(!dashboard_base_url_uses_https("https://"));
+        assert!(!dashboard_base_url_uses_https("not a url"));
+    }
+
+    #[tokio::test]
+    async fn child_startup_check_reports_immediate_success_exit() -> Result<()> {
+        let mut child = tokio::process::Command::new(std::env::current_exe()?)
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        let status = child_exit_status_after(&mut child, Duration::from_secs(2))
+            .await?
+            .expect("help child should exit quickly");
+
+        assert!(status.success());
+        Ok(())
+    }
+
+    #[test]
     fn mutating_routes_require_dashboard_token() {
         let state = test_state("token-123");
         let headers = HeaderMap::new();
@@ -2133,6 +2299,51 @@ mod tests {
         assert!(reject_mutation(&headers, &state).is_some());
     }
 
+    #[test]
+    fn csrf_token_compare_matches_only_exact_token() {
+        assert!(constant_time_eq(b"token-123", b"token-123"));
+        assert!(!constant_time_eq(b"token-123", b"token-124"));
+        assert!(!constant_time_eq(b"token-123", b"token-1234"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_rejects_untrusted_host_header_before_serving_html() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let response = dashboard_router(test_state("token-123"))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "evil.test:8765")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn dashboard_serves_loopback_host_header() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let response = dashboard_router(test_state("token-123"))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "localhost:8765")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn retry_endpoint_rejects_missing_dashboard_token() {
         use axum::{body::Body, http::Request};
@@ -2143,6 +2354,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/jobs/not-real/retry")
+                    .header("host", TEST_HOST)
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -2166,6 +2378,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/estimate")
+                    .header("host", TEST_HOST)
                     .header("content-type", "multipart/form-data; boundary=B")
                     .body(Body::from(body))
                     .expect("request should build"),
@@ -2186,6 +2399,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/glossary")
+                    .header("host", TEST_HOST)
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"source":"a","target":"b","source_language":"English","target_language":"Italian"}"#,
@@ -2201,12 +2415,58 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri("/api/glossary/1")
+                    .header("host", TEST_HOST)
                     .body(Body::empty())
                     .expect("request should build"),
             )
             .await
             .expect("route should respond");
         assert_eq!(remove.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn translate_rejects_non_https_openai_compatible_base_url() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let body = concat!(
+            "--B\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"book.epub\"\r\n",
+            "Content-Type: application/epub+zip\r\n\r\n",
+            "not-a-real-epub\r\n",
+            "--B\r\n",
+            "Content-Disposition: form-data; name=\"target\"\r\n\r\n",
+            "Italian\r\n",
+            "--B\r\n",
+            "Content-Disposition: form-data; name=\"provider\"\r\n\r\n",
+            "openai-compatible\r\n",
+            "--B\r\n",
+            "Content-Disposition: form-data; name=\"base_url\"\r\n\r\n",
+            "http://api.example.test/v1\r\n",
+            "--B\r\n",
+            "Content-Disposition: form-data; name=\"model\"\r\n\r\n",
+            "test-model\r\n",
+            "--B\r\n",
+            "Content-Disposition: form-data; name=\"api_key\"\r\n\r\n",
+            "sk-test-key\r\n",
+            "--B--\r\n",
+        );
+
+        let response = dashboard_router(test_state("token-123"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/translate")
+                    .header("host", TEST_HOST)
+                    .header(CSRF_HEADER, "token-123")
+                    .header("content-type", "multipart/form-data; boundary=B")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
