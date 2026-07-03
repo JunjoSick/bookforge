@@ -6,10 +6,11 @@
 //! are acceptable, embedded runtimes are not.
 
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Command, Output},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -70,7 +71,9 @@ impl PopplerTools {
 
     /// `pdftohtml -v` prints its version banner on stderr.
     pub fn version(&self) -> Option<String> {
-        let output = Command::new(&self.pdftohtml).arg("-v").output().ok()?;
+        let mut command = Command::new(&self.pdftohtml);
+        command.arg("-v");
+        let output = command_output(&mut command).ok()?;
         let banner = String::from_utf8_lossy(&output.stderr);
         banner.lines().next().map(|line| line.trim().to_string())
     }
@@ -79,11 +82,12 @@ impl PopplerTools {
     pub fn pdf_to_xml(&self, pdf: &Path) -> Result<String, ToolError> {
         let work_dir = scoped_temp_dir("bookforge-pdftohtml")?;
         let pdf = absolute_path(pdf)?;
-        let output = Command::new(&self.pdftohtml)
+        let mut command = Command::new(&self.pdftohtml);
+        command
             .current_dir(&work_dir)
             .args(["-xml", "-stdout", "-q", "-enc", "UTF-8", "-fmt", "png"])
-            .arg(pdf)
-            .output()?;
+            .arg(pdf);
+        let output = command_output(&mut command)?;
         let _ = fs::remove_dir_all(&work_dir);
         if !output.status.success() {
             return Err(ToolError::Failed {
@@ -99,11 +103,9 @@ impl PopplerTools {
     /// no layout decisions, so its character count approximates "all the
     /// text poppler can see".
     pub fn pdf_to_text(&self, pdf: &Path) -> Result<String, ToolError> {
-        let output = Command::new(&self.pdftotext)
-            .args(["-enc", "UTF-8", "-q"])
-            .arg(pdf)
-            .arg("-")
-            .output()?;
+        let mut command = Command::new(&self.pdftotext);
+        command.args(["-enc", "UTF-8", "-q"]).arg(pdf).arg("-");
+        let output = command_output(&mut command)?;
         if !output.status.success() {
             return Err(ToolError::Failed {
                 tool: "pdftotext",
@@ -126,11 +128,12 @@ impl PopplerTools {
         }
 
         let root = output_dir.join("image");
-        let output = Command::new(&self.pdfimages)
+        let mut command = Command::new(&self.pdfimages);
+        command
             .args(["-png", "-p", "-print-filenames", "-q"])
             .arg(pdf)
-            .arg(&root)
-            .output()?;
+            .arg(&root);
+        let output = command_output(&mut command)?;
         if !output.status.success() {
             return Err(ToolError::Failed {
                 tool: "pdfimages",
@@ -179,7 +182,8 @@ impl PopplerTools {
         fs::create_dir_all(output_dir)?;
         let root = output_dir.join(format!("page-{page:04}"));
         let page_arg = page.to_string();
-        let output = Command::new(&self.pdftoppm)
+        let mut command = Command::new(&self.pdftoppm);
+        command
             .args([
                 "-f",
                 &page_arg,
@@ -191,8 +195,8 @@ impl PopplerTools {
                 "150",
             ])
             .arg(pdf)
-            .arg(&root)
-            .output()?;
+            .arg(&root);
+        let output = command_output(&mut command)?;
         if !output.status.success() {
             return Err(ToolError::Failed {
                 tool: "pdftoppm",
@@ -217,7 +221,8 @@ impl PopplerTools {
         let top_arg = crop.top.to_string();
         let width_arg = crop.width.to_string();
         let height_arg = crop.height.to_string();
-        let output = Command::new(&self.pdftoppm)
+        let mut command = Command::new(&self.pdftoppm);
+        command
             .args([
                 "-f",
                 &page_arg,
@@ -237,8 +242,8 @@ impl PopplerTools {
                 &height_arg,
             ])
             .arg(pdf)
-            .arg(&root)
-            .output()?;
+            .arg(&root);
+        let output = command_output(&mut command)?;
         if !output.status.success() {
             return Err(ToolError::Failed {
                 tool: "pdftoppm",
@@ -250,10 +255,9 @@ impl PopplerTools {
     }
 
     fn list_images(&self, pdf: &Path) -> Result<Vec<ListedImage>, ToolError> {
-        let output = Command::new(&self.pdfimages)
-            .args(["-list"])
-            .arg(pdf)
-            .output()?;
+        let mut command = Command::new(&self.pdfimages);
+        command.args(["-list"]).arg(pdf);
+        let output = command_output(&mut command)?;
         if !output.status.success() {
             return Err(ToolError::Failed {
                 tool: "pdfimages",
@@ -265,6 +269,21 @@ impl PopplerTools {
             &output.stdout,
         )))
     }
+}
+
+fn command_output(command: &mut Command) -> io::Result<Output> {
+    let mut delay = Duration::from_millis(5);
+    for attempt in 0..4 {
+        match command.output() {
+            Ok(output) => return Ok(output),
+            Err(err) if err.raw_os_error() == Some(26) && attempt < 3 => {
+                thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    command.output()
 }
 
 #[derive(Debug, Clone, Copy)]

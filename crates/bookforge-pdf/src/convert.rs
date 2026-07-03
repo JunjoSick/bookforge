@@ -96,6 +96,7 @@ fn convert_pdf_with_tools(
             &low_confidence_pages,
         )?;
     }
+    let layout_warnings = media_layout_warnings(&blocks, &block_anchors);
     let reconstructed_chars: usize = blocks.iter().map(DocBlock::char_count).sum();
     let figure_count = blocks
         .iter()
@@ -124,6 +125,7 @@ fn convert_pdf_with_tools(
             figures: figure_count,
             tables: media_figures.counts.tables,
             equations: media_figures.counts.equations,
+            layout_warnings,
         },
     );
 
@@ -236,6 +238,36 @@ fn replace_page_with_preserved_image(
             top: 0,
         },
     );
+}
+
+fn media_layout_warnings(blocks: &[DocBlock], block_anchors: &[BlockAnchor]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (index, block) in blocks.iter().enumerate().skip(1) {
+        if !matches!(blocks.get(index - 1), Some(DocBlock::Figure { .. }))
+            || !starts_with_lowercase_or_suffix(block)
+        {
+            continue;
+        }
+        let Some(anchor) = block_anchors.get(index) else {
+            continue;
+        };
+        warnings.push(format!(
+            "page {}: lowercase paragraph continuation follows media block near y={}; review paragraph join",
+            anchor.page, anchor.top
+        ));
+    }
+    warnings
+}
+
+fn starts_with_lowercase_or_suffix(block: &DocBlock) -> bool {
+    let DocBlock::Paragraph { spans } = block else {
+        return false;
+    };
+    let text = fragment_text(spans);
+    let trimmed = text.trim_start();
+    trimmed.chars().next().is_some_and(|ch| ch.is_lowercase())
+        || trimmed.starts_with(',')
+        || trimmed.starts_with(';')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -944,9 +976,12 @@ mod tests {
 
     #[cfg(unix)]
     fn write_executable(path: &Path, script: &str) {
-        use std::{fs, os::unix::fs::PermissionsExt};
+        use std::{fs, io::Write, os::unix::fs::PermissionsExt};
 
-        fs::write(path, script).expect("tool fixture");
+        let mut file = fs::File::create(path).expect("tool fixture");
+        file.write_all(script.as_bytes()).expect("tool fixture");
+        file.sync_all().expect("tool fixture sync");
+        drop(file);
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("tool executable");
     }
 
@@ -1130,6 +1165,65 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
                 .iter()
                 .any(|block| matches!(block.kind, bookforge_core::ir::BlockKind::Caption)),
             "figcaption should remain a normal translatable caption block"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_pdf_warns_on_lowercase_continuation_after_media() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.pdf");
+        let output = dir.path().join("output.epub");
+        fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+
+        let pdftohtml = dir.path().join("pdftohtml");
+        write_executable(
+            &pdftohtml,
+            r##"#!/bin/sh
+cat <<'XML'
+<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="80" left="100" width="260" height="12" font="0">This paragraph</text>
+    <image top="130" left="120" width="120" height="80" src="paper-1_1.png"/>
+    <text top="260" left="100" width="260" height="12" font="0">continues after the figure.</text>
+  </page>
+</pdf2xml>
+XML
+"##,
+        );
+
+        let pdftotext = dir.path().join("pdftotext");
+        write_executable(
+            &pdftotext,
+            r#"#!/bin/sh
+printf 'This paragraph\ncontinues after the figure.\n'
+"#,
+        );
+        let pdfimages = dir.path().join("pdfimages");
+        fake_pdfimages(&pdfimages);
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
+
+        let tools = PopplerTools {
+            pdftohtml,
+            pdftotext,
+            pdfimages,
+            pdftoppm,
+        };
+        let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+            .expect("conversion should succeed");
+
+        assert!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning
+                    .contains("lowercase paragraph continuation follows media block")),
+            "media-separated lowercase continuations should be flagged"
         );
     }
 

@@ -29,7 +29,7 @@ pub struct ConversionReport {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ReportMetrics {
     pub blocks: usize,
     pub reconstructed_chars: usize,
@@ -38,6 +38,7 @@ pub struct ReportMetrics {
     pub figures: usize,
     pub tables: usize,
     pub equations: usize,
+    pub layout_warnings: Vec<String>,
 }
 
 impl ConversionReport {
@@ -74,6 +75,7 @@ impl ConversionReport {
                 ));
             }
         }
+        warnings.extend(metrics.layout_warnings);
 
         Self {
             input: input.to_string(),
@@ -147,6 +149,7 @@ mod tests {
                 figures: 0,
                 tables: 0,
                 equations: 0,
+                layout_warnings: Vec::new(),
             },
         );
 
@@ -181,6 +184,7 @@ mod tests {
                 figures: 0,
                 tables: 0,
                 equations: 0,
+                layout_warnings: Vec::new(),
             },
         );
 
@@ -210,6 +214,7 @@ mod tests {
                 figures: 0,
                 tables: 0,
                 equations: 0,
+                layout_warnings: Vec::new(),
             },
         );
 
@@ -241,6 +246,7 @@ mod tests {
                 figures: 1,
                 tables: 0,
                 equations: 0,
+                layout_warnings: Vec::new(),
             },
         );
 
@@ -253,5 +259,39 @@ mod tests {
                     && warning.contains("action=preserve"))
         );
         assert!(report.summary().contains("Low-confidence pages: 1"));
+    }
+
+    #[test]
+    fn summary_includes_layout_warnings() {
+        let report = ConversionReport::build(
+            "in.pdf",
+            "out.epub",
+            Vec::new(),
+            ReportMetrics {
+                blocks: 0,
+                reconstructed_chars: 0,
+                baseline_chars: 0,
+                images: 0,
+                figures: 1,
+                tables: 0,
+                equations: 0,
+                layout_warnings: vec![
+                    "page 1: lowercase paragraph continuation follows media block near y=120"
+                        .to_string(),
+                ],
+            },
+        );
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("lowercase paragraph continuation"))
+        );
+        assert!(
+            report
+                .summary()
+                .contains("lowercase paragraph continuation follows media block")
+        );
     }
 }
