@@ -1,17 +1,26 @@
 # BookForge — Technical Roadmap, v1.0.1 through v2.0
 
-**Document version:** 1.1.2
-**Last updated:** 2026-07-02
+**Document version:** 1.2.0
+**Last updated:** 2026-07-03
 **Status:** historical roadmap plus active follow-up notes
 **Audience:** project maintainer + Claude Code (or any other coding agent) implementing
 the milestones below.
 
-> **Current status:** v2.0 has shipped; the current release line is v2.0.2
-> as of 2026-07-02. This document is kept for architectural invariants,
-> shipped-milestone context, and deferred follow-up work. For current user
-> behavior, start with `README.md`, `CHANGELOG.md`, and
-> `docs/v2-web-dashboard-plan.md`; older milestone sections below are
-> historical unless explicitly marked as follow-up.
+> **Current status:** the current release line is v2.1.0 (2026-07-03).
+> This document is kept for architectural invariants, shipped-milestone
+> context, and deferred follow-up work. For current user behavior, start
+> with `README.md`, `CHANGELOG.md`, and `docs/v2-web-dashboard-plan.md`;
+> older milestone sections below are historical unless explicitly marked
+> as follow-up.
+>
+> **Milestone numbers vs. release versions.** The `v1.x` labels below are
+> roadmap *milestone names*, frozen when this plan was written; they no
+> longer track released product versions (semver `v2.x`), and milestones
+> shipped out of order. Read them as feature names. Mapping so far:
+> milestone v1.8 → releases v1.8.x (2026-06-20); v2.0 milestone →
+> releases v2.0.0–v2.0.3; milestone v1.6 (PDF hardening) → release
+> v2.1.0 (2026-07-03); milestone v1.7 (bilingual output) → in progress,
+> expected v2.2.0.
 
 ---
 
@@ -72,7 +81,7 @@ pattern is an architectural smell, not a feature.
 
 A cached translation is reused if and only if `(source_hash, prompt_contract_version,
 provider, model, source_language, target_language)` all match. Prompt
-versioning has a major/minor split (see §12.3); cache is keyed on major only,
+versioning has a major/minor split (see §11.3); cache is keyed on major only,
 so prose-level prompt revisions don't invalidate cache.
 
 ### 1.4 Quality is measured by reader experience, not by feature count.
@@ -107,8 +116,8 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v1.3 | Context + style | 8–12 days | none (explicit "no promotion" rule) | shipped |
 | v1.4 | Distribution + writeup | 5–7 days | one technical post, two or three venues; cargo-dist binaries land here | shipped |
 | v1.5 | Extraction + scheduling overhaul (shipped scope; see §8 post-ship note) | — | none | shipped 2026-06-12 |
-| v1.6 | PDF ingestion hardening (§9) | 8–14 days | release notes; maybe a short writeup if layout reconstruction turns out interesting | **next** |
-| v1.7 | Bilingual output (§9b) | 5–8 days | passive (release notes only) | planned |
+| v1.6 | PDF ingestion hardening (§9) | 8–14 days | release notes; maybe a short writeup if layout reconstruction turns out interesting | **shipped 2026-07-03 as release v2.1.0** |
+| v1.7 | Bilingual output (§9b) | 5–8 days | passive (release notes only) | **in progress (2026-07-03)** |
 | v1.8 | Structural credibility (EPUBCheck + corpus; was the planned v1.5 scope, §8) | 10–14 days | README final rewrite citing corpus | **shipped 2026-06-20** |
 | v2.0 | Monitoring UI (`RunState`, `watch`, `--ui tui`, local `serve`) | shipped scope | release notes | shipped; current patch v2.0.2 (2026-07-02) |
 
@@ -820,6 +829,13 @@ order and truncated at the token budget (default 800 tokens, configurable
 via `--glossary-budget-tokens`). A `tracing::warn!()` line fires if
 truncation drops any `user_seeded` or `always_active` entries.
 
+**Post-ship note (2026-07-03).** Ranking rules 3 and 4 (recently-active,
+high-frequency anchors) were specified before any usage evidence existed,
+and nothing instruments whether they ever fire usefully. Before extending
+this machinery further, add counters (per rule: entries injected /
+entries honored in output) to a real translation run and check the data;
+if rules 3–4 contribute nothing measurable, simplify rather than extend.
+
 **Token estimator.** v1.2 uses a conservative `chars / 3` heuristic
 (rounded up) instead of a real BPE tokenizer. The heuristic over-counts
 slightly on Latin scripts and under-counts on Asian scripts; both
@@ -1416,6 +1432,14 @@ clean equivalent), keep them and document why. Don't compromise correctness
 for compatibility; do compromise tooling-bleed for compatibility.
 
 ### 7.8 The writeup
+
+> **Status note (2026-07-03):** the writeup was never published — the
+> rest of v1.4 (cargo-dist, distribution) shipped without it. It remains
+> the only intentional marketing event in the roadmap and is now
+> *stronger* than originally scoped: §9's layout-reconstruction work
+> ("maybe a short writeup if it turns out interesting" — it did) and the
+> measured whitespace-boundary fix are concrete war stories the original
+> outline lacked. Treat as open, unscheduled work.
 
 Title (suggested): **"BookForge: Translating EPUBs Without Letting the LLM Near the Structure"**
 
@@ -2075,6 +2099,15 @@ Not every element should be appended to. Default policy table:
 This policy is hardcoded for v1.7. Make it configurable via a TOML file
 (`--bilingual-policy <file>`) only if real users ask for it.
 
+**Insertion-point ruling (2026-07-03, clarifying an ambiguity).** In
+`append-text` mode the translation is inserted as **exactly one span per
+block, at the end of the block's inline content** (or, per the table
+above, inside the last `<p>` for blockquote/aside). It is NOT inserted
+after each individual text run — a paragraph with mid-sentence inline
+markup gets one trailing span, never interleaved fragments. The §9b.4
+example is normative; the older "after each source text run" phrasing in
+§9b.12.3 was a spec bug and has been corrected.
+
 ### 9b.6 CSS
 
 Default stylesheet (injected into the EPUB if not already present):
@@ -2224,8 +2257,10 @@ bookforge translate origin.epub \
    Italian-translated `<p class="bookforge-translation" lang="it">...</p>` sibling.
 2. The output passes EPUBCheck.
 3. `bookforge translate book.epub --target Italian --mode append-text`
-   produces inline bilingual content with `<span class="bookforge-translation"
-   lang="it">...</span>` after each source text run.
+   produces inline bilingual content with exactly one
+   `<span class="bookforge-translation" lang="it">...</span>` appended at
+   the end of each block's inline content (see the insertion-point ruling
+   in §9b.5; the §9b.4 example is normative).
 4. `--mode replace` produces output identical to v1.5 (no behavior regression).
 5. Glossary, context, and style sheets all apply in bilingual modes.
 6. Token usage in bilingual modes is roughly equal to that in replace
@@ -2247,7 +2282,35 @@ wait until the PDF ingestion surface is useful on real documents.
 
 ---
 
+## 9c. Follow-up (proposed 2026-07-03) — source-EPUB reflow
+
+**Not yet scheduled; flagged during v1.6 validation.** The owner's
+library contains many EPUBs produced by *third-party* PDF conversions
+(Calibre et al.) where every printed line is its own `<p>`. BookForge
+correctly preserves that structure, so translations inherit
+English-line-length paragraph breaks and read ragged in the target
+language (observed on the CCRU Abstract Culture book, 2026-07-03). This
+is distinct from §9: it is a *source-quality repair* concern for EPUBs
+BookForge did not create.
+
+Sketch: an opt-in `--reflow` preprocessing pass (or `bookforge reflow`
+command) that merges consecutive blocks when the first lacks terminal
+punctuation and the next starts lowercase, with conservative guards
+(same class/style, no intervening headings/images) and a report of every
+merge. Because it deliberately changes structure, it must stay opt-in
+and must never run as part of default translation. Effort guess:
+2–4 days. Priority: high relative to remaining unscheduled work — it
+addresses the most visible reader-facing defect in the owner's actual
+library.
+
+---
+
 ## 10. v2 — open-ended (sketched, not committed)
+
+> **Status note (2026-07-03):** "v2" shipped (releases v2.0.0–v2.1.0)
+> with a scope chosen at the time — the monitoring UI plus web dashboard.
+> The candidates sketched below were written before that decision; read
+> them as a v2.x/v3 idea list, not as the shipped v2's contents.
 
 The v2 list is what's interesting *as of writing*. The real v2
 priorities will be informed by:
@@ -2529,6 +2592,17 @@ This roadmap is a living document. After each milestone ships:
    milestones, update those milestones' specs.
 4. After v1.4 ships and the writeup is published, recompute v2 from
    the feedback received. Replace §10 with whatever the new v2 actually is.
+
+5. Decisions made in working documents (e.g. `docs/codex-handoff-*.md`
+   task specs, review fix-pass rulings) must be folded back into the
+   relevant milestone section here once the work ships. Handoff docs are
+   scratch; this document is the record. A ruling that only lives in a
+   handoff doc will be lost.
+6. Every milestone's acceptance criteria must include at least one
+   **un-mockable** criterion — a real end-to-end run on a real input with
+   real external tools, verified by inspection. The v1.6 review found
+   that every confirmed bug lived beyond the stubbed-tool boundary;
+   unit-test-shaped criteria alone would have shipped all of them.
 
 The maintainer is the source of truth; this document is the maintainer's
 externalized memory. When in doubt, ask.
