@@ -1,6 +1,6 @@
 [package]
 name = "bookforge-cli"
-version = "2.0.3"
+version = "2.1.0"
 description = "CLI-first EPUB translation engine with deterministic structure rebuild and review loop."
 readme = "../../README.md"
 edition.workspace = true
@@ -16,11 +16,11 @@ path = "src/main.rs"
 anyhow.workspace = true
 async-stream = { version = "0.3", optional = true }
 axum = { version = "0.8", optional = true, features = ["multipart"] }
-bookforge-core = { version = "2.0.3", path = "../bookforge-core", features = ["cli"] }
-bookforge-epub = { version = "2.0.3", path = "../bookforge-epub" }
-bookforge-llm = { version = "2.0.3", path = "../bookforge-llm" }
-bookforge-pdf = { version = "2.0.3", path = "../bookforge-pdf" }
-bookforge-store = { version = "2.0.3", path = "../bookforge-store" }
+bookforge-core = { version = "2.1.0", path = "../bookforge-core", features = ["cli"] }
+bookforge-epub = { version = "2.1.0", path = "../bookforge-epub" }
+bookforge-llm = { version = "2.1.0", path = "../bookforge-llm" }
+bookforge-pdf = { version = "2.1.0", path = "../bookforge-pdf" }
+bookforge-store = { version = "2.1.0", path = "../bookforge-store" }
 clap.workspace = true
 console.workspace = true
 futures-core = { version = "0.3", optional = true }

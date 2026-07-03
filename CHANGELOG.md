@@ -1,5 +1,39 @@
 # Changelog
 
+## v2.1.0 - 2026-07-03
+
+BookForge v2.1.0 ships the v1.6 roadmap milestone: PDF ingestion hardening.
+Scientific papers and unorthodox-layout books (landscape art books, zine
+formats) now convert to translation-ready EPUBs with figures, tables, and
+equations preserved as correctly-cropped images.
+
+- Figure/table/equation regions are detected and preserved as page crops,
+  with crop coordinates correctly scaled between pdftohtml XML units and the
+  render DPI (pdftohtml zoom is now pinned explicitly).
+- Extracted raster sub-images cluster into one composite figure per diagram;
+  decorative/repeated rasters are filtered and reported instead of emitted.
+- Media regions are mutually exclusive (figures over tables over equations),
+  detectors skip fragments inside image regions, and vector-figure/table
+  regions clamp to their column on two-column pages — prose is never absorbed
+  into an image region.
+- pdfimages mask/stencil rows no longer shift page attribution; extracted
+  images pair with layout regions by dimensions rather than position.
+- pdfimages/pdftoppm are optional: without them conversion degrades to
+  text-only with a warning instead of failing (`doctor` lists them as
+  recommended).
+- Low-confidence pages fall back per `--low-confidence` (linearize/preserve);
+  coverage reporting credits media-preserved characters separately so
+  preserved figures never read as text loss.
+- Layout audit warnings itemize every text fragment absorbed into a media
+  crop and flag paragraph joins around media blocks for review.
+- Shared math-symbol classification moved to `bookforge-core`, used by both
+  PDF equation detection and EPUB inline-math protection.
+
+Validated end-to-end with real poppler against a two-column scientific paper
+(arXiv 1810.04805) and two unorthodox-layout books (a 213-page landscape
+InDesign art book at 99.3% text coverage and a small-format zine at 100%),
+including full EN→IT translation runs on the converted output.
+
 ## v2.0.3 - 2026-07-02
 
 BookForge v2.0.3 hardens the local browser dashboard, fixes inline-marker
