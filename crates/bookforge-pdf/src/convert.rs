@@ -2,7 +2,7 @@
 //! EPUB + report.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -66,10 +66,12 @@ fn convert_pdf_with_tools(
     let xml = tools.pdf_to_xml(input)?;
     let pages = parse_pdf2xml(&xml)?;
     let reconstruction = reconstruct(&pages, options.columns);
+    let media_dir = scoped_temp_dir("bookforge-pdf-media")?;
     let image_dir = scoped_temp_dir("bookforge-pdf-images")?;
     let extracted_images = tools.extract_images(input, &image_dir)?;
-    let mut figure_blocks = figure_blocks_from_images(&pages, &extracted_images)?;
-    let media_dir = scoped_temp_dir("bookforge-pdf-media")?;
+    let figure_result =
+        figure_blocks_from_images(input, &pages, &extracted_images, tools, &media_dir)?;
+    let mut figure_blocks = figure_result.figures;
     let media_figures = media_figure_blocks(input, &pages, tools, &media_dir);
     let _ = fs::remove_dir_all(&media_dir);
     let _ = fs::remove_dir_all(&image_dir);
@@ -96,7 +98,8 @@ fn convert_pdf_with_tools(
             &low_confidence_pages,
         )?;
     }
-    let layout_warnings = media_layout_warnings(&blocks, &block_anchors);
+    let mut layout_warnings = figure_result.warnings;
+    layout_warnings.extend(media_layout_warnings(&blocks, &block_anchors));
     let reconstructed_chars: usize = blocks.iter().map(DocBlock::char_count).sum();
     let figure_count = blocks
         .iter()
@@ -347,6 +350,30 @@ struct AnchoredFigure {
     block: DocBlock,
     anchor: BlockAnchor,
     text_region: Option<RegionRect>,
+}
+
+struct FigureBlocks {
+    figures: Vec<AnchoredFigure>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CaptionKey {
+    page: u32,
+    text: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ImageFigureCandidate<'a> {
+    image: &'a ExtractedImage,
+    region: Option<&'a ImageRegion>,
+    caption: Option<&'a Fragment>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FigureCropRegion<'a> {
+    rect: RegionRect,
+    caption: &'a Fragment,
 }
 
 fn media_figure_blocks(
@@ -735,15 +762,156 @@ fn is_math_symbol(ch: char) -> bool {
 }
 
 fn figure_blocks_from_images(
+    input: &Path,
     pages: &[Page],
     images: &[ExtractedImage],
-) -> Result<Vec<AnchoredFigure>> {
+    tools: &PopplerTools,
+    output_dir: &Path,
+) -> Result<FigureBlocks> {
     let pages_by_number = pages
         .iter()
         .map(|page| (page.number, page))
         .collect::<HashMap<_, _>>();
-    let mut page_image_counts: HashMap<u32, usize> = HashMap::new();
+    let candidates = image_figure_candidates(&pages_by_number, images);
+    let handled_captions = candidates
+        .iter()
+        .filter_map(|candidate| Some(caption_key(candidate.image.page, &candidate.caption?.spans)))
+        .collect::<HashSet<_>>();
+    let mut used_images = vec![false; candidates.len()];
     let mut figures = Vec::new();
+    let mut warnings = Vec::new();
+    let mut figure_crop_count = 0;
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        if used_images[index] {
+            continue;
+        }
+        let (Some(_region), Some(caption)) = (candidate.region, candidate.caption) else {
+            continue;
+        };
+        let key = caption_key(candidate.image.page, &caption.spans);
+        let group = candidates
+            .iter()
+            .enumerate()
+            .filter(|(group_index, group_candidate)| {
+                !used_images[*group_index]
+                    && group_candidate.region.is_some()
+                    && group_candidate.caption.is_some_and(|group_caption| {
+                        caption_key(group_candidate.image.page, &group_caption.spans) == key
+                    })
+            })
+            .collect::<Vec<_>>();
+        if group.len() < 2 {
+            continue;
+        }
+
+        let Some(page) = pages_by_number.get(&candidate.image.page).copied() else {
+            continue;
+        };
+        let regions = group
+            .iter()
+            .filter_map(|(_, candidate)| candidate.region)
+            .collect::<Vec<_>>();
+        let rect = rect_from_image_regions(page, &regions).padded(page, 8);
+        let (rect, snapped) = snap_rect_above_caption(rect, caption);
+        figure_crop_count += 1;
+        let asset = render_figure_crop(
+            input,
+            tools,
+            output_dir,
+            figure_crop_count,
+            rect,
+            "pdf-figure",
+        )?;
+        if snapped {
+            warnings.push(caption_snap_warning(rect.page, caption.top));
+        }
+        figures.push(AnchoredFigure {
+            block: DocBlock::Figure {
+                image: asset,
+                caption: Some(caption.spans.clone()),
+            },
+            anchor: BlockAnchor {
+                page: rect.page,
+                top: rect.top,
+            },
+            text_region: Some(rect),
+        });
+        for (group_index, _) in group {
+            used_images[group_index] = true;
+        }
+    }
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        if used_images[index] {
+            continue;
+        }
+        if let (Some(region), Some(caption)) = (candidate.region, candidate.caption)
+            && caption_overlaps_image(region, caption)
+        {
+            warnings.push(caption_overlap_warning(candidate.image.page, caption.top));
+        }
+        let top = candidate
+            .region
+            .map(|region| region.top)
+            .unwrap_or(i32::MAX);
+        let asset = image_asset(candidate.image, candidate.region)?;
+        figures.push(AnchoredFigure {
+            block: DocBlock::Figure {
+                image: asset,
+                caption: candidate.caption.map(|caption| caption.spans.clone()),
+            },
+            anchor: BlockAnchor {
+                page: candidate.image.page,
+                top,
+            },
+            text_region: None,
+        });
+    }
+
+    for region in vector_figure_regions(pages, &handled_captions) {
+        figure_crop_count += 1;
+        let rect = region.rect.padded(
+            pages_by_number
+                .get(&region.rect.page)
+                .copied()
+                .expect("vector figure regions come from known pages"),
+            48,
+        );
+        let (rect, snapped) = snap_rect_above_caption(rect, region.caption);
+        let asset = render_figure_crop(
+            input,
+            tools,
+            output_dir,
+            figure_crop_count,
+            rect,
+            "pdf-figure",
+        )?;
+        if snapped {
+            warnings.push(caption_snap_warning(rect.page, region.caption.top));
+        }
+        figures.push(AnchoredFigure {
+            block: DocBlock::Figure {
+                image: asset,
+                caption: Some(region.caption.spans.clone()),
+            },
+            anchor: BlockAnchor {
+                page: rect.page,
+                top: rect.top,
+            },
+            text_region: Some(rect),
+        });
+    }
+
+    Ok(FigureBlocks { figures, warnings })
+}
+
+fn image_figure_candidates<'a>(
+    pages_by_number: &HashMap<u32, &'a Page>,
+    images: &'a [ExtractedImage],
+) -> Vec<ImageFigureCandidate<'a>> {
+    let mut page_image_counts: HashMap<u32, usize> = HashMap::new();
+    let mut candidates = Vec::new();
 
     for image in images {
         let page = pages_by_number.get(&image.page).copied();
@@ -751,23 +919,239 @@ fn figure_blocks_from_images(
         let region = page.and_then(|page| page.images.get(*page_index));
         *page_index += 1;
 
-        let caption = page.and_then(|page| detect_caption(page, region));
-        let top = region.map(|region| region.top).unwrap_or(i32::MAX);
-        let asset = image_asset(image, region)?;
-        figures.push(AnchoredFigure {
-            block: DocBlock::Figure {
-                image: asset,
-                caption,
-            },
-            anchor: BlockAnchor {
-                page: image.page,
-                top,
-            },
-            text_region: None,
+        candidates.push(ImageFigureCandidate {
+            image,
+            region,
+            caption: page.and_then(|page| detect_caption_fragment(page, region)),
         });
     }
 
-    Ok(figures)
+    candidates
+}
+
+fn vector_figure_regions<'a>(
+    pages: &'a [Page],
+    handled_captions: &HashSet<CaptionKey>,
+) -> Vec<FigureCropRegion<'a>> {
+    let mut regions = Vec::new();
+    for page in pages {
+        for caption in figure_caption_fragments(page) {
+            let key = caption_key(page.number, &caption.spans);
+            if handled_captions.contains(&key) {
+                continue;
+            }
+            let chart_fragments = chart_label_fragments(page, caption);
+            if chart_fragments.len() < 4
+                || chart_fragments
+                    .iter()
+                    .filter(|fragment| {
+                        fragment_text(&fragment.spans)
+                            .chars()
+                            .any(|ch| ch.is_ascii_digit())
+                    })
+                    .count()
+                    < 3
+            {
+                continue;
+            }
+            regions.push(FigureCropRegion {
+                rect: rect_from_fragments(page, &chart_fragments),
+                caption,
+            });
+        }
+    }
+    regions
+}
+
+fn chart_label_fragments<'a>(page: &'a Page, caption: &Fragment) -> Vec<&'a Fragment> {
+    page.fragments
+        .iter()
+        .filter(|fragment| {
+            let bottom = fragment.top + fragment.height;
+            bottom <= caption.top
+                && caption.top.saturating_sub(bottom) <= 360
+                && is_chart_label_fragment(fragment)
+        })
+        .collect()
+}
+
+fn is_chart_label_fragment(fragment: &Fragment) -> bool {
+    let text = fragment_text(&fragment.spans);
+    let trimmed = text.trim();
+    if trimmed.is_empty() || is_caption_text(trimmed) {
+        return false;
+    }
+    let chars = trimmed.chars().count();
+    let words = trimmed.split_whitespace().count();
+    let has_digit = trimmed.chars().any(|ch| ch.is_ascii_digit());
+    let short_axis_label = words <= 3 && chars <= 24;
+    (has_digit || short_axis_label) && words <= 4 && chars <= 28
+}
+
+fn rect_from_image_regions(page: &Page, regions: &[&ImageRegion]) -> RegionRect {
+    let left = regions.iter().map(|region| region.left).min().unwrap_or(0);
+    let right = regions
+        .iter()
+        .map(|region| region.left + region.width)
+        .max()
+        .unwrap_or(page.width);
+    let top = regions.iter().map(|region| region.top).min().unwrap_or(0);
+    let bottom = regions
+        .iter()
+        .map(|region| region.bottom())
+        .max()
+        .unwrap_or(page.height);
+    RegionRect {
+        page: page.number,
+        top,
+        left,
+        width: right - left,
+        height: bottom - top,
+    }
+}
+
+fn render_figure_crop(
+    input: &Path,
+    tools: &PopplerTools,
+    output_dir: &Path,
+    index: usize,
+    rect: RegionRect,
+    prefix: &str,
+) -> Result<ImageAsset> {
+    let name = format!("{prefix}-{index:04}");
+    let rendered = tools.render_page_crop_png(
+        input,
+        PageCrop {
+            page: rect.page,
+            left: rect.left,
+            top: rect.top,
+            width: rect.width,
+            height: rect.height,
+        },
+        output_dir,
+        &name,
+    )?;
+    figure_crop_asset(index, rect, &rendered)
+}
+
+fn figure_crop_asset(index: usize, rect: RegionRect, path: &Path) -> Result<ImageAsset> {
+    let bytes = fs::read(path)?;
+    Ok(ImageAsset {
+        id: format!("pdf-figure-{index:04}"),
+        href: format!("images/pdf-figure-{index:04}.png"),
+        media_type: "image/png".to_string(),
+        bytes,
+        page: rect.page,
+        top: Some(rect.top),
+        left: Some(rect.left),
+        width: Some(rect.width),
+        height: Some(rect.height),
+    })
+}
+
+fn snap_rect_above_caption(rect: RegionRect, caption: &Fragment) -> (RegionRect, bool) {
+    let caption_limit = caption.top.saturating_sub(2);
+    if rect.bottom() <= caption_limit {
+        return (rect, false);
+    }
+    let bottom = caption_limit.max(rect.top + 1);
+    (
+        RegionRect {
+            height: bottom - rect.top,
+            ..rect
+        },
+        true,
+    )
+}
+
+fn caption_overlaps_image(region: &ImageRegion, caption: &Fragment) -> bool {
+    caption.top < region.bottom() && caption.top + caption.height > region.top
+}
+
+fn caption_snap_warning(page: u32, caption_top: i32) -> String {
+    format!(
+        "page {page}: figure crop snapped above caption near y={caption_top}; review duplicated caption risk"
+    )
+}
+
+fn caption_overlap_warning(page: u32, caption_top: i32) -> String {
+    format!(
+        "page {page}: figure caption overlaps image bounds near y={caption_top}; review duplicated caption inside raster"
+    )
+}
+
+fn caption_key(page: u32, spans: &[Span]) -> CaptionKey {
+    CaptionKey {
+        page,
+        text: normalize_caption(&fragment_text(spans)),
+    }
+}
+
+fn figure_caption_fragments(page: &Page) -> Vec<&Fragment> {
+    page.fragments
+        .iter()
+        .filter(|fragment| is_figure_caption_text(&fragment_text(&fragment.spans)))
+        .collect()
+}
+
+fn detect_caption_fragment<'a>(
+    page: &'a Page,
+    region: Option<&ImageRegion>,
+) -> Option<&'a Fragment> {
+    let mut candidates = figure_caption_fragments(page);
+    candidates.sort_by_key(|fragment| fragment.top);
+
+    if let Some(region) = region {
+        let bottom = region.bottom();
+        candidates
+            .into_iter()
+            .filter(|fragment| fragment.top >= bottom.saturating_sub(8))
+            .min_by_key(|fragment| fragment.top.saturating_sub(bottom))
+            .filter(|fragment| fragment.top.saturating_sub(bottom) <= 160)
+    } else {
+        candidates.into_iter().next()
+    }
+}
+
+fn is_figure_caption_text(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    lower.starts_with("figure ")
+        || lower.starts_with("figure\u{00a0}")
+        || lower.starts_with("fig. ")
+        || lower.starts_with("fig.\u{00a0}")
+        || lower.starts_with("fig ")
+}
+
+fn is_caption_text(text: &str) -> bool {
+    is_figure_caption_text(text) || is_table_caption_text(text)
+}
+
+fn is_table_caption_text(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    lower.starts_with("table ") || lower.starts_with("table\u{00a0}")
+}
+
+fn detect_table_caption(page: &Page, rect: RegionRect) -> Option<Vec<Span>> {
+    let mut candidates = page
+        .fragments
+        .iter()
+        .filter(|fragment| is_table_caption_text(&fragment_text(&fragment.spans)))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|fragment| fragment.top);
+
+    candidates
+        .iter()
+        .rev()
+        .find(|fragment| {
+            let bottom = fragment.top + fragment.height;
+            bottom <= rect.top && rect.top.saturating_sub(bottom) <= 140
+        })
+        .or_else(|| {
+            candidates.iter().find(|fragment| {
+                fragment.top >= rect.bottom() && fragment.top.saturating_sub(rect.bottom()) <= 140
+            })
+        })
+        .map(|fragment| fragment.spans.clone())
 }
 
 fn image_asset(image: &ExtractedImage, region: Option<&ImageRegion>) -> Result<ImageAsset> {
@@ -796,65 +1180,6 @@ fn image_asset(image: &ExtractedImage, region: Option<&ImageRegion>) -> Result<I
             .map(|region| region.height)
             .or_else(|| image.height.map(|height| height as i32)),
     })
-}
-
-fn detect_caption(page: &Page, region: Option<&ImageRegion>) -> Option<Vec<Span>> {
-    let mut candidates = page
-        .fragments
-        .iter()
-        .filter(|fragment| is_caption_text(&fragment_text(&fragment.spans)))
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|fragment| fragment.top);
-
-    if let Some(region) = region {
-        let bottom = region.bottom();
-        candidates
-            .into_iter()
-            .filter(|fragment| fragment.top >= bottom.saturating_sub(8))
-            .min_by_key(|fragment| fragment.top.saturating_sub(bottom))
-            .filter(|fragment| fragment.top.saturating_sub(bottom) <= 160)
-            .map(|fragment| fragment.spans.clone())
-    } else {
-        candidates.first().map(|fragment| fragment.spans.clone())
-    }
-}
-
-fn detect_table_caption(page: &Page, rect: RegionRect) -> Option<Vec<Span>> {
-    let mut candidates = page
-        .fragments
-        .iter()
-        .filter(|fragment| is_table_caption_text(&fragment_text(&fragment.spans)))
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|fragment| fragment.top);
-
-    candidates
-        .iter()
-        .rev()
-        .find(|fragment| {
-            let bottom = fragment.top + fragment.height;
-            bottom <= rect.top && rect.top.saturating_sub(bottom) <= 140
-        })
-        .or_else(|| {
-            candidates.iter().find(|fragment| {
-                fragment.top >= rect.bottom() && fragment.top.saturating_sub(rect.bottom()) <= 140
-            })
-        })
-        .map(|fragment| fragment.spans.clone())
-}
-
-fn is_caption_text(text: &str) -> bool {
-    let lower = text.trim_start().to_ascii_lowercase();
-    lower.starts_with("figure ")
-        || lower.starts_with("figure\u{00a0}")
-        || lower.starts_with("fig. ")
-        || lower.starts_with("fig.\u{00a0}")
-        || lower.starts_with("fig ")
-        || is_table_caption_text(text)
-}
-
-fn is_table_caption_text(text: &str) -> bool {
-    let lower = text.trim_start().to_ascii_lowercase();
-    lower.starts_with("table ") || lower.starts_with("table\u{00a0}")
 }
 
 fn insert_figure_blocks(
@@ -974,6 +1299,15 @@ fn baseline_page_char_counts(text: &str, pages: usize) -> Vec<usize> {
 mod tests {
     use super::*;
 
+    const BERT_FIGURE1_CAPTION_BOUNDARY_XML: &str =
+        include_str!("../fixtures/bert_figure1_caption_boundary.xml");
+    const BERT_FIGURE4_MULTIPANEL_XML: &str =
+        include_str!("../fixtures/bert_figure4_multipanel.xml");
+    const BERT_FIGURE5_VECTOR_CHART_XML: &str =
+        include_str!("../fixtures/bert_figure5_vector_chart.xml");
+    const BERT_MODEL_PARAMETER_FALSE_POSITIVE_XML: &str =
+        include_str!("../fixtures/bert_model_parameter_false_positive.xml");
+
     #[cfg(unix)]
     fn write_executable(path: &Path, script: &str) {
         use std::{fs, io::Write, os::unix::fs::PermissionsExt};
@@ -983,6 +1317,34 @@ mod tests {
         file.sync_all().expect("tool fixture sync");
         drop(file);
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("tool executable");
+    }
+
+    #[cfg(unix)]
+    fn fake_pdftohtml_with_xml(path: &Path, xml: &str) {
+        write_executable(
+            path,
+            &format!(
+                r#"#!/bin/sh
+cat <<'XML'
+{xml}
+XML
+"#
+            ),
+        );
+    }
+
+    #[cfg(unix)]
+    fn fake_pdftotext_with_text(path: &Path, text: &str) {
+        write_executable(
+            path,
+            &format!(
+                r#"#!/bin/sh
+cat <<'TEXT'
+{text}
+TEXT
+"#
+            ),
+        );
     }
 
     #[cfg(unix)]
@@ -1006,6 +1368,29 @@ echo "$last-000-000.png"
     }
 
     #[cfg(unix)]
+    fn fake_pdfimages_two(path: &Path) {
+        write_executable(
+            path,
+            r#"#!/bin/sh
+if [ "$1" = "-list" ]; then
+cat <<'LIST'
+page   num  type   width height color comp bpc  enc interp  object ID x-ppi y-ppi size ratio
+--------------------------------------------------------------------------------------------
+   1     0 image     180    90  rgb     3   8  image  no        12  0    72    72  1K  1.0%
+   1     1 image     180    90  rgb     3   8  image  no        13  0    72    72  1K  1.0%
+LIST
+exit 0
+fi
+for last do :; done
+printf 'fake-panel-a' > "$last-000-000.png"
+printf 'fake-panel-b' > "$last-000-001.png"
+echo "$last-000-000.png"
+echo "$last-000-001.png"
+"#,
+        );
+    }
+
+    #[cfg(unix)]
     fn fake_pdfimages_empty(path: &Path) {
         write_executable(
             path,
@@ -1016,6 +1401,17 @@ page   num  type   width height color comp bpc  enc interp  object ID x-ppi y-pp
 --------------------------------------------------------------------------------------------
 LIST
 fi
+"#,
+        );
+    }
+
+    #[cfg(unix)]
+    fn fake_pdftoppm_record_args(path: &Path) {
+        write_executable(
+            path,
+            r#"#!/bin/sh
+for last do :; done
+printf '%s\n' "$*" > "$last.png"
 "#,
         );
     }
@@ -1166,6 +1562,189 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
                 .any(|block| matches!(block.kind, bookforge_core::ir::BlockKind::Caption)),
             "figcaption should remain a normal translatable caption block"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_pdf_snaps_figure_crop_above_caption_boundary_fixture() {
+        use std::{fs, io::Read};
+        use zip::ZipArchive;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.pdf");
+        let output = dir.path().join("output.epub");
+        fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+
+        let pdftohtml = dir.path().join("pdftohtml");
+        fake_pdftohtml_with_xml(&pdftohtml, BERT_FIGURE1_CAPTION_BOUNDARY_XML);
+        let pdftotext = dir.path().join("pdftotext");
+        fake_pdftotext_with_text(
+            &pdftotext,
+            "Results introduce a boundary-sensitive figure.\nFigure 1. Boundary-sensitive raster caption.\nThe caption should be translated once.\n",
+        );
+        let pdfimages = dir.path().join("pdfimages");
+        fake_pdfimages_two(&pdfimages);
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm_record_args(&pdftoppm);
+
+        let tools = PopplerTools {
+            pdftohtml,
+            pdftotext,
+            pdfimages,
+            pdftoppm,
+        };
+        let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+            .expect("conversion should succeed");
+
+        assert_eq!(outcome.report.images, 2);
+        assert_eq!(outcome.report.figures, 1);
+        assert!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("figure crop snapped above caption")),
+            "caption boundary crop should report the snap"
+        );
+
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("<figure id=\"pdf-figure-0001\">"));
+        assert_eq!(
+            content
+                .matches("Figure 1. Boundary-sensitive raster caption.")
+                .count(),
+            1
+        );
+
+        let mut image = String::new();
+        archive
+            .by_name("images/pdf-figure-0001.png")
+            .expect("figure crop exists")
+            .read_to_string(&mut image)
+            .expect("crop args read");
+        assert!(
+            image.contains("-H 100"),
+            "crop should stop above the caption baseline; args were {image:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_pdf_groups_multipanel_figure_fixture_as_one_captioned_crop() {
+        use std::{fs, io::Read};
+        use zip::ZipArchive;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.pdf");
+        let output = dir.path().join("output.epub");
+        fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+
+        let pdftohtml = dir.path().join("pdftohtml");
+        fake_pdftohtml_with_xml(&pdftohtml, BERT_FIGURE4_MULTIPANEL_XML);
+        let pdftotext = dir.path().join("pdftotext");
+        fake_pdftotext_with_text(
+            &pdftotext,
+            "A multi-panel result follows.\nFigure 4. Multi-panel activation maps.\nDiscussion resumes after the figure.\n",
+        );
+        let pdfimages = dir.path().join("pdfimages");
+        fake_pdfimages_two(&pdfimages);
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
+
+        let tools = PopplerTools {
+            pdftohtml,
+            pdftotext,
+            pdfimages,
+            pdftoppm,
+        };
+        let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+            .expect("conversion should succeed");
+
+        assert_eq!(outcome.report.images, 2);
+        assert_eq!(outcome.report.figures, 1);
+
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("<figure id=\"pdf-figure-0001\">"));
+        assert!(!content.contains("pdf-image-0001"));
+        assert!(!content.contains("pdf-image-0002"));
+        assert_eq!(
+            content
+                .matches("Figure 4. Multi-panel activation maps.")
+                .count(),
+            1
+        );
+        assert!(content.contains("Discussion resumes after the figure."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_pdf_preserves_vector_chart_fixture_as_captioned_crop() {
+        use std::{fs, io::Read};
+        use zip::ZipArchive;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.pdf");
+        let output = dir.path().join("output.epub");
+        fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+
+        let pdftohtml = dir.path().join("pdftohtml");
+        fake_pdftohtml_with_xml(&pdftohtml, BERT_FIGURE5_VECTOR_CHART_XML);
+        let pdftotext = dir.path().join("pdftotext");
+        fake_pdftotext_with_text(
+            &pdftotext,
+            "Vector-chart results are below.\n1.0 0.5 0.0 0 10 20 Epoch\nFigure 5. Vector chart of held-out accuracy.\nThe next paragraph should stay prose.\n",
+        );
+        let pdfimages = dir.path().join("pdfimages");
+        fake_pdfimages_empty(&pdfimages);
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
+
+        let tools = PopplerTools {
+            pdftohtml,
+            pdftotext,
+            pdfimages,
+            pdftoppm,
+        };
+        let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+            .expect("conversion should succeed");
+
+        assert_eq!(outcome.report.images, 0);
+        assert_eq!(outcome.report.figures, 1);
+        assert_eq!(outcome.report.tables, 0);
+        assert_eq!(outcome.report.equations, 0);
+
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("<figure id=\"pdf-figure-0001\">"));
+        assert_eq!(
+            content
+                .matches("Figure 5. Vector chart of held-out accuracy.")
+                .count(),
+            1
+        );
+        assert!(content.contains("The next paragraph should stay prose."));
+        assert!(!content.contains("1.0 0.5"));
+        assert!(!content.contains("Epoch"));
     }
 
     #[cfg(unix)]
@@ -1460,26 +2039,12 @@ printf 'The energy term E = mc^2 appears inline.\n'
         fs::write(&input, b"dummy pdf").expect("input pdf fixture");
 
         let pdftohtml = dir.path().join("pdftohtml");
-        write_executable(
-            &pdftohtml,
-            r##"#!/bin/sh
-cat <<'XML'
-<pdf2xml>
-  <page number="1" width="600" height="800">
-    <fontspec id="0" size="12" family="Times" color="#000000"/>
-    <text top="100" left="80" width="440" height="12" font="0">The model = stable result used k = 3 in parentheses (n = 12).</text>
-  </page>
-</pdf2xml>
-XML
-"##,
-        );
+        fake_pdftohtml_with_xml(&pdftohtml, BERT_MODEL_PARAMETER_FALSE_POSITIVE_XML);
 
         let pdftotext = dir.path().join("pdftotext");
-        write_executable(
+        fake_pdftotext_with_text(
             &pdftotext,
-            r#"#!/bin/sh
-printf 'The model = stable result used k = 3 in parentheses (n = 12).\n'
-"#,
+            "The model = stable result used k = 3 in parentheses (n = 12).\n",
         );
         let pdfimages = dir.path().join("pdfimages");
         fake_pdfimages_empty(&pdfimages);

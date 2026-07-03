@@ -1,0 +1,16 @@
+<pdf2xml producer="poppler">
+  <page number="1" width="612" height="792">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <fontspec id="1" size="10" family="Times" color="#000000"/>
+    <text top="30" left="72" width="300" height="12" font="0">Vector-chart results are below.</text>
+    <text top="126" left="112" width="24" height="10" font="1">1.0</text>
+    <text top="196" left="112" width="24" height="10" font="1">0.5</text>
+    <text top="266" left="112" width="24" height="10" font="1">0.0</text>
+    <text top="286" left="180" width="12" height="10" font="1">0</text>
+    <text top="286" left="300" width="18" height="10" font="1">10</text>
+    <text top="286" left="420" width="18" height="10" font="1">20</text>
+    <text top="320" left="265" width="48" height="10" font="1">Epoch</text>
+    <text top="356" left="96" width="390" height="12" font="1">Figure 5. Vector chart of held-out accuracy.</text>
+    <text top="400" left="72" width="330" height="12" font="0">The next paragraph should stay prose.</text>
+  </page>
+</pdf2xml>

@@ -1,0 +1,11 @@
+<pdf2xml producer="poppler">
+  <page number="1" width="612" height="792">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <fontspec id="1" size="10" family="Times" color="#000000"/>
+    <text top="72" left="72" width="280" height="12" font="0">Results introduce a boundary-sensitive figure.</text>
+    <image top="110" left="96" width="180" height="90" src="figure1-a.png"/>
+    <image top="110" left="302" width="180" height="90" src="figure1-b.png"/>
+    <text top="204" left="96" width="360" height="12" font="1">Figure 1. Boundary-sensitive raster caption.</text>
+    <text top="245" left="72" width="340" height="12" font="0">The caption should be translated once.</text>
+  </page>
+</pdf2xml>
