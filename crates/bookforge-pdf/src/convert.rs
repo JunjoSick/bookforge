@@ -11,11 +11,13 @@ use std::{
 use crate::{
     Result,
     epub::write_epub,
-    model::{ColumnMode, DocBlock, ImageAsset, ImageRegion, LowConfidenceMode, Page, Span},
+    model::{
+        ColumnMode, DocBlock, Fragment, ImageAsset, ImageRegion, LowConfidenceMode, Page, Span,
+    },
     parse::parse_pdf2xml,
     reconstruct::{BlockAnchor, PageStats, reconstruct},
     report::{ConversionReport, ReportMetrics},
-    tools::{ExtractedImage, PopplerTools},
+    tools::{ExtractedImage, PageCrop, PopplerTools},
 };
 
 const LOW_CONFIDENCE_COVERAGE: f64 = 0.95;
@@ -66,11 +68,16 @@ fn convert_pdf_with_tools(
     let reconstruction = reconstruct(&pages, options.columns);
     let image_dir = scoped_temp_dir("bookforge-pdf-images")?;
     let extracted_images = tools.extract_images(input, &image_dir)?;
-    let figure_blocks = figure_blocks_from_images(&pages, &extracted_images)?;
+    let mut figure_blocks = figure_blocks_from_images(&pages, &extracted_images)?;
+    let media_dir = scoped_temp_dir("bookforge-pdf-media")?;
+    let media_figures = media_figure_blocks(input, &pages, tools, &media_dir);
+    let _ = fs::remove_dir_all(&media_dir);
+    let _ = fs::remove_dir_all(&image_dir);
+    let media_figures = media_figures?;
+    figure_blocks.extend(media_figures.figures);
     let mut blocks = reconstruction.blocks;
     let mut block_anchors = reconstruction.block_anchors;
     insert_figure_blocks(&mut blocks, &mut block_anchors, figure_blocks);
-    let _ = fs::remove_dir_all(&image_dir);
     let baseline = tools.pdf_to_text(input)?;
     let baseline_chars = baseline.chars().filter(|ch| !ch.is_whitespace()).count();
     let baseline_page_chars = baseline_page_char_counts(&baseline, reconstruction.pages.len());
@@ -115,6 +122,8 @@ fn convert_pdf_with_tools(
             baseline_chars,
             images: extracted_images.len(),
             figures: figure_count,
+            tables: media_figures.counts.tables,
+            equations: media_figures.counts.equations,
         },
     );
 
@@ -229,9 +238,468 @@ fn replace_page_with_preserved_image(
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaKind {
+    Table,
+    Equation,
+}
+
+impl MediaKind {
+    fn id_prefix(self) -> &'static str {
+        match self {
+            MediaKind::Table => "pdf-table",
+            MediaKind::Equation => "pdf-equation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegionRect {
+    page: u32,
+    top: i32,
+    left: i32,
+    width: i32,
+    height: i32,
+}
+
+impl RegionRect {
+    fn right(self) -> i32 {
+        self.left + self.width
+    }
+
+    fn bottom(self) -> i32 {
+        self.top + self.height
+    }
+
+    fn padded(self, page: &Page, padding: i32) -> Self {
+        let left = self.left.saturating_sub(padding).max(0);
+        let top = self.top.saturating_sub(padding).max(0);
+        let right = (self.right() + padding).min(page.width).max(left + 1);
+        let bottom = (self.bottom() + padding).min(page.height).max(top + 1);
+        Self {
+            page: self.page,
+            top,
+            left,
+            width: right - left,
+            height: bottom - top,
+        }
+    }
+
+    fn overlaps_fragment(self, fragment: &crate::model::Fragment) -> bool {
+        fragment.top < self.bottom()
+            && fragment.top + fragment.height > self.top
+            && fragment.left < self.right()
+            && fragment.right() > self.left
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MediaRegion {
+    kind: MediaKind,
+    rect: RegionRect,
+    caption: Option<Vec<Span>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MediaCounts {
+    tables: usize,
+    equations: usize,
+}
+
+struct MediaFigures {
+    figures: Vec<AnchoredFigure>,
+    counts: MediaCounts,
+}
+
 struct AnchoredFigure {
     block: DocBlock,
     anchor: BlockAnchor,
+    text_region: Option<RegionRect>,
+}
+
+fn media_figure_blocks(
+    input: &Path,
+    pages: &[Page],
+    tools: &PopplerTools,
+    output_dir: &Path,
+) -> Result<MediaFigures> {
+    let regions = detect_media_regions(pages);
+    let mut figures = Vec::new();
+    let mut counts = MediaCounts::default();
+
+    for region in regions {
+        let index = match region.kind {
+            MediaKind::Table => {
+                counts.tables += 1;
+                counts.tables
+            }
+            MediaKind::Equation => {
+                counts.equations += 1;
+                counts.equations
+            }
+        };
+        let name = format!("{}-{index:04}", region.kind.id_prefix());
+        let rendered = tools.render_page_crop_png(
+            input,
+            PageCrop {
+                page: region.rect.page,
+                left: region.rect.left,
+                top: region.rect.top,
+                width: region.rect.width,
+                height: region.rect.height,
+            },
+            output_dir,
+            &name,
+        )?;
+        let asset = media_asset(region.kind, index, region.rect, &rendered)?;
+        figures.push(AnchoredFigure {
+            block: DocBlock::Figure {
+                image: asset,
+                caption: region.caption,
+            },
+            anchor: BlockAnchor {
+                page: region.rect.page,
+                top: region.rect.top,
+            },
+            text_region: Some(region.rect),
+        });
+    }
+
+    Ok(MediaFigures { figures, counts })
+}
+
+fn detect_media_regions(pages: &[Page]) -> Vec<MediaRegion> {
+    let mut regions = Vec::new();
+    for page in pages {
+        let mut page_regions = table_regions_for_page(page);
+        let excluded = page_regions
+            .iter()
+            .map(|region| region.rect)
+            .collect::<Vec<_>>();
+        page_regions.extend(equation_regions_for_page(page, &excluded));
+        regions.extend(page_regions);
+    }
+    regions.sort_by_key(|region| {
+        (
+            region.rect.page,
+            region.rect.top,
+            match region.kind {
+                MediaKind::Table => 0,
+                MediaKind::Equation => 1,
+            },
+        )
+    });
+    regions
+}
+
+fn media_asset(kind: MediaKind, index: usize, rect: RegionRect, path: &Path) -> Result<ImageAsset> {
+    let bytes = fs::read(path)?;
+    let prefix = kind.id_prefix();
+    Ok(ImageAsset {
+        id: format!("{prefix}-{index:04}"),
+        href: format!("images/{prefix}-{index:04}.png"),
+        media_type: "image/png".to_string(),
+        bytes,
+        page: rect.page,
+        top: Some(rect.top),
+        left: Some(rect.left),
+        width: Some(rect.width),
+        height: Some(rect.height),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct FragmentRow<'a> {
+    fragments: Vec<&'a Fragment>,
+    top: i32,
+    left: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl<'a> FragmentRow<'a> {
+    fn new(fragment: &'a Fragment) -> Self {
+        Self {
+            fragments: vec![fragment],
+            top: fragment.top,
+            left: fragment.left,
+            right: fragment.right(),
+            bottom: fragment.top + fragment.height,
+        }
+    }
+
+    fn push(&mut self, fragment: &'a Fragment) {
+        self.top = self.top.min(fragment.top);
+        self.left = self.left.min(fragment.left);
+        self.right = self.right.max(fragment.right());
+        self.bottom = self.bottom.max(fragment.top + fragment.height);
+        self.fragments.push(fragment);
+        self.fragments.sort_by_key(|fragment| fragment.left);
+    }
+
+    fn height(&self) -> i32 {
+        self.bottom - self.top
+    }
+}
+
+fn fragment_rows(page: &Page) -> Vec<FragmentRow<'_>> {
+    let mut fragments = page
+        .fragments
+        .iter()
+        .filter(|fragment| fragment.width > 0 && !fragment_text(&fragment.spans).trim().is_empty())
+        .collect::<Vec<_>>();
+    fragments.sort_by_key(|fragment| (fragment.top, fragment.left));
+
+    let mut rows: Vec<FragmentRow<'_>> = Vec::new();
+    for fragment in fragments {
+        let same_row = rows.last().is_some_and(|row| {
+            let tolerance = (row.height().max(fragment.height) / 2).max(3);
+            (fragment.top - row.top).abs() <= tolerance
+        });
+        if same_row {
+            let row = rows.last_mut().expect("checked above");
+            row.push(fragment);
+        } else {
+            rows.push(FragmentRow::new(fragment));
+        }
+    }
+    rows
+}
+
+fn table_regions_for_page(page: &Page) -> Vec<MediaRegion> {
+    let rows = fragment_rows(page);
+    let mut regions = Vec::new();
+    let mut group: Vec<&FragmentRow<'_>> = Vec::new();
+
+    for row in &rows {
+        if is_tableish_row(row) {
+            let continues = group
+                .last()
+                .is_some_and(|last| row.top - last.bottom <= (last.height().max(12) * 3).max(36));
+            if !group.is_empty() && !continues {
+                push_table_region(page, &group, &mut regions);
+                group.clear();
+            }
+            group.push(row);
+        } else if !group.is_empty() {
+            push_table_region(page, &group, &mut regions);
+            group.clear();
+        }
+    }
+    if !group.is_empty() {
+        push_table_region(page, &group, &mut regions);
+    }
+
+    regions
+}
+
+fn push_table_region(page: &Page, rows: &[&FragmentRow<'_>], regions: &mut Vec<MediaRegion>) {
+    if rows.len() < 3 || !table_group_has_aligned_columns(rows) {
+        return;
+    }
+    let rect = rect_from_rows(page, rows).padded(page, 8);
+    regions.push(MediaRegion {
+        kind: MediaKind::Table,
+        rect,
+        caption: detect_table_caption(page, rect),
+    });
+}
+
+fn is_tableish_row(row: &FragmentRow<'_>) -> bool {
+    if row.fragments.len() < 3 {
+        return false;
+    }
+    let numeric_cells = row
+        .fragments
+        .iter()
+        .filter(|fragment| {
+            let text = fragment_text(&fragment.spans);
+            text.chars().any(|ch| ch.is_ascii_digit()) || text.contains('%')
+        })
+        .count();
+    let short_cells = row
+        .fragments
+        .iter()
+        .filter(|fragment| fragment_text(&fragment.spans).trim().chars().count() <= 32)
+        .count();
+
+    numeric_cells >= 2 && short_cells >= row.fragments.len().saturating_sub(1)
+}
+
+fn table_group_has_aligned_columns(rows: &[&FragmentRow<'_>]) -> bool {
+    let mut buckets: HashMap<i32, usize> = HashMap::new();
+    for row in rows {
+        let mut seen = Vec::new();
+        for fragment in &row.fragments {
+            let bucket = fragment.left / 12;
+            if !seen.contains(&bucket) {
+                seen.push(bucket);
+            }
+        }
+        for bucket in seen {
+            *buckets.entry(bucket).or_default() += 1;
+        }
+    }
+    let min_hits = (rows.len() / 2).max(2);
+    buckets.values().filter(|hits| **hits >= min_hits).count() >= 3
+}
+
+fn rect_from_rows(page: &Page, rows: &[&FragmentRow<'_>]) -> RegionRect {
+    let left = rows.iter().map(|row| row.left).min().unwrap_or(0);
+    let right = rows.iter().map(|row| row.right).max().unwrap_or(page.width);
+    let top = rows.iter().map(|row| row.top).min().unwrap_or(0);
+    let bottom = rows
+        .iter()
+        .map(|row| row.bottom)
+        .max()
+        .unwrap_or(page.height);
+    RegionRect {
+        page: page.number,
+        top,
+        left,
+        width: right - left,
+        height: bottom - top,
+    }
+}
+
+fn equation_regions_for_page(page: &Page, excluded: &[RegionRect]) -> Vec<MediaRegion> {
+    let mut fragments = page
+        .fragments
+        .iter()
+        .filter(|fragment| {
+            !excluded
+                .iter()
+                .any(|region| region.overlaps_fragment(fragment))
+                && is_display_equation_fragment(page, fragment)
+        })
+        .collect::<Vec<_>>();
+    fragments.sort_by_key(|fragment| (fragment.top, fragment.left));
+
+    let mut regions = Vec::new();
+    let mut group: Vec<&Fragment> = Vec::new();
+    for fragment in fragments {
+        let continues = group.last().is_some_and(|last| {
+            fragment.top - (last.top + last.height)
+                <= (last.height.max(fragment.height) * 2).max(24)
+        });
+        if !group.is_empty() && !continues {
+            push_equation_region(page, &group, &mut regions);
+            group.clear();
+        }
+        group.push(fragment);
+    }
+    if !group.is_empty() {
+        push_equation_region(page, &group, &mut regions);
+    }
+
+    regions
+}
+
+fn push_equation_region(page: &Page, fragments: &[&Fragment], regions: &mut Vec<MediaRegion>) {
+    let rect = rect_from_fragments(page, fragments).padded(page, 10);
+    regions.push(MediaRegion {
+        kind: MediaKind::Equation,
+        rect,
+        caption: None,
+    });
+}
+
+fn rect_from_fragments(page: &Page, fragments: &[&Fragment]) -> RegionRect {
+    let left = fragments
+        .iter()
+        .map(|fragment| fragment.left)
+        .min()
+        .unwrap_or(0);
+    let right = fragments
+        .iter()
+        .map(|fragment| fragment.right())
+        .max()
+        .unwrap_or(page.width);
+    let top = fragments
+        .iter()
+        .map(|fragment| fragment.top)
+        .min()
+        .unwrap_or(0);
+    let bottom = fragments
+        .iter()
+        .map(|fragment| fragment.top + fragment.height)
+        .max()
+        .unwrap_or(page.height);
+    RegionRect {
+        page: page.number,
+        top,
+        left,
+        width: right - left,
+        height: bottom - top,
+    }
+}
+
+fn is_display_equation_fragment(page: &Page, fragment: &Fragment) -> bool {
+    let text = fragment_text(&fragment.spans);
+    let trimmed = text.trim();
+    if trimmed.chars().count() < 3 || is_caption_text(trimmed) {
+        return false;
+    }
+    let nonspace = trimmed.chars().filter(|ch| !ch.is_whitespace()).count();
+    let math_symbols = trimmed.chars().filter(|ch| is_math_symbol(*ch)).count();
+    let word_count = trimmed.split_whitespace().count();
+    let centered = ((fragment.left + fragment.width / 2) - page.width / 2).abs() <= page.width / 5;
+    let short = fragment.width <= page.width * 7 / 10;
+    let has_strong_operator = trimmed.contains('=')
+        || trimmed.chars().any(|ch| {
+            matches!(
+                ch,
+                '\u{2211}'
+                    | '\u{222b}'
+                    | '\u{221a}'
+                    | '\u{2264}'
+                    | '\u{2265}'
+                    | '\u{2248}'
+                    | '\u{2260}'
+            )
+        });
+
+    centered
+        && short
+        && has_strong_operator
+        && word_count <= 8
+        && math_symbols >= 2
+        && math_symbols * 3 >= nonspace
+}
+
+fn is_math_symbol(ch: char) -> bool {
+    matches!(
+        ch,
+        '=' | '+'
+            | '-'
+            | '*'
+            | '/'
+            | '^'
+            | '_'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '|'
+            | '<'
+            | '>'
+            | '\u{2211}'
+            | '\u{222b}'
+            | '\u{221a}'
+            | '\u{2264}'
+            | '\u{2265}'
+            | '\u{2248}'
+            | '\u{2260}'
+            | '\u{00b1}'
+            | '\u{00d7}'
+            | '\u{00f7}'
+            | '\u{2202}'
+            | '\u{2207}'
+            | '\u{221e}'
+            | '\u{2208}'
+    )
 }
 
 fn figure_blocks_from_images(
@@ -263,6 +731,7 @@ fn figure_blocks_from_images(
                 page: image.page,
                 top,
             },
+            text_region: None,
         });
     }
 
@@ -318,6 +787,29 @@ fn detect_caption(page: &Page, region: Option<&ImageRegion>) -> Option<Vec<Span>
     }
 }
 
+fn detect_table_caption(page: &Page, rect: RegionRect) -> Option<Vec<Span>> {
+    let mut candidates = page
+        .fragments
+        .iter()
+        .filter(|fragment| is_table_caption_text(&fragment_text(&fragment.spans)))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|fragment| fragment.top);
+
+    candidates
+        .iter()
+        .rev()
+        .find(|fragment| {
+            let bottom = fragment.top + fragment.height;
+            bottom <= rect.top && rect.top.saturating_sub(bottom) <= 140
+        })
+        .or_else(|| {
+            candidates.iter().find(|fragment| {
+                fragment.top >= rect.bottom() && fragment.top.saturating_sub(rect.bottom()) <= 140
+            })
+        })
+        .map(|fragment| fragment.spans.clone())
+}
+
 fn is_caption_text(text: &str) -> bool {
     let lower = text.trim_start().to_ascii_lowercase();
     lower.starts_with("figure ")
@@ -325,8 +817,12 @@ fn is_caption_text(text: &str) -> bool {
         || lower.starts_with("fig. ")
         || lower.starts_with("fig.\u{00a0}")
         || lower.starts_with("fig ")
-        || lower.starts_with("table ")
-        || lower.starts_with("table\u{00a0}")
+        || is_table_caption_text(text)
+}
+
+fn is_table_caption_text(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    lower.starts_with("table ") || lower.starts_with("table\u{00a0}")
 }
 
 fn insert_figure_blocks(
@@ -338,6 +834,9 @@ fn insert_figure_blocks(
     let count = figures.len();
 
     for figure in figures {
+        if let Some(region) = figure.text_region {
+            remove_blocks_in_region(blocks, block_anchors, region);
+        }
         if let DocBlock::Figure {
             caption: Some(caption),
             ..
@@ -363,6 +862,23 @@ fn insert_figure_blocks(
     }
 
     count
+}
+
+fn remove_blocks_in_region(
+    blocks: &mut Vec<DocBlock>,
+    block_anchors: &mut Vec<BlockAnchor>,
+    region: RegionRect,
+) {
+    let mut index = 0;
+    while index < block_anchors.len() {
+        let anchor = block_anchors[index];
+        if anchor.page == region.page && anchor.top >= region.top && anchor.top <= region.bottom() {
+            blocks.remove(index);
+            block_anchors.remove(index);
+        } else {
+            index += 1;
+        }
+    }
 }
 
 fn remove_duplicate_caption_block(
@@ -615,6 +1131,169 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
                 .any(|block| matches!(block.kind, bookforge_core::ir::BlockKind::Caption)),
             "figcaption should remain a normal translatable caption block"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_pdf_preserves_detected_table_as_crop_with_caption() {
+        use std::{fs, io::Read};
+        use zip::ZipArchive;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.pdf");
+        let output = dir.path().join("output.epub");
+        fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+
+        let pdftohtml = dir.path().join("pdftohtml");
+        write_executable(
+            &pdftohtml,
+            r##"#!/bin/sh
+cat <<'XML'
+<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="80" left="100" width="260" height="12" font="0">Body before table.</text>
+    <text top="120" left="100" width="220" height="12" font="0">Table 1. Scores.</text>
+    <text top="170" left="100" width="50" height="12" font="0">Metric</text>
+    <text top="170" left="240" width="40" height="12" font="0">2019</text>
+    <text top="170" left="360" width="40" height="12" font="0">2020</text>
+    <text top="190" left="100" width="20" height="12" font="0">A</text>
+    <text top="190" left="240" width="40" height="12" font="0">0.91</text>
+    <text top="190" left="360" width="40" height="12" font="0">0.93</text>
+    <text top="210" left="100" width="20" height="12" font="0">B</text>
+    <text top="210" left="240" width="40" height="12" font="0">0.81</text>
+    <text top="210" left="360" width="40" height="12" font="0">0.84</text>
+    <text top="280" left="100" width="260" height="12" font="0">Body after table.</text>
+  </page>
+</pdf2xml>
+XML
+"##,
+        );
+
+        let pdftotext = dir.path().join("pdftotext");
+        write_executable(
+            &pdftotext,
+            r#"#!/bin/sh
+printf 'Body before table.\nTable 1. Scores.\nMetric 2019 2020\nA 0.91 0.93\nB 0.81 0.84\nBody after table.\n'
+"#,
+        );
+        let pdfimages = dir.path().join("pdfimages");
+        fake_pdfimages_empty(&pdfimages);
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
+
+        let tools = PopplerTools {
+            pdftohtml,
+            pdftotext,
+            pdfimages,
+            pdftoppm,
+        };
+        let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+            .expect("conversion should succeed");
+
+        assert_eq!(outcome.report.tables, 1);
+        assert_eq!(outcome.report.equations, 0);
+        assert_eq!(outcome.report.figures, 1);
+
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("Body before table."));
+        assert!(content.contains("Body after table."));
+        assert!(content.contains("<figure id=\"pdf-table-0001\">"));
+        assert!(content.contains("<figcaption>Table 1. Scores.</figcaption>"));
+        assert_eq!(content.matches("Table 1. Scores.").count(), 1);
+        assert!(!content.contains("0.91"));
+        assert!(!content.contains("2019"));
+
+        let mut image = Vec::new();
+        archive
+            .by_name("images/pdf-table-0001.png")
+            .expect("table crop exists")
+            .read_to_end(&mut image)
+            .expect("image reads");
+        assert_eq!(image, b"fake-page");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_pdf_preserves_display_equation_as_crop() {
+        use std::{fs, io::Read};
+        use zip::ZipArchive;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.pdf");
+        let output = dir.path().join("output.epub");
+        fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+
+        let pdftohtml = dir.path().join("pdftohtml");
+        write_executable(
+            &pdftohtml,
+            r##"#!/bin/sh
+cat <<'XML'
+<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="80" left="100" width="260" height="12" font="0">Body before equation.</text>
+    <text top="160" left="240" width="120" height="12" font="0">E = mc^2</text>
+    <text top="230" left="100" width="260" height="12" font="0">Body after equation.</text>
+  </page>
+</pdf2xml>
+XML
+"##,
+        );
+
+        let pdftotext = dir.path().join("pdftotext");
+        write_executable(
+            &pdftotext,
+            r#"#!/bin/sh
+printf 'Body before equation.\nE = mc^2\nBody after equation.\n'
+"#,
+        );
+        let pdfimages = dir.path().join("pdfimages");
+        fake_pdfimages_empty(&pdfimages);
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
+
+        let tools = PopplerTools {
+            pdftohtml,
+            pdftotext,
+            pdfimages,
+            pdftoppm,
+        };
+        let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+            .expect("conversion should succeed");
+
+        assert_eq!(outcome.report.tables, 0);
+        assert_eq!(outcome.report.equations, 1);
+        assert_eq!(outcome.report.figures, 1);
+
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("Body before equation."));
+        assert!(content.contains("Body after equation."));
+        assert!(content.contains("<figure id=\"pdf-equation-0001\">"));
+        assert!(content.contains("images/pdf-equation-0001.png"));
+        assert!(!content.contains("E = mc^2"));
+
+        let mut image = Vec::new();
+        archive
+            .by_name("images/pdf-equation-0001.png")
+            .expect("equation crop exists")
+            .read_to_end(&mut image)
+            .expect("image reads");
+        assert_eq!(image, b"fake-page");
     }
 
     #[cfg(unix)]

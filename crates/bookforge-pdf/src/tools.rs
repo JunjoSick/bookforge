@@ -48,6 +48,15 @@ pub struct ExtractedImage {
     pub extension: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCrop {
+    pub page: u32,
+    pub left: i32,
+    pub top: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 impl PopplerTools {
     /// Locate the required poppler binaries or explain what is missing.
     pub fn discover() -> Result<Self, ToolError> {
@@ -180,6 +189,52 @@ impl PopplerTools {
                 "-png",
                 "-r",
                 "150",
+            ])
+            .arg(pdf)
+            .arg(&root)
+            .output()?;
+        if !output.status.success() {
+            return Err(ToolError::Failed {
+                tool: "pdftoppm",
+                code: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        Ok(root.with_extension("png"))
+    }
+
+    pub fn render_page_crop_png(
+        &self,
+        pdf: &Path,
+        crop: PageCrop,
+        output_dir: &Path,
+        name: &str,
+    ) -> Result<PathBuf, ToolError> {
+        fs::create_dir_all(output_dir)?;
+        let root = output_dir.join(name);
+        let page_arg = crop.page.to_string();
+        let left_arg = crop.left.to_string();
+        let top_arg = crop.top.to_string();
+        let width_arg = crop.width.to_string();
+        let height_arg = crop.height.to_string();
+        let output = Command::new(&self.pdftoppm)
+            .args([
+                "-f",
+                &page_arg,
+                "-l",
+                &page_arg,
+                "-singlefile",
+                "-png",
+                "-r",
+                "150",
+                "-x",
+                &left_arg,
+                "-y",
+                &top_arg,
+                "-W",
+                &width_arg,
+                "-H",
+                &height_arg,
             ])
             .arg(pdf)
             .arg(&root)

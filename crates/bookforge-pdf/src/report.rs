@@ -22,6 +22,8 @@ pub struct ConversionReport {
     pub two_column_pages: usize,
     pub images: usize,
     pub figures: usize,
+    pub tables: usize,
+    pub equations: usize,
     pub low_confidence_pages: usize,
     pub page_stats: Vec<PageStats>,
     pub warnings: Vec<String>,
@@ -34,6 +36,8 @@ pub struct ReportMetrics {
     pub baseline_chars: usize,
     pub images: usize,
     pub figures: usize,
+    pub tables: usize,
+    pub equations: usize,
 }
 
 impl ConversionReport {
@@ -82,6 +86,8 @@ impl ConversionReport {
             two_column_pages: page_stats.iter().filter(|page| page.two_column).count(),
             images: metrics.images,
             figures: metrics.figures,
+            tables: metrics.tables,
+            equations: metrics.equations,
             low_confidence_pages: page_stats.iter().filter(|page| page.low_confidence).count(),
             page_stats,
             warnings,
@@ -90,12 +96,14 @@ impl ConversionReport {
 
     pub fn summary(&self) -> String {
         let mut out = format!(
-            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nImages: {} extracted, {} figure block(s)\nLow-confidence pages: {}\nText coverage vs pdftotext: {:.1}% ({} reconstructed / {} baseline characters)\n",
+            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nImages: {} extracted, {} figure block(s)\nTables: {} crop(s)\nEquations: {} crop(s)\nLow-confidence pages: {}\nText coverage vs pdftotext: {:.1}% ({} reconstructed / {} baseline characters)\n",
             self.pages,
             self.blocks,
             self.two_column_pages,
             self.images,
             self.figures,
+            self.tables,
+            self.equations,
             self.low_confidence_pages,
             self.coverage_percent,
             self.reconstructed_chars,
@@ -137,6 +145,8 @@ mod tests {
                 baseline_chars: 100,
                 images: 0,
                 figures: 0,
+                tables: 0,
+                equations: 0,
             },
         );
 
@@ -169,6 +179,8 @@ mod tests {
                 baseline_chars: 0,
                 images: 0,
                 figures: 0,
+                tables: 0,
+                equations: 0,
             },
         );
 
@@ -196,6 +208,8 @@ mod tests {
                 baseline_chars: 42,
                 images: 0,
                 figures: 0,
+                tables: 0,
+                equations: 0,
             },
         );
 
@@ -225,6 +239,8 @@ mod tests {
                 baseline_chars: 100,
                 images: 0,
                 figures: 1,
+                tables: 0,
+                equations: 0,
             },
         );
 
