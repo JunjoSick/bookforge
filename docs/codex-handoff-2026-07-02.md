@@ -281,6 +281,94 @@ step below, not just more stub tests.
 3. Text-only degraded mode: rename pdfimages away, convert a text PDF,
    confirm an EPUB is still produced with a warning.
 
+## Task 5 (added 2026-07-03) — heuristic fixes from the real BERT acceptance run
+
+Task 4 shipped and was verified end-to-end against arXiv 1810.04805 with
+real poppler (commit 682aa8f): crop geometry, coverage crediting, and the
+degraded text-only mode are all confirmed good. The visual read-through
+found three remaining heuristic problems. The test PDF is available at
+`/tmp/claude-1000/-home-junjo-Desktop-tRustTheProcess/0e5a3f15-2fec-4135-967b-aea61ff5e4d7/scratchpad/bert.pdf`
+(775166 bytes, 16 pages, A4) — use it for the acceptance re-run; if
+unreadable from the sandbox, distill XML fixtures from it as before.
+
+### 5.1 Vector-figure regions are too greedy (page 16 evidence)
+
+`pdf-figure-0005.png` captured the intended chart (bottom-left column,
+"MNLI Dev Accuracy" plot) PLUS the section heading "C.2 Ablation for
+Different Masking Procedures" and full paragraphs from BOTH text columns.
+Those paragraphs (one of 119 chars) were then removed as "preserved as
+image" — translatable prose became untranslatable pixels. The audit
+warnings from Task 4 itemize exactly which text was absorbed (grep the
+convert output for "preserved as image").
+
+Fix direction, in `vector_figure_regions` / region growth:
+- Build the region from the chart-label fragments and drawn-graphic
+  extents only; do not let caption width or the 360px lookback drag in
+  full-width bands.
+- On pages detected as two-column (`two_column` per-page stat already
+  exists), clamp the region horizontally to the column that contains the
+  labels' centroid.
+- Never absorb prose-like fragments into a region: a fragment with (say)
+  > 6 words and sentence punctuation is prose; if it would fall inside a
+  candidate region, shrink the region below it rather than swallow it.
+  If shrinking is impossible, keep the block as text and warn — for a
+  translation tool, wrongly-imaged prose is worse than a slightly
+  cropped chart.
+
+### 5.2 Table/equation detectors fire inside figures
+
+Evidence: `pdf-table-0007.png` and `pdf-table-0008.png` are horizontal
+strips sliced out of Figure 1's diagram (aligned E_[CLS]/E_1/…/E_N token
+boxes read as "aligned numeric cells"); the single equation crop
+`pdf-equation-0001.png` is actually the table header cell "MNLI-(m/mm)
+392k" — no display equation at all.
+
+Fix direction:
+- Exclude any row/fragment that intersects an extracted-image region or
+  a detected figure region from table and equation candidacy — media
+  regions must be disjoint by construction (one classification per area,
+  figures win over tables over equations).
+- Investigate which gate admitted "MNLI-(m/mm)": determine what counted
+  as the strong operator ('/'? '-'?) and tighten `has_strong_operator`
+  to genuine relational/aggregation operators (=, <, >, ≤, ≥, ∑, ∫, …) —
+  not slashes, hyphens, or parens. Add "MNLI-(m/mm) 392k" as a negative
+  fixture.
+- Diagram token rows: add the Figure 1 strip as a negative fixture for
+  the table detector (distill from the BERT XML).
+
+### 5.3 Cluster diagram sub-images into one figure
+
+The paper's ~5 real figures became 52 figure blocks because each vector
+diagram is drawn with many small raster XObjects (38 extracted images:
+arrows, ellipsis dots, colored boxes — see `pdf-image-0035.png`, a strip
+of ellipses). Each currently becomes its own Figure block in the reading
+flow.
+
+Fix direction:
+- Cluster image regions on the same page whose rects overlap or sit
+  within ~24 XML units of each other into one composite region; render
+  ONE crop for the cluster (the padded union rect) and emit ONE figure
+  block.
+- If a cluster (or single image) falls inside an already-detected
+  vector-figure region, it is part of that figure — drop it, don't emit
+  it separately.
+- Keep the Task 4 decorative/repeated-raster filtering for what remains.
+
+### Acceptance for task 5 (blocking)
+
+1. Unit fixtures: page-16 two-column chart (region must exclude both
+   prose columns), Figure 1 token-row strip (not a table), "MNLI-(m/mm)
+   392k" (not an equation), and a multi-raster diagram page (one figure
+   block out).
+2. Re-run the BERT conversion (command as in Task 4 acceptance): report
+   must show roughly 5-8 figure blocks (not 52), tables only for the real
+   tables, no equation crops unless a real display equation is found, and
+   no "preserved as image" warning containing a prose paragraph (> ~60
+   chars with sentence punctuation) — chart labels and captions are fine.
+3. Full workspace check/test/clippy/fmt clean. Commit in logical units.
+   Claude does the final visual pass on the crops before the PR leaves
+   draft.
+
 ## Verification expectations (all tasks)
 
 - `cargo check --workspace --all-features`, `cargo test --workspace`,

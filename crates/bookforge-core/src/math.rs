@@ -37,5 +37,8 @@ pub fn is_inline_math_operator(ch: char) -> bool {
 
 pub fn is_strong_inline_math_operator(ch: char) -> bool {
     is_inline_math_operator(ch)
-        && !matches!(ch, '_' | '-' | '(' | ')' | '[' | ']' | '{' | '}' | '|')
+        && !matches!(
+            ch,
+            '_' | '-' | '/' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+        )
 }

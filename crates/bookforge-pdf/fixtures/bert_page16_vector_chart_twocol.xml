@@ -1,0 +1,26 @@
+<pdf2xml producer="poppler">
+  <page number="16" width="612" height="792">
+    <fontspec id="0" size="10" family="Times" color="#000000"/>
+    <fontspec id="1" size="8" family="Times" color="#000000"/>
+    <fontspec id="2" size="12" family="Times" color="#000000"/>
+    <text top="72" left="72" width="220" height="10" font="0">Left column prose starts this appendix page.</text>
+    <text top="88" left="72" width="220" height="10" font="0">It has enough sentence text to remain translatable.</text>
+    <text top="104" left="72" width="220" height="10" font="0">The detector must not preserve this line as pixels.</text>
+    <text top="72" left="324" width="220" height="10" font="0">Right column prose starts beside the chart.</text>
+    <text top="88" left="324" width="220" height="10" font="0">It also has enough sentence text to remain translatable.</text>
+    <text top="104" left="324" width="220" height="10" font="0">The chart crop must not cross into this column.</text>
+    <text top="342" left="72" width="230" height="12" font="2">C.2 Ablation for Different Masking Procedures</text>
+    <text top="366" left="72" width="230" height="10" font="0">This paragraph describes the ablation and must stay as text.</text>
+    <text top="382" left="72" width="230" height="10" font="0">Wrongly imaging prose here would make translation worse.</text>
+    <text top="366" left="324" width="220" height="10" font="0">The opposite column continues with ordinary prose.</text>
+    <text top="382" left="324" width="220" height="10" font="0">It should be outside the vector figure region.</text>
+    <text top="508" left="86" width="20" height="8" font="1">1.0</text>
+    <text top="568" left="86" width="20" height="8" font="1">0.9</text>
+    <text top="628" left="86" width="20" height="8" font="1">0.8</text>
+    <text top="646" left="130" width="8" height="8" font="1">0</text>
+    <text top="646" left="198" width="14" height="8" font="1">10</text>
+    <text top="646" left="266" width="14" height="8" font="1">20</text>
+    <text top="664" left="148" width="90" height="8" font="1">MNLI Dev Accuracy</text>
+    <text top="692" left="72" width="230" height="10" font="0">Figure 5. MNLI Dev Accuracy for masking ablations.</text>
+  </page>
+</pdf2xml>

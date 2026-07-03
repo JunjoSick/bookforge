@@ -93,11 +93,18 @@ fn convert_pdf_with_tools(
         }
     };
     let mut crop_renderer = PageCropRenderer::new(input, tools, &page_render_dir);
-    let figure_result =
-        figure_blocks_from_images(&pages, &extracted_images, &mut crop_renderer, &media_dir)?;
+    let figure_result = figure_blocks_from_images(
+        &pages,
+        &page_stats,
+        &extracted_images,
+        &mut crop_renderer,
+        &media_dir,
+    )?;
+    let media_exclusions = figure_result.exclusions.clone();
     let mut figure_blocks = figure_result.figures;
     layout_warnings.extend(figure_result.warnings);
-    let media_figures = media_figure_blocks(&pages, &mut crop_renderer, &media_dir)?;
+    let media_figures =
+        media_figure_blocks(&pages, &media_exclusions, &mut crop_renderer, &media_dir)?;
     let _ = fs::remove_dir_all(&media_dir);
     let _ = fs::remove_dir_all(&image_dir);
     let _ = fs::remove_dir_all(&page_render_dir);
@@ -370,6 +377,39 @@ impl RegionRect {
             && fragment.left < self.right()
             && fragment.right() > self.left
     }
+
+    fn area(self) -> i64 {
+        i64::from(self.width.max(0)) * i64::from(self.height.max(0))
+    }
+
+    fn overlap_area(self, other: Self) -> i64 {
+        if self.page != other.page {
+            return 0;
+        }
+        let left = self.left.max(other.left);
+        let right = self.right().min(other.right());
+        let top = self.top.max(other.top);
+        let bottom = self.bottom().min(other.bottom());
+        i64::from((right - left).max(0)) * i64::from((bottom - top).max(0))
+    }
+
+    fn touches_within(self, other: Self, gap: i32) -> bool {
+        self.page == other.page
+            && self.left <= other.right().saturating_add(gap)
+            && other.left <= self.right().saturating_add(gap)
+            && self.top <= other.bottom().saturating_add(gap)
+            && other.top <= self.bottom().saturating_add(gap)
+    }
+}
+
+fn region_rect_from_image_region(page: u32, region: &ImageRegion) -> RegionRect {
+    RegionRect {
+        page,
+        top: region.top,
+        left: region.left,
+        width: region.width,
+        height: region.height,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -400,12 +440,7 @@ struct AnchoredFigure {
 struct FigureBlocks {
     figures: Vec<AnchoredFigure>,
     warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct CaptionKey {
-    page: u32,
-    text: String,
+    exclusions: Vec<RegionRect>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -460,10 +495,11 @@ impl<'a> PageCropRenderer<'a> {
 
 fn media_figure_blocks(
     pages: &[Page],
+    figure_exclusions: &[RegionRect],
     crop_renderer: &mut PageCropRenderer<'_>,
     output_dir: &Path,
 ) -> Result<MediaFigures> {
-    let regions = detect_media_regions(pages);
+    let regions = detect_media_regions(pages, figure_exclusions);
     let mut figures = Vec::new();
     let mut counts = MediaCounts::default();
     let mut warnings = Vec::new();
@@ -527,14 +563,17 @@ fn media_figure_blocks(
     })
 }
 
-fn detect_media_regions(pages: &[Page]) -> Vec<MediaRegion> {
+fn detect_media_regions(pages: &[Page], figure_exclusions: &[RegionRect]) -> Vec<MediaRegion> {
     let mut regions = Vec::new();
     for page in pages {
-        let mut page_regions = table_regions_for_page(page);
-        let excluded = page_regions
-            .iter()
-            .map(|region| region.rect)
-            .collect::<Vec<_>>();
+        let mut excluded = media_exclusion_regions_for_page(page, figure_exclusions);
+        let mut page_regions = table_regions_for_page(page, &excluded);
+        excluded.extend(
+            page_regions
+                .iter()
+                .map(|region| region.rect)
+                .collect::<Vec<_>>(),
+        );
         page_regions.extend(equation_regions_for_page(page, &excluded));
         regions.extend(page_regions);
     }
@@ -549,6 +588,24 @@ fn detect_media_regions(pages: &[Page]) -> Vec<MediaRegion> {
         )
     });
     regions
+}
+
+fn media_exclusion_regions_for_page(
+    page: &Page,
+    figure_exclusions: &[RegionRect],
+) -> Vec<RegionRect> {
+    let mut excluded = page
+        .images
+        .iter()
+        .map(|region| region_rect_from_image_region(page.number, region))
+        .collect::<Vec<_>>();
+    excluded.extend(
+        figure_exclusions
+            .iter()
+            .filter(|region| region.page == page.number)
+            .copied(),
+    );
+    excluded
 }
 
 fn media_asset(kind: MediaKind, index: usize, rect: RegionRect, path: &Path) -> Result<ImageAsset> {
@@ -625,12 +682,19 @@ fn fragment_rows(page: &Page) -> Vec<FragmentRow<'_>> {
     rows
 }
 
-fn table_regions_for_page(page: &Page) -> Vec<MediaRegion> {
+fn table_regions_for_page(page: &Page, excluded: &[RegionRect]) -> Vec<MediaRegion> {
     let rows = fragment_rows(page);
     let mut regions = Vec::new();
     let mut group: Vec<&FragmentRow<'_>> = Vec::new();
 
     for row in &rows {
+        if row_overlaps_excluded_region(row, excluded) {
+            if !group.is_empty() {
+                push_table_region(page, &group, &mut regions);
+                group.clear();
+            }
+            continue;
+        }
         if is_tableish_row(row) {
             let continues = group
                 .last()
@@ -650,6 +714,14 @@ fn table_regions_for_page(page: &Page) -> Vec<MediaRegion> {
     }
 
     regions
+}
+
+fn row_overlaps_excluded_region(row: &FragmentRow<'_>, excluded: &[RegionRect]) -> bool {
+    excluded.iter().any(|region| {
+        row.fragments
+            .iter()
+            .any(|fragment| region.overlaps_fragment(fragment))
+    })
 }
 
 fn push_table_region(page: &Page, rows: &[&FragmentRow<'_>], regions: &mut Vec<MediaRegion>) {
@@ -836,6 +908,7 @@ fn is_single_parenthetical(text: &str) -> bool {
 
 fn figure_blocks_from_images(
     pages: &[Page],
+    page_stats: &[PageStats],
     images: &[ExtractedImage],
     crop_renderer: &mut PageCropRenderer<'_>,
     output_dir: &Path,
@@ -846,49 +919,50 @@ fn figure_blocks_from_images(
         .collect::<HashMap<_, _>>();
     let candidates = image_figure_candidates(&pages_by_number, images);
     let repeated_regionless = repeated_regionless_image_signatures(&candidates);
-    let handled_captions = candidates
+    let two_column_pages = page_stats
         .iter()
-        .filter(|candidate| candidate.region.is_some())
-        .filter_map(|candidate| Some(caption_key(candidate.image.page, &candidate.caption?.spans)))
+        .filter(|stats| stats.two_column)
+        .map(|stats| stats.page)
         .collect::<HashSet<_>>();
-    let mut used_images = vec![false; candidates.len()];
-    let mut figures = Vec::new();
     let mut warnings = Vec::new();
+    let vector_regions = vector_figure_regions(pages, &two_column_pages, &mut warnings);
+    let vector_rects = vector_regions
+        .iter()
+        .filter_map(|region| {
+            let page = pages_by_number.get(&region.rect.page).copied()?;
+            Some(snap_rect_above_caption(region.rect.padded(page, 48), region.caption).0)
+        })
+        .collect::<Vec<_>>();
+    let mut used_images = vec![false; candidates.len()];
+    for (index, candidate) in candidates.iter().enumerate() {
+        if candidate_region_rect(candidate)
+            .is_some_and(|rect| region_covered_by_any(rect, &vector_rects))
+        {
+            used_images[index] = true;
+        }
+    }
+    let mut figures = Vec::new();
+    let mut exclusions = Vec::new();
     let mut figure_crop_count = 0;
 
-    for (index, candidate) in candidates.iter().enumerate() {
-        if used_images[index] {
+    for cluster in image_candidate_clusters(&candidates, &used_images, &pages_by_number) {
+        if cluster.len() < 2 {
             continue;
         }
-        let (Some(_region), Some(caption)) = (candidate.region, candidate.caption) else {
+        let page_number = candidates[cluster[0]].image.page;
+        let Some(page) = pages_by_number.get(&page_number).copied() else {
             continue;
         };
-        let key = caption_key(candidate.image.page, &caption.spans);
-        let group = candidates
+        let regions = cluster
             .iter()
-            .enumerate()
-            .filter(|(group_index, group_candidate)| {
-                !used_images[*group_index]
-                    && group_candidate.region.is_some()
-                    && group_candidate.caption.is_some_and(|group_caption| {
-                        caption_key(group_candidate.image.page, &group_caption.spans) == key
-                    })
-            })
+            .filter_map(|index| candidate_region_rect(&candidates[*index]))
             .collect::<Vec<_>>();
-        if group.len() < 2 {
-            continue;
-        }
-
-        let Some(page) = pages_by_number.get(&candidate.image.page).copied() else {
-            continue;
-        };
-        let regions = group
-            .iter()
-            .filter_map(|(_, candidate)| candidate.region)
-            .collect::<Vec<_>>();
-        let text_rect = rect_from_image_regions(page, &regions);
+        let text_rect = rect_from_region_rects(page, &regions);
         let rect = text_rect.padded(page, 8);
-        let (rect, snapped) = snap_rect_above_caption(rect, caption);
+        let caption = detect_caption_fragment_for_rect(page, Some(text_rect));
+        let (rect, snapped) = caption
+            .map(|caption| snap_rect_above_caption(rect, caption))
+            .unwrap_or((rect, false));
         figure_crop_count += 1;
         let asset = match render_figure_crop(
             crop_renderer,
@@ -907,13 +981,13 @@ fn figure_blocks_from_images(
                 continue;
             }
         };
-        if snapped {
+        if snapped && let Some(caption) = caption {
             warnings.push(caption_snap_warning(rect.page, caption.top));
         }
         figures.push(AnchoredFigure {
             block: DocBlock::Figure {
                 image: asset,
-                caption: Some(caption.spans.clone()),
+                caption: caption.map(|caption| caption.spans.clone()),
             },
             anchor: BlockAnchor {
                 page: rect.page,
@@ -923,7 +997,8 @@ fn figure_blocks_from_images(
             },
             text_region: Some(text_rect),
         });
-        for (group_index, _) in group {
+        exclusions.push(text_rect);
+        for group_index in cluster {
             used_images[group_index] = true;
         }
     }
@@ -968,7 +1043,7 @@ fn figure_blocks_from_images(
         });
     }
 
-    for region in vector_figure_regions(pages, &handled_captions) {
+    for region in vector_regions {
         figure_crop_count += 1;
         let rect = region.rect.padded(
             pages_by_number
@@ -1011,9 +1086,164 @@ fn figure_blocks_from_images(
             },
             text_region: Some(region.rect),
         });
+        exclusions.push(region.rect);
+    }
+    drop_overlapping_uncaptioned_figures(&mut figures);
+
+    Ok(FigureBlocks {
+        figures,
+        warnings,
+        exclusions,
+    })
+}
+
+fn drop_overlapping_uncaptioned_figures(figures: &mut Vec<AnchoredFigure>) {
+    let captioned = figures
+        .iter()
+        .filter(|figure| {
+            matches!(
+                &figure.block,
+                DocBlock::Figure {
+                    caption: Some(_),
+                    ..
+                }
+            )
+        })
+        .filter_map(anchored_figure_rect)
+        .collect::<Vec<_>>();
+    figures.retain(|figure| {
+        if matches!(
+            &figure.block,
+            DocBlock::Figure {
+                caption: Some(_),
+                ..
+            }
+        ) {
+            return true;
+        }
+        let Some(rect) = anchored_figure_rect(figure) else {
+            return true;
+        };
+        !region_covered_by_any(rect, &captioned)
+            && !captioned.iter().any(|captioned| {
+                captioned.page == rect.page
+                    && rect.top <= captioned.bottom().saturating_add(320)
+                    && rect.bottom().saturating_add(320) >= captioned.top
+            })
+    });
+}
+
+fn anchored_figure_rect(figure: &AnchoredFigure) -> Option<RegionRect> {
+    let DocBlock::Figure { image, .. } = &figure.block else {
+        return None;
+    };
+    Some(RegionRect {
+        page: image.page,
+        top: image.top?,
+        left: image.left?,
+        width: image.width?,
+        height: image.height?,
+    })
+}
+
+const IMAGE_CLUSTER_GAP: i32 = 28;
+
+fn image_candidate_clusters(
+    candidates: &[ImageFigureCandidate<'_>],
+    already_used: &[bool],
+    pages_by_number: &HashMap<u32, &Page>,
+) -> Vec<Vec<usize>> {
+    let mut visited = already_used.to_vec();
+    let caption_keys = candidates
+        .iter()
+        .map(|candidate| extended_caption_key(candidate, pages_by_number))
+        .collect::<Vec<_>>();
+    let mut clusters = Vec::new();
+
+    for index in 0..candidates.len() {
+        if visited[index] || candidate_region_rect(&candidates[index]).is_none() {
+            continue;
+        }
+        visited[index] = true;
+        let mut cluster = vec![index];
+        let mut stack = vec![index];
+
+        while let Some(current) = stack.pop() {
+            let current_rect =
+                candidate_region_rect(&candidates[current]).expect("clustered candidate has rect");
+            for other in 0..candidates.len() {
+                if visited[other] {
+                    continue;
+                }
+                let Some(other_rect) = candidate_region_rect(&candidates[other]) else {
+                    continue;
+                };
+                if current_rect.touches_within(other_rect, IMAGE_CLUSTER_GAP)
+                    || candidates_share_caption(&candidates[current], &candidates[other])
+                    || caption_keys[current].is_some()
+                        && caption_keys[current] == caption_keys[other]
+                {
+                    visited[other] = true;
+                    stack.push(other);
+                    cluster.push(other);
+                }
+            }
+        }
+
+        clusters.push(cluster);
     }
 
-    Ok(FigureBlocks { figures, warnings })
+    clusters
+}
+
+fn extended_caption_key(
+    candidate: &ImageFigureCandidate<'_>,
+    pages_by_number: &HashMap<u32, &Page>,
+) -> Option<(u32, i32, String)> {
+    let rect = candidate_region_rect(candidate)?;
+    let page = pages_by_number.get(&candidate.image.page).copied()?;
+    let mut captions = figure_caption_fragments(page);
+    captions.sort_by_key(|caption| caption.top);
+    captions
+        .into_iter()
+        .filter(|caption| {
+            rect.bottom() <= caption.top && caption.top.saturating_sub(rect.bottom()) <= 320
+        })
+        .min_by_key(|caption| caption.top.saturating_sub(rect.bottom()))
+        .map(|caption| {
+            (
+                candidate.image.page,
+                caption.top,
+                normalize_text_key(&spans_text(&caption.spans)),
+            )
+        })
+}
+
+fn candidate_region_rect(candidate: &ImageFigureCandidate<'_>) -> Option<RegionRect> {
+    candidate
+        .region
+        .map(|region| region_rect_from_image_region(candidate.image.page, region))
+}
+
+fn candidates_share_caption(
+    left: &ImageFigureCandidate<'_>,
+    right: &ImageFigureCandidate<'_>,
+) -> bool {
+    left.image.page == right.image.page
+        && left
+            .caption
+            .zip(right.caption)
+            .is_some_and(|(left, right)| {
+                normalize_text_key(&spans_text(&left.spans))
+                    == normalize_text_key(&spans_text(&right.spans))
+            })
+}
+
+fn region_covered_by_any(rect: RegionRect, regions: &[RegionRect]) -> bool {
+    regions.iter().any(|region| {
+        let overlap = rect.overlap_area(*region);
+        overlap > 0 && overlap * 5 >= rect.area()
+    })
 }
 
 fn image_figure_candidates<'a>(
@@ -1135,16 +1365,15 @@ fn image_byte_signature(image: &ExtractedImage) -> Option<u64> {
 
 fn vector_figure_regions<'a>(
     pages: &'a [Page],
-    handled_captions: &HashSet<CaptionKey>,
+    two_column_pages: &HashSet<u32>,
+    warnings: &mut Vec<String>,
 ) -> Vec<FigureCropRegion<'a>> {
     let mut regions = Vec::new();
     for page in pages {
         for caption in figure_caption_fragments(page) {
-            let key = caption_key(page.number, &caption.spans);
-            if handled_captions.contains(&key) {
-                continue;
-            }
-            let chart_fragments = chart_label_fragments(page, caption);
+            let two_column =
+                two_column_pages.contains(&page.number) && page_has_two_column_prose(page);
+            let chart_fragments = chart_label_fragments(page, caption, two_column);
             if chart_fragments.len() < 4
                 || chart_fragments
                     .iter()
@@ -1158,17 +1387,36 @@ fn vector_figure_regions<'a>(
             {
                 continue;
             }
-            regions.push(FigureCropRegion {
-                rect: rect_from_fragments(page, &chart_fragments),
-                caption,
-            });
+            let Some(mut rect) = vector_region_rect(page, caption, &chart_fragments, two_column)
+            else {
+                continue;
+            };
+            rect = shrink_region_away_from_prose(page, rect, &chart_fragments);
+            if chart_fragments
+                .iter()
+                .filter(|fragment| rect.overlaps_fragment(fragment))
+                .count()
+                < 4
+            {
+                warnings.push(format!(
+                    "page {}: skipped vector figure near y={} because prose-like text intersects the candidate region",
+                    page.number, caption.top
+                ));
+                continue;
+            }
+            regions.push(FigureCropRegion { rect, caption });
         }
     }
     regions
 }
 
-fn chart_label_fragments<'a>(page: &'a Page, caption: &Fragment) -> Vec<&'a Fragment> {
-    page.fragments
+fn chart_label_fragments<'a>(
+    page: &'a Page,
+    caption: &Fragment,
+    two_column: bool,
+) -> Vec<&'a Fragment> {
+    let mut fragments = page
+        .fragments
         .iter()
         .filter(|fragment| {
             let bottom = fragment.top + fragment.height;
@@ -1176,13 +1424,20 @@ fn chart_label_fragments<'a>(page: &'a Page, caption: &Fragment) -> Vec<&'a Frag
                 && caption.top.saturating_sub(bottom) <= 360
                 && is_chart_label_fragment(fragment)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if two_column && let Some((left, right)) = column_bounds_for_labels(page, &fragments) {
+        fragments.retain(|fragment| {
+            let center = fragment.left + fragment.width / 2;
+            center >= left && center <= right
+        });
+    }
+    fragments
 }
 
 fn is_chart_label_fragment(fragment: &Fragment) -> bool {
     let text = spans_text(&fragment.spans);
     let trimmed = text.trim();
-    if trimmed.is_empty() || is_caption_text(trimmed) {
+    if trimmed.is_empty() || is_caption_text(trimmed) || is_prose_like_fragment(fragment) {
         return false;
     }
     let chars = trimmed.chars().count();
@@ -1192,11 +1447,139 @@ fn is_chart_label_fragment(fragment: &Fragment) -> bool {
     (has_digit || short_axis_label) && words <= 4 && chars <= 28
 }
 
-fn rect_from_image_regions(page: &Page, regions: &[&ImageRegion]) -> RegionRect {
+fn vector_region_rect(
+    page: &Page,
+    caption: &Fragment,
+    chart_fragments: &[&Fragment],
+    two_column: bool,
+) -> Option<RegionRect> {
+    let label_rect = rect_from_fragments(page, chart_fragments);
+    let mut rects = vec![label_rect];
+    for image in &page.images {
+        let image_rect = region_rect_from_image_region(page.number, image);
+        if image_rect.bottom() <= caption.top
+            && caption.top.saturating_sub(image_rect.bottom()) <= 360
+            && image_rect.touches_within(label_rect, 48)
+        {
+            rects.push(image_rect);
+        }
+    }
+    let mut rect = rect_from_region_rects(page, &rects);
+    if two_column {
+        let (left, right) = column_bounds_for_labels(page, chart_fragments)?;
+        rect = clamp_rect_horizontally(rect, left, right)?;
+    }
+    Some(rect)
+}
+
+fn column_bounds_for_labels(page: &Page, chart_fragments: &[&Fragment]) -> Option<(i32, i32)> {
+    let content_left = page.fragments.iter().map(|fragment| fragment.left).min()?;
+    let content_right = page
+        .fragments
+        .iter()
+        .map(Fragment::right)
+        .max()
+        .unwrap_or(page.width);
+    let content_width = (content_right - content_left).max(1);
+    let mid = content_left + content_width / 2;
+    let center_sum = chart_fragments
+        .iter()
+        .map(|fragment| fragment.left + fragment.width / 2)
+        .sum::<i32>();
+    let centroid = center_sum / i32::try_from(chart_fragments.len()).ok()?.max(1);
+    if centroid <= mid {
+        Some((content_left, mid))
+    } else {
+        Some((mid, content_right))
+    }
+}
+
+fn page_has_two_column_prose(page: &Page) -> bool {
+    let Some(content_left) = page.fragments.iter().map(|fragment| fragment.left).min() else {
+        return false;
+    };
+    let content_right = page
+        .fragments
+        .iter()
+        .map(Fragment::right)
+        .max()
+        .unwrap_or(page.width);
+    let mid = content_left + (content_right - content_left).max(1) / 2;
+    let mut left = 0;
+    let mut right = 0;
+    for fragment in page
+        .fragments
+        .iter()
+        .filter(|fragment| is_prose_like_fragment(fragment))
+    {
+        if fragment.left + fragment.width / 2 <= mid {
+            left += 1;
+        } else {
+            right += 1;
+        }
+    }
+    left >= 2 && right >= 2
+}
+
+fn clamp_rect_horizontally(rect: RegionRect, left: i32, right: i32) -> Option<RegionRect> {
+    let clamped_left = rect.left.max(left);
+    let clamped_right = rect.right().min(right);
+    (clamped_right > clamped_left).then_some(RegionRect {
+        left: clamped_left,
+        width: clamped_right - clamped_left,
+        ..rect
+    })
+}
+
+fn shrink_region_away_from_prose(
+    page: &Page,
+    mut rect: RegionRect,
+    chart_fragments: &[&Fragment],
+) -> RegionRect {
+    let label_top = chart_fragments
+        .iter()
+        .map(|fragment| fragment.top)
+        .min()
+        .unwrap_or(rect.top);
+    let label_bottom = chart_fragments
+        .iter()
+        .map(|fragment| fragment.top + fragment.height)
+        .max()
+        .unwrap_or(rect.bottom());
+    let original_bottom = rect.bottom();
+    for fragment in &page.fragments {
+        if !rect.overlaps_fragment(fragment) || !is_prose_like_fragment(fragment) {
+            continue;
+        }
+        let fragment_bottom = fragment.top + fragment.height;
+        if fragment_bottom <= label_top {
+            let new_top = fragment_bottom.saturating_add(2).min(original_bottom - 1);
+            rect.height = original_bottom - new_top;
+            rect.top = new_top;
+        } else if fragment.top >= label_bottom {
+            let new_bottom = fragment.top.saturating_sub(2).max(rect.top + 1);
+            rect.height = new_bottom - rect.top;
+        }
+    }
+    rect
+}
+
+fn is_prose_like_fragment(fragment: &Fragment) -> bool {
+    let text = spans_text(&fragment.spans);
+    let trimmed = text.trim();
+    let words = trimmed.split_whitespace().count();
+    words > 6
+        && trimmed
+            .chars()
+            .any(|ch| matches!(ch, '.' | '!' | '?' | ';' | ':'))
+        && trimmed.chars().any(|ch| ch.is_alphabetic())
+}
+
+fn rect_from_region_rects(page: &Page, regions: &[RegionRect]) -> RegionRect {
     let left = regions.iter().map(|region| region.left).min().unwrap_or(0);
     let right = regions
         .iter()
-        .map(|region| region.left + region.width)
+        .map(|region| region.right())
         .max()
         .unwrap_or(page.width);
     let top = regions.iter().map(|region| region.top).min().unwrap_or(0);
@@ -1282,13 +1665,6 @@ fn caption_overlap_warning(page: u32, caption_top: i32) -> String {
     )
 }
 
-fn caption_key(page: u32, spans: &[Span]) -> CaptionKey {
-    CaptionKey {
-        page,
-        text: normalize_text_key(&spans_text(spans)),
-    }
-}
-
 fn figure_caption_fragments(page: &Page) -> Vec<&Fragment> {
     page.fragments
         .iter()
@@ -1300,6 +1676,11 @@ fn detect_caption_fragment<'a>(
     page: &'a Page,
     region: Option<&ImageRegion>,
 ) -> Option<&'a Fragment> {
+    let region = region.map(|region| region_rect_from_image_region(page.number, region));
+    detect_caption_fragment_for_rect(page, region)
+}
+
+fn detect_caption_fragment_for_rect(page: &Page, region: Option<RegionRect>) -> Option<&Fragment> {
     let mut candidates = figure_caption_fragments(page);
     candidates.sort_by_key(|fragment| fragment.top);
 
@@ -1438,10 +1819,21 @@ fn remove_blocks_in_region(
             && anchor.top < region.bottom()
             && anchor_overlaps_region_horizontally(anchor, region)
         {
+            let text = blocks[index].block.text();
+            if is_prose_like_text(&text) {
+                warnings.push(format!(
+                    "page {}: kept overlapping prose as text near image region y={} ({} chars): {}",
+                    region.page,
+                    region.top,
+                    blocks[index].block.char_count(),
+                    audit_snippet(&text)
+                ));
+                index += 1;
+                continue;
+            }
             let removed = blocks.remove(index);
             let chars = removed.block.char_count();
             removed_chars += chars;
-            let text = removed.block.text();
             if !text.trim().is_empty() {
                 warnings.push(format!(
                     "page {}: preserved as image near y={} ({} chars): {}",
@@ -1456,6 +1848,16 @@ fn remove_blocks_in_region(
         }
     }
     removed_chars
+}
+
+fn is_prose_like_text(text: &str) -> bool {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.chars().count() >= 60
+        && normalized
+            .chars()
+            .any(|ch| matches!(ch, '.' | '!' | '?' | ';' | ':'))
+        && normalized.split_whitespace().count() > 8
+        && normalized.chars().any(|ch| ch.is_alphabetic())
 }
 
 fn remove_duplicate_caption_block(blocks: &mut Vec<AnchoredBlock>, page: u32, caption: &str) {
@@ -1511,6 +1913,10 @@ mod tests {
         include_str!("../fixtures/bert_figure4_multipanel.xml");
     const BERT_FIGURE5_VECTOR_CHART_XML: &str =
         include_str!("../fixtures/bert_figure5_vector_chart.xml");
+    const BERT_PAGE16_VECTOR_CHART_TWOCOL_XML: &str =
+        include_str!("../fixtures/bert_page16_vector_chart_twocol.xml");
+    const BERT_FIGURE1_TOKEN_STRIP_XML: &str =
+        include_str!("../fixtures/bert_figure1_token_strip.xml");
     const BERT_MODEL_PARAMETER_FALSE_POSITIVE_XML: &str =
         include_str!("../fixtures/bert_model_parameter_false_positive.xml");
 
@@ -1703,6 +2109,41 @@ cp "$script_dir/pdftoppm.fixture.png" "$last.png"
     }
 
     #[test]
+    fn remove_blocks_in_region_keeps_prose_like_blocks_as_text() {
+        let mut blocks = vec![AnchoredBlock {
+            block: DocBlock::Paragraph {
+                spans: vec![span(
+                    "This prose sentence should remain translatable even when a table crop overlaps its anchor and geometry.",
+                )],
+            },
+            anchor: BlockAnchor {
+                page: 1,
+                top: 120,
+                left: 100,
+                width: 320,
+            },
+        }];
+        let mut warnings = Vec::new();
+
+        let removed = remove_blocks_in_region(
+            &mut blocks,
+            RegionRect {
+                page: 1,
+                top: 100,
+                left: 90,
+                width: 340,
+                height: 80,
+            },
+            &mut warnings,
+        );
+
+        assert_eq!(removed, 0);
+        assert_eq!(blocks.len(), 1);
+        assert!(warnings[0].contains("kept overlapping prose as text"));
+        assert!(!warnings[0].contains("preserved as image"));
+    }
+
+    #[test]
     fn image_regions_match_by_dimensions_not_position() {
         let page = Page {
             number: 1,
@@ -1799,7 +2240,7 @@ cp "$script_dir/pdftoppm.fixture.png" "$last.png"
         let page_dir = dir.path().join("pages");
         let mut renderer = PageCropRenderer::new(Path::new("input.pdf"), &tools, &page_dir);
 
-        let result = figure_blocks_from_images(&pages, &images, &mut renderer, dir.path())
+        let result = figure_blocks_from_images(&pages, &[], &images, &mut renderer, dir.path())
             .expect("figure pass");
 
         assert!(result.figures.is_empty());
@@ -1826,6 +2267,14 @@ cp "$script_dir/pdftoppm.fixture.png" "$last.png"
     }
 
     #[test]
+    fn mnli_table_header_fragment_is_not_display_equation() {
+        let page = empty_page(1);
+        let header = fragment(200, 220, 160, 12, "MNLI-(m/mm) 392k");
+
+        assert!(!is_display_equation_fragment(&page, &header));
+    }
+
+    #[test]
     fn three_row_aligned_stats_without_caption_are_not_tables() {
         let mut page = empty_page(1);
         page.fragments = vec![
@@ -1840,7 +2289,114 @@ cp "$script_dir/pdftoppm.fixture.png" "$last.png"
             fragment(140, 240, 30, 12, "21"),
         ];
 
-        assert!(table_regions_for_page(&page).is_empty());
+        assert!(table_regions_for_page(&page, &[]).is_empty());
+    }
+
+    #[test]
+    fn figure_token_rows_inside_image_region_are_not_tables() {
+        let pages = parse_pdf2xml(BERT_FIGURE1_TOKEN_STRIP_XML).expect("fixture parses");
+        let regions = detect_media_regions(&pages, &[]);
+
+        assert!(
+            regions.iter().all(|region| region.kind != MediaKind::Table),
+            "token rows inside Figure 1 image bounds must not become table crops"
+        );
+    }
+
+    #[test]
+    fn vector_chart_region_clamps_to_chart_column_and_excludes_prose() {
+        let pages = parse_pdf2xml(BERT_PAGE16_VECTOR_CHART_TWOCOL_XML).expect("fixture parses");
+        let page = &pages[0];
+        let mut warnings = Vec::new();
+        let regions = vector_figure_regions(&pages, &HashSet::from([page.number]), &mut warnings);
+
+        assert_eq!(regions.len(), 1);
+        let rect = regions[0].rect;
+        assert!(
+            rect.right() <= page.width / 2,
+            "two-column chart region must stay in the caption column: {rect:?}"
+        );
+        assert!(
+            page.fragments
+                .iter()
+                .filter(|fragment| is_prose_like_fragment(fragment))
+                .all(|fragment| !rect.overlaps_fragment(fragment)),
+            "prose fragments must stay outside vector chart text region: {rect:?}"
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn nearby_raster_subimages_cluster_into_one_figure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut page = empty_page(1);
+        page.images = vec![
+            ImageRegion {
+                top: 120,
+                left: 100,
+                width: 40,
+                height: 30,
+                src: None,
+            },
+            ImageRegion {
+                top: 124,
+                left: 160,
+                width: 42,
+                height: 30,
+                src: None,
+            },
+            ImageRegion {
+                top: 126,
+                left: 222,
+                width: 40,
+                height: 30,
+                src: None,
+            },
+        ];
+        page.fragments = vec![fragment(
+            190,
+            100,
+            320,
+            12,
+            "Figure 1. A diagram composed of raster sub-images.",
+        )];
+        let mut images = Vec::new();
+        for index in 0..3 {
+            let path = dir.path().join(format!("subimage-{index}.png"));
+            fs::write(&path, format!("subimage-{index}")).expect("image bytes");
+            images.push(ExtractedImage {
+                page: 1,
+                index,
+                width: Some(40),
+                height: Some(30),
+                path,
+                extension: "png".to_string(),
+            });
+        }
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
+        let tools = PopplerTools {
+            pdftohtml: PathBuf::from("pdftohtml"),
+            pdftotext: PathBuf::from("pdftotext"),
+            pdfimages: None,
+            pdftoppm: Some(pdftoppm),
+        };
+        let page_dir = dir.path().join("pages");
+        let mut renderer = PageCropRenderer::new(Path::new("input.pdf"), &tools, &page_dir);
+
+        let result = figure_blocks_from_images(&[page], &[], &images, &mut renderer, dir.path())
+            .expect("figure pass");
+
+        assert_eq!(result.figures.len(), 1);
+        assert_eq!(result.exclusions.len(), 1);
+        let DocBlock::Figure { image, caption } = &result.figures[0].block else {
+            panic!("cluster should emit a figure block");
+        };
+        assert_eq!(image.id, "pdf-figure-0001");
+        assert_eq!(
+            caption.as_ref().map(|spans| spans_text(spans)).as_deref(),
+            Some("Figure 1. A diagram composed of raster sub-images.")
+        );
     }
 
     #[test]
@@ -2025,7 +2581,7 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
             .expect("conversion should succeed");
 
         assert_eq!(outcome.report.images, 1);
-        assert_eq!(outcome.report.figures, 1);
+        assert_eq!(outcome.report.figures, 1, "{}", outcome.report.summary());
 
         let mut archive =
             ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
@@ -2089,7 +2645,7 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
             .expect("conversion should succeed");
 
         assert_eq!(outcome.report.images, 2);
-        assert_eq!(outcome.report.figures, 1);
+        assert_eq!(outcome.report.figures, 1, "{}", outcome.report.summary());
         assert!(
             outcome
                 .report
@@ -2157,7 +2713,7 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
             .expect("conversion should succeed");
 
         assert_eq!(outcome.report.images, 2);
-        assert_eq!(outcome.report.figures, 1);
+        assert_eq!(outcome.report.figures, 1, "{}", outcome.report.summary());
 
         let mut archive =
             ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
@@ -2212,7 +2768,7 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
             .expect("conversion should succeed");
 
         assert_eq!(outcome.report.images, 0);
-        assert_eq!(outcome.report.figures, 1);
+        assert_eq!(outcome.report.figures, 1, "{}", outcome.report.summary());
         assert_eq!(outcome.report.tables, 0);
         assert_eq!(outcome.report.equations, 0);
 
