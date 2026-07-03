@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use bookforge_core::{
     GlossaryFormat, JsonMode, ProviderPreset,
-    config::{ContextScope, DoubleCheckMode, FallbackScope, TranslationProfile},
+    config::{
+        BilingualMode, BilingualStyle, ContextScope, DoubleCheckMode, FallbackScope,
+        TranslationProfile,
+    },
 };
 use clap::Args;
 
@@ -59,6 +62,18 @@ pub struct TranslateArgs {
 
     #[arg(long)]
     pub out: Option<PathBuf>,
+
+    #[arg(long, value_enum, default_value_t = BilingualMode::Replace)]
+    pub mode: BilingualMode,
+
+    #[arg(long)]
+    pub bilingual_css: Option<PathBuf>,
+
+    #[arg(long, value_enum, default_value_t = BilingualStyle::Minimal)]
+    pub bilingual_style: BilingualStyle,
+
+    #[arg(long, default_value = " / ")]
+    pub bilingual_separator: String,
 
     /// Run BookForge validators and EPUBCheck on the rebuilt EPUB.
     #[arg(long, default_value_t = false)]

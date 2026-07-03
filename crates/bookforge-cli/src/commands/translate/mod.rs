@@ -51,6 +51,7 @@ pub(crate) use cache::{CacheContext, apply_cached_translations, pending_segments
 use checkpointing::finalize_writer;
 pub(crate) use engine::{CheckpointRunContext, run_checkpointed_translation};
 use reporting::print_summary_rebuild_and_report;
+pub(crate) use reporting::rebuild_options_from_snapshot;
 use settings::{apply_provider_preset, resolve_settings, retry_amplification_warning};
 use snapshot::persist_snapshot;
 
@@ -537,7 +538,7 @@ async fn run_mock_translation(
             ""
         },
     );
-    persist_snapshot(
+    let snapshot = persist_snapshot(
         &store,
         &job,
         input,
@@ -557,6 +558,7 @@ async fn run_mock_translation(
         None,
         None,
     )?;
+    let rebuild_options = rebuild_options_from_snapshot(&snapshot);
     store.insert_segments(
         &job.id,
         &segments,
@@ -641,6 +643,7 @@ async fn run_mock_translation(
         &translations,
         &qa_reviews,
         config,
+        &rebuild_options,
         cli_args.validate_output,
         cli_args.strict_epubcheck,
         human_stdout_enabled(cli_args.ui),
@@ -826,7 +829,7 @@ async fn run_openai_compatible_translation(
             ""
         },
     );
-    persist_snapshot(
+    let snapshot = persist_snapshot(
         &store,
         &job,
         input,
@@ -846,6 +849,7 @@ async fn run_openai_compatible_translation(
         Some(provider_config.base_url.clone()),
         Some(provider_config.api_key_env.clone()),
     )?;
+    let rebuild_options = rebuild_options_from_snapshot(&snapshot);
     store.insert_segments(
         &job.id,
         &segments,
@@ -925,6 +929,7 @@ async fn run_openai_compatible_translation(
         settings,
         &run_config,
         config,
+        &rebuild_options,
         &book,
         progress.clone(),
         started,
@@ -960,6 +965,7 @@ async fn finish_translation_pipeline(
     settings: &ResolvedRunSettings,
     run_config: &TranslationRunConfig,
     config: &TranslationConfig,
+    rebuild_options: &bookforge_epub::RebuildOptions,
     book: &bookforge_core::ir::Book,
     progress: Arc<dyn bookforge_core::ProgressSink>,
     started: std::time::Instant,
@@ -1012,6 +1018,7 @@ async fn finish_translation_pipeline(
         translations,
         &qa_reviews,
         config,
+        rebuild_options,
         cli_args.validate_output,
         cli_args.strict_epubcheck,
         human_stdout_enabled(cli_args.ui),
@@ -2623,6 +2630,10 @@ case_sensitive = true
             provider_max_attempts: None,
             validation_max_attempts: None,
             out: None,
+            mode: bookforge_core::BilingualMode::Replace,
+            bilingual_css: None,
+            bilingual_style: bookforge_core::BilingualStyle::Minimal,
+            bilingual_separator: " / ".to_string(),
             validate_output: false,
             strict_epubcheck: false,
             book_id: None,

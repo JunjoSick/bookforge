@@ -47,6 +47,7 @@ pub(crate) fn persist_snapshot(
         .clone()
         .unwrap_or_else(|| default_event_path(&job.id));
     let input_snapshot = snapshot_input_epub(store, job, input)?;
+    let bilingual_css = read_bilingual_css(cli_args)?;
     let snapshot = RunConfigSnapshot {
         input_path: input.to_path_buf(),
         input_snapshot_path: Some(input_snapshot.epub_path.clone()),
@@ -79,11 +80,24 @@ pub(crate) fn persist_snapshot(
         style_rendered_block: style_rendered_block.to_string(),
         entities_fingerprint: entities_fingerprint.to_string(),
         entities_rendered_block: entities_rendered_block.to_string(),
+        bilingual_mode: cli_args.mode,
+        bilingual_separator: cli_args.bilingual_separator.clone(),
+        bilingual_style: cli_args.bilingual_style,
+        bilingual_css,
         settings: ResolvedRunSettingsSnapshot::from_settings(settings),
     };
     store.update_job_config_snapshot(&job.id, &snapshot)?;
     store.update_job_event_path(&job.id, &events_path)?;
     Ok(snapshot)
+}
+
+fn read_bilingual_css(cli_args: &TranslateArgs) -> anyhow::Result<Option<String>> {
+    let Some(path) = cli_args.bilingual_css.as_ref() else {
+        return Ok(None);
+    };
+    std::fs::read_to_string(path)
+        .map(Some)
+        .map_err(|err| anyhow::anyhow!("failed to read --bilingual-css {}: {err}", path.display()))
 }
 
 #[derive(Debug, Clone)]

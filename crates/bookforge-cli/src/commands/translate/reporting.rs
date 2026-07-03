@@ -1,9 +1,10 @@
 use anyhow::Result;
 use bookforge_core::{
+    RunConfigSnapshot,
     config::TranslationConfig,
     segment::{BlockTranslation, Segment},
 };
-use bookforge_epub::rebuild_epub_with_language;
+use bookforge_epub::{RebuildOptions, rebuild_epub_with_options};
 use bookforge_llm::{QaSegmentReview, SegmentTranslation};
 use bookforge_store::{JobRecord, JobStore};
 
@@ -30,17 +31,13 @@ pub fn print_summary_rebuild_and_report(
     translations: &[SegmentTranslation],
     qa_reviews: &[QaSegmentReview],
     config: &TranslationConfig,
+    rebuild_options: &RebuildOptions,
     validate_output: bool,
     strict_epubcheck: bool,
     print_stdout: bool,
 ) -> Result<()> {
     let block_translations = block_translations(translations);
-    rebuild_epub_with_language(
-        book,
-        &block_translations,
-        &config.output,
-        Some(&config.target_language),
-    )?;
+    rebuild_epub_with_options(book, &block_translations, &config.output, rebuild_options)?;
     let mut validation_failure = None;
     if validate_output || strict_epubcheck {
         let validation_path = validate::default_report_path(&config.output);
@@ -111,4 +108,14 @@ pub fn print_summary_rebuild_and_report(
     }
 
     Ok(())
+}
+
+pub fn rebuild_options_from_snapshot(snapshot: &RunConfigSnapshot) -> RebuildOptions {
+    RebuildOptions {
+        target_language: Some(snapshot.target_language.clone()),
+        mode: snapshot.bilingual_mode,
+        bilingual_separator: snapshot.bilingual_separator.clone(),
+        bilingual_style: snapshot.bilingual_style,
+        bilingual_css: snapshot.bilingual_css.clone(),
+    }
 }

@@ -8,8 +8,9 @@ use std::{
 
 use bookforge_core::{
     BookforgeError, Result,
+    config::{BilingualMode, BilingualStyle},
     ir::{Block, Book, DomPath, TEXT_NODE_PATH_BASE},
-    marker::{parse_empty_marker, parse_paired_marker_open},
+    marker::{parse_empty_marker, parse_paired_marker_open, strip_marker_tokens},
     segment::BlockTranslation,
 };
 use quick_xml::{
@@ -18,8 +19,44 @@ use quick_xml::{
 };
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
+const TRANSLATION_CLASS: &str = "bookforge-translation";
+const HEADING_TRANSLATION_CLASS: &str = "bookforge-heading-translation";
+const BILINGUAL_STYLESHEET_BASENAME: &str = "bookforge-bilingual";
+const BILINGUAL_STYLESHEET_EXTENSION: &str = "css";
+const DEFAULT_APPEND_TEXT_SEPARATOR: &str = " / ";
+
+#[derive(Debug, Clone)]
+pub struct RebuildOptions {
+    pub target_language: Option<String>,
+    pub mode: BilingualMode,
+    pub bilingual_separator: String,
+    pub bilingual_style: BilingualStyle,
+    pub bilingual_css: Option<String>,
+}
+
+impl Default for RebuildOptions {
+    fn default() -> Self {
+        Self {
+            target_language: None,
+            mode: BilingualMode::Replace,
+            bilingual_separator: DEFAULT_APPEND_TEXT_SEPARATOR.to_string(),
+            bilingual_style: BilingualStyle::Minimal,
+            bilingual_css: None,
+        }
+    }
+}
+
+impl RebuildOptions {
+    pub fn replace_with_target_language(target_language: Option<&str>) -> Self {
+        Self {
+            target_language: target_language.map(ToOwned::to_owned),
+            ..Self::default()
+        }
+    }
+}
+
 pub fn rebuild_epub(book: &Book, translations: &[BlockTranslation], output: &Path) -> Result<()> {
-    rebuild_epub_with_language(book, translations, output, None)
+    rebuild_epub_with_options(book, translations, output, &RebuildOptions::default())
 }
 
 pub fn rebuild_epub_with_language(
@@ -28,8 +65,22 @@ pub fn rebuild_epub_with_language(
     output: &Path,
     target_language: Option<&str>,
 ) -> Result<()> {
+    rebuild_epub_with_options(
+        book,
+        translations,
+        output,
+        &RebuildOptions::replace_with_target_language(target_language),
+    )
+}
+
+pub fn rebuild_epub_with_options(
+    book: &Book,
+    translations: &[BlockTranslation],
+    output: &Path,
+    options: &RebuildOptions,
+) -> Result<()> {
     let staged = sibling_work_path(output, "tmp");
-    let result = write_rebuilt_epub(book, translations, &staged, target_language);
+    let result = write_rebuilt_epub(book, translations, &staged, options);
     let skipped = match result {
         Ok(skipped) => skipped,
         Err(error) => {
@@ -56,7 +107,7 @@ fn write_rebuilt_epub(
     book: &Book,
     translations: &[BlockTranslation],
     output: &Path,
-    target_language: Option<&str>,
+    options: &RebuildOptions,
 ) -> Result<usize> {
     let source_path = book.source_path.as_deref().ok_or_else(|| {
         BookforgeError::InvalidInput("book IR does not include a source EPUB path".to_string())
@@ -80,6 +131,8 @@ fn write_rebuilt_epub(
         })
         .collect::<Vec<_>>();
     let patches_by_href = patches_by_href(book, &patches);
+    let archive_names = archive_entry_names(&mut archive)?;
+    let stylesheet = stylesheet_plan(book.id.0.as_str(), &archive_names, options);
 
     write_mimetype_first(&mut archive, &mut writer)?;
 
@@ -106,14 +159,19 @@ fn write_rebuilt_epub(
             let xhtml = String::from_utf8(bytes).map_err(|err| {
                 BookforgeError::InvalidInput(format!("XHTML resource '{name}' is not UTF-8: {err}"))
             })?;
-            let outcome = patch_xhtml_blocks(&xhtml, file_patches)?;
+            let outcome = patch_xhtml_blocks_with_options(&xhtml, file_patches, options)?;
             total_skipped += outcome.skipped_blocks;
             let xhtml = if name == book.id.0 {
-                if let Some(target_language) = target_language {
-                    patch_opf_language(&outcome.xhtml, target_language)?
-                } else {
-                    outcome.xhtml
-                }
+                patch_opf_for_rebuild(
+                    &outcome.xhtml,
+                    options,
+                    stylesheet.as_ref().map(|plan| plan.opf_href.as_str()),
+                )?
+            } else if let Some(plan) = stylesheet.as_ref() {
+                inject_stylesheet_link(
+                    &outcome.xhtml,
+                    &relative_href(name.as_str(), plan.archive_path.as_str()),
+                )?
             } else {
                 outcome.xhtml
             };
@@ -124,13 +182,17 @@ fn write_rebuilt_epub(
             })?;
             xhtml.into_bytes()
         } else if name == book.id.0 {
-            if let Some(target_language) = target_language {
+            if options.target_language.is_some() || stylesheet.is_some() {
                 let opf = String::from_utf8(bytes).map_err(|err| {
                     BookforgeError::InvalidInput(format!(
                         "OPF resource '{name}' is not UTF-8: {err}"
                     ))
                 })?;
-                let opf = patch_opf_language(&opf, target_language)?;
+                let opf = patch_opf_for_rebuild(
+                    &opf,
+                    options,
+                    stylesheet.as_ref().map(|plan| plan.opf_href.as_str()),
+                )?;
                 validate_xml(&opf).map_err(|err| {
                     BookforgeError::InvalidInput(format!(
                         "patched OPF '{name}' failed validation: {err}"
@@ -146,6 +208,11 @@ fn write_rebuilt_epub(
 
         writer.start_file(name, deflated)?;
         writer.write_all(&output_bytes)?;
+    }
+
+    if let Some(plan) = stylesheet {
+        writer.start_file(plan.archive_path, deflated)?;
+        writer.write_all(plan.content.as_bytes())?;
     }
 
     writer.finish()?;
@@ -211,8 +278,165 @@ fn write_mimetype_first(source: &mut ZipArchive<File>, writer: &mut ZipWriter<Fi
     Ok(())
 }
 
+fn archive_entry_names(archive: &mut ZipArchive<File>) -> Result<HashSet<String>> {
+    let mut names = HashSet::new();
+    for index in 0..archive.len() {
+        names.insert(archive.by_index(index)?.name().to_string());
+    }
+    Ok(names)
+}
+
 fn deterministic_zip_time() -> DateTime {
     DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("DOS epoch timestamp should be valid")
+}
+
+#[derive(Debug, Clone)]
+struct StylesheetPlan {
+    archive_path: String,
+    opf_href: String,
+    content: String,
+}
+
+fn stylesheet_plan(
+    package_path: &str,
+    archive_names: &HashSet<String>,
+    options: &RebuildOptions,
+) -> Option<StylesheetPlan> {
+    if !options.mode.is_append() {
+        return None;
+    }
+
+    let package_dir = package_base_dir(package_path);
+    let mut ordinal = 1usize;
+    loop {
+        let filename = if ordinal == 1 {
+            format!("{BILINGUAL_STYLESHEET_BASENAME}.{BILINGUAL_STYLESHEET_EXTENSION}")
+        } else {
+            format!("{BILINGUAL_STYLESHEET_BASENAME}-{ordinal}.{BILINGUAL_STYLESHEET_EXTENSION}")
+        };
+        let archive_path = join_epub_path(&package_dir, &filename);
+        if !archive_names.contains(&archive_path) {
+            return Some(StylesheetPlan {
+                archive_path,
+                opf_href: filename,
+                content: options
+                    .bilingual_css
+                    .clone()
+                    .unwrap_or_else(|| builtin_bilingual_css(options.bilingual_style).to_string()),
+            });
+        }
+        ordinal += 1;
+    }
+}
+
+fn builtin_bilingual_css(style: BilingualStyle) -> &'static str {
+    match style {
+        BilingualStyle::Minimal => {
+            r#".bookforge-translation {
+  color: #555;
+  font-style: italic;
+  margin-top: 0.2em;
+}
+
+.bookforge-translation[lang="ja"],
+.bookforge-translation[lang="zh"],
+.bookforge-translation[lang="ko"] {
+  font-style: normal;
+}
+
+p.bookforge-translation {
+}
+
+span.bookforge-translation {
+}
+"#
+        }
+        BilingualStyle::Prominent => {
+            r#".bookforge-translation {
+  color: #333;
+  font-style: italic;
+  margin-top: 0.35em;
+  padding-left: 0.75em;
+  border-left: 0.18em solid #777;
+}
+
+.bookforge-translation[lang="ja"],
+.bookforge-translation[lang="zh"],
+.bookforge-translation[lang="ko"] {
+  font-style: normal;
+}
+
+span.bookforge-translation {
+  padding-left: 0;
+  border-left: 0;
+}
+"#
+        }
+        BilingualStyle::InlineOnly => {
+            r#".bookforge-translation {
+  color: inherit;
+  font-style: normal;
+  margin-top: 0;
+}
+
+span.bookforge-translation {
+  color: #555;
+  font-style: italic;
+}
+
+span.bookforge-translation[lang="ja"],
+span.bookforge-translation[lang="zh"],
+span.bookforge-translation[lang="ko"] {
+  font-style: normal;
+}
+"#
+        }
+    }
+}
+
+fn package_base_dir(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(base, _)| base.to_string())
+        .unwrap_or_default()
+}
+
+fn join_epub_path(base: &str, href: &str) -> String {
+    if base.is_empty() {
+        href.to_string()
+    } else {
+        format!("{base}/{href}")
+    }
+}
+
+fn relative_href(from_file: &str, target_file: &str) -> String {
+    let from_parts = from_file.split('/').collect::<Vec<_>>();
+    let target_parts = target_file.split('/').collect::<Vec<_>>();
+    let from_dir_len = from_parts.len().saturating_sub(1);
+    let from_dir = &from_parts[..from_dir_len];
+
+    let mut common = 0usize;
+    while common < from_dir.len()
+        && common < target_parts.len()
+        && from_dir[common] == target_parts[common]
+    {
+        common += 1;
+    }
+
+    let mut out = Vec::new();
+    out.extend(std::iter::repeat_n(
+        "..",
+        from_dir.len().saturating_sub(common),
+    ));
+    out.extend(target_parts[common..].iter().copied());
+    if out.is_empty() {
+        target_parts
+            .last()
+            .copied()
+            .unwrap_or(target_file)
+            .to_string()
+    } else {
+        out.join("/")
+    }
 }
 
 fn patches_by_href<'a>(
@@ -236,6 +460,28 @@ fn patches_by_href<'a>(
     }
 
     by_href
+}
+
+fn patch_opf_for_rebuild(
+    opf: &str,
+    options: &RebuildOptions,
+    stylesheet_href: Option<&str>,
+) -> Result<String> {
+    let mut patched = match options.target_language.as_deref() {
+        Some(target_language) if options.mode == BilingualMode::Replace => {
+            patch_opf_language(opf, target_language)?
+        }
+        Some(target_language) if options.mode.is_append() => {
+            patch_opf_bilingual_language(opf, target_language)?
+        }
+        _ => opf.to_string(),
+    };
+
+    if let Some(href) = stylesheet_href {
+        patched = patch_opf_stylesheet_manifest(&patched, href)?;
+    }
+
+    Ok(patched)
 }
 
 fn patch_opf_language(opf: &str, target_language: &str) -> Result<String> {
@@ -290,6 +536,231 @@ fn patch_opf_language(opf: &str, target_language: &str) -> Result<String> {
     })
 }
 
+fn patch_opf_bilingual_language(opf: &str, target_language: &str) -> Result<String> {
+    let language_tag = epub_language_tag(target_language);
+    if opf_language_tags(opf)?
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&language_tag))
+    {
+        return Ok(opf.to_string());
+    }
+
+    let mut reader = Reader::from_str(opf);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut in_language = false;
+    let mut found_language = false;
+    let mut inserted = false;
+    let mut language_end_name: Option<Vec<u8>> = None;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) if local_name(element.name().as_ref()) == b"language" => {
+                found_language = true;
+                in_language = true;
+                language_end_name = Some(element.name().as_ref().to_vec());
+                writer.write_event(Event::Start(element))?;
+            }
+            Event::Empty(element) if local_name(element.name().as_ref()) == b"language" => {
+                found_language = true;
+                let end = element.to_end();
+                let end_name = end.name().as_ref().to_vec();
+                writer.write_event(Event::Start(element.to_owned()))?;
+                writer.write_event(Event::End(end))?;
+                if !inserted {
+                    write_language_element(&mut writer, &end_name, &language_tag)?;
+                    inserted = true;
+                }
+            }
+            Event::End(element)
+                if in_language && local_name(element.name().as_ref()) == b"language" =>
+            {
+                in_language = false;
+                let end_name = language_end_name
+                    .take()
+                    .unwrap_or_else(|| element.name().as_ref().to_vec());
+                writer.write_event(Event::End(element))?;
+                if !inserted {
+                    write_language_element(&mut writer, &end_name, &language_tag)?;
+                    inserted = true;
+                }
+            }
+            Event::Eof => break,
+            event => writer.write_event(event)?,
+        }
+    }
+
+    if !found_language {
+        return Ok(opf.to_string());
+    }
+
+    String::from_utf8(writer.into_inner()).map_err(|err| {
+        BookforgeError::InvalidInput(format!(
+            "patched bilingual OPF language is not valid UTF-8: {err}"
+        ))
+    })
+}
+
+fn opf_language_tags(opf: &str) -> Result<Vec<String>> {
+    let mut reader = Reader::from_str(opf);
+    reader.config_mut().trim_text(false);
+    let mut in_language = false;
+    let mut tags = Vec::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) if local_name(element.name().as_ref()) == b"language" => {
+                in_language = true;
+            }
+            Event::Text(text) if in_language => {
+                let value = text
+                    .html_content()
+                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                let value = value.trim();
+                if !value.is_empty() {
+                    tags.push(value.to_string());
+                }
+            }
+            Event::CData(text) if in_language => {
+                let value = text
+                    .decode()
+                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                let value = value.trim();
+                if !value.is_empty() {
+                    tags.push(value.to_string());
+                }
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"language" => {
+                in_language = false;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(tags)
+}
+
+fn write_language_element(
+    writer: &mut Writer<Vec<u8>>,
+    name: &[u8],
+    language_tag: &str,
+) -> Result<()> {
+    let name = String::from_utf8_lossy(name);
+    writer.write_event(Event::Start(quick_xml::events::BytesStart::new(
+        name.as_ref(),
+    )))?;
+    writer.write_event(Event::Text(BytesText::new(language_tag)))?;
+    writer.write_event(Event::End(BytesEnd::new(name.as_ref())))?;
+    Ok(())
+}
+
+fn patch_opf_stylesheet_manifest(opf: &str, href: &str) -> Result<String> {
+    if opf_manifest_has_href(opf, href)? {
+        return Ok(opf.to_string());
+    }
+
+    let mut reader = Reader::from_str(opf);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut in_manifest = false;
+    let mut inserted = false;
+    let item_id = unique_manifest_id(opf, "bookforge-bilingual-css")?;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) if local_name(element.name().as_ref()) == b"manifest" => {
+                in_manifest = true;
+                writer.write_event(Event::Start(element))?;
+            }
+            Event::End(element)
+                if in_manifest && local_name(element.name().as_ref()) == b"manifest" =>
+            {
+                write_stylesheet_manifest_item(&mut writer, &item_id, href)?;
+                inserted = true;
+                in_manifest = false;
+                writer.write_event(Event::End(element))?;
+            }
+            Event::Eof => break,
+            event => writer.write_event(event)?,
+        }
+    }
+
+    if !inserted {
+        return Ok(opf.to_string());
+    }
+
+    String::from_utf8(writer.into_inner()).map_err(|err| {
+        BookforgeError::InvalidInput(format!("patched OPF manifest is not valid UTF-8: {err}"))
+    })
+}
+
+fn opf_manifest_has_href(opf: &str, href: &str) -> Result<bool> {
+    let mut reader = Reader::from_str(opf);
+    reader.config_mut().trim_text(false);
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"item" =>
+            {
+                if attr_value_unescaped(&element, b"href")?.as_deref() == Some(href) {
+                    return Ok(true);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(false)
+}
+
+fn unique_manifest_id(opf: &str, base: &str) -> Result<String> {
+    let mut ids = HashSet::new();
+    let mut reader = Reader::from_str(opf);
+    reader.config_mut().trim_text(false);
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"item" =>
+            {
+                if let Some(id) = attr_value_unescaped(&element, b"id")? {
+                    ids.insert(id);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    if !ids.contains(base) {
+        return Ok(base.to_string());
+    }
+    for ordinal in 2usize.. {
+        let candidate = format!("{base}-{ordinal}");
+        if !ids.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    unreachable!("unbounded manifest id search should always return")
+}
+
+fn write_stylesheet_manifest_item(
+    writer: &mut Writer<Vec<u8>>,
+    item_id: &str,
+    href: &str,
+) -> Result<()> {
+    let mut item = quick_xml::events::BytesStart::new("item");
+    item.push_attribute(("id", item_id));
+    item.push_attribute(("href", href));
+    item.push_attribute(("media-type", "text/css"));
+    writer.write_event(Event::Empty(item))?;
+    Ok(())
+}
+
 fn epub_language_tag(language: &str) -> String {
     let trimmed = language.trim();
     if trimmed.is_empty() {
@@ -331,6 +802,80 @@ fn local_name(name: &[u8]) -> &[u8] {
     name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
 }
 
+fn attr_value_unescaped(
+    element: &quick_xml::events::BytesStart<'_>,
+    attr_name: &[u8],
+) -> Result<Option<String>> {
+    for attr in element.attributes() {
+        let attr = attr.map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+        if local_name(attr.key.as_ref()) == attr_name {
+            return Ok(Some(attr.unescape_value()?.into_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn inject_stylesheet_link(xhtml: &str, href: &str) -> Result<String> {
+    if xhtml_has_stylesheet_href(xhtml, href)? {
+        return Ok(xhtml.to_string());
+    }
+
+    let mut reader = Reader::from_str(xhtml);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut inserted = false;
+
+    loop {
+        match reader.read_event()? {
+            Event::End(element) if local_name(element.name().as_ref()) == b"head" => {
+                write_stylesheet_link(&mut writer, href)?;
+                inserted = true;
+                writer.write_event(Event::End(element))?;
+            }
+            Event::Eof => break,
+            event => writer.write_event(event)?,
+        }
+    }
+
+    if !inserted {
+        return Ok(xhtml.to_string());
+    }
+
+    String::from_utf8(writer.into_inner()).map_err(|err| {
+        BookforgeError::InvalidInput(format!("stylesheet-linked XHTML is not valid UTF-8: {err}"))
+    })
+}
+
+fn xhtml_has_stylesheet_href(xhtml: &str, href: &str) -> Result<bool> {
+    let mut reader = Reader::from_str(xhtml);
+    reader.config_mut().trim_text(false);
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"link" =>
+            {
+                if attr_value_unescaped(&element, b"href")?.as_deref() == Some(href) {
+                    return Ok(true);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(false)
+}
+
+fn write_stylesheet_link(writer: &mut Writer<Vec<u8>>, href: &str) -> Result<()> {
+    let mut link = quick_xml::events::BytesStart::new("link");
+    link.push_attribute(("rel", "stylesheet"));
+    link.push_attribute(("type", "text/css"));
+    link.push_attribute(("href", href));
+    writer.write_event(Event::Empty(link))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BlockPatch<'a> {
     block: &'a Block,
@@ -367,10 +912,19 @@ pub(crate) fn patch_xhtml(xhtml: &str, patches: &[(&DomPath, &str)]) -> Result<P
             translation,
         })
         .collect::<Vec<_>>();
-    patch_xhtml_with_specs(xhtml, &specs)
+    patch_xhtml_with_specs(xhtml, &specs, &RebuildOptions::default())
 }
 
+#[cfg(test)]
 fn patch_xhtml_blocks(xhtml: &str, patches: &[BlockPatch<'_>]) -> Result<PatchOutcome> {
+    patch_xhtml_blocks_with_options(xhtml, patches, &RebuildOptions::default())
+}
+
+fn patch_xhtml_blocks_with_options(
+    xhtml: &str,
+    patches: &[BlockPatch<'_>],
+    options: &RebuildOptions,
+) -> Result<PatchOutcome> {
     let specs = patches
         .iter()
         .map(|patch| PatchSpec {
@@ -379,10 +933,14 @@ fn patch_xhtml_blocks(xhtml: &str, patches: &[BlockPatch<'_>]) -> Result<PatchOu
             translation: patch.translation,
         })
         .collect::<Vec<_>>();
-    patch_xhtml_with_specs(xhtml, &specs)
+    patch_xhtml_with_specs(xhtml, &specs, options)
 }
 
-fn patch_xhtml_with_specs(xhtml: &str, patches: &[PatchSpec<'_>]) -> Result<PatchOutcome> {
+fn patch_xhtml_with_specs(
+    xhtml: &str,
+    patches: &[PatchSpec<'_>],
+    options: &RebuildOptions,
+) -> Result<PatchOutcome> {
     let patch_map = patches
         .iter()
         .map(|patch| (patch.dom_path.0.as_slice(), *patch))
@@ -396,59 +954,53 @@ fn patch_xhtml_with_specs(xhtml: &str, patches: &[PatchSpec<'_>]) -> Result<Patc
     loop {
         match reader.read_event()? {
             Event::Start(element) => {
-                let path = enter_element(&mut stack);
+                let name = local_name(element.name().as_ref()).to_vec();
+                let path = enter_element(&mut stack, &name);
                 writer.write_event(Event::Start(element.borrow()))?;
 
                 if let Some(patch) = patch_map.get(path.as_slice()).copied() {
                     let buffered = buffer_until_matching_end(&mut reader)?;
-                    if buffered.has_inline_children {
-                        match patch.block.map(|block| {
-                            render_marked_translation(block, patch.translation, &buffered.events)
-                        }) {
-                            Some(Ok(events)) => {
-                                for event in &events {
-                                    writer.write_event(event.borrow())?;
-                                }
-                            }
-                            Some(Err(error)) => {
-                                skipped_blocks += 1;
-                                tracing::warn!(
-                                    block_path = ?path,
-                                    error = %error,
-                                    "preserving original block contents: translated inline markers \
-                                     could not be applied",
-                                );
-                                for event in &buffered.events {
-                                    writer.write_event(event.borrow())?;
-                                }
-                            }
-                            None => {
-                                skipped_blocks += 1;
-                                tracing::warn!(
-                                    block_path = ?path,
-                                    "preserving original block contents: inline patch did not include \
-                                     block marker metadata",
-                                );
-                                for event in &buffered.events {
-                                    writer.write_event(event.borrow())?;
-                                }
-                            }
+                    match options.mode {
+                        BilingualMode::Replace => {
+                            write_replace_block(
+                                &mut writer,
+                                patch,
+                                &buffered,
+                                &path,
+                                &mut skipped_blocks,
+                            )?;
+                            writer.write_event(Event::End(buffered.end.borrow()))?;
                         }
-                    } else {
-                        writer.write_event(Event::Text(BytesText::new(patch.translation)))?;
+                        BilingualMode::AppendBlock | BilingualMode::AppendText => {
+                            write_append_block(
+                                &mut writer,
+                                element.borrow(),
+                                patch,
+                                &buffered,
+                                options,
+                                &path,
+                                &mut skipped_blocks,
+                            )?;
+                        }
                     }
-                    writer.write_event(Event::End(buffered.end.borrow()))?;
                     stack.pop();
                 }
             }
             Event::Empty(element) => {
                 let path = next_child_path(&mut stack);
                 if let Some(patch) = patch_map.get(path.as_slice()).copied() {
-                    let name = element.name();
-                    let name_str = String::from_utf8_lossy(name.as_ref()).into_owned();
-                    writer.write_event(Event::Start(element.borrow()))?;
-                    writer.write_event(Event::Text(BytesText::new(patch.translation)))?;
-                    writer.write_event(Event::End(BytesEnd::new(name_str)))?;
+                    match options.mode {
+                        BilingualMode::Replace => {
+                            let name = element.name();
+                            let name_str = String::from_utf8_lossy(name.as_ref()).into_owned();
+                            writer.write_event(Event::Start(element.borrow()))?;
+                            writer.write_event(Event::Text(BytesText::new(patch.translation)))?;
+                            writer.write_event(Event::End(BytesEnd::new(name_str)))?;
+                        }
+                        BilingualMode::AppendBlock | BilingualMode::AppendText => {
+                            writer.write_event(Event::Empty(element.borrow()))?;
+                        }
+                    }
                 } else {
                     writer.write_event(Event::Empty(element.borrow()))?;
                 }
@@ -469,9 +1021,33 @@ fn patch_xhtml_with_specs(xhtml: &str, patches: &[PatchSpec<'_>]) -> Result<Patc
                     .map(|value| !value.trim().is_empty())
                     .unwrap_or(true);
                 match text_node_patch(&patch_map, &mut stack, non_whitespace) {
-                    Some(translation) => {
-                        writer.write_event(Event::Text(BytesText::new(translation)))?
-                    }
+                    Some(patch) => match options.mode {
+                        BilingualMode::Replace => {
+                            writer.write_event(Event::Text(BytesText::new(patch.translation)))?
+                        }
+                        BilingualMode::AppendText => {
+                            writer.write_event(Event::Text(text.borrow()))?;
+                            write_inline_translation_span(
+                                &mut writer,
+                                patch,
+                                &[],
+                                options,
+                                &mut skipped_blocks,
+                            )?;
+                        }
+                        BilingualMode::AppendBlock => {
+                            writer.write_event(Event::Text(text.borrow()))?;
+                            write_translation_element_for_patch(
+                                &mut writer,
+                                "p",
+                                &[TRANSLATION_CLASS],
+                                patch,
+                                &[],
+                                options,
+                                &mut skipped_blocks,
+                            )?;
+                        }
+                    },
                     None => writer.write_event(Event::Text(text.borrow()))?,
                 }
             }
@@ -481,9 +1057,33 @@ fn patch_xhtml_with_specs(xhtml: &str, patches: &[PatchSpec<'_>]) -> Result<Patc
                     .map(|value| !value.trim().is_empty())
                     .unwrap_or(true);
                 match text_node_patch(&patch_map, &mut stack, non_whitespace) {
-                    Some(translation) => {
-                        writer.write_event(Event::Text(BytesText::new(translation)))?
-                    }
+                    Some(patch) => match options.mode {
+                        BilingualMode::Replace => {
+                            writer.write_event(Event::Text(BytesText::new(patch.translation)))?
+                        }
+                        BilingualMode::AppendText => {
+                            writer.write_event(Event::CData(text.borrow()))?;
+                            write_inline_translation_span(
+                                &mut writer,
+                                patch,
+                                &[],
+                                options,
+                                &mut skipped_blocks,
+                            )?;
+                        }
+                        BilingualMode::AppendBlock => {
+                            writer.write_event(Event::CData(text.borrow()))?;
+                            write_translation_element_for_patch(
+                                &mut writer,
+                                "p",
+                                &[TRANSLATION_CLASS],
+                                patch,
+                                &[],
+                                options,
+                                &mut skipped_blocks,
+                            )?;
+                        }
+                    },
                     None => writer.write_event(Event::CData(text.borrow()))?,
                 }
             }
@@ -545,6 +1145,367 @@ fn buffer_until_matching_end(reader: &mut Reader<&[u8]>) -> Result<BufferedBlock
             event => events.push(event.into_owned()),
         }
     }
+}
+
+fn write_replace_block(
+    writer: &mut Writer<Vec<u8>>,
+    patch: PatchSpec<'_>,
+    buffered: &BufferedBlock,
+    path: &[usize],
+    skipped_blocks: &mut usize,
+) -> Result<()> {
+    if buffered.has_inline_children {
+        match patch
+            .block
+            .map(|block| render_marked_translation(block, patch.translation, &buffered.events))
+        {
+            Some(Ok(events)) => {
+                for event in &events {
+                    writer.write_event(event.borrow())?;
+                }
+            }
+            Some(Err(error)) => {
+                *skipped_blocks += 1;
+                tracing::warn!(
+                    block_path = ?path,
+                    error = %error,
+                    "preserving original block contents: translated inline markers could not be applied",
+                );
+                write_events(writer, &buffered.events)?;
+            }
+            None => {
+                *skipped_blocks += 1;
+                tracing::warn!(
+                    block_path = ?path,
+                    "preserving original block contents: inline patch did not include block marker metadata",
+                );
+                write_events(writer, &buffered.events)?;
+            }
+        }
+    } else {
+        writer.write_event(Event::Text(BytesText::new(patch.translation)))?;
+    }
+    Ok(())
+}
+
+fn write_append_block(
+    writer: &mut Writer<Vec<u8>>,
+    original_start: quick_xml::events::BytesStart<'_>,
+    patch: PatchSpec<'_>,
+    buffered: &BufferedBlock,
+    options: &RebuildOptions,
+    path: &[usize],
+    skipped_blocks: &mut usize,
+) -> Result<()> {
+    if !source_has_visible_text(&buffered.events) || patch.translation.trim().is_empty() {
+        write_events(writer, &buffered.events)?;
+        writer.write_event(Event::End(buffered.end.borrow()))?;
+        return Ok(());
+    }
+
+    let action = append_action(&original_start, patch, options.mode);
+    match action {
+        AppendAction::Skip => {
+            write_events(writer, &buffered.events)?;
+            writer.write_event(Event::End(buffered.end.borrow()))?;
+        }
+        AppendAction::SiblingParagraph { classes } => {
+            write_events(writer, &buffered.events)?;
+            writer.write_event(Event::End(buffered.end.borrow()))?;
+            let _ = write_translation_element_for_patch(
+                writer,
+                "p",
+                &classes,
+                patch,
+                &buffered.events,
+                options,
+                skipped_blocks,
+            )
+            .inspect_err(|error| {
+                *skipped_blocks += 1;
+                tracing::warn!(
+                    block_path = ?path,
+                    error = %error,
+                    "preserving source-only block: appended translation could not be rendered",
+                );
+            });
+        }
+        AppendAction::NestedParagraph => {
+            write_events(writer, &buffered.events)?;
+            let _ = write_translation_element_for_patch(
+                writer,
+                "p",
+                &[TRANSLATION_CLASS],
+                patch,
+                &buffered.events,
+                options,
+                skipped_blocks,
+            )
+            .inspect_err(|error| {
+                *skipped_blocks += 1;
+                tracing::warn!(
+                    block_path = ?path,
+                    error = %error,
+                    "preserving source-only block: nested translation could not be rendered",
+                );
+            });
+            writer.write_event(Event::End(buffered.end.borrow()))?;
+        }
+        AppendAction::InlineAtEnd => {
+            write_events(writer, &buffered.events)?;
+            let _ = write_inline_translation_span(
+                writer,
+                patch,
+                &buffered.events,
+                options,
+                skipped_blocks,
+            )
+            .inspect_err(|error| {
+                *skipped_blocks += 1;
+                tracing::warn!(
+                    block_path = ?path,
+                    error = %error,
+                    "preserving source-only block: inline translation could not be rendered",
+                );
+            });
+            writer.write_event(Event::End(buffered.end.borrow()))?;
+        }
+        AppendAction::InlineInLastParagraph => {
+            write_events_with_inline_in_last_paragraph(
+                writer,
+                patch,
+                &buffered.events,
+                options,
+                skipped_blocks,
+                path,
+            )?;
+            writer.write_event(Event::End(buffered.end.borrow()))?;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum AppendAction {
+    Skip,
+    SiblingParagraph { classes: Vec<String> },
+    NestedParagraph,
+    InlineAtEnd,
+    InlineInLastParagraph,
+}
+
+fn append_action(
+    original_start: &quick_xml::events::BytesStart<'_>,
+    patch: PatchSpec<'_>,
+    mode: BilingualMode,
+) -> AppendAction {
+    if patch
+        .block
+        .is_some_and(|block| matches!(block.kind, bookforge_core::ir::BlockKind::Code))
+    {
+        return AppendAction::Skip;
+    }
+
+    let element_name = original_start.name();
+    let name = local_name(element_name.as_ref());
+    match mode {
+        BilingualMode::Replace => AppendAction::Skip,
+        BilingualMode::AppendBlock => match name {
+            b"p" | b"blockquote" | b"figcaption" | b"caption" | b"aside" => {
+                AppendAction::SiblingParagraph {
+                    classes: vec![TRANSLATION_CLASS.to_string()],
+                }
+            }
+            b"h1" | b"h2" | b"h3" | b"h4" | b"h5" | b"h6" => AppendAction::SiblingParagraph {
+                classes: heading_translation_classes(original_start),
+            },
+            b"li" | b"td" | b"th" => AppendAction::NestedParagraph,
+            _ => AppendAction::Skip,
+        },
+        BilingualMode::AppendText => match name {
+            b"p" | b"li" | b"h1" | b"h2" | b"h3" | b"h4" | b"h5" | b"h6" | b"figcaption"
+            | b"caption" | b"td" | b"th" => AppendAction::InlineAtEnd,
+            b"blockquote" | b"aside" => AppendAction::InlineInLastParagraph,
+            _ => AppendAction::Skip,
+        },
+    }
+}
+
+fn heading_translation_classes(original_start: &quick_xml::events::BytesStart<'_>) -> Vec<String> {
+    let mut classes = attr_value_unescaped(original_start, b"class")
+        .ok()
+        .flatten()
+        .map(|value| {
+            value
+                .split_whitespace()
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    classes.push(TRANSLATION_CLASS.to_string());
+    classes.push(HEADING_TRANSLATION_CLASS.to_string());
+    dedupe_classes(classes)
+}
+
+fn dedupe_classes(classes: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    classes
+        .into_iter()
+        .filter(|class| !class.is_empty() && seen.insert(class.clone()))
+        .collect()
+}
+
+fn write_events(writer: &mut Writer<Vec<u8>>, events: &[Event<'static>]) -> Result<()> {
+    for event in events {
+        writer.write_event(event.borrow())?;
+    }
+    Ok(())
+}
+
+fn source_has_visible_text(events: &[Event<'static>]) -> bool {
+    events.iter().any(|event| match event {
+        Event::Text(text) => text
+            .html_content()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(true),
+        Event::CData(text) => text
+            .decode()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(true),
+        _ => false,
+    })
+}
+
+fn write_events_with_inline_in_last_paragraph(
+    writer: &mut Writer<Vec<u8>>,
+    patch: PatchSpec<'_>,
+    events: &[Event<'static>],
+    options: &RebuildOptions,
+    skipped_blocks: &mut usize,
+    path: &[usize],
+) -> Result<()> {
+    let insert_at = events.iter().rposition(
+        |event| matches!(event, Event::End(end) if local_name(end.name().as_ref()) == b"p"),
+    );
+
+    if let Some(insert_at) = insert_at {
+        for (index, event) in events.iter().enumerate() {
+            if index == insert_at {
+                let _ = write_plain_inline_translation_span(writer, patch, options)
+                    .inspect_err(|error| {
+                        *skipped_blocks += 1;
+                        tracing::warn!(
+                            block_path = ?path,
+                            error = %error,
+                            "preserving source-only block: inline translation could not be rendered",
+                        );
+                    });
+            }
+            writer.write_event(event.borrow())?;
+        }
+    } else {
+        write_events(writer, events)?;
+        let _ = write_plain_inline_translation_span(writer, patch, options).inspect_err(|error| {
+            *skipped_blocks += 1;
+            tracing::warn!(
+                block_path = ?path,
+                error = %error,
+                "preserving source-only block: inline translation could not be rendered",
+            );
+        });
+    }
+
+    Ok(())
+}
+
+fn write_plain_inline_translation_span(
+    writer: &mut Writer<Vec<u8>>,
+    patch: PatchSpec<'_>,
+    options: &RebuildOptions,
+) -> Result<()> {
+    let normalized = normalize_marker_whitespace(patch.translation);
+    let stripped = strip_marker_tokens(&normalized);
+    let rendered = [Event::Text(BytesText::new(stripped.trim()).into_owned())];
+    writer.write_event(Event::Text(BytesText::new(&options.bilingual_separator)))?;
+    write_translation_element(writer, "span", &[TRANSLATION_CLASS], options, &rendered)
+}
+
+fn write_inline_translation_span(
+    writer: &mut Writer<Vec<u8>>,
+    patch: PatchSpec<'_>,
+    original_events: &[Event<'static>],
+    options: &RebuildOptions,
+    _skipped_blocks: &mut usize,
+) -> Result<()> {
+    let rendered = render_translation_for_append(patch, original_events)?;
+    writer.write_event(Event::Text(BytesText::new(&options.bilingual_separator)))?;
+    write_translation_element(writer, "span", &[TRANSLATION_CLASS], options, &rendered)
+}
+
+fn write_translation_element_for_patch(
+    writer: &mut Writer<Vec<u8>>,
+    element_name: &str,
+    classes: &[impl AsRef<str>],
+    patch: PatchSpec<'_>,
+    original_events: &[Event<'static>],
+    options: &RebuildOptions,
+    _skipped_blocks: &mut usize,
+) -> Result<()> {
+    let rendered = render_translation_for_append(patch, original_events)?;
+    write_translation_element(writer, element_name, classes, options, &rendered)
+}
+
+fn render_translation_for_append(
+    patch: PatchSpec<'_>,
+    original_events: &[Event<'static>],
+) -> Result<Vec<Event<'static>>> {
+    if let Some(block) = patch.block {
+        return render_marked_translation(block, patch.translation, original_events);
+    }
+    Ok(vec![Event::Text(
+        BytesText::new(patch.translation).into_owned(),
+    )])
+}
+
+fn write_translation_element(
+    writer: &mut Writer<Vec<u8>>,
+    element_name: &str,
+    classes: &[impl AsRef<str>],
+    options: &RebuildOptions,
+    content: &[Event<'static>],
+) -> Result<()> {
+    let class_attr = classes
+        .iter()
+        .map(|class| class.as_ref())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut element = quick_xml::events::BytesStart::new(element_name);
+    element.push_attribute(("class", class_attr.as_str()));
+    let lang_attr = options
+        .target_language
+        .as_deref()
+        .map(epub_language_tag)
+        .unwrap_or_default();
+    if !lang_attr.is_empty() {
+        element.push_attribute(("lang", lang_attr.as_str()));
+        if is_rtl_language_tag(&lang_attr) {
+            element.push_attribute(("dir", "rtl"));
+        }
+    }
+    writer.write_event(Event::Start(element))?;
+    write_events(writer, content)?;
+    writer.write_event(Event::End(BytesEnd::new(element_name)))?;
+    Ok(())
+}
+
+fn is_rtl_language_tag(language_tag: &str) -> bool {
+    let primary = language_tag
+        .split('-')
+        .next()
+        .unwrap_or(language_tag)
+        .to_ascii_lowercase();
+    matches!(primary.as_str(), "ar" | "he" | "fa")
 }
 
 #[derive(Debug, Clone)]
@@ -1031,7 +1992,7 @@ fn text_node_patch<'a>(
     patch_map: &HashMap<&[usize], PatchSpec<'a>>,
     stack: &mut [ElementFrame],
     non_whitespace: bool,
-) -> Option<&'a str> {
+) -> Option<PatchSpec<'a>> {
     if !non_whitespace {
         return None;
     }
@@ -1039,12 +2000,10 @@ fn text_node_patch<'a>(
     let mut path = frame.path.clone();
     path.push(TEXT_NODE_PATH_BASE + frame.text_count);
     frame.text_count += 1;
-    patch_map
-        .get(path.as_slice())
-        .map(|patch| patch.translation)
+    patch_map.get(path.as_slice()).copied()
 }
 
-fn enter_element(stack: &mut Vec<ElementFrame>) -> Vec<usize> {
+fn enter_element(stack: &mut Vec<ElementFrame>, _name: &[u8]) -> Vec<usize> {
     let path = next_child_path(stack);
     stack.push(ElementFrame {
         path: path.clone(),
@@ -1083,6 +2042,256 @@ mod tests {
 
         assert!(patched.contains("<dc:language>it</dc:language>"));
         validate_xml(&patched).expect("patched OPF should remain XML");
+    }
+
+    #[test]
+    fn patch_opf_bilingual_language_adds_secondary_target_language() {
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:language>en</dc:language>
+  </metadata>
+</package>"#;
+
+        let patched = patch_opf_bilingual_language(opf, "Italian").expect("language should patch");
+
+        assert!(patched.contains("<dc:language>en</dc:language>"));
+        assert!(patched.contains("<dc:language>it</dc:language>"));
+        validate_xml(&patched).expect("patched OPF should remain XML");
+    }
+
+    #[test]
+    fn append_block_adds_paragraph_sibling_with_lang() {
+        let xhtml = "<root><p>Original</p></root>";
+        let block = plain_block(
+            "b_000000",
+            DomPath(vec![0, 0]),
+            BlockKind::Paragraph,
+            "Original",
+        );
+        let outcome = patch_xhtml_blocks_with_options(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "Tradotto",
+            }],
+            &append_options(BilingualMode::AppendBlock),
+        )
+        .expect("patch should succeed");
+
+        assert!(
+            outcome.xhtml.contains(
+                r#"<p>Original</p><p class="bookforge-translation" lang="it">Tradotto</p>"#
+            )
+        );
+        validate_xml(&outcome.xhtml).expect("append-block output should re-parse");
+    }
+
+    #[test]
+    fn append_text_adds_inline_span_with_configured_separator() {
+        let xhtml = "<root><p>Original</p></root>";
+        let block = plain_block(
+            "b_000000",
+            DomPath(vec![0, 0]),
+            BlockKind::Paragraph,
+            "Original",
+        );
+        let mut options = append_options(BilingualMode::AppendText);
+        options.bilingual_separator = " -- ".to_string();
+        let outcome = patch_xhtml_blocks_with_options(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "Tradotto",
+            }],
+            &options,
+        )
+        .expect("patch should succeed");
+
+        assert!(outcome.xhtml.contains(
+            r#"<p>Original -- <span class="bookforge-translation" lang="it">Tradotto</span></p>"#
+        ));
+        validate_xml(&outcome.xhtml).expect("append-text output should re-parse");
+    }
+
+    #[test]
+    fn append_translation_for_rtl_target_sets_dir_attribute() {
+        let xhtml = "<root><p>Original</p></root>";
+        let block = plain_block(
+            "b_000000",
+            DomPath(vec![0, 0]),
+            BlockKind::Paragraph,
+            "Original",
+        );
+        let mut options = append_options(BilingualMode::AppendBlock);
+        options.target_language = Some("Arabic".to_string());
+        let outcome = patch_xhtml_blocks_with_options(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "Target",
+            }],
+            &options,
+        )
+        .expect("patch should succeed");
+
+        assert!(
+            outcome
+                .xhtml
+                .contains(r#"<p class="bookforge-translation" lang="ar" dir="rtl">Target</p>"#)
+        );
+        validate_xml(&outcome.xhtml).expect("rtl append output should re-parse");
+    }
+
+    #[test]
+    fn append_block_heading_uses_paragraph_with_original_and_heading_classes() {
+        let xhtml = r#"<root><h2 class="title">Chapter</h2></root>"#;
+        let block = plain_block(
+            "b_000000",
+            DomPath(vec![0, 0]),
+            BlockKind::Heading(2),
+            "Chapter",
+        );
+        let outcome = patch_xhtml_blocks_with_options(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "Capitolo",
+            }],
+            &append_options(BilingualMode::AppendBlock),
+        )
+        .expect("patch should succeed");
+
+        assert!(outcome.xhtml.contains(
+            r#"<p class="title bookforge-translation bookforge-heading-translation" lang="it">Capitolo</p>"#
+        ));
+        validate_xml(&outcome.xhtml).expect("heading append output should re-parse");
+    }
+
+    #[test]
+    fn append_block_list_item_and_table_cell_use_nested_paragraphs() {
+        let options = append_options(BilingualMode::AppendBlock);
+        let list = "<root><ul><li>Item</li></ul></root>";
+        let list_block = plain_block(
+            "b_000000",
+            DomPath(vec![0, 0, 0]),
+            BlockKind::ListItem,
+            "Item",
+        );
+        let list_outcome = patch_xhtml_blocks_with_options(
+            list,
+            &[BlockPatch {
+                block: &list_block,
+                translation: "Elemento",
+            }],
+            &options,
+        )
+        .expect("list patch should succeed");
+        assert!(
+            list_outcome.xhtml.contains(
+                r#"<li>Item<p class="bookforge-translation" lang="it">Elemento</p></li>"#
+            )
+        );
+
+        let table = "<root><table><tr><td>Cell</td></tr></table></root>";
+        let cell_block = plain_block(
+            "b_000001",
+            DomPath(vec![0, 0, 0, 0]),
+            BlockKind::TableCell,
+            "Cell",
+        );
+        let table_outcome = patch_xhtml_blocks_with_options(
+            table,
+            &[BlockPatch {
+                block: &cell_block,
+                translation: "Cella",
+            }],
+            &options,
+        )
+        .expect("table patch should succeed");
+        assert!(
+            table_outcome
+                .xhtml
+                .contains(r#"<td>Cell<p class="bookforge-translation" lang="it">Cella</p></td>"#)
+        );
+        validate_xml(&list_outcome.xhtml).expect("list append output should re-parse");
+        validate_xml(&table_outcome.xhtml).expect("table append output should re-parse");
+    }
+
+    #[test]
+    fn append_text_blockquote_inserts_span_inside_last_paragraph() {
+        let xhtml = "<root><blockquote><p>Quote</p></blockquote></root>";
+        let block = plain_block("b_000000", DomPath(vec![0, 0]), BlockKind::Quote, "Quote");
+        let outcome = patch_xhtml_blocks_with_options(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "Citazione",
+            }],
+            &append_options(BilingualMode::AppendText),
+        )
+        .expect("patch should succeed");
+
+        assert!(
+            outcome.xhtml.contains(
+                r#"<blockquote><p>Quote / <span class="bookforge-translation" lang="it">Citazione</span></p></blockquote>"#
+            ),
+            "got: {}",
+            outcome.xhtml
+        );
+        validate_xml(&outcome.xhtml).expect("blockquote append output should re-parse");
+    }
+
+    #[test]
+    fn append_modes_skip_code_pre_and_empty_blocks() {
+        let options = append_options(BilingualMode::AppendBlock);
+        let code = "<root><pre>literal</pre></root>";
+        let code_block = plain_block("b_000000", DomPath(vec![0, 0]), BlockKind::Code, "literal");
+        let code_outcome = patch_xhtml_blocks_with_options(
+            code,
+            &[BlockPatch {
+                block: &code_block,
+                translation: "tradotto",
+            }],
+            &options,
+        )
+        .expect("code patch should succeed");
+        assert_eq!(code_outcome.xhtml, code);
+
+        let empty = "<root><p></p></root>";
+        let empty_block = plain_block("b_000001", DomPath(vec![0, 0]), BlockKind::Paragraph, "");
+        let empty_outcome = patch_xhtml_blocks_with_options(
+            empty,
+            &[BlockPatch {
+                block: &empty_block,
+                translation: "tradotto",
+            }],
+            &options,
+        )
+        .expect("empty patch should succeed");
+        assert_eq!(empty_outcome.xhtml, empty);
+    }
+
+    #[test]
+    fn replace_mode_options_match_default_patch_output() {
+        let xhtml = "<root><p>Original</p></root>";
+        let block = plain_block(
+            "b_000000",
+            DomPath(vec![0, 0]),
+            BlockKind::Paragraph,
+            "Original",
+        );
+        let patches = [BlockPatch {
+            block: &block,
+            translation: "Tradotto",
+        }];
+
+        let default = patch_xhtml_blocks(xhtml, &patches).expect("default patch should succeed");
+        let replace = patch_xhtml_blocks_with_options(xhtml, &patches, &RebuildOptions::default())
+            .expect("replace patch should succeed");
+
+        assert_eq!(replace.xhtml, default.xhtml);
+        assert_eq!(replace.skipped_blocks, default.skipped_blocks);
     }
 
     #[test]
@@ -1307,6 +2516,36 @@ mod tests {
     #[test]
     fn validate_xml_rejects_malformed_input() {
         assert!(validate_xml("<root><p>oops</root>").is_err());
+    }
+
+    fn append_options(mode: BilingualMode) -> RebuildOptions {
+        RebuildOptions {
+            target_language: Some("Italian".to_string()),
+            mode,
+            bilingual_separator: DEFAULT_APPEND_TEXT_SEPARATOR.to_string(),
+            bilingual_style: BilingualStyle::Minimal,
+            bilingual_css: None,
+        }
+    }
+
+    fn plain_block(id: &str, dom_path: DomPath, kind: BlockKind, text: &str) -> Block {
+        Block {
+            id: BlockId(id.to_string()),
+            section_id: SectionId("sec_000000".to_string()),
+            kind,
+            dom_path,
+            text_runs: if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![TextRun {
+                    id: "r000000_000".to_string(),
+                    text: text.to_string(),
+                }]
+            },
+            inline_marks: Vec::new(),
+            protected_spans: Vec::<ProtectedSpan>::new(),
+            token_estimate: 4,
+        }
     }
 
     fn block(id: &str, dom_path: DomPath, inline_marks: Vec<InlineMark>) -> Block {

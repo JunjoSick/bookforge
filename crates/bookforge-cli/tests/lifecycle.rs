@@ -277,6 +277,147 @@ fn cli_translate_context_window_persists_snapshot_settings() {
 }
 
 #[test]
+fn cli_translate_bilingual_options_persist_in_snapshot() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = fixture_input();
+    let output = temp.path().join("out.epub");
+    let events = temp.path().join("events.jsonl");
+    let css_path = temp.path().join("bilingual.css");
+    fs::write(&css_path, ".bookforge-translation { color: #123456; }\n")
+        .expect("custom bilingual CSS should write");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--profile",
+            "v1-fast",
+            "--mode",
+            "append-text",
+            "--bilingual-separator",
+            " -- ",
+            "--bilingual-style",
+            "prominent",
+            "--bilingual-css",
+            css_path.to_str().unwrap(),
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let job_id = job_id_from_events(&events);
+    let store =
+        JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store should open");
+    let snapshot = store
+        .load_job_config_snapshot(&job_id)
+        .expect("snapshot load")
+        .expect("snapshot present");
+    assert_eq!(
+        snapshot.bilingual_mode,
+        bookforge_core::BilingualMode::AppendText
+    );
+    assert_eq!(snapshot.bilingual_separator, " -- ");
+    assert_eq!(
+        snapshot.bilingual_style,
+        bookforge_core::BilingualStyle::Prominent
+    );
+    assert_eq!(
+        snapshot.bilingual_css.as_deref(),
+        Some(".bookforge-translation { color: #123456; }\n")
+    );
+}
+
+#[test]
+fn cli_translate_append_block_keeps_glossary_terms_in_run_snapshot() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = fixture_input();
+    let output = temp.path().join("out.epub");
+    let events = temp.path().join("events.jsonl");
+    let glossary = temp.path().join("glossary.toml");
+    fs::write(
+        &glossary,
+        r#"[meta]
+schema_version = 1
+source_language = "English"
+target_language = "Italian"
+
+[meta.scope]
+kind = "book"
+id = "fellowship"
+
+[[term]]
+source = "Ivan Ilych"
+target = "Ivan Ilic"
+category = "person"
+case_sensitive = true
+"#,
+    )
+    .expect("glossary should write");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--source",
+            "English",
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--profile",
+            "v1-fast",
+            "--book-id",
+            "fellowship",
+            "--glossary",
+            glossary.to_str().unwrap(),
+            "--mode",
+            "append-block",
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let job_id = job_id_from_events(&events);
+    let store =
+        JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store should open");
+    let snapshot = store
+        .load_job_config_snapshot(&job_id)
+        .expect("snapshot load")
+        .expect("snapshot present");
+    assert_eq!(
+        snapshot.bilingual_mode,
+        bookforge_core::BilingualMode::AppendBlock
+    );
+    assert!(
+        snapshot
+            .glossary_terms
+            .iter()
+            .any(|term| term.source_text == "Ivan Ilych" && term.target_text == "Ivan Ilic"),
+        "append-block runs should retain selected glossary terms in the same snapshot used for prompts"
+    );
+}
+
+#[test]
 fn cli_translate_with_style_sheet_persists_rendered_block_in_snapshot() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let input = fixture_input();

@@ -12,11 +12,11 @@ pub mod segment;
 pub mod style;
 
 pub use config::{
-    BatchConfig, DoubleCheckConfig, DoubleCheckMode, FallbackScope, JsonMode, ModelEndpoint,
-    ModelRouteConfig, PromptVersion, ProviderErrorKind, ProviderPreset, ProviderPresetResolved,
-    ProviderPresetRuntimeOverrides, ProviderRequestMetric, ProviderRuntimeConfig, QaRunConfig,
-    ResolvedRunSettings, RetryAfterPolicy, SegmentationConfig, TranslationConfig,
-    TranslationProfile, cap_output_tokens,
+    BatchConfig, BilingualMode, BilingualStyle, DoubleCheckConfig, DoubleCheckMode, FallbackScope,
+    JsonMode, ModelEndpoint, ModelRouteConfig, PromptVersion, ProviderErrorKind, ProviderPreset,
+    ProviderPresetResolved, ProviderPresetRuntimeOverrides, ProviderRequestMetric,
+    ProviderRuntimeConfig, QaRunConfig, ResolvedRunSettings, RetryAfterPolicy, SegmentationConfig,
+    TranslationConfig, TranslationProfile, cap_output_tokens,
 };
 pub use entity::{
     Entity, EntityGender, entities_fingerprint, merge_scope_entities, render_entity_agreement_block,
