@@ -793,7 +793,12 @@ fn epub_language_tag(language: &str) -> String {
         "norwegian" => "no",
         "danish" => "da",
         "finnish" => "fi",
-        _ => trimmed,
+        // Unknown language names (multi-word, non-ASCII, unmapped) cannot
+        // be emitted verbatim: `lang="Haitian Creole"` is not a valid
+        // BCP 47 tag and fails EPUBCheck. `und` is the BCP 47 code for
+        // "undetermined", which keeps the attribute present (§9b.9) and
+        // the document valid.
+        _ => "und",
     }
     .to_string()
 }
@@ -2112,6 +2117,18 @@ mod tests {
             r#"<p>Original -- <span class="bookforge-translation" lang="it">Tradotto</span></p>"#
         ));
         validate_xml(&outcome.xhtml).expect("append-text output should re-parse");
+    }
+
+    #[test]
+    fn epub_language_tag_maps_known_names_and_falls_back_to_und() {
+        assert_eq!(epub_language_tag("Italian"), "it");
+        assert_eq!(epub_language_tag("Brazilian Portuguese"), "pt-BR");
+        assert_eq!(epub_language_tag("it"), "it");
+        assert_eq!(epub_language_tag("pt-BR"), "pt-br");
+        assert_eq!(epub_language_tag(""), "");
+        // Unmapped multi-word names must not leak into lang attributes.
+        assert_eq!(epub_language_tag("Haitian Creole"), "und");
+        assert_eq!(epub_language_tag("Neapolitan"), "und");
     }
 
     #[test]
