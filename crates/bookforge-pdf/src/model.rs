@@ -68,10 +68,7 @@ impl Line {
     }
 
     pub fn text(&self) -> String {
-        self.spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>()
+        spans_text(&self.spans)
     }
 
     pub fn char_count(&self) -> usize {
@@ -140,10 +137,7 @@ impl DocBlock {
     }
 
     pub fn text(&self) -> String {
-        self.spans()
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>()
+        spans_text(self.spans())
     }
 
     pub fn char_count(&self) -> usize {
@@ -152,6 +146,20 @@ impl DocBlock {
             .map(|span| span.text.chars().filter(|ch| !ch.is_whitespace()).count())
             .sum()
     }
+}
+
+pub(crate) fn spans_text(spans: &[Span]) -> String {
+    spans
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect::<String>()
+}
+
+pub(crate) fn normalize_text_key(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

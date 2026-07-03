@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{ColumnMode, DocBlock, Fragment, Line, Page, Span};
+use crate::model::{ColumnMode, DocBlock, Fragment, Line, Page, Span, normalize_text_key};
 
 /// Per-page reconstruction diagnostics for the conversion report.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -24,8 +24,7 @@ pub struct PageStats {
 }
 
 pub struct Reconstruction {
-    pub blocks: Vec<DocBlock>,
-    pub block_anchors: Vec<BlockAnchor>,
+    pub blocks: Vec<AnchoredBlock>,
     pub pages: Vec<PageStats>,
 }
 
@@ -33,12 +32,22 @@ pub struct Reconstruction {
 pub struct BlockAnchor {
     pub page: u32,
     pub top: i32,
+    pub left: i32,
+    pub width: i32,
 }
 
 #[derive(Debug, Clone)]
-struct AnchoredBlock {
+pub struct AnchoredBlock {
+    pub block: DocBlock,
+    pub anchor: BlockAnchor,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBlock {
     block: DocBlock,
     top: i32,
+    left: i32,
+    right: i32,
 }
 
 pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
@@ -46,8 +55,7 @@ pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
     let heading_levels = heading_levels(pages, body_size);
     let running_margin_texts = running_margin_texts(pages, body_size);
 
-    let mut blocks: Vec<DocBlock> = Vec::new();
-    let mut block_anchors = Vec::new();
+    let mut blocks: Vec<AnchoredBlock> = Vec::new();
     let mut stats = Vec::new();
 
     for page in pages {
@@ -78,12 +86,11 @@ pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
         });
 
         let page_blocks = cluster_paragraphs(&ordered, body_size, &heading_levels);
-        append_with_continuation(&mut blocks, &mut block_anchors, page.number, page_blocks);
+        append_with_continuation(&mut blocks, page.number, page_blocks);
     }
 
     Reconstruction {
         blocks,
-        block_anchors,
         pages: stats,
     }
 }
@@ -96,7 +103,7 @@ fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<String> {
             if line.font_size > body_size + 1 || !near_vertical_margin(page, &line) {
                 continue;
             }
-            let normalized = normalize_running_text(&line.text());
+            let normalized = normalize_text_key(&line.text());
             if normalized.len() >= 4 && normalized.chars().any(|ch| ch.is_alphabetic()) {
                 seen_on_page.insert(normalized);
             }
@@ -123,19 +130,12 @@ fn is_running_margin_line(
 ) -> bool {
     line.font_size <= body_size + 1
         && near_vertical_margin(page, line)
-        && running_margin_texts.contains(&normalize_running_text(&line.text()))
+        && running_margin_texts.contains(&normalize_text_key(&line.text()))
 }
 
 fn near_vertical_margin(page: &Page, line: &Line) -> bool {
     let margin = (page.height / 8).max(line.height * 3);
     line.top <= margin || line.top + line.height >= page.height - margin
-}
-
-fn normalize_running_text(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
 }
 
 /// Group fragments that share a baseline into one visual line, joining
@@ -342,18 +342,22 @@ fn cluster_paragraphs(
     lines: &[Line],
     body_size: u32,
     heading_levels: &HashMap<u32, u8>,
-) -> Vec<AnchoredBlock> {
+) -> Vec<PendingBlock> {
     let median_gap = median_line_gap(lines);
     let mut blocks = Vec::new();
     let mut current: Vec<Span> = Vec::new();
     let mut current_heading: Option<u8> = None;
     let mut current_top: Option<i32> = None;
+    let mut current_left: Option<i32> = None;
+    let mut current_right: Option<i32> = None;
     let mut previous: Option<&Line> = None;
 
     let flush = |spans: &mut Vec<Span>,
                  heading: &mut Option<u8>,
                  top: &mut Option<i32>,
-                 blocks: &mut Vec<AnchoredBlock>| {
+                 left: &mut Option<i32>,
+                 right: &mut Option<i32>,
+                 blocks: &mut Vec<PendingBlock>| {
         if spans.is_empty() {
             return;
         }
@@ -362,9 +366,13 @@ fn cluster_paragraphs(
             Some(level) => DocBlock::Heading { level, spans },
             None => DocBlock::Paragraph { spans },
         };
-        blocks.push(AnchoredBlock {
+        let left = left.take().unwrap_or_default();
+        let right = right.take().unwrap_or(left + 1).max(left + 1);
+        blocks.push(PendingBlock {
             block,
             top: top.take().unwrap_or_default(),
+            left,
+            right,
         });
     };
 
@@ -390,10 +398,17 @@ fn cluster_paragraphs(
                 &mut current,
                 &mut current_heading,
                 &mut current_top,
+                &mut current_left,
+                &mut current_right,
                 &mut blocks,
             );
             current_heading = heading;
             current_top = Some(line.top);
+            current_left = Some(line.left);
+            current_right = Some(line.right);
+        } else {
+            current_left = Some(current_left.map_or(line.left, |left| left.min(line.left)));
+            current_right = Some(current_right.map_or(line.right, |right| right.max(line.right)));
         }
         join_line_into(&mut current, line);
         previous = Some(line);
@@ -402,6 +417,8 @@ fn cluster_paragraphs(
         &mut current,
         &mut current_heading,
         &mut current_top,
+        &mut current_left,
+        &mut current_right,
         &mut blocks,
     );
 
@@ -465,14 +482,16 @@ fn median_line_gap(lines: &[Line]) -> i32 {
 /// the previous page's last one when the earlier text does not end a
 /// sentence and the new text starts lowercase.
 fn append_with_continuation(
-    blocks: &mut Vec<DocBlock>,
-    block_anchors: &mut Vec<BlockAnchor>,
+    blocks: &mut Vec<AnchoredBlock>,
     page: u32,
-    mut incoming: Vec<AnchoredBlock>,
+    mut incoming: Vec<PendingBlock>,
 ) {
     if let (
-        Some(DocBlock::Paragraph { spans: tail }),
         Some(AnchoredBlock {
+            block: DocBlock::Paragraph { spans: tail },
+            ..
+        }),
+        Some(PendingBlock {
             block: DocBlock::Paragraph { spans: head },
             ..
         }),
@@ -501,11 +520,15 @@ fn append_with_continuation(
         }
     }
     for anchored in incoming {
-        block_anchors.push(BlockAnchor {
-            page,
-            top: anchored.top,
+        blocks.push(AnchoredBlock {
+            block: anchored.block,
+            anchor: BlockAnchor {
+                page,
+                top: anchored.top,
+                left: anchored.left,
+                width: (anchored.right - anchored.left).max(1),
+            },
         });
-        blocks.push(anchored.block);
     }
 }
 
@@ -571,10 +594,14 @@ mod tests {
         let result = reconstruct(&pages, ColumnMode::Auto);
 
         assert!(result.pages[0].two_column, "page must detect two columns");
-        let texts: Vec<String> = result.blocks.iter().map(DocBlock::text).collect();
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
 
         assert!(
-            matches!(&result.blocks[0], DocBlock::Heading { level: 1, .. }),
+            matches!(&result.blocks[0].block, DocBlock::Heading { level: 1, .. }),
             "title should be an h1, got {:?}",
             result.blocks[0]
         );
@@ -604,7 +631,11 @@ mod tests {
         let pages = parse_pdf2xml(xml).expect("fixture parses");
         let result = reconstruct(&pages, ColumnMode::Auto);
 
-        let texts: Vec<String> = result.blocks.iter().map(DocBlock::text).collect();
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
         assert_eq!(
             texts,
             vec![
@@ -638,7 +669,7 @@ mod tests {
         let all_text: String = result
             .blocks
             .iter()
-            .map(|block| block.text())
+            .map(|anchored| anchored.block.text())
             .collect::<Vec<_>>()
             .join("\n");
         let left_pos = all_text.find("left four").expect("left text present");
@@ -669,7 +700,11 @@ mod tests {
         let pages = parse_pdf2xml(xml).expect("fixture parses");
         let result = reconstruct(&pages, ColumnMode::Auto);
 
-        let texts: Vec<String> = result.blocks.iter().map(DocBlock::text).collect();
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
         assert_eq!(
             texts,
             vec!["This sentence does not end until the following page.".to_string()]
@@ -703,7 +738,11 @@ mod tests {
         let pages = parse_pdf2xml(xml).expect("fixture parses");
         let result = reconstruct(&pages, ColumnMode::Auto);
 
-        let texts: Vec<String> = result.blocks.iter().map(DocBlock::text).collect();
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
 
         assert_eq!(texts[0], "THIS SOVIET WORLD");
         assert_eq!(

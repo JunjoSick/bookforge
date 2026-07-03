@@ -75,10 +75,22 @@ fn run_pdf_doctor() -> anyhow::Result<()> {
     println!("PDF conversion tooling:");
     match PopplerTools::discover() {
         Ok(tools) => {
-            println!("  pdftohtml: {}", tools.pdftohtml.display());
-            println!("  pdftotext: {}", tools.pdftotext.display());
-            println!("  pdfimages: {}", tools.pdfimages.display());
-            println!("  pdftoppm: {}", tools.pdftoppm.display());
+            println!("  pdftohtml (required): {}", tools.pdftohtml.display());
+            println!("  pdftotext (required): {}", tools.pdftotext.display());
+            match &tools.pdfimages {
+                Some(path) => println!(
+                    "  pdfimages (recommended, figure preservation): {}",
+                    path.display()
+                ),
+                None => println!("  pdfimages (recommended, figure preservation): missing"),
+            }
+            match &tools.pdftoppm {
+                Some(path) => println!(
+                    "  pdftoppm (recommended, figure/table/equation crops): {}",
+                    path.display()
+                ),
+                None => println!("  pdftoppm (recommended, figure/table/equation crops): missing"),
+            }
             if let Some(version) = tools.version() {
                 println!("  version: {version}");
             }
@@ -87,7 +99,7 @@ fn run_pdf_doctor() -> anyhow::Result<()> {
             println!("  MISSING: {err}");
             println!();
             println!(
-                "  Install poppler and add pdftohtml, pdftotext, pdfimages, and pdftoppm to PATH."
+                "  Install poppler and add at least pdftohtml and pdftotext to PATH. pdfimages and pdftoppm are recommended for figure preservation."
             );
         }
     }

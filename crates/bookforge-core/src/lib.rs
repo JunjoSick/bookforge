@@ -4,6 +4,7 @@ pub mod error;
 pub mod glossary;
 pub mod ir;
 pub mod marker;
+pub mod math;
 pub mod progress;
 pub mod run_snapshot;
 pub mod scheduler;

@@ -1359,23 +1359,7 @@ fn is_math_operator_token(value: &str) -> bool {
 }
 
 fn is_inline_math_operator(ch: char) -> bool {
-    matches!(
-        ch,
-        '=' | '+'
-            | '*'
-            | '/'
-            | '^'
-            | '_'
-            | '<'
-            | '>'
-            | '\u{2264}'
-            | '\u{2265}'
-            | '\u{2248}'
-            | '\u{2260}'
-            | '\u{00b1}'
-            | '\u{00d7}'
-            | '\u{00f7}'
-    )
+    bookforge_core::math::is_inline_math_operator(ch)
 }
 
 fn is_math_token_char(ch: char) -> bool {
@@ -1383,7 +1367,7 @@ fn is_math_token_char(ch: char) -> bool {
 }
 
 fn is_strong_inline_math_operator(ch: char) -> bool {
-    is_inline_math_operator(ch) && ch != '_'
+    bookforge_core::math::is_strong_inline_math_operator(ch)
 }
 
 fn trim_token(raw: &str) -> &str {
