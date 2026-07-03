@@ -1,5 +1,36 @@
 # Changelog
 
+## v2.2.0 - 2026-07-04
+
+BookForge v2.2.0 ships the v1.7 roadmap milestone: bilingual output.
+A new `--mode` flag produces bilingual EPUBs with the translation
+appended after the original instead of replacing it — for language
+learners, bilingual readers, and verification reading.
+
+- `--mode replace|append-text|append-block` (default `replace`,
+  unchanged behavior). `append-block` adds a sibling
+  `<p class="bookforge-translation" lang="…">` after each source block;
+  `append-text` adds one inline span at the end of each block's content,
+  separated by `--bilingual-separator` (default " / ").
+- Per-element append policy keeps output EPUB-valid: nested paragraphs
+  inside list items, table cells, and captions; heading translations as
+  styled paragraphs; code/pre untouched; block markup inside translation
+  wrappers is flattened.
+- Bundled stylesheet (`--bilingual-style minimal|prominent|inline-only`)
+  or custom `--bilingual-css`; CJK targets skip italics; RTL targets
+  (ar/he/fa) get `dir="rtl"`; unmappable language names fall back to
+  the `und` language tag.
+- The target language is recorded as a secondary `<dc:language>`; the
+  table of contents stays source-language in append modes.
+- Bilingual mode is a pure reassembly concern: same prompts, same
+  single-target translation contract, and the segment cache is shared
+  across modes — switching modes reuses every cached translation.
+- Resume/retry remember the mode; pre-v2.2 jobs resume unchanged.
+
+Validation: full workspace suite (476+ tests), mock-provider end-to-end
+in both append modes on a real converted book with structural validation
+and manual inspection of the output XHTML.
+
 ## v2.1.0 - 2026-07-03
 
 BookForge v2.1.0 ships the v1.6 roadmap milestone: PDF ingestion hardening.

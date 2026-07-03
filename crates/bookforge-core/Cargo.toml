@@ -1,6 +1,6 @@
 [package]
 name = "bookforge-core"
-version = "2.1.0"
+version = "2.2.0"
 description = "Core IR, segmentation, configuration, and progress types for BookForge."
 edition.workspace = true
 license.workspace = true
