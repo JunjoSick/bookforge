@@ -6,11 +6,14 @@ use std::{
 };
 
 use bookforge_core::{
+    config::BilingualMode,
     config::SegmentationConfig,
     ir::BlockKind,
     segment::{BlockTranslation, build_segments},
 };
-use bookforge_epub::{inspect_epub, read_epub, rebuild_epub};
+use bookforge_epub::{
+    RebuildOptions, inspect_epub, read_epub, rebuild_epub, rebuild_epub_with_options,
+};
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 #[test]
@@ -152,6 +155,49 @@ fn rebuild_can_safely_replace_the_source_path() {
         .read_to_string(&mut chapter)
         .expect("chapter should read");
     assert!(chapter.contains("Safely replaced in place."));
+}
+
+#[test]
+fn rebuild_replace_options_are_byte_identical_to_default_rebuild() {
+    let fixture = create_minimal_epub();
+    let book = read_epub(&fixture).expect("fixture should parse into IR");
+    let body_block = book
+        .blocks
+        .iter()
+        .find(|block| block_text(block) == "Hello from chapter 1.")
+        .expect("body paragraph should be extracted");
+    let translations = [BlockTranslation {
+        block_id: body_block.id.clone(),
+        text: "Ciao da un EPUB minimo.".to_string(),
+    }];
+    let output_default = std::env::temp_dir().join(format!(
+        "bookforge-replace-default-{}.epub",
+        std::process::id()
+    ));
+    let output_options = std::env::temp_dir().join(format!(
+        "bookforge-replace-options-{}.epub",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&output_default);
+    let _ = std::fs::remove_file(&output_options);
+
+    rebuild_epub(&book, &translations, &output_default).expect("default rebuild should succeed");
+    rebuild_epub_with_options(
+        &book,
+        &translations,
+        &output_options,
+        &RebuildOptions {
+            mode: BilingualMode::Replace,
+            ..RebuildOptions::default()
+        },
+    )
+    .expect("explicit replace rebuild should succeed");
+
+    assert_eq!(
+        std::fs::read(&output_default).expect("default output should read"),
+        std::fs::read(&output_options).expect("options output should read"),
+        "replace mode must remain byte-identical to the default rebuild path"
+    );
 }
 
 #[test]

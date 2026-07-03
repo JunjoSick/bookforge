@@ -266,28 +266,38 @@ struct RoundtripRun {
 
 /// Translate `chapters` with the given mock model and return the output EPUB.
 fn translate(chapters: &[(&str, &str)], model: &str) -> RoundtripRun {
+    translate_with_extra_args(chapters, model, &[])
+}
+
+fn translate_with_extra_args(
+    chapters: &[(&str, &str)],
+    model: &str,
+    extra: &[&str],
+) -> RoundtripRun {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let input = build_epub(temp.path(), "in.epub", chapters);
     let output = temp.path().join("out.epub");
+    let mut args = vec![
+        "translate",
+        input.to_str().unwrap(),
+        "--source",
+        "English",
+        "--target",
+        "Italian",
+        "--provider",
+        "mock",
+        "--model",
+        model,
+        "--ui",
+        "quiet",
+        "--out",
+        output.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
     Command::cargo_bin("bookforge")
         .expect("bookforge binary should be built")
         .current_dir(temp.path())
-        .args([
-            "translate",
-            input.to_str().unwrap(),
-            "--source",
-            "English",
-            "--target",
-            "Italian",
-            "--provider",
-            "mock",
-            "--model",
-            model,
-            "--ui",
-            "quiet",
-            "--out",
-            output.to_str().unwrap(),
-        ])
+        .args(args)
         .assert()
         .success();
     assert!(output.exists(), "translated EPUB should exist");
@@ -298,28 +308,38 @@ fn translate(chapters: &[(&str, &str)], model: &str) -> RoundtripRun {
 }
 
 fn translate_with_ncx(chapters: &[(&str, &str)], model: &str) -> RoundtripRun {
+    translate_with_ncx_extra_args(chapters, model, &[])
+}
+
+fn translate_with_ncx_extra_args(
+    chapters: &[(&str, &str)],
+    model: &str,
+    extra: &[&str],
+) -> RoundtripRun {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let input = build_epub_with_ncx(temp.path(), "in.epub", chapters);
     let output = temp.path().join("out.epub");
+    let mut args = vec![
+        "translate",
+        input.to_str().unwrap(),
+        "--source",
+        "English",
+        "--target",
+        "Italian",
+        "--provider",
+        "mock",
+        "--model",
+        model,
+        "--ui",
+        "quiet",
+        "--out",
+        output.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
     Command::cargo_bin("bookforge")
         .expect("bookforge binary should be built")
         .current_dir(temp.path())
-        .args([
-            "translate",
-            input.to_str().unwrap(),
-            "--source",
-            "English",
-            "--target",
-            "Italian",
-            "--provider",
-            "mock",
-            "--model",
-            model,
-            "--ui",
-            "quiet",
-            "--out",
-            output.to_str().unwrap(),
-        ])
+        .args(args)
         .assert()
         .success();
     assert!(output.exists(), "translated EPUB should exist");
@@ -656,6 +676,143 @@ fn coverage_epub3_nav_document_not_in_spine() {
     assert!(
         nav.contains(r#"<a href="ch1.xhtml">[Italian] Chapter One</a>"#),
         "EPUB3 nav link label should be translated even when nav is not in spine, got: {nav}"
+    );
+}
+
+#[test]
+fn bilingual_append_block_mock_e2e_preserves_source_and_adds_translation_block() {
+    let body = r#"<p>BILINGUAL_BLOCK_SENTINEL text.</p>"#;
+    let run = translate_with_extra_args(
+        &[("ch1.xhtml", body)],
+        "mock-prefix-target",
+        &["--mode", "append-block"],
+    );
+
+    let chapter = read_zip_text(&run.output, "ch1.xhtml");
+    assert!(
+        chapter.contains("<p>BILINGUAL_BLOCK_SENTINEL text.</p>"),
+        "source paragraph should remain visible, got: {chapter}"
+    );
+    assert!(
+        chapter.contains(
+            r#"<p class="bookforge-translation" lang="it">[Italian] BILINGUAL_BLOCK_SENTINEL text.</p>"#
+        ),
+        "translated sibling paragraph should be appended, got: {chapter}"
+    );
+    assert!(
+        chapter
+            .contains(r#"<link rel="stylesheet" type="text/css" href="bookforge-bilingual.css"/>"#),
+        "chapter should link the generated bilingual stylesheet, got: {chapter}"
+    );
+
+    let opf = read_zip_text(&run.output, "content.opf");
+    assert!(opf.contains("<dc:language>en</dc:language>"));
+    assert!(opf.contains("<dc:language>it</dc:language>"));
+    assert!(opf.contains(r#"href="bookforge-bilingual.css" media-type="text/css""#));
+    assert!(
+        read_zip_text(&run.output, "bookforge-bilingual.css").contains(".bookforge-translation")
+    );
+}
+
+#[test]
+fn bilingual_append_text_mock_e2e_preserves_source_and_adds_inline_span() {
+    let body = r#"<p>BILINGUAL_TEXT_SENTINEL text.</p>"#;
+    let run = translate_with_extra_args(
+        &[("ch1.xhtml", body)],
+        "mock-prefix-target",
+        &["--mode", "append-text", "--bilingual-separator", " -- "],
+    );
+
+    let chapter = read_zip_text(&run.output, "ch1.xhtml");
+    assert!(
+        chapter.contains(
+            r#"<p>BILINGUAL_TEXT_SENTINEL text. -- <span class="bookforge-translation" lang="it">[Italian] BILINGUAL_TEXT_SENTINEL text.</span></p>"#
+        ),
+        "translated inline span should be appended with the requested separator, got: {chapter}"
+    );
+
+    let opf = read_zip_text(&run.output, "content.opf");
+    assert!(opf.contains("<dc:language>en</dc:language>"));
+    assert!(opf.contains("<dc:language>it</dc:language>"));
+}
+
+#[test]
+fn bilingual_append_modes_do_not_inject_stylesheet_into_ncx() {
+    let body = r#"<p>NCX_APPEND_SENTINEL text.</p>"#;
+    for mode in ["append-block", "append-text"] {
+        let run = translate_with_ncx_extra_args(
+            &[("ch1.xhtml", body)],
+            "mock-prefix-target",
+            &["--mode", mode],
+        );
+
+        let toc = read_zip_text(&run.output, "toc.ncx");
+        assert!(
+            !toc.contains("stylesheet") && !toc.contains("bookforge-bilingual.css"),
+            "{mode} must not inject an XHTML stylesheet link into toc.ncx, got: {toc}"
+        );
+
+        let chapter = read_zip_text(&run.output, "ch1.xhtml");
+        assert!(
+            chapter.contains(
+                r#"<link rel="stylesheet" type="text/css" href="bookforge-bilingual.css"/>"#
+            ),
+            "{mode} should still link the generated stylesheet from XHTML resources, got: {chapter}"
+        );
+    }
+}
+
+#[test]
+fn bilingual_append_block_mock_e2e_keeps_caption_and_child_blocks_epub_shaped() {
+    let body = r#"<table><caption>CAPTION_SENTINEL text.</caption><tr><td>CELL_SENTINEL</td></tr></table><blockquote><p>QUOTE_ONE_SENTINEL.</p><p>QUOTE_TWO_SENTINEL.</p></blockquote><ul><li><p>LIST_ONE_SENTINEL.</p><p>LIST_TWO_SENTINEL.</p></li></ul>"#;
+    let run = translate_with_extra_args(
+        &[("ch1.xhtml", body)],
+        "mock-prefix-target",
+        &["--mode", "append-block"],
+    );
+
+    let chapter = read_zip_text(&run.output, "ch1.xhtml");
+    assert!(
+        chapter.contains(
+            r#"<caption>CAPTION_SENTINEL text.<p class="bookforge-translation" lang="it">[Italian] CAPTION_SENTINEL text.</p></caption>"#
+        ),
+        "caption translation should stay inside caption, got: {chapter}"
+    );
+    assert!(
+        !chapter.contains(r#"<p class="bookforge-translation" lang="it"><p>"#),
+        "append-block translation wrappers must not contain child p elements, got: {chapter}"
+    );
+    assert!(
+        chapter.contains("[Italian] QUOTE_ONE_SENTINEL. QUOTE_TWO_SENTINEL."),
+        "flattened blockquote translation should join child paragraphs with a space, got: {chapter}"
+    );
+    assert!(
+        chapter.contains("[Italian] LIST_ONE_SENTINEL. LIST_TWO_SENTINEL."),
+        "flattened list-item translation should join child paragraphs with a space, got: {chapter}"
+    );
+}
+
+#[test]
+fn bilingual_append_text_mock_e2e_flattens_child_blocks_inside_spans() {
+    let body = r#"<blockquote><p>QUOTE_TEXT_ONE_SENTINEL.</p><p>QUOTE_TEXT_TWO_SENTINEL.</p></blockquote><ul><li><p>LIST_TEXT_ONE_SENTINEL.</p><p>LIST_TEXT_TWO_SENTINEL.</p></li></ul>"#;
+    let run = translate_with_extra_args(
+        &[("ch1.xhtml", body)],
+        "mock-prefix-target",
+        &["--mode", "append-text"],
+    );
+
+    let chapter = read_zip_text(&run.output, "ch1.xhtml");
+    assert!(
+        !chapter.contains(r#"<span class="bookforge-translation" lang="it"><p>"#),
+        "append-text translation spans must not contain child p elements, got: {chapter}"
+    );
+    assert!(
+        chapter.contains("[Italian] QUOTE_TEXT_ONE_SENTINEL. QUOTE_TEXT_TWO_SENTINEL."),
+        "flattened blockquote translation should join child paragraphs with a space, got: {chapter}"
+    );
+    assert!(
+        chapter.contains("[Italian] LIST_TEXT_ONE_SENTINEL. LIST_TEXT_TWO_SENTINEL."),
+        "flattened list-item translation should join child paragraphs with a space, got: {chapter}"
     );
 }
 

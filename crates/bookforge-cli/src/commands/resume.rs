@@ -14,7 +14,7 @@ use bookforge_core::{
     },
     select_glossary_for_segments,
 };
-use bookforge_epub::{read_epub, rebuild_epub};
+use bookforge_epub::{read_epub, rebuild_epub_with_options};
 use bookforge_llm::{
     ContextRegistry, ContextRunConfig, EntityRunConfig, GlossaryRunConfig, MockProvider,
     OpenAiCompatibleConfig, OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation,
@@ -406,7 +406,8 @@ async fn run_inner(
     .await?;
     let block_translations =
         rebuild_block_translations(&segments, &stored_blocks, &cached_translations);
-    rebuild_epub(&book, &block_translations, &output)?;
+    let rebuild_options = super::translate::rebuild_options_from_snapshot(snapshot);
+    rebuild_epub_with_options(&book, &block_translations, &output, &rebuild_options)?;
 
     let job = store
         .get_job(&job.id)?
@@ -1302,6 +1303,10 @@ mod tests {
             style_rendered_block: String::new(),
             entities_fingerprint: String::new(),
             entities_rendered_block: String::new(),
+            bilingual_mode: bookforge_core::BilingualMode::Replace,
+            bilingual_separator: " / ".to_string(),
+            bilingual_style: bookforge_core::BilingualStyle::Minimal,
+            bilingual_css: None,
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
         store

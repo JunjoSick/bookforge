@@ -13,6 +13,50 @@ pub struct TranslationConfig {
     pub output: PathBuf,
 }
 
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BilingualMode {
+    #[default]
+    Replace,
+    AppendText,
+    AppendBlock,
+}
+
+impl BilingualMode {
+    pub fn is_append(self) -> bool {
+        matches!(self, Self::AppendText | Self::AppendBlock)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::AppendText => "append-text",
+            Self::AppendBlock => "append-block",
+        }
+    }
+}
+
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BilingualStyle {
+    #[default]
+    Minimal,
+    Prominent,
+    InlineOnly,
+}
+
+impl BilingualStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Prominent => "prominent",
+            Self::InlineOnly => "inline-only",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SegmentationConfig {
     pub max_segment_tokens: usize,

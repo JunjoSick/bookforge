@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use crate::{
-    BatchConfig, DoubleCheckConfig, JsonMode, ProviderPreset, ProviderRuntimeConfig, QaRunConfig,
-    ResolvedRunSettings, RetryAfterPolicy, SchedulerConfig, SegmentationConfig, TranslationProfile,
+    BatchConfig, BilingualMode, BilingualStyle, DoubleCheckConfig, JsonMode, ProviderPreset,
+    ProviderRuntimeConfig, QaRunConfig, ResolvedRunSettings, RetryAfterPolicy, SchedulerConfig,
+    SegmentationConfig, TranslationProfile,
     config::ContextScope,
     glossary::{GlossaryFormat, GlossaryTerm},
 };
@@ -65,6 +66,14 @@ pub struct RunConfigSnapshot {
     /// Pre-rendered entity grammatical-agreement block.
     #[serde(default)]
     pub entities_rendered_block: String,
+    #[serde(default)]
+    pub bilingual_mode: BilingualMode,
+    #[serde(default = "default_bilingual_separator")]
+    pub bilingual_separator: String,
+    #[serde(default)]
+    pub bilingual_style: BilingualStyle,
+    #[serde(default)]
+    pub bilingual_css: Option<String>,
     pub settings: ResolvedRunSettingsSnapshot,
 }
 
@@ -78,6 +87,10 @@ fn default_glossary_budget_tokens() -> usize {
 
 fn default_glossary_format() -> GlossaryFormat {
     GlossaryFormat::Json
+}
+
+fn default_bilingual_separator() -> String {
+    " / ".to_string()
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

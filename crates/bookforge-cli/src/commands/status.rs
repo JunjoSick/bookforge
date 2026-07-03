@@ -215,6 +215,10 @@ mod tests {
             style_rendered_block: String::new(),
             entities_fingerprint: String::new(),
             entities_rendered_block: String::new(),
+            bilingual_mode: bookforge_core::BilingualMode::Replace,
+            bilingual_separator: " / ".to_string(),
+            bilingual_style: bookforge_core::BilingualStyle::Minimal,
+            bilingual_css: None,
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         }
     }
