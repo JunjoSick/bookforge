@@ -2341,21 +2341,57 @@ So this section is a **sketch**, not a commitment. Re-evaluate after v1.8 ships.
   it is now mainline ingestion, spec'd as v1.6 in §9 (decision 2026-06).
 - **Glossary auto-extraction (v1.2.x)** — already mentioned, file here as
   a reminder if it didn't ship as a point release.
-- **Proper Pause + Stop for in-flight translations.** The v2 web redesign
-  (`bookforge serve`, `BookForge App` UI) exposes Library/Wizard/Progress/
-  Review/Validation/Glossary at CLI parity, but the Progress screen is
-  **monitor-only** because the engine has no live control surface:
-  - *Stop* — runs are spawned **detached** (`serve` drops the child handle) and
-    CLI runs aren't `serve`'s children at all, so there is no PID to signal.
-    Needs `serve` to track child handles (and/or a store-recorded PID) so a Stop
-    can terminate the run; the existing per-chapter checkpoints already make the
-    stopped job resumable via `bookforge resume`.
-  - *Pause* — there is **no cooperative pause primitive** in `bookforge-core`'s
-    run loop. Needs a real pause/resume signal (cooperative checkpoint-and-halt
-    at a segment boundary) plumbed through the engine, then surfaced as
-    `POST /api/jobs/{id}/pause|resume|cancel` and wired into the Progress screen's
-    Pause/Stop/Resume controls. Until then the UI omits these controls rather
-    than faking them.
+- **Proper Pause + Stop for in-flight translations.** Promoted from a
+  sketch to a scheduled mini-spec — see §10.1.1 below.
+
+#### 10.1.1 Mini-spec: Pause + Stop (added 2026-07-03, ready to schedule)
+
+**Goal.** The Progress surfaces (CLI `--ui`, `watch`, and the `serve`
+dashboard) gain working Pause / Resume / Stop controls. Today they are
+monitor-only; the de-facto pause is "kill the process and `bookforge
+resume`", which works (checkpointing guarantees at most the in-flight
+segments are re-paid) but is graceless and invisible to the dashboard.
+
+**Design — three small pieces, in dependency order:**
+
+1. **Cooperative pause in the scheduler (`bookforge-llm`).** A shared
+   `PauseSignal` (an `Arc<AtomicU8>`-style tri-state run/pause/stop,
+   sibling to the existing `CancellationToken` plumbing) checked before
+   each new segment dispatch. On *pause*: stop dispatching, let in-flight
+   requests complete and checkpoint, then park. On *stop*: same, then
+   exit the run loop cleanly. Job status gains `paused` (store enum +
+   JSONL event `JobPaused` / `JobResumed` — additive, §1.5-compatible).
+2. **Control channel for detached runs.** Runs spawned by `serve` (and
+   CLI runs generally) are not children of the controller, so signal the
+   engine via a file the run loop polls at segment boundaries:
+   `.bookforge/runs/<job-id>/control` containing `pause|resume|stop`.
+   Filesystem-based control matches the existing events.jsonl tailing
+   architecture, works across unrelated processes, and needs no new
+   dependencies (§1.6). Poll cost is one small read per segment boundary.
+3. **Surfaces.** CLI: `bookforge pause <job-id>` / `resume` (extend the
+   existing command to also clear a paused control file) / `stop <job-id>`.
+   Serve: `POST /api/jobs/{id}/pause|resume|stop` writing the same control
+   file (CSRF-protected like existing POSTs), and the Progress screen's
+   Pause/Stop/Resume buttons wired up. TUI: keybindings on `watch`.
+
+**Acceptance.**
+1. Pausing mid-run stops new provider requests within one segment
+   boundary; in-flight segments checkpoint; job shows `paused` in
+   `status`, `watch`, and the dashboard.
+2. Resume (CLI or dashboard) continues without re-translating any
+   succeeded segment (cache/checkpoint identical to today's resume).
+3. Stop terminates the run cleanly; `bookforge resume` afterwards works
+   exactly as it does after a kill today.
+4. A pre-feature job (no control file) runs unchanged.
+5. Un-mockable criterion (§15.6): pause/resume/stop a real DeepSeek run
+   from the dashboard, verify token spend stops while paused.
+
+**Out of scope:** per-segment abort of in-flight requests (let them
+finish; they're checkpointed), scheduling/queueing multiple jobs, pause
+across machine reboots beyond what the control file naturally provides.
+
+**Effort:** 1–2 days engine + 1 day surfaces. **Priority:** after v1.7
+ships; pairs naturally with §9c in a quality-of-life release.
 
 ### 10.2 Explicit non-goals (still)
 
