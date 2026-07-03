@@ -369,6 +369,56 @@ Fix direction:
    Claude does the final visual pass on the crops before the PR leaves
    draft.
 
+## Task 6 (added 2026-07-03) — cosmetic crop polish (final v1.6 pass)
+
+Task 5 verified good end-to-end (BERT: figures 52→11, no prose imaged;
+Fisher's Acid Communism 100% clean; Flatline Constructs 99.3% with correct
+spread reading order). Three cosmetic items remain from the visual pass —
+none lose text, all are crop-quality. Fix on `v1.6-pdf-hardening`.
+
+### 6.1 Clamp table regions to their column
+
+Table crops on two-column pages span the full page width, pulling the
+neighboring column's content into the image (BERT `pdf-table-0002.png`
+mixes two different tables; `pdf-table-0005.png` shows body prose from
+the other column). Apply the same column-clamping Task 5.1 added for
+vector figures: clamp the table region horizontally to the column
+containing the tableish rows. The neighboring text is NOT removed from
+the flow (coverage unaffected) — this is purely about the crop rect.
+
+### 6.2 Shrink vector-figure crops above prose
+
+The page-16 chart crop (`pdf-figure-0009.png`) still *shows* the section
+heading and intro paragraph above the chart (the text correctly stays in
+the flow, so it appears twice: once as pixels, once as text). Task 5.1
+stopped absorbing prose into the region for removal purposes; also shrink
+the crop rect itself: the region's top should start at the topmost
+chart-label/graphic fragment, not at prose above it.
+
+### 6.3 Include outermost sub-images in cluster unions
+
+Two BERT diagrams are clipped at the edges: `pdf-figure-0006.png` loses
+Figure 2's leftmost token column, `pdf-figure-0007.png` loses Figure 3's
+third panel (ELMo). Likely the outermost raster sub-images fall outside
+the cluster distance threshold or land in a second cluster that then gets
+dropped/merged wrong. Diagnose against the BERT XML (pages 3 and 13-ish);
+fix so a diagram's full horizontal extent is covered — consider unioning
+clusters whose rects vertically overlap on the same page.
+
+### Acceptance for task 6 (blocking)
+
+1. BERT re-run: table crops contain a single column's content; the
+   page-16 figure crop starts at the chart (no heading/prose visible);
+   Figures 2 and 3 crops show the complete diagrams (all panels/columns).
+   Counts stay in the Task 5 ranges (figures ~5-11, tables ~6, 0
+   equations) and coverage stays 100.0%.
+2. Fisher regression: converting `test/Acid_Communism.pdf` and
+   `test/Flatline_Constructs.pdf` yields coverage >= the current values
+   (100.0% / 99.3%) with no new warnings.
+3. Full workspace check/test/clippy/fmt clean; fixtures for 6.1-6.3 where
+   distillable. Commit in logical units; do not push; PR #22 stays as-is
+   (already ready) — Claude re-verifies visually before pushing.
+
 ## Verification expectations (all tasks)
 
 - `cargo check --workspace --all-features`, `cargo test --workspace`,

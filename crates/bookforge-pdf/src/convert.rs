@@ -393,6 +393,10 @@ impl RegionRect {
         i64::from((right - left).max(0)) * i64::from((bottom - top).max(0))
     }
 
+    fn vertically_overlaps(self, other: Self) -> bool {
+        self.page == other.page && self.top < other.bottom() && other.top < self.bottom()
+    }
+
     fn touches_within(self, other: Self, gap: i32) -> bool {
         self.page == other.page
             && self.left <= other.right().saturating_add(gap)
@@ -728,7 +732,13 @@ fn push_table_region(page: &Page, rows: &[&FragmentRow<'_>], regions: &mut Vec<M
     if rows.len() < 3 || !table_group_has_aligned_columns(rows) {
         return;
     }
-    let rect = rect_from_rows(page, rows);
+    let mut rect = rect_from_rows(page, rows);
+    if page_has_two_column_prose(page)
+        && let Some((left, right)) = column_bounds_for_table_rows(page, rows)
+        && let Some(clamped) = clamp_rect_horizontally(rect, left, right)
+    {
+        rect = clamped;
+    }
     let caption = detect_table_caption(page, rect);
     if rows.len() < 4 && caption.is_none() {
         return;
@@ -795,6 +805,26 @@ fn rect_from_rows(page: &Page, rows: &[&FragmentRow<'_>]) -> RegionRect {
         width: right - left,
         height: bottom - top,
     }
+}
+
+fn column_bounds_for_table_rows(page: &Page, rows: &[&FragmentRow<'_>]) -> Option<(i32, i32)> {
+    let mut fragments = rows
+        .iter()
+        .flat_map(|row| row.fragments.iter().copied())
+        .filter(|fragment| is_table_signal_fragment(fragment))
+        .collect::<Vec<_>>();
+    if fragments.is_empty() {
+        fragments = rows
+            .iter()
+            .flat_map(|row| row.fragments.iter().copied())
+            .collect::<Vec<_>>();
+    }
+    column_bounds_for_fragments(page, &fragments)
+}
+
+fn is_table_signal_fragment(fragment: &Fragment) -> bool {
+    let text = spans_text(&fragment.spans);
+    text.chars().any(|ch| ch.is_ascii_digit()) || text.contains('%')
 }
 
 fn equation_regions_for_page(page: &Page, excluded: &[RegionRect]) -> Vec<MediaRegion> {
@@ -930,7 +960,10 @@ fn figure_blocks_from_images(
         .iter()
         .filter_map(|region| {
             let page = pages_by_number.get(&region.rect.page).copied()?;
-            Some(snap_rect_above_caption(region.rect.padded(page, 48), region.caption).0)
+            Some(
+                snap_rect_above_caption(padded_vector_crop_rect(page, region.rect), region.caption)
+                    .0,
+            )
         })
         .collect::<Vec<_>>();
     let mut used_images = vec![false; candidates.len()];
@@ -1045,12 +1078,12 @@ fn figure_blocks_from_images(
 
     for region in vector_regions {
         figure_crop_count += 1;
-        let rect = region.rect.padded(
+        let rect = padded_vector_crop_rect(
             pages_by_number
                 .get(&region.rect.page)
                 .copied()
                 .expect("vector figure regions come from known pages"),
-            48,
+            region.rect,
         );
         let (rect, snapped) = snap_rect_above_caption(rect, region.caption);
         let asset = match render_figure_crop(
@@ -1193,7 +1226,62 @@ fn image_candidate_clusters(
         clusters.push(cluster);
     }
 
+    merge_vertically_overlapping_clusters(clusters, candidates, pages_by_number)
+}
+
+fn merge_vertically_overlapping_clusters(
+    mut clusters: Vec<Vec<usize>>,
+    candidates: &[ImageFigureCandidate<'_>],
+    pages_by_number: &HashMap<u32, &Page>,
+) -> Vec<Vec<usize>> {
+    let mut index = 0;
+    while index < clusters.len() {
+        let mut other = index + 1;
+        while other < clusters.len() {
+            if clusters_vertically_overlap(
+                &clusters[index],
+                &clusters[other],
+                candidates,
+                pages_by_number,
+            ) {
+                let mut merged = clusters.remove(other);
+                clusters[index].append(&mut merged);
+            } else {
+                other += 1;
+            }
+        }
+        index += 1;
+    }
     clusters
+}
+
+fn clusters_vertically_overlap(
+    left: &[usize],
+    right: &[usize],
+    candidates: &[ImageFigureCandidate<'_>],
+    pages_by_number: &HashMap<u32, &Page>,
+) -> bool {
+    let Some(left_rect) = cluster_rect(left, candidates, pages_by_number) else {
+        return false;
+    };
+    let Some(right_rect) = cluster_rect(right, candidates, pages_by_number) else {
+        return false;
+    };
+    left_rect.vertically_overlaps(right_rect)
+}
+
+fn cluster_rect(
+    cluster: &[usize],
+    candidates: &[ImageFigureCandidate<'_>],
+    pages_by_number: &HashMap<u32, &Page>,
+) -> Option<RegionRect> {
+    let page_number = candidates.get(*cluster.first()?)?.image.page;
+    let page = pages_by_number.get(&page_number).copied()?;
+    let regions = cluster
+        .iter()
+        .filter_map(|index| candidate_region_rect(&candidates[*index]))
+        .collect::<Vec<_>>();
+    (!regions.is_empty()).then(|| rect_from_region_rects(page, &regions))
 }
 
 fn extended_caption_key(
@@ -1425,11 +1513,25 @@ fn chart_label_fragments<'a>(
                 && is_chart_label_fragment(fragment)
         })
         .collect::<Vec<_>>();
-    if two_column && let Some((left, right)) = column_bounds_for_labels(page, &fragments) {
+    let single_column_caption = two_column && !fragment_spans_columns(page, caption);
+    if single_column_caption {
+        if let Some((left, right)) = column_bounds_for_fragments(page, &[caption]) {
+            fragments.retain(|fragment| {
+                let center = fragment.left + fragment.width / 2;
+                center >= left && center <= right
+            });
+        }
+    } else if two_column
+        && !fragments_span_columns(page, &fragments)
+        && let Some((left, right)) = column_bounds_for_labels(page, &fragments)
+    {
         fragments.retain(|fragment| {
             let center = fragment.left + fragment.width / 2;
             center >= left && center <= right
         });
+    }
+    if single_column_caption && !fragments_span_columns(page, &fragments) {
+        trim_fragments_above_large_vertical_gap(&mut fragments);
     }
     fragments
 }
@@ -1465,14 +1567,88 @@ fn vector_region_rect(
         }
     }
     let mut rect = rect_from_region_rects(page, &rects);
-    if two_column {
+    if two_column
+        && !fragment_spans_columns(page, caption)
+        && !fragments_span_columns(page, chart_fragments)
+    {
         let (left, right) = column_bounds_for_labels(page, chart_fragments)?;
         rect = clamp_rect_horizontally(rect, left, right)?;
     }
     Some(rect)
 }
 
-fn column_bounds_for_labels(page: &Page, chart_fragments: &[&Fragment]) -> Option<(i32, i32)> {
+fn trim_fragments_above_large_vertical_gap(fragments: &mut Vec<&Fragment>) {
+    if fragments.len() < 2 {
+        return;
+    }
+    fragments.sort_by_key(|fragment| (fragment.top, fragment.left));
+    let Some(split_index) = fragments
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, pair)| {
+            let previous_bottom = pair[0].top + pair[0].height;
+            let split_index = index + 1;
+            (pair[1].top.saturating_sub(previous_bottom) >= 36
+                && fragments_have_chart_signal(&fragments[split_index..]))
+            .then_some(split_index)
+        })
+        .next_back()
+    else {
+        return;
+    };
+    fragments.drain(0..split_index);
+}
+
+fn fragments_have_chart_signal(fragments: &[&Fragment]) -> bool {
+    fragments.len() >= 4
+        && fragments
+            .iter()
+            .filter(|fragment| {
+                spans_text(&fragment.spans)
+                    .chars()
+                    .any(|ch| ch.is_ascii_digit())
+            })
+            .count()
+            >= 3
+}
+
+fn fragments_span_columns(page: &Page, fragments: &[&Fragment]) -> bool {
+    if fragments.len() < 6 {
+        return false;
+    }
+    let Some((content_left, content_right)) = content_bounds(page) else {
+        return false;
+    };
+    let content_width = (content_right - content_left).max(1);
+    let mid = content_left + content_width / 2;
+    let left_count = fragments
+        .iter()
+        .filter(|fragment| fragment.left + fragment.width / 2 <= mid)
+        .count();
+    let right_count = fragments.len().saturating_sub(left_count);
+    let fragment_left = fragments
+        .iter()
+        .map(|fragment| fragment.left)
+        .min()
+        .unwrap_or(content_left);
+    let fragment_right = fragments
+        .iter()
+        .map(|fragment| fragment.right())
+        .max()
+        .unwrap_or(content_right);
+    left_count >= 3 && right_count >= 3 && fragment_right - fragment_left >= content_width * 2 / 5
+}
+
+fn fragment_spans_columns(page: &Page, fragment: &Fragment) -> bool {
+    let Some((content_left, content_right)) = content_bounds(page) else {
+        return false;
+    };
+    let content_width = (content_right - content_left).max(1);
+    let mid = content_left + content_width / 2;
+    fragment.width >= content_width * 2 / 3 || (fragment.left < mid && fragment.right() > mid)
+}
+
+fn content_bounds(page: &Page) -> Option<(i32, i32)> {
     let content_left = page.fragments.iter().map(|fragment| fragment.left).min()?;
     let content_right = page
         .fragments
@@ -1480,13 +1656,22 @@ fn column_bounds_for_labels(page: &Page, chart_fragments: &[&Fragment]) -> Optio
         .map(Fragment::right)
         .max()
         .unwrap_or(page.width);
+    Some((content_left, content_right))
+}
+
+fn column_bounds_for_labels(page: &Page, chart_fragments: &[&Fragment]) -> Option<(i32, i32)> {
+    column_bounds_for_fragments(page, chart_fragments)
+}
+
+fn column_bounds_for_fragments(page: &Page, fragments: &[&Fragment]) -> Option<(i32, i32)> {
+    let (content_left, content_right) = content_bounds(page)?;
     let content_width = (content_right - content_left).max(1);
     let mid = content_left + content_width / 2;
-    let center_sum = chart_fragments
+    let center_sum = fragments
         .iter()
         .map(|fragment| fragment.left + fragment.width / 2)
         .sum::<i32>();
-    let centroid = center_sum / i32::try_from(chart_fragments.len()).ok()?.max(1);
+    let centroid = center_sum / i32::try_from(fragments.len()).ok()?.max(1);
     if centroid <= mid {
         Some((content_left, mid))
     } else {
@@ -1562,6 +1747,16 @@ fn shrink_region_away_from_prose(
         }
     }
     rect
+}
+
+fn padded_vector_crop_rect(page: &Page, rect: RegionRect) -> RegionRect {
+    let mut crop = rect.padded(page, 48);
+    if crop.top < rect.top {
+        let bottom = crop.bottom();
+        crop.top = rect.top;
+        crop.height = (bottom - crop.top).max(1);
+    }
+    crop
 }
 
 fn is_prose_like_fragment(fragment: &Fragment) -> bool {
@@ -2293,6 +2488,88 @@ cp "$script_dir/pdftoppm.fixture.png" "$last.png"
     }
 
     #[test]
+    fn table_region_clamps_to_table_column_on_two_column_page() {
+        let mut page = empty_page(1);
+        page.fragments = vec![
+            fragment(
+                70,
+                72,
+                220,
+                10,
+                "Left column prose establishes a normal sentence.",
+            ),
+            fragment(
+                86,
+                72,
+                220,
+                10,
+                "Another left column sentence keeps detection stable.",
+            ),
+            fragment(
+                70,
+                330,
+                220,
+                10,
+                "Right column prose establishes a normal sentence.",
+            ),
+            fragment(
+                86,
+                330,
+                220,
+                10,
+                "Another right column sentence keeps detection stable.",
+            ),
+            fragment(130, 72, 140, 10, "Table 1. Scores."),
+            fragment(170, 72, 40, 10, "Metric"),
+            fragment(170, 150, 32, 10, "2019"),
+            fragment(170, 220, 32, 10, "2020"),
+            fragment(
+                170,
+                330,
+                220,
+                10,
+                "Right column prose should not enter this crop.",
+            ),
+            fragment(190, 72, 20, 10, "A"),
+            fragment(190, 150, 32, 10, "0.91"),
+            fragment(190, 220, 32, 10, "0.93"),
+            fragment(
+                190,
+                330,
+                220,
+                10,
+                "Neighboring body text remains ordinary prose.",
+            ),
+            fragment(210, 72, 20, 10, "B"),
+            fragment(210, 150, 32, 10, "0.81"),
+            fragment(210, 220, 32, 10, "0.84"),
+            fragment(
+                210,
+                330,
+                220,
+                10,
+                "The crop must stay within the table column.",
+            ),
+        ];
+
+        let regions = table_regions_for_page(&page, &[]);
+
+        assert_eq!(regions.len(), 1);
+        let rect = regions[0].rect;
+        assert!(
+            rect.right() <= 330,
+            "table crop must stay in the table column: {rect:?}"
+        );
+        assert!(
+            page.fragments
+                .iter()
+                .filter(|fragment| fragment.left > page.width / 2)
+                .all(|fragment| !rect.overlaps_fragment(fragment)),
+            "right-column prose must stay outside the table crop: {rect:?}"
+        );
+    }
+
+    #[test]
     fn figure_token_rows_inside_image_region_are_not_tables() {
         let pages = parse_pdf2xml(BERT_FIGURE1_TOKEN_STRIP_XML).expect("fixture parses");
         let regions = detect_media_regions(&pages, &[]);
@@ -2323,7 +2600,222 @@ cp "$script_dir/pdftoppm.fixture.png" "$last.png"
                 .all(|fragment| !rect.overlaps_fragment(fragment)),
             "prose fragments must stay outside vector chart text region: {rect:?}"
         );
+        let crop = padded_vector_crop_rect(page, rect);
+        assert_eq!(
+            crop.top, rect.top,
+            "vector crop must not pad upward into prose above the chart"
+        );
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn vector_chart_region_drops_short_prose_above_chart_labels() {
+        let mut page = empty_page(1);
+        page.width = 892;
+        page.height = 1262;
+        page.fragments = vec![
+            fragment(
+                100,
+                108,
+                327,
+                15,
+                "Left column prose establishes normal text for detection.",
+            ),
+            fragment(
+                120,
+                108,
+                327,
+                15,
+                "Another left column sentence keeps this page two-column.",
+            ),
+            fragment(
+                100,
+                461,
+                327,
+                15,
+                "Right column prose establishes normal text for detection.",
+            ),
+            fragment(
+                120,
+                461,
+                327,
+                15,
+                "Another right column sentence keeps this page two-column.",
+            ),
+            fragment(711, 108, 71, 15, "In Section"),
+            fragment(
+                731,
+                108,
+                327,
+                15,
+                "mixed strategy for masking the target tokens when",
+            ),
+            fragment(812, 108, 66, 15, "strategies."),
+            fragment(871, 130, 12, 9, "84"),
+            fragment(904, 130, 12, 9, "82"),
+            fragment(936, 130, 12, 9, "80"),
+            fragment(1026, 188, 18, 9, "200"),
+            fragment(1043, 205, 130, 9, "Pre-training Steps"),
+            fragment(
+                1075,
+                108,
+                327,
+                13,
+                "Figure 5: Ablation over number of training steps.",
+            ),
+        ];
+        let mut warnings = Vec::new();
+        let pages = vec![page];
+
+        let regions = vector_figure_regions(&pages, &HashSet::from([1]), &mut warnings);
+
+        assert_eq!(regions.len(), 1);
+        assert!(
+            regions[0].rect.top >= 871,
+            "chart region must start at chart labels, not short prose: {:?}",
+            regions[0].rect
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn full_width_vector_diagram_is_not_clamped_to_one_column() {
+        let mut page = empty_page(1);
+        page.width = 892;
+        page.height = 1262;
+        page.fragments = vec![
+            fragment(
+                399,
+                108,
+                327,
+                15,
+                "Left column prose establishes normal text for detection.",
+            ),
+            fragment(
+                419,
+                108,
+                327,
+                15,
+                "Another left column sentence keeps this page two-column.",
+            ),
+            fragment(
+                399,
+                461,
+                327,
+                15,
+                "Right column prose establishes normal text for detection.",
+            ),
+            fragment(
+                419,
+                461,
+                327,
+                15,
+                "Another right column sentence keeps this page two-column.",
+            ),
+            fragment(101, 167, 79, 13, "BERT (Ours)"),
+            fragment(153, 144, 12, 6, "Trm"),
+            fragment(153, 178, 12, 6, "Trm"),
+            fragment(127, 147, 6, 6, "T"),
+            fragment(131, 153, 3, 4, "1"),
+            fragment(127, 182, 4, 6, "T"),
+            fragment(131, 186, 3, 4, "2"),
+            fragment(102, 335, 79, 13, "OpenAI GPT"),
+            fragment(153, 322, 12, 6, "Trm"),
+            fragment(153, 357, 12, 6, "Trm"),
+            fragment(127, 326, 6, 6, "T"),
+            fragment(131, 332, 3, 4, "1"),
+            fragment(105, 608, 36, 13, "ELMo"),
+            fragment(165, 486, 15, 6, "Lstm"),
+            fragment(165, 683, 15, 6, "Lstm"),
+            fragment(165, 749, 15, 6, "Lstm"),
+            fragment(127, 573, 6, 6, "T"),
+            fragment(131, 579, 3, 4, "1"),
+            fragment(127, 608, 4, 6, "T"),
+            fragment(131, 612, 3, 4, "2"),
+            fragment(228, 678, 6, 6, "E"),
+            fragment(233, 685, 3, 4, "N"),
+            fragment(
+                276,
+                108,
+                680,
+                13,
+                "Figure 3: Differences in pre-training model architectures.",
+            ),
+        ];
+        let mut warnings = Vec::new();
+        let page_width = page.width;
+        let pages = vec![page];
+
+        let regions = vector_figure_regions(&pages, &HashSet::from([1]), &mut warnings);
+
+        assert_eq!(regions.len(), 1);
+        assert!(
+            regions[0].rect.right() > page_width * 3 / 4,
+            "full-width vector diagram must include the rightmost panel: {:?}",
+            regions[0].rect
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn vertically_overlapping_outer_subimage_clusters_merge() {
+        let mut page = empty_page(1);
+        page.images = vec![
+            ImageRegion {
+                top: 120,
+                left: 60,
+                width: 40,
+                height: 30,
+                src: None,
+            },
+            ImageRegion {
+                top: 124,
+                left: 180,
+                width: 40,
+                height: 30,
+                src: None,
+            },
+            ImageRegion {
+                top: 126,
+                left: 235,
+                width: 40,
+                height: 30,
+                src: None,
+            },
+            ImageRegion {
+                top: 122,
+                left: 430,
+                width: 40,
+                height: 30,
+                src: None,
+            },
+        ];
+        let pages_by_number = HashMap::from([(1, &page)]);
+        let images = (0..4)
+            .map(|index| ExtractedImage {
+                page: 1,
+                index,
+                width: Some(40),
+                height: Some(30),
+                path: PathBuf::from(format!("subimage-{index}.png")),
+                extension: "png".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let candidates = image_figure_candidates(&pages_by_number, &images);
+        let clusters = image_candidate_clusters(
+            &candidates,
+            &vec![false; candidates.len()],
+            &pages_by_number,
+        );
+
+        assert_eq!(
+            clusters.len(),
+            1,
+            "expected one merged cluster: {clusters:?}"
+        );
+        let mut cluster = clusters[0].clone();
+        cluster.sort_unstable();
+        assert_eq!(cluster, vec![0, 1, 2, 3]);
     }
 
     #[test]
