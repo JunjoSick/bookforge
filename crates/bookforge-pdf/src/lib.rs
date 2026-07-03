@@ -1,4 +1,4 @@
-//! PDF ingestion for BookForge (ROADMAP §9b).
+//! PDF ingestion for BookForge (ROADMAP §9).
 //!
 //! Layout extraction is delegated to poppler's command-line tools;
 //! everything after the `pdftohtml -xml` output is deterministic Rust:
@@ -16,7 +16,9 @@ pub mod report;
 pub mod tools;
 
 pub use convert::{ConvertOptions, ConvertOutcome, convert_pdf};
-pub use model::{ColumnMode, DocBlock, Line, Page, Span};
+pub use model::{
+    ColumnMode, DocBlock, ImageAsset, ImageRegion, Line, LowConfidenceMode, Page, Span,
+};
 pub use parse::parse_pdf2xml;
 pub use reconstruct::reconstruct;
 pub use report::ConversionReport;

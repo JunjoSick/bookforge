@@ -1,0 +1,11 @@
+<pdf2xml producer="poppler">
+  <page number="1" width="612" height="792">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <fontspec id="1" size="10" family="Times" color="#000000"/>
+    <text top="72" left="72" width="300" height="12" font="0">A multi-panel result follows.</text>
+    <image top="120" left="84" width="210" height="100" src="figure4-left.png"/>
+    <image top="120" left="318" width="210" height="100" src="figure4-right.png"/>
+    <text top="245" left="84" width="390" height="12" font="1">Figure 4. Multi-panel activation maps.</text>
+    <text top="290" left="72" width="340" height="12" font="0">Discussion resumes after the figure.</text>
+  </page>
+</pdf2xml>

@@ -6,6 +6,7 @@
 //! <page number="1" width="918" height="1188" ...>
 //!   <fontspec id="0" size="17" family="Times" color="#000000"/>
 //!   <text top="246" left="261" width="394" height="18" font="0">Line with <b>bold</b></text>
+//!   <image top="320" left="120" width="300" height="180" src="paper-1_1.png"/>
 //! </page>
 //! ```
 //!
@@ -18,7 +19,7 @@ use quick_xml::{Reader, events::Event};
 
 use crate::{
     PdfError, Result,
-    model::{Fragment, Page, Span},
+    model::{Fragment, ImageRegion, Page, Span},
 };
 
 pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
@@ -59,6 +60,7 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                     width,
                     height,
                     fragments: Vec::new(),
+                    images: Vec::new(),
                     font_sizes: HashMap::new(),
                 });
             }
@@ -109,6 +111,35 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                 current_fragment = Some(fragment);
                 bold_depth = 0;
                 italic_depth = 0;
+            }
+            Event::Start(element) | Event::Empty(element)
+                if local(element.name().as_ref()) == b"image" =>
+            {
+                let Some(page) = current_page.as_mut() else {
+                    continue;
+                };
+                let mut region = ImageRegion {
+                    top: 0,
+                    left: 0,
+                    width: 0,
+                    height: 0,
+                    src: None,
+                };
+                for attr in element.attributes() {
+                    let attr = attr.map_err(|err| PdfError::InvalidInput(err.to_string()))?;
+                    let value = attr
+                        .decode_and_unescape_value(reader.decoder())
+                        .map_err(|err| PdfError::InvalidInput(err.to_string()))?;
+                    match local(attr.key.as_ref()) {
+                        b"top" => region.top = parse_coord(&value),
+                        b"left" => region.left = parse_coord(&value),
+                        b"width" => region.width = parse_coord(&value),
+                        b"height" => region.height = parse_coord(&value),
+                        b"src" => region.src = Some(value.into_owned()),
+                        _ => {}
+                    }
+                }
+                page.images.push(region);
             }
             Event::Start(element) if current_fragment.is_some() => {
                 match local(element.name().as_ref()) {
@@ -215,6 +246,7 @@ mod tests {
   <fontspec id="0" size="22" family="Times" color="#000000"/>
   <fontspec id="1" size="11" family="Times" color="#000000"/>
   <text top="100" left="200" width="500" height="24" font="0">A <b>Bold</b> Title</text>
+  <image top="150" left="210" width="120" height="80" src="fig-1.png"/>
   <text top="200" left="100" width="350" height="12" font="1">Left column line with <i>italics</i>.</text>
   <text top="200" left="480" width="350" height="12" font="1">Right column &amp; more.</text>
 </page>
@@ -229,6 +261,9 @@ mod tests {
         assert_eq!(page.width, 918);
         assert_eq!(page.font_sizes.get(&0), Some(&22));
         assert_eq!(page.fragments.len(), 3);
+        assert_eq!(page.images.len(), 1);
+        assert_eq!(page.images[0].top, 150);
+        assert_eq!(page.images[0].src.as_deref(), Some("fig-1.png"));
 
         let title = &page.fragments[0];
         assert_eq!(title.font, 0);

@@ -1,0 +1,6 @@
+<pdf2xml producer="poppler">
+  <page number="1" width="612" height="792">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="100" left="80" width="440" height="12" font="0">The model = stable result used k = 3 in parentheses (n = 12).</text>
+  </page>
+</pdf2xml>

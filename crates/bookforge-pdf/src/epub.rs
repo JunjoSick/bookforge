@@ -8,7 +8,7 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
     Result,
-    model::{DocBlock, Span},
+    model::{DocBlock, ImageAsset, Span},
 };
 
 const CONTAINER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -29,16 +29,38 @@ pub fn write_epub(blocks: &[DocBlock], title: &str, language: &str, output: &Pat
     zip.start_file("META-INF/container.xml", deflated)?;
     zip.write_all(CONTAINER_XML.as_bytes())?;
     zip.start_file("content.opf", deflated)?;
-    zip.write_all(opf(title, language).as_bytes())?;
+    zip.write_all(opf(title, language, figure_assets(blocks)).as_bytes())?;
     zip.start_file("content.xhtml", deflated)?;
     zip.write_all(chapter_xhtml(blocks, title).as_bytes())?;
     zip.start_file("nav.xhtml", deflated)?;
     zip.write_all(nav_xhtml(title).as_bytes())?;
+    for asset in figure_assets(blocks) {
+        zip.start_file(asset.href.as_str(), deflated)?;
+        zip.write_all(&asset.bytes)?;
+    }
     zip.finish()?;
     Ok(())
 }
 
-fn opf(title: &str, language: &str) -> String {
+fn opf(title: &str, language: &str, assets: Vec<&ImageAsset>) -> String {
+    let asset_items = assets
+        .iter()
+        .map(|asset| {
+            format!(
+                r#"    <item id="{}" href="{}" media-type="{}"/>"#,
+                escape_attr(&asset.id),
+                escape_attr(&asset.href),
+                escape_attr(&asset.media_type)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let asset_items = if asset_items.is_empty() {
+        String::new()
+    } else {
+        format!("{asset_items}\n")
+    };
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
@@ -51,6 +73,7 @@ fn opf(title: &str, language: &str) -> String {
   <manifest>
     <item id="content" href="content.xhtml" media-type="application/xhtml+xml"/>
     <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+{asset_items}
   </manifest>
   <spine>
     <itemref idref="content"/>
@@ -88,6 +111,21 @@ fn chapter_xhtml(blocks: &[DocBlock], title: &str) -> String {
             DocBlock::Paragraph { spans } => {
                 body.push_str(&format!("<p>{}</p>\n", render_spans(spans)));
             }
+            DocBlock::Figure { image, caption } => {
+                body.push_str(&format!(
+                    "<figure id=\"{}\"><img src=\"{}\" alt=\"PDF image from page {}\"/>",
+                    escape_attr(&image.id),
+                    escape_attr(&image.href),
+                    image.page
+                ));
+                if let Some(caption) = caption {
+                    body.push_str(&format!(
+                        "<figcaption>{}</figcaption>",
+                        render_spans(caption)
+                    ));
+                }
+                body.push_str("</figure>\n");
+            }
         }
     }
     format!(
@@ -99,6 +137,16 @@ fn chapter_xhtml(blocks: &[DocBlock], title: &str) -> String {
 </html>"#,
         escape_text(title)
     )
+}
+
+fn figure_assets(blocks: &[DocBlock]) -> Vec<&ImageAsset> {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            DocBlock::Figure { image, .. } => Some(image),
+            _ => None,
+        })
+        .collect()
 }
 
 fn render_spans(spans: &[Span]) -> String {
@@ -122,6 +170,21 @@ fn escape_text(text: &str) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn escape_attr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
             _ => out.push(ch),
         }
     }

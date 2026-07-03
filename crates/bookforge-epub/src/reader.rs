@@ -1261,6 +1261,14 @@ fn detect_protected_spans(text: &str) -> Vec<ProtectedSpan> {
             })
         })
         .collect::<Vec<_>>();
+    spans.extend(
+        detect_math_spans(text)
+            .into_iter()
+            .map(|text| ProtectedSpan {
+                kind: ProtectedSpanKind::Math,
+                text,
+            }),
+    );
     spans.sort_by(|left, right| left.text.cmp(&right.text));
     spans.dedup_by(|left, right| left.kind == right.kind && left.text == right.text);
     spans
@@ -1279,11 +1287,87 @@ fn protected_span_kind(value: &str) -> Option<ProtectedSpanKind> {
         Some(ProtectedSpanKind::Citation)
     } else if looks_like_protected_number(value) {
         Some(ProtectedSpanKind::Number)
+    } else if looks_like_inline_math_token(value) {
+        Some(ProtectedSpanKind::Math)
     } else if looks_like_filename(value) {
         Some(ProtectedSpanKind::Filename)
     } else {
         None
     }
+}
+
+fn detect_math_spans(text: &str) -> Vec<String> {
+    let tokens = text
+        .split_whitespace()
+        .map(trim_token)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let mut spans = Vec::new();
+
+    for window in tokens.windows(3) {
+        let [left, op, right] = window else {
+            continue;
+        };
+        if is_math_operator_token(op)
+            && looks_like_math_operand(left)
+            && looks_like_math_operand(right)
+            && (looks_like_inline_math_token(left)
+                || looks_like_inline_math_token(right)
+                || is_symbolic_operand(left)
+                || is_symbolic_operand(right))
+        {
+            spans.push(format!("{left} {op} {right}"));
+        }
+    }
+
+    spans.sort();
+    spans.dedup();
+    spans
+}
+
+fn looks_like_inline_math_token(value: &str) -> bool {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() < 3 {
+        return false;
+    }
+    let has_operand = chars.iter().any(|ch| ch.is_ascii_alphanumeric());
+    let has_strong_operator = chars.iter().any(|ch| is_strong_inline_math_operator(*ch));
+    let has_numeric_subscript = chars.contains(&'_') && chars.iter().any(|ch| ch.is_ascii_digit());
+    has_operand
+        && (has_strong_operator || has_numeric_subscript)
+        && chars.iter().all(|ch| is_math_token_char(*ch))
+}
+
+fn looks_like_math_operand(value: &str) -> bool {
+    let chars = value.chars().collect::<Vec<_>>();
+    !chars.is_empty()
+        && chars.len() <= 24
+        && chars.iter().any(|ch| ch.is_ascii_alphanumeric())
+        && chars.iter().all(|ch| is_math_token_char(*ch))
+}
+
+fn is_symbolic_operand(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic()) && chars.next().is_none()
+}
+
+fn is_math_operator_token(value: &str) -> bool {
+    matches!(
+        value,
+        "=" | "<" | ">" | "<=" | ">=" | "==" | "\u{2264}" | "\u{2265}" | "\u{2248}" | "\u{2260}"
+    )
+}
+
+fn is_inline_math_operator(ch: char) -> bool {
+    bookforge_core::math::is_inline_math_operator(ch)
+}
+
+fn is_math_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || is_inline_math_operator(ch) || matches!(ch, '.' | ',')
+}
+
+fn is_strong_inline_math_operator(ch: char) -> bool {
+    bookforge_core::math::is_strong_inline_math_operator(ch)
 }
 
 fn trim_token(raw: &str) -> &str {
@@ -1760,6 +1844,34 @@ mod tests {
         assert!(texts.contains(&"chapter.xhtml"));
         assert!(texts.contains(&"[@tolstoy1886]"));
         assert!(texts.contains(&"@note1"));
+    }
+
+    #[test]
+    fn protected_spans_include_inline_math_without_overflagging_prose() {
+        let spans = detect_protected_spans("Einstein wrote E = mc^2, with p<0.05 elsewhere.");
+        let math = spans
+            .iter()
+            .filter(|span| span.kind == ProtectedSpanKind::Math)
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(math.contains(&"E = mc^2"));
+        assert!(math.contains(&"p<0.05"));
+
+        let prose = detect_protected_spans("The model = stable result was described in prose.");
+        assert!(
+            !prose
+                .iter()
+                .any(|span| span.kind == ProtectedSpanKind::Math && span.text == "model = stable")
+        );
+
+        let sentinel =
+            detect_protected_spans("OUTER_SENTINEL should remain ordinary fixture text.");
+        assert!(
+            !sentinel
+                .iter()
+                .any(|span| span.kind == ProtectedSpanKind::Math)
+        );
     }
 
     fn block_text(block: &Block) -> String {

@@ -1,0 +1,19 @@
+<pdf2xml producer="poppler">
+  <page number="1" width="612" height="792">
+    <fontspec id="0" size="9" family="Times" color="#000000"/>
+    <image top="116" left="72" width="468" height="180" src="figure1-diagram.png"/>
+    <text top="148" left="92" width="42" height="9" font="0">E_[CLS]</text>
+    <text top="148" left="198" width="24" height="9" font="0">E_1</text>
+    <text top="148" left="304" width="24" height="9" font="0">E_2</text>
+    <text top="148" left="410" width="26" height="9" font="0">E_N</text>
+    <text top="170" left="92" width="42" height="9" font="0">T_[CLS]</text>
+    <text top="170" left="198" width="24" height="9" font="0">T_1</text>
+    <text top="170" left="304" width="24" height="9" font="0">T_2</text>
+    <text top="170" left="410" width="26" height="9" font="0">T_N</text>
+    <text top="192" left="92" width="42" height="9" font="0">C_[CLS]</text>
+    <text top="192" left="198" width="24" height="9" font="0">C_1</text>
+    <text top="192" left="304" width="24" height="9" font="0">C_2</text>
+    <text top="192" left="410" width="26" height="9" font="0">C_N</text>
+    <text top="318" left="72" width="420" height="10" font="0">Figure 1. Overall pre-training and fine-tuning procedures for BERT.</text>
+  </page>
+</pdf2xml>

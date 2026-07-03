@@ -5,6 +5,9 @@ use serde::Serialize;
 
 use crate::reconstruct::PageStats;
 
+pub const LOW_CONFIDENCE_COVERAGE_RATIO: f64 = 0.95;
+pub const LOW_CONFIDENCE_COVERAGE_PERCENT: f64 = LOW_CONFIDENCE_COVERAGE_RATIO * 100.0;
+
 #[derive(Debug, Serialize)]
 pub struct ConversionReport {
     pub input: String,
@@ -13,6 +16,9 @@ pub struct ConversionReport {
     pub blocks: usize,
     /// Non-whitespace characters in reconstructed blocks.
     pub reconstructed_chars: usize,
+    /// Non-whitespace characters removed from text blocks because the same
+    /// content was preserved in table/equation/figure raster crops.
+    pub media_preserved_chars: usize,
     /// Non-whitespace characters in the raw `pdftotext` baseline.
     pub baseline_chars: usize,
     /// reconstructed/baseline, capped at 100. Above ~100 means the
@@ -20,8 +26,26 @@ pub struct ConversionReport {
     /// dropped content and the page list below says where.
     pub coverage_percent: f64,
     pub two_column_pages: usize,
+    pub images: usize,
+    pub figures: usize,
+    pub tables: usize,
+    pub equations: usize,
+    pub low_confidence_pages: usize,
     pub page_stats: Vec<PageStats>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReportMetrics {
+    pub blocks: usize,
+    pub reconstructed_chars: usize,
+    pub media_preserved_chars: usize,
+    pub baseline_chars: usize,
+    pub images: usize,
+    pub figures: usize,
+    pub tables: usize,
+    pub equations: usize,
+    pub layout_warnings: Vec<String>,
 }
 
 impl ConversionReport {
@@ -29,40 +53,53 @@ impl ConversionReport {
         input: &str,
         output: &str,
         page_stats: Vec<PageStats>,
-        blocks: usize,
-        reconstructed_chars: usize,
-        baseline_chars: usize,
+        metrics: ReportMetrics,
     ) -> Self {
-        let coverage_percent = if baseline_chars == 0 {
+        let credited_chars = metrics.reconstructed_chars + metrics.media_preserved_chars;
+        let coverage_percent = if metrics.baseline_chars == 0 {
             100.0
         } else {
-            (reconstructed_chars as f64 / baseline_chars as f64 * 100.0).min(100.0)
+            (credited_chars as f64 / metrics.baseline_chars as f64 * 100.0).min(100.0)
         };
 
         let mut warnings = Vec::new();
-        if coverage_percent < 95.0 {
+        if coverage_percent < LOW_CONFIDENCE_COVERAGE_PERCENT {
             warnings.push(format!(
                 "reconstructed text covers only {coverage_percent:.1}% of the pdftotext baseline; some content was not captured"
             ));
         }
         for page in &page_stats {
-            if page.chars == 0 && page.baseline_chars > 0 {
+            if page.low_confidence {
+                let action = page.low_confidence_action.as_deref().unwrap_or("linearize");
+                let page_coverage = page_coverage_percent(page.chars, page.baseline_chars);
+                warnings.push(format!(
+                    "page {}: low-confidence reconstruction ({page_coverage:.1}% of pdftotext baseline, {} reconstructed / {} baseline characters); action={action}",
+                    page.page, page.chars, page.baseline_chars
+                ));
+            } else if page.chars == 0 && page.baseline_chars > 0 {
                 warnings.push(format!(
                     "page {}: no text reconstructed, but pdftotext found {} baseline characters",
                     page.page, page.baseline_chars
                 ));
             }
         }
+        warnings.extend(metrics.layout_warnings);
 
         Self {
             input: input.to_string(),
             output: output.to_string(),
             pages: page_stats.len(),
-            blocks,
-            reconstructed_chars,
-            baseline_chars,
+            blocks: metrics.blocks,
+            reconstructed_chars: metrics.reconstructed_chars,
+            media_preserved_chars: metrics.media_preserved_chars,
+            baseline_chars: metrics.baseline_chars,
             coverage_percent,
             two_column_pages: page_stats.iter().filter(|page| page.two_column).count(),
+            images: metrics.images,
+            figures: metrics.figures,
+            tables: metrics.tables,
+            equations: metrics.equations,
+            low_confidence_pages: page_stats.iter().filter(|page| page.low_confidence).count(),
             page_stats,
             warnings,
         }
@@ -70,12 +107,18 @@ impl ConversionReport {
 
     pub fn summary(&self) -> String {
         let mut out = format!(
-            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nText coverage vs pdftotext: {:.1}% ({} reconstructed / {} baseline characters)\n",
+            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nImages: {} extracted, {} figure block(s)\nTables: {} crop(s)\nEquations: {} crop(s)\nLow-confidence pages: {}\nText coverage vs pdftotext: {:.1}% ({} reconstructed + {} preserved as images / {} baseline characters)\n",
             self.pages,
             self.blocks,
             self.two_column_pages,
+            self.images,
+            self.figures,
+            self.tables,
+            self.equations,
+            self.low_confidence_pages,
             self.coverage_percent,
             self.reconstructed_chars,
+            self.media_preserved_chars,
             self.baseline_chars,
         );
         if self.warnings.is_empty() {
@@ -90,19 +133,42 @@ impl ConversionReport {
     }
 }
 
+fn page_coverage_percent(chars: usize, baseline_chars: usize) -> f64 {
+    if baseline_chars == 0 {
+        100.0
+    } else {
+        (chars as f64 / baseline_chars as f64 * 100.0).min(100.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn summary_does_not_describe_over_baseline_reconstruction_as_of_total() {
-        let report = ConversionReport::build("in.pdf", "out.epub", Vec::new(), 1, 101, 100);
+        let report = ConversionReport::build(
+            "in.pdf",
+            "out.epub",
+            Vec::new(),
+            ReportMetrics {
+                blocks: 1,
+                reconstructed_chars: 101,
+                media_preserved_chars: 0,
+                baseline_chars: 100,
+                images: 0,
+                figures: 0,
+                tables: 0,
+                equations: 0,
+                layout_warnings: Vec::new(),
+            },
+        );
 
         assert_eq!(report.coverage_percent, 100.0);
         assert!(
             report
                 .summary()
-                .contains("101 reconstructed / 100 baseline characters")
+                .contains("101 reconstructed + 0 preserved as images / 100 baseline characters")
         );
         assert!(!report.summary().contains("101 of 100"));
     }
@@ -118,10 +184,20 @@ mod tests {
                 chars: 0,
                 baseline_chars: 0,
                 two_column: false,
+                low_confidence: false,
+                low_confidence_action: None,
             }],
-            0,
-            0,
-            0,
+            ReportMetrics {
+                blocks: 0,
+                reconstructed_chars: 0,
+                media_preserved_chars: 0,
+                baseline_chars: 0,
+                images: 0,
+                figures: 0,
+                tables: 0,
+                equations: 0,
+                layout_warnings: Vec::new(),
+            },
         );
 
         assert!(report.warnings.is_empty());
@@ -139,15 +215,122 @@ mod tests {
                 chars: 0,
                 baseline_chars: 42,
                 two_column: false,
+                low_confidence: false,
+                low_confidence_action: None,
             }],
-            0,
-            0,
-            42,
+            ReportMetrics {
+                blocks: 0,
+                reconstructed_chars: 0,
+                media_preserved_chars: 0,
+                baseline_chars: 42,
+                images: 0,
+                figures: 0,
+                tables: 0,
+                equations: 0,
+                layout_warnings: Vec::new(),
+            },
         );
 
         assert_eq!(report.warnings.len(), 2);
         assert!(
             report.warnings[1].contains("page 7: no text reconstructed, but pdftotext found 42")
+        );
+    }
+
+    #[test]
+    fn low_confidence_pages_warn_with_action() {
+        let report = ConversionReport::build(
+            "in.pdf",
+            "out.epub",
+            vec![PageStats {
+                page: 4,
+                lines: 1,
+                chars: 4,
+                baseline_chars: 100,
+                two_column: false,
+                low_confidence: true,
+                low_confidence_action: Some("preserve".to_string()),
+            }],
+            ReportMetrics {
+                blocks: 0,
+                reconstructed_chars: 4,
+                media_preserved_chars: 0,
+                baseline_chars: 100,
+                images: 0,
+                figures: 1,
+                tables: 0,
+                equations: 0,
+                layout_warnings: Vec::new(),
+            },
+        );
+
+        assert_eq!(report.low_confidence_pages, 1);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("page 4: low-confidence")
+                    && warning.contains("action=preserve"))
+        );
+        assert!(report.summary().contains("Low-confidence pages: 1"));
+    }
+
+    #[test]
+    fn media_preserved_chars_credit_coverage() {
+        let report = ConversionReport::build(
+            "in.pdf",
+            "out.epub",
+            Vec::new(),
+            ReportMetrics {
+                blocks: 1,
+                reconstructed_chars: 80,
+                media_preserved_chars: 20,
+                baseline_chars: 100,
+                images: 0,
+                figures: 1,
+                tables: 1,
+                equations: 0,
+                layout_warnings: Vec::new(),
+            },
+        );
+
+        assert_eq!(report.coverage_percent, 100.0);
+        assert!(report.warnings.is_empty());
+        assert!(report.summary().contains("20 preserved as images"));
+    }
+
+    #[test]
+    fn summary_includes_layout_warnings() {
+        let report = ConversionReport::build(
+            "in.pdf",
+            "out.epub",
+            Vec::new(),
+            ReportMetrics {
+                blocks: 0,
+                reconstructed_chars: 0,
+                media_preserved_chars: 0,
+                baseline_chars: 0,
+                images: 0,
+                figures: 1,
+                tables: 0,
+                equations: 0,
+                layout_warnings: vec![
+                    "page 1: lowercase paragraph continuation follows media block near y=120"
+                        .to_string(),
+                ],
+            },
+        );
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("lowercase paragraph continuation"))
+        );
+        assert!(
+            report
+                .summary()
+                .contains("lowercase paragraph continuation follows media block")
         );
     }
 }
