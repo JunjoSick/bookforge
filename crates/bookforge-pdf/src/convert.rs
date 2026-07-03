@@ -1298,6 +1298,127 @@ printf 'Body before equation.\nE = mc^2\nBody after equation.\n'
 
     #[cfg(unix)]
     #[test]
+    fn convert_pdf_marks_inline_math_as_protected_span() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.pdf");
+        let output = dir.path().join("output.epub");
+        fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+
+        let pdftohtml = dir.path().join("pdftohtml");
+        write_executable(
+            &pdftohtml,
+            r##"#!/bin/sh
+cat <<'XML'
+<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="100" left="100" width="360" height="12" font="0">The energy term E = mc^2 appears inline.</text>
+  </page>
+</pdf2xml>
+XML
+"##,
+        );
+
+        let pdftotext = dir.path().join("pdftotext");
+        write_executable(
+            &pdftotext,
+            r#"#!/bin/sh
+printf 'The energy term E = mc^2 appears inline.\n'
+"#,
+        );
+        let pdfimages = dir.path().join("pdfimages");
+        fake_pdfimages_empty(&pdfimages);
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
+
+        let tools = PopplerTools {
+            pdftohtml,
+            pdftotext,
+            pdfimages,
+            pdftoppm,
+        };
+        convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+            .expect("conversion should succeed");
+
+        let book = bookforge_epub::read_epub(&output).expect("converted EPUB should be readable");
+        assert!(
+            book.blocks.iter().any(|block| {
+                block.protected_spans.iter().any(|span| {
+                    span.kind == bookforge_core::ir::ProtectedSpanKind::Math
+                        && span.text == "E = mc^2"
+                })
+            }),
+            "inline math should become a protected span after PDF conversion"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_pdf_does_not_crop_model_parameter_prose_as_equation() {
+        use std::{fs, io::Read};
+        use zip::ZipArchive;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.pdf");
+        let output = dir.path().join("output.epub");
+        fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+
+        let pdftohtml = dir.path().join("pdftohtml");
+        write_executable(
+            &pdftohtml,
+            r##"#!/bin/sh
+cat <<'XML'
+<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="100" left="80" width="440" height="12" font="0">The model = stable result used k = 3 in parentheses (n = 12).</text>
+  </page>
+</pdf2xml>
+XML
+"##,
+        );
+
+        let pdftotext = dir.path().join("pdftotext");
+        write_executable(
+            &pdftotext,
+            r#"#!/bin/sh
+printf 'The model = stable result used k = 3 in parentheses (n = 12).\n'
+"#,
+        );
+        let pdfimages = dir.path().join("pdfimages");
+        fake_pdfimages_empty(&pdfimages);
+        let pdftoppm = dir.path().join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
+
+        let tools = PopplerTools {
+            pdftohtml,
+            pdftotext,
+            pdfimages,
+            pdftoppm,
+        };
+        let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+            .expect("conversion should succeed");
+
+        assert_eq!(outcome.report.tables, 0);
+        assert_eq!(outcome.report.equations, 0);
+        assert_eq!(outcome.report.figures, 0);
+
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("The model = stable result used k = 3"));
+        assert!(!content.contains("pdf-equation-0001.png"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn low_confidence_pages_linearize_by_default() {
         use std::{fs, io::Read};
         use zip::ZipArchive;
