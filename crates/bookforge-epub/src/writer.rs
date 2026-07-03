@@ -10,7 +10,7 @@ use bookforge_core::{
     BookforgeError, Result,
     config::{BilingualMode, BilingualStyle},
     ir::{Block, Book, DomPath, TEXT_NODE_PATH_BASE},
-    marker::{parse_empty_marker, parse_paired_marker_open, strip_marker_tokens},
+    marker::{parse_empty_marker, parse_paired_marker_open},
     segment::BlockTranslation,
 };
 use quick_xml::{
@@ -167,7 +167,10 @@ fn write_rebuilt_epub(
                     options,
                     stylesheet.as_ref().map(|plan| plan.opf_href.as_str()),
                 )?
-            } else if let Some(plan) = stylesheet.as_ref() {
+            } else if let Some(plan) = stylesheet
+                .as_ref()
+                .filter(|_| is_xhtml_resource_name(name.as_str()))
+            {
                 inject_stylesheet_link(
                     &outcome.xhtml,
                     &relative_href(name.as_str(), plan.archive_path.as_str()),
@@ -437,6 +440,17 @@ fn relative_href(from_file: &str, target_file: &str) -> String {
     } else {
         out.join("/")
     }
+}
+
+fn is_xhtml_resource_name(name: &str) -> bool {
+    name.rsplit_once('.')
+        .map(|(_, extension)| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "xhtml" | "html" | "htm"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn patches_by_href<'a>(
@@ -1317,15 +1331,15 @@ fn append_action(
     match mode {
         BilingualMode::Replace => AppendAction::Skip,
         BilingualMode::AppendBlock => match name {
-            b"p" | b"blockquote" | b"figcaption" | b"caption" | b"aside" => {
-                AppendAction::SiblingParagraph {
-                    classes: vec![TRANSLATION_CLASS.to_string()],
-                }
-            }
+            b"p" | b"blockquote" | b"figcaption" | b"aside" => AppendAction::SiblingParagraph {
+                classes: vec![TRANSLATION_CLASS.to_string()],
+            },
             b"h1" | b"h2" | b"h3" | b"h4" | b"h5" | b"h6" => AppendAction::SiblingParagraph {
                 classes: heading_translation_classes(original_start),
             },
-            b"li" | b"td" | b"th" => AppendAction::NestedParagraph,
+            // A sibling of <caption> sits directly inside <table>, where
+            // <p> is invalid; captions allow flow content, so nest instead.
+            b"li" | b"td" | b"th" | b"caption" => AppendAction::NestedParagraph,
             _ => AppendAction::Skip,
         },
         BilingualMode::AppendText => match name {
@@ -1397,43 +1411,38 @@ fn write_events_with_inline_in_last_paragraph(
     if let Some(insert_at) = insert_at {
         for (index, event) in events.iter().enumerate() {
             if index == insert_at {
-                let _ = write_plain_inline_translation_span(writer, patch, options)
-                    .inspect_err(|error| {
-                        *skipped_blocks += 1;
-                        tracing::warn!(
-                            block_path = ?path,
-                            error = %error,
-                            "preserving source-only block: inline translation could not be rendered",
-                        );
-                    });
+                let _ = write_inline_translation_span(
+                    writer,
+                    patch,
+                    events,
+                    options,
+                    skipped_blocks,
+                )
+                .inspect_err(|error| {
+                    *skipped_blocks += 1;
+                    tracing::warn!(
+                        block_path = ?path,
+                        error = %error,
+                        "preserving source-only block: inline translation could not be rendered",
+                    );
+                });
             }
             writer.write_event(event.borrow())?;
         }
     } else {
         write_events(writer, events)?;
-        let _ = write_plain_inline_translation_span(writer, patch, options).inspect_err(|error| {
-            *skipped_blocks += 1;
-            tracing::warn!(
-                block_path = ?path,
-                error = %error,
-                "preserving source-only block: inline translation could not be rendered",
-            );
-        });
+        let _ = write_inline_translation_span(writer, patch, events, options, skipped_blocks)
+            .inspect_err(|error| {
+                *skipped_blocks += 1;
+                tracing::warn!(
+                    block_path = ?path,
+                    error = %error,
+                    "preserving source-only block: inline translation could not be rendered",
+                );
+            });
     }
 
     Ok(())
-}
-
-fn write_plain_inline_translation_span(
-    writer: &mut Writer<Vec<u8>>,
-    patch: PatchSpec<'_>,
-    options: &RebuildOptions,
-) -> Result<()> {
-    let normalized = normalize_marker_whitespace(patch.translation);
-    let stripped = strip_marker_tokens(&normalized);
-    let rendered = [Event::Text(BytesText::new(stripped.trim()).into_owned())];
-    writer.write_event(Event::Text(BytesText::new(&options.bilingual_separator)))?;
-    write_translation_element(writer, "span", &[TRANSLATION_CLASS], options, &rendered)
 }
 
 fn write_inline_translation_span(
@@ -1466,11 +1475,104 @@ fn render_translation_for_append(
     original_events: &[Event<'static>],
 ) -> Result<Vec<Event<'static>>> {
     if let Some(block) = patch.block {
-        return render_marked_translation(block, patch.translation, original_events);
+        let rendered = render_marked_translation(block, patch.translation, original_events)?;
+        return Ok(flatten_block_level_events(rendered));
     }
     Ok(vec![Event::Text(
         BytesText::new(patch.translation).into_owned(),
     )])
+}
+
+/// Appended translations are wrapped in a single `<p>` or `<span>`.
+/// When the source block owns child block markup (a `<blockquote>` with
+/// child `<p>`s, an `<li>` with a nested paragraph), the inline-marker
+/// template reproduces those block elements inside the wrapper, emitting
+/// invalid nestings like `<p><p>…</p></p>` or `<span><p>…</p></span>`.
+/// Drop block-level tags from the rendered translation, keep their
+/// content, and separate former siblings with a single space.
+fn flatten_block_level_events(events: Vec<Event<'static>>) -> Vec<Event<'static>> {
+    let mut output: Vec<Event<'static>> = Vec::with_capacity(events.len());
+    let mut dropped_any = false;
+    for event in events {
+        let block_level = match &event {
+            Event::Start(element) | Event::Empty(element) => {
+                is_block_level_name(local_name(element.name().as_ref()))
+            }
+            Event::End(element) => is_block_level_name(local_name(element.name().as_ref())),
+            _ => false,
+        };
+        if block_level {
+            dropped_any = true;
+            if matches!(event, Event::End(_) | Event::Empty(_)) {
+                push_flatten_separator(&mut output);
+            }
+            continue;
+        }
+        output.push(event);
+    }
+    if dropped_any {
+        while matches!(
+            output.last(),
+            Some(Event::Text(text))
+                if text.html_content().is_ok_and(|value| value.trim().is_empty())
+        ) {
+            output.pop();
+        }
+    }
+    output
+}
+
+fn push_flatten_separator(output: &mut Vec<Event<'static>>) {
+    if !output.is_empty() && !last_event_ends_with_whitespace(output) {
+        output.push(Event::Text(BytesText::new(" ").into_owned()));
+    }
+}
+
+fn last_event_ends_with_whitespace(events: &[Event<'static>]) -> bool {
+    matches!(
+        events.last(),
+        Some(Event::Text(text)) if text_ends_with_whitespace(text)
+    )
+}
+
+fn text_ends_with_whitespace(text: &BytesText<'_>) -> bool {
+    text.html_content()
+        .is_ok_and(|value| value.chars().next_back().is_some_and(char::is_whitespace))
+}
+
+fn is_block_level_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"p" | b"div"
+            | b"blockquote"
+            | b"li"
+            | b"ul"
+            | b"ol"
+            | b"dl"
+            | b"dt"
+            | b"dd"
+            | b"table"
+            | b"thead"
+            | b"tbody"
+            | b"tfoot"
+            | b"tr"
+            | b"td"
+            | b"th"
+            | b"caption"
+            | b"h1"
+            | b"h2"
+            | b"h3"
+            | b"h4"
+            | b"h5"
+            | b"h6"
+            | b"section"
+            | b"article"
+            | b"aside"
+            | b"figure"
+            | b"figcaption"
+            | b"pre"
+            | b"hr"
+    )
 }
 
 fn write_translation_element(
@@ -2066,6 +2168,16 @@ mod tests {
     }
 
     #[test]
+    fn xhtml_resource_name_matches_html_extensions_case_insensitively() {
+        assert!(is_xhtml_resource_name("chapter.xhtml"));
+        assert!(is_xhtml_resource_name("OPS/Text/CHAPTER.HTML"));
+        assert!(is_xhtml_resource_name("Text/chapter.HtM"));
+        assert!(!is_xhtml_resource_name("toc.ncx"));
+        assert!(!is_xhtml_resource_name("styles/bookforge-bilingual.css"));
+        assert!(!is_xhtml_resource_name("chapter"));
+    }
+
+    #[test]
     fn append_block_adds_paragraph_sibling_with_lang() {
         let xhtml = "<root><p>Original</p></root>";
         let block = plain_block(
@@ -2236,14 +2348,59 @@ mod tests {
     }
 
     #[test]
-    fn append_text_blockquote_inserts_span_inside_last_paragraph() {
-        let xhtml = "<root><blockquote><p>Quote</p></blockquote></root>";
-        let block = plain_block("b_000000", DomPath(vec![0, 0]), BlockKind::Quote, "Quote");
+    fn append_block_table_caption_uses_nested_translation_paragraph() {
+        let xhtml = "<root><table><caption>Caption</caption><tr><td>Cell</td></tr></table></root>";
+        let block = plain_block(
+            "b_000000",
+            DomPath(vec![0, 0, 0]),
+            BlockKind::Caption,
+            "Caption",
+        );
         let outcome = patch_xhtml_blocks_with_options(
             xhtml,
             &[BlockPatch {
                 block: &block,
-                translation: "Citazione",
+                translation: "Didascalia",
+            }],
+            &append_options(BilingualMode::AppendBlock),
+        )
+        .expect("caption patch should succeed");
+
+        assert!(
+            outcome.xhtml.contains(
+                r#"<caption>Caption<p class="bookforge-translation" lang="it">Didascalia</p></caption>"#
+            ),
+            "caption translation should be nested inside caption, got: {}",
+            outcome.xhtml
+        );
+        assert!(
+            !outcome
+                .xhtml
+                .contains(r#"</caption><p class="bookforge-translation""#),
+            "caption translation must not become a table-child sibling, got: {}",
+            outcome.xhtml
+        );
+        validate_xml(&outcome.xhtml).expect("caption append output should re-parse");
+    }
+
+    #[test]
+    fn append_text_blockquote_inserts_span_inside_last_paragraph() {
+        let xhtml = "<root><blockquote><p>Quote</p></blockquote></root>";
+        let block = marked_block(
+            "b_000000",
+            DomPath(vec![0, 0]),
+            BlockKind::Quote,
+            "<m1>Quote</m1>",
+            vec![InlineMark {
+                id: "m1".to_string(),
+                kind: "p".to_string(),
+            }],
+        );
+        let outcome = patch_xhtml_blocks_with_options(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "<m1>Citazione</m1>",
             }],
             &append_options(BilingualMode::AppendText),
         )
@@ -2257,6 +2414,83 @@ mod tests {
             outcome.xhtml
         );
         validate_xml(&outcome.xhtml).expect("blockquote append output should re-parse");
+    }
+
+    #[test]
+    fn append_modes_flatten_child_paragraphs_inside_translation_wrappers() {
+        let xhtml = "<root><blockquote><p>Quote one</p><p>Quote two</p></blockquote><ul><li><p>List one</p><p>List two</p></li></ul></root>";
+        let quote = marked_block(
+            "b_000000",
+            DomPath(vec![0, 0]),
+            BlockKind::Quote,
+            "<m1>Quote one</m1><m2>Quote two</m2>",
+            paragraph_marks(),
+        );
+        let list_item = marked_block(
+            "b_000001",
+            DomPath(vec![0, 1, 0]),
+            BlockKind::ListItem,
+            "<m1>List one</m1><m2>List two</m2>",
+            paragraph_marks(),
+        );
+
+        for mode in [BilingualMode::AppendBlock, BilingualMode::AppendText] {
+            let outcome = patch_xhtml_blocks_with_options(
+                xhtml,
+                &[
+                    BlockPatch {
+                        block: &quote,
+                        translation: "<m1>Quote uno</m1><m2>Quote due</m2>",
+                    },
+                    BlockPatch {
+                        block: &list_item,
+                        translation: "<m1>Lista uno</m1><m2>Lista due</m2>",
+                    },
+                ],
+                &append_options(mode),
+            )
+            .expect("nested child paragraph patch should succeed");
+
+            assert!(
+                !outcome
+                    .xhtml
+                    .contains(r#"<p class="bookforge-translation" lang="it"><p>"#),
+                "{mode:?} must not nest child paragraphs inside translation paragraphs: {}",
+                outcome.xhtml
+            );
+            assert!(
+                !outcome
+                    .xhtml
+                    .contains(r#"<span class="bookforge-translation" lang="it"><p>"#),
+                "{mode:?} must not nest child paragraphs inside translation spans: {}",
+                outcome.xhtml
+            );
+            assert!(
+                outcome.xhtml.contains("Quote uno Quote due"),
+                "{mode:?} should join flattened blockquote paragraphs with a space: {}",
+                outcome.xhtml
+            );
+            assert!(
+                outcome.xhtml.contains("Lista uno Lista due"),
+                "{mode:?} should join flattened list-item paragraphs with a space: {}",
+                outcome.xhtml
+            );
+            validate_xml(&outcome.xhtml).expect("nested append output should re-parse");
+        }
+    }
+
+    #[test]
+    fn flatten_block_level_events_separates_empty_block_markers() {
+        let flattened = flatten_block_level_events(vec![
+            Event::Text(BytesText::new("Before").into_owned()),
+            Event::Empty(quick_xml::events::BytesStart::new("hr").into_owned()),
+            Event::Text(BytesText::new("After").into_owned()),
+        ]);
+        let mut writer = Writer::new(Vec::new());
+        write_events(&mut writer, &flattened).expect("flattened events should write");
+        let output = String::from_utf8(writer.into_inner()).expect("output should be UTF-8");
+
+        assert_eq!(output, "Before After");
     }
 
     #[test]
@@ -2579,5 +2813,40 @@ mod tests {
             protected_spans: Vec::<ProtectedSpan>::new(),
             token_estimate: 4,
         }
+    }
+
+    fn marked_block(
+        id: &str,
+        dom_path: DomPath,
+        kind: BlockKind,
+        text: &str,
+        inline_marks: Vec<InlineMark>,
+    ) -> Block {
+        Block {
+            id: BlockId(id.to_string()),
+            section_id: SectionId("sec_000000".to_string()),
+            kind,
+            dom_path,
+            text_runs: vec![TextRun {
+                id: "r000000_000".to_string(),
+                text: text.to_string(),
+            }],
+            inline_marks,
+            protected_spans: Vec::<ProtectedSpan>::new(),
+            token_estimate: 4,
+        }
+    }
+
+    fn paragraph_marks() -> Vec<InlineMark> {
+        vec![
+            InlineMark {
+                id: "m1".to_string(),
+                kind: "p".to_string(),
+            },
+            InlineMark {
+                id: "m2".to_string(),
+                kind: "p".to_string(),
+            },
+        ]
     }
 }
