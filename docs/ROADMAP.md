@@ -2293,15 +2293,65 @@ language (observed on the CCRU Abstract Culture book, 2026-07-03). This
 is distinct from §9: it is a *source-quality repair* concern for EPUBs
 BookForge did not create.
 
-Sketch: an opt-in `--reflow` preprocessing pass (or `bookforge reflow`
-command) that merges consecutive blocks when the first lacks terminal
-punctuation and the next starts lowercase, with conservative guards
-(same class/style, no intervening headings/images) and a report of every
-merge. Because it deliberately changes structure, it must stay opt-in
-and must never run as part of default translation. Effort guess:
-2–4 days. Priority: high relative to remaining unscheduled work — it
-addresses the most visible reader-facing defect in the owner's actual
-library.
+**Spec (promoted from sketch 2026-07-04, scheduled).**
+
+### 9c.1 Surface
+
+A standalone command only: `bookforge reflow <input.epub> --output
+<out.epub> [--report <path.json>] [--dry-run]`. No `--reflow` flag on
+`translate` in this milestone — the output is a repaired *source* EPUB
+the owner inspects before spending tokens, and keeping the translation
+pipeline untouched means cache keys need no thought (the repaired file
+simply has different source hashes). `--dry-run` writes the report and
+prints the summary without producing an output EPUB. Default report
+path: next to the output with `.reflow-report.json` suffix.
+
+### 9c.2 Merge rule
+
+Consecutive sibling blocks A, B merge when ALL of:
+
+1. Both are `<p>` elements. Only `<p>` — headings, `li`, `blockquote`
+   etc. never participate in this milestone.
+2. A's text ends **without** terminal punctuation. Terminal set:
+   `.` `!` `?` `:` `;` `…`, optionally followed by closing quotes/
+   brackets (`"` `”` `’` `»` `)` `]`), which still count as terminal.
+3. B's text starts with a Unicode lowercase letter.
+4. `class` attributes are equal (or both absent); B carries no `id`
+   (it may be a link target).
+5. Neither block is empty, contains nested block-level elements, or
+   contains images/replaced content.
+6. Nothing but whitespace sits between them in the parent (no
+   intervening elements, comments, or PIs).
+
+Join with a single space; **dehyphenation**: if A ends in a hyphen
+attached to a word character, drop the hyphen and join with no space.
+Merges chain (A+B+C…) as long as each successive pair qualifies.
+B's inline children are appended to A's children verbatim; A's
+attributes win for the merged block.
+
+### 9c.3 Report
+
+JSON report: totals plus one record per merge (resource name, block
+index, first ~40 chars of each side) so every structural change is
+auditable. Human summary printed at the end (files touched, merge
+count, paragraph count before/after).
+
+### 9c.4 Acceptance
+
+1. CCRU Abstract Culture (the motivating book): paragraph count drops
+   substantially; spot-checked chapters read as prose; EPUBCheck passes
+   on the output.
+2. A conventionally-typeset EPUB (e.g. the Fisher sources in `test/`)
+   produces **zero or near-zero** merges — the guards must not fire on
+   healthy books.
+3. `--dry-run` writes no EPUB; the report matches what a real run does.
+4. Un-mockable criterion (§15.6): reflow the real CCRU EPUB and read a
+   chapter of the output.
+
+Because it deliberately changes structure, it stays opt-in forever and
+never runs as part of default translation. Effort: 2–4 days. Priority:
+high relative to remaining unscheduled work — it addresses the most
+visible reader-facing defect in the owner's actual library.
 
 ---
 
