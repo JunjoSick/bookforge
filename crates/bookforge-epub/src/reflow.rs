@@ -461,6 +461,7 @@ fn append_merged_children(
 ) -> Result<()> {
     if dehyphenated {
         trim_trailing_whitespace(&mut left.children)?;
+        trim_leading_whitespace(&mut right.children)?;
         let _ = remove_trailing_hyphen(&mut left.children)?;
     } else {
         trim_trailing_whitespace(&mut left.children)?;
@@ -1088,6 +1089,18 @@ mod tests {
         assert_eq!(outcome.merges.len(), 1);
         assert!(outcome.xhtml.contains("<p>translation.</p>"));
         assert!(outcome.merges[0].dehyphenated);
+    }
+
+    #[test]
+    fn dehyphenation_trims_right_leading_whitespace() {
+        let outcome = reflow_snippet("<p>trans-</p><p>\n  lation.</p>");
+
+        assert_eq!(outcome.merges.len(), 1);
+        assert!(
+            outcome.xhtml.contains("<p>translation.</p>"),
+            "got: {}",
+            outcome.xhtml
+        );
     }
 
     #[test]
