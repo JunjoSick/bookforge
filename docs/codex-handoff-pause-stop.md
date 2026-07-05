@@ -135,3 +135,55 @@ Fix ruling — keep the spawn-all design, gate the provider call instead:
    `pause` before launch, assert no RequestStarted after the first
    completion boundary, status `paused`, then resume completes; same
    for stop→resume. This is the coverage gap that let the bug ship.
+
+## Real-run verification result (Claude, 2026-07-05) — batch fix GOOD, finalize-stage leak found
+
+The batch-mode fix (af9b0b5) is VERIFIED on a real DeepSeek dashboard run.
+Early-pause (during the in-flight translation batch), concurrency=1:
+- 14:26:50 JobPaused; batches 0002/0003 HELD — zero RequestStarted for
+  the full 32s pause window (zero token spend). status=paused.
+- 14:27:22 JobResumed → batch_0002 fired immediately (no deadlock,
+  resume-while-parked works), job completed, NO duplicate segments.
+Acceptance §10.1.1.1-4 confirmed live. Good work.
+
+### Remaining bug — finalize passes ignore pause (must fix for §10.1.1.5)
+
+The pause gate covers ONLY the primary translation loop. The
+post-translation passes are not pause-aware:
+- `crates/bookforge-llm/src/qa_batch.rs:469` → `pause_signal: None`
+- `crates/bookforge-llm/src/double_check.rs:878` → `pause_signal: None`
+
+Live proof (late-pause, pausing after all translation batches were
+already dispatched): JobPaused fired correctly, then `repair_0000` was
+queued and executed a fresh provider request and the job ran to
+TranslationFinished — token spend did NOT stop while paused. Fails
+acceptance 5 (the un-mockable criterion). The mock e2e missed it
+because its fixture produced no QA/repair pass.
+
+Fix ruling — pause/stop must hold across the WHOLE pipeline:
+1. Thread the shared PauseSignal (and a ControlFilePoller) into the QA
+   and double-check/repair run configs — replace the `pause_signal:
+   None` at qa_batch.rs:469 and double_check.rs:878 so their batch
+   loops gate exactly like the primary loop. Plumb the poller from the
+   caller the same way translate_and_checkpoint does.
+2. Add a stage-boundary control checkpoint in the pipeline orchestration
+   (the QA / double-check invocation sites in
+   crates/bookforge-cli/src/commands/translate/mod.rs — finish_
+   translation_pipeline and the run_* paths): BEFORE starting each
+   post-translation provider-calling stage, consult the control file.
+   If paused, park until resume/stop (reuse the poller's wait). If
+   stopped, checkpoint and return the stopped-resume hint path (job
+   stays resumable; `bookforge resume` must re-run the skipped finalize
+   stages). This covers the case where pause is set at the instant
+   translation returns with nothing left to hold.
+3. Regression (the coverage gap that let this ship): extend the batched
+   mock e2e to force a finalize pass — configure QA/double-check on and
+   induce a needs-review/failed segment so a repair/double-check batch
+   is produced. Pre-arm `pause` to land during/after the translation
+   batches; assert NO provider RequestStarted with a `repair_`/`qa_`/
+   double-check request id after pause and status `paused`; then resume
+   completes. Same shape for stop→resume.
+
+Verify with a real DeepSeek dashboard run afterward (Claude will do the
+un-mockable re-check): late-pause must freeze spend through the finalize
+stages too.
