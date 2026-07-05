@@ -36,7 +36,8 @@ use axum::{
     routing::{delete, get, post},
 };
 use bookforge_core::{
-    GlossaryCategory, GlossaryScopeKind, GlossaryStatus, GlossaryTerm, RunState, now_ms,
+    ControlCommand, GlossaryCategory, GlossaryScopeKind, GlossaryStatus, GlossaryTerm, RunState,
+    now_ms,
 };
 use bookforge_store::{GlossaryFilter, JobRecord, JobStore, JobSummary, RetryScope};
 use serde::Deserialize;
@@ -188,6 +189,9 @@ fn dashboard_router(state: AppState) -> Router {
         .route("/api/jobs/{id}/review", get(job_review))
         .route("/api/jobs/{id}/validate", post(job_validate))
         .route("/api/jobs/{id}/retry", post(retry_job))
+        .route("/api/jobs/{id}/pause", post(pause_job))
+        .route("/api/jobs/{id}/resume", post(resume_job))
+        .route("/api/jobs/{id}/stop", post(stop_job))
         .route("/api/options", get(dashboard_options))
         .route("/api/providers", get(provider_status))
         .route("/api/estimate", post(estimate_translate))
@@ -424,6 +428,63 @@ async fn retry_job(
     })
     .await??;
     Ok(Json(json!({ "retried": retried })).into_response())
+}
+
+async fn pause_job(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    control_job(id, state, headers, ControlCommand::Pause).await
+}
+
+async fn resume_job(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    control_job(id, state, headers, ControlCommand::Resume).await
+}
+
+async fn stop_job(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    control_job(id, state, headers, ControlCommand::Stop).await
+}
+
+async fn control_job(
+    id: String,
+    state: AppState,
+    headers: HeaderMap,
+    command: ControlCommand,
+) -> Result<Response, AppError> {
+    if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+    let outcome = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let store = JobStore::open_default()?;
+        if store.get_job(&id)?.is_none() {
+            return Ok(None);
+        }
+        let path = crate::control::request_job_control(&id, command)?;
+        Ok(Some(path.display().to_string()))
+    })
+    .await??;
+
+    match outcome {
+        Some(path) => Ok(Json(json!({
+            "command": command.as_str(),
+            "control_path": path,
+        }))
+        .into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such job" })),
+        )
+            .into_response()),
+    }
 }
 
 async fn dashboard_options() -> Json<DashboardOptions> {
@@ -1154,6 +1215,8 @@ impl JobDetail {
             status: job.as_ref().map(|j| j.status.clone()).unwrap_or_else(|| {
                 if state.finished {
                     "done".into()
+                } else if state.paused {
+                    "paused".into()
                 } else {
                     "running".into()
                 }
@@ -1295,6 +1358,8 @@ main{min-height:calc(100vh - 60px)}
 
 .badge{display:inline-block;font:600 10.5px var(--sans);padding:3px 9px;border-radius:20px;color:var(--muted);background:var(--chip)}
 .badge.running,.badge.translating{color:var(--accent);background:var(--accentsoft)}
+.badge.paused{color:var(--warn);background:var(--chip)}
+.badge.stopped{color:var(--danger);background:var(--accentsoft)}
 .badge.done,.badge.completed,.badge.succeeded{color:var(--good);background:var(--goodbg)}
 .badge.failed,.badge.error{color:var(--danger);background:var(--accentsoft)}
 
@@ -1856,6 +1921,9 @@ async function renderProgress(stage) {
       <div class="prog-bar" id="progbar"><i id="barfill" style="width:0%"></i></div>
       <div class="prog-actions"><span class="live"><span class="dot" id="livedot"></span><span id="livetxt">connecting…</span></span>
         <span class="grow" style="flex:1"></span>
+        <button class="btn btn-ghost" id="pausebtn" onclick="bfJobControl('${esc(d.id)}','pause')">Pause</button>
+        <button class="btn btn-ghost" id="resumebtn" onclick="bfJobControl('${esc(d.id)}','resume')">Resume</button>
+        <button class="btn btn-ghost" id="stopbtn" onclick="bfJobControl('${esc(d.id)}','stop')">Stop</button>
         <button class="btn btn-ghost" onclick="bfGo('review',{selected:'${esc(d.id)}'})">Open review →</button>
         <button class="btn btn-ghost" id="retrybtn" onclick="bfRetry('${esc(d.id)}')">Retry failed / needs-review</button></div></div>
     <div class="stat-grid" id="stats"></div>
@@ -1870,6 +1938,8 @@ async function renderProgress(stage) {
 function setLive(on, txt) { const dt = $("#livedot"), tx = $("#livetxt"); if (dt) dt.classList.toggle("on", on); if (tx) tx.textContent = txt; }
 function updateState(s) {
   const total = s.total_segments || 0, done = s.done_segments || 0, p = pct(done, total);
+  const liveStatus = s.paused ? "paused" : (s.finished ? "done" : null);
+  if (liveStatus) setProgressStatus(liveStatus);
   const fill = $("#barfill"); if (fill) fill.style.width = p + "%";
   const pv = $("#pctv"); if (pv) pv.textContent = p;
   const bar = $("#progbar"); if (bar) bar.classList.toggle("done", !!s.finished);
@@ -1903,6 +1973,8 @@ function fmtEvent(ev) {
     case "StageFinished": body = `stage complete: ${v.stage}`; break;
     case "SegmentationFinished": body = `segmented into ${v.segment_count} segments`; break;
     case "CacheScanFinished": body = `cache scan: ${v.hits} hits / ${v.misses} misses`; break;
+    case "JobPaused": body = `paused`; cls="warn"; break;
+    case "JobResumed": body = `resumed`; cls="good"; break;
     case "CheckpointFlushed": body = `checkpoint flushed (${v.flushed_count})`; break;
     case "ConcurrencyChanged": body = `concurrency ${v.previous} → ${v.current} (${v.reason})`; break;
     case "Warning": body = `⚠ ${v.kind}: ${shorten(v.message,90)}`; cls="warn"; break;
@@ -1929,6 +2001,33 @@ async function bfRetry(id) {
     if (toast) toast.textContent = r.ok ? `marked ${j.retried} segment(s) — run: bookforge resume ${id}` : (j.error || "retry failed");
   } catch (e) { if (toast) toast.textContent = "retry failed"; }
   if (btn) btn.disabled = false;
+}
+function setProgressStatus(status) {
+  const pill = $("#progpill");
+  if (!pill) return;
+  pill.textContent = status;
+  pill.className = "badge " + badgeClass(status);
+}
+async function bfJobControl(id, command) {
+  const toast = $("#toast");
+  const buttons = ["#pausebtn","#resumebtn","#stopbtn"].map(id => $(id)).filter(Boolean);
+  buttons.forEach(b => b.disabled = true);
+  if (toast) toast.textContent = command + " requested…";
+  try {
+    const r = await fetch("/api/jobs/" + encodeURIComponent(id) + "/" + command, { method: "POST", headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    const j = await r.json();
+    if (r.ok) {
+      if (command === "pause") setProgressStatus("paused");
+      if (command === "resume") setProgressStatus("running");
+      if (command === "stop") setProgressStatus("stopped");
+      if (toast) toast.textContent = `${command} requested`;
+    } else {
+      if (toast) toast.textContent = j.error || `${command} failed`;
+    }
+  } catch (e) {
+    if (toast) toast.textContent = `${command} failed`;
+  }
+  buttons.forEach(b => b.disabled = false);
 }
 
 /* ---------------- Review / Validation / Glossary (wired in later milestones) ---------------- */
@@ -2354,6 +2453,26 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/jobs/not-real/retry")
+                    .header("host", TEST_HOST)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn control_endpoint_rejects_missing_dashboard_token() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let response = dashboard_router(test_state("token-123"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/jobs/not-real/pause")
                     .header("host", TEST_HOST)
                     .body(Body::empty())
                     .expect("request should build"),

@@ -120,6 +120,9 @@ impl TuiMode {
 pub enum TuiAction {
     /// Mark this job's failed + needs-review segments for retry.
     RetryFlagged,
+    PauseJob,
+    ResumeJob,
+    StopJob,
 }
 
 /// Owns the terminal and the folded [`RunState`]; renders the dashboard.
@@ -214,6 +217,15 @@ impl TuiApp {
             KeyCode::Char('r') if self.mode == TuiMode::Watch => {
                 self.actions.push(TuiAction::RetryFlagged)
             }
+            KeyCode::Char('p') if self.mode == TuiMode::Watch => {
+                self.actions.push(TuiAction::PauseJob)
+            }
+            KeyCode::Char('u') if self.mode == TuiMode::Watch => {
+                self.actions.push(TuiAction::ResumeJob)
+            }
+            KeyCode::Char('s') if self.mode == TuiMode::Watch => {
+                self.actions.push(TuiAction::StopJob)
+            }
             _ => {}
         }
     }
@@ -277,6 +289,8 @@ fn render_dashboard(
 fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunState, mode: TuiMode) {
     let status = if state.finished {
         "done"
+    } else if state.paused {
+        "paused"
     } else if state.total_segments > 0 {
         "running"
     } else {
@@ -425,7 +439,7 @@ fn render_footer(
             format!(" finished · q to exit{review}")
         }
         (TuiMode::Attached, false) => format!(" q/Ctrl-C abort & quit · {keys}"),
-        (TuiMode::Watch, _) => format!(" q quit · r retry failed/review · {keys}"),
+        (TuiMode::Watch, _) => format!(" q quit · p pause · u resume · s stop · r retry · {keys}"),
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::new().fg(Color::DarkGray)),
@@ -466,6 +480,8 @@ fn format_event_line(event: &ProgressEvent) -> Line<'static> {
             format!("cache scan: {hits} hits, {misses} misses"),
             Style::new().fg(Color::Gray),
         ),
+        ProgressEvent::JobPaused { .. } => ("paused".to_string(), Style::new().fg(Color::Yellow)),
+        ProgressEvent::JobResumed { .. } => ("resumed".to_string(), Style::new().fg(Color::Green)),
         ProgressEvent::BatchQueued {
             batch_id,
             item_count,
