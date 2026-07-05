@@ -426,6 +426,9 @@ fn merge_decision(left: &XmlElement, right: &XmlElement) -> Result<Option<MergeD
     if left_text.trim().is_empty() || right_text.trim().is_empty() {
         return Ok(None);
     }
+    if !left_text.chars().any(char::is_alphabetic) {
+        return Ok(None);
+    }
     if ends_with_terminal_punctuation(&left_text) {
         return Ok(None);
     }
@@ -1089,6 +1092,14 @@ mod tests {
         assert_eq!(outcome.merges.len(), 1);
         assert!(outcome.xhtml.contains("<p>translation.</p>"));
         assert!(outcome.merges[0].dehyphenated);
+    }
+
+    #[test]
+    fn letterless_left_paragraph_blocks_merge() {
+        // Bare page/footnote numbers from PDF conversions must not be
+        // glued into prose (§9c.2 condition 7).
+        assert_eq!(merge_count("<p>1</p><p>doubt what attracted.</p>"), 0);
+        assert_eq!(merge_count("<p>— 12 —</p><p>opening up.</p>"), 0);
     }
 
     #[test]

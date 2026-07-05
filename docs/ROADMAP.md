@@ -2322,6 +2322,10 @@ Consecutive sibling blocks A, B merge when ALL of:
    contains images/replaced content.
 6. Nothing but whitespace sits between them in the parent (no
    intervening elements, comments, or PIs).
+7. A contains at least one alphabetic character (ruling 2026-07-05:
+   bare page/footnote-number paragraphs from PDF conversions — e.g.
+   `<p>1</p>` mid-sentence — must never be glued into prose; observed
+   corrupting 3 merges on Acid Communism).
 
 Join with a single space; **dehyphenation**: if A ends in a hyphen
 attached to a word character, drop the hyphen and join with no space.
@@ -2340,7 +2344,10 @@ count, paragraph count before/after).
 
 1. CCRU Abstract Culture (the motivating book): paragraph count drops
    substantially; spot-checked chapters read as prose; EPUBCheck passes
-   on the output.
+   on the output. (Ruling 2026-07-05: when the *input* already fails
+   EPUBCheck — the CCRU source ships 10 pre-existing errors — the
+   criterion is **error parity**: reflow must introduce no new
+   messages.)
 2. A conventionally-typeset EPUB (e.g. the Fisher sources in `test/`)
    produces **zero or near-zero** merges — the guards must not fire on
    healthy books.
