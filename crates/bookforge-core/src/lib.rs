@@ -36,7 +36,10 @@ pub use progress::{
     IssueEntry, IssueLevel, NullProgressSink, ProgressEvent, ProgressSink, RunState,
     event_timestamp_ms, now_ms,
 };
-pub use run_snapshot::{ResolvedRunSettingsSnapshot, RunConfigSnapshot};
+pub use run_snapshot::{
+    FallbackRunConfigSnapshot, FinalizeCheckpointSnapshot, ResolvedRunSettingsSnapshot,
+    RunConfigSnapshot,
+};
 pub use scheduler::SchedulerConfig;
 pub use style::{
     DoNotFields, RegisterFields, StyleSheet, VoiceFields, merge_style_sheets, render_style_block,

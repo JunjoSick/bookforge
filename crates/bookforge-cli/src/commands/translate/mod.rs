@@ -2,7 +2,7 @@ use anyhow::Result;
 #[cfg(test)]
 use bookforge_core::config::TranslationProfile;
 use bookforge_core::{
-    GlossaryFormat, GlossaryTerm, NullProgressSink,
+    FallbackRunConfigSnapshot, GlossaryFormat, GlossaryTerm, NullProgressSink, RunConfigSnapshot,
     config::{
         DoubleCheckMode, FallbackScope, PromptVersion, ResolvedRunSettings, TranslationConfig,
     },
@@ -62,6 +62,27 @@ use reporting::print_summary_rebuild_and_report;
 pub(crate) use reporting::rebuild_options_from_snapshot;
 use settings::{apply_provider_preset, resolve_settings, retry_amplification_warning};
 use snapshot::persist_snapshot;
+
+#[derive(Debug, Clone)]
+pub(crate) struct FallbackPassConfig {
+    provider: String,
+    model: String,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
+    scope: FallbackScope,
+}
+
+impl FallbackPassConfig {
+    pub(crate) fn from_snapshot(snapshot: Option<&FallbackRunConfigSnapshot>) -> Option<Self> {
+        snapshot.map(|fallback| Self {
+            provider: fallback.provider.clone(),
+            model: fallback.model.clone(),
+            base_url: fallback.base_url.clone(),
+            api_key_env: fallback.api_key_env.clone(),
+            scope: fallback.scope,
+        })
+    }
+}
 
 pub async fn run(
     args: TranslateArgs,
@@ -547,7 +568,7 @@ async fn run_mock_translation(
             ""
         },
     );
-    let snapshot = persist_snapshot(
+    let mut snapshot = persist_snapshot(
         &store,
         &job,
         input,
@@ -577,11 +598,13 @@ async fn run_mock_translation(
         &cache_namespace,
     )?;
     let pause_signal = bookforge_llm::PauseSignal::new();
-    let _control_watcher = crate::control::ControlFileWatcher::spawn(
+    let stop_cancel_token = tokio_util::sync::CancellationToken::new();
+    let _control_watcher = crate::control::ControlFileWatcher::spawn_with_stop_cancel(
         store.path().to_path_buf(),
         job.id.clone(),
         progress.clone(),
         pause_signal.clone(),
+        stop_cancel_token.clone(),
     );
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
@@ -646,8 +669,12 @@ async fn run_mock_translation(
     }
     translations.extend(fresh_translations);
     translations.sort_by_key(|translation| translation.ordinal);
-    let mut control_poller =
-        crate::control::ControlFilePoller::new(&store, &job.id, progress.clone());
+    let mut control_poller = crate::control::ControlFilePoller::new_with_stop_cancel(
+        &store,
+        &job.id,
+        progress.clone(),
+        stop_cancel_token.clone(),
+    );
     if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
         print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
         return Ok(());
@@ -665,7 +692,33 @@ async fn run_mock_translation(
         print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
         return Ok(());
     }
-    if settings.double_check.mode != DoubleCheckMode::Off {
+    let fallback_config = FallbackPassConfig::from_snapshot(snapshot.fallback.as_ref());
+    let fallback_translations = run_fallback_pass(
+        &stop_cancel_token,
+        fallback_config.as_ref(),
+        &segments,
+        std::mem::take(&mut translations),
+        &store,
+        &job.id,
+        prompt_version,
+        settings,
+        &run_config,
+        Some(&mut control_poller),
+        progress.clone(),
+    )
+    .await?;
+    translations = fallback_translations;
+    if job_was_stopped(&store, &job.id)? {
+        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+        return Ok(());
+    }
+    if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
+        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+        return Ok(());
+    }
+    if settings.double_check.mode != DoubleCheckMode::Off
+        && !snapshot.finalize.double_check_complete
+    {
         println!("Double-check: auditing translations...");
         let corrections = match run_double_check(
             ProgressRequestProvider::new(provider.clone(), progress.clone()),
@@ -696,12 +749,26 @@ async fn run_mock_translation(
             &translations,
             &changed_segment_ids,
         )?;
+        snapshot.finalize.double_check_complete = true;
+        store.update_job_config_snapshot(&job.id, &snapshot)?;
         if job_was_stopped(&store, &job.id)? {
             print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
             return Ok(());
         }
     }
-    mark_job_finished(&store, &job.id, &translations)?;
+    loop {
+        if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
+            print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+            return Ok(());
+        }
+        if mark_job_finished(&store, &job.id, &translations)? {
+            break;
+        }
+        if job_was_stopped(&store, &job.id)? {
+            print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+            return Ok(());
+        }
+    }
     print_summary_rebuild_and_report(
         &store,
         &job,
@@ -897,7 +964,7 @@ async fn run_openai_compatible_translation(
             ""
         },
     );
-    let snapshot = persist_snapshot(
+    let mut snapshot = persist_snapshot(
         &store,
         &job,
         input,
@@ -927,11 +994,12 @@ async fn run_openai_compatible_translation(
         &cache_namespace,
     )?;
     let pause_signal = bookforge_llm::PauseSignal::new();
-    let _control_watcher = crate::control::ControlFileWatcher::spawn(
+    let _control_watcher = crate::control::ControlFileWatcher::spawn_with_stop_cancel(
         store.path().to_path_buf(),
         job.id.clone(),
         progress.clone(),
         pause_signal.clone(),
+        cancel_token.clone(),
     );
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
@@ -1013,10 +1081,11 @@ async fn run_openai_compatible_translation(
         &book,
         progress.clone(),
         started,
+        &mut snapshot,
     )
     .await?;
 
-    if cancel_token.is_cancelled() {
+    if cancel_token.is_cancelled() && !job_was_stopped(&store, &job.id)? {
         let _ = store.mark_job_interrupted(&job.id);
         eprintln!();
         eprintln!("Interrupted by user.");
@@ -1049,14 +1118,19 @@ async fn finish_translation_pipeline(
     book: &bookforge_core::ir::Book,
     progress: Arc<dyn bookforge_core::ProgressSink>,
     started: std::time::Instant,
+    snapshot: &mut RunConfigSnapshot,
 ) -> Result<()> {
     translations.sort_by_key(|t| t.ordinal);
 
     let pause_signal = run_config.pause_signal.clone().unwrap_or_default();
     let mut controlled_run_config = run_config.clone();
     controlled_run_config.pause_signal = Some(pause_signal.clone());
-    let mut control_poller =
-        crate::control::ControlFilePoller::new(store, &job.id, progress.clone());
+    let mut control_poller = crate::control::ControlFilePoller::new_with_stop_cancel(
+        store,
+        &job.id,
+        progress.clone(),
+        cancel_token.clone(),
+    );
 
     if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
         print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
@@ -1076,9 +1150,10 @@ async fn finish_translation_pipeline(
         print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
         return Ok(());
     }
+    let fallback_config = FallbackPassConfig::from_snapshot(snapshot.fallback.as_ref());
     let fallback_translations = run_fallback_pass(
-        provider,
-        cli_args,
+        cancel_token,
+        fallback_config.as_ref(),
         segments,
         std::mem::take(translations),
         store,
@@ -1087,6 +1162,7 @@ async fn finish_translation_pipeline(
         settings,
         &controlled_run_config,
         Some(&mut control_poller),
+        progress.clone(),
     )
     .await?;
     *translations = fallback_translations;
@@ -1099,25 +1175,42 @@ async fn finish_translation_pipeline(
         print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
         return Ok(());
     }
-    run_double_check_pass(DoubleCheckPass {
-        provider,
-        cancel_token,
-        cli_args,
-        segments,
-        translations,
-        store,
-        job_id: &job.id,
-        config: &controlled_run_config,
-        settings,
-        progress: progress.clone(),
-    })
-    .await?;
+    if !snapshot.finalize.double_check_complete
+        && run_double_check_pass(DoubleCheckPass {
+            provider,
+            cancel_token,
+            cli_args,
+            segments,
+            translations,
+            store,
+            job_id: &job.id,
+            config: &controlled_run_config,
+            settings,
+            progress: progress.clone(),
+        })
+        .await?
+    {
+        snapshot.finalize.double_check_complete = true;
+        store.update_job_config_snapshot(&job.id, snapshot)?;
+    }
     if job_was_stopped(store, &job.id)? {
         print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
         return Ok(());
     }
 
-    mark_job_finished(store, &job.id, translations)?;
+    loop {
+        if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
+            print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+            return Ok(());
+        }
+        if mark_job_finished(store, &job.id, translations)? {
+            break;
+        }
+        if job_was_stopped(store, &job.id)? {
+            print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+            return Ok(());
+        }
+    }
     print_summary_rebuild_and_report(
         store,
         job,
@@ -1173,14 +1266,24 @@ pub(crate) struct ProgressRequestProvider<P> {
     inner: P,
     progress: Arc<dyn bookforge_core::ProgressSink>,
     counter: Arc<AtomicUsize>,
+    request_prefix: Option<&'static str>,
 }
 
 impl<P> ProgressRequestProvider<P> {
     pub(crate) fn new(inner: P, progress: Arc<dyn bookforge_core::ProgressSink>) -> Self {
+        Self::new_with_prefix(inner, progress, None)
+    }
+
+    pub(crate) fn new_with_prefix(
+        inner: P,
+        progress: Arc<dyn bookforge_core::ProgressSink>,
+        request_prefix: Option<&'static str>,
+    ) -> Self {
         Self {
             inner,
             progress,
             counter: Arc::new(AtomicUsize::new(0)),
+            request_prefix,
         }
     }
 }
@@ -1195,7 +1298,9 @@ where
     ) -> std::result::Result<CompletionResponse, LlmError> {
         let metadata = request.metadata.clone();
         let max_output_tokens = request.max_output_tokens;
-        let prefix = finalize_request_prefix(metadata.prompt_template.as_deref());
+        let prefix = self
+            .request_prefix
+            .unwrap_or_else(|| finalize_request_prefix(metadata.prompt_template.as_deref()));
         let request_id = format!(
             "{prefix}_{:04}",
             self.counter.fetch_add(1, Ordering::Relaxed)
@@ -1459,6 +1564,14 @@ where
             }
             Ok(translations)
         }
+        (Err(_), _)
+            if config
+                .pause_signal
+                .as_ref()
+                .is_some_and(|signal| signal.is_stopped()) =>
+        {
+            Ok(Vec::new())
+        }
         (Ok(_), Ok(Err(e))) | (Err(e @ bookforge_llm::LlmError::Provider(_)), _) => {
             let message = format!("batch translation checkpoint failure: {e}");
             mark_unfinished_segments_failed(
@@ -1493,9 +1606,9 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_fallback_pass(
-    primary_provider: &OpenAiCompatibleProvider,
-    cli_args: &TranslateArgs,
+pub(crate) async fn run_fallback_pass(
+    cancel_token: &tokio_util::sync::CancellationToken,
+    fallback_config: Option<&FallbackPassConfig>,
     segments: &[Segment],
     mut translations: Vec<SegmentTranslation>,
     store: &JobStore,
@@ -1504,54 +1617,46 @@ async fn run_fallback_pass(
     settings: &ResolvedRunSettings,
     primary_run_config: &TranslationRunConfig,
     control: Option<&mut crate::control::ControlFilePoller<'_>>,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
 ) -> Result<Vec<SegmentTranslation>> {
-    if cli_args.fallback_provider.is_none() && cli_args.fallback_model.is_none() {
+    let Some(fallback_config) = fallback_config else {
         return Ok(translations);
-    }
+    };
+    let provider_str = fallback_config.provider.as_str();
+    let model_str = fallback_config.model.as_str();
+    let fallback_scope = fallback_config.scope;
+    let fallback_base_url = fallback_config.base_url.as_deref();
+    let fallback_api_key_env = fallback_config.api_key_env.as_deref();
 
-    let provider_str = cli_args
-        .fallback_provider
-        .as_deref()
-        .unwrap_or("openrouter");
-    let model_str = cli_args
-        .fallback_model
-        .as_deref()
-        .unwrap_or(primary_provider.model());
-
-    let fallback_config = provider_config(
-        provider_str,
-        Some(model_str),
-        cli_args.fallback_base_url.as_deref(),
-        cli_args.fallback_api_key_env.as_deref(),
-        settings.provider.timeout_seconds,
-        settings.provider.provider_max_attempts,
-        settings.provider.thinking_disabled,
-        settings.provider.retry_after_policy,
-        settings.provider.max_backoff_seconds,
-        settings.provider.max_idle_per_host,
-        settings.provider.json_mode,
-    )?;
-
-    let fallback = OpenAiCompatibleProvider::new_with_cancel(
-        fallback_config,
-        primary_provider.cancel_token.clone(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let fallback_model = fallback.model().to_string();
-
+    let fallback_status_by_segment = store
+        .segment_records(job_id)?
+        .into_iter()
+        .map(|record| (record.id, record.status))
+        .collect::<std::collections::HashMap<_, _>>();
     let candidates: Vec<Segment> = segments
         .iter()
         .filter(|s| {
             let t = translations.iter().find(|t| t.segment_id.0 == s.id.0);
             match t {
-                Some(t) => match cli_args.fallback_only {
+                Some(t) => match fallback_scope {
                     FallbackScope::Failed => t.status == SegmentStatus::Failed,
                     FallbackScope::NeedsReview => t.status == SegmentStatus::NeedsReview,
                     FallbackScope::FailedAndNeedsReview => {
                         t.status == SegmentStatus::Failed || t.status == SegmentStatus::NeedsReview
                     }
                 },
-                None => false,
+                None => {
+                    let Some(status) = fallback_status_by_segment.get(&s.id.0) else {
+                        return false;
+                    };
+                    match fallback_scope {
+                        FallbackScope::Failed => status == "failed",
+                        FallbackScope::NeedsReview => status == "needs_review",
+                        FallbackScope::FailedAndNeedsReview => {
+                            status == "failed" || status == "needs_review"
+                        }
+                    }
+                }
             }
         })
         .cloned()
@@ -1565,14 +1670,14 @@ async fn run_fallback_pass(
         "Fallback: retrying {} segments with {}/{}",
         candidates.len(),
         provider_str,
-        fallback_model
+        model_str
     );
 
     let run_config = TranslationRunConfig {
         source_language: primary_run_config.source_language.clone(),
         target_language: primary_run_config.target_language.clone(),
         provider: provider_str.to_string(),
-        model: fallback_model.clone(),
+        model: model_str.to_string(),
         prompt_version: prompt_version.to_string(),
         temperature: 0.2,
         scheduler: SchedulerConfig {
@@ -1598,13 +1703,51 @@ async fn run_fallback_pass(
         store,
         job_id,
         provider: provider_str,
-        model: &fallback_model,
+        model: model_str,
         prompt_version,
         sender: &sender,
     };
 
-    let translation_result =
-        translate_and_checkpoint(fallback, &candidates, &run_config, checkpoint, control).await;
+    let translation_result = match provider_str {
+        "mock" => {
+            let fallback = MockProvider::new(mock_mode(model_str), &run_config.target_language);
+            translate_and_checkpoint(
+                ProgressRequestProvider::new_with_prefix(fallback, progress, Some("fallback")),
+                &candidates,
+                &run_config,
+                checkpoint,
+                control,
+            )
+            .await
+        }
+        "deepseek" | "openrouter" | "openai-compatible" => {
+            let provider_config = provider_config(
+                provider_str,
+                Some(model_str),
+                fallback_base_url,
+                fallback_api_key_env,
+                settings.provider.timeout_seconds,
+                settings.provider.provider_max_attempts,
+                settings.provider.thinking_disabled,
+                settings.provider.retry_after_policy,
+                settings.provider.max_backoff_seconds,
+                settings.provider.max_idle_per_host,
+                settings.provider.json_mode,
+            )?;
+            let fallback =
+                OpenAiCompatibleProvider::new_with_cancel(provider_config, cancel_token.clone())
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            translate_and_checkpoint(
+                ProgressRequestProvider::new_with_prefix(fallback, progress, Some("fallback")),
+                &candidates,
+                &run_config,
+                checkpoint,
+                control,
+            )
+            .await
+        }
+        provider => anyhow::bail!("unsupported fallback provider '{provider}'"),
+    };
     let fresh = finalize_writer(translation_result, sender, writer).await?;
 
     for ft in &fresh {
@@ -1613,8 +1756,11 @@ async fn run_fallback_pass(
             .find(|t| t.segment_id.0 == ft.segment_id.0)
         {
             *existing = ft.clone();
+        } else {
+            translations.push(ft.clone());
         }
     }
+    translations.sort_by_key(|translation| translation.ordinal);
 
     Ok(translations)
 }
@@ -1632,7 +1778,7 @@ struct DoubleCheckPass<'a> {
     progress: Arc<dyn bookforge_core::ProgressSink>,
 }
 
-async fn run_double_check_pass(pass: DoubleCheckPass<'_>) -> Result<()> {
+async fn run_double_check_pass(pass: DoubleCheckPass<'_>) -> Result<bool> {
     let DoubleCheckPass {
         provider,
         cancel_token,
@@ -1646,40 +1792,50 @@ async fn run_double_check_pass(pass: DoubleCheckPass<'_>) -> Result<()> {
         progress,
     } = pass;
     if settings.double_check.mode == DoubleCheckMode::Off {
-        return Ok(());
+        return Ok(true);
     }
 
-    let dc_provider =
-        if cli_args.double_check_provider.is_some() || cli_args.double_check_model.is_some() {
-            let provider_str = cli_args
-                .double_check_provider
-                .as_deref()
-                .unwrap_or("openrouter");
-            let dc_config = provider_config(
-                provider_str,
-                cli_args.double_check_model.as_deref(),
-                cli_args.double_check_base_url.as_deref(),
-                cli_args.double_check_api_key_env.as_deref(),
-                settings.provider.timeout_seconds,
-                settings.provider.provider_max_attempts,
-                settings.provider.thinking_disabled,
-                settings.provider.retry_after_policy,
-                settings.provider.max_backoff_seconds,
-                settings.provider.max_idle_per_host,
-                settings.provider.json_mode,
-            )?;
-            OpenAiCompatibleProvider::new_with_cancel(dc_config, cancel_token.clone())
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-        } else {
-            provider.clone()
-        };
+    let (dc_provider, dc_provider_name, dc_model) = if cli_args.double_check_provider.is_some()
+        || cli_args.double_check_model.is_some()
+    {
+        let provider_str = cli_args
+            .double_check_provider
+            .as_deref()
+            .unwrap_or("openrouter");
+        let dc_config = provider_config(
+            provider_str,
+            cli_args.double_check_model.as_deref(),
+            cli_args.double_check_base_url.as_deref(),
+            cli_args.double_check_api_key_env.as_deref(),
+            settings.provider.timeout_seconds,
+            settings.provider.provider_max_attempts,
+            settings.provider.thinking_disabled,
+            settings.provider.retry_after_policy,
+            settings.provider.max_backoff_seconds,
+            settings.provider.max_idle_per_host,
+            settings.provider.json_mode,
+        )?;
+        let provider = OpenAiCompatibleProvider::new_with_cancel(dc_config, cancel_token.clone())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let model = provider.model().to_string();
+        (provider, provider_str.to_string(), model)
+    } else {
+        (
+            provider.clone(),
+            config.provider.clone(),
+            provider.model().to_string(),
+        )
+    };
+    let mut double_check_config = config.clone();
+    double_check_config.provider = dc_provider_name;
+    double_check_config.model = dc_model;
 
     println!("Double-check: auditing translations...");
     let corrections = match run_double_check(
         ProgressRequestProvider::new(dc_provider, progress),
         segments,
         translations,
-        config,
+        &double_check_config,
         &settings.double_check,
     )
     .await
@@ -1691,7 +1847,7 @@ async fn run_double_check_pass(pass: DoubleCheckPass<'_>) -> Result<()> {
                 .as_ref()
                 .is_some_and(bookforge_llm::PauseSignal::is_stopped) =>
         {
-            return Ok(());
+            return Ok(false);
         }
         Err(e) => return Err(anyhow::anyhow!("double-check failed: {e}")),
     };
@@ -1722,7 +1878,7 @@ async fn run_double_check_pass(pass: DoubleCheckPass<'_>) -> Result<()> {
         changed_segment_ids.len()
     );
 
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn apply_double_check_corrections(
@@ -1901,6 +2057,14 @@ where
 
     match (translations, checkpoint_result) {
         (Ok(translations), Ok(Ok(()))) => Ok(translations),
+        (Err(_), _)
+            if config
+                .pause_signal
+                .as_ref()
+                .is_some_and(|signal| signal.is_stopped()) =>
+        {
+            Ok(Vec::new())
+        }
         (Ok(_), Ok(Err(e))) | (Err(e @ bookforge_llm::LlmError::Provider(_)), _) => {
             let message = format!("translation checkpoint failure: {e}");
             mark_unfinished_segments_failed(
@@ -2097,7 +2261,10 @@ pub(crate) fn mark_job_finished(
     store: &JobStore,
     job_id: &str,
     translations: &[SegmentTranslation],
-) -> Result<()> {
+) -> Result<bool> {
+    if job_was_stopped(store, job_id)? || job_is_paused(store, job_id)? {
+        return Ok(false);
+    }
     let Some(summary) = store.summary(job_id)? else {
         anyhow::bail!("job '{job_id}' was not found");
     };
@@ -2105,30 +2272,36 @@ pub(crate) fn mark_job_finished(
         summary.succeeded + summary.cached + summary.failed + summary.needs_review;
     if terminal_segments < summary.total_segments || summary.retry_pending > 0 {
         store.mark_job_needs_review(job_id)?;
-        return Ok(());
+        return Ok(!job_was_stopped(store, job_id)? && !job_is_paused(store, job_id)?);
     }
     if translations
         .iter()
         .any(|translation| translation.status == SegmentStatus::Failed)
     {
         store.mark_job_needs_review(job_id)?;
-        return Ok(());
+        return Ok(!job_was_stopped(store, job_id)? && !job_is_paused(store, job_id)?);
     }
     if translations
         .iter()
         .any(|translation| translation.status == SegmentStatus::NeedsReview)
     {
         store.mark_job_needs_review(job_id)?;
-        return Ok(());
+        return Ok(!job_was_stopped(store, job_id)? && !job_is_paused(store, job_id)?);
     }
     store.mark_job_complete(job_id)?;
-    Ok(())
+    Ok(!job_was_stopped(store, job_id)? && !job_is_paused(store, job_id)?)
 }
 
 pub(crate) fn job_was_stopped(store: &JobStore, job_id: &str) -> Result<bool> {
     Ok(store
         .get_job(job_id)?
         .is_some_and(|job| job.status == "stopped"))
+}
+
+pub(crate) fn job_is_paused(store: &JobStore, job_id: &str) -> Result<bool> {
+    Ok(store
+        .get_job(job_id)?
+        .is_some_and(|job| job.status == "paused"))
 }
 
 pub(crate) fn print_stopped_resume_hint(job_id: &str, print_stdout: bool) {
@@ -2465,19 +2638,13 @@ mod tests {
         let mut settings = TranslationProfile::V1Fast.resolve();
         settings.provider.timeout_seconds = 1;
         settings.provider.provider_max_attempts = 1;
-        let primary = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
-            base_url: "https://127.0.0.1:9/v1".to_string(),
-            api_key_env: "OPENAI_API_KEY".to_string(),
-            model: "primary-model".to_string(),
-            timeout_seconds: 1,
-            provider_max_attempts: 1,
-            thinking_disabled: false,
-            retry_after_policy: bookforge_core::RetryAfterPolicy::None,
-            max_backoff_seconds: 1,
-            max_idle_per_host: 1,
-            json_mode: bookforge_core::JsonMode::Auto,
-        })
-        .expect("provider should build");
+        let fallback_config = FallbackPassConfig {
+            provider: args.fallback_provider.clone().unwrap(),
+            model: args.fallback_model.clone().unwrap(),
+            base_url: args.fallback_base_url.clone(),
+            api_key_env: args.fallback_api_key_env.clone(),
+            scope: args.fallback_only,
+        };
         let run_config = TranslationRunConfig {
             source_language: Some("English".to_string()),
             target_language: "Italian".to_string(),
@@ -2509,8 +2676,8 @@ mod tests {
         );
 
         let result = run_fallback_pass(
-            &primary,
-            &args,
+            &tokio_util::sync::CancellationToken::new(),
+            Some(&fallback_config),
             &segments,
             translations,
             &store,
@@ -2519,6 +2686,7 @@ mod tests {
             &settings,
             &run_config,
             Some(&mut control),
+            Arc::new(NullProgressSink),
         )
         .await
         .expect("fallback should stop before provider request");
@@ -2584,7 +2752,9 @@ mod tests {
             })
             .expect("completed segment should save");
 
-        mark_job_finished(&store, &job.id, &[translation]).expect("job finish should succeed");
+        assert!(
+            mark_job_finished(&store, &job.id, &[translation]).expect("job finish should succeed")
+        );
 
         let job = store
             .get_job(&job.id)

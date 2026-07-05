@@ -594,6 +594,7 @@ fn is_important_event(event: &ProgressEvent) -> bool {
         ProgressEvent::Error { .. }
         | ProgressEvent::JobPaused { .. }
         | ProgressEvent::JobResumed { .. }
+        | ProgressEvent::RequestStarted { .. }
         | ProgressEvent::Warning { .. }
         | ProgressEvent::BatchRepairFinished { .. }
         | ProgressEvent::CheckpointFlushed { .. }

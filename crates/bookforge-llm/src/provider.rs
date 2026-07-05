@@ -137,10 +137,12 @@ impl MockProvider {
 impl LlmProvider for MockProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let started = Instant::now();
-        if let Some(delay_ms) = std::env::var("BOOKFORGE_MOCK_DELAY_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-        {
+        let template = request
+            .metadata
+            .prompt_template
+            .as_deref()
+            .unwrap_or("translate_segment");
+        if let Some(delay_ms) = mock_delay_ms(template) {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
 
@@ -156,11 +158,6 @@ impl LlmProvider for MockProvider {
             });
         }
 
-        let template = request
-            .metadata
-            .prompt_template
-            .as_deref()
-            .unwrap_or("translate_segment");
         let block_ids = &request.metadata.block_ids;
 
         let content = if template == "qa_batch" {
@@ -394,6 +391,19 @@ fn transform_text(mode: MockMode, target_language: &str, source: &str) -> String
         MockMode::Uppercase => source.to_uppercase(),
         MockMode::MalformedJson => unreachable!("handled above"),
     }
+}
+
+fn mock_delay_ms(template: &str) -> Option<u64> {
+    let stage_env = match template {
+        "qa_batch" | "qa_segment" => Some("BOOKFORGE_MOCK_QA_DELAY_MS"),
+        "double_check_batch" => Some("BOOKFORGE_MOCK_DOUBLE_CHECK_DELAY_MS"),
+        "correct_batch" => Some("BOOKFORGE_MOCK_CORRECTION_DELAY_MS"),
+        _ => None,
+    };
+    stage_env
+        .and_then(|name| std::env::var(name).ok())
+        .or_else(|| std::env::var("BOOKFORGE_MOCK_DELAY_MS").ok())
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 /// Recover per-block source strings from a rendered marker-safe user prompt.

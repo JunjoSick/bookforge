@@ -238,6 +238,8 @@ mod tests {
             bilingual_separator: " / ".to_string(),
             bilingual_style: bookforge_core::BilingualStyle::Minimal,
             bilingual_css: None,
+            fallback: None,
+            finalize: bookforge_core::FinalizeCheckpointSnapshot::default(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         }
     }

@@ -29,6 +29,7 @@ pub(crate) struct ControlFilePoller<'a> {
     path: PathBuf,
     progress: Arc<dyn ProgressSink>,
     last_state: PauseState,
+    stop_cancel_token: Option<CancellationToken>,
 }
 
 impl<'a> ControlFilePoller<'a> {
@@ -37,13 +38,39 @@ impl<'a> ControlFilePoller<'a> {
         job_id: impl Into<String>,
         progress: Arc<dyn ProgressSink>,
     ) -> Self {
+        Self::new_inner(store, job_id, control_path_for_job, progress, None)
+    }
+
+    pub(crate) fn new_with_stop_cancel(
+        store: &'a JobStore,
+        job_id: impl Into<String>,
+        progress: Arc<dyn ProgressSink>,
+        stop_cancel_token: CancellationToken,
+    ) -> Self {
+        Self::new_inner(
+            store,
+            job_id,
+            control_path_for_job,
+            progress,
+            Some(stop_cancel_token),
+        )
+    }
+
+    fn new_inner(
+        store: &'a JobStore,
+        job_id: impl Into<String>,
+        path_for_job: impl FnOnce(&str) -> PathBuf,
+        progress: Arc<dyn ProgressSink>,
+        stop_cancel_token: Option<CancellationToken>,
+    ) -> Self {
         let job_id = job_id.into();
         Self {
-            path: control_path_for_job(&job_id),
+            path: path_for_job(&job_id),
             store,
             job_id,
             progress,
             last_state: PauseState::Running,
+            stop_cancel_token,
         }
     }
 
@@ -60,6 +87,7 @@ impl<'a> ControlFilePoller<'a> {
             path,
             progress,
             last_state: PauseState::Running,
+            stop_cancel_token: None,
         }
     }
 
@@ -86,44 +114,61 @@ impl<'a> ControlFilePoller<'a> {
     }
 
     fn pause(&mut self, signal: &PauseSignal) -> Result<()> {
-        if signal.state() == PauseState::Stopped {
+        if signal.state() == PauseState::Stopped || self.job_status_is("stopped")? {
+            signal.stop();
+            self.last_state = PauseState::Stopped;
             return Ok(());
         }
-        let already_paused = signal.state() == PauseState::Paused;
-        signal.pause();
-        if !already_paused && self.last_state != PauseState::Paused {
+        if signal.pause() {
             self.store.mark_job_paused(&self.job_id)?;
-            self.progress.emit(ProgressEvent::JobPaused {
-                job_id: self.job_id.clone(),
-                timestamp_ms: now_ms(),
-            });
-            self.last_state = PauseState::Paused;
+            if self.job_status_is("paused")? && self.last_state != PauseState::Paused {
+                self.progress.emit(ProgressEvent::JobPaused {
+                    job_id: self.job_id.clone(),
+                    timestamp_ms: now_ms(),
+                });
+                self.last_state = PauseState::Paused;
+            }
         }
         Ok(())
     }
 
     fn resume(&mut self, signal: &PauseSignal) -> Result<()> {
-        if signal.state() != PauseState::Paused {
+        if signal.state() == PauseState::Stopped || self.job_status_is("stopped")? {
+            signal.stop();
+            self.last_state = PauseState::Stopped;
+            return Ok(());
+        }
+        if !signal.resume() {
             self.last_state = signal.state();
             return Ok(());
         }
-        signal.resume();
         self.store.mark_job_running(&self.job_id)?;
-        self.progress.emit(ProgressEvent::JobResumed {
-            job_id: self.job_id.clone(),
-            timestamp_ms: now_ms(),
-        });
-        self.last_state = PauseState::Running;
+        if self.job_status_is("running")? {
+            self.progress.emit(ProgressEvent::JobResumed {
+                job_id: self.job_id.clone(),
+                timestamp_ms: now_ms(),
+            });
+            self.last_state = PauseState::Running;
+        }
         Ok(())
     }
 
     fn stop(&mut self, signal: &PauseSignal) -> Result<()> {
-        if signal.state() != PauseState::Stopped {
-            signal.stop();
+        if let Some(token) = &self.stop_cancel_token {
+            token.cancel();
+        }
+        if signal.stop() {
             self.store.mark_job_stopped(&self.job_id)?;
             self.last_state = PauseState::Stopped;
         }
         Ok(())
+    }
+
+    fn job_status_is(&self, expected: &str) -> Result<bool> {
+        Ok(self
+            .store
+            .get_job(&self.job_id)?
+            .is_some_and(|job| job.status == expected))
     }
 }
 
@@ -133,11 +178,28 @@ pub(crate) struct ControlFileWatcher {
 }
 
 impl ControlFileWatcher {
-    pub(crate) fn spawn(
+    pub(crate) fn spawn_with_stop_cancel(
         store_path: PathBuf,
         job_id: impl Into<String>,
         progress: Arc<dyn ProgressSink>,
         signal: PauseSignal,
+        stop_cancel_token: CancellationToken,
+    ) -> Self {
+        Self::spawn_inner(
+            store_path,
+            job_id,
+            progress,
+            signal,
+            Some(stop_cancel_token),
+        )
+    }
+
+    fn spawn_inner(
+        store_path: PathBuf,
+        job_id: impl Into<String>,
+        progress: Arc<dyn ProgressSink>,
+        signal: PauseSignal,
+        stop_cancel_token: Option<CancellationToken>,
     ) -> Self {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
@@ -147,8 +209,13 @@ impl ControlFileWatcher {
                 {
                     match JobStore::open(store_path.clone()) {
                         Ok(store) => {
-                            let mut poller =
-                                ControlFilePoller::new(&store, job_id.clone(), progress.clone());
+                            let mut poller = ControlFilePoller::new_inner(
+                                &store,
+                                job_id.clone(),
+                                control_path_for_job,
+                                progress.clone(),
+                                stop_cancel_token.clone(),
+                            );
                             if let Err(error) = poller.poll(&signal) {
                                 progress.emit(ProgressEvent::Error {
                                     kind: "control_file_watcher".to_string(),

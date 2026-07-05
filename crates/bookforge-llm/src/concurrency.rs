@@ -50,26 +50,33 @@ impl PauseSignal {
         PauseState::from_u8(self.state.load(Ordering::Acquire))
     }
 
-    pub fn pause(&self) {
-        let _ = self.state.compare_exchange(
-            PAUSE_RUNNING,
-            PAUSE_PAUSED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+    pub fn pause(&self) -> bool {
+        self.state
+            .compare_exchange(
+                PAUSE_RUNNING,
+                PAUSE_PAUSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
-    pub fn resume(&self) {
-        if self.state() != PauseState::Stopped {
-            self.state.store(PAUSE_RUNNING, Ordering::Release);
-        }
+    pub fn resume(&self) -> bool {
+        self.state
+            .compare_exchange(
+                PAUSE_PAUSED,
+                PAUSE_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
-    pub fn stop(&self) {
-        self.state.store(PAUSE_STOPPED, Ordering::Release);
+    pub fn stop(&self) -> bool {
+        self.state.swap(PAUSE_STOPPED, Ordering::AcqRel) != PAUSE_STOPPED
     }
 
-    pub fn set(&self, state: PauseState) {
+    pub fn set(&self, state: PauseState) -> bool {
         match state {
             PauseState::Running => self.resume(),
             PauseState::Paused => self.pause(),

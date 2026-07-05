@@ -1719,6 +1719,203 @@ fn cli_stop_during_inflight_batch_skips_finalize_until_resume() {
 }
 
 #[test]
+fn cli_pause_during_inflight_qa_request_parks_before_more_finalize_work() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("finalize-qa-pause-events.jsonl");
+    let output = temp.path().join("finalize-qa-pause.epub");
+    let mut child = spawn_finalize_stage_delay_mock_translate(
+        &temp,
+        &events,
+        &output,
+        &[("BOOKFORGE_MOCK_QA_DELAY_MS", "3000")],
+    );
+    let job_id = wait_for_job_id_in_store(&temp);
+    wait_for_request_started_prefix(&events, "qa_");
+
+    let control_path = control_path(&temp, &job_id);
+    write_control_file(&control_path, ControlCommand::Pause).expect("pause control should write");
+    wait_for_job_status(&temp, &job_id, "paused");
+    thread::sleep(Duration::from_millis(3300));
+
+    let paused_events = read_jsonl(&events);
+    assert!(
+        finalize_request_started_between_pause_and_resume(&paused_events).is_empty(),
+        "new finalize requests started while QA pause was parked: {:?}",
+        finalize_request_started_between_pause_and_resume(&paused_events)
+    );
+    assert_eq!(
+        event_count(&paused_events, "TranslationFinished"),
+        0,
+        "paused in-flight QA run should not complete"
+    );
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["resume", &job_id, "--ui", "quiet"])
+        .assert()
+        .success();
+
+    let status = child.wait().expect("translate child should exit");
+    assert!(status.success(), "translate child failed: {status}");
+    wait_for_event_count(&events, "TranslationFinished", 1);
+    assert!(output.exists(), "resumed QA pause run should write output");
+}
+
+#[test]
+fn cli_pause_during_inflight_double_check_request_parks_before_corrections() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("finalize-double-check-pause-events.jsonl");
+    let output = temp.path().join("finalize-double-check-pause.epub");
+    let mut child = spawn_finalize_stage_delay_mock_translate(
+        &temp,
+        &events,
+        &output,
+        &[("BOOKFORGE_MOCK_DOUBLE_CHECK_DELAY_MS", "3000")],
+    );
+    let job_id = wait_for_job_id_in_store(&temp);
+    wait_for_request_started_prefix(&events, "double_check_");
+
+    let control_path = control_path(&temp, &job_id);
+    write_control_file(&control_path, ControlCommand::Pause).expect("pause control should write");
+    wait_for_job_status(&temp, &job_id, "paused");
+    thread::sleep(Duration::from_millis(3300));
+
+    let paused_events = read_jsonl(&events);
+    assert!(
+        finalize_request_started_between_pause_and_resume(&paused_events)
+            .iter()
+            .all(|id| !id.starts_with("repair_")),
+        "correction requests started while double-check pause was parked: {:?}",
+        finalize_request_started_between_pause_and_resume(&paused_events)
+    );
+    assert_eq!(
+        event_count(&paused_events, "TranslationFinished"),
+        0,
+        "paused in-flight double-check run should not complete"
+    );
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["resume", &job_id, "--ui", "quiet"])
+        .assert()
+        .success();
+
+    let status = child.wait().expect("translate child should exit");
+    assert!(status.success(), "translate child failed: {status}");
+    wait_for_event_count(&events, "TranslationFinished", 1);
+    assert!(
+        output.exists(),
+        "resumed double-check pause run should write output"
+    );
+}
+
+#[test]
+fn cli_stop_during_finalize_resume_runs_fallback_and_marks_terminal_status() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("finalize-fallback-stop-events.jsonl");
+    let output = temp.path().join("finalize-fallback-stop.epub");
+    let mut child = spawn_finalize_fallback_mock_translate(&temp, &events, &output);
+    let job_id = wait_for_job_id_in_store(&temp);
+    wait_for_review_or_failed_segments(&temp, &job_id);
+
+    write_control_file(&control_path(&temp, &job_id), ControlCommand::Stop)
+        .expect("stop control should write");
+    let status = child.wait().expect("translate child should exit");
+    assert!(status.success(), "translate child failed: {status}");
+    wait_for_job_status(&temp, &job_id, "stopped");
+    assert_eq!(
+        event_count(&read_jsonl(&events), "TranslationFinished"),
+        0,
+        "stopped finalize run should not emit completion"
+    );
+
+    let resume_events = temp.path().join("finalize-fallback-resume-events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "resume",
+            &job_id,
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            resume_events.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let resumed_events = wait_for_event_count(&resume_events, "TranslationFinished", 1);
+    assert!(
+        request_started_ids(&resumed_events)
+            .iter()
+            .any(|id| id.starts_with("fallback_")),
+        "resume should run fallback pass; request ids={:?}",
+        request_started_ids(&resumed_events)
+    );
+    assert_eq!(job_status(&temp, &job_id), "succeeded");
+    assert!(
+        output.exists(),
+        "resume after fallback stop should write output"
+    );
+}
+
+#[test]
+fn cli_resume_after_stop_with_persisted_corrections_is_idempotent() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("finalize-correction-stop-events.jsonl");
+    let output = temp.path().join("finalize-correction-stop.epub");
+    let mut child = spawn_finalize_stage_delay_mock_translate(
+        &temp,
+        &events,
+        &output,
+        &[("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS", "1200")],
+    );
+    let job_id = wait_for_job_id_in_store(&temp);
+    wait_for_request_finished_prefix(&events, "repair_");
+    wait_for_corrected_block(&temp, &job_id);
+
+    write_control_file(&control_path(&temp, &job_id), ControlCommand::Stop)
+        .expect("stop control should write");
+    let status = child.wait().expect("translate child should exit");
+    assert!(status.success(), "translate child failed: {status}");
+    wait_for_job_status(&temp, &job_id, "stopped");
+
+    let resume_events = temp.path().join("finalize-correction-resume-events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .env("BOOKFORGE_MOCK_DOUBLE_CHECK_FAIL", "1")
+        .args([
+            "resume",
+            &job_id,
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            resume_events.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    wait_for_event_count(&resume_events, "TranslationFinished", 1);
+    let block_texts = stored_block_texts(&temp, &job_id);
+    assert!(
+        block_texts
+            .iter()
+            .all(|text| !text.contains("[corrected] [corrected]")),
+        "resume double-applied persisted corrections: {block_texts:?}"
+    );
+    assert!(
+        request_started_ids(&read_jsonl(&resume_events))
+            .iter()
+            .all(|id| !id.starts_with("double_check_") && !id.starts_with("repair_")),
+        "resume should skip checkpointed double-check pass"
+    );
+    assert_eq!(job_status(&temp, &job_id), "succeeded");
+    assert!(
+        output.exists(),
+        "resume after correction stop should write output"
+    );
+}
+
+#[test]
 fn cli_resume_uses_input_snapshot_after_original_is_moved() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let fixture = fixture_input();
@@ -1963,12 +2160,27 @@ fn spawn_finalize_controlled_mock_translate(
     events: &Path,
     output: &Path,
 ) -> process::Child {
+    spawn_finalize_stage_delay_mock_translate(
+        temp,
+        events,
+        output,
+        &[
+            ("BOOKFORGE_MOCK_DELAY_MS", "300"),
+            ("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS", "600"),
+        ],
+    )
+}
+
+fn spawn_finalize_stage_delay_mock_translate(
+    temp: &TempDir,
+    events: &Path,
+    output: &Path,
+    envs: &[(&str, &str)],
+) -> process::Child {
     let input = fixture_input();
     let mut cmd = process::Command::new(assert_cmd::cargo::cargo_bin("bookforge"));
     cmd.current_dir(temp.path())
-        .env("BOOKFORGE_MOCK_DELAY_MS", "300")
         .env("BOOKFORGE_MOCK_DOUBLE_CHECK_FAIL", "1")
-        .env("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS", "600")
         .args([
             "translate",
             input.to_str().unwrap(),
@@ -2008,8 +2220,56 @@ fn spawn_finalize_controlled_mock_translate(
             "--out",
             output.to_str().unwrap(),
         ]);
+    for (name, value) in envs {
+        cmd.env(name, value);
+    }
     cmd.spawn()
         .expect("finalize-controlled translate should spawn")
+}
+
+fn spawn_finalize_fallback_mock_translate(
+    temp: &TempDir,
+    events: &Path,
+    output: &Path,
+) -> process::Child {
+    let input = fixture_input();
+    let mut cmd = process::Command::new(assert_cmd::cargo::cargo_bin("bookforge"));
+    cmd.current_dir(temp.path())
+        .env("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS", "1500")
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-malformed-json",
+            "--profile",
+            "v1-fast",
+            "--batch-target-tokens",
+            "100000",
+            "--batch-max-items",
+            "100",
+            "--context-window",
+            "0",
+            "--concurrency",
+            "1",
+            "--fallback-provider",
+            "mock",
+            "--fallback-model",
+            "mock-prefix-target",
+            "--fallback-only",
+            "failed-and-needs-review",
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ]);
+    cmd.spawn()
+        .expect("finalize-fallback translate should spawn")
 }
 
 fn sha256_file(path: &Path) -> String {
@@ -2056,8 +2316,31 @@ fn wait_for_job_id_in_store(temp: &TempDir) -> String {
     }
 }
 
+fn control_path(temp: &TempDir, job_id: &str) -> PathBuf {
+    temp.path()
+        .join(".bookforge/runs")
+        .join(job_id)
+        .join("control")
+}
+
 fn wait_for_event_count(path: &Path, key: &str, min_count: usize) -> Vec<serde_json::Value> {
     wait_for_events(path, |events| event_count(events, key) >= min_count)
+}
+
+fn wait_for_request_started_prefix(path: &Path, prefix: &str) -> Vec<serde_json::Value> {
+    wait_for_events(path, |events| {
+        request_started_ids(events)
+            .iter()
+            .any(|id| id.starts_with(prefix))
+    })
+}
+
+fn wait_for_request_finished_prefix(path: &Path, prefix: &str) -> Vec<serde_json::Value> {
+    wait_for_events(path, |events| {
+        request_finished_ids(events)
+            .iter()
+            .any(|id| id.starts_with(prefix))
+    })
 }
 
 fn wait_for_events(
@@ -2103,6 +2386,65 @@ fn wait_for_job_status(temp: &TempDir, job_id: &str, expected: &str) {
     }
 }
 
+fn job_status(temp: &TempDir, job_id: &str) -> String {
+    let db = temp.path().join(".bookforge/jobs.sqlite");
+    let store = JobStore::open(&db).expect("store should open");
+    store
+        .get_job(job_id)
+        .expect("job should load")
+        .expect("job should exist")
+        .status
+}
+
+fn wait_for_corrected_block(temp: &TempDir, job_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if stored_block_texts(temp, job_id)
+            .iter()
+            .any(|text| text.contains("[corrected]"))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for corrected block in job {job_id}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_review_or_failed_segments(temp: &TempDir, job_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let db = temp.path().join(".bookforge/jobs.sqlite");
+        if db.exists()
+            && let Ok(store) = JobStore::open(&db)
+            && let Ok(records) = store.segment_records(job_id)
+            && records
+                .iter()
+                .any(|record| record.status == "failed" || record.status == "needs_review")
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for failed/review segments in job {job_id}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn stored_block_texts(temp: &TempDir, job_id: &str) -> Vec<String> {
+    let db = temp.path().join(".bookforge/jobs.sqlite");
+    let store = JobStore::open(&db).expect("store should open");
+    store
+        .load_block_translations(job_id)
+        .expect("block translations should load")
+        .into_iter()
+        .map(|block| block.text)
+        .collect()
+}
+
 fn event_count(events: &[serde_json::Value], key: &str) -> usize {
     events
         .iter()
@@ -2128,11 +2470,14 @@ fn finalize_request_started_count(events: &[serde_json::Value]) -> usize {
 }
 
 fn finalize_request_started_ids(events: &[serde_json::Value]) -> Vec<String> {
-    events
-        .iter()
-        .filter_map(request_started_id)
+    request_started_ids(events)
+        .into_iter()
         .filter(|id| is_finalize_request_id(id))
         .collect()
+}
+
+fn request_started_ids(events: &[serde_json::Value]) -> Vec<String> {
+    events.iter().filter_map(request_started_id).collect()
 }
 
 fn finalize_request_started_between_pause_and_resume(events: &[serde_json::Value]) -> Vec<String> {
@@ -2164,8 +2509,24 @@ fn request_started_id(event: &serde_json::Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn request_finished_ids(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| {
+            event
+                .get("RequestFinished")
+                .and_then(|payload| payload.get("request_id"))
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
 fn is_finalize_request_id(id: &str) -> bool {
-    id.starts_with("qa_") || id.starts_with("repair_") || id.starts_with("double_check_")
+    id.starts_with("qa_")
+        || id.starts_with("repair_")
+        || id.starts_with("double_check_")
+        || id.starts_with("fallback_")
 }
 
 fn segment_finished_ids(events: &[serde_json::Value]) -> Vec<String> {
