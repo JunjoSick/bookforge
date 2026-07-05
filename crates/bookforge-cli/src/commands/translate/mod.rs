@@ -623,7 +623,7 @@ async fn run_mock_translation(
             prompt_version,
         },
         progress.clone(),
-        false,
+        settings.batch.enabled,
     )
     .await?;
     if job_was_stopped(&store, &job.id)? {

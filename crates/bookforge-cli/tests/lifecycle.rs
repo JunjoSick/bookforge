@@ -1479,31 +1479,36 @@ fn cli_pause_and_resume_live_mock_run() {
     let events = temp.path().join("events.jsonl");
     let output = temp.path().join("out.epub");
     let mut child = spawn_controlled_mock_translate(&temp, &events, &output);
-    let job_id = wait_for_job_id(&events);
-    thread::sleep(Duration::from_millis(75));
-
-    bookforge()
-        .current_dir(temp.path())
-        .args(["pause", &job_id])
-        .assert()
-        .success();
+    let job_id = wait_for_job_id_in_store(&temp);
+    thread::sleep(Duration::from_millis(50));
     let control_path = temp
         .path()
         .join(".bookforge/runs")
         .join(&job_id)
         .join("control");
+    write_control_file(&control_path, ControlCommand::Pause).expect("pause control should write");
     assert_eq!(
         fs::read_to_string(&control_path).expect("pause control file should exist"),
         "pause\n"
     );
     wait_for_job_status(&temp, &job_id, "paused");
     let paused_events = wait_for_event_count(&events, "JobPaused", 1);
+    assert_eq!(
+        batch_request_started_count(&paused_events),
+        1,
+        "batch pause should not start another provider request after first completion"
+    );
     let finished_at_pause = segment_finished_ids(&paused_events);
-    thread::sleep(Duration::from_millis(250));
+    thread::sleep(Duration::from_millis(400));
     assert_eq!(
         segment_finished_ids(&read_jsonl(&events)).len(),
         finished_at_pause.len(),
         "paused run should not dispatch more segments"
+    );
+    assert_eq!(
+        batch_request_started_count(&read_jsonl(&events)),
+        1,
+        "paused batch run should not start another provider request while parked"
     );
 
     bookforge()
@@ -1529,14 +1534,14 @@ fn cli_stop_then_resume_mock_run() {
     let events = temp.path().join("events.jsonl");
     let output = temp.path().join("out.epub");
     let mut child = spawn_controlled_mock_translate(&temp, &events, &output);
-    let job_id = wait_for_job_id(&events);
-    thread::sleep(Duration::from_millis(75));
-
-    bookforge()
-        .current_dir(temp.path())
-        .args(["stop", &job_id])
-        .assert()
-        .success();
+    let job_id = wait_for_job_id_in_store(&temp);
+    thread::sleep(Duration::from_millis(50));
+    let control_path = temp
+        .path()
+        .join(".bookforge/runs")
+        .join(&job_id)
+        .join("control");
+    write_control_file(&control_path, ControlCommand::Stop).expect("stop control should write");
 
     let status = child.wait().expect("translate child should exit");
     assert!(status.success(), "translate child failed: {status}");
@@ -1551,6 +1556,20 @@ fn cli_stop_then_resume_mock_run() {
     assert!(
         !initially_finished.is_empty(),
         "stop test should checkpoint at least one segment"
+    );
+    assert_eq!(
+        batch_request_started_count(&stopped_events),
+        1,
+        "batch stop should not start another provider request after first completion"
+    );
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
+    let summary = store
+        .summary(&job_id)
+        .expect("summary should load")
+        .expect("job should exist");
+    assert_eq!(
+        summary.failed, 0,
+        "stopped batch items should remain resumable instead of failed"
     );
 
     let resume_events = temp.path().join("resume-events.jsonl");
@@ -1806,6 +1825,8 @@ fn spawn_controlled_mock_translate(temp: &TempDir, events: &Path, output: &Path)
             "v1-fast",
             "--max-segment-tokens",
             "1",
+            "--batch-max-items",
+            "1",
             "--context-window",
             "0",
             "--concurrency",
@@ -1844,11 +1865,24 @@ fn job_id_from_events(path: &Path) -> String {
         .expect("event log should include job id")
 }
 
-fn wait_for_job_id(path: &Path) -> String {
-    wait_for_events(path, |events| {
-        events.iter().any(|event| event.get("JobCreated").is_some())
-    });
-    job_id_from_events(path)
+fn wait_for_job_id_in_store(temp: &TempDir) -> String {
+    let db = temp.path().join(".bookforge/jobs.sqlite");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if db.exists()
+            && let Ok(store) = JobStore::open(&db)
+            && let Ok(ids) = store.list_job_ids()
+            && let Some(id) = ids.into_iter().next()
+        {
+            return id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a job id in {}",
+            db.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn wait_for_event_count(path: &Path, key: &str, min_count: usize) -> Vec<serde_json::Value> {
@@ -1902,6 +1936,19 @@ fn event_count(events: &[serde_json::Value], key: &str) -> usize {
     events
         .iter()
         .filter(|event| event.get(key).is_some())
+        .count()
+}
+
+fn batch_request_started_count(events: &[serde_json::Value]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            event
+                .get("RequestStarted")
+                .and_then(|payload| payload.get("batch_id"))
+                .and_then(|value| value.as_str())
+                .is_some()
+        })
         .count()
 }
 

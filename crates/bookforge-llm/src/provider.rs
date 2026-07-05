@@ -180,6 +180,58 @@ impl LlmProvider for MockProvider {
                 })
                 .collect::<Vec<_>>();
             serde_json::to_string(&json!({ "reviews": reviews }))?
+        } else if template.starts_with("translate_batch_") {
+            let items = extract_batch_items(&request.user)
+                .into_iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?.to_string();
+                    let response_id = if self.mode == MockMode::WrongSegmentId {
+                        "wrong_segment".to_string()
+                    } else {
+                        id
+                    };
+                    if template.contains("run_preserving") {
+                        let runs = entry
+                            .get("runs")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|runs| {
+                                runs.iter()
+                                    .filter_map(|run| {
+                                        let id = run.get("id")?.as_str()?;
+                                        let source = run.get("text")?.as_str().unwrap_or_default();
+                                        Some(json!({
+                                            "id": id,
+                                            "text": transform_run_text(
+                                                self.mode,
+                                                &self.target_language,
+                                                source,
+                                            ),
+                                        }))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        Some(json!({
+                            "id": response_id,
+                            "runs": runs,
+                        }))
+                    } else {
+                        let source = entry
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        Some(json!({
+                            "id": response_id,
+                            "translation": transform_text(
+                                self.mode,
+                                &self.target_language,
+                                source,
+                            ),
+                        }))
+                    }
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string(&json!({ "items": items }))?
         } else {
             let segment_id = request.metadata.segment_id.clone().ok_or_else(|| {
                 LlmError::Provider("mock request is missing segment_id".to_string())
@@ -442,6 +494,25 @@ fn extract_qa_batch_item_ids(user_prompt: &str) -> Vec<String> {
                 })
                 .collect::<Vec<_>>();
             if ids.is_empty() { None } else { Some(ids) }
+        })
+        .unwrap_or_default()
+}
+
+fn extract_batch_items(user_prompt: &str) -> Vec<serde_json::Value> {
+    user_prompt
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('[') {
+                return None;
+            }
+            let parsed: Vec<serde_json::Value> = serde_json::from_str(trimmed).ok()?;
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(parsed)
+            }
         })
         .unwrap_or_default()
 }

@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque, hash_map::Entry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::{
-    sync::{Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc},
     task::JoinSet,
 };
 
@@ -20,12 +20,18 @@ use crate::{
     concurrency::{PauseSignal, PauseState},
 };
 
+enum BatchWorkerResult {
+    Provider(Result<BatchTranslationResult, LlmError>),
+    StoppedUnfinished,
+}
+
 struct BatchWorkerOutput {
     batch: TranslationBatch,
-    result: Result<BatchTranslationResult, LlmError>,
+    result: BatchWorkerResult,
     request_status: RequestStatus,
     latency_ms: u64,
     max_output_tokens: u32,
+    request_permit: Option<OwnedSemaphorePermit>,
 }
 
 struct RepairWorkerOutput {
@@ -1478,22 +1484,9 @@ where
             while !pending_queue.is_empty() && !stop_dispatch {
                 if let Some(signal) = pause_signal.as_ref() {
                     on_control_boundary(signal)?;
-                    match signal.state() {
-                        PauseState::Running => {}
-                        PauseState::Stopped => {
-                            stop_dispatch = true;
-                            break;
-                        }
-                        PauseState::Paused if tasks.is_empty() => {
-                            if wait_for_batch_resume_or_stop(signal, &mut on_control_boundary)
-                                .await?
-                                == PauseState::Stopped
-                            {
-                                stop_dispatch = true;
-                                break;
-                            }
-                        }
-                        PauseState::Paused => break,
+                    if signal.state() == PauseState::Stopped {
+                        stop_dispatch = true;
+                        break;
                     }
                 }
 
@@ -1522,6 +1515,7 @@ where
                 let progress = progress.clone();
                 let request_semaphore = request_semaphore.clone();
                 let section_titles = section_titles.clone();
+                let pause_signal = pause_signal.clone();
 
                 tasks.spawn(async move {
                     // Strict context must be awaited before any permit is
@@ -1533,18 +1527,48 @@ where
                     } else {
                         None
                     };
-                    let request_permit = match request_semaphore.acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => {
+                    if let Some(signal) = pause_signal.as_ref()
+                        && signal.wait_until_running_or_stopped().await == PauseState::Stopped
+                    {
+                        return BatchWorkerOutput {
+                            batch,
+                            result: BatchWorkerResult::StoppedUnfinished,
+                            request_status: RequestStatus::OtherError,
+                            latency_ms: 0,
+                            max_output_tokens: 0,
+                            request_permit: None,
+                        };
+                    }
+                    let request_permit = loop {
+                        if let Some(signal) = pause_signal.as_ref()
+                            && signal.wait_until_running_or_stopped().await == PauseState::Stopped
+                        {
                             return BatchWorkerOutput {
                                 batch,
-                                result: Err(LlmError::Provider(
-                                    "batch request semaphore closed".to_string(),
-                                )),
+                                result: BatchWorkerResult::StoppedUnfinished,
                                 request_status: RequestStatus::OtherError,
                                 latency_ms: 0,
                                 max_output_tokens: 0,
+                                request_permit: None,
                             };
+                        }
+                        match request_semaphore.clone().try_acquire_owned() {
+                            Ok(permit) => break permit,
+                            Err(TryAcquireError::NoPermits) => {
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                            }
+                            Err(TryAcquireError::Closed) => {
+                                return BatchWorkerOutput {
+                                    batch,
+                                    result: BatchWorkerResult::Provider(Err(LlmError::Provider(
+                                        "batch request semaphore closed".to_string(),
+                                    ))),
+                                    request_status: RequestStatus::OtherError,
+                                    latency_ms: 0,
+                                    max_output_tokens: 0,
+                                    request_permit: None,
+                                };
+                            }
                         }
                     };
 
@@ -1554,12 +1578,13 @@ where
                             Err(_) => {
                                 return BatchWorkerOutput {
                                     batch,
-                                    result: Err(LlmError::Provider(
+                                    result: BatchWorkerResult::Provider(Err(LlmError::Provider(
                                         "adaptive concurrency limiter closed".to_string(),
-                                    )),
+                                    ))),
                                     request_status: RequestStatus::OtherError,
                                     latency_ms: 0,
                                     max_output_tokens: 0,
+                                    request_permit: Some(request_permit),
                                 };
                             }
                         },
@@ -1611,18 +1636,32 @@ where
                     let request_status = request_status_for_controller(&result);
 
                     drop(permit);
-                    drop(request_permit);
                     BatchWorkerOutput {
                         batch,
-                        result,
+                        result: BatchWorkerResult::Provider(result),
                         request_status,
                         latency_ms,
                         max_output_tokens,
+                        request_permit: Some(request_permit),
                     }
                 });
             }
 
-            let Some(joined) = tasks.join_next().await else {
+            let joined = match pause_signal.as_ref() {
+                Some(signal) if signal.state() == PauseState::Paused => {
+                    tokio::select! {
+                        joined = tasks.join_next() => joined,
+                        state = wait_for_batch_resume_or_stop(signal, &mut on_control_boundary) => {
+                            if state? == PauseState::Stopped {
+                                stop_dispatch = true;
+                            }
+                            tasks.join_next().await
+                        }
+                    }
+                }
+                _ => tasks.join_next().await,
+            };
+            let Some(joined) = joined else {
                 continue;
             };
             let BatchWorkerOutput {
@@ -1631,8 +1670,30 @@ where
                 request_status,
                 latency_ms,
                 max_output_tokens,
+                request_permit,
             } = joined
                 .map_err(|err| LlmError::Provider(format!("batch worker task failed: {err}")))?;
+
+            if let Some(signal) = pause_signal.as_ref() {
+                on_control_boundary(signal)?;
+                if signal.state() == PauseState::Stopped {
+                    stop_dispatch = true;
+                }
+            }
+            drop(request_permit);
+
+            let result = match result {
+                BatchWorkerResult::Provider(result) => result,
+                BatchWorkerResult::StoppedUnfinished => {
+                    stop_dispatch = true;
+                    unblock_fence_for_batch_failure(
+                        config.context_registry.as_deref(),
+                        &segments_by_id,
+                        &batch.items,
+                    );
+                    continue;
+                }
+            };
 
             progress.emit(bookforge_core::ProgressEvent::RequestFinished {
                 request_id: format!("batch_{}", batch.id),
