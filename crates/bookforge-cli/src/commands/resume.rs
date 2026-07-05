@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -23,6 +24,9 @@ use bookforge_llm::{
 };
 use bookforge_store::{JobRecord, JobStore, StoredBlockTranslation};
 use clap::Args;
+
+const PAUSED_RESUME_WAIT: Duration = Duration::from_secs(10);
+const PAUSED_RESUME_POLL: Duration = Duration::from_millis(250);
 
 use crate::{
     QaMode,
@@ -71,6 +75,13 @@ pub struct ResumeArgs {
 
     #[arg(long, default_value_t = false)]
     pub no_thinking: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Relaunch a paused job; only use if the paused process is gone because this can double-run the job"
+    )]
+    pub force: bool,
 }
 
 pub async fn run(args: ResumeArgs) -> Result<()> {
@@ -78,14 +89,28 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
     let Some(job) = store.get_job(&args.job_id)? else {
         anyhow::bail!("job '{}' was not found", args.job_id);
     };
-    if job.status == "paused" {
+    if job.status == "paused" && !args.force {
         let path = crate::control::request_job_control(&args.job_id, ControlCommand::Resume)?;
         if human_stdout_enabled(args.ui) {
             println!("resume requested for {} ({})", args.job_id, path.display());
         }
+        if wait_for_paused_job_to_leave_paused(
+            &store,
+            &args.job_id,
+            PAUSED_RESUME_WAIT,
+            PAUSED_RESUME_POLL,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        eprintln!("{}", dead_paused_resume_hint(&args.job_id));
         return Ok(());
     }
     crate::control::clear_job_control(&args.job_id)?;
+    if job.status == "paused" && args.force {
+        store.mark_job_running(&args.job_id)?;
+    }
     let mut snapshot = load_resume_snapshot(&store, &args.job_id)?;
 
     let progress_jsonl = args
@@ -101,6 +126,33 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
 
     let run_result = run_inner(args, store, job, &mut snapshot, progress).await;
     finalize_reporter(run_result, reporter).await
+}
+
+async fn wait_for_paused_job_to_leave_paused(
+    store: &JobStore,
+    job_id: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<bool> {
+    let started = tokio::time::Instant::now();
+    loop {
+        match store.get_job(job_id)? {
+            Some(job) if job.status == "paused" => {}
+            Some(_) | None => return Ok(true),
+        }
+        if started.elapsed() >= timeout {
+            return Ok(false);
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+fn dead_paused_resume_hint(job_id: &str) -> String {
+    format!(
+        "Job {job_id} is still paused after waiting for a live process to resume it. \
+If the paused process is gone, run: bookforge resume {job_id} --force. \
+Only use --force if the paused process is gone; otherwise it can double-run the job."
+    )
 }
 
 fn load_resume_snapshot(store: &JobStore, job_id: &str) -> Result<RunConfigSnapshot> {
@@ -880,7 +932,7 @@ mod tests {
         io::Write,
         path::Path,
         sync::Mutex,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
@@ -900,6 +952,61 @@ mod tests {
         job: JobRecord,
         snapshot: RunConfigSnapshot,
         segments: Vec<Segment>,
+    }
+
+    #[tokio::test]
+    async fn paused_resume_wait_times_out_with_force_hint() {
+        let fixture = resume_fixture(TranslationProfile::V1Fast.resolve(), 1);
+        fixture
+            .store
+            .mark_job_paused(&fixture.job.id)
+            .expect("job should mark paused");
+
+        let resumed = wait_for_paused_job_to_leave_paused(
+            &fixture.store,
+            &fixture.job.id,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("paused wait should not error");
+
+        assert!(!resumed, "dead paused job should time out");
+        let hint = dead_paused_resume_hint(&fixture.job.id);
+        assert!(hint.contains("bookforge resume"));
+        assert!(hint.contains("--force"));
+        assert!(hint.contains("double-run"));
+    }
+
+    #[tokio::test]
+    async fn paused_resume_wait_returns_when_job_leaves_paused() {
+        let fixture = resume_fixture(TranslationProfile::V1Fast.resolve(), 1);
+        fixture
+            .store
+            .mark_job_paused(&fixture.job.id)
+            .expect("job should mark paused");
+        let store_path = fixture.store.path().to_path_buf();
+        let job_id = fixture.job.id.clone();
+        let wake_id = job_id.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let store = JobStore::open(store_path).expect("store should reopen");
+            store
+                .mark_job_running(&wake_id)
+                .expect("job should leave paused");
+        });
+
+        let resumed = wait_for_paused_job_to_leave_paused(
+            &fixture.store,
+            &job_id,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("paused wait should not error");
+
+        assert!(resumed, "live paused job should be observed leaving paused");
     }
 
     #[tokio::test]
@@ -1355,6 +1462,7 @@ mod tests {
             progress_jsonl: None,
             output: None,
             no_thinking: false,
+            force: false,
         };
 
         run_inner(

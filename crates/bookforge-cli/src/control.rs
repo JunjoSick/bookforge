@@ -45,7 +45,7 @@ impl<'a> ControlFilePoller<'a> {
     }
 
     #[cfg(test)]
-    fn new_with_path(
+    pub(crate) fn new_with_path(
         store: &'a JobStore,
         job_id: impl Into<String>,
         path: PathBuf,

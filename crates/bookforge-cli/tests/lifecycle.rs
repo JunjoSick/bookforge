@@ -7,7 +7,10 @@ use std::{
 };
 
 use assert_cmd::Command;
-use bookforge_core::{GlossaryCategory, GlossaryStatus, GlossaryTerm};
+use bookforge_core::{
+    ControlCommand, GlossaryCategory, GlossaryStatus, GlossaryTerm, read_control_file,
+    write_control_file,
+};
 use bookforge_store::{GlossaryFilter, JobStore, NewGlossaryCandidate};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -1402,6 +1405,71 @@ fn cli_resume_reuses_checkpointed_segments() {
             .get("segment_id")
             .and_then(|value| value.as_str()),
         Some(retry_id.as_str())
+    );
+}
+
+#[test]
+fn cli_resume_force_relaunches_dead_paused_job() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let run = translate_quiet(&temp, "mock-prefix-target");
+    let resume_events = temp.path().join("force-resume-events.jsonl");
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
+    let retry_id = store
+        .segment_records(&run.job_id)
+        .expect("segments should load")
+        .into_iter()
+        .next()
+        .expect("fixture should produce segments")
+        .id;
+    store
+        .mark_segment_failed(&run.job_id, &retry_id, "force dead paused resume")
+        .expect("segment should be marked failed");
+    store
+        .mark_job_paused(&run.job_id)
+        .expect("job should be marked paused");
+    let control_path = temp
+        .path()
+        .join(".bookforge/runs")
+        .join(&run.job_id)
+        .join("control");
+    write_control_file(&control_path, ControlCommand::Pause).expect("pause control should write");
+    drop(store);
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "resume",
+            &run.job_id,
+            "--force",
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            resume_events.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        read_control_file(&control_path).expect("control file should read"),
+        ControlCommand::Run,
+        "forced resume should clear stale pause control"
+    );
+    let events = read_jsonl(&resume_events);
+    let segment_finished = segment_finished_ids(&events);
+    assert_eq!(
+        segment_finished,
+        vec![retry_id],
+        "forced resume should translate only the failed segment"
+    );
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
+    assert_ne!(
+        store
+            .get_job(&run.job_id)
+            .expect("job should load")
+            .expect("job should exist")
+            .status,
+        "paused",
+        "forced resume should leave the paused state"
     );
 }
 

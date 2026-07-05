@@ -995,6 +995,8 @@ async fn finish_translation_pipeline(
     )
     .await;
 
+    let mut control_poller =
+        crate::control::ControlFilePoller::new(store, &job.id, progress.clone());
     let fallback_translations = run_fallback_pass(
         provider,
         cli_args,
@@ -1005,9 +1007,14 @@ async fn finish_translation_pipeline(
         run_prompt_version,
         settings,
         run_config,
+        Some(&mut control_poller),
     )
     .await?;
     *translations = fallback_translations;
+    if job_was_stopped(store, &job.id)? {
+        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+        return Ok(());
+    }
 
     run_double_check_pass(DoubleCheckPass {
         provider,
@@ -1290,6 +1297,7 @@ async fn run_fallback_pass(
     prompt_version: &str,
     settings: &ResolvedRunSettings,
     primary_run_config: &TranslationRunConfig,
+    control: Option<&mut crate::control::ControlFilePoller<'_>>,
 ) -> Result<Vec<SegmentTranslation>> {
     if cli_args.fallback_provider.is_none() && cli_args.fallback_model.is_none() {
         return Ok(translations);
@@ -1375,7 +1383,7 @@ async fn run_fallback_pass(
         context_registry: primary_run_config.context_registry.clone(),
         style: primary_run_config.style.clone(),
         entities: primary_run_config.entities.clone(),
-        pause_signal: primary_run_config.pause_signal.clone(),
+        pause_signal: Some(primary_run_config.pause_signal.clone().unwrap_or_default()),
     }; // fallback_run_config
 
     let writer = CheckpointWriter::spawn(store.path().to_path_buf(), Arc::new(NullProgressSink));
@@ -1390,7 +1398,7 @@ async fn run_fallback_pass(
     };
 
     let translation_result =
-        translate_and_checkpoint(fallback, &candidates, &run_config, checkpoint, None).await;
+        translate_and_checkpoint(fallback, &candidates, &run_config, checkpoint, control).await;
     let fresh = finalize_writer(translation_result, sender, writer).await?;
 
     for ft in &fresh {
@@ -2185,6 +2193,129 @@ mod tests {
 
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(input_path);
+    }
+
+    #[tokio::test]
+    async fn fallback_pass_honors_stop_control_file() {
+        let db_path = temp_path("fallback_stop.sqlite");
+        let input_path = temp_path("fallback_stop_input.epub");
+        let output_path = temp_path("fallback_stop_output.epub");
+        let control_path = temp_path("fallback_stop_control");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+        bookforge_core::write_control_file(&control_path, bookforge_core::ControlCommand::Stop)
+            .expect("stop control should write");
+
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &output_path,
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "openai-compatible",
+                model: "primary-model",
+                base_url: Some("https://127.0.0.1:9/v1"),
+                api_key_env: Some("OPENAI_API_KEY"),
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job should be created");
+        let segments = vec![segment("seg_fallback", 0)];
+        store
+            .insert_segments(
+                &job.id,
+                &segments,
+                "v1",
+                "openai-compatible",
+                "primary-model",
+                "test_ns",
+            )
+            .expect("segments should insert");
+        let translations = vec![translation_for(
+            &segments[0],
+            "failed before fallback",
+            "failed",
+            SegmentStatus::Failed,
+        )];
+        let mut args = translate_args_with_preset(None);
+        args.fallback_provider = Some("openai-compatible".to_string());
+        args.fallback_model = Some("fallback-model".to_string());
+        args.fallback_base_url = Some("https://127.0.0.1:9/v1".to_string());
+        args.fallback_api_key_env = Some("OPENAI_API_KEY".to_string());
+
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.provider.timeout_seconds = 1;
+        settings.provider.provider_max_attempts = 1;
+        let primary = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: "https://127.0.0.1:9/v1".to_string(),
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            model: "primary-model".to_string(),
+            timeout_seconds: 1,
+            provider_max_attempts: 1,
+            thinking_disabled: false,
+            retry_after_policy: bookforge_core::RetryAfterPolicy::None,
+            max_backoff_seconds: 1,
+            max_idle_per_host: 1,
+            json_mode: bookforge_core::JsonMode::Auto,
+        })
+        .expect("provider should build");
+        let run_config = TranslationRunConfig {
+            source_language: Some("English".to_string()),
+            target_language: "Italian".to_string(),
+            provider: "openai-compatible".to_string(),
+            model: "primary-model".to_string(),
+            prompt_version: "v1".to_string(),
+            temperature: 0.2,
+            scheduler: SchedulerConfig {
+                concurrency: 1,
+                max_attempts: 1,
+            },
+            profile: settings.profile,
+            model_context_tokens: None,
+            max_output_tokens: None,
+            batch_max_output_tokens: None,
+            compact_prompts: false,
+            glossary: GlossaryRunConfig::default(),
+            context: ContextRunConfig::default(),
+            context_registry: None,
+            style: None,
+            entities: None,
+            pause_signal: None,
+        };
+        let mut control = crate::control::ControlFilePoller::new_with_path(
+            &store,
+            &job.id,
+            control_path.clone(),
+            Arc::new(NullProgressSink),
+        );
+
+        let result = run_fallback_pass(
+            &primary,
+            &args,
+            &segments,
+            translations,
+            &store,
+            &job.id,
+            "v1",
+            &settings,
+            &run_config,
+            Some(&mut control),
+        )
+        .await
+        .expect("fallback should stop before provider request");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].status, SegmentStatus::Failed);
+        assert_eq!(
+            store.get_job(&job.id).unwrap().unwrap().status,
+            "stopped",
+            "fallback stop control should mark the job stopped"
+        );
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+        let _ = fs::remove_file(output_path);
+        let _ = fs::remove_file(control_path);
     }
 
     #[test]
