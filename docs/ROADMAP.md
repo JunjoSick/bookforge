@@ -2333,6 +2333,20 @@ Merges chain (A+B+C…) as long as each successive pair qualifies.
 B's inline children are appended to A's children verbatim; A's
 attributes win for the merged block.
 
+**`--aggressive` (ruling 2026-07-05, owner-approved).** An opt-in flag
+that relaxes condition 3 only: B may also start with an uppercase
+letter, an opening quote/bracket (`“` `‘` `"` `'` `«` `(` `[`), or a
+dash (`—` `–`). All other conditions hold, plus one extra guard that
+replaces the letterless screen condition 3 gave for free: **B must
+contain at least one alphabetic character** (mirror of condition 7).
+Rationale: the conservative rule leaves continuation lines split when
+they begin with a proper noun or bracketed insert (observed on CCRU:
+"…review of David" / "Toop's Rap Attack…"); the cost is a real
+false-positive risk on verse and deliberately short lines, which is why
+it is a separate opt-in level, never the default. Every merge that only
+qualified under the relaxed rule is marked `"aggressive": true` in the
+report so audits can focus on them.
+
 ### 9c.3 Report
 
 JSON report: totals plus one record per merge (resource name, block

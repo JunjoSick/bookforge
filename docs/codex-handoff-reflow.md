@@ -82,3 +82,26 @@ CCRU output reads as prose with far fewer `<p>`s and passes
 EPUBCheck/validator; healthy EPUBs are untouched (≈0 merges); dry-run
 report matches a real run; the final un-mockable read-a-chapter check
 is the maintainer's/Claude's job, not yours.
+
+## Follow-up task: --aggressive level (2026-07-05, owner-approved)
+
+PR #24 is open; add this as new commits on `feat/reflow`. The
+authoritative spec is the new `--aggressive` ruling in ROADMAP §9c.2 —
+read it first. Condensed:
+
+- `--aggressive` flag on `bookforge reflow`, relaxing ONLY condition 3:
+  B may also start with uppercase, opening quote/bracket
+  (`“ ‘ " ' « ( [`), or a dash (`— –`). Everything else unchanged.
+- New guard under aggressive: B must contain at least one alphabetic
+  character (letterless right-side blocks must never merge).
+- Merge records that only qualified under the relaxed rule carry
+  `"aggressive": true` in the JSON report (serde should skip the field
+  when false to keep conservative reports byte-stable).
+- Unit tests: uppercase/bracket/dash starts merge under aggressive and
+  not under default; letterless B never merges; report flag set only on
+  relaxed-rule merges; conservative behavior byte-identical when the
+  flag is absent.
+- E2E: rerun CCRU with and without --aggressive, report both merge
+  counts; the "…review of David" / "Toop's Rap Attack…" pair in
+  index_split_007 must merge under aggressive.
+- Full workspace gates before each commit. Do not push.
