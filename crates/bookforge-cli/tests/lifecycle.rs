@@ -1602,6 +1602,123 @@ fn cli_stop_then_resume_mock_run() {
 }
 
 #[test]
+fn cli_pause_during_inflight_batch_holds_finalize_passes() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("finalize-pause-events.jsonl");
+    let output = temp.path().join("finalize-pause.epub");
+    let mut child = spawn_finalize_controlled_mock_translate(&temp, &events, &output);
+    let job_id = wait_for_job_id_in_store(&temp);
+    wait_for_events(&events, |events| batch_request_started_count(events) >= 1);
+
+    let control_path = temp
+        .path()
+        .join(".bookforge/runs")
+        .join(&job_id)
+        .join("control");
+    write_control_file(&control_path, ControlCommand::Pause).expect("pause control should write");
+    wait_for_job_status(&temp, &job_id, "paused");
+    thread::sleep(Duration::from_millis(700));
+
+    let paused_events = read_jsonl(&events);
+    assert!(
+        finalize_request_started_between_pause_and_resume(&paused_events).is_empty(),
+        "finalize provider requests started while paused: {:?}",
+        finalize_request_started_between_pause_and_resume(&paused_events)
+    );
+    assert_eq!(
+        event_count(&paused_events, "TranslationFinished"),
+        0,
+        "paused finalize run should not complete"
+    );
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["resume", &job_id, "--ui", "quiet"])
+        .assert()
+        .success();
+
+    let status = child.wait().expect("translate child should exit");
+    assert!(status.success(), "translate child failed: {status}");
+    let final_events = wait_for_event_count(&events, "TranslationFinished", 1);
+    assert!(
+        finalize_request_started_count(&final_events) > 0,
+        "resumed run should execute QA/double-check finalize provider requests"
+    );
+    assert!(
+        finalize_request_started_ids(&final_events)
+            .iter()
+            .any(|id| id.starts_with("repair_") || id.starts_with("double_check_")),
+        "forced double-check/repair pass should run after resume; ids={:?}",
+        finalize_request_started_ids(&final_events)
+    );
+    assert!(output.exists(), "resumed finalize run should write output");
+}
+
+#[test]
+fn cli_stop_during_inflight_batch_skips_finalize_until_resume() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("finalize-stop-events.jsonl");
+    let output = temp.path().join("finalize-stop.epub");
+    let mut child = spawn_finalize_controlled_mock_translate(&temp, &events, &output);
+    let job_id = wait_for_job_id_in_store(&temp);
+    wait_for_events(&events, |events| batch_request_started_count(events) >= 1);
+
+    let control_path = temp
+        .path()
+        .join(".bookforge/runs")
+        .join(&job_id)
+        .join("control");
+    write_control_file(&control_path, ControlCommand::Stop).expect("stop control should write");
+
+    let status = child.wait().expect("translate child should exit");
+    assert!(status.success(), "translate child failed: {status}");
+    wait_for_job_status(&temp, &job_id, "stopped");
+    let stopped_events = read_jsonl(&events);
+    assert_eq!(
+        finalize_request_started_count(&stopped_events),
+        0,
+        "stopped run should not start finalize provider requests"
+    );
+    assert_eq!(
+        event_count(&stopped_events, "TranslationFinished"),
+        0,
+        "stopped run should not emit final completion"
+    );
+
+    let resume_events = temp.path().join("finalize-stop-resume-events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .env("BOOKFORGE_MOCK_DOUBLE_CHECK_FAIL", "1")
+        .args([
+            "resume",
+            &job_id,
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            resume_events.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let resumed_events = wait_for_event_count(&resume_events, "TranslationFinished", 1);
+    assert!(
+        finalize_request_started_count(&resumed_events) > 0,
+        "resume should execute skipped finalize provider requests"
+    );
+    assert!(
+        finalize_request_started_ids(&resumed_events)
+            .iter()
+            .any(|id| id.starts_with("repair_") || id.starts_with("double_check_")),
+        "resume should run forced double-check/repair pass; ids={:?}",
+        finalize_request_started_ids(&resumed_events)
+    );
+    assert!(
+        output.exists(),
+        "resume after finalize stop should write output"
+    );
+}
+
+#[test]
 fn cli_resume_uses_input_snapshot_after_original_is_moved() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let fixture = fixture_input();
@@ -1841,6 +1958,60 @@ fn spawn_controlled_mock_translate(temp: &TempDir, events: &Path, output: &Path)
     cmd.spawn().expect("controlled translate should spawn")
 }
 
+fn spawn_finalize_controlled_mock_translate(
+    temp: &TempDir,
+    events: &Path,
+    output: &Path,
+) -> process::Child {
+    let input = fixture_input();
+    let mut cmd = process::Command::new(assert_cmd::cargo::cargo_bin("bookforge"));
+    cmd.current_dir(temp.path())
+        .env("BOOKFORGE_MOCK_DELAY_MS", "300")
+        .env("BOOKFORGE_MOCK_DOUBLE_CHECK_FAIL", "1")
+        .env("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS", "600")
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--profile",
+            "v1-fast",
+            "--batch-target-tokens",
+            "100000",
+            "--batch-max-items",
+            "100",
+            "--context-window",
+            "0",
+            "--concurrency",
+            "1",
+            "--qa",
+            "all",
+            "--qa-batch-target-tokens",
+            "100000",
+            "--double-check",
+            "formatting",
+            "--double-check-provider",
+            "mock",
+            "--double-check-model",
+            "mock-prefix-target",
+            "--double-check-batch-target-tokens",
+            "100000",
+            "--auto-correct",
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ]);
+    cmd.spawn()
+        .expect("finalize-controlled translate should spawn")
+}
+
 fn sha256_file(path: &Path) -> String {
     let bytes = fs::read(path).expect("file should read");
     let digest = Sha256::digest(&bytes);
@@ -1950,6 +2121,51 @@ fn batch_request_started_count(events: &[serde_json::Value]) -> usize {
                 .is_some()
         })
         .count()
+}
+
+fn finalize_request_started_count(events: &[serde_json::Value]) -> usize {
+    finalize_request_started_ids(events).len()
+}
+
+fn finalize_request_started_ids(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(request_started_id)
+        .filter(|id| is_finalize_request_id(id))
+        .collect()
+}
+
+fn finalize_request_started_between_pause_and_resume(events: &[serde_json::Value]) -> Vec<String> {
+    let mut paused = false;
+    let mut ids = Vec::new();
+    for event in events {
+        if event.get("JobPaused").is_some() {
+            paused = true;
+            continue;
+        }
+        if paused && event.get("JobResumed").is_some() {
+            break;
+        }
+        if paused
+            && let Some(id) = request_started_id(event)
+            && is_finalize_request_id(&id)
+        {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+fn request_started_id(event: &serde_json::Value) -> Option<String> {
+    event
+        .get("RequestStarted")
+        .and_then(|payload| payload.get("request_id"))
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn is_finalize_request_id(id: &str) -> bool {
+    id.starts_with("qa_") || id.starts_with("repair_") || id.starts_with("double_check_")
 }
 
 fn segment_finished_ids(events: &[serde_json::Value]) -> Vec<String> {

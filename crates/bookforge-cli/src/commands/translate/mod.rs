@@ -16,19 +16,26 @@ use bookforge_epub::read_epub;
 #[cfg(test)]
 use bookforge_llm::translate_segments;
 use bookforge_llm::{
-    AdaptiveLimiter, ContextRegistry, ContextRunConfig, EntityRunConfig, GlossaryRunConfig,
-    LlmError, LlmProvider, MockMode, MockProvider, OpenAiCompatibleConfig,
-    OpenAiCompatibleProvider, ProviderRateController, QaSegmentReview, RateControllerConfig,
-    SegmentTranslation, StyleRunConfig, TelemetryLog, TranslationRunConfig,
-    account_for_batch_prompt_overhead, build_translation_batches, qa_segments_parallel,
-    run_double_check, telemetry_summary, translate_batches_with_callback,
+    AdaptiveLimiter, CompletionRequest, CompletionResponse, ContextRegistry, ContextRunConfig,
+    EntityRunConfig, GlossaryRunConfig, LlmError, LlmProvider, MockMode, MockProvider,
+    OpenAiCompatibleConfig, OpenAiCompatibleProvider, ProviderCapabilities, ProviderRateController,
+    QaSegmentReview, RateControllerConfig, SegmentTranslation, StyleRunConfig, TelemetryLog,
+    TranslationRunConfig, account_for_batch_prompt_overhead, build_translation_batches,
+    qa_segments_parallel, run_double_check, telemetry_summary, translate_batches_with_callback,
     translate_batches_with_control, translate_segments_with_callback,
     translate_segments_with_control,
 };
 use bookforge_store::{CreateJob, JobRecord, JobStore, SaveTranslation};
 use clap::Args;
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 #[cfg(test)]
 use crate::LanguageArgs;
@@ -569,6 +576,13 @@ async fn run_mock_translation(
         &model,
         &cache_namespace,
     )?;
+    let pause_signal = bookforge_llm::PauseSignal::new();
+    let _control_watcher = crate::control::ControlFileWatcher::spawn(
+        store.path().to_path_buf(),
+        job.id.clone(),
+        progress.clone(),
+        pause_signal.clone(),
+    );
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
         target_language: config.target_language.clone(),
@@ -587,7 +601,7 @@ async fn run_mock_translation(
         context_registry: context_registry.clone(),
         style: style.run_config.clone(),
         entities: entities.run_config.clone(),
-        pause_signal: None,
+        pause_signal: Some(pause_signal.clone()),
     }; // mock
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     let mut translations = apply_cached_translations(
@@ -632,8 +646,14 @@ async fn run_mock_translation(
     }
     translations.extend(fresh_translations);
     translations.sort_by_key(|translation| translation.ordinal);
+    let mut control_poller =
+        crate::control::ControlFilePoller::new(&store, &job.id, progress.clone());
+    if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
+        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+        return Ok(());
+    }
     let qa_reviews = qa_reviews_for_mode(
-        provider,
+        ProgressRequestProvider::new(provider.clone(), progress.clone()),
         &segments,
         &translations,
         &run_config,
@@ -641,6 +661,46 @@ async fn run_mock_translation(
         cli_args.qa,
     )
     .await;
+    if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
+        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+        return Ok(());
+    }
+    if settings.double_check.mode != DoubleCheckMode::Off {
+        println!("Double-check: auditing translations...");
+        let corrections = match run_double_check(
+            ProgressRequestProvider::new(provider.clone(), progress.clone()),
+            &segments,
+            &translations,
+            &run_config,
+            &settings.double_check,
+        )
+        .await
+        {
+            Ok(corrections) => corrections,
+            Err(_)
+                if run_config
+                    .pause_signal
+                    .as_ref()
+                    .is_some_and(bookforge_llm::PauseSignal::is_stopped) =>
+            {
+                print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow::anyhow!("double-check failed: {e}")),
+        };
+        let changed_segment_ids = apply_double_check_corrections(&mut translations, &corrections);
+        persist_corrected_translations(
+            &store,
+            &job.id,
+            &run_config,
+            &translations,
+            &changed_segment_ids,
+        )?;
+        if job_was_stopped(&store, &job.id)? {
+            print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+            return Ok(());
+        }
+    }
     mark_job_finished(&store, &job.id, &translations)?;
     print_summary_rebuild_and_report(
         &store,
@@ -866,6 +926,13 @@ async fn run_openai_compatible_translation(
         &model,
         &cache_namespace,
     )?;
+    let pause_signal = bookforge_llm::PauseSignal::new();
+    let _control_watcher = crate::control::ControlFileWatcher::spawn(
+        store.path().to_path_buf(),
+        job.id.clone(),
+        progress.clone(),
+        pause_signal.clone(),
+    );
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
         target_language: config.target_language.clone(),
@@ -884,7 +951,7 @@ async fn run_openai_compatible_translation(
         context_registry: context_registry.clone(),
         style: style.run_config.clone(),
         entities: entities.run_config.clone(),
-        pause_signal: None,
+        pause_signal: Some(pause_signal.clone()),
     };
     let mut translations = apply_cached_translations(
         &segments,
@@ -985,18 +1052,30 @@ async fn finish_translation_pipeline(
 ) -> Result<()> {
     translations.sort_by_key(|t| t.ordinal);
 
+    let pause_signal = run_config.pause_signal.clone().unwrap_or_default();
+    let mut controlled_run_config = run_config.clone();
+    controlled_run_config.pause_signal = Some(pause_signal.clone());
+    let mut control_poller =
+        crate::control::ControlFilePoller::new(store, &job.id, progress.clone());
+
+    if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
+        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+        return Ok(());
+    }
     let qa_reviews = qa_reviews_for_mode(
-        provider.clone(),
+        ProgressRequestProvider::new(provider.clone(), progress.clone()),
         segments,
         translations,
-        run_config,
+        &controlled_run_config,
         &settings.qa,
         cli_args.qa,
     )
     .await;
 
-    let mut control_poller =
-        crate::control::ControlFilePoller::new(store, &job.id, progress.clone());
+    if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
+        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+        return Ok(());
+    }
     let fallback_translations = run_fallback_pass(
         provider,
         cli_args,
@@ -1006,7 +1085,7 @@ async fn finish_translation_pipeline(
         &job.id,
         run_prompt_version,
         settings,
-        run_config,
+        &controlled_run_config,
         Some(&mut control_poller),
     )
     .await?;
@@ -1016,6 +1095,10 @@ async fn finish_translation_pipeline(
         return Ok(());
     }
 
+    if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
+        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+        return Ok(());
+    }
     run_double_check_pass(DoubleCheckPass {
         provider,
         cancel_token,
@@ -1024,10 +1107,15 @@ async fn finish_translation_pipeline(
         translations,
         store,
         job_id: &job.id,
-        config: run_config,
+        config: &controlled_run_config,
         settings,
+        progress: progress.clone(),
     })
     .await?;
+    if job_was_stopped(store, &job.id)? {
+        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+        return Ok(());
+    }
 
     mark_job_finished(store, &job.id, translations)?;
     print_summary_rebuild_and_report(
@@ -1062,6 +1150,124 @@ async fn finish_translation_pipeline(
     });
 
     Ok(())
+}
+
+async fn wait_for_finalize_stage_control(
+    control: &mut crate::control::ControlFilePoller<'_>,
+    signal: &bookforge_llm::PauseSignal,
+) -> Result<bool> {
+    if let Some(delay_ms) = std::env::var("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+    Ok(!matches!(
+        control.wait_until_running_or_stopped(signal).await?,
+        bookforge_llm::PauseState::Stopped
+    ))
+}
+
+#[derive(Clone)]
+pub(crate) struct ProgressRequestProvider<P> {
+    inner: P,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
+    counter: Arc<AtomicUsize>,
+}
+
+impl<P> ProgressRequestProvider<P> {
+    pub(crate) fn new(inner: P, progress: Arc<dyn bookforge_core::ProgressSink>) -> Self {
+        Self {
+            inner,
+            progress,
+            counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl<P> LlmProvider for ProgressRequestProvider<P>
+where
+    P: LlmProvider,
+{
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> std::result::Result<CompletionResponse, LlmError> {
+        let metadata = request.metadata.clone();
+        let max_output_tokens = request.max_output_tokens;
+        let prefix = finalize_request_prefix(metadata.prompt_template.as_deref());
+        let request_id = format!(
+            "{prefix}_{:04}",
+            self.counter.fetch_add(1, Ordering::Relaxed)
+        );
+        self.progress
+            .emit(bookforge_core::ProgressEvent::RequestStarted {
+                request_id: request_id.clone(),
+                batch_id: None,
+                segment_id: metadata.segment_id.clone(),
+                provider: metadata.provider.clone(),
+                model: metadata.model.clone(),
+                prompt_template: metadata.prompt_template.clone(),
+                items: metadata.block_ids.len().max(1),
+                estimated_input_tokens: 0,
+                max_output_tokens,
+                active_requests: 1,
+                target_concurrency: 1,
+                timestamp_ms: bookforge_core::progress::now_ms(),
+            });
+
+        let started = Instant::now();
+        let result = self.inner.complete(request).await;
+        let (status, finish_reason, input_tokens, output_tokens, error_kind) = match &result {
+            Ok(response) => (
+                "ok".to_string(),
+                Some(format!("{:?}", response.finish_reason)),
+                response.input_tokens,
+                response.output_tokens,
+                None,
+            ),
+            Err(error) => (
+                "error".to_string(),
+                None,
+                None,
+                None,
+                Some(classify_error(error).to_string()),
+            ),
+        };
+        self.progress
+            .emit(bookforge_core::ProgressEvent::RequestFinished {
+                request_id,
+                batch_id: None,
+                segment_id: metadata.segment_id,
+                status,
+                latency_ms: started.elapsed().as_millis() as u64,
+                status_code: None,
+                finish_reason,
+                retry_count: 0,
+                input_tokens,
+                output_tokens,
+                error_kind,
+                timestamp_ms: bookforge_core::progress::now_ms(),
+            });
+        result
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn is_reasoning(&self) -> bool {
+        self.inner.is_reasoning()
+    }
+}
+
+fn finalize_request_prefix(prompt_template: Option<&str>) -> &'static str {
+    match prompt_template {
+        Some("qa_batch" | "qa_segment") => "qa",
+        Some("correct_batch") => "repair",
+        Some("double_check_batch") => "double_check",
+        _ => "finalize",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1423,6 +1629,7 @@ struct DoubleCheckPass<'a> {
     job_id: &'a str,
     config: &'a TranslationRunConfig,
     settings: &'a ResolvedRunSettings,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
 }
 
 async fn run_double_check_pass(pass: DoubleCheckPass<'_>) -> Result<()> {
@@ -1436,6 +1643,7 @@ async fn run_double_check_pass(pass: DoubleCheckPass<'_>) -> Result<()> {
         job_id,
         config,
         settings,
+        progress,
     } = pass;
     if settings.double_check.mode == DoubleCheckMode::Off {
         return Ok(());
@@ -1467,15 +1675,26 @@ async fn run_double_check_pass(pass: DoubleCheckPass<'_>) -> Result<()> {
         };
 
     println!("Double-check: auditing translations...");
-    let corrections = run_double_check(
-        dc_provider,
+    let corrections = match run_double_check(
+        ProgressRequestProvider::new(dc_provider, progress),
         segments,
         translations,
         config,
         &settings.double_check,
     )
     .await
-    .map_err(|e| anyhow::anyhow!("double-check failed: {e}"))?;
+    {
+        Ok(corrections) => corrections,
+        Err(_)
+            if config
+                .pause_signal
+                .as_ref()
+                .is_some_and(bookforge_llm::PauseSignal::is_stopped) =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(anyhow::anyhow!("double-check failed: {e}")),
+    };
 
     let applied = corrections
         .iter()
@@ -1541,7 +1760,7 @@ pub(crate) fn apply_double_check_corrections(
     changed_segment_ids.into_iter().collect()
 }
 
-fn persist_corrected_translations(
+pub(crate) fn persist_corrected_translations(
     store: &JobStore,
     job_id: &str,
     config: &TranslationRunConfig,

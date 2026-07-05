@@ -1,6 +1,7 @@
 use crate::{
     CompletionRequest, LlmError, LlmProvider, PromptLibrary, PromptTemplate, QaIssue,
     QaSegmentReview, RequestMetadata, ResponseFormat, SegmentTranslation, TranslationRunConfig,
+    concurrency::PauseState,
 };
 use bookforge_core::{
     config::QaRunConfig,
@@ -94,6 +95,14 @@ where
         let chunk_for_error = chunk.clone();
 
         tasks.spawn(async move {
+            if let Some(signal) = config.pause_signal.as_ref()
+                && signal.wait_until_running_or_stopped().await == PauseState::Stopped
+            {
+                return chunk_for_error
+                    .iter()
+                    .map(|item| qa_error_review(item, "qa_stopped", "QA pass stopped"))
+                    .collect::<Vec<_>>();
+            }
             let Ok(_permit) = semaphore.acquire_owned().await else {
                 return chunk_for_error
                     .iter()
@@ -176,6 +185,8 @@ async fn request_qa_batch<P>(
 where
     P: LlmProvider,
 {
+    wait_for_qa_pause(config).await?;
+
     use crate::Substitutions;
 
     let prompt_items = items
@@ -283,6 +294,15 @@ where
     }
 
     Ok(reviews)
+}
+
+async fn wait_for_qa_pause(config: &TranslationRunConfig) -> Result<(), LlmError> {
+    if let Some(signal) = config.pause_signal.as_ref()
+        && signal.wait_until_running_or_stopped().await == PauseState::Stopped
+    {
+        return Err(LlmError::Provider("QA request stopped".to_string()));
+    }
+    Ok(())
 }
 
 fn chunk_qa_items(items: &[QaWorkItem], budget_tokens: usize) -> Vec<Vec<QaWorkItem>> {

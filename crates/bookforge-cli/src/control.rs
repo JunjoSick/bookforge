@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use bookforge_core::{
@@ -7,6 +7,9 @@ use bookforge_core::{
 };
 use bookforge_llm::{PauseSignal, PauseState};
 use bookforge_store::JobStore;
+use tokio_util::sync::CancellationToken;
+
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(crate) fn request_job_control(job_id: &str, command: ControlCommand) -> Result<PathBuf> {
     let path = control_path_for_job(job_id);
@@ -68,12 +71,27 @@ impl<'a> ControlFilePoller<'a> {
         }
     }
 
+    pub(crate) async fn wait_until_running_or_stopped(
+        &mut self,
+        signal: &PauseSignal,
+    ) -> Result<PauseState> {
+        loop {
+            self.poll(signal)?;
+            match signal.state() {
+                PauseState::Running => return Ok(PauseState::Running),
+                PauseState::Stopped => return Ok(PauseState::Stopped),
+                PauseState::Paused => tokio::time::sleep(CONTROL_POLL_INTERVAL).await,
+            }
+        }
+    }
+
     fn pause(&mut self, signal: &PauseSignal) -> Result<()> {
         if signal.state() == PauseState::Stopped {
             return Ok(());
         }
+        let already_paused = signal.state() == PauseState::Paused;
         signal.pause();
-        if self.last_state != PauseState::Paused {
+        if !already_paused && self.last_state != PauseState::Paused {
             self.store.mark_job_paused(&self.job_id)?;
             self.progress.emit(ProgressEvent::JobPaused {
                 job_id: self.job_id.clone(),
@@ -106,6 +124,69 @@ impl<'a> ControlFilePoller<'a> {
             self.last_state = PauseState::Stopped;
         }
         Ok(())
+    }
+}
+
+pub(crate) struct ControlFileWatcher {
+    cancel: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ControlFileWatcher {
+    pub(crate) fn spawn(
+        store_path: PathBuf,
+        job_id: impl Into<String>,
+        progress: Arc<dyn ProgressSink>,
+        signal: PauseSignal,
+    ) -> Self {
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let job_id = job_id.into();
+        let handle = tokio::spawn(async move {
+            loop {
+                {
+                    match JobStore::open(store_path.clone()) {
+                        Ok(store) => {
+                            let mut poller =
+                                ControlFilePoller::new(&store, job_id.clone(), progress.clone());
+                            if let Err(error) = poller.poll(&signal) {
+                                progress.emit(ProgressEvent::Error {
+                                    kind: "control_file_watcher".to_string(),
+                                    message: format!("failed to poll control file: {error}"),
+                                    timestamp_ms: now_ms(),
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            progress.emit(ProgressEvent::Error {
+                                kind: "control_file_watcher".to_string(),
+                                message: format!(
+                                    "failed to open job store for control watcher: {error}"
+                                ),
+                                timestamp_ms: now_ms(),
+                            });
+                        }
+                    }
+                }
+                tokio::select! {
+                    _ = task_cancel.cancelled() => break,
+                    _ = tokio::time::sleep(CONTROL_POLL_INTERVAL) => {}
+                }
+            }
+        });
+        Self { cancel, handle }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn shutdown(self) {
+        self.cancel.cancel();
+    }
+}
+
+impl Drop for ControlFileWatcher {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.handle.abort();
     }
 }
 

@@ -180,6 +180,48 @@ impl LlmProvider for MockProvider {
                 })
                 .collect::<Vec<_>>();
             serde_json::to_string(&json!({ "reviews": reviews }))?
+        } else if template == "double_check_batch" {
+            let force_fail = std::env::var("BOOKFORGE_MOCK_DOUBLE_CHECK_FAIL").is_ok();
+            let items = extract_batch_items(&request.user)
+                .into_iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?.to_string();
+                    let issues = if force_fail {
+                        vec![json!({
+                            "severity": "major",
+                            "kind": "mock_double_check",
+                            "message": "mock double-check requested correction",
+                            "source_excerpt": null,
+                            "translation_excerpt": null,
+                            "needs_correction": true,
+                        })]
+                    } else {
+                        Vec::new()
+                    };
+                    Some(json!({
+                        "id": id,
+                        "verdict": if force_fail { "fail" } else { "pass" },
+                        "issues": issues,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string(&json!({ "items": items }))?
+        } else if template == "correct_batch" {
+            let items = extract_json_array_after_label(&request.user, "Items:")
+                .into_iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?.to_string();
+                    let current = entry
+                        .get("current_translation")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    Some(json!({
+                        "id": id,
+                        "corrected_translation": format!("{current} [corrected]"),
+                    }))
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string(&json!({ "items": items }))?
         } else if template.starts_with("translate_batch_") {
             let items = extract_batch_items(&request.user)
                 .into_iter()
@@ -515,6 +557,36 @@ fn extract_batch_items(user_prompt: &str) -> Vec<serde_json::Value> {
             }
         })
         .unwrap_or_default()
+}
+
+fn extract_json_array_after_label(user_prompt: &str, label: &str) -> Vec<serde_json::Value> {
+    let Some(label_index) = user_prompt.find(label) else {
+        return Vec::new();
+    };
+    let after_label = &user_prompt[label_index + label.len()..];
+    let Some(start) = after_label.find('[') else {
+        return Vec::new();
+    };
+    let array_slice = &after_label[start..];
+    let mut depth = 0usize;
+    let mut end_index = None;
+    for (offset, ch) in array_slice.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    end_index = Some(offset + ch.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end_index else {
+        return Vec::new();
+    };
+    serde_json::from_str(&array_slice[..end]).unwrap_or_default()
 }
 
 /// Recover the plain-mode source segment from a rendered prompt by reading

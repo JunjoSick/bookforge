@@ -8,6 +8,7 @@ use std::{
 use anyhow::Result;
 use bookforge_core::{
     ControlCommand, ProgressEvent, ProgressSink, ResolvedRunSettings, RunConfigSnapshot,
+    config::DoubleCheckMode,
     merge_scope_terms,
     progress::now_ms,
     segment::{
@@ -20,7 +21,7 @@ use bookforge_epub::{read_epub, rebuild_epub_with_options};
 use bookforge_llm::{
     ContextRegistry, ContextRunConfig, EntityRunConfig, GlossaryRunConfig, MockProvider,
     OpenAiCompatibleConfig, OpenAiCompatibleProvider, QaSegmentReview, SegmentTranslation,
-    StyleRunConfig, TranslationRunConfig,
+    StyleRunConfig, TranslationRunConfig, run_double_check,
 };
 use bookforge_store::{JobRecord, JobStore, StoredBlockTranslation};
 use clap::Args;
@@ -35,7 +36,8 @@ use crate::{
 };
 
 use super::translate::{
-    CacheContext, CheckpointRunContext, apply_cached_translations, job_was_stopped, mock_mode,
+    CacheContext, CheckpointRunContext, ProgressRequestProvider, apply_cached_translations,
+    apply_double_check_corrections, job_was_stopped, mock_mode, persist_corrected_translations,
     print_stopped_resume_hint, qa_reviews_for_mode, run_checkpointed_translation,
 };
 
@@ -311,6 +313,13 @@ async fn run_inner(
     } else {
         None
     };
+    let pause_signal = bookforge_llm::PauseSignal::new();
+    let _control_watcher = crate::control::ControlFileWatcher::spawn(
+        store.path().to_path_buf(),
+        job.id.clone(),
+        progress.clone(),
+        pause_signal.clone(),
+    );
     let run_config = TranslationRunConfig {
         source_language: snapshot.source_language.clone(),
         target_language: snapshot.target_language.clone(),
@@ -329,7 +338,7 @@ async fn run_inner(
         context_registry: context_registry.clone(),
         style: style_run_config_from_snapshot(snapshot),
         entities: entities_run_config_from_snapshot(snapshot),
-        pause_signal: None,
+        pause_signal: Some(pause_signal.clone()),
     };
 
     let cache_namespace = if legacy_cache_namespace {
@@ -457,9 +466,21 @@ async fn run_inner(
     cached_translations.sort_by_key(|translation| translation.ordinal);
     mark_job_from_summary(&store, &job.id)?;
 
-    let stored_blocks = store.load_block_translations(&job.id)?;
+    let mut stored_blocks = store.load_block_translations(&job.id)?;
     let segment_records = store.segment_records(&job.id)?;
-    let translations = rebuild_segment_translations(&segments, &stored_blocks, &segment_records);
+    let mut translations =
+        rebuild_segment_translations(&segments, &stored_blocks, &segment_records);
+    let mut control_poller =
+        crate::control::ControlFilePoller::new(&store, &job.id, progress.clone());
+    if matches!(
+        control_poller
+            .wait_until_running_or_stopped(&pause_signal)
+            .await?,
+        bookforge_llm::PauseState::Stopped
+    ) {
+        print_stopped_resume_hint(&job.id, print_stdout);
+        return Ok(());
+    }
     let qa_reviews = qa_after_resume(
         &job,
         &segments,
@@ -470,8 +491,53 @@ async fn run_inner(
         args.qa,
     )
     .await?;
-    let block_translations =
-        rebuild_block_translations(&segments, &stored_blocks, &cached_translations);
+    if matches!(
+        control_poller
+            .wait_until_running_or_stopped(&pause_signal)
+            .await?,
+        bookforge_llm::PauseState::Stopped
+    ) {
+        print_stopped_resume_hint(&job.id, print_stdout);
+        return Ok(());
+    }
+    if settings.double_check.mode != DoubleCheckMode::Off {
+        let changed_segment_ids = match double_check_after_resume(
+            &job,
+            &segments,
+            &mut translations,
+            &run_config,
+            snapshot,
+            &settings,
+            progress.clone(),
+        )
+        .await
+        {
+            Ok(changed_segment_ids) => changed_segment_ids,
+            Err(_) if pause_signal.is_stopped() => {
+                print_stopped_resume_hint(&job.id, print_stdout);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        persist_corrected_translations(
+            &store,
+            &job.id,
+            &run_config,
+            &translations,
+            &changed_segment_ids,
+        )?;
+        stored_blocks = store.load_block_translations(&job.id)?;
+        if matches!(
+            control_poller
+                .wait_until_running_or_stopped(&pause_signal)
+                .await?,
+            bookforge_llm::PauseState::Stopped
+        ) {
+            print_stopped_resume_hint(&job.id, print_stdout);
+            return Ok(());
+        }
+    }
+    let block_translations = rebuild_block_translations(&segments, &stored_blocks, &translations);
     let rebuild_options = super::translate::rebuild_options_from_snapshot(snapshot);
     rebuild_epub_with_options(&book, &block_translations, &output, &rebuild_options)?;
 
@@ -815,6 +881,68 @@ async fn qa_after_resume(
         }
         _ => Ok(Vec::new()),
     }
+}
+
+async fn double_check_after_resume(
+    job: &JobRecord,
+    segments: &[Segment],
+    translations: &mut [SegmentTranslation],
+    config: &TranslationRunConfig,
+    snapshot: &RunConfigSnapshot,
+    settings: &ResolvedRunSettings,
+    progress: Arc<dyn ProgressSink>,
+) -> Result<Vec<String>> {
+    let double_check = &settings.double_check;
+    let provider_name = double_check
+        .provider
+        .as_deref()
+        .unwrap_or(&snapshot.provider);
+    let model = double_check.model.as_deref().unwrap_or(&snapshot.model);
+    let base_url = double_check
+        .base_url
+        .as_deref()
+        .or(snapshot.base_url.as_deref());
+    let api_key_env = double_check
+        .api_key_env
+        .as_deref()
+        .or(snapshot.api_key_env.as_deref());
+
+    let corrections = match provider_name {
+        "mock" => {
+            let provider = MockProvider::new(mock_mode(model), &job.target_lang);
+            run_double_check(
+                ProgressRequestProvider::new(provider, progress),
+                segments,
+                translations,
+                config,
+                double_check,
+            )
+            .await
+        }
+        "deepseek" | "openrouter" | "openai-compatible" => {
+            let provider_config = openai_compatible_config_from_parts(
+                provider_name,
+                model,
+                base_url,
+                api_key_env,
+                &job.id,
+                settings,
+            )?;
+            let provider = OpenAiCompatibleProvider::new(provider_config)?;
+            run_double_check(
+                ProgressRequestProvider::new(provider, progress),
+                segments,
+                translations,
+                config,
+                double_check,
+            )
+            .await
+        }
+        _ => return Ok(Vec::new()),
+    }
+    .map_err(|error| anyhow::anyhow!("double-check failed: {error}"))?;
+
+    Ok(apply_double_check_corrections(translations, &corrections))
 }
 
 fn rebuild_block_translations(
