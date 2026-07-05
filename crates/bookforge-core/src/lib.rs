@@ -1,4 +1,5 @@
 pub mod config;
+pub mod control;
 pub mod entity;
 pub mod error;
 pub mod glossary;
@@ -17,6 +18,10 @@ pub use config::{
     ProviderPresetResolved, ProviderPresetRuntimeOverrides, ProviderRequestMetric,
     ProviderRuntimeConfig, QaRunConfig, ResolvedRunSettings, RetryAfterPolicy, SegmentationConfig,
     TranslationConfig, TranslationProfile, cap_output_tokens,
+};
+pub use control::{
+    ControlCommand, clear_control_file, control_path_for_job, parse_control_command,
+    read_control_file, run_dir_for_job, write_control_file,
 };
 pub use entity::{
     Entity, EntityGender, entities_fingerprint, merge_scope_entities, render_entity_agreement_block,

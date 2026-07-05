@@ -17,6 +17,7 @@ use crate::{
     CompletionRequest, FinishReason, LlmError, LlmProvider, PromptLibrary, ProviderRateController,
     RequestMetadata, RequestStatus, ResponseFormat, SegmentTranslation, Substitutions,
     TelemetryLog, TranslationRunConfig,
+    concurrency::{PauseSignal, PauseState},
 };
 
 struct BatchWorkerOutput {
@@ -1365,14 +1366,49 @@ pub async fn translate_batches_with_callback<P, F>(
     config: &TranslationRunConfig,
     telemetry: Arc<TelemetryLog>,
     rate_controller: Option<Arc<ProviderRateController>>,
-    mut batch_sizer: Option<&mut BatchSizer>,
+    batch_sizer: Option<&mut BatchSizer>,
     progress: Arc<dyn bookforge_core::ProgressSink>,
     finalized_tx: Option<mpsc::Sender<SegmentTranslation>>,
-    mut on_segment: F,
+    on_segment: F,
 ) -> Result<Vec<SegmentTranslation>, LlmError>
 where
     P: LlmProvider,
     F: FnMut(&SegmentTranslation) -> Result<(), LlmError>,
+{
+    translate_batches_with_control(
+        provider,
+        batches,
+        segments,
+        config,
+        telemetry,
+        rate_controller,
+        batch_sizer,
+        progress,
+        finalized_tx,
+        on_segment,
+        |_| Ok(()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn translate_batches_with_control<P, F, C>(
+    provider: P,
+    batches: Vec<TranslationBatch>,
+    segments: &[Segment],
+    config: &TranslationRunConfig,
+    telemetry: Arc<TelemetryLog>,
+    rate_controller: Option<Arc<ProviderRateController>>,
+    mut batch_sizer: Option<&mut BatchSizer>,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
+    finalized_tx: Option<mpsc::Sender<SegmentTranslation>>,
+    mut on_segment: F,
+    mut on_control_boundary: C,
+) -> Result<Vec<SegmentTranslation>, LlmError>
+where
+    P: LlmProvider,
+    F: FnMut(&SegmentTranslation) -> Result<(), LlmError>,
+    C: FnMut(&PauseSignal) -> Result<(), LlmError>,
 {
     let library = Arc::new(PromptLibrary::global().clone());
     let provider = Arc::new(provider);
@@ -1395,6 +1431,7 @@ where
     );
     let config = Arc::new(config.clone());
     let concurrency = config.scheduler.concurrency.max(1);
+    let pause_signal = config.pause_signal.clone();
     let request_semaphore = Arc::new(Semaphore::new(concurrency));
 
     let all_items: HashMap<String, TranslationBatchItem> = batches
@@ -1423,9 +1460,10 @@ where
     let max_rounds = 3usize;
     let mut single_invalid_attempts: HashMap<String, usize> = HashMap::new();
     let mut transient_attempts: HashMap<String, usize> = HashMap::new();
+    let mut stop_dispatch = false;
 
     for _round in 0..max_rounds {
-        if pending.is_empty() {
+        if pending.is_empty() || stop_dispatch {
             break;
         }
 
@@ -1436,8 +1474,32 @@ where
         let mut pending_queue: VecDeque<TranslationBatch> = pending.drain(..).collect();
         let mut tasks = JoinSet::<BatchWorkerOutput>::new();
 
-        while !pending_queue.is_empty() || !tasks.is_empty() {
-            while let Some(batch) = pending_queue.pop_front() {
+        while (!pending_queue.is_empty() && !stop_dispatch) || !tasks.is_empty() {
+            while !pending_queue.is_empty() && !stop_dispatch {
+                if let Some(signal) = pause_signal.as_ref() {
+                    on_control_boundary(signal)?;
+                    match signal.state() {
+                        PauseState::Running => {}
+                        PauseState::Stopped => {
+                            stop_dispatch = true;
+                            break;
+                        }
+                        PauseState::Paused if tasks.is_empty() => {
+                            if wait_for_batch_resume_or_stop(signal, &mut on_control_boundary)
+                                .await?
+                                == PauseState::Stopped
+                            {
+                                stop_dispatch = true;
+                                break;
+                            }
+                        }
+                        PauseState::Paused => break,
+                    }
+                }
+
+                let Some(batch) = pending_queue.pop_front() else {
+                    break;
+                };
                 let mut normalized = normalize_batch_for_current_sizer(
                     batch,
                     batch_sizer.as_deref(),
@@ -1878,6 +1940,9 @@ where
                     });
                 }
             }
+        }
+        if stop_dispatch {
+            break;
         }
         pending = pending_queue.into();
     }
@@ -2325,6 +2390,23 @@ where
     }
 
     Ok(translations)
+}
+
+async fn wait_for_batch_resume_or_stop<C>(
+    signal: &PauseSignal,
+    on_control_boundary: &mut C,
+) -> Result<PauseState, LlmError>
+where
+    C: FnMut(&PauseSignal) -> Result<(), LlmError>,
+{
+    loop {
+        on_control_boundary(signal)?;
+        match signal.state() {
+            PauseState::Running => return Ok(PauseState::Running),
+            PauseState::Stopped => return Ok(PauseState::Stopped),
+            PauseState::Paused => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
 }
 
 fn batch_max_output_tokens(
@@ -3756,6 +3838,7 @@ mod tests {
             context_registry: None,
             style: None,
             entities: None,
+            pause_signal: None,
         }
     }
 

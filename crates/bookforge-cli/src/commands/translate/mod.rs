@@ -22,7 +22,8 @@ use bookforge_llm::{
     SegmentTranslation, StyleRunConfig, TelemetryLog, TranslationRunConfig,
     account_for_batch_prompt_overhead, build_translation_batches, qa_segments_parallel,
     run_double_check, telemetry_summary, translate_batches_with_callback,
-    translate_segments_with_callback,
+    translate_batches_with_control, translate_segments_with_callback,
+    translate_segments_with_control,
 };
 use bookforge_store::{CreateJob, JobRecord, JobStore, SaveTranslation};
 use clap::Args;
@@ -514,6 +515,7 @@ async fn run_mock_translation(
     if human_stdout_enabled(cli_args.ui) {
         println!("Job: {}", job.id);
     }
+    crate::control::clear_job_control(&job.id)?;
     progress.emit(bookforge_core::ProgressEvent::JobCreated {
         job_id: job.id.clone(),
         input_path: input.display().to_string(),
@@ -585,6 +587,7 @@ async fn run_mock_translation(
         context_registry: context_registry.clone(),
         style: style.run_config.clone(),
         entities: entities.run_config.clone(),
+        pause_signal: None,
     }; // mock
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     let mut translations = apply_cached_translations(
@@ -623,6 +626,10 @@ async fn run_mock_translation(
         false,
     )
     .await?;
+    if job_was_stopped(&store, &job.id)? {
+        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+        return Ok(());
+    }
     translations.extend(fresh_translations);
     translations.sort_by_key(|translation| translation.ordinal);
     let qa_reviews = qa_reviews_for_mode(
@@ -805,6 +812,7 @@ async fn run_openai_compatible_translation(
     if human_stdout_enabled(cli_args.ui) {
         println!("Job: {}", job.id);
     }
+    crate::control::clear_job_control(&job.id)?;
     progress.emit(bookforge_core::ProgressEvent::JobCreated {
         job_id: job.id.clone(),
         input_path: input.display().to_string(),
@@ -876,6 +884,7 @@ async fn run_openai_compatible_translation(
         context_registry: context_registry.clone(),
         style: style.run_config.clone(),
         entities: entities.run_config.clone(),
+        pause_signal: None,
     };
     let mut translations = apply_cached_translations(
         &segments,
@@ -915,6 +924,10 @@ async fn run_openai_compatible_translation(
         settings.batch.enabled,
     )
     .await?;
+    if job_was_stopped(&store, &job.id)? {
+        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
+        return Ok(());
+    }
     translations.extend(fresh_translations);
 
     finish_translation_pipeline(
@@ -1113,6 +1126,7 @@ pub(crate) async fn translate_and_checkpoint_batch<P>(
     settings: &ResolvedRunSettings,
     checkpoint: CheckpointContext<'_>,
     progress: Arc<dyn bookforge_core::ProgressSink>,
+    mut control: Option<&mut crate::control::ControlFilePoller<'_>>,
 ) -> Result<Vec<SegmentTranslation>>
 where
     P: LlmProvider,
@@ -1124,7 +1138,7 @@ where
     );
 
     if batches.is_empty() {
-        return translate_and_checkpoint(provider, segments, config, checkpoint).await;
+        return translate_and_checkpoint(provider, segments, config, checkpoint, control).await;
     }
 
     eprintln!("Batches: {}", batches.len());
@@ -1184,19 +1198,43 @@ where
         })
     };
 
-    let batch_result = translate_batches_with_callback(
-        provider,
-        batches,
-        segments,
-        config,
-        telemetry.clone(),
-        rate_controller,
-        batch_sizer.as_mut(),
-        progress.clone(),
-        Some(finalized_tx),
-        |_| Ok(()),
-    )
-    .await;
+    let batch_result = match control.as_mut() {
+        Some(control) => {
+            translate_batches_with_control(
+                provider,
+                batches,
+                segments,
+                config,
+                telemetry.clone(),
+                rate_controller,
+                batch_sizer.as_mut(),
+                progress.clone(),
+                Some(finalized_tx),
+                |_| Ok(()),
+                |signal| {
+                    control
+                        .poll(signal)
+                        .map_err(|err| bookforge_llm::LlmError::Provider(err.to_string()))
+                },
+            )
+            .await
+        }
+        None => {
+            translate_batches_with_callback(
+                provider,
+                batches,
+                segments,
+                config,
+                telemetry.clone(),
+                rate_controller,
+                batch_sizer.as_mut(),
+                progress.clone(),
+                Some(finalized_tx),
+                |_| Ok(()),
+            )
+            .await
+        }
+    };
 
     let checkpoint_result = checkpoint_handle.await;
 
@@ -1337,6 +1375,7 @@ async fn run_fallback_pass(
         context_registry: primary_run_config.context_registry.clone(),
         style: primary_run_config.style.clone(),
         entities: primary_run_config.entities.clone(),
+        pause_signal: primary_run_config.pause_signal.clone(),
     }; // fallback_run_config
 
     let writer = CheckpointWriter::spawn(store.path().to_path_buf(), Arc::new(NullProgressSink));
@@ -1351,7 +1390,7 @@ async fn run_fallback_pass(
     };
 
     let translation_result =
-        translate_and_checkpoint(fallback, &candidates, &run_config, checkpoint).await;
+        translate_and_checkpoint(fallback, &candidates, &run_config, checkpoint, None).await;
     let fresh = finalize_writer(translation_result, sender, writer).await?;
 
     for ft in &fresh {
@@ -1567,6 +1606,7 @@ pub(crate) async fn translate_and_checkpoint<P>(
     segments: &[Segment],
     config: &TranslationRunConfig,
     checkpoint: CheckpointContext<'_>,
+    mut control: Option<&mut crate::control::ControlFilePoller<'_>>,
 ) -> Result<Vec<SegmentTranslation>>
 where
     P: LlmProvider,
@@ -1600,14 +1640,33 @@ where
         })
     };
 
-    let translations = translate_segments_with_callback(
-        provider,
-        segments,
-        config,
-        |_| Ok(()),
-        Some(finalized_tx),
-    )
-    .await;
+    let translations = match control.as_mut() {
+        Some(control) => {
+            translate_segments_with_control(
+                provider,
+                segments,
+                config,
+                |_| Ok(()),
+                Some(finalized_tx),
+                |signal| {
+                    control
+                        .poll(signal)
+                        .map_err(|err| bookforge_llm::LlmError::Provider(err.to_string()))
+                },
+            )
+            .await
+        }
+        None => {
+            translate_segments_with_callback(
+                provider,
+                segments,
+                config,
+                |_| Ok(()),
+                Some(finalized_tx),
+            )
+            .await
+        }
+    };
 
     // Drop finalized_tx so the checkpoint task exits
     // (finalized_tx was moved into translate_segments_with_callback)
@@ -1837,6 +1896,19 @@ pub(crate) fn mark_job_finished(
     }
     store.mark_job_complete(job_id)?;
     Ok(())
+}
+
+pub(crate) fn job_was_stopped(store: &JobStore, job_id: &str) -> Result<bool> {
+    Ok(store
+        .get_job(job_id)?
+        .is_some_and(|job| job.status == "stopped"))
+}
+
+pub(crate) fn print_stopped_resume_hint(job_id: &str, print_stdout: bool) {
+    if print_stdout {
+        println!("Stopped. Progress has been saved to job: {job_id}");
+        println!("Resume with: bookforge resume {job_id}");
+    }
 }
 
 #[derive(Debug, Args)]
@@ -2086,6 +2158,7 @@ mod tests {
             context_registry: None,
             style: None,
             entities: None,
+            pause_signal: None,
         };
 
         let error = translate_with_scheduler_guard(

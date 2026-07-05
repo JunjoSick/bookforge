@@ -466,6 +466,7 @@ mod tests {
             context_registry: None,
             style: None,
             entities: None,
+            pause_signal: None,
         }
     }
 

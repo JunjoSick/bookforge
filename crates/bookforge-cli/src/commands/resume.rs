@@ -6,7 +6,8 @@ use std::{
 
 use anyhow::Result;
 use bookforge_core::{
-    ProgressEvent, ProgressSink, ResolvedRunSettings, RunConfigSnapshot, merge_scope_terms,
+    ControlCommand, ProgressEvent, ProgressSink, ResolvedRunSettings, RunConfigSnapshot,
+    merge_scope_terms,
     progress::now_ms,
     segment::{
         BlockTranslation, Segment, SegmentStatus, build_segments, compute_cache_namespace,
@@ -30,8 +31,8 @@ use crate::{
 };
 
 use super::translate::{
-    CacheContext, CheckpointRunContext, apply_cached_translations, mock_mode, qa_reviews_for_mode,
-    run_checkpointed_translation,
+    CacheContext, CheckpointRunContext, apply_cached_translations, job_was_stopped, mock_mode,
+    print_stopped_resume_hint, qa_reviews_for_mode, run_checkpointed_translation,
 };
 
 #[derive(Debug, Args)]
@@ -77,6 +78,14 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
     let Some(job) = store.get_job(&args.job_id)? else {
         anyhow::bail!("job '{}' was not found", args.job_id);
     };
+    if job.status == "paused" {
+        let path = crate::control::request_job_control(&args.job_id, ControlCommand::Resume)?;
+        if human_stdout_enabled(args.ui) {
+            println!("resume requested for {} ({})", args.job_id, path.display());
+        }
+        return Ok(());
+    }
+    crate::control::clear_job_control(&args.job_id)?;
     let mut snapshot = load_resume_snapshot(&store, &args.job_id)?;
 
     let progress_jsonl = args
@@ -268,6 +277,7 @@ async fn run_inner(
         context_registry: context_registry.clone(),
         style: style_run_config_from_snapshot(snapshot),
         entities: entities_run_config_from_snapshot(snapshot),
+        pause_signal: None,
     };
 
     let cache_namespace = if legacy_cache_namespace {
@@ -386,6 +396,10 @@ async fn run_inner(
             provider => anyhow::bail!("cannot resume unsupported provider '{provider}'"),
         }?
     };
+    if job_was_stopped(&store, &job.id)? {
+        print_stopped_resume_hint(&job.id, print_stdout);
+        return Ok(());
+    }
 
     cached_translations.extend(fresh_translations);
     cached_translations.sort_by_key(|translation| translation.ordinal);

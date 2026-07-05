@@ -137,6 +137,12 @@ impl MockProvider {
 impl LlmProvider for MockProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let started = Instant::now();
+        if let Some(delay_ms) = std::env::var("BOOKFORGE_MOCK_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
 
         if self.mode == MockMode::MalformedJson {
             return Ok(CompletionResponse {
@@ -1088,7 +1094,11 @@ mod tests {
         let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let request_count_clone = request_count.clone();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
         let addr = listener.local_addr().unwrap();
         let port = addr.port();
 

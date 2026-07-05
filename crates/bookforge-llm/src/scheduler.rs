@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bookforge_core::{
     config::{ContextScope, TranslationProfile},
@@ -10,12 +11,10 @@ use bookforge_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{
-    sync::{Semaphore, mpsc},
-    task::JoinSet,
-};
+use tokio::{sync::mpsc, task::JoinSet};
 
 use crate::{
+    concurrency::{PauseSignal, PauseState},
     prompt::{PromptLibrary, PromptTemplate, Substitutions},
     provider::{
         CompletionRequest, FinishReason, LlmError, LlmProvider, RequestMetadata, ResponseFormat,
@@ -54,6 +53,8 @@ pub struct TranslationRunConfig {
     /// substitutes `rendered_block` into the `{{entity_agreement_block}}`
     /// placeholder. `None` = no entities active; renders to empty string.
     pub entities: Option<EntityRunConfig>,
+    /// Cooperative control signal checked before dispatching each new segment.
+    pub pause_signal: Option<PauseSignal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,6 +505,30 @@ where
     P: LlmProvider,
     F: FnMut(&SegmentTranslation) -> Result<()>,
 {
+    translate_segments_with_control(
+        provider,
+        segments,
+        config,
+        &mut on_translation,
+        finalized_tx,
+        |_| Ok(()),
+    )
+    .await
+}
+
+pub async fn translate_segments_with_control<P, F, B>(
+    provider: P,
+    segments: &[Segment],
+    config: &TranslationRunConfig,
+    mut on_translation: F,
+    finalized_tx: Option<mpsc::Sender<SegmentTranslation>>,
+    mut on_control_boundary: B,
+) -> Result<Vec<SegmentTranslation>>
+where
+    P: LlmProvider,
+    F: FnMut(&SegmentTranslation) -> Result<()>,
+    B: FnMut(&PauseSignal) -> Result<()>,
+{
     if config.scheduler.concurrency == 0 {
         return Err(LlmError::Provider(
             "scheduler concurrency must be greater than zero".to_string(),
@@ -513,56 +538,74 @@ where
     let library = Arc::new(PromptLibrary::global().clone());
     let provider = Arc::new(provider);
     let config = Arc::new(config.clone());
-    let semaphore = Arc::new(Semaphore::new(config.scheduler.concurrency));
+    let concurrency = config.scheduler.concurrency;
+    let pause_signal = config.pause_signal.clone();
+    let mut dispatch_segments = segments.to_vec();
+    dispatch_segments.sort_by_key(|segment| segment.ordinal);
     let mut tasks = JoinSet::new();
-
-    for segment in segments {
-        let segment = segment.clone();
-        let provider = provider.clone();
-        let config = config.clone();
-        let library = library.clone();
-        let semaphore = semaphore.clone();
-
-        tasks.spawn(async move {
-            let mode = select_mode(&segment);
-            // Strict mode must wait for predecessors BEFORE taking a permit,
-            // otherwise waiters occupy the whole pool and deadlock. Best-
-            // effort mode snapshots AFTER taking a permit so predecessors
-            // have had as long as possible to finish.
-            let strict_context_pairs = if config.context.strict {
-                Some(context_pairs_for_segment(&segment, &config).await)
-            } else {
-                None
-            };
-            let Ok(_permit) = semaphore.acquire_owned().await else {
-                let failed = failed_translation_with_tokens(
-                    &segment,
-                    mode,
-                    "scheduler semaphore closed before segment could run".to_string(),
-                    None,
-                    None,
-                    None,
-                );
-                if let Some(registry) = config.context_registry.as_deref() {
-                    registry.pre_populate(&segment, &failed);
-                }
-                return failed;
-            };
-            let context_pairs = match strict_context_pairs {
-                Some(pairs) => pairs,
-                None => context_pairs_for_segment(&segment, &config).await,
-            };
-            let translation =
-                translate_one(provider, library, segment.clone(), &config, context_pairs).await;
-            if let Some(registry) = config.context_registry.as_deref() {
-                registry.pre_populate(&segment, &translation);
-            }
-            translation
-        });
-    }
+    let mut next_index = 0usize;
+    let mut stop_dispatch = false;
 
     let mut translations = Vec::with_capacity(segments.len());
-    while let Some(result) = tasks.join_next().await {
+    loop {
+        while !stop_dispatch && next_index < dispatch_segments.len() && tasks.len() < concurrency {
+            if let Some(signal) = pause_signal.as_ref() {
+                on_control_boundary(signal)?;
+                match signal.state() {
+                    PauseState::Running => {}
+                    PauseState::Stopped => {
+                        stop_dispatch = true;
+                        break;
+                    }
+                    PauseState::Paused if tasks.is_empty() => {
+                        if wait_for_resume_or_stop(signal, &mut on_control_boundary).await?
+                            == PauseState::Stopped
+                        {
+                            stop_dispatch = true;
+                            break;
+                        }
+                    }
+                    PauseState::Paused => break,
+                }
+            }
+
+            let segment = dispatch_segments[next_index].clone();
+            next_index += 1;
+            let provider = provider.clone();
+            let config = config.clone();
+            let library = library.clone();
+
+            tasks.spawn(async move {
+                // Strict mode waits for predecessors before the provider call.
+                // Bounded dispatch keeps waiters from flooding the executor.
+                let strict_context_pairs = if config.context.strict {
+                    Some(context_pairs_for_segment(&segment, &config).await)
+                } else {
+                    None
+                };
+                let context_pairs = match strict_context_pairs {
+                    Some(pairs) => pairs,
+                    None => context_pairs_for_segment(&segment, &config).await,
+                };
+                let translation =
+                    translate_one(provider, library, segment.clone(), &config, context_pairs).await;
+                if let Some(registry) = config.context_registry.as_deref() {
+                    registry.pre_populate(&segment, &translation);
+                }
+                translation
+            });
+        }
+
+        if tasks.is_empty() {
+            if stop_dispatch || next_index >= dispatch_segments.len() {
+                break;
+            }
+            continue;
+        }
+
+        let Some(result) = tasks.join_next().await else {
+            continue;
+        };
         let translation = result.map_err(|err| LlmError::Provider(err.to_string()))?;
         if let Some(ref tx) = finalized_tx {
             tx.send(translation.clone())
@@ -575,6 +618,23 @@ where
 
     translations.sort_by_key(|translation| translation.ordinal);
     Ok(translations)
+}
+
+async fn wait_for_resume_or_stop<B>(
+    signal: &PauseSignal,
+    on_control_boundary: &mut B,
+) -> Result<PauseState>
+where
+    B: FnMut(&PauseSignal) -> Result<()>,
+{
+    loop {
+        on_control_boundary(signal)?;
+        match signal.state() {
+            PauseState::Running => return Ok(PauseState::Running),
+            PauseState::Stopped => return Ok(PauseState::Stopped),
+            PauseState::Paused => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
 }
 
 pub async fn qa_segments<P>(
@@ -1598,6 +1658,12 @@ fn source_fallback_blocks(segment: &Segment) -> Vec<BlockTranslation> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
     use bookforge_core::{
         ir::SectionId,
         segment::{
@@ -1927,6 +1993,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_signal_gates_new_segment_dispatch() {
+        let segments = vec![
+            segment("seg_a", 0, vec![("b0", "First")]),
+            segment("seg_b", 1, vec![("b0", "Second")]),
+        ];
+        let mut cfg = config();
+        cfg.scheduler.concurrency = 1;
+        let signal = PauseSignal::new();
+        cfg.pause_signal = Some(signal.clone());
+        let provider = BlockingProvider::new();
+        let started = provider.started.clone();
+        let release = provider.release.clone();
+        let paused_once = Arc::new(AtomicBool::new(false));
+        let pause_for_callback = paused_once.clone();
+        let started_for_callback = started.clone();
+
+        let run = tokio::spawn(async move {
+            translate_segments_with_control(
+                provider,
+                &segments,
+                &cfg,
+                |_| Ok(()),
+                None,
+                |signal| {
+                    if started_for_callback.load(Ordering::Acquire) >= 1
+                        && !pause_for_callback.swap(true, Ordering::AcqRel)
+                    {
+                        signal.pause();
+                    }
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        wait_for_request_count(&started, 1).await;
+        release.notify_waiters();
+        wait_for_pause(&signal).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            started.load(Ordering::Acquire),
+            1,
+            "second segment must not dispatch while paused"
+        );
+
+        signal.resume();
+        let translations = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("paused run should resume")
+            .expect("scheduler task should not panic")
+            .expect("scheduler should succeed");
+        assert_eq!(translations.len(), 2);
+        assert_eq!(started.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
     async fn finalized_channel_close_is_run_error() {
         let segments = vec![segment("seg_a", 0, vec![("b0", "First")])];
         let (tx, rx) = mpsc::channel::<SegmentTranslation>(1);
@@ -2094,6 +2216,7 @@ mod tests {
             context_registry: None,
             style: None,
             entities: None,
+            pause_signal: None,
         }
     }
 
@@ -2161,6 +2284,70 @@ mod tests {
                 supports_usage_tokens: false,
             }
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct BlockingProvider {
+        started: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl BlockingProvider {
+        fn new() -> Self {
+            Self {
+                started: Arc::new(AtomicUsize::new(0)),
+                release: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
+
+    impl LlmProvider for BlockingProvider {
+        async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+            let count = self.started.fetch_add(1, Ordering::AcqRel);
+            if count == 0 {
+                self.release.notified().await;
+            }
+            Ok(CompletionResponse {
+                content: serde_json::json!({
+                    "segment_id": request.metadata.segment_id.unwrap_or_default(),
+                    "translation": "Tradotto"
+                })
+                .to_string(),
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(1),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 0,
+                raw: serde_json::json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    async fn wait_for_request_count(started: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while started.load(Ordering::Acquire) < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("request count should be reached");
+    }
+
+    async fn wait_for_pause(signal: &PauseSignal) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while signal.state() != PauseState::Paused {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("signal should pause");
     }
 
     #[derive(Debug, Clone)]

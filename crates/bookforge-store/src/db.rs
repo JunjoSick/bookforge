@@ -618,7 +618,7 @@ impl JobStore {
                 ],
             )?;
         }
-        self.touch_job(request.job_id, "running")?;
+        self.touch_job_unless_status(request.job_id, "running", &["paused", "stopped"])?;
         Ok(())
     }
 
@@ -669,7 +669,7 @@ impl JobStore {
                 ],
             )?;
         }
-        self.touch_job(request.job_id, "needs_review")?;
+        self.touch_job_unless_status(request.job_id, "needs_review", &["paused", "stopped"])?;
         Ok(())
     }
 
@@ -706,7 +706,7 @@ impl JobStore {
                 params![translated_hash, request.job_id, request.segment_id],
             )?;
         }
-        self.touch_job(request.job_id, "running")?;
+        self.touch_job_unless_status(request.job_id, "running", &["paused", "stopped"])?;
         Ok(())
     }
 
@@ -716,6 +716,14 @@ impl JobStore {
 
     pub fn mark_job_running(&self, job_id: &str) -> Result<()> {
         self.touch_job(job_id, "running")
+    }
+
+    pub fn mark_job_paused(&self, job_id: &str) -> Result<()> {
+        self.touch_job(job_id, "paused")
+    }
+
+    pub fn mark_job_stopped(&self, job_id: &str) -> Result<()> {
+        self.touch_job(job_id, "stopped")
     }
 
     pub fn mark_job_succeeded(&self, job_id: &str) -> Result<()> {
@@ -2331,6 +2339,30 @@ impl JobStore {
         )?;
         Ok(())
     }
+
+    fn touch_job_unless_status(
+        &self,
+        job_id: &str,
+        status: &str,
+        protected_statuses: &[&str],
+    ) -> Result<()> {
+        let current = {
+            let conn = self.conn.borrow();
+            conn.query_row(
+                "SELECT status FROM jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        };
+        if current
+            .as_deref()
+            .is_some_and(|current| protected_statuses.contains(&current))
+        {
+            return Ok(());
+        }
+        self.touch_job(job_id, status)
+    }
 }
 
 fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
@@ -2662,6 +2694,64 @@ mod tests {
             .expect("block translations should load");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].text, "Tradotto");
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn job_status_allows_pause_resume_and_stop() {
+        let db_path = temp_path("pause_status.sqlite");
+        let input_path = temp_path("pause_input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("pause_output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job should be created");
+
+        store.mark_job_running(&job.id).unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "running");
+        store.mark_job_paused(&job.id).unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "paused");
+        let segments = vec![segment("seg_pause", 0)];
+        store
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "test_ns")
+            .unwrap();
+        store
+            .save_translation(SaveTranslation {
+                job_id: &job.id,
+                segment_id: "seg_pause",
+                translated_text: "Tradotto",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "Tradotto".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(1),
+                tokens_estimated: false,
+            })
+            .unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "paused");
+        store.mark_job_running(&job.id).unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "running");
+        store.mark_job_stopped(&job.id).unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "stopped");
 
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(input_path);

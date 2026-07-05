@@ -27,6 +27,14 @@ pub enum ProgressEvent {
         output_path: String,
         timestamp_ms: u64,
     },
+    JobPaused {
+        job_id: String,
+        timestamp_ms: u64,
+    },
+    JobResumed {
+        job_id: String,
+        timestamp_ms: u64,
+    },
     StageStarted {
         stage: String,
         timestamp_ms: u64,
@@ -189,6 +197,8 @@ pub fn event_timestamp_ms(event: &ProgressEvent) -> u64 {
     use ProgressEvent::*;
     match event {
         JobCreated { timestamp_ms, .. }
+        | JobPaused { timestamp_ms, .. }
+        | JobResumed { timestamp_ms, .. }
         | StageStarted { timestamp_ms, .. }
         | StageFinished { timestamp_ms, .. }
         | RuntimeConfigResolved { timestamp_ms, .. }
@@ -274,6 +284,7 @@ pub struct RunState {
     // Terminal summary.
     pub finished: bool,
     pub finished_elapsed_ms: Option<u64>,
+    pub paused: bool,
 
     // Bounded log surfaces for the TUI / web panels. The full ring is kept in
     // memory for in-process renderers (TUI/indicatif read it directly), but only
@@ -317,6 +328,14 @@ impl RunState {
                 self.job_id = Some(job_id.clone());
                 self.input_path = Some(input_path.clone());
                 self.output_path = Some(output_path.clone());
+            }
+            ProgressEvent::JobPaused { job_id, .. } => {
+                self.job_id = Some(job_id.clone());
+                self.paused = true;
+            }
+            ProgressEvent::JobResumed { job_id, .. } => {
+                self.job_id = Some(job_id.clone());
+                self.paused = false;
             }
             ProgressEvent::RuntimeConfigResolved {
                 provider,
@@ -455,6 +474,7 @@ impl RunState {
                 self.done_segments = *succeeded + *cached + *needs_review + *failed;
                 self.finished = true;
                 self.finished_elapsed_ms = Some(*elapsed_ms);
+                self.paused = false;
             }
             _ => {}
         }
@@ -667,6 +687,23 @@ mod tests {
         let mut state = RunState::default();
         state.fold(&parsed);
         assert_eq!(state.succeeded, 1);
+    }
+
+    #[test]
+    fn job_pause_events_fold_into_state() {
+        let mut state = RunState::default();
+        state.fold(&ProgressEvent::JobPaused {
+            job_id: "job_pause".into(),
+            timestamp_ms: 10,
+        });
+        assert_eq!(state.job_id.as_deref(), Some("job_pause"));
+        assert!(state.paused);
+
+        state.fold(&ProgressEvent::JobResumed {
+            job_id: "job_pause".into(),
+            timestamp_ms: 20,
+        });
+        assert!(!state.paused);
     }
 
     #[test]

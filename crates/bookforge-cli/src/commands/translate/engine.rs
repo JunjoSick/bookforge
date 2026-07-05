@@ -45,6 +45,7 @@ pub(crate) fn batch_run_config(
         context_registry: run_config.context_registry.clone(),
         style: run_config.style.clone(),
         entities: run_config.entities.clone(),
+        pause_signal: run_config.pause_signal.clone(),
     }
 }
 
@@ -66,6 +67,14 @@ where
 
     let writer = CheckpointWriter::spawn(checkpoint.store.path().to_path_buf(), progress.clone());
     let sender = writer.sender();
+    let pause_signal = run_config.pause_signal.clone().unwrap_or_default();
+    let mut controlled_config = run_config.clone();
+    controlled_config.pause_signal = Some(pause_signal);
+    let mut control_poller = crate::control::ControlFilePoller::new(
+        checkpoint.store,
+        checkpoint.job_id,
+        progress.clone(),
+    );
     let checkpoint_context = CheckpointContext {
         store: checkpoint.store,
         job_id: checkpoint.job_id,
@@ -75,7 +84,7 @@ where
         sender: &sender,
     };
     let translation_result = if batch_enabled {
-        let batch_config = batch_run_config(run_config, settings);
+        let batch_config = batch_run_config(&controlled_config, settings);
         translate_and_checkpoint_batch(
             provider,
             pending_segments,
@@ -83,10 +92,18 @@ where
             settings,
             checkpoint_context,
             progress,
+            Some(&mut control_poller),
         )
         .await
     } else {
-        translate_and_checkpoint(provider, pending_segments, run_config, checkpoint_context).await
+        translate_and_checkpoint(
+            provider,
+            pending_segments,
+            &controlled_config,
+            checkpoint_context,
+            Some(&mut control_poller),
+        )
+        .await
     };
     finalize_writer(translation_result, sender, writer).await
 }

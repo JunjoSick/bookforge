@@ -1,11 +1,96 @@
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
 use bookforge_core::{ProgressEvent, ProgressSink};
+
+const PAUSE_RUNNING: u8 = 0;
+const PAUSE_PAUSED: u8 = 1;
+const PAUSE_STOPPED: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseState {
+    Running,
+    Paused,
+    Stopped,
+}
+
+impl PauseState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            PAUSE_PAUSED => Self::Paused,
+            PAUSE_STOPPED => Self::Stopped,
+            _ => Self::Running,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PauseSignal {
+    state: Arc<AtomicU8>,
+}
+
+impl Default for PauseSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PauseSignal {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(PAUSE_RUNNING)),
+        }
+    }
+
+    pub fn state(&self) -> PauseState {
+        PauseState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    pub fn pause(&self) {
+        let _ = self.state.compare_exchange(
+            PAUSE_RUNNING,
+            PAUSE_PAUSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub fn resume(&self) {
+        if self.state() != PauseState::Stopped {
+            self.state.store(PAUSE_RUNNING, Ordering::Release);
+        }
+    }
+
+    pub fn stop(&self) {
+        self.state.store(PAUSE_STOPPED, Ordering::Release);
+    }
+
+    pub fn set(&self, state: PauseState) {
+        match state {
+            PauseState::Running => self.resume(),
+            PauseState::Paused => self.pause(),
+            PauseState::Stopped => self.stop(),
+        }
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.state() == PauseState::Stopped
+    }
+
+    pub async fn wait_until_running_or_stopped(&self) -> PauseState {
+        loop {
+            match self.state() {
+                PauseState::Running => return PauseState::Running,
+                PauseState::Stopped => return PauseState::Stopped,
+                PauseState::Paused => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    }
+}
 
 pub struct AdaptiveLimiter {
     state: Mutex<usize>,
@@ -186,6 +271,43 @@ mod tests {
             permits.push(limiter.acquire().await.unwrap());
         }
         permits
+    }
+
+    #[test]
+    fn pause_signal_state_machine_preserves_stop() {
+        let signal = PauseSignal::new();
+        assert_eq!(signal.state(), PauseState::Running);
+
+        signal.pause();
+        assert_eq!(signal.state(), PauseState::Paused);
+
+        signal.resume();
+        assert_eq!(signal.state(), PauseState::Running);
+
+        signal.stop();
+        assert_eq!(signal.state(), PauseState::Stopped);
+
+        signal.resume();
+        assert_eq!(signal.state(), PauseState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn pause_signal_waits_until_resumed() {
+        let signal = PauseSignal::new();
+        signal.pause();
+        let resumed = signal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            resumed.resume();
+        });
+
+        let state = timeout(
+            Duration::from_millis(200),
+            signal.wait_until_running_or_stopped(),
+        )
+        .await
+        .expect("signal should resume");
+        assert_eq!(state, PauseState::Running);
     }
 
     #[tokio::test]

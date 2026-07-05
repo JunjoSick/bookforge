@@ -1,3 +1,4 @@
+pub mod control;
 pub mod convert;
 pub mod doctor;
 pub mod entity;

@@ -2,7 +2,8 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    process, thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use assert_cmd::Command;
@@ -1405,6 +1406,115 @@ fn cli_resume_reuses_checkpointed_segments() {
 }
 
 #[test]
+fn cli_pause_and_resume_live_mock_run() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("events.jsonl");
+    let output = temp.path().join("out.epub");
+    let mut child = spawn_controlled_mock_translate(&temp, &events, &output);
+    let job_id = wait_for_job_id(&events);
+    thread::sleep(Duration::from_millis(75));
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["pause", &job_id])
+        .assert()
+        .success();
+    let control_path = temp
+        .path()
+        .join(".bookforge/runs")
+        .join(&job_id)
+        .join("control");
+    assert_eq!(
+        fs::read_to_string(&control_path).expect("pause control file should exist"),
+        "pause\n"
+    );
+    wait_for_job_status(&temp, &job_id, "paused");
+    let paused_events = wait_for_event_count(&events, "JobPaused", 1);
+    let finished_at_pause = segment_finished_ids(&paused_events);
+    thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        segment_finished_ids(&read_jsonl(&events)).len(),
+        finished_at_pause.len(),
+        "paused run should not dispatch more segments"
+    );
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["resume", &job_id, "--ui", "quiet"])
+        .assert()
+        .success();
+
+    let status = child.wait().expect("translate child should exit");
+    assert!(status.success(), "translate child failed: {status}");
+    let final_events = wait_for_event_count(&events, "TranslationFinished", 1);
+    assert!(
+        event_count(&final_events, "JobResumed") >= 1,
+        "resume event should be logged"
+    );
+    assert_no_duplicate_segments(&segment_finished_ids(&final_events));
+    assert!(output.exists(), "resumed live run should write output");
+}
+
+#[test]
+fn cli_stop_then_resume_mock_run() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("events.jsonl");
+    let output = temp.path().join("out.epub");
+    let mut child = spawn_controlled_mock_translate(&temp, &events, &output);
+    let job_id = wait_for_job_id(&events);
+    thread::sleep(Duration::from_millis(75));
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["stop", &job_id])
+        .assert()
+        .success();
+
+    let status = child.wait().expect("translate child should exit");
+    assert!(status.success(), "translate child failed: {status}");
+    wait_for_job_status(&temp, &job_id, "stopped");
+    let stopped_events = read_jsonl(&events);
+    assert_eq!(
+        event_count(&stopped_events, "TranslationFinished"),
+        0,
+        "stopped run should not emit final completion"
+    );
+    let initially_finished = segment_finished_ids(&stopped_events);
+    assert!(
+        !initially_finished.is_empty(),
+        "stop test should checkpoint at least one segment"
+    );
+
+    let resume_events = temp.path().join("resume-events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "resume",
+            &job_id,
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            resume_events.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let resumed_events = wait_for_event_count(&resume_events, "TranslationFinished", 1);
+    let resumed_finished = segment_finished_ids(&resumed_events);
+    assert!(
+        !resumed_finished.is_empty(),
+        "resume should translate remaining segments"
+    );
+    for id in &initially_finished {
+        assert!(
+            !resumed_finished.contains(id),
+            "resume retranslated already checkpointed segment {id}"
+        );
+    }
+    assert!(output.exists(), "resume after stop should write output");
+}
+
+#[test]
 fn cli_resume_uses_input_snapshot_after_original_is_moved() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let fixture = fixture_input();
@@ -1610,6 +1720,38 @@ fn translate_quiet_input(temp: &TempDir, input: &Path, model: &str) -> Translate
     }
 }
 
+fn spawn_controlled_mock_translate(temp: &TempDir, events: &Path, output: &Path) -> process::Child {
+    let input = fixture_input();
+    let mut cmd = process::Command::new(assert_cmd::cargo::cargo_bin("bookforge"));
+    cmd.current_dir(temp.path())
+        .env("BOOKFORGE_MOCK_DELAY_MS", "300")
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--profile",
+            "v1-fast",
+            "--max-segment-tokens",
+            "1",
+            "--context-window",
+            "0",
+            "--concurrency",
+            "1",
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ]);
+    cmd.spawn().expect("controlled translate should spawn")
+}
+
 fn sha256_file(path: &Path) -> String {
     let bytes = fs::read(path).expect("file should read");
     let digest = Sha256::digest(&bytes);
@@ -1632,6 +1774,95 @@ fn job_id_from_events(path: &Path) -> String {
                 .map(ToOwned::to_owned)
         })
         .expect("event log should include job id")
+}
+
+fn wait_for_job_id(path: &Path) -> String {
+    wait_for_events(path, |events| {
+        events.iter().any(|event| event.get("JobCreated").is_some())
+    });
+    job_id_from_events(path)
+}
+
+fn wait_for_event_count(path: &Path, key: &str, min_count: usize) -> Vec<serde_json::Value> {
+    wait_for_events(path, |events| event_count(events, key) >= min_count)
+}
+
+fn wait_for_events(
+    path: &Path,
+    mut ready: impl FnMut(&[serde_json::Value]) -> bool,
+) -> Vec<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if path.exists() {
+            let events = read_jsonl_lenient(path);
+            if ready(&events) {
+                return events;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for events in {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_job_status(temp: &TempDir, job_id: &str, expected: &str) {
+    let db = temp.path().join(".bookforge/jobs.sqlite");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut actual = None;
+        if db.exists()
+            && let Ok(store) = JobStore::open(&db)
+            && let Ok(Some(job)) = store.get_job(job_id)
+        {
+            if job.status == expected {
+                return;
+            }
+            actual = Some(job.status);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for job {job_id} status {expected}; actual={actual:?}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn event_count(events: &[serde_json::Value], key: &str) -> usize {
+    events
+        .iter()
+        .filter(|event| event.get(key).is_some())
+        .count()
+}
+
+fn segment_finished_ids(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| event.get("SegmentFinished"))
+        .filter_map(|payload| payload.get("segment_id"))
+        .filter_map(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn assert_no_duplicate_segments(ids: &[String]) {
+    let unique = ids.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "duplicate segment completion: {ids:?}"
+    );
+}
+
+fn read_jsonl_lenient(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
