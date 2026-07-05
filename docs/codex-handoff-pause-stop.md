@@ -70,3 +70,31 @@ the maintainer rather than inventing it.
   the dashboard and watch token spend stop) is the maintainer's/
   Claude's job afterwards, not yours.
 - Do not push; leave the branch ready for Claude's review pass.
+
+## Review fix pass (Claude, 2026-07-05 — two findings)
+
+Implementation landed as 852b15d + 99cf88b; workspace green; lifecycle
+e2e verified live pause/resume/stop through real child processes. Two
+gaps found in review, both to fix:
+
+1. **Dead-paused job is unresumable (medium).** `bookforge resume` on a
+   `paused` job only writes `resume` to the control file and returns.
+   Correct for a live paused process (relaunching would double-write the
+   job), but if the process died/machine rebooted while paused, the DB
+   status stays `paused` forever and resume never falls back to a
+   relaunch. Ruling: keep the signal path as default, but after writing
+   the control file wait up to ~10s for the job to leave `paused`; if it
+   doesn't, print a hint explaining that a dead paused run needs
+   `bookforge resume <id> --force`. Add `--force`: clears the control
+   file, marks the job for relaunch, and takes the normal resume path.
+   No liveness heuristics — the user decides; document the double-run
+   risk in the flag help ("only use if the paused process is gone").
+2. **Fallback pass ignores the control file (low).** `run_fallback_pass`
+   inherits the primary's PauseSignal but passes `control: None`, so
+   pause/stop written during a fallback pass isn't polled until it ends.
+   Wire the same ControlFilePoller through (same pattern as the main
+   pass) if lifetimes permit; otherwise leave a code comment and note it
+   in ROADMAP §10.1.1 out-of-scope.
+
+Then: regression tests for both (paused-dead resume hint + --force path;
+control honored during fallback), full workspace gates, do not push.
