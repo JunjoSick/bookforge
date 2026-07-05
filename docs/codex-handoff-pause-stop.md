@@ -98,3 +98,40 @@ gaps found in review, both to fix:
 
 Then: regression tests for both (paused-dead resume hint + --force path;
 control honored during fallback), full workspace gates, do not push.
+
+## Real-run finding (Claude, 2026-07-05 — batch path pause is inert)
+
+The §15.6 un-mockable check (real DeepSeek run from the dashboard,
+pre-armed pause) caught what mock e2e cannot: in batch mode the pause
+took no effect — batch_0002's provider request started TWO MINUTES
+after the control file said `pause`, and the job never marked `paused`.
+
+Root cause (`batch.rs` ~1479): the dispatch loop spawns ALL pending
+batches as tasks immediately (deliberate — the in-code comment explains
+context waiters must not consume provider-concurrency slots), with
+concurrency enforced by `request_semaphore` inside the tasks. The pause
+check only gates spawning from `pending_queue`, which drains in
+milliseconds. Mock e2e missed it because mock runs don't take the batch
+path.
+
+Fix ruling — keep the spawn-all design, gate the provider call instead:
+
+1. Inside each spawned batch task, BEFORE acquiring
+   `request_semaphore` (never while holding a permit), wait on
+   `signal.wait_until_running_or_stopped()`. On Stopped, return a
+   synthetic outcome that leaves the batch's items unfinished (same
+   shape as a transient skip — segments must stay resumable, not be
+   marked failed).
+2. The join side of the loop must keep translating file→signal: call
+   `on_control_boundary(signal)` after every `join_next` completion
+   (and in the paused/parked wait), so a pause written mid-round is
+   noticed once in-flight batches land, the store flips to `paused`,
+   and JobPaused is emitted.
+3. Strict-context interaction: the pre-permit pause gate must sit
+   AFTER the strict-context await (a paused prerequisite batch must
+   not deadlock a waiter — re-check the stranding comment's scenario
+   under pause).
+4. Regression test: mock-provider e2e WITH batching enabled — pre-arm
+   `pause` before launch, assert no RequestStarted after the first
+   completion boundary, status `paused`, then resume completes; same
+   for stop→resume. This is the coverage gap that let the bug ship.
