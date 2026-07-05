@@ -1,5 +1,6 @@
 mod checkpoint;
 mod commands;
+mod control;
 mod cost;
 #[cfg(any(feature = "tui", feature = "serve"))]
 mod eventlog;
@@ -18,8 +19,8 @@ use commands::serve;
 #[cfg(feature = "tui")]
 use commands::watch;
 use commands::{
-    convert, doctor, entity, estimate, glossary, ingest_flags, inspect, reflow, resume, retry,
-    review, status, style, tail, translate, validate,
+    control as control_commands, convert, doctor, entity, estimate, glossary, ingest_flags,
+    inspect, reflow, resume, retry, review, status, style, tail, translate, validate,
 };
 #[cfg(any(test, not(feature = "serve")))]
 use std::io::Write;
@@ -56,7 +57,9 @@ enum Command {
     Inspect(inspect::InspectArgs),
     Estimate(estimate::EstimateArgs),
     Translate(Box<translate::TranslateArgs>),
+    Pause(control_commands::PauseArgs),
     Resume(resume::ResumeArgs),
+    Stop(control_commands::StopArgs),
     Review(review::ReviewArgs),
     IngestFlags(ingest_flags::IngestFlagsArgs),
     Glossary(glossary::GlossaryArgs),
@@ -114,7 +117,9 @@ async fn run_command(command: Command, cancel_token: CancellationToken) -> Resul
         Command::Inspect(args) => inspect::run(args).await,
         Command::Estimate(args) => estimate::run(args).await,
         Command::Translate(args) => translate::run(*args, cancel_token).await,
+        Command::Pause(args) => control_commands::pause(args).await,
         Command::Resume(args) => resume::run(args).await,
+        Command::Stop(args) => control_commands::stop(args).await,
         Command::Review(args) => review::run(args).await,
         Command::IngestFlags(args) => ingest_flags::run(args).await,
         Command::Glossary(args) => glossary::run(args).await,

@@ -618,7 +618,7 @@ impl JobStore {
                 ],
             )?;
         }
-        self.touch_job(request.job_id, "running")?;
+        self.touch_job_unless_status(request.job_id, "running", &["paused", "stopped"])?;
         Ok(())
     }
 
@@ -669,7 +669,7 @@ impl JobStore {
                 ],
             )?;
         }
-        self.touch_job(request.job_id, "needs_review")?;
+        self.touch_job_unless_status(request.job_id, "needs_review", &["paused", "stopped"])?;
         Ok(())
     }
 
@@ -706,16 +706,28 @@ impl JobStore {
                 params![translated_hash, request.job_id, request.segment_id],
             )?;
         }
-        self.touch_job(request.job_id, "running")?;
+        self.touch_job_unless_status(request.job_id, "running", &["paused", "stopped"])?;
         Ok(())
     }
 
     pub fn mark_job_complete(&self, job_id: &str) -> Result<()> {
-        self.touch_job(job_id, "succeeded")
+        self.touch_job_unless_status(job_id, "succeeded", &["stopped"])
     }
 
     pub fn mark_job_running(&self, job_id: &str) -> Result<()> {
+        self.touch_job_unless_status(job_id, "running", &["stopped"])
+    }
+
+    pub fn mark_job_running_for_resume(&self, job_id: &str) -> Result<()> {
         self.touch_job(job_id, "running")
+    }
+
+    pub fn mark_job_paused(&self, job_id: &str) -> Result<()> {
+        self.touch_job_unless_status(job_id, "paused", &["stopped"])
+    }
+
+    pub fn mark_job_stopped(&self, job_id: &str) -> Result<()> {
+        self.touch_job(job_id, "stopped")
     }
 
     pub fn mark_job_succeeded(&self, job_id: &str) -> Result<()> {
@@ -723,15 +735,15 @@ impl JobStore {
     }
 
     pub fn mark_job_needs_review(&self, job_id: &str) -> Result<()> {
-        self.touch_job(job_id, "needs_review")
+        self.touch_job_unless_status(job_id, "needs_review", &["stopped"])
     }
 
     pub fn mark_job_interrupted(&self, job_id: &str) -> Result<()> {
-        self.touch_job(job_id, "interrupted")
+        self.touch_job_unless_status(job_id, "interrupted", &["stopped"])
     }
 
     pub fn mark_job_failed(&self, job_id: &str) -> Result<()> {
-        self.touch_job(job_id, "failed")
+        self.touch_job_unless_status(job_id, "failed", &["stopped"])
     }
 
     pub fn mark_segment_failed(&self, job_id: &str, segment_id: &str, error: &str) -> Result<()> {
@@ -742,7 +754,7 @@ impl JobStore {
                 params![error, job_id, segment_id],
             )?;
         }
-        self.touch_job(job_id, "failed")?;
+        self.mark_job_failed(job_id)?;
         Ok(())
     }
 
@@ -763,7 +775,7 @@ impl JobStore {
                 params![error, job_id, segment_id],
             )?;
         }
-        self.touch_job(job_id, "failed")?;
+        self.mark_job_failed(job_id)?;
         Ok(())
     }
 
@@ -803,7 +815,7 @@ impl JobStore {
         }
 
         if updated > 0 {
-            self.touch_job(job_id, "failed")?;
+            self.mark_job_failed(job_id)?;
         }
         Ok(updated)
     }
@@ -1004,7 +1016,7 @@ impl JobStore {
             let conn = self.conn.borrow();
             conn.execute(&sql, params![job_id])?
         };
-        self.touch_job(job_id, "retry_pending")?;
+        self.touch_job_unless_status(job_id, "retry_pending", &["stopped"])?;
         Ok(count)
     }
 
@@ -1066,7 +1078,7 @@ impl JobStore {
             updated += conn.execute(&sql, params.as_slice())?;
         }
         if updated > 0 {
-            self.touch_job(job_id, "needs_review")?;
+            self.mark_job_needs_review(job_id)?;
         }
         Ok(updated)
     }
@@ -2331,6 +2343,42 @@ impl JobStore {
         )?;
         Ok(())
     }
+
+    fn touch_job_unless_status(
+        &self,
+        job_id: &str,
+        status: &str,
+        protected_statuses: &[&str],
+    ) -> Result<()> {
+        let now = timestamp_string();
+        let conn = self.conn.borrow();
+        if protected_statuses.is_empty() {
+            conn.execute(
+                "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![status, now, job_id],
+            )?;
+            return Ok(());
+        }
+
+        let placeholders = std::iter::repeat_n("?", protected_statuses.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE jobs
+             SET status = ?, updated_at = ?
+             WHERE id = ? AND status NOT IN ({placeholders})"
+        );
+        let mut params: Vec<&dyn rusqlite::types::ToSql> =
+            Vec::with_capacity(3 + protected_statuses.len());
+        params.push(&status);
+        params.push(&now);
+        params.push(&job_id);
+        for protected in protected_statuses {
+            params.push(protected);
+        }
+        conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
 }
 
 fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
@@ -2667,6 +2715,91 @@ mod tests {
         let _ = fs::remove_file(input_path);
     }
 
+    #[test]
+    fn job_status_allows_pause_resume_and_stop() {
+        let db_path = temp_path("pause_status.sqlite");
+        let input_path = temp_path("pause_input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("pause_output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job should be created");
+
+        store.mark_job_running(&job.id).unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "running");
+        store.mark_job_paused(&job.id).unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "paused");
+        let segments = vec![segment("seg_pause", 0)];
+        store
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "test_ns")
+            .unwrap();
+        store
+            .save_translation(SaveTranslation {
+                job_id: &job.id,
+                segment_id: "seg_pause",
+                translated_text: "Tradotto",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "Tradotto".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(1),
+                tokens_estimated: false,
+            })
+            .unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "paused");
+        store.mark_job_running(&job.id).unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "running");
+        store.mark_job_stopped(&job.id).unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "stopped");
+        store.mark_job_paused(&job.id).unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "stopped");
+        store.mark_job_running(&job.id).unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "stopped");
+        store.mark_job_complete(&job.id).unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "stopped");
+        store
+            .save_translation(SaveTranslation {
+                job_id: &job.id,
+                segment_id: "seg_pause",
+                translated_text: "Tradotto ancora",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "Tradotto ancora".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(1),
+                tokens_estimated: false,
+            })
+            .unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "stopped");
+        store.mark_job_running_for_resume(&job.id).unwrap();
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "running");
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
     fn segment(id: &str, ordinal: usize) -> Segment {
         let block_id = BlockId(format!("b_{ordinal:06}"));
         Segment {
@@ -2905,6 +3038,8 @@ mod tests {
             bilingual_separator: " / ".to_string(),
             bilingual_style: bookforge_core::BilingualStyle::Minimal,
             bilingual_css: None,
+            fallback: None,
+            finalize: bookforge_core::run_snapshot::FinalizeCheckpointSnapshot::default(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
 
@@ -2997,6 +3132,8 @@ mod tests {
             bilingual_separator: " / ".to_string(),
             bilingual_style: bookforge_core::BilingualStyle::Minimal,
             bilingual_css: None,
+            fallback: None,
+            finalize: bookforge_core::run_snapshot::FinalizeCheckpointSnapshot::default(),
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
 

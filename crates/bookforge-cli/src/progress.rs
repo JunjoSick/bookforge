@@ -529,6 +529,16 @@ impl ProgressBars {
                 self.checkpoint_bar
                     .set_message(format!("flushed {}", self.state.checkpoint_flushed));
             }
+            ProgressEvent::JobPaused { .. } => {
+                self.stage_bar.set_message("paused");
+                self.batch_bar.set_message("paused");
+                self.rate_bar.set_message("paused");
+            }
+            ProgressEvent::JobResumed { .. } => {
+                self.stage_bar.set_message("translating...");
+                self.batch_bar
+                    .set_message(format!("{} active", self.state.active_requests));
+            }
             ProgressEvent::BatchQueued { batch_id, .. } => {
                 self.batch_bar
                     .set_message(format!("batch {batch_id} queued"));
@@ -582,6 +592,9 @@ fn format_eta(eta_secs: f64) -> String {
 fn is_important_event(event: &ProgressEvent) -> bool {
     match event {
         ProgressEvent::Error { .. }
+        | ProgressEvent::JobPaused { .. }
+        | ProgressEvent::JobResumed { .. }
+        | ProgressEvent::RequestStarted { .. }
         | ProgressEvent::Warning { .. }
         | ProgressEvent::BatchRepairFinished { .. }
         | ProgressEvent::CheckpointFlushed { .. }

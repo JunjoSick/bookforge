@@ -137,6 +137,14 @@ impl MockProvider {
 impl LlmProvider for MockProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let started = Instant::now();
+        let template = request
+            .metadata
+            .prompt_template
+            .as_deref()
+            .unwrap_or("translate_segment");
+        if let Some(delay_ms) = mock_delay_ms(template) {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
 
         if self.mode == MockMode::MalformedJson {
             return Ok(CompletionResponse {
@@ -150,11 +158,6 @@ impl LlmProvider for MockProvider {
             });
         }
 
-        let template = request
-            .metadata
-            .prompt_template
-            .as_deref()
-            .unwrap_or("translate_segment");
         let block_ids = &request.metadata.block_ids;
 
         let content = if template == "qa_batch" {
@@ -174,6 +177,100 @@ impl LlmProvider for MockProvider {
                 })
                 .collect::<Vec<_>>();
             serde_json::to_string(&json!({ "reviews": reviews }))?
+        } else if template == "double_check_batch" {
+            let force_fail = std::env::var("BOOKFORGE_MOCK_DOUBLE_CHECK_FAIL").is_ok();
+            let items = extract_batch_items(&request.user)
+                .into_iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?.to_string();
+                    let issues = if force_fail {
+                        vec![json!({
+                            "severity": "major",
+                            "kind": "mock_double_check",
+                            "message": "mock double-check requested correction",
+                            "source_excerpt": null,
+                            "translation_excerpt": null,
+                            "needs_correction": true,
+                        })]
+                    } else {
+                        Vec::new()
+                    };
+                    Some(json!({
+                        "id": id,
+                        "verdict": if force_fail { "fail" } else { "pass" },
+                        "issues": issues,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string(&json!({ "items": items }))?
+        } else if template == "correct_batch" {
+            let items = extract_json_array_after_label(&request.user, "Items:")
+                .into_iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?.to_string();
+                    let current = entry
+                        .get("current_translation")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    Some(json!({
+                        "id": id,
+                        "corrected_translation": format!("{current} [corrected]"),
+                    }))
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string(&json!({ "items": items }))?
+        } else if template.starts_with("translate_batch_") {
+            let items = extract_batch_items(&request.user)
+                .into_iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?.to_string();
+                    let response_id = if self.mode == MockMode::WrongSegmentId {
+                        "wrong_segment".to_string()
+                    } else {
+                        id
+                    };
+                    if template.contains("run_preserving") {
+                        let runs = entry
+                            .get("runs")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|runs| {
+                                runs.iter()
+                                    .filter_map(|run| {
+                                        let id = run.get("id")?.as_str()?;
+                                        let source = run.get("text")?.as_str().unwrap_or_default();
+                                        Some(json!({
+                                            "id": id,
+                                            "text": transform_run_text(
+                                                self.mode,
+                                                &self.target_language,
+                                                source,
+                                            ),
+                                        }))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        Some(json!({
+                            "id": response_id,
+                            "runs": runs,
+                        }))
+                    } else {
+                        let source = entry
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        Some(json!({
+                            "id": response_id,
+                            "translation": transform_text(
+                                self.mode,
+                                &self.target_language,
+                                source,
+                            ),
+                        }))
+                    }
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string(&json!({ "items": items }))?
         } else {
             let segment_id = request.metadata.segment_id.clone().ok_or_else(|| {
                 LlmError::Provider("mock request is missing segment_id".to_string())
@@ -294,6 +391,19 @@ fn transform_text(mode: MockMode, target_language: &str, source: &str) -> String
         MockMode::Uppercase => source.to_uppercase(),
         MockMode::MalformedJson => unreachable!("handled above"),
     }
+}
+
+fn mock_delay_ms(template: &str) -> Option<u64> {
+    let stage_env = match template {
+        "qa_batch" | "qa_segment" => Some("BOOKFORGE_MOCK_QA_DELAY_MS"),
+        "double_check_batch" => Some("BOOKFORGE_MOCK_DOUBLE_CHECK_DELAY_MS"),
+        "correct_batch" => Some("BOOKFORGE_MOCK_CORRECTION_DELAY_MS"),
+        _ => None,
+    };
+    stage_env
+        .and_then(|name| std::env::var(name).ok())
+        .or_else(|| std::env::var("BOOKFORGE_MOCK_DELAY_MS").ok())
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 /// Recover per-block source strings from a rendered marker-safe user prompt.
@@ -438,6 +548,55 @@ fn extract_qa_batch_item_ids(user_prompt: &str) -> Vec<String> {
             if ids.is_empty() { None } else { Some(ids) }
         })
         .unwrap_or_default()
+}
+
+fn extract_batch_items(user_prompt: &str) -> Vec<serde_json::Value> {
+    user_prompt
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('[') {
+                return None;
+            }
+            let parsed: Vec<serde_json::Value> = serde_json::from_str(trimmed).ok()?;
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(parsed)
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn extract_json_array_after_label(user_prompt: &str, label: &str) -> Vec<serde_json::Value> {
+    let Some(label_index) = user_prompt.find(label) else {
+        return Vec::new();
+    };
+    let after_label = &user_prompt[label_index + label.len()..];
+    let Some(start) = after_label.find('[') else {
+        return Vec::new();
+    };
+    let array_slice = &after_label[start..];
+    let mut depth = 0usize;
+    let mut end_index = None;
+    for (offset, ch) in array_slice.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    end_index = Some(offset + ch.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end_index else {
+        return Vec::new();
+    };
+    serde_json::from_str(&array_slice[..end]).unwrap_or_default()
 }
 
 /// Recover the plain-mode source segment from a rendered prompt by reading
@@ -1088,7 +1247,11 @@ mod tests {
         let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let request_count_clone = request_count.clone();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
         let addr = listener.local_addr().unwrap();
         let port = addr.port();
 

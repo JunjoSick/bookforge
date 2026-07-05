@@ -5,7 +5,8 @@ use std::{
 };
 
 use bookforge_core::{
-    GlossaryTerm, ResolvedRunSettings, ResolvedRunSettingsSnapshot, RunConfigSnapshot,
+    FallbackRunConfigSnapshot, FinalizeCheckpointSnapshot, GlossaryTerm, ResolvedRunSettings,
+    ResolvedRunSettingsSnapshot, RunConfigSnapshot,
 };
 use bookforge_store::{JobRecord, JobStore};
 use sha2::{Digest, Sha256};
@@ -84,11 +85,35 @@ pub(crate) fn persist_snapshot(
         bilingual_separator: cli_args.bilingual_separator.clone(),
         bilingual_style: cli_args.bilingual_style,
         bilingual_css,
+        fallback: fallback_snapshot(cli_args, model),
+        finalize: FinalizeCheckpointSnapshot::default(),
         settings: ResolvedRunSettingsSnapshot::from_settings(settings),
     };
     store.update_job_config_snapshot(&job.id, &snapshot)?;
     store.update_job_event_path(&job.id, &events_path)?;
     Ok(snapshot)
+}
+
+fn fallback_snapshot(
+    cli_args: &TranslateArgs,
+    primary_model: &str,
+) -> Option<FallbackRunConfigSnapshot> {
+    if cli_args.fallback_provider.is_none() && cli_args.fallback_model.is_none() {
+        return None;
+    }
+    Some(FallbackRunConfigSnapshot {
+        provider: cli_args
+            .fallback_provider
+            .clone()
+            .unwrap_or_else(|| "openrouter".to_string()),
+        model: cli_args
+            .fallback_model
+            .clone()
+            .unwrap_or_else(|| primary_model.to_string()),
+        base_url: cli_args.fallback_base_url.clone(),
+        api_key_env: cli_args.fallback_api_key_env.clone(),
+        scope: cli_args.fallback_only,
+    })
 }
 
 fn read_bilingual_css(cli_args: &TranslateArgs) -> anyhow::Result<Option<String>> {

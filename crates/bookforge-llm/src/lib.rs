@@ -14,8 +14,9 @@ pub use batch::{
     BatchTranslationResult, TranslationBatch, TranslationBatchItem,
     account_for_batch_prompt_overhead, build_translation_batches, collect_repair_items,
     parse_batch_response, split_batch, translate_batches_with_callback,
+    translate_batches_with_control,
 };
-pub use concurrency::AdaptiveLimiter;
+pub use concurrency::{AdaptiveLimiter, PauseSignal, PauseState};
 pub use double_check::{
     CorrectionItem, CorrectionRecord, CorrectionStatus, DoubleCheckItem, run_double_check,
 };
@@ -33,5 +34,6 @@ pub use scheduler::{
     CompletedContext, ContextRegistry, ContextRunConfig, EntityRunConfig, GlossaryRunConfig,
     QaIssue, QaSegmentReview, SegmentTranslation, StyleRunConfig, TranslationRunConfig,
     qa_segments, translate_segments, translate_segments_with_callback,
+    translate_segments_with_control,
 };
 pub use telemetry::{TelemetryLog, telemetry_summary};

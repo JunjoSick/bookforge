@@ -9,6 +9,7 @@
 use std::{path::Path, time::Duration};
 
 use anyhow::Result;
+use bookforge_core::ControlCommand;
 use bookforge_store::{JobStore, RetryScope};
 
 use crate::eventlog::{EventLogTailer, events_path_for};
@@ -129,6 +130,24 @@ async fn drive_watch(
                     )),
                     Err(err) => app.set_status(format!("retry failed: {err}")),
                 },
+                TuiAction::PauseJob => {
+                    match crate::control::request_job_control(job_id, ControlCommand::Pause) {
+                        Ok(_) => app.set_status("pause requested".to_string()),
+                        Err(err) => app.set_status(format!("pause failed: {err}")),
+                    }
+                }
+                TuiAction::ResumeJob => {
+                    match crate::control::request_job_control(job_id, ControlCommand::Resume) {
+                        Ok(_) => app.set_status("resume requested".to_string()),
+                        Err(err) => app.set_status(format!("resume failed: {err}")),
+                    }
+                }
+                TuiAction::StopJob => {
+                    match crate::control::request_job_control(job_id, ControlCommand::Stop) {
+                        Ok(_) => app.set_status("stop requested".to_string()),
+                        Err(err) => app.set_status(format!("stop failed: {err}")),
+                    }
+                }
             }
         }
         app.draw()?;

@@ -74,6 +74,10 @@ pub struct RunConfigSnapshot {
     pub bilingual_style: BilingualStyle,
     #[serde(default)]
     pub bilingual_css: Option<String>,
+    #[serde(default)]
+    pub fallback: Option<FallbackRunConfigSnapshot>,
+    #[serde(default)]
+    pub finalize: FinalizeCheckpointSnapshot,
     pub settings: ResolvedRunSettingsSnapshot,
 }
 
@@ -105,6 +109,20 @@ pub struct ResolvedRunSettingsSnapshot {
     pub adaptive_concurrency: bool,
     pub qa: QaRunConfigSnapshot,
     pub double_check: DoubleCheckConfigSnapshot,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct FallbackRunConfigSnapshot {
+    pub provider: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub scope: crate::FallbackScope,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct FinalizeCheckpointSnapshot {
+    pub double_check_complete: bool,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

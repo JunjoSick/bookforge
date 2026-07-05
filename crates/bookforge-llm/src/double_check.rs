@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::{
     CompletionRequest, LlmError, LlmProvider, PromptLibrary, RequestMetadata, ResponseFormat,
-    SegmentTranslation, Substitutions, TranslationRunConfig,
+    SegmentTranslation, Substitutions, TranslationRunConfig, concurrency::PauseState,
 };
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -471,6 +471,8 @@ where
         .render(&vars)
         .map_err(|e| LlmError::Provider(e.to_string()))?;
 
+    wait_for_double_check_pause(config, "double-check audit").await?;
+
     let response = provider
         .complete(CompletionRequest {
             system: rendered.system,
@@ -478,7 +480,13 @@ where
             response_format: ResponseFormat::Json,
             temperature: 0.0,
             max_output_tokens: None,
-            metadata: RequestMetadata::default(),
+            metadata: RequestMetadata {
+                prompt_template: Some(library.double_check_batch.name.clone()),
+                prompt_version: Some(library.double_check_batch.version.clone()),
+                provider: Some(config.provider.clone()),
+                model: Some(config.model.clone()),
+                ..RequestMetadata::default()
+            },
         })
         .await?;
 
@@ -597,6 +605,8 @@ where
         .render(&vars)
         .map_err(|e| LlmError::Provider(e.to_string()))?;
 
+    wait_for_double_check_pause(config, "double-check correction").await?;
+
     let response = provider
         .complete(CompletionRequest {
             system: rendered.system,
@@ -604,7 +614,13 @@ where
             response_format: ResponseFormat::Json,
             temperature: 0.1,
             max_output_tokens: None,
-            metadata: RequestMetadata::default(),
+            metadata: RequestMetadata {
+                prompt_template: Some(library.correct_batch.name.clone()),
+                prompt_version: Some(library.correct_batch.version.clone()),
+                provider: Some(config.provider.clone()),
+                model: Some(config.model.clone()),
+                ..RequestMetadata::default()
+            },
         })
         .await?;
 
@@ -661,6 +677,18 @@ where
     }
 
     Ok(corrected)
+}
+
+async fn wait_for_double_check_pause(
+    config: &TranslationRunConfig,
+    stage: &str,
+) -> Result<(), LlmError> {
+    if let Some(signal) = config.pause_signal.as_ref()
+        && signal.wait_until_running_or_stopped().await == PauseState::Stopped
+    {
+        return Err(LlmError::Provider(format!("{stage} stopped")));
+    }
+    Ok(())
 }
 
 fn validate_correction(item: &CorrectionItem) -> CorrectionStatus {
@@ -875,6 +903,7 @@ mod tests {
             context_registry: None,
             style: None,
             entities: None,
+            pause_signal: None,
         }
     }
 
