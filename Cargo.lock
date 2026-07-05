@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-cli"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-core"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "clap",
  "quick-xml",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-epub"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "bookforge-core",
  "quick-xml",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-llm"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "bookforge-core",
  "reqwest",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-pdf"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "bookforge-core",
  "bookforge-epub",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-store"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "bookforge-core",
  "rusqlite",
