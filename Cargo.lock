@@ -312,6 +312,7 @@ dependencies = [
  "bookforge-core",
  "quick-xml",
  "serde",
+ "serde_json",
  "tracing",
  "zip",
 ]

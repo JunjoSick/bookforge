@@ -16,6 +16,7 @@ use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileO
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReflowOptions {
     pub dry_run: bool,
+    pub aggressive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,14 +51,20 @@ pub struct ReflowMergeRecord {
     pub left_preview: String,
     pub right_preview: String,
     pub dehyphenated: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub aggressive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right_class: Option<String>,
 }
 
 pub fn reflow_epub(input: &Path, output: &Path, options: &ReflowOptions) -> Result<ReflowOutcome> {
     let result = if options.dry_run {
-        write_reflowed_epub(input, output, None)
+        write_reflowed_epub(input, output, options, None)
     } else {
         let staged = sibling_work_path(output, "reflow");
-        let result = with_output_writer(input, output, &staged);
+        let result = with_output_writer(input, output, options, &staged);
         match result {
             Ok(report) => {
                 if let Err(error) = commit_staged_output(&staged, output) {
@@ -79,15 +86,21 @@ pub fn reflow_epub(input: &Path, output: &Path, options: &ReflowOptions) -> Resu
     })
 }
 
-fn with_output_writer(input: &Path, output: &Path, staged: &Path) -> Result<ReflowReport> {
+fn with_output_writer(
+    input: &Path,
+    output: &Path,
+    options: &ReflowOptions,
+    staged: &Path,
+) -> Result<ReflowReport> {
     let output_file = File::create(staged)?;
     let writer = ZipWriter::new(output_file);
-    write_reflowed_epub(input, output, Some(writer))
+    write_reflowed_epub(input, output, options, Some(writer))
 }
 
 fn write_reflowed_epub(
     input: &Path,
     output: &Path,
+    options: &ReflowOptions,
     writer: Option<ZipWriter<File>>,
 ) -> Result<ReflowReport> {
     let source = File::open(input)?;
@@ -103,12 +116,12 @@ fn write_reflowed_epub(
     match writer {
         Some(mut writer) => {
             write_mimetype_first(&mut archive, &mut writer)?;
-            write_archive_entries(&mut archive, Some(&mut writer), &mut report)?;
+            write_archive_entries(&mut archive, Some(&mut writer), &mut report, options)?;
             writer.finish()?;
         }
         None => {
             validate_mimetype(&mut archive)?;
-            write_archive_entries(&mut archive, None, &mut report)?;
+            write_archive_entries(&mut archive, None, &mut report, options)?;
         }
     }
 
@@ -119,6 +132,7 @@ fn write_archive_entries(
     archive: &mut ZipArchive<File>,
     mut writer: Option<&mut ZipWriter<File>>,
     report: &mut ReflowReport,
+    options: &ReflowOptions,
 ) -> Result<()> {
     let deflated = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
@@ -145,7 +159,7 @@ fn write_archive_entries(
             let xhtml = String::from_utf8(bytes).map_err(|err| {
                 BookforgeError::InvalidInput(format!("XHTML resource '{name}' is not UTF-8: {err}"))
             })?;
-            let outcome = reflow_xhtml_resource(&xhtml, &name)?;
+            let outcome = reflow_xhtml_resource(&xhtml, &name, options)?;
             report.totals.files_checked += 1;
             report.totals.paragraphs_before += outcome.paragraphs_before;
             report.totals.paragraphs_after += outcome.paragraphs_after;
@@ -170,6 +184,10 @@ fn write_archive_entries(
     Ok(())
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug)]
 struct ResourceReflow {
     xhtml: String,
@@ -178,10 +196,14 @@ struct ResourceReflow {
     merges: Vec<ReflowMergeRecord>,
 }
 
-fn reflow_xhtml_resource(xhtml: &str, resource: &str) -> Result<ResourceReflow> {
+fn reflow_xhtml_resource(
+    xhtml: &str,
+    resource: &str,
+    options: &ReflowOptions,
+) -> Result<ResourceReflow> {
     let (mut nodes, paragraphs_before) = parse_xml(xhtml)?;
     let mut merges = Vec::new();
-    reflow_nodes(&mut nodes, resource, &mut merges)?;
+    reflow_nodes(&mut nodes, resource, options, &mut merges)?;
     let paragraphs_after = count_paragraphs(&nodes);
 
     if merges.is_empty() {
@@ -335,11 +357,12 @@ fn write_node(writer: &mut Writer<Vec<u8>>, node: &XmlNode) -> Result<()> {
 fn reflow_nodes(
     nodes: &mut Vec<XmlNode>,
     resource: &str,
+    options: &ReflowOptions,
     merges: &mut Vec<ReflowMergeRecord>,
 ) -> Result<()> {
     for node in nodes.iter_mut() {
         if let XmlNode::Element(element) = node {
-            reflow_nodes(&mut element.children, resource, merges)?;
+            reflow_nodes(&mut element.children, resource, options, merges)?;
         }
     }
 
@@ -356,7 +379,9 @@ fn reflow_nodes(
         };
 
         let decision = match (&nodes[left_index], &nodes[right_index]) {
-            (XmlNode::Element(left), XmlNode::Element(right)) => merge_decision(left, right)?,
+            (XmlNode::Element(left), XmlNode::Element(right)) => {
+                merge_decision(left, right, options)?
+            }
             _ => None,
         };
 
@@ -404,6 +429,9 @@ struct MergeDecision {
     left_preview: String,
     right_preview: String,
     dehyphenated: bool,
+    aggressive: bool,
+    left_class: Option<String>,
+    right_class: Option<String>,
 }
 
 impl MergeDecision {
@@ -415,11 +443,18 @@ impl MergeDecision {
             left_preview: self.left_preview,
             right_preview: self.right_preview,
             dehyphenated: self.dehyphenated,
+            aggressive: self.aggressive,
+            left_class: self.left_class,
+            right_class: self.right_class,
         }
     }
 }
 
-fn merge_decision(left: &XmlElement, right: &XmlElement) -> Result<Option<MergeDecision>> {
+fn merge_decision(
+    left: &XmlElement,
+    right: &XmlElement,
+    options: &ReflowOptions,
+) -> Result<Option<MergeDecision>> {
     let left_text = visible_text(&left.children)?;
     let right_text = visible_text(&right.children)?;
 
@@ -432,11 +467,13 @@ fn merge_decision(left: &XmlElement, right: &XmlElement) -> Result<Option<MergeD
     if ends_with_terminal_punctuation(&left_text) {
         return Ok(None);
     }
-    if !starts_with_unicode_lowercase(&right_text) {
+    let Some(right_start) = right_start_mode(&right_text, options.aggressive) else {
         return Ok(None);
-    }
-    if attr_value_unescaped(&left.start, b"class")? != attr_value_unescaped(&right.start, b"class")?
-    {
+    };
+    let left_class = attr_value_unescaped(&left.start, b"class")?;
+    let right_class = attr_value_unescaped(&right.start, b"class")?;
+    let class_mismatch = left_class != right_class;
+    if class_mismatch && !options.aggressive {
         return Ok(None);
     }
     if attr_value_unescaped(&right.start, b"id")?.is_some() {
@@ -454,6 +491,9 @@ fn merge_decision(left: &XmlElement, right: &XmlElement) -> Result<Option<MergeD
         left_preview: preview(&left_text),
         right_preview: preview(&right_text),
         dehyphenated: should_dehyphenate(&left_text),
+        aggressive: right_start == RightStartMode::Aggressive || class_mismatch,
+        left_class: if class_mismatch { left_class } else { None },
+        right_class: if class_mismatch { right_class } else { None },
     }))
 }
 
@@ -592,11 +632,25 @@ fn is_terminal_closer(ch: char) -> bool {
     matches!(ch, '"' | '”' | '’' | '»' | ')' | ']')
 }
 
-fn starts_with_unicode_lowercase(text: &str) -> bool {
-    text.trim_start()
-        .chars()
-        .next()
-        .is_some_and(char::is_lowercase)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RightStartMode {
+    Conservative,
+    Aggressive,
+}
+
+fn right_start_mode(text: &str, aggressive: bool) -> Option<RightStartMode> {
+    let first = text.trim_start().chars().next()?;
+    if first.is_lowercase() {
+        return Some(RightStartMode::Conservative);
+    }
+    if !aggressive || !text.chars().any(char::is_alphabetic) || !is_aggressive_right_start(first) {
+        return None;
+    }
+    Some(RightStartMode::Aggressive)
+}
+
+fn is_aggressive_right_start(ch: char) -> bool {
+    ch.is_uppercase() || matches!(ch, '“' | '‘' | '"' | '\'' | '«' | '(' | '[' | '—' | '–')
 }
 
 fn should_dehyphenate(text: &str) -> bool {
@@ -985,13 +1039,24 @@ mod tests {
     };
     use zip::{ZipWriter, write::SimpleFileOptions};
 
-    fn reflow_snippet(body: &str) -> ResourceReflow {
+    fn reflow_snippet_with_options(body: &str, options: &ReflowOptions) -> ResourceReflow {
         let xhtml = format!("<html><body>{body}</body></html>");
-        reflow_xhtml_resource(&xhtml, "chapter.xhtml").expect("snippet should reflow")
+        reflow_xhtml_resource(&xhtml, "chapter.xhtml", options).expect("snippet should reflow")
+    }
+
+    fn reflow_snippet(body: &str) -> ResourceReflow {
+        reflow_snippet_with_options(body, &ReflowOptions::default())
     }
 
     fn merge_count(body: &str) -> usize {
         reflow_snippet(body).merges.len()
+    }
+
+    fn aggressive_options() -> ReflowOptions {
+        ReflowOptions {
+            aggressive: true,
+            ..ReflowOptions::default()
+        }
     }
 
     #[test]
@@ -1025,6 +1090,42 @@ mod tests {
     }
 
     #[test]
+    fn aggressive_merges_uppercase_quote_bracket_and_dash_starts() {
+        let cases = [
+            "<p>review of David</p><p>Toop's Rap Attack.</p>",
+            "<p>Hello</p><p>“World.”</p>",
+            "<p>Hello</p><p>[World].</p>",
+            "<p>Hello</p><p>— World.</p>",
+        ];
+        let options = aggressive_options();
+
+        for body in cases {
+            assert_eq!(merge_count(body), 0, "default should not merge {body}");
+            let outcome = reflow_snippet_with_options(body, &options);
+            assert_eq!(outcome.merges.len(), 1, "aggressive should merge {body}");
+            assert!(outcome.merges[0].aggressive);
+        }
+    }
+
+    #[test]
+    fn aggressive_rejects_letterless_right_paragraph() {
+        let options = aggressive_options();
+
+        assert_eq!(
+            reflow_snippet_with_options("<p>Hello</p><p>— 12 —</p>", &options)
+                .merges
+                .len(),
+            0
+        );
+        assert_eq!(
+            reflow_snippet_with_options("<p>Hello</p><p>[123]</p>", &options)
+                .merges
+                .len(),
+            0
+        );
+    }
+
+    #[test]
     fn unicode_lowercase_starts_merge() {
         let outcome = reflow_snippet("<p>Hello</p><p>éclat.</p>");
 
@@ -1038,6 +1139,26 @@ mod tests {
             merge_count(r#"<p class="body">Hello</p><p class="note">world.</p>"#),
             0
         );
+    }
+
+    #[test]
+    fn aggressive_merges_unequal_classes_and_records_audit_fields() {
+        let outcome = reflow_snippet_with_options(
+            r#"<p class="calibre6">review of David</p><p class="calibre1">Toop’s Rap Attack.</p>"#,
+            &aggressive_options(),
+        );
+
+        assert_eq!(outcome.merges.len(), 1);
+        assert!(
+            outcome
+                .xhtml
+                .contains(r#"<p class="calibre6">review of David Toop’s Rap Attack.</p>"#),
+            "got: {}",
+            outcome.xhtml
+        );
+        assert!(outcome.merges[0].aggressive);
+        assert_eq!(outcome.merges[0].left_class.as_deref(), Some("calibre6"));
+        assert_eq!(outcome.merges[0].right_class.as_deref(), Some("calibre1"));
     }
 
     #[test]
@@ -1141,7 +1262,58 @@ mod tests {
                 left_preview: "Alpha line carries enough text for previ...".to_string(),
                 right_preview: "beta line continues.".to_string(),
                 dehyphenated: false,
+                aggressive: false,
+                left_class: None,
+                right_class: None,
             }
+        );
+    }
+
+    #[test]
+    fn report_marks_only_relaxed_rule_merges_as_aggressive() {
+        let outcome = reflow_snippet_with_options(
+            r#"<p class="body">Hello</p><p class="body">world</p><p class="note">again.</p>"#,
+            &aggressive_options(),
+        );
+
+        assert_eq!(outcome.merges.len(), 2);
+        assert!(!outcome.merges[0].aggressive);
+        assert!(outcome.merges[1].aggressive);
+        assert_eq!(outcome.merges[1].left_class.as_deref(), Some("body"));
+        assert_eq!(outcome.merges[1].right_class.as_deref(), Some("note"));
+        assert!(
+            serde_json::to_string_pretty(&outcome.merges[1])
+                .expect("record should serialize")
+                .contains(r#""aggressive": true"#)
+        );
+        assert!(
+            serde_json::to_string_pretty(&outcome.merges[1])
+                .expect("record should serialize")
+                .contains(r#""left_class": "body""#)
+        );
+        assert!(
+            serde_json::to_string_pretty(&outcome.merges[1])
+                .expect("record should serialize")
+                .contains(r#""right_class": "note""#)
+        );
+    }
+
+    #[test]
+    fn conservative_record_json_omits_aggressive_field() {
+        let outcome = reflow_snippet("<p>Hello</p><p>world.</p>");
+        let json =
+            serde_json::to_string_pretty(&outcome.merges[0]).expect("record should serialize");
+
+        assert_eq!(
+            json,
+            r#"{
+  "resource": "chapter.xhtml",
+  "block_index": 0,
+  "merged_block_index": 1,
+  "left_preview": "Hello",
+  "right_preview": "world.",
+  "dehyphenated": false
+}"#
         );
     }
 
@@ -1151,8 +1323,15 @@ mod tests {
         let output = unique_temp_path("bookforge-reflow-dry-run", "epub");
         let _ = fs::remove_file(&output);
 
-        let outcome = reflow_epub(&input, &output, &ReflowOptions { dry_run: true })
-            .expect("dry run should reflow");
+        let outcome = reflow_epub(
+            &input,
+            &output,
+            &ReflowOptions {
+                dry_run: true,
+                ..ReflowOptions::default()
+            },
+        )
+        .expect("dry run should reflow");
 
         assert!(!outcome.output_written);
         assert!(!output.exists());

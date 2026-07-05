@@ -259,6 +259,7 @@ mod tests {
             "--output",
             "reflowed.epub",
             "--dry-run",
+            "--aggressive",
         ]);
 
         match cli.command {
@@ -266,6 +267,7 @@ mod tests {
                 assert_eq!(args.input, PathBuf::from("source.epub"));
                 assert_eq!(args.output, PathBuf::from("reflowed.epub"));
                 assert!(args.dry_run);
+                assert!(args.aggressive);
             }
             _ => panic!("expected reflow command"),
         }

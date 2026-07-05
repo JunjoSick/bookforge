@@ -23,6 +23,10 @@ pub struct ReflowArgs {
     /// Write the report and summary without producing an output EPUB.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Enable opt-in relaxed paragraph merging for proper-noun and quoted continuations.
+    #[arg(long)]
+    pub aggressive: bool,
 }
 
 pub async fn run(args: ReflowArgs) -> Result<()> {
@@ -39,6 +43,7 @@ pub async fn run(args: ReflowArgs) -> Result<()> {
         &args.output,
         &ReflowOptions {
             dry_run: args.dry_run,
+            aggressive: args.aggressive,
         },
     )
     .with_context(|| format!("reflowing {}", args.input.display()))?;
