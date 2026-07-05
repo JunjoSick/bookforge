@@ -2333,12 +2333,22 @@ Merges chain (A+B+C…) as long as each successive pair qualifies.
 B's inline children are appended to A's children verbatim; A's
 attributes win for the merged block.
 
-**`--aggressive` (ruling 2026-07-05, owner-approved).** An opt-in flag
-that relaxes condition 3 only: B may also start with an uppercase
-letter, an opening quote/bracket (`“` `‘` `"` `'` `«` `(` `[`), or a
-dash (`—` `–`). All other conditions hold, plus one extra guard that
-replaces the letterless screen condition 3 gave for free: **B must
-contain at least one alphabetic character** (mirror of condition 7).
+**`--aggressive` (ruling 2026-07-05, owner-approved; amended same day).**
+An opt-in flag that relaxes two conditions:
+
+- Condition 3: B may also start with an uppercase letter, an opening
+  quote/bracket (`“` `‘` `"` `'` `«` `(` `[`), or a dash (`—` `–`).
+- Condition 4 (amended ruling): class equality is **not** required.
+  Calibre-style PDF conversions assign per-line classes (`calibre1`,
+  `calibre6`, …) as typographic artifacts of line position, so the
+  class guard blocks exactly the continuation lines aggressive mode
+  exists for. A's class wins (A's attributes already win); when the
+  two classes differ the merge record carries `left_class`/
+  `right_class` for audit.
+
+All other conditions hold, plus one extra guard that replaces the
+letterless screen condition 3 gave for free: **B must contain at least
+one alphabetic character** (mirror of condition 7).
 Rationale: the conservative rule leaves continuation lines split when
 they begin with a proper noun or bracketed insert (observed on CCRU:
 "…review of David" / "Toop's Rap Attack…"); the cost is a real
