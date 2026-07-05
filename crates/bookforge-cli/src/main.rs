@@ -18,8 +18,8 @@ use commands::serve;
 #[cfg(feature = "tui")]
 use commands::watch;
 use commands::{
-    convert, doctor, entity, estimate, glossary, ingest_flags, inspect, resume, retry, review,
-    status, style, tail, translate, validate,
+    convert, doctor, entity, estimate, glossary, ingest_flags, inspect, reflow, resume, retry,
+    review, status, style, tail, translate, validate,
 };
 #[cfg(any(test, not(feature = "serve")))]
 use std::io::Write;
@@ -52,6 +52,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Convert(convert::ConvertArgs),
+    Reflow(reflow::ReflowArgs),
     Inspect(inspect::InspectArgs),
     Estimate(estimate::EstimateArgs),
     Translate(Box<translate::TranslateArgs>),
@@ -109,6 +110,7 @@ fn parse_cli() -> Result<Cli> {
 async fn run_command(command: Command, cancel_token: CancellationToken) -> Result<()> {
     match command {
         Command::Convert(args) => convert::run(args).await,
+        Command::Reflow(args) => reflow::run(args).await,
         Command::Inspect(args) => inspect::run(args).await,
         Command::Estimate(args) => estimate::run(args).await,
         Command::Translate(args) => translate::run(*args, cancel_token).await,
@@ -245,6 +247,29 @@ mod tests {
                 assert_eq!(args.profile, TranslationProfile::V1Fast);
             }
             _ => panic!("expected translate command"),
+        }
+    }
+
+    #[test]
+    fn reflow_requires_output_and_accepts_dry_run() {
+        let cli = Cli::parse_from([
+            "bookforge",
+            "reflow",
+            "source.epub",
+            "--output",
+            "reflowed.epub",
+            "--dry-run",
+            "--aggressive",
+        ]);
+
+        match cli.command {
+            Some(Command::Reflow(args)) => {
+                assert_eq!(args.input, PathBuf::from("source.epub"));
+                assert_eq!(args.output, PathBuf::from("reflowed.epub"));
+                assert!(args.dry_run);
+                assert!(args.aggressive);
+            }
+            _ => panic!("expected reflow command"),
         }
     }
 
