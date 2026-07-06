@@ -1828,9 +1828,9 @@ function bfToggleAdvanced() { syncWizInputs(); App.wizard.advancedOpen = !App.wi
 function bfPickProvider(id) { syncWizInputs(); const w = App.wizard; w.provider = id; const opt = providerOption(id); w.model = opt.default_model || (opt.models||[])[0] || w.model; w.estimate = null; renderReviewStep($("#wizbody")); }
 function bfPickModel(m) { syncWizInputs(); App.wizard.model = m; App.wizard.estimate = null; renderReviewStep($("#wizbody")); }
 function bfConc(d) { const el = $("#w_conc"); if (!el) return; let v = (parseInt(el.value,10)||1) + d; v = Math.max(1, Math.min(16, v)); el.value = v; App.wizard.concurrency = v; }
-function bfCycleQa() { const w = App.wizard; w.qa = w.qa === "off" ? "suspicious" : w.qa === "suspicious" ? "all" : "off"; renderReviewStep($("#wizbody")); }
-function bfCycleContext() { const w = App.wizard; w.context = w.context >= 6 ? 0 : w.context + 1; renderReviewStep($("#wizbody")); }
-function bfToggleValidate() { App.wizard.validate = !App.wizard.validate; renderReviewStep($("#wizbody")); }
+function bfCycleQa() { syncWizInputs(); const w = App.wizard; w.qa = w.qa === "off" ? "suspicious" : w.qa === "suspicious" ? "all" : "off"; renderReviewStep($("#wizbody")); }
+function bfCycleContext() { syncWizInputs(); const w = App.wizard; w.context = w.context >= 6 ? 0 : w.context + 1; renderReviewStep($("#wizbody")); }
+function bfToggleValidate() { syncWizInputs(); App.wizard.validate = !App.wizard.validate; renderReviewStep($("#wizbody")); }
 
 async function requestEstimate() {
   const w = App.wizard; if (!w.file) return;
