@@ -1524,13 +1524,13 @@ where
                 let Some(batch) = pending_queue.pop_front() else {
                     break;
                 };
+                let output_override = escalated_output_tokens.remove(&batch.id);
                 let mut normalized = normalize_batch_for_current_sizer(
                     batch,
                     batch_sizer.as_deref(),
                     Some(config.as_ref()),
                 );
                 let batch = normalized.remove(0);
-                let output_override = escalated_output_tokens.remove(&batch.id);
                 for extra in normalized.into_iter().rev() {
                     pending_queue.push_front(extra);
                 }
@@ -4359,6 +4359,76 @@ mod tests {
             !events
                 .iter()
                 .any(|event| { matches!(event, bookforge_core::ProgressEvent::BatchSplit { .. }) })
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_truncation_escalated_retry_survives_adaptive_renaming() {
+        let long_source = "long ".repeat(3_600);
+        let seg = make_segment("seg1", vec![plain_block(&long_source)], vec![]);
+        let segments = vec![seg];
+        let cfg = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            adaptive_sizing: true,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+        assert_eq!(batches.len(), 1);
+        assert!(
+            batches[0].token_estimate
+                > BatchSizer::new(cfg.target_tokens, cfg.max_items).target_tokens(),
+            "fixture must force adaptive normalization to rename the single-item batch"
+        );
+        let item_ids = batches[0]
+            .items
+            .iter()
+            .map(|item| (item.item_id.clone(), "Tradotto lungo".to_string()))
+            .collect::<Vec<_>>();
+        let max_tokens = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingSequenceProvider::new(
+            vec![
+                RecordedResponse::FinishLength,
+                RecordedResponse::ItemsFromBatch(item_ids),
+            ],
+            max_tokens.clone(),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let progress = Arc::new(RecordingProgress {
+            events: events.clone(),
+        });
+        let mut sizer = BatchSizer::new(cfg.target_tokens, cfg.max_items);
+
+        let translations = translate_batches_with_callback(
+            provider,
+            batches,
+            &segments,
+            &test_run_config(),
+            Arc::new(TelemetryLog::new()),
+            None,
+            Some(&mut sizer),
+            progress,
+            None,
+            |_| Ok(()),
+        )
+        .await
+        .expect("escalated retry should survive adaptive renaming");
+
+        assert_eq!(translations.len(), 1);
+        let budgets = max_tokens.lock().unwrap().clone();
+        assert_eq!(budgets.len(), 2);
+        assert!(
+            budgets[1].unwrap() > budgets[0].unwrap(),
+            "second request should keep the escalated output budget after adaptive renaming: {budgets:?}"
+        );
+        let events = events.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| { matches!(event, bookforge_core::ProgressEvent::BatchSplit { .. }) }),
+            "batch should not split before the escalated retry"
         );
     }
 

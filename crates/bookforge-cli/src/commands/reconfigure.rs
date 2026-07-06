@@ -205,6 +205,7 @@ pub async fn run(args: ReconfigureArgs) -> Result<()> {
     for line in describe_overrides(&merged) {
         println!("  {line}");
     }
+    println!("Apply: {}", apply_instructions(&args.job_id));
     Ok(())
 }
 
@@ -242,8 +243,23 @@ pub(crate) fn load_overrides_for_job(job_id: &str) -> Result<Option<RunConfigOve
     load_overrides_from_path(&overrides_path_for_job(job_id))
 }
 
+pub(crate) fn clear_overrides_for_job(job_id: &str) -> Result<PathBuf> {
+    let path = overrides_path_for_job(job_id);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
 pub(crate) fn overrides_path_for_job(job_id: &str) -> PathBuf {
     run_dir_for_job(job_id).join("overrides.json")
+}
+
+pub(crate) fn apply_instructions(job_id: &str) -> String {
+    format!(
+        "Stop the paused run first: `bookforge stop {job_id}`, then `bookforge resume {job_id}` to apply overrides. If the paused process is already gone, use `bookforge resume {job_id} --force`."
+    )
 }
 
 pub(crate) fn describe_overrides(overrides: &RunConfigOverrides) -> Vec<String> {

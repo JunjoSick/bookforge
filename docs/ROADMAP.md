@@ -2561,6 +2561,10 @@ seam to amend them.
    the control-file architecture from §10.1.1). On `resume` (and on a live
    run's next batch boundary, if feasible later), merge the overrides over the
    loaded `RunConfigSnapshot`.
+   For v1, live fast-resume of an already-paused process cannot apply pending
+   overrides because that process keeps its in-memory scheduler settings. Stop
+   the paused run first and then `resume`, or use `resume --force` only when the
+   paused process is already gone; full live application remains deferred.
 3. **Guardrails — reject cache-affecting settings.** Only settings that change
    *how remaining work is scheduled/budgeted* are mutable. Immutable
    (would make partial output inconsistent or invalidate the cache):
