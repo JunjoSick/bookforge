@@ -79,3 +79,86 @@ proportional to item count), so truncation-driven splits spiral.
 - The un-mockable acceptance (maintainer's job, not yours): a real provider run
   that (1) reconfigures a paused job's output budget and resumes to completion,
   and (2) triggers the systemic-truncation alert on a hard target.
+
+## Fix pass — review of PR #26 (Claude, 2026-07-06)
+
+The initial commit `6a98137` is correct on the truncation state machine
+(terminates, additive alert, no dep/schema/prompt changes) and on the reconfigure
+guardrails. An independent review found **three real defects**. Rulings below are
+binding — implement all three with tests, run the full gate before committing, do
+not push.
+
+### Fix 1 (BLOCKER) — live fast-resume silently ignores overrides
+
+`resume.rs` (`run`, the `job.status == "paused" && !args.force` branch): this path
+signals the already-running parked process via a Resume control file and returns.
+That live process keeps its **old in-memory settings** and never reads
+`overrides.json`, so the natural `pause → reconfigure → resume` silently drops the
+new budget — defeating §10.1.3 acceptance #1.
+
+Full live re-application (resizing a running scheduler/semaphore mid-flight) stays
+**deferred** per the §10.1.3 "if feasible later" note — do NOT attempt it here.
+Instead make the gap **loud and give a working path**:
+
+- In that branch, before signalling, check `reconfigure::load_overrides_for_job`.
+  If overrides exist, do **not** silently fast-resume — `bail!` with an actionable
+  message, e.g.: *"job '<id>' has pending reconfigure overrides that a live
+  fast-resume cannot apply. Stop the paused run first: `bookforge stop <id>`, then
+  `bookforge resume <id>` to apply them. If the paused process is already gone, use
+  `bookforge resume <id> --force`."* (Both `stop`→`resume` and `resume --force`
+  route through `run_inner`, which already reads and applies overrides — verify
+  the stopped-job path in `run` at the `job.status == "stopped"` branch.)
+- With no overrides present, behaviour is unchanged.
+- Add the apply-instructions to `reconfigure::run`'s success stdout (one line:
+  how to make the overrides take effect, matching the message above).
+- Add a short note to ROADMAP §10.1.3 documenting this application model
+  (live fast-resume cannot apply overrides; use `stop`+`resume` or `resume
+  --force`; full live application deferred).
+- Test: a paused job with an overrides sidecar + `resume` (no `--force`) errors
+  with the guidance instead of returning Ok and skipping overrides.
+
+### Fix 2 (SHOULD-FIX) — escalation override lost when adaptive sizing renames the batch
+
+`batch.rs` ~line 1533: `escalated_output_tokens.remove(&batch.id)` runs **after**
+`normalize_batch_for_current_sizer`, which (`repack_batch_with_config`) renames the
+batch to `{base_id}_adaptive_{part}` whenever it exceeds the current sizer
+thresholds. The escalation arm inserted the override under the *as-queued* id, so
+if adaptive sizing shrinks between re-queue and re-pop the lookup misses and the
+escalated retry is dropped (falls back to split at the smaller budget — the spiral
+we were preventing).
+
+- Fix: capture the override from the **popped batch's id, before** calling
+  `normalize_batch_for_current_sizer` (that id equals the key the escalation arm
+  inserted under). Carry the captured `output_override` onto the primary
+  normalized batch (`normalized.remove(0)`); extras re-queue without it.
+- Keep the existing single-escalation invariant (escalated batches don't
+  re-escalate).
+- Test (mock, `adaptive_sizing: true`): a batch scheduled for an escalated retry
+  still runs its retry at the escalated budget even after a sizer change — assert
+  the retried request uses the escalated `max_output_tokens` and no premature
+  `BatchSplit` is emitted before the escalated retry.
+
+### Fix 3 (SHOULD-FIX) — stale overrides sidecar reused / never cleaned up
+
+`resume.rs`: `overrides.json` is loaded for **any** resume with no terminal-job
+guard and is never removed after success. Resuming an already-succeeded job
+re-applies stale overrides; a stale `validate-output: true` can rerun finalization
+and even `mark_job_failed` a previously-succeeded job.
+
+- Fix: **clear `overrides.json` on successful terminal completion** of a resume
+  (next to where the run finishes / control file is cleared — add a
+  `reconfigure::clear_overrides_for_job` helper mirroring the control-file clear;
+  removal must be idempotent / NotFound-tolerant).
+- Also guard application: do not apply overrides when the job entering `resume` is
+  already terminal (e.g. `succeeded`); only resumable states (`paused`/`stopped`)
+  should consume them.
+- Test: after a successful override-applied resume the sidecar is gone; a second
+  resume of the now-succeeded job neither reads nor re-applies it.
+
+### Gate + commit
+
+- `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -A
+  clippy::too_many_arguments -D warnings`, `cargo test --workspace --locked` must
+  all pass before committing.
+- Conventional-commit each logical fix (or one `fix:` commit covering all three is
+  fine). Do NOT push — leave for maintainer verify + merge.
