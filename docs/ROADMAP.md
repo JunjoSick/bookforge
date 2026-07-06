@@ -2474,6 +2474,165 @@ across machine reboots beyond what the control file naturally provides.
 **Effort:** 1–2 days engine + 1 day surfaces. **Priority:** after v1.7
 ships; pairs naturally with §9c in a quality-of-life release.
 
+> **Shipped 2026-07-05 in v2.3.0**, alongside §9c reflow (+`--aggressive`).
+> The finalize-stage pause path required a fix pass (threading the shared
+> PauseSignal into QA/double-check, a run-long control-file watcher, and
+> resumable stop) caught by a pre-merge review; see
+> `docs/codex-fix-pause-review.md`.
+
+#### 10.1.2 Mini-spec: In-dashboard review & correction loop (added 2026-07-06, owner-approved)
+
+**Goal.** Make the `serve` dashboard's Review screen *editable* so a
+non-developer translator can fix a flagged / `needs_review` segment in
+place — edit the translation, save it, and rebuild — without touching the
+CLI. Today Review is read-only (`GET /api/jobs/{id}/review`); the only
+correction path is the CLI `ingest-flags` JSON workflow + `retry`, which the
+dashboard's intended audience (translator friends dogfooding real books)
+cannot use. Every real-provider run to date has produced `needs_review`
+segments — recurring case: quote-heavy blocks the model leaves partly
+untranslated — whose remediation is currently developer-only. Closing this
+loop is what turns BookForge from "automated translator you monitor" into
+"the translator's cockpit."
+
+**Design — reuse existing seams, no new deps (§1.6):**
+
+1. **Store: human-override provenance.** Persist a corrected translation
+   with an explicit manual-source marker (provider/model recorded as
+   `manual`, a `human_corrected` flag) so re-runs / QA / double-check never
+   overwrite a human edit and reports can distinguish it. Additive
+   column(s) only (§1.5 events / §11.2 forward migration).
+2. **Engine/CLI: a correction is just a translation write + rebuild.**
+   Reuse `save_translation` and the existing rebuild path
+   (`persist_corrected_translations` / `rebuild_epub_with_options`). Add
+   `bookforge correct <job-id> --segment <id> (--text … | --from-file …)`
+   as the CLI twin so the loop is scriptable and mock-testable.
+3. **Serve: editable Review + save.** New
+   `POST /api/jobs/{id}/segments/{segment-id}/translation` (CSRF-protected,
+   localhost-only, same pattern as the §10.1.1 pause/stop POSTs). The
+   Review screen renders each segment's source + current translation;
+   flagged / `needs_review` ones get an inline editable field with **Save**
+   and **re-translate with a hint** (feeds `ingest-flags`-style guidance
+   into a single-segment retry). Saving persists the override and triggers a
+   rebuild; the events stream reflects it.
+4. **Idempotency + status.** A manual override marks the segment terminal,
+   clears its review flag, and recomputes job status (mirrors the
+   finalize-status handling added in §10.1.1). Resume / QA / double-check
+   must treat `human_corrected` segments as frozen.
+
+**Acceptance.**
+1. In the dashboard, a `needs_review` segment can be edited, saved, and the
+   rebuilt EPUB reflects the change — no CLI, no restart.
+2. A human-corrected segment is never overwritten by a later resume, QA, or
+   double-check pass.
+3. The correction is auditable (report shows it as `manual`) and the output
+   stays EPUBCheck-clean.
+4. CLI `bookforge correct` and the dashboard path produce equivalent results
+   (mock-provider e2e; assert on rebuilt-EPUB SHA where applicable).
+5. A pre-feature job with no overrides behaves exactly as today.
+
+**Out of scope:** full side-by-side/WYSIWYG diff editor, multi-user editing
+or locking, translation-memory suggestions while editing (that's the
+fuzzy-TM sketch in §10.1), batch bulk-edit. Keep it one-segment-at-a-time.
+
+**Effort:** ~1 day store+engine+CLI, ~1–2 days dashboard. **Priority:**
+high — completes the review loop the v2 dashboard started and is the top
+blocker for the non-developer audience.
+
+#### 10.1.3 Mini-spec: On-the-fly settings reconfiguration (added 2026-07-06, owner-approved)
+
+**Goal.** Adjust *cache-safe* run settings on an existing (initially: paused)
+job and have `resume` apply them — without starting a fresh run and losing
+progress. Motivated directly by real use: a run hit repeated output
+truncation on an extreme target (Italian → Toki Pona), and the only way to
+raise `--batch-max-output-tokens` / lower `--batch-max-items` was to abandon
+the job and re-launch from zero. Run settings are baked into the
+`RunConfigSnapshot` at launch and replayed verbatim on resume; there is no
+seam to amend them.
+
+**Design — CLI-first, reuse existing seams, no new deps (§1.6):**
+
+1. **CLI command.** `bookforge reconfigure <job-id> [flags…]` writing only the
+   allowed knobs, e.g. `--batch-max-output-tokens`, `--batch-max-items`,
+   `--batch-target-tokens`, `--concurrency`, `--qa`, `--double-check`,
+   `--validate-output`, `--provider-max-attempts`, adaptive-concurrency
+   toggles.
+2. **Persistence: an overrides sidecar.** Write
+   `.bookforge/runs/<job-id>/overrides.json` (additive, no migration — matches
+   the control-file architecture from §10.1.1). On `resume` (and on a live
+   run's next batch boundary, if feasible later), merge the overrides over the
+   loaded `RunConfigSnapshot`.
+   For v1, live fast-resume of an already-paused process cannot apply pending
+   overrides because that process keeps its in-memory scheduler settings. Stop
+   the paused run first and then `resume`, or use `resume --force` only when the
+   paused process is already gone; full live application remains deferred.
+3. **Guardrails — reject cache-affecting settings.** Only settings that change
+   *how remaining work is scheduled/budgeted* are mutable. Immutable
+   (would make partial output inconsistent or invalidate the cache):
+   provider, model, source/target language, profile, context window/scope,
+   prompt version, glossary/style/entity inputs. Attempting to change these
+   fails with a clear message explaining a fresh run is required and why.
+4. **Surfaces.** CLI now. Dashboard later: the Advanced panel, editable on a
+   paused job's Progress screen (pairs with §10.1.2).
+
+**Acceptance.**
+1. Reconfigure a paused job's `--batch-max-output-tokens` + `--batch-max-items`,
+   resume, and the remaining batches use the new budget; already-succeeded
+   segments are not re-translated (cache/checkpoint identical).
+2. Attempting to change provider/model/language is rejected with a clear,
+   actionable message.
+3. Overrides are auditable (visible in `status`), additive, and a job with no
+   overrides resumes exactly as today.
+
+**Out of scope (for v1):** live reconfiguration of a *running* (non-paused)
+job mid-batch; changing the model/provider mid-job; reconfiguring completed
+jobs.
+
+**Effort:** ~1 day CLI + snapshot-merge. **Priority:** high — small, and it
+removes a real "lost all my progress to change one number" cliff.
+
+#### 10.1.4 Mini-spec: Truncation handling + fail-fast alert (added 2026-07-06, owner-approved)
+
+**Goal.** Handle `max_output_tokens` truncation intelligently, and surface a
+prominent, actionable **alert** when truncation is *systemic* instead of
+spiraling silently. Surfaced by the Toki Pona limit test: a minimal-vocabulary
+target forces long circumlocutions, and its words fragment into many subword
+tokens, so output token count vastly exceeds the input-proportional budget
+(`input × 3–5`, capped 32k). Every batch truncated mid-JSON; the scheduler's
+reflex is to *split* (`batch_invalid_response_split`), but the per-batch budget
+is proportional to item count, so each split gets a *smaller* ceiling and
+truncates again — recursing to single items that also fail. Result: ~5 minutes
+of churn, mostly failures, with no clear signal to the operator.
+
+**Design (in `bookforge-llm` batch scheduler, `batch.rs`):**
+
+1. **Distinguish truncation from invalid JSON.** The failure branch already
+   knows `RequestStatus::Truncated` vs invalid JSON — act on it differently.
+2. **Escalate-then-split.** On truncation, first **retry the same batch with an
+   escalated `max_output_tokens`** (e.g. toward the model cap / a bounded
+   multiple of the last budget) before falling back to splitting. Splitting is
+   correct for isolating a few pathological items; it is backwards for a budget
+   that was simply too small.
+3. **Fail-fast alert on systemic truncation.** Track the truncation rate; when
+   it crosses a threshold (e.g. N consecutive batches, or >X% still truncating
+   after escalation), emit a prominent additive alert event (new
+   `ProgressEvent` variant or a distinct `Warning` kind, §1.5) surfaced in CLI
+   `--ui`, `watch`, and the dashboard — with an actionable message ("output
+   budget repeatedly exhausted; the target/model may be producing runaway
+   output — raise `--batch-max-output-tokens`, lower `--batch-max-items`, or try
+   a different model"). Optionally auto-park (pause) rather than burn tokens.
+
+**Acceptance.**
+1. A single legitimately-long segment that fits under the model cap succeeds
+   after escalation instead of being marked failed.
+2. On systemic truncation, a clear alert appears within a bounded number of
+   failures (not a multi-minute silent spiral), and spend is bounded.
+3. Events are additive (§1.5); no new dependencies (§1.6); normal runs (no
+   truncation) are unaffected and byte-stable.
+
+**Effort:** ~1 day. **Priority:** medium-high — bounds cost and confusion on
+hard targets; pairs naturally with §10.1.3 (the alert tells you what to
+reconfigure).
+
 ### 10.2 Explicit non-goals (still)
 
 - LLM-driven DOM repair. Architectural invariant violation.

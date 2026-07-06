@@ -31,6 +31,7 @@ const PAUSED_RESUME_POLL: Duration = Duration::from_millis(250);
 
 use crate::{
     QaMode,
+    commands::{reconfigure, validate},
     performance::performance_summary_from_events,
     report::{ReportInput, write_report},
 };
@@ -58,8 +59,8 @@ pub struct ResumeArgs {
     #[arg(long)]
     pub validation_max_attempts: Option<usize>,
 
-    #[arg(long, value_enum, default_value_t = QaMode::Off)]
-    pub qa: QaMode,
+    #[arg(long, value_enum)]
+    pub qa: Option<QaMode>,
 
     #[arg(long)]
     pub timeout_seconds: Option<u64>,
@@ -93,28 +94,14 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
         anyhow::bail!("job '{}' was not found", args.job_id);
     };
     if job.status == "paused" && !args.force {
-        let path = crate::control::request_job_control(&args.job_id, ControlCommand::Resume)?;
-        if human_stdout_enabled(args.ui) {
-            println!("resume requested for {} ({})", args.job_id, path.display());
-        }
-        if wait_for_paused_job_to_leave_paused(
-            &store,
-            &args.job_id,
-            PAUSED_RESUME_WAIT,
-            PAUSED_RESUME_POLL,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        eprintln!("{}", dead_paused_resume_hint(&args.job_id));
-        return Ok(());
+        return live_fast_resume_paused_job(&store, &args).await;
     }
     crate::control::clear_job_control(&args.job_id)?;
     if (job.status == "paused" && args.force) || job.status == "stopped" {
         store.mark_job_running_for_resume(&args.job_id)?;
     }
     let mut snapshot = load_resume_snapshot(&store, &args.job_id)?;
+    let overrides = load_resume_overrides_for_status(&args.job_id, &job.status)?;
 
     let progress_jsonl = args
         .progress_jsonl
@@ -127,8 +114,44 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
     );
     let progress = reporter.sink();
 
-    let run_result = run_inner(args, store, job, &mut snapshot, progress).await;
+    let run_result = run_inner(args, store, job, &mut snapshot, overrides, progress).await;
     finalize_reporter(run_result, reporter).await
+}
+
+async fn live_fast_resume_paused_job(store: &JobStore, args: &ResumeArgs) -> Result<()> {
+    if reconfigure::load_overrides_for_job(&args.job_id)?.is_some() {
+        anyhow::bail!(
+            "job '{}' has pending reconfigure overrides that a live fast-resume cannot apply. {}",
+            args.job_id,
+            reconfigure::apply_instructions(&args.job_id)
+        );
+    }
+    let path = crate::control::request_job_control(&args.job_id, ControlCommand::Resume)?;
+    if human_stdout_enabled(args.ui) {
+        println!("resume requested for {} ({})", args.job_id, path.display());
+    }
+    if wait_for_paused_job_to_leave_paused(
+        store,
+        &args.job_id,
+        PAUSED_RESUME_WAIT,
+        PAUSED_RESUME_POLL,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    eprintln!("{}", dead_paused_resume_hint(&args.job_id));
+    Ok(())
+}
+
+fn load_resume_overrides_for_status(
+    job_id: &str,
+    job_status: &str,
+) -> Result<Option<reconfigure::RunConfigOverrides>> {
+    match job_status {
+        "paused" | "stopped" => reconfigure::load_overrides_for_job(job_id),
+        _ => Ok(None),
+    }
 }
 
 async fn wait_for_paused_job_to_leave_paused(
@@ -188,6 +211,7 @@ async fn run_inner(
     store: JobStore,
     job: JobRecord,
     snapshot: &mut RunConfigSnapshot,
+    overrides: Option<reconfigure::RunConfigOverrides>,
     progress: Arc<dyn ProgressSink>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
@@ -216,6 +240,17 @@ async fn run_inner(
     });
     let book = read_epub(&input)?;
     let mut settings = snapshot.settings.to_settings();
+    let qa_mode = args
+        .qa
+        .or_else(|| overrides.as_ref().and_then(|overrides| overrides.qa))
+        .unwrap_or(QaMode::Off);
+    let validate_output = overrides
+        .as_ref()
+        .and_then(|overrides| overrides.validate_output)
+        .unwrap_or(false);
+    if let Some(overrides) = overrides.as_ref() {
+        reconfigure::apply_overrides_to_settings(&mut settings, overrides);
+    }
     if let Some(value) = args.concurrency {
         settings.scheduler.concurrency = value.max(1);
     }
@@ -492,7 +527,7 @@ async fn run_inner(
         &run_config,
         snapshot,
         &settings,
-        args.qa,
+        qa_mode,
         progress.clone(),
         stop_cancel_token.clone(),
     )
@@ -576,6 +611,20 @@ async fn run_inner(
     let block_translations = rebuild_block_translations(&segments, &stored_blocks, &translations);
     let rebuild_options = super::translate::rebuild_options_from_snapshot(snapshot);
     rebuild_epub_with_options(&book, &block_translations, &output, &rebuild_options)?;
+    if validate_output {
+        let validation_path = validate::default_report_path(&output);
+        let validation = validate::validate_and_write(&output, &validation_path, false)?;
+        if print_stdout {
+            println!("Validation report: {}", validation_path.display());
+        }
+        if validation.failed {
+            store.mark_job_failed(&job.id)?;
+            anyhow::bail!(
+                "rebuilt EPUB failed validation; see {}",
+                validation_path.display()
+            );
+        }
+    }
     loop {
         if matches!(
             control_poller
@@ -619,6 +668,7 @@ async fn run_inner(
     snapshot.report_json_path = Some(report.json.clone());
     snapshot.report_markdown_path = Some(report.markdown.clone());
     store.update_job_config_snapshot(&job.id, snapshot)?;
+    reconfigure::clear_overrides_for_job(&job.id)?;
     progress.emit(ProgressEvent::ArtifactWritten {
         path: output.display().to_string(),
         timestamp_ms: now_ms(),
@@ -1124,7 +1174,7 @@ mod tests {
     use bookforge_store::{CreateJob, SaveNeedsReview, SaveTranslation};
     use std::{
         io::Write,
-        path::Path,
+        path::{Path, PathBuf},
         sync::Mutex,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -1204,6 +1254,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paused_fast_resume_with_overrides_errors_with_apply_guidance() {
+        let fixture = resume_fixture(TranslationProfile::V1Fast.resolve(), 1);
+        fixture
+            .store
+            .mark_job_paused(&fixture.job.id)
+            .expect("job should mark paused");
+        let _path = write_overrides_sidecar(
+            &fixture.job.id,
+            &reconfigure::RunConfigOverrides {
+                batch_max_output_tokens: Some(12_000),
+                ..reconfigure::RunConfigOverrides::default()
+            },
+        );
+        let args = resume_args(&fixture.job.id);
+
+        let error = live_fast_resume_paused_job(&fixture.store, &args)
+            .await
+            .expect_err("pending overrides must block live fast-resume");
+        let message = error.to_string();
+
+        assert!(message.contains("live fast-resume cannot apply"));
+        assert!(message.contains(&format!("bookforge stop {}", fixture.job.id)));
+        assert!(message.contains(&format!("bookforge resume {}", fixture.job.id)));
+        assert!(message.contains("--force"));
+        assert_eq!(
+            bookforge_core::read_control_file(&bookforge_core::control_path_for_job(
+                &fixture.job.id
+            ))
+            .expect("control file should read"),
+            ControlCommand::Run
+        );
+        reconfigure::clear_overrides_for_job(&fixture.job.id).expect("sidecar should clear");
+    }
+
+    #[tokio::test]
     async fn resume_uses_snapshot_segmentation_settings() {
         let mut settings = TranslationProfile::V1Fast.resolve();
         settings.batch.enabled = false;
@@ -1266,6 +1351,105 @@ mod tests {
         let runtime = runtime_config_event(&events);
         assert_eq!(runtime.json_mode, "PromptOnly");
         assert_eq!(runtime.provider_max_attempts, 4);
+    }
+
+    #[tokio::test]
+    async fn resume_applies_reconfigure_overrides_without_retranslating_succeeded_segments() {
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.batch.enabled = true;
+        settings.batch.target_tokens = 8_000;
+        settings.batch.max_items = 8;
+        settings.batch.adaptive_sizing = true;
+        settings.provider.batch_max_output_tokens = Some(2_000);
+        settings.provider.provider_max_attempts = 2;
+        let mut fixture = resume_fixture(settings, 2);
+        save_succeeded(
+            &fixture.store,
+            &fixture.job.id,
+            &fixture.segments[0],
+            "stored",
+        );
+        fixture
+            .store
+            .mark_segment_failed(&fixture.job.id, &fixture.segments[1].id.0, "retry")
+            .expect("second segment should be retryable");
+
+        let events = run_fixture_with_overrides(
+            &mut fixture,
+            Some(reconfigure::RunConfigOverrides {
+                batch_max_output_tokens: Some(12_000),
+                batch_max_items: Some(1),
+                batch_target_tokens: Some(4_000),
+                provider_max_attempts: Some(5),
+                adaptive_concurrency: Some(true),
+                adaptive_batch_sizing: Some(false),
+                ..reconfigure::RunConfigOverrides::default()
+            }),
+        )
+        .await
+        .expect("resume should apply reconfigure overrides");
+        let runtime = runtime_config_event(&events);
+
+        assert_eq!(runtime.batch_max_output_tokens, Some(12_000));
+        assert_eq!(runtime.batch_max_items, 1);
+        assert_eq!(runtime.batch_target_tokens, 4_000);
+        assert_eq!(runtime.provider_max_attempts, 5);
+        assert!(runtime.adaptive_concurrency);
+        assert!(!runtime.adaptive_batch_sizing);
+        assert_eq!(
+            segment_finished_ids(&events),
+            vec![fixture.segments[1].id.0.clone()]
+        );
+        let stored = fixture
+            .store
+            .load_block_translations(&fixture.job.id)
+            .expect("stored translations should load");
+        assert!(
+            stored
+                .iter()
+                .any(|block| block.segment_id == fixture.segments[0].id.0
+                    && block.text.starts_with("stored")),
+            "succeeded segment should keep its original checkpointed translation"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_clears_overrides_after_success_and_terminal_status_ignores_stale_sidecar() {
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.batch.enabled = false;
+        settings.provider.batch_max_output_tokens = Some(2_000);
+        let mut fixture = resume_fixture(settings, 1);
+        let overrides = reconfigure::RunConfigOverrides {
+            batch_max_output_tokens: Some(12_000),
+            ..reconfigure::RunConfigOverrides::default()
+        };
+        let path = write_overrides_sidecar(&fixture.job.id, &overrides);
+
+        let events = run_fixture_with_overrides(&mut fixture, Some(overrides))
+            .await
+            .expect("resume should apply overrides and finish");
+        let runtime = runtime_config_event(&events);
+
+        assert_eq!(runtime.batch_max_output_tokens, Some(12_000));
+        assert!(
+            !path.exists(),
+            "successful terminal resume should remove overrides sidecar"
+        );
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("sidecar parent should exist");
+        }
+        std::fs::write(&path, "{not valid json").expect("stale malformed sidecar should write");
+        let overrides = load_resume_overrides_for_status(&fixture.job.id, "succeeded")
+            .expect("terminal job should not read stale sidecar");
+
+        assert!(overrides.is_none());
+        assert!(
+            path.exists(),
+            "terminal status guard should not consume the stale sidecar"
+        );
+        reconfigure::clear_overrides_for_job(&fixture.job.id)
+            .expect("stale sidecar should clean up");
     }
 
     #[tokio::test]
@@ -1640,18 +1824,41 @@ mod tests {
     }
 
     async fn run_fixture(fixture: &mut ResumeFixture) -> Result<Vec<ProgressEvent>> {
+        run_fixture_with_overrides(fixture, None).await
+    }
+
+    async fn run_fixture_with_overrides(
+        fixture: &mut ResumeFixture,
+        overrides: Option<reconfigure::RunConfigOverrides>,
+    ) -> Result<Vec<ProgressEvent>> {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::new(RecordingSink {
             events: events.clone(),
         });
         let run_store = JobStore::open(fixture.store.path()).expect("store should reopen");
-        let args = ResumeArgs {
-            job_id: fixture.job.id.clone(),
+        let args = resume_args(&fixture.job.id);
+
+        run_inner(
+            args,
+            run_store,
+            fixture.job.clone(),
+            &mut fixture.snapshot,
+            overrides,
+            sink,
+        )
+        .await?;
+
+        Ok(events.lock().expect("events lock").clone())
+    }
+
+    fn resume_args(job_id: &str) -> ResumeArgs {
+        ResumeArgs {
+            job_id: job_id.to_string(),
             concurrency: None,
             max_attempts: None,
             provider_max_attempts: None,
             validation_max_attempts: None,
-            qa: QaMode::Off,
+            qa: None,
             timeout_seconds: None,
             max_output_tokens: None,
             ui: None,
@@ -1659,18 +1866,20 @@ mod tests {
             output: None,
             no_thinking: false,
             force: false,
-        };
+        }
+    }
 
-        run_inner(
-            args,
-            run_store,
-            fixture.job.clone(),
-            &mut fixture.snapshot,
-            sink,
-        )
-        .await?;
-
-        Ok(events.lock().expect("events lock").clone())
+    fn write_overrides_sidecar(
+        job_id: &str,
+        overrides: &reconfigure::RunConfigOverrides,
+    ) -> PathBuf {
+        let path = reconfigure::overrides_path_for_job(job_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("sidecar parent should exist");
+        }
+        let json = serde_json::to_string_pretty(overrides).expect("overrides should serialize");
+        std::fs::write(&path, format!("{json}\n")).expect("overrides sidecar should write");
+        path
     }
 
     fn runtime_config_event(events: &[ProgressEvent]) -> RuntimeConfigEvent<'_> {
@@ -1680,6 +1889,11 @@ mod tests {
                 if let ProgressEvent::RuntimeConfigResolved {
                     profile,
                     provider_max_attempts,
+                    batch_target_tokens,
+                    batch_max_items,
+                    adaptive_batch_sizing,
+                    adaptive_concurrency,
+                    batch_max_output_tokens,
                     compact_prompts,
                     json_mode,
                     ..
@@ -1688,6 +1902,11 @@ mod tests {
                     Some(RuntimeConfigEvent {
                         profile,
                         provider_max_attempts: *provider_max_attempts,
+                        batch_target_tokens: *batch_target_tokens,
+                        batch_max_items: *batch_max_items,
+                        adaptive_batch_sizing: *adaptive_batch_sizing,
+                        adaptive_concurrency: *adaptive_concurrency,
+                        batch_max_output_tokens: *batch_max_output_tokens,
                         compact_prompts: *compact_prompts,
                         json_mode,
                     })
@@ -1701,6 +1920,11 @@ mod tests {
     struct RuntimeConfigEvent<'a> {
         profile: &'a str,
         provider_max_attempts: usize,
+        batch_target_tokens: usize,
+        batch_max_items: usize,
+        adaptive_batch_sizing: bool,
+        adaptive_concurrency: bool,
+        batch_max_output_tokens: Option<u32>,
         compact_prompts: bool,
         json_mode: &'a str,
     }

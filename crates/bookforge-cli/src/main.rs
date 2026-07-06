@@ -20,7 +20,7 @@ use commands::serve;
 use commands::watch;
 use commands::{
     control as control_commands, convert, doctor, entity, estimate, glossary, ingest_flags,
-    inspect, reflow, resume, retry, review, status, style, tail, translate, validate,
+    inspect, reconfigure, reflow, resume, retry, review, status, style, tail, translate, validate,
 };
 #[cfg(any(test, not(feature = "serve")))]
 use std::io::Write;
@@ -58,6 +58,7 @@ enum Command {
     Estimate(estimate::EstimateArgs),
     Translate(Box<translate::TranslateArgs>),
     Pause(control_commands::PauseArgs),
+    Reconfigure(reconfigure::ReconfigureArgs),
     Resume(resume::ResumeArgs),
     Stop(control_commands::StopArgs),
     Review(review::ReviewArgs),
@@ -118,6 +119,7 @@ async fn run_command(command: Command, cancel_token: CancellationToken) -> Resul
         Command::Estimate(args) => estimate::run(args).await,
         Command::Translate(args) => translate::run(*args, cancel_token).await,
         Command::Pause(args) => control_commands::pause(args).await,
+        Command::Reconfigure(args) => reconfigure::run(args).await,
         Command::Resume(args) => resume::run(args).await,
         Command::Stop(args) => control_commands::stop(args).await,
         Command::Review(args) => review::run(args).await,
@@ -217,7 +219,8 @@ pub(crate) struct ProviderArgs {
     pub(crate) timeout_seconds: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum QaMode {
     Off,
     Suspicious,
