@@ -6,6 +6,7 @@ pub mod estimate;
 pub mod glossary;
 pub mod ingest_flags;
 pub mod inspect;
+pub mod reconfigure;
 pub mod reflow;
 pub mod resume;
 pub mod retry;

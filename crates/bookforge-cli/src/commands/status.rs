@@ -6,6 +6,7 @@ use bookforge_core::RunConfigSnapshot;
 use bookforge_store::{JobRecord, JobStore, JobSummary};
 
 use crate::{
+    commands::reconfigure,
     performance::{RunPerformanceSummary, performance_summary_from_events},
     report::report_paths,
 };
@@ -41,6 +42,16 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     }
     if let Some(ref api_key_env) = job.api_key_env {
         println!("API key env: {api_key_env}");
+    }
+    if let Some(overrides) = reconfigure::load_overrides_for_job(&args.job_id)? {
+        println!();
+        println!(
+            "Overrides: {}",
+            reconfigure::overrides_path_for_job(&args.job_id).display()
+        );
+        for line in reconfigure::describe_overrides(&overrides) {
+            println!("  {line}");
+        }
     }
     println!();
     println!("Segments:");

@@ -31,6 +31,8 @@ struct BatchWorkerOutput {
     request_status: RequestStatus,
     latency_ms: u64,
     max_output_tokens: u32,
+    output_escalated: bool,
+    next_max_output_tokens: Option<u32>,
     request_permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -157,6 +159,33 @@ const BATCH_SIZER_STABLE_SUCCESS_THRESHOLD: f64 = 0.98;
 const BATCH_SIZER_INCREASE_INTERVAL: Duration = Duration::from_secs(5);
 const BATCH_SIZER_DECREASE_INTERVAL: Duration = Duration::from_secs(1);
 const BATCH_SIZER_TARGET_P95_LATENCY_MS: u64 = 30_000;
+const SYSTEMIC_TRUNCATION_ALERT_AFTER: usize = 3;
+
+#[derive(Default)]
+struct TruncationAlertState {
+    unresolved_after_escalation: usize,
+    alert_emitted: bool,
+}
+
+impl TruncationAlertState {
+    fn observe_resolved(&mut self) {
+        self.unresolved_after_escalation = 0;
+    }
+
+    fn observe_unresolved(&mut self, progress: &Arc<dyn bookforge_core::ProgressSink>) {
+        self.unresolved_after_escalation = self.unresolved_after_escalation.saturating_add(1);
+        if self.alert_emitted || self.unresolved_after_escalation < SYSTEMIC_TRUNCATION_ALERT_AFTER
+        {
+            return;
+        }
+        self.alert_emitted = true;
+        progress.emit(bookforge_core::ProgressEvent::Warning {
+            kind: "systemic_truncation".to_string(),
+            message: "output budget repeatedly exhausted after escalation; raise --batch-max-output-tokens, lower --batch-max-items, or try a different model".to_string(),
+            timestamp_ms: bookforge_core::progress::now_ms(),
+        });
+    }
+}
 
 impl BatchSizer {
     pub fn new(target_tokens: usize, max_items: usize) -> Self {
@@ -1466,6 +1495,8 @@ where
     let max_rounds = 3usize;
     let mut single_invalid_attempts: HashMap<String, usize> = HashMap::new();
     let mut transient_attempts: HashMap<String, usize> = HashMap::new();
+    let mut escalated_output_tokens: HashMap<String, u32> = HashMap::new();
+    let mut truncation_alert = TruncationAlertState::default();
     let mut stop_dispatch = false;
 
     for _round in 0..max_rounds {
@@ -1499,6 +1530,7 @@ where
                     Some(config.as_ref()),
                 );
                 let batch = normalized.remove(0);
+                let output_override = escalated_output_tokens.remove(&batch.id);
                 for extra in normalized.into_iter().rev() {
                     pending_queue.push_front(extra);
                 }
@@ -1518,6 +1550,7 @@ where
                 let pause_signal = pause_signal.clone();
 
                 tasks.spawn(async move {
+                    let output_escalated = output_override.is_some();
                     // Strict context must be awaited before any permit is
                     // held (waiters would starve prerequisite batches);
                     // best-effort context is snapshotted after permits so
@@ -1536,6 +1569,8 @@ where
                             request_status: RequestStatus::OtherError,
                             latency_ms: 0,
                             max_output_tokens: 0,
+                            output_escalated,
+                            next_max_output_tokens: None,
                             request_permit: None,
                         };
                     }
@@ -1549,6 +1584,8 @@ where
                                 request_status: RequestStatus::OtherError,
                                 latency_ms: 0,
                                 max_output_tokens: 0,
+                                output_escalated,
+                                next_max_output_tokens: None,
                                 request_permit: None,
                             };
                         }
@@ -1566,6 +1603,8 @@ where
                                     request_status: RequestStatus::OtherError,
                                     latency_ms: 0,
                                     max_output_tokens: 0,
+                                    output_escalated,
+                                    next_max_output_tokens: None,
                                     request_permit: None,
                                 };
                             }
@@ -1584,6 +1623,8 @@ where
                                     request_status: RequestStatus::OtherError,
                                     latency_ms: 0,
                                     max_output_tokens: 0,
+                                    output_escalated,
+                                    next_max_output_tokens: None,
                                     request_permit: Some(request_permit),
                                 };
                             }
@@ -1598,6 +1639,19 @@ where
 
                     let started = std::time::Instant::now();
                     let is_reasoning = provider.is_reasoning();
+                    let default_max_output_tokens =
+                        capped_batch_max_output_tokens(&batch, &config, is_reasoning);
+                    let max_output_tokens = output_override.unwrap_or(default_max_output_tokens);
+                    let next_max_output_tokens = (!output_escalated)
+                        .then(|| {
+                            next_escalated_batch_max_output_tokens(
+                                max_output_tokens,
+                                &batch,
+                                &config,
+                                is_reasoning,
+                            )
+                        })
+                        .flatten();
 
                     let request_id = format!("batch_{}", batch.id);
                     progress.emit(bookforge_core::ProgressEvent::RequestStarted {
@@ -1609,23 +1663,18 @@ where
                         prompt_template: None,
                         items: batch.items.len(),
                         estimated_input_tokens: batch.token_estimate,
-                        max_output_tokens: Some(capped_batch_max_output_tokens(
-                            &batch,
-                            &config,
-                            is_reasoning,
-                        )),
+                        max_output_tokens: Some(max_output_tokens),
                         active_requests: 0,
                         target_concurrency: config.scheduler.concurrency,
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
 
-                    let max_output_tokens =
-                        capped_batch_max_output_tokens(&batch, &config, is_reasoning);
                     let result = translate_one_batch(
                         provider.clone(),
                         library.clone(),
                         batch.clone(),
                         &config,
+                        Some(max_output_tokens),
                         context_pairs,
                         validate_source_copy,
                         &section_titles,
@@ -1642,6 +1691,8 @@ where
                         request_status,
                         latency_ms,
                         max_output_tokens,
+                        output_escalated,
+                        next_max_output_tokens,
                         request_permit: Some(request_permit),
                     }
                 });
@@ -1670,6 +1721,8 @@ where
                 request_status,
                 latency_ms,
                 max_output_tokens,
+                output_escalated,
+                next_max_output_tokens,
                 request_permit,
             } = joined
                 .map_err(|err| LlmError::Provider(format!("batch worker task failed: {err}")))?;
@@ -1743,6 +1796,7 @@ where
 
             match result {
                 Ok(batch_result) => {
+                    truncation_alert.observe_resolved();
                     if let Some(ref mut sizer) = batch_sizer {
                         sizer.on_success_for_mode(batch.mode, latency_ms);
                     }
@@ -1800,7 +1854,27 @@ where
                     }
                     all_results.push(batch_result);
                 }
+                Err(LlmError::InvalidResponse(_))
+                    if batch.kind == BatchKind::Translation
+                        && request_status == RequestStatus::Truncated
+                        && !output_escalated
+                        && next_max_output_tokens.is_some() =>
+                {
+                    let next_max_output_tokens =
+                        next_max_output_tokens.expect("checked Some above");
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "batch_truncation_escalated_retry".to_string(),
+                        message: format!(
+                            "batch {} exhausted max_output_tokens {}; retrying once with {} before splitting",
+                            batch.id, max_output_tokens, next_max_output_tokens
+                        ),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    escalated_output_tokens.insert(batch.id.clone(), next_max_output_tokens);
+                    pending_queue.push_back(batch);
+                }
                 Err(LlmError::InvalidResponse(_)) if batch.kind == BatchKind::Repair => {
+                    truncation_alert.observe_resolved();
                     progress.emit(bookforge_core::ProgressEvent::Warning {
                         kind: "repair_batch_invalid_response".to_string(),
                         message: format!(
@@ -1839,7 +1913,49 @@ where
                         output_tokens: None,
                     });
                 }
+                Err(error @ LlmError::InvalidResponse(_))
+                    if request_status == RequestStatus::Truncated && batch.items.len() == 1 =>
+                {
+                    if let Some(ref mut sizer) = batch_sizer {
+                        sizer.on_truncation_for_mode(batch.mode);
+                    }
+                    truncation_alert.observe_unresolved(&progress);
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "single_item_batch_truncated".to_string(),
+                        message: format!(
+                            "single-item batch {} still exhausted max_output_tokens {}; not splitting further",
+                            batch.id, max_output_tokens
+                        ),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    unblock_fence_for_batch_failure(
+                        config.context_registry.as_deref(),
+                        &segments_by_id,
+                        &batch.items,
+                    );
+                    all_results.push(BatchTranslationResult {
+                        batch_id: batch.id.clone(),
+                        translations: Vec::new(),
+                        failures: batch
+                            .items
+                            .iter()
+                            .map(|item| BatchItemFailure {
+                                item_id: item.item_id.clone(),
+                                segment_id: item.segment_id.clone(),
+                                error: format!("single-item batch truncated: {error}"),
+                                input_tokens: None,
+                                input_cached_tokens: None,
+                                output_tokens: None,
+                                tokens_estimated: false,
+                            })
+                            .collect(),
+                        input_tokens: None,
+                        input_cached_tokens: None,
+                        output_tokens: None,
+                    });
+                }
                 Err(error @ LlmError::InvalidResponse(_)) if batch.items.len() == 1 => {
+                    truncation_alert.observe_resolved();
                     let attempts = single_invalid_attempts
                         .entry(batch.id.clone())
                         .and_modify(|count| *count += 1)
@@ -1898,6 +2014,11 @@ where
                             sizer.on_invalid_json_for_mode(batch.mode);
                         }
                     }
+                    if request_status == RequestStatus::Truncated {
+                        truncation_alert.observe_unresolved(&progress);
+                    } else {
+                        truncation_alert.observe_resolved();
+                    }
                     let split = split_batch_with_config(&batch, Some(config.as_ref()));
                     if split.len() == 2 {
                         progress.emit(bookforge_core::ProgressEvent::BatchSplit {
@@ -1908,16 +2029,27 @@ where
                         });
                     }
                     progress.emit(bookforge_core::ProgressEvent::Warning {
-                        kind: "batch_invalid_response_split".to_string(),
+                        kind: if request_status == RequestStatus::Truncated {
+                            "batch_truncated_split"
+                        } else {
+                            "batch_invalid_response_split"
+                        }
+                        .to_string(),
                         message: format!(
-                            "batch {} failed with invalid response, splitting",
-                            batch.id
+                            "batch {} failed with {}, splitting",
+                            batch.id,
+                            if request_status == RequestStatus::Truncated {
+                                "truncated output"
+                            } else {
+                                "invalid response"
+                            }
                         ),
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
                     pending_queue.extend(split);
                 }
                 Err(ref error) if is_transient(error) && batch.kind == BatchKind::Translation => {
+                    truncation_alert.observe_resolved();
                     let attempts = transient_attempts
                         .entry(batch.id.clone())
                         .and_modify(|count| *count += 1)
@@ -1969,6 +2101,7 @@ where
                     }
                 }
                 Err(error) => {
+                    truncation_alert.observe_resolved();
                     progress.emit(bookforge_core::ProgressEvent::Warning {
                         kind: "batch_failed".to_string(),
                         message: format!("batch {} failed: {error}", batch.id),
@@ -2521,11 +2654,45 @@ fn capped_batch_max_output_tokens(
     )
 }
 
+fn next_escalated_batch_max_output_tokens(
+    current: u32,
+    batch: &TranslationBatch,
+    config: &TranslationRunConfig,
+    reasoning: bool,
+) -> Option<u32> {
+    let ceiling = batch_output_token_ceiling(batch, config, reasoning);
+    let bumped = current.saturating_mul(2).max(current.saturating_add(2_048));
+    let next = bumped.min(ceiling);
+    (next > current).then_some(next)
+}
+
+fn batch_output_token_ceiling(
+    batch: &TranslationBatch,
+    config: &TranslationRunConfig,
+    reasoning: bool,
+) -> u32 {
+    let extended_output = config.provider.eq_ignore_ascii_case("deepseek");
+    let ceiling = if config.profile == TranslationProfile::FreeTier {
+        if reasoning { 8_192 } else { 4_096 }
+    } else if extended_output || reasoning {
+        32_768
+    } else {
+        16_384
+    };
+    bookforge_core::config::cap_output_tokens(
+        ceiling,
+        batch.token_estimate,
+        config.model_context_tokens,
+        None,
+    )
+}
+
 async fn translate_one_batch(
     provider: Arc<impl LlmProvider>,
     library: Arc<PromptLibrary>,
     batch: TranslationBatch,
     config: &TranslationRunConfig,
+    max_output_tokens_override: Option<u32>,
     context_pairs: Vec<crate::scheduler::CompletedContext>,
     validate_source_copy: bool,
     section_titles: &HashMap<String, String>,
@@ -2582,7 +2749,8 @@ async fn translate_one_batch(
         .render(&vars)
         .map_err(|e| LlmError::Provider(e.to_string()))?;
 
-    let max_tokens = capped_batch_max_output_tokens(&batch, config, provider.is_reasoning());
+    let max_tokens = max_output_tokens_override
+        .unwrap_or_else(|| capped_batch_max_output_tokens(&batch, config, provider.is_reasoning()));
 
     let response = provider
         .complete(CompletionRequest {
@@ -3830,6 +3998,88 @@ mod tests {
         }
     }
 
+    enum RecordedResponse {
+        FinishLength,
+        ItemsFromBatch(Vec<(String, String)>),
+    }
+
+    struct RecordingSequenceProvider {
+        responses: Mutex<Vec<RecordedResponse>>,
+        max_output_tokens: Arc<Mutex<Vec<Option<u32>>>>,
+    }
+
+    impl RecordingSequenceProvider {
+        fn new(
+            responses: Vec<RecordedResponse>,
+            max_output_tokens: Arc<Mutex<Vec<Option<u32>>>>,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().rev().collect()),
+                max_output_tokens,
+            }
+        }
+    }
+
+    impl LlmProviderTrait for RecordingSequenceProvider {
+        async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+            self.max_output_tokens
+                .lock()
+                .unwrap()
+                .push(request.max_output_tokens);
+            let response = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or(RecordedResponse::FinishLength);
+            match response {
+                RecordedResponse::FinishLength => Ok(CompletionResponse {
+                    content: "{\"items\":[]}".to_string(),
+                    input_tokens: Some(1),
+                    input_cached_tokens: Some(0),
+                    output_tokens: Some(1),
+                    finish_reason: FinishReason::Length,
+                    provider_latency_ms: 0,
+                    raw: serde_json::json!({}),
+                }),
+                RecordedResponse::ItemsFromBatch(items) => {
+                    let json = serde_json::json!({
+                        "items": items
+                            .into_iter()
+                            .map(|(id, t)| serde_json::json!({"id": id, "translation": t}))
+                            .collect::<Vec<_>>(),
+                    });
+                    Ok(CompletionResponse {
+                        content: json.to_string(),
+                        input_tokens: Some(1),
+                        input_cached_tokens: Some(0),
+                        output_tokens: Some(1),
+                        finish_reason: FinishReason::Stop,
+                        provider_latency_ms: 0,
+                        raw: serde_json::json!({}),
+                    })
+                }
+            }
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    struct RecordingProgress {
+        events: Arc<Mutex<Vec<bookforge_core::ProgressEvent>>>,
+    }
+
+    impl bookforge_core::ProgressSink for RecordingProgress {
+        fn emit(&self, event: bookforge_core::ProgressEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
     impl LlmProviderTrait for StubProvider {
         async fn complete(
             &self,
@@ -3995,6 +4245,7 @@ mod tests {
             library,
             batch,
             &config,
+            None,
             Vec::new(),
             false,
             &HashMap::new(),
@@ -4022,6 +4273,7 @@ mod tests {
             library,
             batch,
             &config,
+            None,
             Vec::new(),
             false,
             &HashMap::new(),
@@ -4034,6 +4286,140 @@ mod tests {
             Ok(_) => panic!("truncated error must not be swallowed into Ok"),
             other => panic!("expected InvalidResponse, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn batch_truncation_retries_same_batch_with_escalated_budget() {
+        let seg1 = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+        let seg2 = make_segment("seg2", vec![plain_block("Goodbye")], vec![]);
+        let segments = vec![seg1, seg2];
+        let cfg = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 64,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+        let item_ids = batches[0]
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.item_id.clone(),
+                    format!("Tradotto {}", item.source_text),
+                )
+            })
+            .collect::<Vec<_>>();
+        let max_tokens = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingSequenceProvider::new(
+            vec![
+                RecordedResponse::FinishLength,
+                RecordedResponse::ItemsFromBatch(item_ids),
+            ],
+            max_tokens.clone(),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let progress = Arc::new(RecordingProgress {
+            events: events.clone(),
+        });
+
+        let translations = translate_batches_with_callback(
+            provider,
+            batches,
+            &segments,
+            &test_run_config(),
+            Arc::new(TelemetryLog::new()),
+            None,
+            None,
+            progress,
+            None,
+            |_| Ok(()),
+        )
+        .await
+        .expect("escalated retry should succeed");
+
+        assert_eq!(translations.len(), 2);
+        let budgets = max_tokens.lock().unwrap().clone();
+        assert_eq!(budgets.len(), 2);
+        assert!(
+            budgets[1].unwrap() > budgets[0].unwrap(),
+            "second request should use escalated output budget: {budgets:?}"
+        );
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                bookforge_core::ProgressEvent::Warning { kind, .. }
+                    if kind == "batch_truncation_escalated_retry"
+            )
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| { matches!(event, bookforge_core::ProgressEvent::BatchSplit { .. }) })
+        );
+    }
+
+    #[tokio::test]
+    async fn systemic_truncation_emits_alert_after_escalated_failures() {
+        let segments = (0..6)
+            .map(|idx| make_segment(&format!("seg{idx}"), vec![plain_block("Hello")], vec![]))
+            .collect::<Vec<_>>();
+        let cfg = BatchConfig {
+            enabled: true,
+            target_tokens: 1000,
+            max_items: 2,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+        assert!(
+            batches.len() >= 3,
+            "fixture should build at least 3 batches"
+        );
+        let max_tokens = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingSequenceProvider::new(
+            std::iter::repeat_with(|| RecordedResponse::FinishLength)
+                .take(64)
+                .collect(),
+            max_tokens,
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let progress = Arc::new(RecordingProgress {
+            events: events.clone(),
+        });
+
+        let _translations = translate_batches_with_callback(
+            provider,
+            batches,
+            &segments,
+            &test_run_config(),
+            Arc::new(TelemetryLog::new()),
+            None,
+            None,
+            progress,
+            None,
+            |_| Ok(()),
+        )
+        .await
+        .expect("systemic truncation should become bounded failures");
+
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    bookforge_core::ProgressEvent::Warning { kind, message, .. }
+                        if kind == "systemic_truncation"
+                            && message.contains("--batch-max-output-tokens")
+                            && message.contains("--batch-max-items")
+                )
+            }),
+            "systemic truncation alert should be emitted"
+        );
     }
 
     #[tokio::test]
