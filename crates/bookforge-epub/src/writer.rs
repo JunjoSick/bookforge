@@ -828,7 +828,10 @@ fn attr_value_unescaped(
     for attr in element.attributes() {
         let attr = attr.map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
         if local_name(attr.key.as_ref()) == attr_name {
-            return Ok(Some(attr.unescape_value()?.into_owned()));
+            return Ok(Some(
+                attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                    .into_owned(),
+            ));
         }
     }
     Ok(None)
