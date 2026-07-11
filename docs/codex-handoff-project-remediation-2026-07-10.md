@@ -214,10 +214,43 @@ the prompt with inline hint controls.
   (`CARGO_TARGET_DIR=target/msrv-1.88`). Rust 1.88 did not publish a Windows
   gnullvm host toolchain, which is why this check uses the GNU host.
 
+### First GitHub workflow exercise — ACTION REQUIRED (2026-07-11)
+
+Draft PR #27 successfully exercised the previously unrun workflows. At commit
+`ef08182a`, the following checks are green:
+
+- Linux workspace tests, Windows MSVC workspace tests, and MSRV 1.88;
+- exact CI clippy and formatting;
+- small Standard Ebooks corpus smoke test;
+- release planning (artifact jobs correctly skip on a pull request);
+- CodeQL Rust analysis.
+
+The only failing check is RustSec. Its log reports three vulnerable locked
+dependencies and one warning:
+
+- `quick-xml 0.38.4`: RUSTSEC-2026-0194 and RUSTSEC-2026-0195, patched in
+  `>=0.41.0`. This is a direct workspace dependency (`Cargo.toml` currently
+  requests `0.38`), so it needs a manifest bump plus any API adaptation.
+- `quinn-proto 0.11.14`: RUSTSEC-2026-0185, patched in `>=0.11.15`. It is a
+  locked transitive dependency from the HTTP stack; first try a precise
+  lockfile update to `0.11.15` or newer allowed by its parent.
+- `anyhow 1.0.102`: RUSTSEC-2026-0190 unsoundness warning. The advisory output
+  names the fixing upstream commit but no patched-version range. Update to the
+  first published release containing that fix after verifying its advisory
+  metadata; do not add an ignore merely to make the check green.
+
+Focused next-agent fix: update those dependencies, run the full workspace
+tests, exact clippy, MSRV 1.88, `cargo audit` (or push to rerun RustSec), and
+the XML-heavy core/EPUB/PDF tests in particular. Then commit and push to PR
+#27. The GitHub logs also contain non-blocking Node 20 deprecation warnings for
+`actions/checkout@v4`, `actions/setup-python@v5`, `actions/setup-java@v4`, and
+`rustsec/audit-check@v2.0.0`; update actions where supported, but keep that
+separate from the security dependency fix.
+
 ### Next steps for the next agent (written 2026-07-11)
 
-1. Watch draft PR #27's first Windows CI and security runs and fix any real
-   workflow or code failures they expose.
+1. Fix the RustSec dependency findings documented immediately above, verify,
+   and push them to draft PR #27. All other first-run workflow checks passed.
 2. Live reconfiguration milestone: follow the recommended design under
    "True live reconfiguration" below. Write a short design doc first
    (snapshot/watch-channel shape, which settings are boundary-applied,
