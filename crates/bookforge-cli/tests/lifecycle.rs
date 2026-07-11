@@ -2338,7 +2338,7 @@ fn cli_resume_after_dashboard_retry_guidance_retranslates_single_segment_mode() 
         .load_retry_guidance(&job_id)
         .expect("guidance should load after resume");
     assert!(
-        guidance_after_resume.get(retry_id.as_str()).is_none(),
+        !guidance_after_resume.contains_key(retry_id.as_str()),
         "guidance should be consumed once the retried segment reaches a terminal (succeeded) result"
     );
 }
@@ -2417,11 +2417,10 @@ fn cli_resume_after_dashboard_retry_guidance_retranslates_batch_mode() {
         retried.attempts
     );
     assert!(
-        store
+        !store
             .load_retry_guidance(&run.job_id)
             .expect("guidance should load after resume")
-            .get(retry_id.as_str())
-            .is_none(),
+            .contains_key(retry_id.as_str()),
         "guidance should be consumed once the retried segment reaches a terminal (succeeded) result in batch mode too"
     );
 }
@@ -2485,7 +2484,7 @@ fn cli_request_segment_retry_rejects_segment_frozen_by_correct_command() {
         .load_retry_guidance(&run.job_id)
         .expect("guidance should load");
     assert!(
-        guidance.get(segment.segment_id.as_str()).is_none(),
+        !guidance.contains_key(segment.segment_id.as_str()),
         "rejected retry must not record guidance for the frozen segment"
     );
     let records = store

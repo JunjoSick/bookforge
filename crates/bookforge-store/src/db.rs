@@ -1205,12 +1205,12 @@ impl JobStore {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        if let Some(job_status) = &job_status {
-            if matches!(job_status.as_str(), "running" | "paused") {
-                return Err(StoreError::InvalidCorrection(format!(
-                    "job '{job_id}' is {job_status}; stop it before requesting a retry"
-                )));
-            }
+        if let Some(job_status) = &job_status
+            && matches!(job_status.as_str(), "running" | "paused")
+        {
+            return Err(StoreError::InvalidCorrection(format!(
+                "job '{job_id}' is {job_status}; stop it before requesting a retry"
+            )));
         }
         let updated = tx.execute(
             "UPDATE segments SET status = 'retry_pending', error = NULL
@@ -4985,7 +4985,7 @@ mod tests {
         let guidance = store
             .load_retry_guidance(&job.id)
             .expect("guidance should load");
-        assert!(guidance.get("seg_a").is_none());
+        assert!(!guidance.contains_key("seg_a"));
         let records = store
             .segment_records(&job.id)
             .expect("segment records should load");
@@ -5023,7 +5023,7 @@ mod tests {
             .load_retry_guidance(&job.id)
             .expect("guidance should load");
         assert!(
-            guidance.get("seg_a").is_none(),
+            !guidance.contains_key("seg_a"),
             "a rejected retry must not record guidance"
         );
         let records = store
@@ -5052,7 +5052,7 @@ mod tests {
             .load_retry_guidance(&job.id)
             .expect("guidance should load");
         assert!(
-            guidance.get("seg_a").is_none(),
+            !guidance.contains_key("seg_a"),
             "a rejected retry must not record guidance"
         );
         let records = store
@@ -5139,7 +5139,7 @@ mod tests {
 
         let guidance_after = store.load_retry_guidance(&job.id).unwrap();
         assert!(
-            guidance_after.get("seg_a").is_none(),
+            !guidance_after.contains_key("seg_a"),
             "the consumed segment's guidance should be gone"
         );
         assert_eq!(

@@ -125,15 +125,17 @@ cargo fmt --all
 git diff --check
 ```
 
-The full workspace test suite, clippy, MSRV, corpus, GitHub workflows, macOS,
-and real-provider scenarios have not yet been run for this branch.
+The corpus, macOS, release-build, installer, and real-provider scenarios have
+not yet been run for this branch. The continuation log below records the full
+workspace suite, exact CI clippy command, MSRV check, and GitHub publication.
 
 ## Claude continuation log (2026-07-10/11)
 
 Claude Code took over from this handoff and is executing the "Immediate next
 work" items below as narrow-scope subagent work packages (WP). Status is kept
 current here; if this session also ends, resume from the first non-done WP.
-The worktree remains intentionally uncommitted.
+The completed work packages were committed as `50542786`; later validation
+notes and clippy cleanups are recorded in the continuation below.
 
 | WP | Scope | Status |
 | --- | --- | --- |
@@ -143,7 +145,7 @@ The worktree remains intentionally uncommitted.
 | WP6 | Report artifacts record manual provenance and refresh after correction (item 6) | DONE — QA report (`{stem}.report.json`/`.md`, the only auto-written per-segment artifact) gains additive `corrected_segments` count and is regenerated from store data after each correction via new `regenerate_report_after_correction` (best-effort, logged on failure since DB+EPUB are already durable). Review JSON is on-demand and already covered; `.validation.json` has no translation content. Note: review.rs emits `human_corrected`/`corrected_at` but no `origin` field, contrary to earlier wording above. Lifecycle test extended to prove report refresh (0→1). |
 | WP3 | Router CSRF tests + isolated-store e2e dashboard test; store path into `AppState` (item 2) | DONE — `AppState` now carries `store_path` resolved once at server construction (was per-request cwd-based `open_default()`, 13 call sites); 3 CSRF tests (no-token + wrong-token → 403 + no store mutation, per endpoint) and `dashboard_review_and_mutation_endpoints_end_to_end` (isolated temp store: review fetch, save correction, flag set/clear, guided retry, frozen-segment 400) in `serve.rs`'s test module (crate has no lib target, so router tests live there). No new deps. |
 | WP4 | Lifecycle test: retry guidance survives restart/resume, reaches single+batch prompts, consumed only on terminal result (item 3) | DONE — 3 tests added to lifecycle.rs (single-segment mode, batch mode, frozen-segment rejection through the real `correct` CLI), 40/40 pass. Two documented gaps (see notes below the table). |
-| — | Manual dashboard exercise on a mock job (item 4) | not started; needs the user or a driven session |
+| — | Manual dashboard exercise on a mock job (item 4) | DONE — owner completed the click-path and the store, events, report, logs, and retry-guidance consumption were independently checked; see below |
 
 Planned order: WP1+WP2 (parallel, disjoint crates), then WP5, WP6, WP3, WP4
 sequentially (all touch `bookforge-cli`). Verification per WP uses the
@@ -151,10 +153,9 @@ gnullvm toolchain commands from "Verification already run".
 
 ### Milestone status after the continuation (dashboard correction milestone)
 
-Items 1, 2, 3, 5, and 6 of "Immediate next work" are DONE and verified; the
-critical prompt-versioning follow-up is RESOLVED. The only open item from
-that list is item 4 (manually exercising the dashboard on a mock job in a
-browser), which needs a human or a driven live session.
+All six items in "Immediate next work" are DONE and verified; the critical
+prompt-versioning follow-up is RESOLVED. The manual dashboard exercise closed
+the final open item on 2026-07-11.
 
 Final composed verification on this Windows gnullvm host (2026-07-11, after
 all work packages merged in the shared worktree; the retry guard landed after
@@ -171,29 +172,59 @@ On 2026-07-11 the owner approved committing this checkpoint as a single
 commit on `codex/project-remediation` (supersedes the "nothing has been
 committed" note in "Git/worktree state" above), and approved adding the
 `request_segment_retry` running/paused guard (see the resolved WP2 finding
-below). Nothing has been pushed and no PR exists.
+below). The branch was pushed and draft PR #27 was opened:
+<https://github.com/JunjoSick/bookforge/pull/27>.
+
+### Manual dashboard exercise — DONE (2026-07-11)
+
+The exercise used isolated workspace
+`tmp/manual-dashboard-20260711`, mock job
+`job_1783791354858557100_52d94333cfc2`, and dashboard
+`http://127.0.0.1:8876/`. The owner completed the full click-path:
+
+1. Library → completed mock job → Review.
+2. Flag a segment → refresh → confirm the flag persists.
+3. Edit translation → Save & rebuild → confirm "human correction saved" is
+   shown next to Re-translate.
+4. Stop before requesting a guided retry (running/paused jobs are rejected).
+5. Re-translate with hint → enter guidance → Resume.
+
+The owner corrected two different segments, so the final report correctly
+shows `Manually corrected: 2`. Independent inspection found no server errors,
+two durable `manual`/`human_corrected` translations, one pending retry with
+the supplied `dashboard_retry` hint, and the expected control signal. A CLI
+`resume` then completed the pending segment: its attempts increased from 1 to
+2, the hint became consumed, the job returned to `succeeded`, the report
+showed `Retried: 1` and `Retry pending: 0`, and the expected resume/request/
+checkpoint/artifact/finished events were appended.
+
+UX finding: dashboard Resume writes a control signal for an existing process;
+it cannot restart a translation process that has already exited. The hint UI
+also currently uses a prompt dialog. Both should be addressed alongside the
+live-reconfiguration/dashboard work: make the stopped-process action explicit
+(spawn/offer `bookforge resume`, or clearly present the command) and replace
+the prompt with inline hint controls.
+
+### Cheap local release-gate checks — DONE (2026-07-11)
+
+- Exact CI lint command passed:
+  `cargo +stable-x86_64-pc-windows-gnullvm clippy --all-targets --all-features -- -A clippy::too_many_arguments -D warnings`.
+- MSRV passed with Rust 1.88 GNU and WinLibs on PATH:
+  `cargo +1.88.0-x86_64-pc-windows-gnu check --workspace --all-targets --locked`
+  (`CARGO_TARGET_DIR=target/msrv-1.88`). Rust 1.88 did not publish a Windows
+  gnullvm host toolchain, which is why this check uses the GNU host.
 
 ### Next steps for the next agent (written 2026-07-11)
 
-1. Manual dashboard exercise (the only open "Immediate next work" item,
-   item 4): create a mock-provider job the way `tests/lifecycle.rs` fixtures
-   do, run `bookforge serve`, and in a browser: flag → refresh (flag
-   survives) → edit/save a segment (expect 200, output EPUB replaced,
-   `{stem}.report.md` shows "Manually corrected: 1") → request a guided
-   retry (note: now rejected while the job is running/paused — stop first) →
-   resume → verify the retry consumed the guidance and events/report look
-   right.
-2. Push the branch so the new Windows CI job and
-   `.github/workflows/security.yml` (RustSec + CodeQL) actually run on
-   GitHub — they have never executed. Fix YAML per CI feedback. Opening a PR
-   is the owner's call.
-3. Cheap local release-gate de-risking not yet done on this branch: the
-   exact CI clippy command with warnings denied, and the MSRV 1.88 check.
-4. Live reconfiguration milestone: follow the recommended design under
+1. Watch draft PR #27's first Windows CI and security runs and fix any real
+   workflow or code failures they expose.
+2. Live reconfiguration milestone: follow the recommended design under
    "True live reconfiguration" below. Write a short design doc first
    (snapshot/watch-channel shape, which settings are boundary-applied,
    event additions, dashboard exposure, race-test matrix) before coding.
-5. Modularization only after live reconfig is behavior-locked; then the
+3. Fold the dashboard UX findings above into that design: inline retry-hint
+   controls and an actionable stopped-process resume path.
+4. Modularization only after live reconfig is behavior-locked; then the
    final release gate (both unchanged below).
 
 Known flake: `cli_stop_then_resume_mock_run` occasionally fails with "stop
@@ -367,4 +398,3 @@ Still required:
 - No hosted/multi-user expansion; dashboard remains loopback-only and
   CSRF/Host protected.
 - Single-binary distribution remains intact.
-
