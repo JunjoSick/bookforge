@@ -53,8 +53,8 @@ git diff --check
 - `.github/dependabot.yml` covers Cargo and GitHub Actions.
 - `.github/workflows/security.yml` adds RustSec (`rustsec/audit-check@v2.0.0`)
   and Rust CodeQL (`github/codeql-action@v4`, `build-mode: none`).
-- The security YAML has not run on GitHub yet; validate with actionlint/CI before
-  treating it as complete.
+- The security workflow is proven on draft PR #27: RustSec and Rust CodeQL are
+  green after the dependency remediation recorded below.
 
 ### Durable manual correction engine
 
@@ -214,7 +214,7 @@ the prompt with inline hint controls.
   (`CARGO_TARGET_DIR=target/msrv-1.88`). Rust 1.88 did not publish a Windows
   gnullvm host toolchain, which is why this check uses the GNU host.
 
-### First GitHub workflow exercise — ACTION REQUIRED (2026-07-11)
+### First GitHub workflow exercise — DONE (2026-07-11)
 
 Draft PR #27 successfully exercised the previously unrun workflows. At commit
 `ef08182a`, the following checks are green:
@@ -225,7 +225,7 @@ Draft PR #27 successfully exercised the previously unrun workflows. At commit
 - release planning (artifact jobs correctly skip on a pull request);
 - CodeQL Rust analysis.
 
-The only failing check is RustSec. Its log reports three vulnerable locked
+The initial failing check was RustSec. Its log reported three vulnerable locked
 dependencies and one warning:
 
 - `quick-xml 0.38.4`: RUSTSEC-2026-0194 and RUSTSEC-2026-0195, patched in
@@ -239,25 +239,23 @@ dependencies and one warning:
   first published release containing that fix after verifying its advisory
   metadata; do not add an ignore merely to make the check green.
 
-Focused next-agent fix: update those dependencies, run the full workspace
-tests, exact clippy, MSRV 1.88, `cargo audit` (or push to rerun RustSec), and
-the XML-heavy core/EPUB/PDF tests in particular. Then commit and push to PR
-#27. The GitHub logs also contain non-blocking Node 20 deprecation warnings for
+Resolved in `5ad38b35`: `quick-xml` was upgraded to 0.41.0 and its deprecated
+attribute APIs were migrated to equivalent explicit XML 1.0 normalization;
+`quinn-proto` was locked to 0.11.15 and `anyhow` to 1.0.103. XML-heavy tests,
+CLI round trips, the full workspace suite, exact clippy, and MSRV 1.88 passed
+locally. PR #27 then passed RustSec, CodeQL, Linux and Windows tests, clippy,
+format, MSRV, small corpus, and release planning. The GitHub logs retain
+non-blocking Node 20 deprecation warnings for
 `actions/checkout@v4`, `actions/setup-python@v5`, `actions/setup-java@v4`, and
 `rustsec/audit-check@v2.0.0`; update actions where supported, but keep that
 separate from the security dependency fix.
 
 ### Next steps for the next agent (written 2026-07-11)
 
-1. Fix the RustSec dependency findings documented immediately above, verify,
-   and push them to draft PR #27. All other first-run workflow checks passed.
-2. Live reconfiguration milestone: follow the recommended design under
-   "True live reconfiguration" below. Write a short design doc first
-   (snapshot/watch-channel shape, which settings are boundary-applied,
-   event additions, dashboard exposure, race-test matrix) before coding.
-3. Fold the dashboard UX findings above into that design: inline retry-hint
-   controls and an actionable stopped-process resume path.
-4. Modularization only after live reconfig is behavior-locked; then the
+1. Implement the accepted live-reconfiguration design in
+   `docs/design-live-reconfiguration.md`, including inline retry-hint controls
+   and an actionable stopped-process resume path.
+2. Modularization only after live reconfig is behavior-locked; then the
    final release gate (both unchanged below).
 
 Known flake: `cli_stop_then_resume_mock_run` occasionally fails with "stop
@@ -357,7 +355,8 @@ Do not skip this item.
 
 ### True live reconfiguration
 
-Not started in this branch. Current behavior remains sidecar + stop/resume.
+Design complete in `docs/design-live-reconfiguration.md`; implementation has
+not started. Current behavior remains sidecar + stop/resume.
 
 Recommended design:
 
