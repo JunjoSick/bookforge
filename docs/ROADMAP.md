@@ -2540,6 +2540,11 @@ blocker for the non-developer audience.
 
 #### 10.1.3 Mini-spec: On-the-fly settings reconfiguration (added 2026-07-06, owner-approved)
 
+> **Implemented on main after v2.3.0; scheduled for v2.4.0.** The current
+> implementation is CLI-first and deliberately retains the stopped/dead-paused
+> resume boundary described below. True in-process application is follow-up
+> work, together with the dashboard surface.
+
 **Goal.** Adjust *cache-safe* run settings on an existing (initially: paused)
 job and have `resume` apply them — without starting a fresh run and losing
 progress. Motivated directly by real use: a run hit repeated output
@@ -2591,6 +2596,10 @@ jobs.
 removes a real "lost all my progress to change one number" cliff.
 
 #### 10.1.4 Mini-spec: Truncation handling + fail-fast alert (added 2026-07-06, owner-approved)
+
+> **Implemented on main after v2.3.0; scheduled for v2.4.0.** Truncated batches
+> escalate their output budget before splitting, and systemic exhaustion emits
+> an additive alert surfaced by CLI, watch, and the browser dashboard.
 
 **Goal.** Handle `max_output_tokens` truncation intelligently, and surface a
 prominent, actionable **alert** when truncation is *systemic* instead of

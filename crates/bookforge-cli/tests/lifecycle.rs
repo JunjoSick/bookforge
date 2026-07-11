@@ -11,7 +11,7 @@ use bookforge_core::{
     ControlCommand, GlossaryCategory, GlossaryStatus, GlossaryTerm, read_control_file,
     write_control_file,
 };
-use bookforge_store::{GlossaryFilter, JobStore, NewGlossaryCandidate};
+use bookforge_store::{GlossaryFilter, JobStore, NewGlossaryCandidate, StoreError};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
@@ -1305,6 +1305,234 @@ fn cli_status_after_translate_reports_succeeded_job() {
 }
 
 #[test]
+fn cli_correct_persists_manual_blocks_and_rebuilds_output() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let run = translate_quiet(&temp, "mock-prefix-target");
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
+    let segment = store
+        .load_terminal_segment_translations(&run.job_id)
+        .expect("translations should load")
+        .into_iter()
+        .next()
+        .expect("fixture should produce a translated segment");
+    let corrected_blocks = segment
+        .blocks
+        .iter()
+        .map(|block| {
+            serde_json::json!({
+                "block_id": block.block_id.0,
+                "text": format!("MANUAL {}", block.text),
+            })
+        })
+        .collect::<Vec<_>>();
+    let correction_path = temp.path().join("correction.json");
+    fs::write(
+        &correction_path,
+        serde_json::to_vec_pretty(&serde_json::json!({ "blocks": corrected_blocks }))
+            .expect("correction should serialize"),
+    )
+    .expect("correction file should write");
+
+    let report_json_path = run.report.with_extension("json");
+    let report_before: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report_json_path).expect("QA report should exist after translate"),
+    )
+    .expect("QA report should parse before correction");
+    assert_eq!(
+        report_before["corrected_segments"], 0,
+        "no segment should be marked corrected before the `correct` run"
+    );
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "correct",
+            &run.job_id,
+            "--segment",
+            &segment.segment_id,
+            "--from-file",
+            correction_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Job status: succeeded"));
+
+    let corrected = store
+        .load_terminal_segment_translations(&run.job_id)
+        .expect("corrected translations should load")
+        .into_iter()
+        .find(|translation| translation.segment_id == segment.segment_id)
+        .expect("corrected segment should remain present");
+    assert!(corrected.human_corrected);
+    assert_eq!(corrected.provider, "manual");
+    assert!(
+        corrected
+            .blocks
+            .iter()
+            .all(|block| block.text.starts_with("MANUAL "))
+    );
+    assert!(
+        run.output.exists(),
+        "correct should rebuild the translated EPUB"
+    );
+
+    // The QA report artifact (report.rs's `write_report`, auto-written at
+    // translate/resume finalization) is regenerated in place by
+    // `correct_job_segment` so it does not go stale after a manual
+    // correction — see `regenerate_report_after_correction` in
+    // `commands/translate/reporting.rs`.
+    let report_after: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report_json_path).expect("QA report should still exist after correction"),
+    )
+    .expect("QA report should parse after correction");
+    assert_eq!(
+        report_after["corrected_segments"], 1,
+        "QA report should be refreshed to reflect the manual correction"
+    );
+    let report_markdown_after = fs::read_to_string(&run.report)
+        .expect("QA report markdown should still exist after correction");
+    assert!(
+        report_markdown_after.contains("Manually corrected: 1"),
+        "QA report markdown should be refreshed with the corrected-segment count: {report_markdown_after}"
+    );
+
+    let review_dir = temp.path().join("corrected-review");
+    bookforge()
+        .current_dir(temp.path())
+        .args(["review", &run.job_id, "--out", review_dir.to_str().unwrap()])
+        .assert()
+        .success();
+    let review: serde_json::Value = serde_json::from_slice(
+        &fs::read(review_dir.join("review.json")).expect("review JSON should exist"),
+    )
+    .expect("review should parse");
+    let reviewed = review["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["segment_id"] == segment.segment_id)
+        .expect("corrected segment should be in review");
+    assert_eq!(reviewed["human_corrected"], true);
+    assert!(reviewed["corrected_at"].is_string());
+
+    assert_no_staged_output_files(&run.output);
+}
+
+/// Lists the output directory and fails if any staged rebuild artifact (the
+/// `<stem>.staged-<pid>-<nonce><ext>` sibling that `correct_job_segment`
+/// rebuilds into before atomically swapping it over the real output) was left
+/// behind. A leftover staged file would mean the atomic swap either never ran
+/// or failed to clean up after itself.
+fn assert_no_staged_output_files(output: &Path) {
+    let stem = output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .expect("output should have a file stem");
+    let dir = output
+        .parent()
+        .expect("output should have a parent directory");
+    let stray = fs::read_dir(dir)
+        .expect("output directory should be readable")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&format!("{stem}.staged-")))
+        .collect::<Vec<_>>();
+    assert!(
+        stray.is_empty(),
+        "no staged correction rebuild artifacts should remain in {}, found: {:?}",
+        dir.display(),
+        stray
+    );
+}
+
+#[test]
+fn cli_correct_with_marker_violation_leaves_db_and_output_unchanged() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let run = translate_quiet(&temp, "mock-prefix-target");
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
+    let segment = store
+        .load_terminal_segment_translations(&run.job_id)
+        .expect("translations should load")
+        .into_iter()
+        .next()
+        .expect("fixture should produce a translated segment");
+    let original_output_bytes = fs::read(&run.output).expect("output should exist before correct");
+
+    // Blanking a block's translation while its source text is non-empty trips
+    // the "empty_translation" structural-validation error, which is a
+    // deterministic way to exercise the failure path without mocking the
+    // filesystem.
+    let corrected_blocks = segment
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            let text = if index == 0 {
+                String::new()
+            } else {
+                block.text.clone()
+            };
+            serde_json::json!({
+                "block_id": block.block_id.0,
+                "text": text,
+            })
+        })
+        .collect::<Vec<_>>();
+    let correction_path = temp.path().join("bad-correction.json");
+    fs::write(
+        &correction_path,
+        serde_json::to_vec_pretty(&serde_json::json!({ "blocks": corrected_blocks }))
+            .expect("correction should serialize"),
+    )
+    .expect("correction file should write");
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args([
+            "correct",
+            &run.job_id,
+            "--segment",
+            &segment.segment_id,
+            "--from-file",
+            correction_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("manual correction violates EPUB marker constraints"),
+        "unexpected stderr: {stderr}"
+    );
+
+    let unchanged = store
+        .load_terminal_segment_translations(&run.job_id)
+        .expect("translations should still load")
+        .into_iter()
+        .find(|translation| translation.segment_id == segment.segment_id)
+        .expect("segment should remain present");
+    assert!(
+        !unchanged.human_corrected,
+        "failed correction must not be recorded as human-corrected"
+    );
+    assert_eq!(
+        unchanged.provider, segment.provider,
+        "failed correction must not overwrite the original provider"
+    );
+    assert_eq!(
+        unchanged.blocks, segment.blocks,
+        "failed correction must not change stored block translations"
+    );
+
+    let output_bytes_after = fs::read(&run.output).expect("output should still exist");
+    assert_eq!(
+        output_bytes_after, original_output_bytes,
+        "failed correction must leave the existing output EPUB byte-identical"
+    );
+
+    assert_no_staged_output_files(&run.output);
+}
+
+#[test]
 fn cli_tail_after_translate_prints_recent_events() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let run = translate_quiet(&temp, "mock-prefix-target");
@@ -1961,6 +2189,316 @@ fn cli_resume_uses_input_snapshot_after_original_is_moved() {
         .args(["resume", &run.job_id, "--ui", "quiet"])
         .assert()
         .success();
+}
+
+// --- Dashboard-driven single-segment retry with guidance ---------------
+//
+// `JobStore::request_segment_retry` stores optional guidance text in
+// `segment_flags` (kind = 'dashboard_retry') and marks the segment /job
+// `retry_pending`. `resume` reloads that guidance fresh via
+// `JobStore::load_retry_guidance` (see commands/resume.rs) and wires it into
+// `TranslationRunConfig.guidance_by_segment`, which is rendered into the
+// prompt (`prompt_extra_for_segment` in single-segment mode,
+// `render_batch_items`'s `retry_guidance` field in batch mode) and is
+// consumed only once a terminal provider result is saved
+// (`consume_dashboard_retry_guidance`, called from `save_translation`,
+// `save_needs_review`, and `save_cached_translation`).
+//
+// IMPORTANT LIMITATION: the compiled `mock` provider used by these
+// subprocess-driven lifecycle tests (`bookforge_llm::provider::MockProvider`)
+// never observes or logs the rendered `request.user` prompt text it
+// receives — it only ever echoes back a transform of the *source* text, and
+// nothing persists the raw prompt anywhere a subprocess-based integration
+// test can read it back (no db column, no progress-jsonl event field, no
+// env-var-gated dump). So these lifecycle tests cannot assert "the prompt
+// text contains the guidance string" the way `bookforge-llm`'s in-process
+// unit tests can (see `prompt_renders_glossary_json_prose_and_prompt_extra`
+// in crates/bookforge-llm/src/scheduler.rs and the analogous
+// `render_batch_items`-guidance test in crates/bookforge-llm/src/batch.rs,
+// which assert the rendered prompt/JSON item literally contains
+// `retry_guidance`/the guidance text). At the lifecycle level we instead
+// assert the strongest observable proxy: guidance is present in the store
+// before resume, the flagged segment is provably re-translated by resume
+// (not served from cache, not skipped), and guidance is gone afterward.
+// A production hook that would make the prompt text itself observable here
+// would be an env-var-gated capture in `MockProvider::complete` (e.g.
+// `BOOKFORGE_MOCK_PROMPT_LOG=<path>` appending
+// `{request_id/segment_id, template, user}` as JSONL) — deliberately not
+// added here since this pass is test-only.
+
+#[test]
+fn cli_resume_after_dashboard_retry_guidance_retranslates_single_segment_mode() {
+    // `--profile safe` disables batching, so this exercises the
+    // single-segment prompt path (`prompt_extra_for_segment`) for guidance.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = fixture_input();
+    let output = temp.path().join("out.epub");
+    let events = temp.path().join("events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--profile",
+            "safe",
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let job_id = job_id_from_events(&events);
+
+    let db_path = temp.path().join(".bookforge/jobs.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+    let before = store
+        .segment_records(&job_id)
+        .expect("segments should load");
+    assert!(!before.is_empty(), "fixture should produce segments");
+    let retry_id = before[0].id.clone();
+    let attempts_before = before[0].attempts;
+
+    store
+        .request_segment_retry(
+            &job_id,
+            &retry_id,
+            Some("Use a more formal register for this paragraph."),
+        )
+        .expect("retry request should succeed");
+    let guidance_before_resume = store
+        .load_retry_guidance(&job_id)
+        .expect("guidance should load");
+    assert_eq!(
+        guidance_before_resume
+            .get(retry_id.as_str())
+            .map(String::as_str),
+        Some("Use a more formal register for this paragraph."),
+        "guidance stored by request_segment_retry should be readable back from the store \
+         (i.e. it survives independent of any in-process state)"
+    );
+    // Drop this handle and open a brand-new one after `resume` runs as a
+    // fresh subprocess below, so nothing about this test relies on shared
+    // in-memory state surviving a "restart".
+    drop(store);
+
+    let resume_events = temp.path().join("resume-events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "resume",
+            &job_id,
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            resume_events.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let events_after = read_jsonl(&resume_events);
+    assert_eq!(
+        batch_request_started_count(&events_after),
+        0,
+        "safe profile should stay on the single-segment prompt path"
+    );
+    assert_eq!(
+        segment_finished_ids(&events_after),
+        vec![retry_id.clone()],
+        "resume should retranslate exactly the segment flagged via dashboard retry"
+    );
+
+    let store = JobStore::open(&db_path).expect("store should open");
+    let after = store
+        .segment_records(&job_id)
+        .expect("segments should load after resume");
+    let retried = after
+        .iter()
+        .find(|record| record.id == retry_id)
+        .expect("retried segment should still be present");
+    assert_eq!(
+        retried.status, "succeeded",
+        "retried segment should reach a terminal status"
+    );
+    assert!(
+        retried.attempts > attempts_before,
+        "retried segment should have actually been re-translated (attempts increased from {attempts_before} to {})",
+        retried.attempts
+    );
+
+    let guidance_after_resume = store
+        .load_retry_guidance(&job_id)
+        .expect("guidance should load after resume");
+    assert!(
+        guidance_after_resume.get(retry_id.as_str()).is_none(),
+        "guidance should be consumed once the retried segment reaches a terminal (succeeded) result"
+    );
+}
+
+#[test]
+fn cli_resume_after_dashboard_retry_guidance_retranslates_batch_mode() {
+    // Default profile (v1-fast) keeps batching enabled, so this exercises
+    // the batch prompt path where guidance is serialized per-item as
+    // `retry_guidance` by `render_batch_items` (bookforge-llm/src/batch.rs).
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let run = translate_quiet(&temp, "mock-prefix-target");
+
+    let db_path = temp.path().join(".bookforge/jobs.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+    let before = store
+        .segment_records(&run.job_id)
+        .expect("segments should load");
+    assert!(!before.is_empty(), "fixture should produce segments");
+    let retry_id = before[0].id.clone();
+    let attempts_before = before[0].attempts;
+
+    store
+        .request_segment_retry(
+            &run.job_id,
+            &retry_id,
+            Some("Tighten the dialogue tag here."),
+        )
+        .expect("retry request should succeed");
+    assert_eq!(
+        store
+            .load_retry_guidance(&run.job_id)
+            .expect("guidance should load")
+            .get(retry_id.as_str())
+            .map(String::as_str),
+        Some("Tighten the dialogue tag here.")
+    );
+    drop(store);
+
+    let resume_events = temp.path().join("resume-events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "resume",
+            &run.job_id,
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            resume_events.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let events_after = read_jsonl(&resume_events);
+    assert!(
+        batch_request_started_count(&events_after) >= 1,
+        "v1-fast profile should route the retry through the batch prompt path"
+    );
+    assert_eq!(
+        segment_finished_ids(&events_after),
+        vec![retry_id.clone()],
+        "resume should retranslate exactly the segment flagged via dashboard retry"
+    );
+
+    let store = JobStore::open(&db_path).expect("store should open");
+    let after = store
+        .segment_records(&run.job_id)
+        .expect("segments should load after resume");
+    let retried = after
+        .iter()
+        .find(|record| record.id == retry_id)
+        .expect("retried segment should still be present");
+    assert_eq!(retried.status, "succeeded");
+    assert!(
+        retried.attempts > attempts_before,
+        "retried segment should have actually been re-translated (attempts increased from {attempts_before} to {})",
+        retried.attempts
+    );
+    assert!(
+        store
+            .load_retry_guidance(&run.job_id)
+            .expect("guidance should load after resume")
+            .get(retry_id.as_str())
+            .is_none(),
+        "guidance should be consumed once the retried segment reaches a terminal (succeeded) result in batch mode too"
+    );
+}
+
+#[test]
+fn cli_request_segment_retry_rejects_segment_frozen_by_correct_command() {
+    // Store-level coverage for this rejection already exists (see
+    // `request_segment_retry_rejects_human_corrected_segment` in
+    // crates/bookforge-store/src/db.rs). This lifecycle-level test is cheap
+    // to add on top of the existing `correct`-flow fixture and exercises the
+    // rejection through the real `correct` CLI command (which calls
+    // `save_manual_correction`) rather than a direct store call, proving the
+    // freeze is honored end-to-end.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let run = translate_quiet(&temp, "mock-prefix-target");
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
+    let segment = store
+        .load_terminal_segment_translations(&run.job_id)
+        .expect("translations should load")
+        .into_iter()
+        .next()
+        .expect("fixture should produce a translated segment");
+    let corrected_blocks = segment
+        .blocks
+        .iter()
+        .map(|block| {
+            serde_json::json!({
+                "block_id": block.block_id.0,
+                "text": format!("MANUAL {}", block.text),
+            })
+        })
+        .collect::<Vec<_>>();
+    let correction_path = temp.path().join("correction.json");
+    fs::write(
+        &correction_path,
+        serde_json::to_vec_pretty(&serde_json::json!({ "blocks": corrected_blocks }))
+            .expect("correction should serialize"),
+    )
+    .expect("correction file should write");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "correct",
+            &run.job_id,
+            "--segment",
+            &segment.segment_id,
+            "--from-file",
+            correction_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let result = store.request_segment_retry(&run.job_id, &segment.segment_id, Some("try again"));
+    assert!(
+        matches!(result, Err(StoreError::InvalidCorrection(_))),
+        "retrying a segment frozen by a human correction must be rejected, got: {result:?}"
+    );
+
+    let guidance = store
+        .load_retry_guidance(&run.job_id)
+        .expect("guidance should load");
+    assert!(
+        guidance.get(segment.segment_id.as_str()).is_none(),
+        "rejected retry must not record guidance for the frozen segment"
+    );
+    let records = store
+        .segment_records(&run.job_id)
+        .expect("segment records should load");
+    let frozen = records
+        .iter()
+        .find(|record| record.id == segment.segment_id)
+        .expect("frozen segment should remain present");
+    assert_eq!(
+        frozen.status, "succeeded",
+        "rejected retry must not disturb the frozen segment's status"
+    );
 }
 
 #[test]

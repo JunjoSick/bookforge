@@ -65,9 +65,20 @@ pub(crate) struct ReviewSegment {
     ordinal: usize,
     source_text: String,
     target_text: String,
+    blocks: Vec<ReviewBlock>,
+    human_corrected: bool,
+    corrected_at: Option<String>,
+    flagged: bool,
     soft_warnings: Vec<ReviewWarning>,
     tokens: ReviewTokens,
     status: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ReviewBlock {
+    block_id: String,
+    source_text: String,
+    target_text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +135,10 @@ pub(crate) fn generate_review_document(store: &JobStore, job_id: &str) -> Result
         .ok_or_else(|| anyhow::anyhow!("job '{}' summary unavailable", job.id))?;
     let records = store.segment_records(&job.id)?;
     let translations = store.load_terminal_segment_translations(&job.id)?;
+    let flagged_segment_ids = store
+        .dashboard_flagged_segment_ids(&job.id)?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
     let glossary_terms = if snapshot.glossary_fingerprint.is_empty() {
         store.load_active_glossary_terms(
             job.source_lang.as_deref().unwrap_or("auto"),
@@ -142,6 +157,7 @@ pub(crate) fn generate_review_document(store: &JobStore, job_id: &str) -> Result
         &segments,
         &records,
         &translations,
+        &flagged_segment_ids,
         &summary,
         &glossary_terms,
     ))
@@ -175,7 +191,10 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
     Ok(())
 }
 
-fn resolve_review_input(job: &JobRecord, snapshot: &RunConfigSnapshot) -> Result<PathBuf> {
+pub(crate) fn resolve_review_input(
+    job: &JobRecord,
+    snapshot: &RunConfigSnapshot,
+) -> Result<PathBuf> {
     if let Some(path) = snapshot
         .input_snapshot_path
         .as_ref()
@@ -221,6 +240,7 @@ fn build_review_document(
     segments: &[bookforge_core::segment::Segment],
     records: &[bookforge_store::SegmentRecord],
     translations: &[bookforge_store::StoredSegmentTranslation],
+    flagged_segment_ids: &std::collections::HashSet<String>,
     summary: &bookforge_store::JobSummary,
     glossary_terms: &[GlossaryTerm],
 ) -> ReviewDocument {
@@ -242,9 +262,18 @@ fn build_review_document(
         .iter()
         .filter_map(|segment| {
             let record = records_by_id.get(segment.id.0.as_str())?;
-            let target_text = translations_by_id
-                .get(segment.id.0.as_str())
+            let stored_translation = translations_by_id.get(segment.id.0.as_str()).copied();
+            let target_text = stored_translation
                 .map(|translation| translation.translated_text.clone())
+                .unwrap_or_default();
+            let translated_blocks = stored_translation
+                .map(|translation| {
+                    translation
+                        .blocks
+                        .iter()
+                        .map(|block| (block.block_id.0.as_str(), block.text.as_str()))
+                        .collect::<HashMap<_, _>>()
+                })
                 .unwrap_or_default();
             Some(ReviewSegment {
                 segment_id: segment.id.0.clone(),
@@ -255,6 +284,25 @@ fn build_review_document(
                     .flatten(),
                 ordinal: segment.ordinal + 1,
                 source_text: segment.source.text.clone(),
+                blocks: segment
+                    .source
+                    .blocks
+                    .iter()
+                    .map(|block| ReviewBlock {
+                        block_id: block.block_id.0.clone(),
+                        source_text: block.text.clone(),
+                        target_text: translated_blocks
+                            .get(block.block_id.0.as_str())
+                            .copied()
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                    .collect(),
+                human_corrected: stored_translation
+                    .is_some_and(|translation| translation.human_corrected),
+                corrected_at: stored_translation
+                    .and_then(|translation| translation.corrected_at.clone()),
+                flagged: flagged_segment_ids.contains(&segment.id.0),
                 soft_warnings: soft_warnings(
                     record,
                     &segment.source.text,

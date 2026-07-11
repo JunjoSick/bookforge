@@ -50,12 +50,18 @@ usually won't move.
 Before submitting:
 
 ```bash
-cargo fmt
-cargo clippy --all-targets --all-features
-cargo test
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
+cargo test --workspace --locked
 ```
 
 All three should pass cleanly. CI runs the same set.
+
+On Windows, use the MSVC Rust host (`stable-x86_64-pc-windows-msvc`) and
+install the Visual Studio Build Tools C++ workload. The GNU host requires a
+separate MinGW toolchain including `dlltool.exe` and is not the contributor
+baseline. Verify the active host with `rustc -vV` before diagnosing a project
+build failure.
 
 Add tests for any behaviour change, especially around:
 
@@ -65,10 +71,9 @@ Add tests for any behaviour change, especially around:
 - Anything that touches the `ProgressSink` event schema or the JSONL
   field set (these are semver-stable for v1.x; see ROADMAP §1.5).
 
-Some lifecycle integration tests under `crates/bookforge-cli/tests/`
-read `test/test.epub`, which is gitignored. They will be skipped or
-fail on a fresh clone unless you drop your own fixture at that path.
-A real-but-small public-domain EPUB works fine.
+Lifecycle integration tests build synthetic EPUB fixtures and run in a fresh
+clone. The separate pinned Standard Ebooks corpus is exercised by CI through
+`scripts/corpus-smoke.sh`; local corpus downloads remain gitignored.
 
 ## Commit and PR style
 

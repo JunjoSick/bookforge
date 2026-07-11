@@ -365,6 +365,8 @@ pub struct GlossaryRunConfig {
     pub format: GlossaryFormat,
     pub entries_by_segment: HashMap<String, Vec<GlossaryPromptTerm>>,
     pub prompt_extra: Option<String>,
+    /// Operator guidance for an explicit single-segment retry.
+    pub guidance_by_segment: HashMap<String, String>,
 }
 
 impl Default for GlossaryRunConfig {
@@ -373,6 +375,7 @@ impl Default for GlossaryRunConfig {
             format: GlossaryFormat::Json,
             entries_by_segment: HashMap::new(),
             prompt_extra: None,
+            guidance_by_segment: HashMap::new(),
         }
     }
 }
@@ -1105,7 +1108,7 @@ fn render_prompt(
     )
     .raw(
         "prompt_extra",
-        config.glossary.prompt_extra.clone().unwrap_or_default(),
+        prompt_extra_for_segment(config, &segment.id.0),
     )
     .json(
         "protected_spans_json",
@@ -1165,6 +1168,20 @@ fn render_prompt(
     template
         .render(&vars)
         .map_err(|err| LlmError::Provider(format!("prompt render failed: {err}")))
+}
+
+pub(crate) fn prompt_extra_for_segment(config: &TranslationRunConfig, segment_id: &str) -> String {
+    match (
+        config.glossary.prompt_extra.as_deref(),
+        config.glossary.guidance_by_segment.get(segment_id),
+    ) {
+        (Some(global), Some(guidance)) if !global.trim().is_empty() => {
+            format!("{global}\n\nRetry guidance for this segment:\n{guidance}")
+        }
+        (_, Some(guidance)) => format!("Retry guidance for this segment:\n{guidance}"),
+        (Some(global), None) => global.to_string(),
+        (None, None) => String::new(),
+    }
 }
 
 pub(crate) fn render_context_pairs(pairs: &[CompletedContext]) -> String {
@@ -2168,6 +2185,10 @@ mod tests {
             }],
         );
         json_config.glossary.prompt_extra = Some("Maintain a literary register.".to_string());
+        json_config.glossary.guidance_by_segment.insert(
+            "seg_a".to_string(),
+            "Keep the quoted phrase in Italian this time.".to_string(),
+        );
 
         let rendered = render_prompt(
             &PromptLibrary::global().plain,
@@ -2179,6 +2200,12 @@ mod tests {
         .expect("prompt should render");
         assert!(rendered.user.contains("\"source\": \"Aragorn\""));
         assert!(rendered.user.contains("Maintain a literary register."));
+        assert!(rendered.user.contains("Retry guidance for this segment"));
+        assert!(
+            rendered
+                .user
+                .contains("Keep the quoted phrase in Italian this time.")
+        );
 
         let mut prose_config = json_config.clone();
         prose_config.glossary.format = bookforge_core::GlossaryFormat::Prose;

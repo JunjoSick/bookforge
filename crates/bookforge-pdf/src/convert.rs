@@ -2102,16 +2102,20 @@ fn baseline_page_char_counts(text: &str, pages: usize) -> Vec<usize> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     const BERT_FIGURE1_CAPTION_BOUNDARY_XML: &str =
         include_str!("../fixtures/bert_figure1_caption_boundary.xml");
+    #[cfg(unix)]
     const BERT_FIGURE4_MULTIPANEL_XML: &str =
         include_str!("../fixtures/bert_figure4_multipanel.xml");
+    #[cfg(unix)]
     const BERT_FIGURE5_VECTOR_CHART_XML: &str =
         include_str!("../fixtures/bert_figure5_vector_chart.xml");
     const BERT_PAGE16_VECTOR_CHART_TWOCOL_XML: &str =
         include_str!("../fixtures/bert_page16_vector_chart_twocol.xml");
     const BERT_FIGURE1_TOKEN_STRIP_XML: &str =
         include_str!("../fixtures/bert_figure1_token_strip.xml");
+    #[cfg(unix)]
     const BERT_MODEL_PARAMETER_FALSE_POSITIVE_XML: &str =
         include_str!("../fixtures/bert_model_parameter_false_positive.xml");
 
@@ -2818,6 +2822,7 @@ cp "$script_dir/pdftoppm.fixture.png" "$last.png"
         assert_eq!(cluster, vec![0, 1, 2, 3]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn nearby_raster_subimages_cluster_into_one_figure() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2911,6 +2916,7 @@ cp "$script_dir/pdftoppm.fixture.png" "$last.png"
         assert_eq!(spans_text(&caption.spans), "Figure 2. True caption.");
     }
 
+    #[cfg(unix)]
     #[cfg(unix)]
     #[test]
     fn convert_pdf_does_not_write_epub_when_baseline_fails() {
@@ -3022,6 +3028,7 @@ XML
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
     #[test]
     fn convert_pdf_embeds_extracted_image_with_translatable_caption() {
         use std::{fs, io::Read};
@@ -3105,6 +3112,7 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
     #[test]
     fn convert_pdf_snaps_figure_crop_above_caption_boundary_fixture() {
         use std::{fs, io::Read};
@@ -3173,6 +3181,7 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
     #[test]
     fn convert_pdf_groups_multipanel_figure_fixture_as_one_captioned_crop() {
         use std::{fs, io::Read};
@@ -3227,6 +3236,7 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
         assert!(content.contains("Discussion resumes after the figure."));
     }
 
+    #[cfg(unix)]
     #[cfg(unix)]
     #[test]
     fn convert_pdf_preserves_vector_chart_fixture_as_captioned_crop() {
@@ -3284,6 +3294,7 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
         assert!(!content.contains("Epoch"));
     }
 
+    #[cfg(unix)]
     #[cfg(unix)]
     #[test]
     fn convert_pdf_warns_on_lowercase_continuation_after_media() {
@@ -3343,6 +3354,7 @@ printf 'This paragraph\ncontinues after the figure.\n'
         );
     }
 
+    #[cfg(unix)]
     #[cfg(unix)]
     #[test]
     fn convert_pdf_preserves_detected_table_as_crop_with_caption() {
@@ -3447,6 +3459,7 @@ printf 'Body before table.\nTable 1. Scores.\nMetric 2019 2020\nA 0.91 0.93\nB 0
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
     #[test]
     fn convert_pdf_preserves_display_equation_as_crop() {
         use std::{fs, io::Read};
@@ -3523,6 +3536,7 @@ printf 'Body before equation.\nE = mc^2\nBody after equation.\n'
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
     #[test]
     fn convert_pdf_marks_inline_math_as_protected_span() {
         use std::fs;
@@ -3581,6 +3595,7 @@ printf 'The energy term E = mc^2 appears inline.\n'
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
     #[test]
     fn convert_pdf_does_not_crop_model_parameter_prose_as_equation() {
         use std::{fs, io::Read};
@@ -3629,6 +3644,7 @@ printf 'The energy term E = mc^2 appears inline.\n'
         assert!(!content.contains("pdf-equation-0001.png"));
     }
 
+    #[cfg(unix)]
     #[cfg(unix)]
     #[test]
     fn low_confidence_pages_linearize_by_default() {
@@ -3704,6 +3720,7 @@ printf 'Tiny plus many baseline characters that the XML reconstruction did not r
         assert!(!content.contains("pdf-page-0001.png"));
     }
 
+    #[cfg(unix)]
     #[cfg(unix)]
     #[test]
     fn low_confidence_pages_can_be_preserved_as_page_images() {

@@ -33,6 +33,9 @@ pub enum StoreError {
 
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    #[error("manual correction rejected: {0}")]
+    InvalidCorrection(String),
 }
 
 pub struct JobStore {
@@ -119,6 +122,10 @@ pub struct StoredSegmentTranslation {
     pub error: Option<String>,
     pub translated_text: String,
     pub blocks: Vec<BlockTranslation>,
+    pub provider: String,
+    pub model: String,
+    pub human_corrected: bool,
+    pub corrected_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +147,14 @@ pub struct SaveTranslation<'a> {
     pub input_cached_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub tokens_estimated: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SaveManualCorrection<'a> {
+    pub job_id: &'a str,
+    pub segment_id: &'a str,
+    pub translated_text: &'a str,
+    pub blocks: &'a [BlockTranslation],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -573,6 +588,9 @@ impl JobStore {
     }
 
     pub fn save_translation(&self, request: SaveTranslation<'_>) -> Result<()> {
+        if self.translation_is_human_corrected(request.job_id, request.segment_id)? {
+            return Ok(());
+        }
         let now = timestamp_string();
         let translated_hash = stable_hash(request.translated_text);
         {
@@ -618,11 +636,15 @@ impl JobStore {
                 ],
             )?;
         }
+        self.consume_dashboard_retry_guidance(request.job_id, request.segment_id)?;
         self.touch_job_unless_status(request.job_id, "running", &["paused", "stopped"])?;
         Ok(())
     }
 
     pub fn save_needs_review(&self, request: SaveNeedsReview<'_>) -> Result<()> {
+        if self.translation_is_human_corrected(request.job_id, request.segment_id)? {
+            return Ok(());
+        }
         let now = timestamp_string();
         let translated_hash = stable_hash(request.preserved_text);
         {
@@ -669,11 +691,15 @@ impl JobStore {
                 ],
             )?;
         }
+        self.consume_dashboard_retry_guidance(request.job_id, request.segment_id)?;
         self.touch_job_unless_status(request.job_id, "needs_review", &["paused", "stopped"])?;
         Ok(())
     }
 
     pub fn save_cached_translation(&self, request: SaveCachedTranslation<'_>) -> Result<()> {
+        if self.translation_is_human_corrected(request.job_id, request.segment_id)? {
+            return Ok(());
+        }
         let now = timestamp_string();
         let translated_hash = stable_hash(request.translated_text);
         {
@@ -706,8 +732,147 @@ impl JobStore {
                 params![translated_hash, request.job_id, request.segment_id],
             )?;
         }
+        self.consume_dashboard_retry_guidance(request.job_id, request.segment_id)?;
         self.touch_job_unless_status(request.job_id, "running", &["paused", "stopped"])?;
         Ok(())
+    }
+
+    pub fn save_manual_correction(&self, request: SaveManualCorrection<'_>) -> Result<()> {
+        if request.translated_text.trim().is_empty() {
+            return Err(StoreError::InvalidCorrection(
+                "translation text cannot be empty".to_string(),
+            ));
+        }
+        if request.blocks.is_empty()
+            || request
+                .blocks
+                .iter()
+                .any(|block| block.text.trim().is_empty())
+        {
+            return Err(StoreError::InvalidCorrection(
+                "every corrected block must contain text".to_string(),
+            ));
+        }
+
+        let now = timestamp_string();
+        let translated_hash = stable_hash(request.translated_text);
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        let job_status = tx
+            .query_row(
+                "SELECT status FROM jobs WHERE id = ?1",
+                params![request.job_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(job_status) = job_status else {
+            return Err(StoreError::InvalidCorrection(format!(
+                "job '{}' was not found",
+                request.job_id
+            )));
+        };
+        if matches!(job_status.as_str(), "running" | "paused") {
+            return Err(StoreError::InvalidCorrection(format!(
+                "job '{}' is {}; stop it before applying a manual correction",
+                request.job_id, job_status
+            )));
+        }
+
+        let prompt_version = tx
+            .query_row(
+                "SELECT prompt_version FROM segments WHERE job_id = ?1 AND id = ?2",
+                params![request.job_id, request.segment_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(prompt_version) = prompt_version else {
+            return Err(StoreError::InvalidCorrection(format!(
+                "segment '{}' was not found in job '{}'",
+                request.segment_id, request.job_id
+            )));
+        };
+
+        tx.execute(
+            "INSERT INTO translations
+             (segment_id, job_id, translated_text, provider, model, prompt_version, created_at,
+              origin, human_corrected, corrected_at)
+             VALUES (?1, ?2, ?3, 'manual', 'manual', ?4, ?5, 'manual', 1, ?5)
+             ON CONFLICT(job_id, segment_id) DO UPDATE SET
+               translated_text = excluded.translated_text,
+               provider = 'manual',
+               model = 'manual',
+               prompt_version = excluded.prompt_version,
+               created_at = excluded.created_at,
+               origin = 'manual',
+               human_corrected = 1,
+               corrected_at = excluded.corrected_at",
+            params![
+                request.segment_id,
+                request.job_id,
+                request.translated_text,
+                prompt_version,
+                now,
+            ],
+        )?;
+        replace_block_translations(&tx, request.job_id, request.segment_id, request.blocks)?;
+        tx.execute(
+            "UPDATE segments
+             SET status = 'succeeded', translated_hash = ?1, error = NULL
+             WHERE job_id = ?2 AND id = ?3",
+            params![translated_hash, request.job_id, request.segment_id],
+        )?;
+        tx.execute(
+            "DELETE FROM qa_findings WHERE job_id = ?1 AND segment_id = ?2",
+            params![request.job_id, request.segment_id],
+        )?;
+        tx.execute(
+            "UPDATE segment_flags SET consumed = 1 WHERE job_id = ?1 AND segment_id = ?2",
+            params![request.job_id, request.segment_id],
+        )?;
+        tx.commit()?;
+        drop(conn);
+
+        self.recompute_job_status(request.job_id)?;
+        Ok(())
+    }
+
+    pub fn translation_is_human_corrected(&self, job_id: &str, segment_id: &str) -> Result<bool> {
+        let conn = self.conn.borrow();
+        Ok(conn
+            .query_row(
+                "SELECT human_corrected FROM translations WHERE job_id = ?1 AND segment_id = ?2",
+                params![job_id, segment_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|value| value != 0))
+    }
+
+    fn consume_dashboard_retry_guidance(&self, job_id: &str, segment_id: &str) -> Result<()> {
+        let conn = self.conn.borrow();
+        conn.execute(
+            "UPDATE segment_flags SET consumed = 1
+             WHERE job_id = ?1 AND segment_id = ?2 AND kind = 'dashboard_retry'",
+            params![job_id, segment_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn recompute_job_status(&self, job_id: &str) -> Result<()> {
+        let conn = self.conn.borrow();
+        let (total, unresolved) = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN status IN ('succeeded', 'skipped_cached') THEN 0 ELSE 1 END), 0)
+             FROM segments WHERE job_id = ?1",
+            params![job_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        drop(conn);
+        if total > 0 && unresolved == 0 {
+            self.touch_job(job_id, "succeeded")
+        } else {
+            self.touch_job(job_id, "needs_review")
+        }
     }
 
     pub fn mark_job_complete(&self, job_id: &str) -> Result<()> {
@@ -1018,6 +1183,126 @@ impl JobStore {
         };
         self.touch_job_unless_status(job_id, "retry_pending", &["stopped"])?;
         Ok(count)
+    }
+
+    pub fn request_segment_retry(
+        &self,
+        job_id: &str,
+        segment_id: &str,
+        guidance: Option<&str>,
+    ) -> Result<()> {
+        if self.translation_is_human_corrected(job_id, segment_id)? {
+            return Err(StoreError::InvalidCorrection(format!(
+                "segment '{segment_id}' has a frozen human correction"
+            )));
+        }
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        let job_status = tx
+            .query_row(
+                "SELECT status FROM jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(job_status) = &job_status {
+            if matches!(job_status.as_str(), "running" | "paused") {
+                return Err(StoreError::InvalidCorrection(format!(
+                    "job '{job_id}' is {job_status}; stop it before requesting a retry"
+                )));
+            }
+        }
+        let updated = tx.execute(
+            "UPDATE segments SET status = 'retry_pending', error = NULL
+             WHERE job_id = ?1 AND id = ?2",
+            params![job_id, segment_id],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::InvalidCorrection(format!(
+                "segment '{segment_id}' was not found in job '{job_id}'"
+            )));
+        }
+        tx.execute(
+            "DELETE FROM segment_flags
+             WHERE job_id = ?1 AND segment_id = ?2 AND kind = 'dashboard_retry'",
+            params![job_id, segment_id],
+        )?;
+        if let Some(guidance) = guidance.filter(|value| !value.trim().is_empty()) {
+            tx.execute(
+                "INSERT INTO segment_flags
+                 (job_id, segment_id, kind, note, ingested_at, consumed)
+                 VALUES (?1, ?2, 'dashboard_retry', ?3, ?4, 0)",
+                params![job_id, segment_id, guidance.trim(), timestamp_string()],
+            )?;
+        }
+        tx.commit()?;
+        drop(conn);
+        self.touch_job_unless_status(job_id, "retry_pending", &["stopped"])?;
+        Ok(())
+    }
+
+    pub fn load_retry_guidance(&self, job_id: &str) -> Result<HashMap<String, String>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT segment_id, note FROM segment_flags
+             WHERE job_id = ?1 AND kind = 'dashboard_retry' AND consumed = 0
+                   AND note IS NOT NULL AND TRIM(note) <> ''
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![job_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut guidance = HashMap::new();
+        for row in rows {
+            let (segment_id, note) = row?;
+            guidance.insert(segment_id, note);
+        }
+        Ok(guidance)
+    }
+
+    pub fn set_dashboard_segment_flag(
+        &self,
+        job_id: &str,
+        segment_id: &str,
+        flagged: bool,
+    ) -> Result<()> {
+        let conn = self.conn.borrow();
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM segments WHERE job_id = ?1 AND id = ?2)",
+            params![job_id, segment_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !exists {
+            return Err(StoreError::InvalidCorrection(format!(
+                "segment '{segment_id}' was not found in job '{job_id}'"
+            )));
+        }
+        conn.execute(
+            "DELETE FROM segment_flags
+             WHERE job_id = ?1 AND segment_id = ?2 AND kind = 'dashboard_flag'",
+            params![job_id, segment_id],
+        )?;
+        if flagged {
+            conn.execute(
+                "INSERT INTO segment_flags
+                 (job_id, segment_id, kind, ingested_at, consumed)
+                 VALUES (?1, ?2, 'dashboard_flag', ?3, 0)",
+                params![job_id, segment_id, timestamp_string()],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn dashboard_flagged_segment_ids(&self, job_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT segment_id FROM segment_flags
+             WHERE job_id = ?1 AND kind = 'dashboard_flag' AND consumed = 0
+             ORDER BY segment_id",
+        )?;
+        let rows = stmt.query_map(params![job_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn insert_segment_flags(&self, flags: &[NewSegmentFlag<'_>]) -> Result<usize> {
@@ -1847,7 +2132,8 @@ impl JobStore {
     ) -> Result<Vec<StoredSegmentTranslation>> {
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
-            "SELECT s.id, s.ordinal, s.status, s.error, t.translated_text
+            "SELECT s.id, s.ordinal, s.status, s.error, t.translated_text,
+                    t.provider, t.model, t.human_corrected, t.corrected_at
              FROM segments s
              JOIN translations t ON t.job_id = s.job_id AND t.segment_id = s.id
              WHERE s.job_id = ?1 AND s.status IN ('succeeded', 'skipped_cached', 'needs_review')
@@ -1860,12 +2146,26 @@ impl JobStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)? != 0,
+                row.get::<_, Option<String>>(8)?,
             ))
         })?;
 
         let mut records = Vec::new();
         for row in rows {
-            let (segment_id, ordinal, status, error, translated_text) = row?;
+            let (
+                segment_id,
+                ordinal,
+                status,
+                error,
+                translated_text,
+                provider,
+                model,
+                human_corrected,
+                corrected_at,
+            ) = row?;
             let mut block_stmt = conn.prepare(
                 "SELECT block_id, translated_text
                  FROM translation_blocks
@@ -1887,6 +2187,10 @@ impl JobStore {
                 error,
                 translated_text,
                 blocks,
+                provider,
+                model,
+                human_corrected,
+                corrected_at,
             });
         }
 
@@ -1931,6 +2235,7 @@ impl JobStore {
                    AND j.target_lang = ?6
                    AND s.cache_namespace = ?7
                    AND s.status IN ('succeeded', 'skipped_cached')
+                   AND t.human_corrected = 0
                  ORDER BY CASE s.status WHEN 'succeeded' THEN 0 ELSE 1 END,
                           CAST(t.created_at AS INTEGER) DESC,
                           t.rowid DESC
@@ -2025,6 +2330,7 @@ impl JobStore {
                    AND j.target_lang = ?{}
                    AND s.cache_namespace = ?{}
                    AND s.status IN ('succeeded', 'skipped_cached')
+                   AND t.human_corrected = 0
                  ORDER BY CASE s.status WHEN 'succeeded' THEN 0 ELSE 1 END,
                           CAST(t.created_at AS INTEGER) DESC,
                           t.rowid DESC",
@@ -2198,6 +2504,9 @@ impl JobStore {
               model TEXT NOT NULL,
               prompt_version TEXT NOT NULL,
               created_at TEXT NOT NULL,
+              origin TEXT NOT NULL DEFAULT 'model',
+              human_corrected INTEGER NOT NULL DEFAULT 0,
+              corrected_at TEXT,
               PRIMARY KEY (job_id, segment_id),
               FOREIGN KEY(job_id, segment_id) REFERENCES segments(job_id, id)
             );
@@ -2314,6 +2623,19 @@ impl JobStore {
             "tokens_estimated",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column(
+            &conn,
+            "translations",
+            "origin",
+            "TEXT NOT NULL DEFAULT 'model'",
+        )?;
+        ensure_column(
+            &conn,
+            "translations",
+            "human_corrected",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(&conn, "translations", "corrected_at", "TEXT")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_segments_cache_lookup
              ON segments(source_hash, cache_namespace, prompt_version, provider, model, status);
@@ -2332,6 +2654,7 @@ impl JobStore {
         record_migration(&conn, 4, "v1_2_glossary_terms")?;
         record_migration(&conn, 5, "v1_2_1_nullable_glossary_candidate_targets")?;
         record_migration(&conn, 6, "v1_3_context_styles_entities")?;
+        record_migration(&conn, 7, "v2_4_human_corrections")?;
         Ok(())
     }
 
@@ -3596,6 +3919,132 @@ mod tests {
     }
 
     #[test]
+    fn cached_translation_rejects_mismatched_prompt_version() {
+        // Regression test for the batch prompt v2 -> v3 bump (retry_guidance
+        // field added to translate_batch_plain/marker_safe/run_preserving and
+        // their compact variants). segments.prompt_version is the
+        // cross-job translation cache key (see find_cached_translation and
+        // find_cached_translations_batch below); a translation cached under
+        // the old "v2" tag must not be served back out when the current
+        // binary queries under the bumped "v3" tag, since the v2-era row was
+        // produced from prompt text that never mentioned retry_guidance.
+        let db_path = temp_path("prompt_version_bump.sqlite");
+        let input_path = temp_path("input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job should be created");
+
+        let mut seg = segment("seg_a", 0);
+        seg.block_ids = vec![BlockId("b_000000".to_string())];
+
+        store
+            .insert_segments(
+                &job.id,
+                std::slice::from_ref(&seg),
+                "v2",
+                "mock",
+                "mock-prefix",
+                "ns_bump",
+            )
+            .expect("segments should insert");
+        store
+            .save_translation(SaveTranslation {
+                job_id: &job.id,
+                segment_id: "seg_a",
+                translated_text: "Tradotto v2",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "Tradotto v2".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v2",
+                input_tokens: Some(11),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(7),
+                tokens_estimated: false,
+            })
+            .expect("translation should save");
+
+        let hit_v2 = store
+            .find_cached_translation(
+                &seg,
+                "v2",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_bump",
+            )
+            .expect("query ok");
+        assert!(
+            hit_v2.is_some(),
+            "row stored under v2 must still be visible to a v2 query"
+        );
+
+        let miss_v3 = store
+            .find_cached_translation(
+                &seg,
+                "v3",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_bump",
+            )
+            .expect("query ok");
+        assert!(
+            miss_v3.is_none(),
+            "row stored under v2 must not be served back for a v3 (retry_guidance) query"
+        );
+
+        let batch_request_v3 = CacheLookupRequest {
+            prompt_version: "v3",
+            provider: "mock",
+            model: "mock-prefix",
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            cache_namespace: "ns_bump",
+        };
+        let batch_miss = store
+            .find_cached_translations_batch(std::slice::from_ref(&seg), batch_request_v3)
+            .expect("batch query ok");
+        assert!(
+            batch_miss.is_empty(),
+            "batch lookup must not return v2-era rows for a v3 query"
+        );
+
+        let batch_request_v2 = CacheLookupRequest {
+            prompt_version: "v2",
+            ..batch_request_v3
+        };
+        let batch_hit = store
+            .find_cached_translations_batch(std::slice::from_ref(&seg), batch_request_v2)
+            .expect("batch query ok");
+        assert!(
+            batch_hit.contains_key(&seg.id.0),
+            "batch lookup must still return the row for a matching v2 query"
+        );
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
     fn cached_translation_rejects_mismatched_block_ids() {
         let db_path = temp_path("blockid_match.sqlite");
         let (store, _job, mut seg) =
@@ -4288,6 +4737,505 @@ mod tests {
         assert_eq!(loaded.series_id.as_deref(), Some("lord-of-the-rings"));
         let _ = fs::remove_file(&db_path);
         let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn manual_correction_is_auditable_frozen_and_not_cacheable() {
+        let db_path = temp_path("manual_correction.sqlite");
+        let (store, job, segment) =
+            build_seeded_store_with_translation(&db_path, "manual_ns", &["b_000000"]);
+        store
+            .mark_job_needs_review(&job.id)
+            .expect("job should become reviewable");
+
+        let manual_blocks = [BlockTranslation {
+            block_id: BlockId("b_000000".to_string()),
+            text: "Correzione umana".to_string(),
+        }];
+        store
+            .save_manual_correction(SaveManualCorrection {
+                job_id: &job.id,
+                segment_id: "seg_a",
+                translated_text: "Correzione umana",
+                blocks: &manual_blocks,
+            })
+            .expect("manual correction should save");
+
+        store
+            .save_translation(SaveTranslation {
+                job_id: &job.id,
+                segment_id: "seg_a",
+                translated_text: "MODEL OVERWRITE",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "MODEL OVERWRITE".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(1),
+                tokens_estimated: false,
+            })
+            .expect("model write should be ignored rather than fail");
+
+        let translations = store
+            .load_terminal_segment_translations(&job.id)
+            .expect("translation should load");
+        assert_eq!(translations.len(), 1);
+        assert_eq!(translations[0].translated_text, "Correzione umana");
+        assert_eq!(translations[0].provider, "manual");
+        assert_eq!(translations[0].model, "manual");
+        assert!(translations[0].human_corrected);
+        assert!(translations[0].corrected_at.is_some());
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "succeeded");
+
+        let cached = store
+            .find_cached_translation(
+                &segment,
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "manual_ns",
+            )
+            .expect("cache lookup should succeed");
+        assert!(cached.is_none(), "manual corrections must remain job-local");
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn manual_correction_rejects_active_jobs() {
+        let db_path = temp_path("manual_correction_running.sqlite");
+        let (store, job, _segment) =
+            build_seeded_store_with_translation(&db_path, "manual_running_ns", &["b_000000"]);
+        let result = store.save_manual_correction(SaveManualCorrection {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            translated_text: "Correzione",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "Correzione".to_string(),
+            }],
+        });
+        assert!(matches!(result, Err(StoreError::InvalidCorrection(_))));
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn dashboard_segment_flag_set_and_clear_is_job_scoped() {
+        let db_path = temp_path("dashboard_flag.sqlite");
+        let input_a = temp_path("flag_input_a.epub");
+        let input_b = temp_path("flag_input_b.epub");
+        fs::write(&input_a, b"epub bytes flag a").expect("input a fixture should be writable");
+        fs::write(&input_b, b"epub bytes flag b").expect("input b fixture should be writable");
+
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job_a = store
+            .create_job(CreateJob {
+                input: &input_a,
+                output: &temp_path("flag_output_a.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job a should be created");
+        let job_b = store
+            .create_job(CreateJob {
+                input: &input_b,
+                output: &temp_path("flag_output_b.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job b should be created");
+
+        let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
+        store
+            .insert_segments(&job_a.id, &segments, "v1", "mock", "mock-prefix", "flag_ns")
+            .expect("job a segments should insert");
+        store
+            .insert_segments(&job_b.id, &segments, "v1", "mock", "mock-prefix", "flag_ns")
+            .expect("job b segments should insert");
+
+        assert!(
+            store
+                .dashboard_flagged_segment_ids(&job_a.id)
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .set_dashboard_segment_flag(&job_a.id, "seg_a", true)
+            .expect("flag should set");
+        assert_eq!(
+            store.dashboard_flagged_segment_ids(&job_a.id).unwrap(),
+            vec!["seg_a".to_string()]
+        );
+        // Flags are job-scoped: the same segment id in a different job is unaffected.
+        assert!(
+            store
+                .dashboard_flagged_segment_ids(&job_b.id)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Clearing the flag removes it from the read path.
+        store
+            .set_dashboard_segment_flag(&job_a.id, "seg_a", false)
+            .expect("flag should clear");
+        assert!(
+            store
+                .dashboard_flagged_segment_ids(&job_a.id)
+                .unwrap()
+                .is_empty()
+        );
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_a);
+        let _ = fs::remove_file(input_b);
+    }
+
+    #[test]
+    fn request_segment_retry_stores_guidance_and_transitions_state() {
+        let db_path = temp_path("retry_guidance.sqlite");
+        let (store, job, _segment) =
+            build_seeded_store_with_translation(&db_path, "retry_ns", &["b_000000"]);
+
+        // A retry request is only accepted once the job is out of "running"/
+        // "paused" (see `request_segment_retry_rejects_running_and_paused_jobs`),
+        // so move it to "needs_review" first, as a real dashboard-driven retry
+        // would only be offered once the job has stopped actively translating.
+        store
+            .mark_job_needs_review(&job.id)
+            .expect("job should become reviewable");
+        assert_eq!(
+            store.get_job(&job.id).unwrap().unwrap().status,
+            "needs_review"
+        );
+
+        store
+            .request_segment_retry(&job.id, "seg_a", Some("check the idiom in paragraph 2"))
+            .expect("retry request should succeed");
+
+        let guidance = store
+            .load_retry_guidance(&job.id)
+            .expect("guidance should load");
+        assert_eq!(
+            guidance.get("seg_a").map(String::as_str),
+            Some("check the idiom in paragraph 2")
+        );
+
+        let records = store
+            .segment_records(&job.id)
+            .expect("segment records should load");
+        let seg_a = records
+            .iter()
+            .find(|record| record.id == "seg_a")
+            .expect("segment should be present");
+        assert_eq!(seg_a.status, "retry_pending");
+        assert!(seg_a.error.is_none());
+
+        assert_eq!(
+            store.get_job(&job.id).unwrap().unwrap().status,
+            "retry_pending"
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn request_segment_retry_rejects_human_corrected_segment() {
+        let db_path = temp_path("retry_frozen.sqlite");
+        let (store, job, _segment) =
+            build_seeded_store_with_translation(&db_path, "retry_frozen_ns", &["b_000000"]);
+        store
+            .mark_job_needs_review(&job.id)
+            .expect("job should become reviewable");
+        store
+            .save_manual_correction(SaveManualCorrection {
+                job_id: &job.id,
+                segment_id: "seg_a",
+                translated_text: "Correzione umana",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "Correzione umana".to_string(),
+                }],
+            })
+            .expect("manual correction should save");
+
+        let result = store.request_segment_retry(&job.id, "seg_a", Some("try again"));
+        assert!(matches!(result, Err(StoreError::InvalidCorrection(_))));
+
+        // The rejected retry must not have recorded guidance or disturbed the frozen segment.
+        let guidance = store
+            .load_retry_guidance(&job.id)
+            .expect("guidance should load");
+        assert!(guidance.get("seg_a").is_none());
+        let records = store
+            .segment_records(&job.id)
+            .expect("segment records should load");
+        let seg_a = records
+            .iter()
+            .find(|record| record.id == "seg_a")
+            .expect("segment should be present");
+        assert_eq!(seg_a.status, "succeeded");
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn request_segment_retry_rejects_running_and_paused_jobs() {
+        // Like save_manual_correction, request_segment_retry must reject retry
+        // requests while the job is "running" or "paused": accepting one would
+        // force-transition an in-flight job to "retry_pending" out from under
+        // whatever is currently driving it. Neither guidance nor segment/job
+        // state may change when the request is rejected.
+        let db_path = temp_path("retry_no_job_guard.sqlite");
+        let (store, job, _segment) =
+            build_seeded_store_with_translation(&db_path, "retry_no_guard_ns", &["b_000000"]);
+
+        store
+            .mark_job_running(&job.id)
+            .expect("job should be running");
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "running");
+        let result = store.request_segment_retry(&job.id, "seg_a", Some("try again"));
+        assert!(
+            matches!(result, Err(StoreError::InvalidCorrection(_))),
+            "retry must be rejected while the job is running, got: {result:?}"
+        );
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "running");
+        let guidance = store
+            .load_retry_guidance(&job.id)
+            .expect("guidance should load");
+        assert!(
+            guidance.get("seg_a").is_none(),
+            "a rejected retry must not record guidance"
+        );
+        let records = store
+            .segment_records(&job.id)
+            .expect("segment records should load");
+        let seg_a = records
+            .iter()
+            .find(|record| record.id == "seg_a")
+            .expect("segment should be present");
+        assert_eq!(
+            seg_a.status, "succeeded",
+            "a rejected retry must not move the segment to retry_pending"
+        );
+
+        store
+            .mark_job_paused(&job.id)
+            .expect("job should be paused");
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "paused");
+        let result = store.request_segment_retry(&job.id, "seg_a", Some("try again"));
+        assert!(
+            matches!(result, Err(StoreError::InvalidCorrection(_))),
+            "retry must be rejected while the job is paused, got: {result:?}"
+        );
+        assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "paused");
+        let guidance = store
+            .load_retry_guidance(&job.id)
+            .expect("guidance should load");
+        assert!(
+            guidance.get("seg_a").is_none(),
+            "a rejected retry must not record guidance"
+        );
+        let records = store
+            .segment_records(&job.id)
+            .expect("segment records should load");
+        let seg_a = records
+            .iter()
+            .find(|record| record.id == "seg_a")
+            .expect("segment should be present");
+        assert_eq!(
+            seg_a.status, "succeeded",
+            "a rejected retry must not move the segment to retry_pending"
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn terminal_save_translation_consumes_only_its_segment_guidance() {
+        let db_path = temp_path("retry_consume.sqlite");
+        let input_path = temp_path("consume_input.epub");
+        fs::write(&input_path, b"epub bytes consume").expect("input fixture should be writable");
+
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("consume_output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job should be created");
+        let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
+        store
+            .insert_segments(
+                &job.id,
+                &segments,
+                "v1",
+                "mock",
+                "mock-prefix",
+                "consume_ns",
+            )
+            .expect("segments should insert");
+        // Jobs are created "running"; request_segment_retry now rejects retries
+        // while running/paused, so move it to "needs_review" first.
+        store
+            .mark_job_needs_review(&job.id)
+            .expect("job should become reviewable");
+
+        store
+            .request_segment_retry(&job.id, "seg_a", Some("guidance for a"))
+            .expect("retry a should succeed");
+        store
+            .request_segment_retry(&job.id, "seg_b", Some("guidance for b"))
+            .expect("retry b should succeed");
+
+        let guidance = store.load_retry_guidance(&job.id).unwrap();
+        assert_eq!(guidance.len(), 2);
+
+        store
+            .save_translation(SaveTranslation {
+                job_id: &job.id,
+                segment_id: "seg_a",
+                translated_text: "Tradotto A",
+                blocks: &[BlockTranslation {
+                    block_id: BlockId("b_000000".to_string()),
+                    text: "Tradotto A".to_string(),
+                }],
+                provider: "mock",
+                model: "mock-prefix",
+                prompt_version: "v1",
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(1),
+                tokens_estimated: false,
+            })
+            .expect("translation should save");
+
+        let guidance_after = store.load_retry_guidance(&job.id).unwrap();
+        assert!(
+            guidance_after.get("seg_a").is_none(),
+            "the consumed segment's guidance should be gone"
+        );
+        assert_eq!(
+            guidance_after.get("seg_b").map(String::as_str),
+            Some("guidance for b"),
+            "another segment's guidance should survive"
+        );
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn load_retry_guidance_is_job_scoped() {
+        let db_path = temp_path("retry_job_scope.sqlite");
+        let input_a = temp_path("scope_input_a.epub");
+        let input_b = temp_path("scope_input_b.epub");
+        fs::write(&input_a, b"epub bytes scope a").expect("input a fixture should be writable");
+        fs::write(&input_b, b"epub bytes scope b").expect("input b fixture should be writable");
+
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job_a = store
+            .create_job(CreateJob {
+                input: &input_a,
+                output: &temp_path("scope_output_a.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job a should be created");
+        let job_b = store
+            .create_job(CreateJob {
+                input: &input_b,
+                output: &temp_path("scope_output_b.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job b should be created");
+
+        let segments = vec![segment("seg_a", 0)];
+        store
+            .insert_segments(
+                &job_a.id,
+                &segments,
+                "v1",
+                "mock",
+                "mock-prefix",
+                "scope_ns",
+            )
+            .expect("job a segments should insert");
+        store
+            .insert_segments(
+                &job_b.id,
+                &segments,
+                "v1",
+                "mock",
+                "mock-prefix",
+                "scope_ns",
+            )
+            .expect("job b segments should insert");
+        // Jobs are created "running"; request_segment_retry now rejects retries
+        // while running/paused, so move job a to "needs_review" first.
+        store
+            .mark_job_needs_review(&job_a.id)
+            .expect("job a should become reviewable");
+
+        store
+            .request_segment_retry(&job_a.id, "seg_a", Some("only for job a"))
+            .expect("retry should succeed");
+
+        let guidance_a = store.load_retry_guidance(&job_a.id).unwrap();
+        assert_eq!(
+            guidance_a.get("seg_a").map(String::as_str),
+            Some("only for job a")
+        );
+
+        let guidance_b = store.load_retry_guidance(&job_b.id).unwrap();
+        assert!(
+            guidance_b.is_empty(),
+            "job b should not see job a's retry guidance"
+        );
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_a);
+        let _ = fs::remove_file(input_b);
     }
 
     fn glossary_term(

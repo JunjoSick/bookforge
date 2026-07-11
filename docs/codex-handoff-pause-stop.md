@@ -146,7 +146,12 @@ Early-pause (during the in-flight translation batch), concurrency=1:
   resume-while-parked works), job completed, NO duplicate segments.
 Acceptance §10.1.1.1-4 confirmed live. Good work.
 
-### Remaining bug — finalize passes ignore pause (must fix for §10.1.1.5)
+### Historical finding — finalize passes ignored pause (fixed before v2.3.0)
+
+Resolution: commits `a5e30027` and `e46eb398` threaded the shared pause signal
+through finalize stages, added stage-boundary checks, and preserved resumable
+stop semantics. The text below is retained as the review record that drove the
+fix; it does not describe the current implementation.
 
 The pause gate covers ONLY the primary translation loop. The
 post-translation passes are not pause-aware:

@@ -140,6 +140,21 @@ struct AppState {
     /// the lifetime of the server: never written to disk, never logged, and
     /// only injected into spawned runs through the child's environment.
     keys: Arc<Mutex<HashMap<String, String>>>,
+    /// Path to the job store's sqlite database, resolved once when the server
+    /// (or, in tests, a router) is constructed. Handlers open a fresh
+    /// [`JobStore`] against this path per request rather than calling
+    /// [`JobStore::open_default`] directly, so the resolved path doesn't
+    /// depend on the process-global current directory at request time — this
+    /// keeps production behavior identical (same default relative path,
+    /// resolved once at startup instead of per-request) while letting tests
+    /// point a router at an isolated temp-dir store without touching CWD.
+    store_path: PathBuf,
+}
+
+/// The default job store path, relative to the current directory — identical
+/// to what [`JobStore::open_default`] uses internally.
+fn default_store_path() -> PathBuf {
+    PathBuf::from(".bookforge/jobs.sqlite")
 }
 
 pub async fn run(args: ServeArgs) -> Result<()> {
@@ -158,6 +173,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         csrf_token: generate_csrf_token()?,
         host_port: local.port(),
         keys: Arc::new(Mutex::new(HashMap::new())),
+        store_path: default_store_path(),
     };
 
     let app = dashboard_router(state);
@@ -187,6 +203,18 @@ fn dashboard_router(state: AppState) -> Router {
         .route("/api/jobs/{id}", get(job_detail))
         .route("/api/jobs/{id}/events", get(job_events))
         .route("/api/jobs/{id}/review", get(job_review))
+        .route(
+            "/api/jobs/{id}/segments/{segment_id}/translation",
+            post(save_manual_translation),
+        )
+        .route(
+            "/api/jobs/{id}/segments/{segment_id}/flag",
+            post(set_segment_flag),
+        )
+        .route(
+            "/api/jobs/{id}/segments/{segment_id}/retry",
+            post(retry_segment_with_guidance),
+        )
         .route("/api/jobs/{id}/validate", post(job_validate))
         .route("/api/jobs/{id}/retry", post(retry_job))
         .route("/api/jobs/{id}/pause", post(pause_job))
@@ -271,9 +299,10 @@ async fn index(State(state): State<AppState>) -> Html<String> {
     Html(DASHBOARD_HTML.replace(CSRF_TOKEN_PLACEHOLDER, &state.csrf_token))
 }
 
-async fn list_jobs() -> Result<Json<Vec<JobListItem>>, AppError> {
-    let items = tokio::task::spawn_blocking(|| -> Result<Vec<JobListItem>> {
-        let store = JobStore::open_default()?;
+async fn list_jobs(State(state): State<AppState>) -> Result<Json<Vec<JobListItem>>, AppError> {
+    let store_path = state.store_path.clone();
+    let items = tokio::task::spawn_blocking(move || -> Result<Vec<JobListItem>> {
+        let store = JobStore::open(store_path)?;
         Ok(store
             .list_job_summaries()?
             .into_iter()
@@ -284,10 +313,14 @@ async fn list_jobs() -> Result<Json<Vec<JobListItem>>, AppError> {
     Ok(Json(items))
 }
 
-async fn job_detail(AxumPath(id): AxumPath<String>) -> Result<Response, AppError> {
+async fn job_detail(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Response, AppError> {
     let lookup = id.clone();
+    let store_path = state.store_path.clone();
     let detail = tokio::task::spawn_blocking(move || -> Result<Option<JobDetail>> {
-        let store = JobStore::open_default()?;
+        let store = JobStore::open(store_path)?;
         let job = store.get_job(&lookup)?;
         let events_path = events_path_for(job.as_ref(), &lookup);
         if job.is_none() && !events_path.exists() {
@@ -317,7 +350,7 @@ async fn job_events(
     State(state): State<AppState>,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
     let refresh = state.refresh;
-    let path = resolve_events_path(id).await;
+    let path = resolve_events_path(id, state.store_path.clone()).await;
 
     let stream = async_stream::stream! {
         let mut tailer = EventLogTailer::new(path);
@@ -353,9 +386,13 @@ async fn job_events(
 /// [`generate_review_document`](super::review::generate_review_document) with the
 /// CLI `review` command; the browser renders it into the Review screen. Errors
 /// (unknown job, or a job that predates run-config snapshots) become 404s.
-async fn job_review(AxumPath(id): AxumPath<String>) -> Result<Response, AppError> {
+async fn job_review(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Response, AppError> {
+    let store_path = state.store_path.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        let store = JobStore::open_default()?;
+        let store = JobStore::open(store_path)?;
         super::review::generate_review_document(&store, &id)
     })
     .await?;
@@ -367,6 +404,97 @@ async fn job_review(AxumPath(id): AxumPath<String>) -> Result<Response, AppError
             Json(json!({ "error": err.to_string() })),
         )
             .into_response()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ManualCorrectionRequest {
+    blocks: Vec<super::correct::CorrectionBlock>,
+}
+
+async fn save_manual_translation(
+    AxumPath((id, segment_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ManualCorrectionRequest>,
+) -> Result<Response, AppError> {
+    if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+    if request.blocks.is_empty() {
+        return Ok(bad_request("at least one corrected block is required"));
+    }
+
+    let store_path = state.store_path.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
+        let store = JobStore::open(store_path)?;
+        super::correct::correct_job_segment(
+            &store,
+            &id,
+            &segment_id,
+            super::correct::CorrectionPayload::Blocks(request.blocks),
+        )
+    })
+    .await?;
+
+    match outcome {
+        Ok(outcome) => Ok(Json(outcome).into_response()),
+        Err(err) => Ok(bad_request(&err.to_string())),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SegmentFlagRequest {
+    flagged: bool,
+}
+
+async fn set_segment_flag(
+    AxumPath((id, segment_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SegmentFlagRequest>,
+) -> Result<Response, AppError> {
+    if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+    let store_path = state.store_path.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<()> {
+        let store = JobStore::open(store_path)?;
+        store.set_dashboard_segment_flag(&id, &segment_id, request.flagged)?;
+        Ok(())
+    })
+    .await?;
+    match outcome {
+        Ok(()) => Ok(Json(json!({ "flagged": request.flagged })).into_response()),
+        Err(err) => Ok(bad_request(&err.to_string())),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SegmentRetryRequest {
+    #[serde(default)]
+    guidance: Option<String>,
+}
+
+async fn retry_segment_with_guidance(
+    AxumPath((id, segment_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SegmentRetryRequest>,
+) -> Result<Response, AppError> {
+    if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+    let store_path = state.store_path.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<()> {
+        let store = JobStore::open(store_path)?;
+        store.request_segment_retry(&id, &segment_id, request.guidance.as_deref())?;
+        Ok(())
+    })
+    .await?;
+    match outcome {
+        Ok(()) => Ok(Json(json!({ "retry_pending": true })).into_response()),
+        Err(err) => Ok(bad_request(&err.to_string())),
     }
 }
 
@@ -384,9 +512,10 @@ async fn job_validate(
         return Ok(response);
     }
 
+    let store_path = state.store_path.clone();
     let outcome = tokio::task::spawn_blocking(
         move || -> Result<Option<super::validate::ValidationReport>> {
-            let store = JobStore::open_default()?;
+            let store = JobStore::open(store_path)?;
             let Some(job) = store.get_job(&id)? else {
                 return Ok(None);
             };
@@ -422,8 +551,9 @@ async fn retry_job(
     if let Some(response) = reject_mutation(&headers, &state) {
         return Ok(response);
     }
+    let store_path = state.store_path.clone();
     let retried = tokio::task::spawn_blocking(move || -> Result<usize> {
-        let store = JobStore::open_default()?;
+        let store = JobStore::open(store_path)?;
         Ok(store.retry_segments(&id, RetryScope::All)?)
     })
     .await??;
@@ -463,8 +593,9 @@ async fn control_job(
     if let Some(response) = reject_mutation(&headers, &state) {
         return Ok(response);
     }
+    let store_path = state.store_path.clone();
     let outcome = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-        let store = JobStore::open_default()?;
+        let store = JobStore::open(store_path)?;
         if store.get_job(&id)?.is_none() {
             return Ok(None);
         }
@@ -801,9 +932,11 @@ fn glossary_term_json(term: &GlossaryTerm) -> serde_json::Value {
 /// `scope` (global/series/book) and `scope_id`.
 async fn list_glossary(
     Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    let store_path = state.store_path.clone();
     let items = tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>> {
-        let store = JobStore::open_default()?;
+        let store = JobStore::open(store_path)?;
         let terms = store.list_glossary_terms(GlossaryFilter {
             scope_kind: params.get("scope").map(|value| parse_glossary_scope(value)),
             scope_id: params
@@ -894,8 +1027,9 @@ async fn add_glossary(
         source_count: 0,
     };
 
+    let store_path = state.store_path.clone();
     let id = tokio::task::spawn_blocking(move || -> Result<i64> {
-        let store = JobStore::open_default()?;
+        let store = JobStore::open(store_path)?;
         Ok(store.add_glossary_term(&term)?)
     })
     .await??;
@@ -910,8 +1044,9 @@ async fn remove_glossary(
     if let Some(response) = reject_mutation(&headers, &state) {
         return Ok(response);
     }
+    let store_path = state.store_path.clone();
     let removed = tokio::task::spawn_blocking(move || -> Result<usize> {
-        let store = JobStore::open_default()?;
+        let store = JobStore::open(store_path)?;
         Ok(store.remove_glossary_term(id)?)
     })
     .await??;
@@ -1091,11 +1226,11 @@ fn hex_bytes(bytes: &[u8]) -> String {
 }
 
 /// Resolve a job's event-log path off the async runtime (sqlite is blocking).
-async fn resolve_events_path(id: String) -> PathBuf {
+async fn resolve_events_path(id: String, store_path: PathBuf) -> PathBuf {
     let fallback = PathBuf::from(format!(".bookforge/runs/{id}/events.jsonl"));
     let lookup = id.clone();
     tokio::task::spawn_blocking(move || {
-        let job = JobStore::open_default()
+        let job = JobStore::open(store_path)
             .ok()
             .and_then(|store| store.get_job(&lookup).ok().flatten());
         events_path_for(job.as_ref(), &lookup)
@@ -1497,6 +1632,11 @@ main{min-height:calc(100vh - 60px)}
 .rev-col .cl{font:600 10px var(--sans);text-transform:uppercase;letter-spacing:.07em;color:var(--faint);margin-bottom:14px}
 .rev-col.tgt .cl{color:var(--accent)}
 .rev-text{font:400 16px/1.7 var(--serif);color:var(--ink);white-space:pre-wrap}
+.rev-block{margin-bottom:16px}.rev-block:last-child{margin-bottom:0}
+.rev-block-id{font:500 9px var(--mono);color:var(--faint);margin-bottom:5px}
+.rev-edit{width:100%;min-height:120px;resize:vertical;border:1px solid var(--line);border-radius:9px;padding:12px;background:var(--card);color:var(--ink);font:400 15px/1.6 var(--serif)}
+.rev-edit:focus{outline:none;border-color:var(--accent)}
+.rev-save-row{display:flex;align-items:center;gap:10px;margin-top:14px}.rev-save-status{font:400 11px var(--sans);color:var(--muted)}
 .rev-note{margin-top:14px;padding:11px 13px;border-radius:9px;background:var(--card);border:1px solid var(--accentline);font:400 12.5px/1.5 var(--sans);color:var(--muted)}
 .rev-note b{color:var(--warn)}
 .rev-empty{flex:1;display:flex;align-items:center;justify-content:center;color:var(--muted);width:100%}
@@ -2035,11 +2175,9 @@ function placeholder(stage, title, note) {
   stage.innerHTML = `<div class="wrap"><div class="pagehead"><div><h1>${title}</h1><p>${note}</p></div></div>
     <div class="empty">${App.selected ? "Loading…" : "Open a job from the library first."}</div></div>`;
 }
-function flagKey(id) { return `bookforge.review.flags.${id}`; }
-function loadFlags(id) { try { return JSON.parse(localStorage.getItem(flagKey(id)) || "{}"); } catch (e) { return {}; } }
-function saveFlags(id, flags) { try { localStorage.setItem(flagKey(id), JSON.stringify(flags)); } catch (e) {} }
 function segTag(seg, flagged) {
   if (flagged) return { label:"Flagged", cls:"bad" };
+  if (seg.human_corrected) return { label:"corrected", cls:"" };
   if (seg.status === "failed") return { label:"failed", cls:"bad" };
   if (seg.status === "needs_review") return { label:"review", cls:"warn" };
   if ((seg.soft_warnings || []).length) return { label:"check", cls:"warn" };
@@ -2055,28 +2193,65 @@ async function renderReview(stage) {
     doc = await r.json();
     if (!r.ok) { stage.innerHTML = `<div class="wrap"><div class="empty">${esc(doc.error || "Review is not available for this job.")}</div></div>`; return; }
   } catch (e) { stage.innerHTML = `<div class="wrap"><div class="empty">Could not load review.</div></div>`; return; }
-  App.review = { doc, idx: 0, filter: "all", flags: loadFlags(id) };
+  App.review = { doc, idx: 0, filter: "all" };
   drawReview();
 }
 function bfReviewPick(i) { App.review.idx = i; drawReview(); }
 function bfReviewNav(d) { const n = (App.review.doc.segments || []).length; App.review.idx = Math.max(0, Math.min(n - 1, App.review.idx + d)); drawReview(); }
 function bfReviewFilter(f) { App.review.filter = f; drawReview(); }
-function bfReviewFlag() {
+async function bfReviewFlag() {
   const R = App.review, seg = R.doc.segments[R.idx]; if (!seg) return;
-  if (R.flags[seg.segment_id]) delete R.flags[seg.segment_id]; else R.flags[seg.segment_id] = { kind: "flagged" };
-  saveFlags(App.selected, R.flags); drawReview();
+  const next = !seg.flagged;
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(App.selected)}/segments/${encodeURIComponent(seg.segment_id)}/flag`, {
+      method:"POST", headers:{"Content-Type":"application/json",[CSRF_HEADER]:CSRF_TOKEN}, body:JSON.stringify({flagged:next})
+    });
+    const body = await r.json(); if (!r.ok) throw new Error(body.error || "flag update failed");
+    seg.flagged = next; drawReview();
+  } catch (e) { window.alert(e.message || "flag update failed"); }
+}
+async function bfReviewSave() {
+  const R = App.review, seg = R && R.doc.segments[R.idx]; if (!seg) return;
+  const status = $("#rev-save-status"), button = $("#rev-save");
+  const blocks = Array.from(document.querySelectorAll(".rev-edit")).map(el => ({ block_id: el.dataset.blockId, text: el.value }));
+  if (blocks.some(block => !block.text.trim())) { if (status) status.textContent = "every block needs translation text"; return; }
+  if (button) button.disabled = true; if (status) status.textContent = "saving and rebuilding…";
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(App.selected)}/segments/${encodeURIComponent(seg.segment_id)}/translation`, {
+      method: "POST", headers: { "Content-Type":"application/json", [CSRF_HEADER]: CSRF_TOKEN }, body: JSON.stringify({ blocks })
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || "correction failed");
+    if (status) status.textContent = `saved · ${body.job_status}`;
+    const refreshed = await fetch("/api/jobs/" + encodeURIComponent(App.selected) + "/review");
+    R.doc = await refreshed.json(); drawReview();
+  } catch (e) { if (status) status.textContent = e.message || "correction failed"; }
+  finally { if (button) button.disabled = false; }
+}
+async function bfReviewRetry() {
+  const R = App.review, seg = R && R.doc.segments[R.idx]; if (!seg) return;
+  const guidance = window.prompt("Optional guidance for the next translation attempt:", "") ?? null;
+  if (guidance === null) return;
+  const status = $("#rev-save-status"); if (status) status.textContent = "marking segment for retry…";
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(App.selected)}/segments/${encodeURIComponent(seg.segment_id)}/retry`, {
+      method:"POST", headers:{"Content-Type":"application/json",[CSRF_HEADER]:CSRF_TOKEN}, body:JSON.stringify({guidance})
+    });
+    const body = await r.json(); if (!r.ok) throw new Error(body.error || "retry request failed");
+    seg.status = "retry_pending"; if (status) status.textContent = `retry queued · resume ${App.selected}`; drawReview();
+  } catch (e) { if (status) status.textContent = e.message || "retry request failed"; }
 }
 function drawReview() {
   const R = App.review, doc = R.doc, segs = doc.segments || [];
-  const flaggedCount = Object.keys(R.flags).length;
+  const flaggedCount = segs.filter(seg => seg.flagged).length;
   const visible = segs.map((s, i) => ({ s, i })).filter(({ s }) => {
-    if (R.filter === "flagged") return !!R.flags[s.segment_id];
+    if (R.filter === "flagged") return !!s.flagged;
     if (R.filter === "warnings") return (s.soft_warnings || []).length || (s.status !== "succeeded" && s.status !== "skipped_cached");
     return true;
   });
   const filters = [["all", `All ${segs.length}`], ["warnings", "To check"], ["flagged", `Flagged ${flaggedCount}`]];
   const rows = visible.map(({ s, i }) => {
-    const flagged = !!R.flags[s.segment_id];
+    const flagged = !!s.flagged;
     const tag = segTag(s, flagged);
     const ref = `${s.chapter_title || s.chapter_id} ¶${s.ordinal}`;
     return `<div class="rev-row ${i === R.idx ? "on" : ""}" onclick="bfReviewPick(${i})">
@@ -2090,16 +2265,17 @@ function drawReview() {
   if (!cur) {
     main = `<div class="rev-empty">No translated segments yet.</div>`;
   } else {
-    const flagged = !!R.flags[cur.segment_id];
+    const flagged = !!cur.flagged;
     const ref = `${cur.chapter_title || cur.chapter_id} ¶${cur.ordinal}`;
     const notes = (cur.soft_warnings || []).map(w =>
       `<div class="rev-note"><b>⚑ ${esc((w.kind || "note").replace(/_/g, " "))}</b> — ${esc(w.message || "")}</div>`).join("");
-    main = `<div class="rev-bar"><span class="ref">${esc(ref)} · ${esc(cur.status)}</span>
+    const blockEditors = (cur.blocks || []).map(block => `<div class="rev-block"><div class="rev-block-id">${esc(block.block_id)}</div><textarea class="rev-edit" data-block-id="${esc(block.block_id)}">${esc(block.target_text || "")}</textarea></div>`).join("");
+    main = `<div class="rev-bar"><span class="ref">${esc(ref)} · ${esc(cur.status)}${cur.human_corrected ? " · manual" : ""}</span>
         <div class="rev-nav"><button class="rev-flag ${flagged ? "on" : ""}" onclick="bfReviewFlag()">⚑ ${flagged ? "Flagged" : "Flag"}</button>
           <button class="rev-btn" onclick="bfReviewNav(-1)">←</button><button class="rev-btn" onclick="bfReviewNav(1)">→</button></div></div>
       <div class="rev-cols scr">
         <div class="rev-col"><div class="cl">Source · ${esc(doc.source_language || "auto")}</div><div class="rev-text">${esc(cur.source_text)}</div></div>
-        <div class="rev-col tgt"><div class="cl">Translation · ${esc(doc.target_language)}</div><div class="rev-text">${esc(cur.target_text || "—")}</div>${notes}</div>
+        <div class="rev-col tgt"><div class="cl">Translation · ${esc(doc.target_language)}</div>${blockEditors}<div class="rev-save-row"><button class="btn btn-primary" id="rev-save" onclick="bfReviewSave()">Save & rebuild</button><button class="btn btn-ghost" onclick="bfReviewRetry()" ${cur.human_corrected ? "disabled" : ""}>Re-translate with hint</button><span class="rev-save-status" id="rev-save-status">${cur.human_corrected ? "human correction saved" : ""}</span></div>${notes}</div>
       </div>`;
   }
   $("#stage").innerHTML = `<div class="review">
@@ -2266,6 +2442,19 @@ mod tests {
             csrf_token: token.to_string(),
             host_port: 8765,
             keys: Arc::new(Mutex::new(HashMap::new())),
+            store_path: default_store_path(),
+        }
+    }
+
+    /// Like [`test_state`], but pointed at an isolated store path instead of
+    /// the process-relative default — lets tests exercise the store-backed
+    /// mutation endpoints against a temp-dir database without chdir'ing the
+    /// (shared, per-process) current directory, which would race across
+    /// parallel test threads.
+    fn test_state_with_store(token: &str, store_path: PathBuf) -> AppState {
+        AppState {
+            store_path,
+            ..test_state(token)
         }
     }
 
@@ -2622,5 +2811,537 @@ mod tests {
         let token = generate_csrf_token().expect("token should generate");
         assert_eq!(token.len(), 32);
         assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Segment mutation endpoints: CSRF rejection + isolated-store end-to-end.
+    //
+    // These build a real completed job (real EPUB parsed with `read_epub`,
+    // real `Segment`s from `build_segments`, real store rows) in a per-test
+    // temp directory so `save_manual_translation` / `set_segment_flag` /
+    // `retry_segment_with_guidance` exercise the same code paths production
+    // traffic does. Every test gets its own `tempfile::TempDir` and its own
+    // `AppState::store_path` (via `test_state_with_store`), so nothing here
+    // touches the process's current directory and tests are parallel-safe.
+    // -----------------------------------------------------------------------
+
+    use bookforge_core::segment::BlockTranslation;
+    use bookforge_store::{CreateJob, SaveTranslation};
+    use std::io::Write as _;
+
+    const FIXTURE_CONTAINER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+
+    const FIXTURE_OPF: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">serve-fixture</dc:identifier>
+    <dc:title>Serve Fixture</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="chapter2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch1"/>
+    <itemref idref="ch2"/>
+  </spine>
+</package>"#;
+
+    const FIXTURE_CHAPTER_ONE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Fixture Chapter One</title></head>
+<body>
+<p>The lantern flickered in the old library.</p>
+</body>
+</html>"#;
+
+    const FIXTURE_CHAPTER_TWO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Fixture Chapter Two</title></head>
+<body>
+<p>Rain tapped steadily against the windowpane.</p>
+</body>
+</html>"#;
+
+    fn build_fixture_epub(path: &std::path::Path) {
+        use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+        let file = std::fs::File::create(path).expect("fixture EPUB should be creatable");
+        let mut zip = ZipWriter::new(file);
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+        zip.start_file("mimetype", stored).unwrap();
+        zip.write_all(b"application/epub+zip").unwrap();
+        zip.start_file("META-INF/container.xml", deflated).unwrap();
+        zip.write_all(FIXTURE_CONTAINER_XML.as_bytes()).unwrap();
+        zip.start_file("content.opf", deflated).unwrap();
+        zip.write_all(FIXTURE_OPF.as_bytes()).unwrap();
+        zip.start_file("chapter1.xhtml", deflated).unwrap();
+        zip.write_all(FIXTURE_CHAPTER_ONE.as_bytes()).unwrap();
+        zip.start_file("chapter2.xhtml", deflated).unwrap();
+        zip.write_all(FIXTURE_CHAPTER_TWO.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    /// A completed two-segment job (one segment per chapter, one block per
+    /// segment) backed by an isolated temp-dir store and a real rebuildable
+    /// output path — everything the mutation endpoints under test touch.
+    struct MutationFixture {
+        // Held only to keep the temp directory alive for the fixture's
+        // lifetime; never read directly.
+        _temp: tempfile::TempDir,
+        store_path: PathBuf,
+        output_path: PathBuf,
+        job_id: String,
+        segment_a: String,
+        segment_b: String,
+        csrf: String,
+    }
+
+    fn build_mutation_fixture() -> MutationFixture {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let input_path = temp.path().join("input.epub");
+        build_fixture_epub(&input_path);
+        let output_path = temp.path().join("output.epub");
+        let store_path = temp.path().join("jobs.sqlite");
+
+        let store = JobStore::open(&store_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &output_path,
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-identity",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job should be created");
+
+        let book = bookforge_epub::read_epub(&input_path).expect("fixture EPUB should parse");
+        let settings = bookforge_core::TranslationProfile::Balanced.resolve();
+        let segments = bookforge_core::segment::build_segments(&book, &settings.segmentation)
+            .expect("segments should build");
+        // `read_epub`/`build_segments` also synthesize a segment for the OPF
+        // `dc:title` metadata (its own section, ahead of the spine chapters),
+        // so a two-chapter book yields three segments total. Only the two
+        // chapter segments are used as `segment_a`/`segment_b` below; the
+        // metadata segment is still inserted and translated like any other
+        // so the fixture matches what a real job actually persists.
+        let chapter_segments = segments
+            .iter()
+            .filter(|segment| segment.section_id.0 != "sec_metadata_opf")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chapter_segments.len(),
+            2,
+            "fixture EPUB (one paragraph per chapter) should yield exactly two chapter segments"
+        );
+
+        store
+            .insert_segments(&job.id, &segments, "v1", "mock", "mock-identity", "test_ns")
+            .expect("segments should insert");
+
+        for segment in &segments {
+            let blocks = segment
+                .source
+                .blocks
+                .iter()
+                .map(|block| BlockTranslation {
+                    block_id: block.block_id.clone(),
+                    text: format!("[IT] {}", block.text),
+                })
+                .collect::<Vec<_>>();
+            let translated_text = blocks
+                .iter()
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            store
+                .save_translation(SaveTranslation {
+                    job_id: &job.id,
+                    segment_id: &segment.id.0,
+                    translated_text: &translated_text,
+                    blocks: &blocks,
+                    input_tokens: Some(10),
+                    input_cached_tokens: Some(0),
+                    output_tokens: Some(12),
+                    tokens_estimated: false,
+                    provider: "mock",
+                    model: "mock-identity",
+                    prompt_version: "v1",
+                })
+                .expect("translation should save");
+        }
+        store
+            .mark_job_complete(&job.id)
+            .expect("job should complete");
+
+        let snapshot = bookforge_core::RunConfigSnapshot {
+            input_path: input_path.clone(),
+            input_snapshot_path: Some(input_path.clone()),
+            input_sha256: Some("test-sha".to_string()),
+            output_path: output_path.clone(),
+            events_path: None,
+            report_json_path: None,
+            report_markdown_path: None,
+            source_language: Some("English".to_string()),
+            target_language: "Italian".to_string(),
+            provider: "mock".to_string(),
+            model: "mock-identity".to_string(),
+            base_url: None,
+            api_key_env: None,
+            profile: settings.profile,
+            provider_preset: None,
+            prompt_version: "v1".to_string(),
+            cache_namespace: "test_ns".to_string(),
+            book_id: None,
+            series_id: None,
+            glossary_budget_tokens: 800,
+            glossary_format: bookforge_core::GlossaryFormat::Json,
+            prompt_extra: None,
+            glossary_fingerprint: String::new(),
+            glossary_terms: Vec::new(),
+            context_window: 0,
+            context_budget_tokens: 1200,
+            context_scope: bookforge_core::config::ContextScope::Chapter,
+            style_fingerprint: String::new(),
+            style_rendered_block: String::new(),
+            entities_fingerprint: String::new(),
+            entities_rendered_block: String::new(),
+            bilingual_mode: bookforge_core::BilingualMode::Replace,
+            bilingual_separator: " / ".to_string(),
+            bilingual_style: bookforge_core::BilingualStyle::Minimal,
+            bilingual_css: None,
+            fallback: None,
+            finalize: bookforge_core::run_snapshot::FinalizeCheckpointSnapshot::default(),
+            settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
+        };
+        store
+            .update_job_config_snapshot(&job.id, &snapshot)
+            .expect("snapshot should persist");
+
+        MutationFixture {
+            store_path,
+            output_path,
+            job_id: job.id,
+            segment_a: chapter_segments[0].id.0.clone(),
+            segment_b: chapter_segments[1].id.0.clone(),
+            csrf: "fixture-csrf-token".to_string(),
+            _temp: temp,
+        }
+    }
+
+    /// Sends `body` to `uri` with the given CSRF header value (or none), and
+    /// returns the response.
+    async fn post_json(
+        router: &Router,
+        uri: &str,
+        csrf: Option<&str>,
+        body: serde_json::Value,
+    ) -> Response {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("host", TEST_HOST)
+            .header("content-type", "application/json");
+        if let Some(token) = csrf {
+            builder = builder.header(CSRF_HEADER, token);
+        }
+        router
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::from(body.to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond")
+    }
+
+    #[tokio::test]
+    async fn save_manual_translation_rejects_missing_or_wrong_csrf_without_mutating_store() {
+        let fixture = build_mutation_fixture();
+        let router = dashboard_router(test_state_with_store(
+            &fixture.csrf,
+            fixture.store_path.clone(),
+        ));
+        let uri = format!(
+            "/api/jobs/{}/segments/{}/translation",
+            fixture.job_id, fixture.segment_a
+        );
+        let body = json!({ "blocks": [{ "block_id": "whatever", "text": "corrupted" }] });
+
+        let missing = post_json(&router, &uri, None, body.clone()).await;
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+        let wrong = post_json(&router, &uri, Some("wrong-token"), body).await;
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+        let store = JobStore::open(&fixture.store_path).expect("store should reopen");
+        assert!(
+            !store
+                .translation_is_human_corrected(&fixture.job_id, &fixture.segment_a)
+                .expect("lookup should succeed"),
+            "a rejected request must not human-correct the segment"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_segment_flag_rejects_missing_or_wrong_csrf_without_mutating_store() {
+        let fixture = build_mutation_fixture();
+        let router = dashboard_router(test_state_with_store(
+            &fixture.csrf,
+            fixture.store_path.clone(),
+        ));
+        let uri = format!(
+            "/api/jobs/{}/segments/{}/flag",
+            fixture.job_id, fixture.segment_b
+        );
+        let body = json!({ "flagged": true });
+
+        let missing = post_json(&router, &uri, None, body.clone()).await;
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+        let wrong = post_json(&router, &uri, Some("wrong-token"), body).await;
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+        let store = JobStore::open(&fixture.store_path).expect("store should reopen");
+        let flagged = store
+            .dashboard_flagged_segment_ids(&fixture.job_id)
+            .expect("flags should load");
+        assert!(
+            !flagged.contains(&fixture.segment_b),
+            "a rejected request must not persist a flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_segment_rejects_missing_or_wrong_csrf_without_mutating_store() {
+        let fixture = build_mutation_fixture();
+        let router = dashboard_router(test_state_with_store(
+            &fixture.csrf,
+            fixture.store_path.clone(),
+        ));
+        let uri = format!(
+            "/api/jobs/{}/segments/{}/retry",
+            fixture.job_id, fixture.segment_b
+        );
+        let body = json!({ "guidance": "please redo" });
+
+        let missing = post_json(&router, &uri, None, body.clone()).await;
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+        let wrong = post_json(&router, &uri, Some("wrong-token"), body).await;
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+        let store = JobStore::open(&fixture.store_path).expect("store should reopen");
+        let guidance = store
+            .load_retry_guidance(&fixture.job_id)
+            .expect("guidance should load");
+        assert!(
+            !guidance.contains_key(&fixture.segment_b),
+            "a rejected request must not persist retry guidance"
+        );
+        let records = store
+            .segment_records(&fixture.job_id)
+            .expect("records should load");
+        let segment_b = records
+            .iter()
+            .find(|record| record.id == fixture.segment_b)
+            .expect("segment_b should exist");
+        assert_eq!(
+            segment_b.status, "succeeded",
+            "a rejected retry must not move the segment to retry_pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_review_and_mutation_endpoints_end_to_end() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let fixture = build_mutation_fixture();
+        let router = dashboard_router(test_state_with_store(
+            &fixture.csrf,
+            fixture.store_path.clone(),
+        ));
+
+        // 1. Review data: per-block source/target text is present for both segments.
+        let review_uri = format!("/api/jobs/{}/review", fixture.job_id);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&review_uri)
+                    .header("host", TEST_HOST)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let review: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("review should be json");
+        let segments = review["segments"].as_array().expect("segments array");
+        // Two chapter segments plus the synthesized OPF `dc:title` metadata
+        // segment (see `build_mutation_fixture`).
+        assert_eq!(segments.len(), 3);
+        for segment in segments {
+            let blocks = segment["blocks"].as_array().expect("blocks array");
+            assert!(!blocks.is_empty(), "each segment should have blocks");
+            for block in blocks {
+                assert!(
+                    !block["target_text"].as_str().unwrap_or_default().is_empty(),
+                    "each block should carry non-empty target text"
+                );
+            }
+        }
+
+        // 2. Save a corrected translation for segment_a.
+        let segment_a_json = segments
+            .iter()
+            .find(|segment| segment["segment_id"] == fixture.segment_a)
+            .expect("segment_a should appear in the review");
+        let block_ids = segment_a_json["blocks"]
+            .as_array()
+            .expect("blocks array")
+            .iter()
+            .map(|block| {
+                block["block_id"]
+                    .as_str()
+                    .expect("block_id should be a string")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let correction_body = json!({
+            "blocks": block_ids
+                .iter()
+                .map(|id| json!({ "block_id": id, "text": "Corrected by reviewer." }))
+                .collect::<Vec<_>>(),
+        });
+        let translation_uri = format!(
+            "/api/jobs/{}/segments/{}/translation",
+            fixture.job_id, fixture.segment_a
+        );
+        let response = post_json(
+            &router,
+            &translation_uri,
+            Some(&fixture.csrf),
+            correction_body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let store = JobStore::open(&fixture.store_path).expect("store should reopen");
+        assert!(
+            store
+                .translation_is_human_corrected(&fixture.job_id, &fixture.segment_a)
+                .expect("lookup should succeed"),
+            "segment_a should be marked human_corrected"
+        );
+        assert!(
+            fixture.output_path.exists(),
+            "the rebuilt output EPUB should exist after the correction"
+        );
+
+        // 3. Flag, then clear, segment_b.
+        let flag_uri = format!(
+            "/api/jobs/{}/segments/{}/flag",
+            fixture.job_id, fixture.segment_b
+        );
+        for flagged in [true, false] {
+            let response = post_json(
+                &router,
+                &flag_uri,
+                Some(&fixture.csrf),
+                json!({ "flagged": flagged }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let flagged_ids = store
+                .dashboard_flagged_segment_ids(&fixture.job_id)
+                .expect("flags should load");
+            assert_eq!(flagged_ids.contains(&fixture.segment_b), flagged);
+        }
+
+        // 4. Request a retry with guidance for segment_b.
+        let retry_uri = format!(
+            "/api/jobs/{}/segments/{}/retry",
+            fixture.job_id, fixture.segment_b
+        );
+        let response = post_json(
+            &router,
+            &retry_uri,
+            Some(&fixture.csrf),
+            json!({ "guidance": "Please redo more literally." }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let guidance = store
+            .load_retry_guidance(&fixture.job_id)
+            .expect("guidance should load");
+        assert_eq!(
+            guidance.get(&fixture.segment_b).map(String::as_str),
+            Some("Please redo more literally.")
+        );
+        let records = store
+            .segment_records(&fixture.job_id)
+            .expect("records should load");
+        let segment_b_record = records
+            .iter()
+            .find(|record| record.id == fixture.segment_b)
+            .expect("segment_b should exist");
+        assert_eq!(segment_b_record.status, "retry_pending");
+
+        // 5. A retry request against the now-frozen (human-corrected) segment_a
+        //    is rejected, and does not disturb its correction.
+        let retry_a_uri = format!(
+            "/api/jobs/{}/segments/{}/retry",
+            fixture.job_id, fixture.segment_a
+        );
+        let response = post_json(
+            &router,
+            &retry_a_uri,
+            Some(&fixture.csrf),
+            json!({ "guidance": "try again" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("error body should be json");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("frozen human correction"),
+            "rejection should explain the segment is frozen: {payload}"
+        );
+        assert!(
+            store
+                .translation_is_human_corrected(&fixture.job_id, &fixture.segment_a)
+                .expect("lookup should succeed"),
+            "the rejected retry must not un-freeze the human correction"
+        );
     }
 }

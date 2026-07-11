@@ -180,18 +180,18 @@ const RUN_PRESERVING_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/translate_run_preserving.v2.md");
 const QA_TEMPLATE_SOURCE: &str = include_str!("../prompts/qa_segment.v1.md");
 
-const BATCH_PLAIN_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_plain.v2.md");
+const BATCH_PLAIN_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_plain.v3.md");
 const BATCH_MARKER_SAFE_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_marker_safe.v2.md");
+    include_str!("../prompts/translate_batch_marker_safe.v3.md");
 const BATCH_RUN_PRESERVING_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_run_preserving.v2.md");
+    include_str!("../prompts/translate_batch_run_preserving.v3.md");
 const BATCH_REPAIR_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_repair.v2.md");
 const BATCH_PLAIN_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_plain_compact.v2.md");
+    include_str!("../prompts/translate_batch_plain_compact.v3.md");
 const BATCH_MARKER_SAFE_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_marker_safe_compact.v2.md");
+    include_str!("../prompts/translate_batch_marker_safe_compact.v3.md");
 const BATCH_RUN_PRESERVING_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_run_preserving_compact.v2.md");
+    include_str!("../prompts/translate_batch_run_preserving_compact.v3.md");
 const BATCH_REPAIR_COMPACT_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/translate_batch_repair_compact.v2.md");
 const QA_BATCH_TEMPLATE_SOURCE: &str = include_str!("../prompts/qa_batch.v1.md");
@@ -241,17 +241,17 @@ impl PromptLibrary {
             .expect("embedded QA template must parse");
 
         let batch_plain =
-            PromptTemplate::parse("translate_batch_plain", "v2", BATCH_PLAIN_TEMPLATE_SOURCE)
+            PromptTemplate::parse("translate_batch_plain", "v3", BATCH_PLAIN_TEMPLATE_SOURCE)
                 .expect("embedded batch plain template must parse");
         let batch_marker_safe = PromptTemplate::parse(
             "translate_batch_marker_safe",
-            "v2",
+            "v3",
             BATCH_MARKER_SAFE_TEMPLATE_SOURCE,
         )
         .expect("embedded batch marker-safe template must parse");
         let batch_run_preserving = PromptTemplate::parse(
             "translate_batch_run_preserving",
-            "v2",
+            "v3",
             BATCH_RUN_PRESERVING_TEMPLATE_SOURCE,
         )
         .expect("embedded batch run-preserving template must parse");
@@ -260,19 +260,19 @@ impl PromptLibrary {
                 .expect("embedded batch repair template must parse");
         let batch_plain_compact = PromptTemplate::parse(
             "translate_batch_plain_compact",
-            "v2",
+            "v3",
             BATCH_PLAIN_COMPACT_TEMPLATE_SOURCE,
         )
         .expect("embedded batch plain compact template must parse");
         let batch_marker_safe_compact = PromptTemplate::parse(
             "translate_batch_marker_safe_compact",
-            "v2",
+            "v3",
             BATCH_MARKER_SAFE_COMPACT_TEMPLATE_SOURCE,
         )
         .expect("embedded batch marker-safe compact template must parse");
         let batch_run_preserving_compact = PromptTemplate::parse(
             "translate_batch_run_preserving_compact",
-            "v2",
+            "v3",
             BATCH_RUN_PRESERVING_COMPACT_TEMPLATE_SOURCE,
         )
         .expect("embedded batch run-preserving compact template must parse");
@@ -424,6 +424,31 @@ mod tests {
         assert_eq!(library.qa_batch.name, "qa_batch");
         assert_eq!(library.double_check_batch.name, "double_check_batch");
         assert_eq!(library.correct_batch.name, "correct_batch");
+    }
+
+    #[test]
+    fn batch_prompt_templates_are_versioned_v3_for_retry_guidance() {
+        // The six batch translate templates (plain / marker-safe /
+        // run-preserving, and their compact variants) gained a per-item
+        // `retry_guidance` field and moved from v2 to v3 so the cross-job
+        // translation cache (keyed on segments.prompt_version) does not
+        // serve up translations produced under the old prompt text.
+        // translate_batch_repair(_compact) and the single-segment / QA
+        // templates were not touched and must stay at their prior versions.
+        let library = PromptLibrary::embedded();
+        assert_eq!(library.batch_plain.version, "v3");
+        assert_eq!(library.batch_marker_safe.version, "v3");
+        assert_eq!(library.batch_run_preserving.version, "v3");
+        assert_eq!(library.batch_plain_compact.version, "v3");
+        assert_eq!(library.batch_marker_safe_compact.version, "v3");
+        assert_eq!(library.batch_run_preserving_compact.version, "v3");
+
+        assert_eq!(library.batch_repair.version, "v2");
+        assert_eq!(library.batch_repair_compact.version, "v2");
+        assert_eq!(library.plain.version, "v2");
+        assert_eq!(library.marker_safe.version, "v2");
+        assert_eq!(library.run_preserving.version, "v2");
+        assert_eq!(library.qa.version, "v1");
     }
 
     #[test]

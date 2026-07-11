@@ -767,19 +767,21 @@ fn item_token_estimate(
         .get(&item.segment_id.0)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    if entries.is_empty() {
-        return estimate;
+    if !entries.is_empty() {
+        estimate += match config.glossary.format {
+            GlossaryFormat::Json => {
+                let rendered = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_string());
+                token_estimate("glossary") + token_estimate(&rendered)
+            }
+            GlossaryFormat::Prose => {
+                let rendered = crate::scheduler::render_glossary_prose(entries);
+                token_estimate("glossary_prose") + token_estimate(&rendered)
+            }
+        };
     }
-    estimate += match config.glossary.format {
-        GlossaryFormat::Json => {
-            let rendered = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_string());
-            token_estimate("glossary") + token_estimate(&rendered)
-        }
-        GlossaryFormat::Prose => {
-            let rendered = crate::scheduler::render_glossary_prose(entries);
-            token_estimate("glossary_prose") + token_estimate(&rendered)
-        }
-    };
+    if let Some(guidance) = config.glossary.guidance_by_segment.get(&item.segment_id.0) {
+        estimate += token_estimate("retry_guidance") + token_estimate(guidance);
+    }
     estimate
 }
 
@@ -2868,6 +2870,13 @@ fn render_batch_items(batch: &TranslationBatch, config: &TranslationRunConfig) -
                 }
             }
 
+            if let Some(guidance) = config.glossary.guidance_by_segment.get(&item.segment_id.0) {
+                obj.insert(
+                    "retry_guidance".to_string(),
+                    serde_json::Value::String(guidance.clone()),
+                );
+            }
+
             if batch.mode == BatchMode::RunPreserving {
                 let runs: Vec<serde_json::Value> = item
                     .text_runs
@@ -4186,9 +4195,15 @@ mod tests {
             }],
         );
         config.glossary.prompt_extra = Some("Use informal register.".to_string());
+        config.glossary.guidance_by_segment.insert(
+            "seg1".to_string(),
+            "Translate the greeting less literally.".to_string(),
+        );
 
         let rendered = render_batch_items(&batch, &config);
         assert!(rendered.contains("\"glossary\""));
+        assert!(rendered.contains("\"retry_guidance\""));
+        assert!(rendered.contains("Translate the greeting less literally."));
         assert!(rendered.contains("\"source\":\"Hello\""));
         assert!(!rendered.contains("Use informal register."));
     }

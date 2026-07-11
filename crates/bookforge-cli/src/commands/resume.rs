@@ -33,7 +33,7 @@ use crate::{
     QaMode,
     commands::{reconfigure, validate},
     performance::performance_summary_from_events,
-    report::{ReportInput, write_report},
+    report::{ReportInput, TranslationQaInput, write_report},
 };
 
 use super::translate::{
@@ -315,7 +315,7 @@ async fn run_inner(
     let pending_segments = select_pending_segments(&segments, &pending_ids)?;
     let prompt_version = snapshot.prompt_version.as_str();
     let legacy_cache_namespace = snapshot.glossary_fingerprint.is_empty();
-    let glossary = if legacy_cache_namespace {
+    let mut glossary = if legacy_cache_namespace {
         crate::commands::translate::PreparedGlossary {
             run_config: GlossaryRunConfig::default(),
             fingerprint: String::new(),
@@ -336,11 +336,13 @@ async fn run_inner(
                 format: snapshot.glossary_format,
                 entries_by_segment: selected.entries_by_segment,
                 prompt_extra: snapshot.prompt_extra.clone(),
+                guidance_by_segment: std::collections::HashMap::new(),
             },
             fingerprint,
             active_terms,
         }
     };
+    glossary.run_config.guidance_by_segment = store.load_retry_guidance(&job.id)?;
     let context_cfg = snapshot_context_run_config(snapshot);
     let context_registry: Option<Arc<ContextRegistry>> = if context_cfg.enabled() {
         let registry = Arc::new(ContextRegistry::new(&segments));
@@ -651,18 +653,37 @@ async fn run_inner(
     let summary = store
         .summary(&job.id)?
         .ok_or_else(|| anyhow::anyhow!("job '{}' was not found after resume", job.id))?;
+    let qa_inputs = translations
+        .iter()
+        .map(|translation| {
+            TranslationQaInput::new(
+                translation.segment_id.0.clone(),
+                matches!(
+                    translation.status,
+                    SegmentStatus::Succeeded | SegmentStatus::SkippedCached
+                ),
+                translation.joined_text(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let corrected_segments = store
+        .load_terminal_segment_translations(&job.id)?
+        .iter()
+        .filter(|translation| translation.human_corrected)
+        .count();
     let report = write_report(ReportInput {
         job: &job,
         summary: &summary,
         segments: &segments,
         segment_records: &segment_records,
-        translations: &translations,
+        translations: &qa_inputs,
         qa_reviews: &qa_reviews,
         performance: snapshot
             .events_path
             .as_ref()
             .and_then(|path| performance_summary_from_events(path).ok().flatten()),
         output: &output,
+        corrected_segments,
     })?;
     store.update_job_report_paths(&job.id, &report.json, &report.markdown)?;
     snapshot.report_json_path = Some(report.json.clone());

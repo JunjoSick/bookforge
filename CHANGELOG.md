@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased (2.4.0-dev)
+
+BookForge main now carries a distinct development version so source builds
+cannot be confused with the published v2.3.0 artifacts.
+
+- Added cache-safe job reconfiguration through `bookforge reconfigure`, with
+  auditable overrides that apply when a stopped or dead paused job resumes.
+- Added escalation-first handling for truncated batch responses and prominent
+  systemic-truncation alerts across CLI, watch, and dashboard surfaces.
+- Fixed resume override handling, adaptive batch override propagation, stale
+  override cleanup, and dashboard wizard API-key retention.
+- Bumped the batch translate prompts (plain, marker-safe, run-preserving, and
+  their compact variants) from v2 to v3 to teach models about a per-item
+  `retry_guidance` field; the batch prompt cache tag moved from `batch_v2`
+  to `batch_v3` so translations cached under the old prompt text are not
+  reused.
+
+## v2.3.0 - 2026-07-05
+
+BookForge v2.3.0 added source-EPUB reflow and cooperative job controls.
+
+- Added `bookforge reflow`, including the opt-in `--aggressive` level, while
+  preserving the rule that source EPUBs are never silently rewritten during
+  translation.
+- Added pause, resume, and stop controls to the engine, CLI, terminal watcher,
+  and browser dashboard, with completed segments checkpointed before parking.
+- Made finalize-stage QA and double-check requests honor pause/stop controls;
+  stopped jobs remain resumable without retranslating completed segments.
+- Hardened reflow boundaries around letterless paragraphs, inline whitespace,
+  dehyphenation, and class-based merge guards.
+
 ## v2.2.0 - 2026-07-04
 
 BookForge v2.2.0 ships the v1.7 roadmap milestone: bilingual output.

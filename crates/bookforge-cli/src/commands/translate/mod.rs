@@ -59,7 +59,7 @@ pub(crate) use cache::{CacheContext, apply_cached_translations, pending_segments
 use checkpointing::finalize_writer;
 pub(crate) use engine::{CheckpointRunContext, run_checkpointed_translation};
 use reporting::print_summary_rebuild_and_report;
-pub(crate) use reporting::rebuild_options_from_snapshot;
+pub(crate) use reporting::{rebuild_options_from_snapshot, regenerate_report_after_correction};
 use settings::{apply_provider_preset, resolve_settings, retry_amplification_warning};
 use snapshot::persist_snapshot;
 
@@ -392,6 +392,7 @@ pub(crate) fn prepare_glossary_run_config(
             format,
             entries_by_segment: selected.entries_by_segment,
             prompt_extra,
+            guidance_by_segment: std::collections::HashMap::new(),
         },
         fingerprint,
         active_terms,
@@ -886,7 +887,7 @@ async fn run_openai_compatible_translation(
         timestamp_ms: bookforge_core::progress::now_ms(),
     });
     let run_prompt_version = if settings.batch.enabled {
-        PromptVersion::BatchV2.as_str()
+        PromptVersion::BatchV3.as_str()
     } else {
         PromptVersion::V2.as_str()
     };

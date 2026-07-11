@@ -1,6 +1,6 @@
 [package]
 name = "bookforge-epub"
-version = "2.3.0"
+version = "2.4.0-dev"
 description = "EPUB reading, validation, and deterministic rebuild support for BookForge."
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bookforge-core = { version = "2.3.0", path = "../bookforge-core" }
+bookforge-core = { version = "2.4.0-dev", path = "../bookforge-core" }
 quick-xml.workspace = true
 serde.workspace = true
 tracing.workspace = true
