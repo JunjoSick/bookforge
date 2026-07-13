@@ -9,6 +9,8 @@ BookForge v2.4.1 is a security-gate maintenance release.
 - Granted the RustSec workflow the minimal Checks API permission it needs to
   report audit results without turning dependency warnings into workflow
   failures.
+- Added GitHub/Sigstore provenance attestations for release assets so users
+  can verify that downloads were produced by BookForge's release workflow.
 
 ## v2.4.0 - 2026-07-13
 
