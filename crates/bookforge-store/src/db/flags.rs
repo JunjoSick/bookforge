@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+pub enum RetryScope {
+    Failed,
+    NeedsReview,
+    All,
+}
+
 impl JobStore {
     pub fn retry_segments(&self, job_id: &str, scope: RetryScope) -> Result<usize> {
         let where_status = match scope {
