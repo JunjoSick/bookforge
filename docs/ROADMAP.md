@@ -1,12 +1,14 @@
 # BookForge — Technical Roadmap, v1.0.1 through v2.0
 
-**Document version:** 1.2.0
-**Last updated:** 2026-07-03
+**Document version:** 1.3.0
+**Last updated:** 2026-07-13
 **Status:** historical roadmap plus active follow-up notes
 **Audience:** project maintainer + Claude Code (or any other coding agent) implementing
 the milestones below.
 
-> **Current status:** the current release line is v2.1.0 (2026-07-03).
+> **Current status:** v2.4.0 is the release candidate on
+> `codex/project-remediation` (2026-07-13); v2.3.0 is the latest published
+> release.
 > This document is kept for architectural invariants, shipped-milestone
 > context, and deferred follow-up work. For current user behavior, start
 > with `README.md`, `CHANGELOG.md`, and `docs/v2-web-dashboard-plan.md`;
@@ -19,8 +21,9 @@ the milestones below.
 > shipped out of order. Read them as feature names. Mapping so far:
 > milestone v1.8 → releases v1.8.x (2026-06-20); v2.0 milestone →
 > releases v2.0.0–v2.0.3; milestone v1.6 (PDF hardening) → release
-> v2.1.0 (2026-07-03); milestone v1.7 (bilingual output) → in progress,
-> expected v2.2.0.
+> v2.1.0 (2026-07-03); milestone v1.7 (bilingual output) → release
+> v2.2.0 (2026-07-04). Reflow and cooperative controls shipped in v2.3.0;
+> durable corrections and live reconfiguration are the v2.4.0 scope.
 
 ---
 
@@ -117,9 +120,9 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v1.4 | Distribution + writeup | 5–7 days | one technical post, two or three venues; cargo-dist binaries land here | shipped |
 | v1.5 | Extraction + scheduling overhaul (shipped scope; see §8 post-ship note) | — | none | shipped 2026-06-12 |
 | v1.6 | PDF ingestion hardening (§9) | 8–14 days | release notes; maybe a short writeup if layout reconstruction turns out interesting | **shipped 2026-07-03 as release v2.1.0** |
-| v1.7 | Bilingual output (§9b) | 5–8 days | passive (release notes only) | **in progress (2026-07-03)** |
+| v1.7 | Bilingual output (§9b) | 5–8 days | passive (release notes only) | **shipped 2026-07-04 as release v2.2.0** |
 | v1.8 | Structural credibility (EPUBCheck + corpus; was the planned v1.5 scope, §8) | 10–14 days | README final rewrite citing corpus | **shipped 2026-06-20** |
-| v2.0 | Monitoring UI (`RunState`, `watch`, `--ui tui`, local `serve`) | shipped scope | release notes | shipped; current patch v2.0.2 (2026-07-02) |
+| v2.0 | Monitoring UI (`RunState`, `watch`, `--ui tui`, local `serve`) | shipped scope | release notes | shipped; patch line completed at v2.0.3 (2026-07-02) |
 
 Priority note (2026-06): the owner needs PDF translation more than
 bilingual output — scientific papers (figures/tables must survive) and

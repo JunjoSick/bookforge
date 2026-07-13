@@ -1,9 +1,9 @@
 # Changelog
 
-## Unreleased (2.4.0-dev)
+## v2.4.0 - 2026-07-13
 
-BookForge main now carries a distinct development version so source builds
-cannot be confused with the published v2.3.0 artifacts.
+BookForge v2.4.0 closes the local review loop and makes safe runtime tuning
+genuinely live while strengthening the release gates around both changes.
 
 - Added revisioned, atomic live job reconfiguration through the CLI and the
   dashboard. Cache-safe concurrency, request-budget, retry, adaptive sizing,
@@ -29,6 +29,11 @@ cannot be confused with the published v2.3.0 artifacts.
   `retry_guidance` field; the batch prompt cache tag moved from `batch_v2`
   to `batch_v3` so translations cached under the old prompt text are not
   reused.
+- Split the largest dashboard, batch, store, PDF-conversion, and translate
+  modules behind behavior-preserving seams while retaining the embedded
+  single-binary dashboard and existing public APIs.
+- Added an explicit pre-v2.4 database migration regression proving existing
+  translations and blocks survive the new human-correction audit columns.
 
 ## v2.3.0 - 2026-07-05
 

@@ -7,6 +7,9 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
+# Build release artifacts on this release-candidate PR. Revert to the default
+# plan-only mode after the cross-platform packaging smoke completes.
+pr-run-mode = "upload"
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
