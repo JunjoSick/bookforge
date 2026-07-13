@@ -1777,10 +1777,18 @@ const DASHBOARD_HTML_TEMPLATE: &str = include_str!("serve/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("serve/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("serve/dashboard.js");
 
+fn assemble_dashboard_html(template: &str, css: &str, js: &str) -> String {
+    let template = template.replace("\r\n", "\n");
+    let css = css.replace("\r\n", "\n");
+    let js = js.replace("\r\n", "\n");
+
+    template
+        .replace("{{BOOKFORGE_DASHBOARD_CSS}}", &css)
+        .replace("{{BOOKFORGE_DASHBOARD_JS}}", &js)
+}
+
 static DASHBOARD_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    DASHBOARD_HTML_TEMPLATE
-        .replace("{{BOOKFORGE_DASHBOARD_CSS}}", DASHBOARD_CSS)
-        .replace("{{BOOKFORGE_DASHBOARD_JS}}", DASHBOARD_JS)
+    assemble_dashboard_html(DASHBOARD_HTML_TEMPLATE, DASHBOARD_CSS, DASHBOARD_JS)
 });
 
 #[cfg(test)]
@@ -2169,6 +2177,16 @@ mod tests {
         assert_eq!(
             format!("{:x}", Sha256::digest(DASHBOARD_HTML.as_bytes())),
             "7a37e7095182825d2f63afec9776214ce7f99ea33464ad1e86ea43342767ce9b"
+        );
+
+        let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");
+        assert_eq!(
+            assemble_dashboard_html(
+                &crlf(DASHBOARD_HTML_TEMPLATE),
+                &crlf(DASHBOARD_CSS),
+                &crlf(DASHBOARD_JS),
+            ),
+            *DASHBOARD_HTML,
         );
     }
 
