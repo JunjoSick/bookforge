@@ -15,6 +15,9 @@ jobs:
   rustsec:
     name: RustSec advisory audit
     runs-on: ubuntu-22.04
+    permissions:
+      checks: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
