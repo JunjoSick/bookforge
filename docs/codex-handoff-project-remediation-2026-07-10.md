@@ -15,7 +15,7 @@ The owner asked the current agent to stop at the first useful checkpoint and
 leave this handoff. Do not discard or rewrite the existing worktree: it is a
 useful, compiling checkpoint, but it is intentionally not committed yet.
 
-## Git/worktree state
+## Git/worktree state (historical starting checkpoint)
 
 - Repository: `C:\Users\gangi\Desktop\bookforge`
 - Branch: `codex/project-remediation`
@@ -32,6 +32,24 @@ git status --short --branch
 git diff --stat
 git diff --check
 ```
+
+### Current authoritative checkpoint (2026-07-13)
+
+- Branch: `codex/project-remediation`; draft PR:
+  <https://github.com/JunjoSick/bookforge/pull/27>.
+- Artifact-smoke HEAD: `16b5b762` (`release: prepare v2.4.0 artifact smoke`).
+- The live-reconfiguration milestone, all requested modularization, the
+  pre-0007 migration regression, and the `2.4.0` release-candidate version
+  bump are committed and pushed.
+- Cargo-dist's expensive `pr-run-mode = "upload"` was enabled only for run
+  `29281323279`; all five target archives and both global installers built.
+  The normal plan-only configuration is restored in this evidence checkpoint.
+- Treat the older dirty-tree/restart notes below as provenance only. Inspect
+  `git status --short --branch` and this current checkpoint before acting.
+- The Codex permission regression recurred after the 2026-07-13 continuation,
+  but the subsequent app restart restored GitHub authentication, workspace
+  writes, executable access, and process control. The leftover isolated
+  dashboard test server PID `16280` was verified and stopped.
 
 ## Completed and verified
 
@@ -355,9 +373,10 @@ Do not skip this item.
 
 ### True live reconfiguration
 
-Design complete in `docs/design-live-reconfiguration.md`. Implementation is
-AUTOMATED-COMPLETE in the uncommitted worktree as of 2026-07-13. Commit/push
-and the selected real-provider acceptance run remain; the historical restart
+Design and implementation are complete in
+`docs/design-live-reconfiguration.md`. Commit `29ee6077` is pushed and the
+mock/automated acceptance matrix is green. The selected real-provider
+acceptance run remains part of the final release gate; the historical restart
 and WIP-review notes below are retained only as provenance.
 
 #### Live implementation checkpoint (Codex, 2026-07-13)
@@ -389,9 +408,8 @@ This checkpoint supersedes both historical subsections below.
   round-trip, 59 core, 154 LLM, 31 PDF, and 34 store tests, plus EPUB and
   documentation tests.
 
-Next: review/clean generated files, update the draft PR with the
-live-reconfiguration commit, confirm Linux/Windows CI, then begin
-behavior-neutral modularization.
+The live implementation was committed, pushed, and confirmed on Linux and
+Windows before behavior-neutral modularization began.
 
 #### Historical restart checkpoint (superseded)
 
@@ -562,41 +580,73 @@ Authoritative starting points:
 
 ### Modularization
 
-Not started. Do it only after dashboard correction and live reconfiguration are
-behavior-locked by tests.
+DONE and pushed as behavior-neutral commits after live reconfiguration was
+locked by tests:
 
-Suggested seams:
+- Dashboard HTML/CSS/JS moved to embedded source assets in `bb76b94c`; Windows
+  CRLF normalization and synthetic regression coverage followed in
+  `cc9805e8`. The assembled LF dashboard remains byte-stable at 82,407 bytes,
+  SHA-256 `7a37e7095182825d2f63afec9776214ce7f99ea33464ad1e86ea43342767ce9b`.
+- LLM batching split into planning, rendering, escalation, execution, and tests
+  across `e7101459`, `19ea4350`, `436a3511`, `7548126f`, and `48500348`.
+- Store schema/migrations, jobs, translations/cache, flags, glossary, and tests
+  split across `d180fbfa`, `076f3d76`, `3de00331`, `f73cca00`, `62829ecb`,
+  and `2e0de4bf` while retaining `JobStore`'s public surface.
+- PDF conversion tests, reporting, rendering, and media detection split across
+  `c5476b44`, `e3276721`, `1a57664e`, and `44278107`.
+- CLI translate tests, orchestration, and finalization split across
+  `c38a7843`, `94f73434`, and `1c4e8fb9`.
 
-- split `bookforge-llm/src/batch.rs` into planning, rendering, execution,
-  truncation/escalation, and tests;
-- split store migrations/schema, jobs, translations/cache, flags, and glossary
-  out of `bookforge-store/src/db.rs` while preserving `JobStore`'s public API;
-- split PDF detection/rendering/reporting from `bookforge-pdf/src/convert.rs`;
-- split translate orchestration/finalization from
-  `bookforge-cli/src/commands/translate/mod.rs`;
-- move dashboard CSS/JS/HTML to separate source files embedded with
-  `include_str!`, retaining the single-binary invariant.
-
-Each extraction should be its own behavior-neutral commit with byte-stability or
-equivalent regression evidence.
+Every extraction passed package tests and warnings-denied clippy. The final
+shape then passed the full local workspace suite and the dispatched Linux,
+Windows MSVC, MSRV, and full-corpus run recorded below.
 
 ### Final release gate
 
-Still required:
+Automated gate status on 2026-07-13:
 
-- `cargo fmt --all --check`;
-- exact CI clippy command with warnings denied;
-- full workspace tests on Linux and Windows MSVC;
-- MSRV 1.88 check;
-- small and full Standard Ebooks corpus;
-- migration tests from pre-0007 databases;
-- macOS/Windows/Linux release builds and installer smoke tests;
-- mock dashboard correction/reconfiguration runs;
-- selected real-provider correction, guided retry, pause, and live-reconfigure
-  scenarios;
-- RustSec and CodeQL green runs;
-- complete v2.4.0 changelog/release notes and final version bump from
-  `2.4.0-dev` to `2.4.0`.
+- DONE — `cargo fmt --all --check` and the exact CI clippy command with
+  warnings denied pass locally and in GitHub Actions.
+- DONE at the modularized source head — the full locked workspace suite passes
+  locally (160 CLI unit, 45 lifecycle, 16 round-trip, 59 core, 154 LLM, 31
+  PDF, and 34 then-existing store tests, plus EPUB and documentation tests).
+  The subsequently added 35th store test (the migration fixture below) passes
+  in its targeted run. A post-version-bump local rerun was attempted, but the
+  Codex permission regression denied execution of the configured LLVM linker;
+  final-head CI remains the authoritative rerun.
+- DONE — workflow-dispatch run
+  <https://github.com/JunjoSick/bookforge/actions/runs/29280629915> passed Linux
+  and Windows MSVC workspace tests, Rust 1.88, exact clippy, formatting, and
+  the full nine-book Standard Ebooks corpus with EPUBCheck. PR runs also pass
+  the small corpus.
+- DONE — `03dd379b` adds and passes an explicit migrations-1-through-6 fixture
+  proving migration 0007 preserves existing translations/blocks, defaults
+  audit fields correctly, records version 7, and is idempotent.
+- DONE (build generation) — cargo-dist run
+  <https://github.com/JunjoSick/bookforge/actions/runs/29281323279> passed native
+  x86_64/aarch64 macOS, x86_64/aarch64 Linux, Windows MSVC, and global
+  archive/checksum/shell/PowerShell-installer generation for v2.4.0; host and
+  announce correctly skipped on the PR.
+- DONE — the owner's mock dashboard correction click-path and subsequent
+  store/event/report/log inspection are recorded above. Automated dashboard
+  CSRF/API, lease-aware controls, correction/retry, live reconfiguration, and
+  single/batch/finalize lifecycle coverage all pass. A separate delayed mock
+  release-gate run completed 43/43 requests without server errors.
+- DONE — RustSec and CodeQL are green on draft PR #27.
+- DONE — `16b5b762` changes all workspace/path-dependency/lockfile versions
+  from `2.4.0-dev` to `2.4.0`, completes release notes, and refreshes stale
+  roadmap release truth.
+
+Still required before tagging:
+
+- execute the generated shell/PowerShell installers on native macOS, Linux,
+  and Windows and verify `bookforge --version` after installation (artifact
+  generation is proven; installer execution is not yet proven);
+- run the selected real-provider correction, guided-retry, pause, and live
+  reconfiguration scenario and inspect its persisted events/store/output;
+- after those two manual/credentialed gates, push the restored plan-only dist
+  config plus final evidence, then require the final-head CI, RustSec, and
+  CodeQL checks to be green.
 
 ## Constraints to preserve
 
