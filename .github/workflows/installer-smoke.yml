@@ -2,6 +2,9 @@ name: Installer smoke (temporary)
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/project-remediation
 
 permissions:
   actions: read
