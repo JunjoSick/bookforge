@@ -3200,7 +3200,12 @@ fn job_id_from_events(path: &Path) -> String {
 
 fn wait_for_job_id_in_store(temp: &TempDir) -> String {
     let db = temp.path().join(".bookforge/jobs.sqlite");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The lifecycle suite runs many child CLI processes in parallel. A loaded
+    // shared CI runner can take more than ten seconds to schedule a newly
+    // spawned worker even though the store appears immediately once it runs.
+    // Keep the success path unchanged while giving process startup enough
+    // headroom to avoid a scheduler-induced release-gate flake.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if db.exists()
             && let Ok(store) = JobStore::open(&db)

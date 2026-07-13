@@ -1,7 +1,7 @@
 # Live reconfiguration design
 
-Status: implemented on `codex/project-remediation`; real-provider acceptance remains a release gate
-Date: accepted 2026-07-11; implementation verified 2026-07-13
+Status: implemented and accepted on `codex/project-remediation`
+Date: design accepted 2026-07-11; implementation and real-provider acceptance verified 2026-07-13
 Source: `docs/codex-handoff-project-remediation-2026-07-10.md` and ROADMAP
 §§10.1.3–10.1.4
 
@@ -242,7 +242,7 @@ The existing `RuntimeConfigResolved` remains the initial full snapshot event.
   single/batch concurrency and budget changes, pause/reconfigure/resume
   ordering, stop precedence, channel closure, pending repartition, adaptive
   naming, escalation, and limiter growth/shrink.
-- The CLI suite passes 159 unit, 45 lifecycle, and 16 round-trip tests. The
+- The CLI suite passes 160 unit, 45 lifecycle, and 16 round-trip tests. The
   lifecycle coverage exercises live single/batch runs, finalize-stage
   snapshots, stop/resume sidecar persistence, successful cleanup, and stale
   crash leases. Dashboard route tests use an isolated store and cover typed
@@ -253,22 +253,31 @@ The existing `RuntimeConfigResolved` remains the initial full snapshot event.
   with warnings denied, and the Rust 1.88 workspace all-target check pass on
   Windows. After replacing the documented fixed-sleep stop/resume flake with
   an event-driven boundary, the clean linked workspace run passes in full:
-  159 CLI unit, 45 lifecycle, 16 round-trip, 59 core, 154 LLM, 31 PDF, and 34
+  160 CLI unit, 45 lifecycle, 16 round-trip, 59 core, 154 LLM, 31 PDF, and 35
   store tests, plus EPUB and documentation tests.
 - The embedded dashboard JavaScript passes a Node syntax check. The earlier
-  manual correction/dashboard exercise remains green; the real-provider steps
-  below are intentionally deferred to the final release gate.
+  manual correction/dashboard exercise and the real-provider acceptance below
+  are green.
 
-### Manual acceptance
+### Manual acceptance (completed 2026-07-13)
 
-1. Start a real-provider batch run and pause it with requests in flight.
-2. Lower items/concurrency, raise output tokens, and resume from the dashboard.
-3. Confirm in-flight requests retain the old revision and every later request
-   reports the new revision/budget.
-4. Kill the worker, queue a retry hint, and confirm dashboard Resume launches a
-   new worker, consumes the hint, and does not retranslate succeeded segments.
-5. Confirm token spend stops while paused and remains bounded after shrinking
-   concurrency.
+The packaged Windows v2.4.0 binary translated an isolated 13-segment synthetic
+EPUB through `deepseek-v4-flash` with one initial worker and one-item batches.
+The run was paused after its first request started, then revision 1 changed
+concurrency, batch sizing, adaptive behavior, and provider attempts before
+Resume. Persisted events prove the in-flight request retained revision 0,
+concurrency 1, and two provider attempts; the next 12 requests used revision 1,
+concurrency 2, and three provider attempts. All requests completed without
+429s, timeouts, server errors, invalid output, or truncation.
+
+After completion, a human correction on one segment rebuilt the EPUB and
+report while remaining frozen as provider `manual`. A guided dashboard retry
+on a different segment persisted across processes; dashboard Resume launched a
+replacement worker, increased only that segment's attempt count from 1 to 2,
+marked the guidance consumed, and left the correction intact. The final job was
+`succeeded`, runtime sidecars were gone, and BookForge structural validation
+passed. The credential and generated acceptance state remained outside the
+tracked worktree under `tmp/`.
 
 ## Implementation order
 

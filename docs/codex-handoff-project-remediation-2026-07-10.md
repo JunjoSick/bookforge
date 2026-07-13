@@ -44,6 +44,9 @@ git diff --check
 - Cargo-dist's expensive `pr-run-mode = "upload"` was enabled only for run
   `29281323279`; all five target archives and both global installers built.
   The normal plan-only configuration is restored in this evidence checkpoint.
+- All manual/credentialed release gates are complete. The only remaining
+  release-candidate action is an exact-final-head CI/security pass on the
+  evidence and lifecycle-test timeout hardening below.
 - Treat the older dirty-tree/restart notes below as provenance only. Inspect
   `git status --short --branch` and this current checkpoint before acting.
 - The Codex permission regression recurred after the 2026-07-13 continuation,
@@ -373,11 +376,10 @@ Do not skip this item.
 
 ### True live reconfiguration
 
-Design and implementation are complete in
+Design, implementation, and real-provider acceptance are complete in
 `docs/design-live-reconfiguration.md`. Commit `29ee6077` is pushed and the
-mock/automated acceptance matrix is green. The selected real-provider
-acceptance run remains part of the final release gate; the historical restart
-and WIP-review notes below are retained only as provenance.
+mock/automated acceptance matrix is green. The historical restart and
+WIP-review notes below are retained only as provenance.
 
 #### Live implementation checkpoint (Codex, 2026-07-13)
 
@@ -611,9 +613,8 @@ Automated gate status on 2026-07-13:
   locally (160 CLI unit, 45 lifecycle, 16 round-trip, 59 core, 154 LLM, 31
   PDF, and 34 then-existing store tests, plus EPUB and documentation tests).
   The subsequently added 35th store test (the migration fixture below) passes
-  in its targeted run. A post-version-bump local rerun was attempted, but the
-  Codex permission regression denied execution of the configured LLVM linker;
-  final-head CI remains the authoritative rerun.
+  in its targeted run. After permissions were restored, the exact live-
+  reconfiguration lifecycle test also passed locally with warnings denied.
 - DONE — workflow-dispatch run
   <https://github.com/JunjoSick/bookforge/actions/runs/29280629915> passed Linux
   and Windows MSVC workspace tests, Rust 1.88, exact clippy, formatting, and
@@ -640,17 +641,31 @@ Automated gate status on 2026-07-13:
   CSRF/API, lease-aware controls, correction/retry, live reconfiguration, and
   single/batch/finalize lifecycle coverage all pass. A separate delayed mock
   release-gate run completed 43/43 requests without server errors.
+- DONE (real provider) — the packaged v2.4.0 Windows binary translated an
+  isolated 13-segment EPUB with `deepseek-v4-flash`. The first request retained
+  revision 0 (concurrency 1, provider attempts 2); after pause/reconfigure/
+  resume, 12 later requests used revision 1 (concurrency 2, provider attempts
+  3). The run had no 429s, timeouts, server errors, invalid output, or
+  truncation. A manual correction remained frozen and refreshed the report;
+  dashboard-guided retry on a different segment persisted, launched a
+  replacement worker, increased its attempts from 1 to 2, consumed its hint,
+  and returned the job to `succeeded`. Store/events/output were inspected,
+  BookForge validation passed, and runtime sidecars were cleaned.
 - DONE — RustSec and CodeQL are green on draft PR #27.
 - DONE — `16b5b762` changes all workspace/path-dependency/lockfile versions
   from `2.4.0-dev` to `2.4.0`, completes release notes, and refreshes stale
   roadmap release truth.
 
-Still required before tagging:
+Final-head release-candidate check:
 
-- run the selected real-provider correction, guided-retry, pause, and live
-  reconfiguration scenario and inspect its persisted events/store/output;
-- after that credentialed gate, push its final evidence, then require the
-  final-head CI, RustSec, and CodeQL checks to be green.
+- Linux run `29285412261` exposed one scheduler-induced lifecycle-test flake:
+  a child process did not create its isolated job store before the shared
+  10-second discovery deadline. The same head passed Windows and every other
+  check. The helper now allows 30 seconds without slowing its immediate success
+  path, and the exact failed test passes locally. The resulting exact head must
+  pass Linux/Windows tests, exact clippy,
+  formatting, MSRV 1.88, small corpus, RustSec, CodeQL, and release planning to
+  be green on the resulting exact head before tagging.
 
 ## Constraints to preserve
 

@@ -22,8 +22,8 @@ genuinely live while strengthening the release gates around both changes.
 - Added escalation-first handling for truncated batch responses and prominent
   systemic-truncation alerts across CLI, watch, and dashboard surfaces.
 - Fixed resume override ordering, adaptive batch override propagation, stale
-  override cleanup, a stop/resume lifecycle timing race, and dashboard wizard
-  API-key retention.
+  override cleanup, stop/resume lifecycle timing races (including scheduler-
+  delayed CI child startup), and dashboard wizard API-key retention.
 - Bumped the batch translate prompts (plain, marker-safe, run-preserving, and
   their compact variants) from v2 to v3 to teach models about a per-item
   `retry_guidance` field; the batch prompt cache tag moved from `batch_v2`
@@ -34,6 +34,10 @@ genuinely live while strengthening the release gates around both changes.
   single-binary dashboard and existing public APIs.
 - Added an explicit pre-v2.4 database migration regression proving existing
   translations and blocks survive the new human-correction audit columns.
+- Exercised the generated installers on native x86_64/aarch64 macOS and Linux
+  plus Windows MSVC, and completed a selected DeepSeek pause, live-reconfigure,
+  correction, guided-retry, replacement-worker, persistence, and output-
+  validation acceptance run.
 
 ## v2.3.0 - 2026-07-05
 
