@@ -1,5 +1,6 @@
 pub mod control;
 pub mod convert;
+pub mod correct;
 pub mod doctor;
 pub mod entity;
 pub mod estimate;

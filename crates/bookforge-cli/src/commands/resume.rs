@@ -33,7 +33,7 @@ use crate::{
     QaMode,
     commands::{reconfigure, validate},
     performance::performance_summary_from_events,
-    report::{ReportInput, write_report},
+    report::{ReportInput, TranslationQaInput, write_report},
 };
 
 use super::translate::{
@@ -119,13 +119,6 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
 }
 
 async fn live_fast_resume_paused_job(store: &JobStore, args: &ResumeArgs) -> Result<()> {
-    if reconfigure::load_overrides_for_job(&args.job_id)?.is_some() {
-        anyhow::bail!(
-            "job '{}' has pending reconfigure overrides that a live fast-resume cannot apply. {}",
-            args.job_id,
-            reconfigure::apply_instructions(&args.job_id)
-        );
-    }
     let path = crate::control::request_job_control(&args.job_id, ControlCommand::Resume)?;
     if human_stdout_enabled(args.ui) {
         println!("resume requested for {} ({})", args.job_id, path.display());
@@ -243,11 +236,11 @@ async fn run_inner(
     let qa_mode = args
         .qa
         .or_else(|| overrides.as_ref().and_then(|overrides| overrides.qa))
-        .unwrap_or(QaMode::Off);
+        .unwrap_or_else(|| QaMode::from_snapshot(&snapshot.qa_mode));
     let validate_output = overrides
         .as_ref()
         .and_then(|overrides| overrides.validate_output)
-        .unwrap_or(false);
+        .unwrap_or(snapshot.validate_output);
     if let Some(overrides) = overrides.as_ref() {
         reconfigure::apply_overrides_to_settings(&mut settings, overrides);
     }
@@ -315,7 +308,7 @@ async fn run_inner(
     let pending_segments = select_pending_segments(&segments, &pending_ids)?;
     let prompt_version = snapshot.prompt_version.as_str();
     let legacy_cache_namespace = snapshot.glossary_fingerprint.is_empty();
-    let glossary = if legacy_cache_namespace {
+    let mut glossary = if legacy_cache_namespace {
         crate::commands::translate::PreparedGlossary {
             run_config: GlossaryRunConfig::default(),
             fingerprint: String::new(),
@@ -336,11 +329,13 @@ async fn run_inner(
                 format: snapshot.glossary_format,
                 entries_by_segment: selected.entries_by_segment,
                 prompt_extra: snapshot.prompt_extra.clone(),
+                guidance_by_segment: std::collections::HashMap::new(),
             },
             fingerprint,
             active_terms,
         }
     };
+    glossary.run_config.guidance_by_segment = store.load_retry_guidance(&job.id)?;
     let context_cfg = snapshot_context_run_config(snapshot);
     let context_registry: Option<Arc<ContextRegistry>> = if context_cfg.enabled() {
         let registry = Arc::new(ContextRegistry::new(&segments));
@@ -351,13 +346,17 @@ async fn run_inner(
     };
     let pause_signal = bookforge_llm::PauseSignal::new();
     let stop_cancel_token = tokio_util::sync::CancellationToken::new();
-    let _control_watcher = crate::control::ControlFileWatcher::spawn_with_stop_cancel(
+    let control_watcher = crate::control::ControlFileWatcher::spawn_with_stop_cancel(
         store.path().to_path_buf(),
         job.id.clone(),
         progress.clone(),
         pause_signal.clone(),
         stop_cancel_token.clone(),
+        settings.clone(),
+        qa_mode,
+        validate_output,
     );
+    let job_runtime_settings = control_watcher.job_runtime_settings();
     let run_config = TranslationRunConfig {
         source_language: snapshot.source_language.clone(),
         target_language: snapshot.target_language.clone(),
@@ -377,6 +376,7 @@ async fn run_inner(
         style: style_run_config_from_snapshot(snapshot),
         entities: entities_run_config_from_snapshot(snapshot),
         pause_signal: Some(pause_signal.clone()),
+        runtime_settings: Some(control_watcher.runtime_settings()),
     };
 
     let cache_namespace = if legacy_cache_namespace {
@@ -520,14 +520,16 @@ async fn run_inner(
         print_stopped_resume_hint(&job.id, print_stdout);
         return Ok(());
     }
+    let qa_runtime = job_runtime_settings.borrow().clone();
+    let qa_run_config = crate::control::freeze_run_config_for_stage(&run_config, &qa_runtime);
     let qa_reviews = qa_after_resume(
         &job,
         &segments,
         &translations,
-        &run_config,
+        &qa_run_config,
         snapshot,
-        &settings,
-        qa_mode,
+        &qa_runtime.settings,
+        qa_runtime.qa,
         progress.clone(),
         stop_cancel_token.clone(),
     )
@@ -566,16 +568,19 @@ async fn run_inner(
         print_stopped_resume_hint(&job.id, print_stdout);
         return Ok(());
     }
-    if settings.double_check.mode != DoubleCheckMode::Off
+    let double_check_runtime = job_runtime_settings.borrow().clone();
+    let double_check_run_config =
+        crate::control::freeze_run_config_for_stage(&run_config, &double_check_runtime);
+    if double_check_runtime.settings.double_check.mode != DoubleCheckMode::Off
         && !snapshot.finalize.double_check_complete
     {
         let changed_segment_ids = match double_check_after_resume(
             &job,
             &segments,
             &mut translations,
-            &run_config,
+            &double_check_run_config,
             snapshot,
-            &settings,
+            &double_check_runtime.settings,
             progress.clone(),
             stop_cancel_token.clone(),
         )
@@ -591,7 +596,7 @@ async fn run_inner(
         persist_corrected_translations(
             &store,
             &job.id,
-            &run_config,
+            &double_check_run_config,
             &translations,
             &changed_segment_ids,
         )?;
@@ -611,7 +616,8 @@ async fn run_inner(
     let block_translations = rebuild_block_translations(&segments, &stored_blocks, &translations);
     let rebuild_options = super::translate::rebuild_options_from_snapshot(snapshot);
     rebuild_epub_with_options(&book, &block_translations, &output, &rebuild_options)?;
-    if validate_output {
+    let validation_runtime = job_runtime_settings.borrow().clone();
+    if validation_runtime.validate_output {
         let validation_path = validate::default_report_path(&output);
         let validation = validate::validate_and_write(&output, &validation_path, false)?;
         if print_stdout {
@@ -651,18 +657,37 @@ async fn run_inner(
     let summary = store
         .summary(&job.id)?
         .ok_or_else(|| anyhow::anyhow!("job '{}' was not found after resume", job.id))?;
+    let qa_inputs = translations
+        .iter()
+        .map(|translation| {
+            TranslationQaInput::new(
+                translation.segment_id.0.clone(),
+                matches!(
+                    translation.status,
+                    SegmentStatus::Succeeded | SegmentStatus::SkippedCached
+                ),
+                translation.joined_text(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let corrected_segments = store
+        .load_terminal_segment_translations(&job.id)?
+        .iter()
+        .filter(|translation| translation.human_corrected)
+        .count();
     let report = write_report(ReportInput {
         job: &job,
         summary: &summary,
         segments: &segments,
         segment_records: &segment_records,
-        translations: &translations,
+        translations: &qa_inputs,
         qa_reviews: &qa_reviews,
         performance: snapshot
             .events_path
             .as_ref()
             .and_then(|path| performance_summary_from_events(path).ok().flatten()),
         output: &output,
+        corrected_segments,
     })?;
     store.update_job_report_paths(&job.id, &report.json, &report.markdown)?;
     snapshot.report_json_path = Some(report.json.clone());
@@ -1254,7 +1279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paused_fast_resume_with_overrides_errors_with_apply_guidance() {
+    async fn paused_fast_resume_with_overrides_signals_the_live_watcher() {
         let fixture = resume_fixture(TranslationProfile::V1Fast.resolve(), 1);
         fixture
             .store
@@ -1268,22 +1293,26 @@ mod tests {
             },
         );
         let args = resume_args(&fixture.job.id);
+        let store_path = fixture.store.path().to_path_buf();
+        let job_id = fixture.job.id.clone();
+        let wake_id = job_id.clone();
 
-        let error = live_fast_resume_paused_job(&fixture.store, &args)
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let store = JobStore::open(store_path).expect("store should reopen");
+            store
+                .mark_job_running(&wake_id)
+                .expect("live watcher should leave paused");
+        });
+
+        live_fast_resume_paused_job(&fixture.store, &args)
             .await
-            .expect_err("pending overrides must block live fast-resume");
-        let message = error.to_string();
+            .expect("pending overrides should be applied by the live watcher");
 
-        assert!(message.contains("live fast-resume cannot apply"));
-        assert!(message.contains(&format!("bookforge stop {}", fixture.job.id)));
-        assert!(message.contains(&format!("bookforge resume {}", fixture.job.id)));
-        assert!(message.contains("--force"));
         assert_eq!(
-            bookforge_core::read_control_file(&bookforge_core::control_path_for_job(
-                &fixture.job.id
-            ))
-            .expect("control file should read"),
-            ControlCommand::Run
+            bookforge_core::read_control_file(&bookforge_core::control_path_for_job(&job_id))
+                .expect("control file should read"),
+            ControlCommand::Resume
         );
         reconfigure::clear_overrides_for_job(&fixture.job.id).expect("sidecar should clear");
     }
@@ -1808,6 +1837,8 @@ mod tests {
             bilingual_css: None,
             fallback: None,
             finalize: bookforge_core::run_snapshot::FinalizeCheckpointSnapshot::default(),
+            qa_mode: "off".to_string(),
+            validate_output: false,
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
         store

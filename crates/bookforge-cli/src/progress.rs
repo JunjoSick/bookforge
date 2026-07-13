@@ -547,6 +547,28 @@ impl ProgressBars {
                 self.batch_bar
                     .set_message(format!("batch {batch_id} split"));
             }
+            ProgressEvent::RuntimeConfigChanged {
+                revision,
+                changed_fields,
+                application,
+                ..
+            } => {
+                self.multi
+                    .println(format!(
+                        "  [runtime r{revision}] {} -> {}",
+                        changed_fields.join(", "),
+                        application.join(", ")
+                    ))
+                    .ok();
+            }
+            ProgressEvent::RuntimeConfigRejected {
+                revision, message, ..
+            } => {
+                let revision = revision.map_or_else(String::new, |value| format!(" r{value}"));
+                self.multi
+                    .println(format!("  [runtime{revision} rejected] {message}"))
+                    .ok();
+            }
             ProgressEvent::Warning { message, .. } => {
                 self.multi.println(format!("  [warn] {message}")).ok();
             }
@@ -594,6 +616,8 @@ fn is_important_event(event: &ProgressEvent) -> bool {
         ProgressEvent::Error { .. }
         | ProgressEvent::JobPaused { .. }
         | ProgressEvent::JobResumed { .. }
+        | ProgressEvent::RuntimeConfigChanged { .. }
+        | ProgressEvent::RuntimeConfigRejected { .. }
         | ProgressEvent::RequestStarted { .. }
         | ProgressEvent::Warning { .. }
         | ProgressEvent::BatchRepairFinished { .. }
@@ -836,6 +860,17 @@ mod tests {
         assert!(is_important_event(&ProgressEvent::Warning {
             kind: "test".into(),
             message: "test".into(),
+            timestamp_ms: 0,
+        }));
+        assert!(is_important_event(&ProgressEvent::RuntimeConfigChanged {
+            revision: 1,
+            changed_fields: vec!["concurrency".to_string()],
+            application: vec!["next_request".to_string()],
+            timestamp_ms: 0,
+        }));
+        assert!(is_important_event(&ProgressEvent::RuntimeConfigRejected {
+            revision: Some(2),
+            message: "invalid".to_string(),
             timestamp_ms: 0,
         }));
         // BatchRepairFinished is critical

@@ -1,6 +1,6 @@
 [package]
 name = "bookforge-llm"
-version = "2.3.0"
+version = "2.4.0"
 description = "Prompting, providers, batching, and validation for BookForge translation runs."
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bookforge-core = { version = "2.3.0", path = "../bookforge-core" }
+bookforge-core = { version = "2.4.0", path = "../bookforge-core" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

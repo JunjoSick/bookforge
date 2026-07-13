@@ -68,6 +68,17 @@ pub enum ProgressEvent {
         batch_max_output_tokens: Option<u32>,
         timestamp_ms: u64,
     },
+    RuntimeConfigChanged {
+        revision: u64,
+        changed_fields: Vec<String>,
+        application: Vec<String>,
+        timestamp_ms: u64,
+    },
+    RuntimeConfigRejected {
+        revision: Option<u64>,
+        message: String,
+        timestamp_ms: u64,
+    },
     SegmentationFinished {
         segment_count: usize,
         timestamp_ms: u64,
@@ -109,6 +120,10 @@ pub enum ProgressEvent {
         max_output_tokens: Option<u32>,
         active_requests: usize,
         target_concurrency: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_config_revision: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_max_attempts: Option<usize>,
         timestamp_ms: u64,
     },
     RequestFinished {
@@ -202,6 +217,8 @@ pub fn event_timestamp_ms(event: &ProgressEvent) -> u64 {
         | StageStarted { timestamp_ms, .. }
         | StageFinished { timestamp_ms, .. }
         | RuntimeConfigResolved { timestamp_ms, .. }
+        | RuntimeConfigChanged { timestamp_ms, .. }
+        | RuntimeConfigRejected { timestamp_ms, .. }
         | SegmentationFinished { timestamp_ms, .. }
         | CacheScanFinished { timestamp_ms, .. }
         | BatchQueued { timestamp_ms, .. }
@@ -260,6 +277,12 @@ pub struct RunState {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub configured_concurrency: usize,
+    #[serde(default)]
+    pub runtime_config_revision: u64,
+    #[serde(default)]
+    pub runtime_config_changed_fields: Vec<String>,
+    #[serde(default)]
+    pub runtime_config_rejection: Option<String>,
 
     // Progress.
     pub stage: Option<String>,
@@ -347,6 +370,18 @@ impl RunState {
                 self.model = Some(model.clone());
                 self.configured_concurrency = *concurrency;
                 self.target_concurrency = *concurrency;
+            }
+            ProgressEvent::RuntimeConfigChanged {
+                revision,
+                changed_fields,
+                ..
+            } => {
+                self.runtime_config_revision = *revision;
+                self.runtime_config_changed_fields = changed_fields.clone();
+                self.runtime_config_rejection = None;
+            }
+            ProgressEvent::RuntimeConfigRejected { message, .. } => {
+                self.runtime_config_rejection = Some(message.clone());
             }
             ProgressEvent::StageStarted { stage, .. } => {
                 self.stage = Some(stage.clone());
@@ -625,6 +660,37 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_events_fold_into_replayable_state() {
+        let mut state = RunState::default();
+        state.fold(&ProgressEvent::RuntimeConfigRejected {
+            revision: Some(2),
+            message: "invalid concurrency".to_string(),
+            timestamp_ms: 10,
+        });
+        assert_eq!(
+            state.runtime_config_rejection.as_deref(),
+            Some("invalid concurrency")
+        );
+
+        state.fold(&ProgressEvent::RuntimeConfigChanged {
+            revision: 3,
+            changed_fields: vec!["concurrency".to_string(), "batch-max-items".to_string()],
+            application: vec!["next_request".to_string(), "next_batch".to_string()],
+            timestamp_ms: 20,
+        });
+
+        assert_eq!(state.runtime_config_revision, 3);
+        assert_eq!(
+            state.runtime_config_changed_fields,
+            vec!["concurrency".to_string(), "batch-max-items".to_string()]
+        );
+        assert!(state.runtime_config_rejection.is_none());
+        let json = serde_json::to_string(&state).unwrap();
+        let replayed: RunState = serde_json::from_str(&json).unwrap();
+        assert_eq!(replayed.runtime_config_revision, 3);
+    }
+
+    #[test]
     fn active_requests_tracks_start_and_finish() {
         let mut state = RunState::default();
         let started = ProgressEvent::RequestStarted {
@@ -639,6 +705,8 @@ mod tests {
             max_output_tokens: None,
             active_requests: 1,
             target_concurrency: 4,
+            runtime_config_revision: None,
+            provider_max_attempts: None,
             timestamp_ms: 1,
         };
         state.fold(&started);
@@ -687,6 +755,20 @@ mod tests {
         let mut state = RunState::default();
         state.fold(&parsed);
         assert_eq!(state.succeeded, 1);
+    }
+
+    #[test]
+    fn older_request_started_events_default_runtime_audit_fields() {
+        let json = r#"{"RequestStarted":{"request_id":"r1","batch_id":null,"segment_id":null,"provider":null,"model":null,"prompt_template":null,"items":1,"estimated_input_tokens":2,"max_output_tokens":256,"active_requests":1,"target_concurrency":2,"timestamp_ms":3}}"#;
+        let event: ProgressEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            event,
+            ProgressEvent::RequestStarted {
+                runtime_config_revision: None,
+                provider_max_attempts: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -741,6 +823,8 @@ mod tests {
             max_output_tokens: None,
             active_requests: active,
             target_concurrency: 4,
+            runtime_config_revision: None,
+            provider_max_attempts: None,
             timestamp_ms: ts,
         };
         state.fold(&started(3, 1));

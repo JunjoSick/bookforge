@@ -514,6 +514,28 @@ fn format_event_line(event: &ProgressEvent) -> Line<'static> {
             format!("concurrency → {current} ({reason})"),
             Style::new().fg(Color::Gray),
         ),
+        ProgressEvent::RuntimeConfigChanged {
+            revision,
+            changed_fields,
+            application,
+            ..
+        } => (
+            format!(
+                "runtime r{revision}: {} → {}",
+                changed_fields.join(", "),
+                application.join(", ")
+            ),
+            Style::new().fg(Color::Cyan),
+        ),
+        ProgressEvent::RuntimeConfigRejected {
+            revision, message, ..
+        } => (
+            format!(
+                "runtime{} rejected: {message}",
+                revision.map_or_else(String::new, |value| format!(" r{value}"))
+            ),
+            Style::new().fg(Color::Red),
+        ),
         ProgressEvent::Warning { message, .. } => {
             (format!("[warn] {message}"), Style::new().fg(Color::Yellow))
         }
@@ -649,5 +671,23 @@ mod tests {
         let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(rendered.contains("3 ok"));
         assert!(rendered.contains("2 review"));
+    }
+
+    #[test]
+    fn runtime_change_event_renders_revision_fields_and_boundary() {
+        let line = format_event_line(&ProgressEvent::RuntimeConfigChanged {
+            revision: 4,
+            changed_fields: vec!["concurrency".to_string(), "qa".to_string()],
+            application: vec!["next_request".to_string(), "next_stage".to_string()],
+            timestamp_ms: 0,
+        });
+        let rendered: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(rendered.contains("runtime r4"));
+        assert!(rendered.contains("concurrency, qa"));
+        assert!(rendered.contains("next_request, next_stage"));
     }
 }

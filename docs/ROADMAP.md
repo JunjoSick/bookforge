@@ -1,12 +1,14 @@
 # BookForge — Technical Roadmap, v1.0.1 through v2.0
 
-**Document version:** 1.2.0
-**Last updated:** 2026-07-03
+**Document version:** 1.3.0
+**Last updated:** 2026-07-13
 **Status:** historical roadmap plus active follow-up notes
 **Audience:** project maintainer + Claude Code (or any other coding agent) implementing
 the milestones below.
 
-> **Current status:** the current release line is v2.1.0 (2026-07-03).
+> **Current status:** v2.4.0 is the release candidate on
+> `codex/project-remediation` (2026-07-13); v2.3.0 is the latest published
+> release.
 > This document is kept for architectural invariants, shipped-milestone
 > context, and deferred follow-up work. For current user behavior, start
 > with `README.md`, `CHANGELOG.md`, and `docs/v2-web-dashboard-plan.md`;
@@ -19,8 +21,9 @@ the milestones below.
 > shipped out of order. Read them as feature names. Mapping so far:
 > milestone v1.8 → releases v1.8.x (2026-06-20); v2.0 milestone →
 > releases v2.0.0–v2.0.3; milestone v1.6 (PDF hardening) → release
-> v2.1.0 (2026-07-03); milestone v1.7 (bilingual output) → in progress,
-> expected v2.2.0.
+> v2.1.0 (2026-07-03); milestone v1.7 (bilingual output) → release
+> v2.2.0 (2026-07-04). Reflow and cooperative controls shipped in v2.3.0;
+> durable corrections and live reconfiguration are the v2.4.0 scope.
 
 ---
 
@@ -117,9 +120,9 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v1.4 | Distribution + writeup | 5–7 days | one technical post, two or three venues; cargo-dist binaries land here | shipped |
 | v1.5 | Extraction + scheduling overhaul (shipped scope; see §8 post-ship note) | — | none | shipped 2026-06-12 |
 | v1.6 | PDF ingestion hardening (§9) | 8–14 days | release notes; maybe a short writeup if layout reconstruction turns out interesting | **shipped 2026-07-03 as release v2.1.0** |
-| v1.7 | Bilingual output (§9b) | 5–8 days | passive (release notes only) | **in progress (2026-07-03)** |
+| v1.7 | Bilingual output (§9b) | 5–8 days | passive (release notes only) | **shipped 2026-07-04 as release v2.2.0** |
 | v1.8 | Structural credibility (EPUBCheck + corpus; was the planned v1.5 scope, §8) | 10–14 days | README final rewrite citing corpus | **shipped 2026-06-20** |
-| v2.0 | Monitoring UI (`RunState`, `watch`, `--ui tui`, local `serve`) | shipped scope | release notes | shipped; current patch v2.0.2 (2026-07-02) |
+| v2.0 | Monitoring UI (`RunState`, `watch`, `--ui tui`, local `serve`) | shipped scope | release notes | shipped; patch line completed at v2.0.3 (2026-07-02) |
 
 Priority note (2026-06): the owner needs PDF translation more than
 bilingual output — scientific papers (figures/tables must survive) and
@@ -2540,6 +2543,13 @@ blocker for the non-developer audience.
 
 #### 10.1.3 Mini-spec: On-the-fly settings reconfiguration (added 2026-07-06, owner-approved)
 
+> **Implemented for v2.4.0 on the project-remediation branch.** Revisioned
+> overrides now apply in-process at request, unstarted-batch, and finalize-stage
+> boundaries. The CLI and dashboard share validation and persistence; a runtime
+> lease lets dashboard Resume signal a live worker or launch one replacement
+> after stop/crash. Automated acceptance is complete; the selected real-provider
+> run remains part of the final release gate.
+
 **Goal.** Adjust *cache-safe* run settings on an existing (initially: paused)
 job and have `resume` apply them — without starting a fresh run and losing
 progress. Motivated directly by real use: a run hit repeated output
@@ -2558,21 +2568,20 @@ seam to amend them.
    toggles.
 2. **Persistence: an overrides sidecar.** Write
    `.bookforge/runs/<job-id>/overrides.json` (additive, no migration — matches
-   the control-file architecture from §10.1.1). On `resume` (and on a live
-   run's next batch boundary, if feasible later), merge the overrides over the
-   loaded `RunConfigSnapshot`.
-   For v1, live fast-resume of an already-paused process cannot apply pending
-   overrides because that process keeps its in-memory scheduler settings. Stop
-   the paused run first and then `resume`, or use `resume --force` only when the
-   paused process is already gone; full live application remains deferred.
+   the control-file architecture from §10.1.1). A long-lived runtime watcher
+   validates and publishes immutable snapshots to the live scheduler. Resume
+   preloads the same durable document before its first dispatch, so stopped and
+   crashed workers use identical effective settings without a startup race.
 3. **Guardrails — reject cache-affecting settings.** Only settings that change
    *how remaining work is scheduled/budgeted* are mutable. Immutable
    (would make partial output inconsistent or invalidate the cache):
    provider, model, source/target language, profile, context window/scope,
    prompt version, glossary/style/entity inputs. Attempting to change these
    fails with a clear message explaining a fresh run is required and why.
-4. **Surfaces.** CLI now. Dashboard later: the Advanced panel, editable on a
-   paused job's Progress screen (pairs with §10.1.2).
+4. **Surfaces.** The CLI, status output, additive progress events, terminal UI,
+   and the dashboard Progress screen expose the effective revision. The
+   dashboard editor is available for running, paused, and stopped jobs with
+   unfinished translation or finalize work.
 
 **Acceptance.**
 1. Reconfigure a paused job's `--batch-max-output-tokens` + `--batch-max-items`,
@@ -2583,14 +2592,18 @@ seam to amend them.
 3. Overrides are auditable (visible in `status`), additive, and a job with no
    overrides resumes exactly as today.
 
-**Out of scope (for v1):** live reconfiguration of a *running* (non-paused)
-job mid-batch; changing the model/provider mid-job; reconfiguring completed
-jobs.
+**Out of scope:** mutating an in-flight provider request or an already-started
+finalize stage; changing model/provider or any cache-affecting identity;
+reconfiguring completed jobs.
 
 **Effort:** ~1 day CLI + snapshot-merge. **Priority:** high — small, and it
 removes a real "lost all my progress to change one number" cliff.
 
 #### 10.1.4 Mini-spec: Truncation handling + fail-fast alert (added 2026-07-06, owner-approved)
+
+> **Implemented on main after v2.3.0; scheduled for v2.4.0.** Truncated batches
+> escalate their output budget before splitting, and systemic exhaustion emits
+> an additive alert surfaced by CLI, watch, and the browser dashboard.
 
 **Goal.** Handle `max_output_tokens` truncation intelligently, and surface a
 prominent, actionable **alert** when truncation is *systemic* instead of

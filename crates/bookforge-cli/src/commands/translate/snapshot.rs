@@ -87,6 +87,8 @@ pub(crate) fn persist_snapshot(
         bilingual_css,
         fallback: fallback_snapshot(cli_args, model),
         finalize: FinalizeCheckpointSnapshot::default(),
+        qa_mode: cli_args.qa.as_str().to_string(),
+        validate_output: cli_args.validate_output,
         settings: ResolvedRunSettingsSnapshot::from_settings(settings),
     };
     store.update_job_config_snapshot(&job.id, &snapshot)?;

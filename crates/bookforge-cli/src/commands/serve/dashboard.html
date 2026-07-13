@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BookForge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,400;0,500;0,600;0,700;1,400&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+{{BOOKFORGE_DASHBOARD_CSS}}
+</style>
+</head>
+<body>
+<header class="appbar">
+  <div class="brand" onclick="bfGo('library')"><b>BookForge</b><small>v2</small></div>
+  <nav class="nav" id="nav"></nav>
+  <span class="spacer"></span>
+  <div class="right">
+    <button class="btn btn-primary" onclick="bfStartNew()">+ New translation</button>
+    <div class="themetoggle" onclick="bfTheme()"><span id="sun">&#9728;</span><span id="moon">&#9790;</span></div>
+  </div>
+</header>
+<main id="stage"></main>
+
+<script>
+{{BOOKFORGE_DASHBOARD_JS}}
+</script>
+</body>
+</html>

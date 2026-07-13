@@ -11,7 +11,7 @@ Return exactly:
 ## User
 
 Translate every item.
-Honor item `glossary`/`glossary_prose` constraints. Style: {{style_guide_block}}
+Honor item `glossary`/`glossary_prose`/`retry_guidance` constraints. Style: {{style_guide_block}}
 Entities: {{entity_agreement_block}}
 Prior context: {{context_translation_pairs}}
 Extra: {{prompt_extra}}

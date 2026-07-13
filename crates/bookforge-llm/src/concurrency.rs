@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use bookforge_core::{ProgressEvent, ProgressSink};
 
@@ -182,6 +182,14 @@ impl AdaptiveLimiter {
         })
     }
 
+    pub fn try_acquire(&self) -> Result<AdaptivePermit, TryAcquireError> {
+        let permit = self.semaphore.clone().try_acquire_owned()?;
+        Ok(AdaptivePermit {
+            permit: Some(permit),
+            permits_to_burn: self.permits_to_burn.clone(),
+        })
+    }
+
     pub fn on_success(&self) {
         let now = Instant::now();
         let mut last = self.last_grow.lock().unwrap();
@@ -252,7 +260,24 @@ impl AdaptiveLimiter {
         } else {
             let delta = previous - new;
             *state = new;
-            self.permits_to_burn.fetch_add(delta, Ordering::AcqRel);
+            // Remove already-idle permits immediately. A drop-only burn
+            // counter is insufficient: waiters can otherwise acquire free
+            // permits after a shrink and temporarily exceed the new target.
+            // Any permit racing with this loop is held by a caller and is
+            // accounted for by the remaining deferred burns.
+            let mut deferred = delta;
+            while deferred > 0 {
+                match self.semaphore.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        permit.forget();
+                        deferred -= 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if deferred > 0 {
+                self.permits_to_burn.fetch_add(deferred, Ordering::AcqRel);
+            }
         }
 
         if let Some(ref progress) = self.progress {
@@ -368,6 +393,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shrink_removes_idle_permits_before_waiters_can_acquire_them() {
+        let limiter = AdaptiveLimiter::new_with_bounds(2, 1, 8, Duration::ZERO, None);
+        assert_eq!(limiter.semaphore.available_permits(), 2);
+
+        limiter.set_target(1, "test");
+
+        assert_eq!(limiter.current(), 1);
+        assert_eq!(limiter.semaphore.available_permits(), 1);
+        let held = limiter.try_acquire().expect("one permit should remain");
+        assert!(
+            limiter.try_acquire().is_err(),
+            "a second permit must not remain available after shrinking"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
     async fn drop_does_not_underflow_when_no_burn_pending() {
         let limiter = AdaptiveLimiter::new(2, 4);
         for _ in 0..10 {
@@ -385,6 +427,7 @@ mod tests {
         limiter.on_success();
         limiter.on_success();
         limiter.on_success();
+        let held = acquire_n(&limiter, 4).await;
         // Shrink 4 -> 1: burn counter = 3
         limiter.on_rate_limit();
         limiter.on_rate_limit();
@@ -394,5 +437,7 @@ mod tests {
         limiter.on_success();
         limiter.on_success();
         assert_eq!(limiter.permits_to_burn.load(Ordering::Acquire), 0);
+        drop(held);
+        assert_eq!(limiter.semaphore.available_permits(), 4);
     }
 }

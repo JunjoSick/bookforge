@@ -19,8 +19,9 @@ use commands::serve;
 #[cfg(feature = "tui")]
 use commands::watch;
 use commands::{
-    control as control_commands, convert, doctor, entity, estimate, glossary, ingest_flags,
-    inspect, reconfigure, reflow, resume, retry, review, status, style, tail, translate, validate,
+    control as control_commands, convert, correct, doctor, entity, estimate, glossary,
+    ingest_flags, inspect, reconfigure, reflow, resume, retry, review, status, style, tail,
+    translate, validate,
 };
 #[cfg(any(test, not(feature = "serve")))]
 use std::io::Write;
@@ -61,6 +62,7 @@ enum Command {
     Reconfigure(reconfigure::ReconfigureArgs),
     Resume(resume::ResumeArgs),
     Stop(control_commands::StopArgs),
+    Correct(correct::CorrectArgs),
     Review(review::ReviewArgs),
     IngestFlags(ingest_flags::IngestFlagsArgs),
     Glossary(glossary::GlossaryArgs),
@@ -122,6 +124,7 @@ async fn run_command(command: Command, cancel_token: CancellationToken) -> Resul
         Command::Reconfigure(args) => reconfigure::run(args).await,
         Command::Resume(args) => resume::run(args).await,
         Command::Stop(args) => control_commands::stop(args).await,
+        Command::Correct(args) => correct::run(args).await,
         Command::Review(args) => review::run(args).await,
         Command::IngestFlags(args) => ingest_flags::run(args).await,
         Command::Glossary(args) => glossary::run(args).await,
@@ -225,6 +228,24 @@ pub(crate) enum QaMode {
     Off,
     Suspicious,
     All,
+}
+
+impl QaMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Suspicious => "suspicious",
+            Self::All => "all",
+        }
+    }
+
+    pub(crate) fn from_snapshot(value: &str) -> Self {
+        match value {
+            "suspicious" => Self::Suspicious,
+            "all" => Self::All,
+            _ => Self::Off,
+        }
+    }
 }
 
 fn default_output_path(input: &std::path::Path, target: &str) -> PathBuf {

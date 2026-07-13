@@ -593,8 +593,11 @@ fn attr_value(
         let attr = attr.map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
         if local_name(attr.key.as_ref()) == attr_name {
             return Ok(Some(
-                attr.decode_and_unescape_value(reader.decoder())?
-                    .into_owned(),
+                attr.decoded_and_normalized_value(
+                    quick_xml::XmlVersion::Implicit1_0,
+                    reader.decoder(),
+                )?
+                .into_owned(),
             ));
         }
     }
@@ -1150,7 +1153,9 @@ fn has_epub_type(element: &BytesStart<'_>, expected: &[u8]) -> Result<bool> {
     for attr in element.attributes() {
         let attr = attr.map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
         if local_name(attr.key.as_ref()) == b"type" {
-            let value = attr.unescape_value()?.into_owned();
+            let value = attr
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                .into_owned();
             return Ok(value
                 .split_ascii_whitespace()
                 .any(|item| item.as_bytes() == expected));

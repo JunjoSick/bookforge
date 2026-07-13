@@ -2,7 +2,7 @@ use anyhow::Result;
 use bookforge_core::{
     RunConfigSnapshot,
     config::TranslationConfig,
-    segment::{BlockTranslation, Segment},
+    segment::{BlockTranslation, Segment, SegmentStatus},
 };
 use bookforge_epub::{RebuildOptions, rebuild_epub_with_options};
 use bookforge_llm::{QaSegmentReview, SegmentTranslation};
@@ -12,7 +12,7 @@ use crate::{
     commands::validate,
     cost::estimate_cost_usd_with_cached,
     performance::performance_summary_from_events,
-    report::{ReportInput, write_report},
+    report::{ReportFiles, ReportInput, TranslationQaInput, write_report},
 };
 
 pub fn block_translations(translations: &[SegmentTranslation]) -> Vec<BlockTranslation> {
@@ -63,15 +63,34 @@ pub fn print_summary_rebuild_and_report(
         .events_path
         .as_ref()
         .and_then(|path| performance_summary_from_events(path).ok().flatten());
+    let qa_inputs = translations
+        .iter()
+        .map(|translation| {
+            TranslationQaInput::new(
+                translation.segment_id.0.clone(),
+                matches!(
+                    translation.status,
+                    SegmentStatus::Succeeded | SegmentStatus::SkippedCached
+                ),
+                translation.joined_text(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let corrected_segments = store
+        .load_terminal_segment_translations(&job.id)?
+        .iter()
+        .filter(|translation| translation.human_corrected)
+        .count();
     let report = write_report(ReportInput {
         job: &report_job,
         summary: &summary,
         segments,
         segment_records: &segment_records,
-        translations,
+        translations: &qa_inputs,
         qa_reviews,
         performance,
         output: &config.output,
+        corrected_segments,
     })?;
     store.update_job_report_paths(&job.id, &report.json, &report.markdown)?;
 
@@ -108,6 +127,66 @@ pub fn print_summary_rebuild_and_report(
     }
 
     Ok(())
+}
+
+/// Refreshes the on-disk QA report (`{stem}.report.json` / `.report.md`) for
+/// a job entirely from store-backed data, without requiring the in-memory
+/// run results (`SegmentTranslation`, `QaSegmentReview`) that only exist
+/// during a live translate/resume run. Used after a manual correction, whose
+/// invocation is a separate process from the original run — the correction
+/// itself is already durably persisted by the time this runs, so this is a
+/// best-effort refresh of a secondary artifact, not part of the correction's
+/// atomicity contract.
+///
+/// QA-review-derived warnings (from an optional double-check pass) cannot be
+/// reconstructed here since they are never persisted to the store; the
+/// refreshed report simply omits them, which is correct because a segment
+/// that was just manually corrected has no meaningful stale AI QA verdict to
+/// preserve anyway.
+pub(crate) fn regenerate_report_after_correction(
+    store: &JobStore,
+    job: &JobRecord,
+    segments: &[Segment],
+) -> Result<ReportFiles> {
+    let summary = store
+        .summary(&job.id)?
+        .ok_or_else(|| anyhow::anyhow!("job '{}' was not found after correction", job.id))?;
+    let report_job = store
+        .get_job(&job.id)?
+        .ok_or_else(|| anyhow::anyhow!("job '{}' was not found after correction", job.id))?;
+    let segment_records = store.segment_records(&job.id)?;
+    let stored_translations = store.load_terminal_segment_translations(&job.id)?;
+    let corrected_segments = stored_translations
+        .iter()
+        .filter(|translation| translation.human_corrected)
+        .count();
+    let qa_inputs = stored_translations
+        .iter()
+        .map(|translation| {
+            TranslationQaInput::new(
+                translation.segment_id.clone(),
+                matches!(translation.status.as_str(), "succeeded" | "skipped_cached"),
+                translation.translated_text.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let performance = report_job
+        .events_path
+        .as_ref()
+        .and_then(|path| performance_summary_from_events(path).ok().flatten());
+    let report = write_report(ReportInput {
+        job: &report_job,
+        summary: &summary,
+        segments,
+        segment_records: &segment_records,
+        translations: &qa_inputs,
+        qa_reviews: &[],
+        performance,
+        output: &report_job.output_path,
+        corrected_segments,
+    })?;
+    store.update_job_report_paths(&job.id, &report.json, &report.markdown)?;
+    Ok(report)
 }
 
 pub fn rebuild_options_from_snapshot(snapshot: &RunConfigSnapshot) -> RebuildOptions {

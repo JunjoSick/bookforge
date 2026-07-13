@@ -1,5 +1,58 @@
 # Changelog
 
+## v2.4.0 - 2026-07-13
+
+BookForge v2.4.0 closes the local review loop and makes safe runtime tuning
+genuinely live while strengthening the release gates around both changes.
+
+- Added revisioned, atomic live job reconfiguration through the CLI and the
+  dashboard. Cache-safe concurrency, request-budget, retry, adaptive sizing,
+  QA, double-check, and validation settings now apply at explicit request,
+  batch, or finalize-stage boundaries without changing in-flight requests or
+  retranslating completed segments.
+- Added worker leases and lease-aware dashboard controls: Resume signals a
+  live worker or safely launches one replacement for a stopped, crashed, or
+  dead-paused job, with concurrent launch attempts deduplicated.
+- Added durable, auditable human corrections and flags to the CLI and Review
+  dashboard. Corrected segments are frozen against model/QA/cache overwrites,
+  guided retries persist across resume, and retry guidance now uses an inline
+  editor with explicit Stop/Resume workflow.
+- Added Windows workspace CI, Dependabot coverage, RustSec auditing, and Rust
+  CodeQL analysis; the new workflows have been exercised on the v2.4 draft PR.
+- Added escalation-first handling for truncated batch responses and prominent
+  systemic-truncation alerts across CLI, watch, and dashboard surfaces.
+- Fixed resume override ordering, adaptive batch override propagation, stale
+  override cleanup, stop/resume lifecycle timing races (including scheduler-
+  delayed CI child startup), and dashboard wizard API-key retention.
+- Bumped the batch translate prompts (plain, marker-safe, run-preserving, and
+  their compact variants) from v2 to v3 to teach models about a per-item
+  `retry_guidance` field; the batch prompt cache tag moved from `batch_v2`
+  to `batch_v3` so translations cached under the old prompt text are not
+  reused.
+- Split the largest dashboard, batch, store, PDF-conversion, and translate
+  modules behind behavior-preserving seams while retaining the embedded
+  single-binary dashboard and existing public APIs.
+- Added an explicit pre-v2.4 database migration regression proving existing
+  translations and blocks survive the new human-correction audit columns.
+- Exercised the generated installers on native x86_64/aarch64 macOS and Linux
+  plus Windows MSVC, and completed a selected DeepSeek pause, live-reconfigure,
+  correction, guided-retry, replacement-worker, persistence, and output-
+  validation acceptance run.
+
+## v2.3.0 - 2026-07-05
+
+BookForge v2.3.0 added source-EPUB reflow and cooperative job controls.
+
+- Added `bookforge reflow`, including the opt-in `--aggressive` level, while
+  preserving the rule that source EPUBs are never silently rewritten during
+  translation.
+- Added pause, resume, and stop controls to the engine, CLI, terminal watcher,
+  and browser dashboard, with completed segments checkpointed before parking.
+- Made finalize-stage QA and double-check requests honor pause/stop controls;
+  stopped jobs remain resumable without retranslating completed segments.
+- Hardened reflow boundaries around letterless paragraphs, inline whitespace,
+  dehyphenation, and class-based merge guards.
+
 ## v2.2.0 - 2026-07-04
 
 BookForge v2.2.0 ships the v1.7 roadmap milestone: bilingual output.

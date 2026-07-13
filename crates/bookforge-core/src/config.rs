@@ -78,6 +78,15 @@ pub enum PromptVersion {
     BatchV1,
     V2,
     BatchV2,
+    /// Batch prompts (plain / marker-safe / run-preserving, and their
+    /// compact variants) gained a per-item `retry_guidance` field. The
+    /// underlying `bookforge-llm` templates moved from v2 to v3; this tag
+    /// must move in lockstep so `segments.prompt_version` (the
+    /// cross-job translation cache key — see
+    /// `bookforge_store::JobStore::find_cached_translation`) stops
+    /// matching translations produced under the old v2-era batch prompt
+    /// text.
+    BatchV3,
 }
 
 impl PromptVersion {
@@ -87,6 +96,7 @@ impl PromptVersion {
             PromptVersion::BatchV1 => "batch_v1",
             PromptVersion::V2 => "v2",
             PromptVersion::BatchV2 => "batch_v2",
+            PromptVersion::BatchV3 => "batch_v3",
         }
     }
 }

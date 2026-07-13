@@ -238,6 +238,7 @@ where
     let rendered = template
         .render(&vars)
         .map_err(|e| LlmError::Provider(e.to_string()))?;
+    let (runtime_config_revision, provider_max_attempts) = config.request_runtime_metadata();
     let response = provider
         .complete(CompletionRequest {
             system: rendered.system,
@@ -256,6 +257,8 @@ where
                 provider: Some(config.provider.clone()),
                 model: Some(config.model.clone()),
                 source_checksum: None,
+                runtime_config_revision,
+                provider_max_attempts,
             },
         })
         .await?;
@@ -487,6 +490,7 @@ mod tests {
             style: None,
             entities: None,
             pause_signal: None,
+            runtime_settings: None,
         }
     }
 

@@ -53,9 +53,20 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Lifecycle integration tests under crates/bookforge-cli/tests/ require
-      # test/test.epub, which is gitignored. They will be skipped in CI; that
-      # is intentional. The remaining workspace tests still run.
+      # Lifecycle tests create synthetic EPUB fixtures and run in clean clones.
+      - run: cargo test --workspace --locked
+
+  test-windows:
+    name: test (windows-msvc)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
       - run: cargo test --workspace --locked
 
   msrv:

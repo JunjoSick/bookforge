@@ -5,8 +5,8 @@ use std::{
 };
 
 use anyhow::Result;
-use bookforge_core::segment::{Segment, SegmentStatus};
-use bookforge_llm::{QaSegmentReview, SegmentTranslation};
+use bookforge_core::segment::Segment;
+use bookforge_llm::QaSegmentReview;
 use bookforge_store::{JobRecord, JobSummary, SegmentRecord};
 use serde::Serialize;
 
@@ -19,16 +19,51 @@ pub(crate) struct ReportFiles {
     pub markdown: PathBuf,
 }
 
+/// Decoupled view of a segment's translated text used to drive the QA
+/// heuristics in [`qa_warnings`]. Kept independent of both
+/// `bookforge_llm::SegmentTranslation` (live in-memory run results) and
+/// `bookforge_store::StoredSegmentTranslation` (reloaded from the database)
+/// so the report can be built fresh from either source — in particular, so a
+/// manual correction (which only has store-backed data available) can
+/// regenerate the report without pulling in a full in-memory run result.
+#[derive(Debug, Clone)]
+pub(crate) struct TranslationQaInput {
+    pub segment_id: String,
+    /// Whether this translation is in a terminal "counts as translated"
+    /// state (mirrors `SegmentStatus::Succeeded | SegmentStatus::SkippedCached`).
+    pub counts_for_warnings: bool,
+    pub joined_text: String,
+}
+
+impl TranslationQaInput {
+    pub(crate) fn new(
+        segment_id: impl Into<String>,
+        counts_for_warnings: bool,
+        joined_text: impl Into<String>,
+    ) -> Self {
+        Self {
+            segment_id: segment_id.into(),
+            counts_for_warnings,
+            joined_text: joined_text.into(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ReportInput<'a> {
     pub job: &'a JobRecord,
     pub summary: &'a JobSummary,
     pub segments: &'a [Segment],
     pub segment_records: &'a [SegmentRecord],
-    pub translations: &'a [SegmentTranslation],
+    pub translations: &'a [TranslationQaInput],
     pub qa_reviews: &'a [QaSegmentReview],
     pub performance: Option<RunPerformanceSummary>,
     pub output: &'a Path,
+    /// Count of segments whose stored translation carries a human
+    /// (manual-correction) origin. Additive counterpart to the other
+    /// aggregate segment counts below — kept in sync with `review.rs`'s
+    /// per-segment `human_corrected` field.
+    pub corrected_segments: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,6 +82,7 @@ struct QaReport {
     failed_segments: usize,
     needs_review_segments: usize,
     retry_pending_segments: usize,
+    corrected_segments: usize,
     input_tokens: u64,
     input_cached_tokens: u64,
     output_tokens: u64,
@@ -81,6 +117,7 @@ pub(crate) fn write_report(input: ReportInput<'_>) -> Result<ReportFiles> {
         failed_segments: input.summary.failed,
         needs_review_segments: input.summary.needs_review,
         retry_pending_segments: input.summary.retry_pending,
+        corrected_segments: input.corrected_segments,
         input_tokens: input.summary.input_tokens,
         input_cached_tokens: input.summary.input_cached_tokens,
         output_tokens: input.summary.output_tokens,
@@ -157,27 +194,24 @@ fn qa_warnings(input: &ReportInput<'_>) -> Vec<QaWarning> {
         .collect::<BTreeMap<_, _>>();
 
     for translation in input.translations {
-        if !matches!(
-            translation.status,
-            SegmentStatus::Succeeded | SegmentStatus::SkippedCached
-        ) {
+        if !translation.counts_for_warnings {
             continue;
         }
-        let Some(source) = source_by_segment.get(translation.segment_id.0.as_str()) else {
+        let Some(source) = source_by_segment.get(translation.segment_id.as_str()) else {
             continue;
         };
-        let translated = translation.joined_text();
+        let translated = translation.joined_text.clone();
         let source_len = source.chars().count().max(1);
         let translated_len = translated.chars().count();
         if source_len >= 40 {
             let ratio = translated_len as f64 / source_len as f64;
             if !(0.33..=3.0).contains(&ratio)
-                && seen.insert((translation.segment_id.0.clone(), "length_ratio"))
+                && seen.insert((translation.segment_id.clone(), "length_ratio"))
             {
                 warnings.push(QaWarning {
                     severity: "warning",
                     kind: "length_ratio",
-                    segment_id: Some(translation.segment_id.0.clone()),
+                    segment_id: Some(translation.segment_id.clone()),
                     message: format!(
                         "translated length ratio is suspicious: {ratio:.2} ({source_len} source chars, {translated_len} target chars)"
                     ),
@@ -187,57 +221,57 @@ fn qa_warnings(input: &ReportInput<'_>) -> Vec<QaWarning> {
 
         if source_len >= 40
             && source.trim() == translated.trim()
-            && seen.insert((translation.segment_id.0.clone(), "untranslated"))
+            && seen.insert((translation.segment_id.clone(), "untranslated"))
         {
             warnings.push(QaWarning {
                 severity: "warning",
                 kind: "untranslated",
-                segment_id: Some(translation.segment_id.0.clone()),
+                segment_id: Some(translation.segment_id.clone()),
                 message: "translation is identical to the source text".to_string(),
             });
         }
 
         if let Some(message) = missing_tokens_message("URL", &urls(source), &urls(&translated))
-            && seen.insert((translation.segment_id.0.clone(), "url_changed"))
+            && seen.insert((translation.segment_id.clone(), "url_changed"))
         {
             warnings.push(QaWarning {
                 severity: "warning",
                 kind: "url_changed",
-                segment_id: Some(translation.segment_id.0.clone()),
+                segment_id: Some(translation.segment_id.clone()),
                 message,
             });
         }
 
         if let Some(message) =
             missing_tokens_message("number", &numbers(source), &numbers(&translated))
-            && seen.insert((translation.segment_id.0.clone(), "number_changed"))
+            && seen.insert((translation.segment_id.clone(), "number_changed"))
         {
             warnings.push(QaWarning {
                 severity: "warning",
                 kind: "number_changed",
-                segment_id: Some(translation.segment_id.0.clone()),
+                segment_id: Some(translation.segment_id.clone()),
                 message,
             });
         }
 
         if looks_like_model_commentary(&translated)
-            && seen.insert((translation.segment_id.0.clone(), "model_commentary"))
+            && seen.insert((translation.segment_id.clone(), "model_commentary"))
         {
             warnings.push(QaWarning {
                 severity: "warning",
                 kind: "model_commentary",
-                segment_id: Some(translation.segment_id.0.clone()),
+                segment_id: Some(translation.segment_id.clone()),
                 message: "translation appears to include model commentary".to_string(),
             });
         }
 
         if has_repetition(&translated)
-            && seen.insert((translation.segment_id.0.clone(), "repetition"))
+            && seen.insert((translation.segment_id.clone(), "repetition"))
         {
             warnings.push(QaWarning {
                 severity: "warning",
                 kind: "repetition",
-                segment_id: Some(translation.segment_id.0.clone()),
+                segment_id: Some(translation.segment_id.clone()),
                 message: "translation contains suspicious repeated words".to_string(),
             });
         }
@@ -559,6 +593,10 @@ fn render_markdown(report: &QaReport) -> String {
     output.push_str(&format!(
         "- Retry pending: {}\n",
         report.retry_pending_segments
+    ));
+    output.push_str(&format!(
+        "- Manually corrected: {}\n",
+        report.corrected_segments
     ));
     output.push_str(&format!("- Input tokens: {}\n", report.input_tokens));
     output.push_str(&format!(

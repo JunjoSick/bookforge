@@ -46,7 +46,10 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                 for attr in element.attributes() {
                     let attr = attr.map_err(|err| PdfError::InvalidInput(err.to_string()))?;
                     let value = attr
-                        .decode_and_unescape_value(reader.decoder())
+                        .decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )
                         .map_err(|err| PdfError::InvalidInput(err.to_string()))?;
                     match local(attr.key.as_ref()) {
                         b"number" => number = value.parse().unwrap_or(0),
@@ -73,7 +76,10 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                 for attr in element.attributes() {
                     let attr = attr.map_err(|err| PdfError::InvalidInput(err.to_string()))?;
                     let value = attr
-                        .decode_and_unescape_value(reader.decoder())
+                        .decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )
                         .map_err(|err| PdfError::InvalidInput(err.to_string()))?;
                     match local(attr.key.as_ref()) {
                         b"id" => id = value.parse::<u32>().ok(),
@@ -97,7 +103,10 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                 for attr in element.attributes() {
                     let attr = attr.map_err(|err| PdfError::InvalidInput(err.to_string()))?;
                     let value = attr
-                        .decode_and_unescape_value(reader.decoder())
+                        .decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )
                         .map_err(|err| PdfError::InvalidInput(err.to_string()))?;
                     match local(attr.key.as_ref()) {
                         b"top" => fragment.top = parse_coord(&value),
@@ -128,7 +137,10 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                 for attr in element.attributes() {
                     let attr = attr.map_err(|err| PdfError::InvalidInput(err.to_string()))?;
                     let value = attr
-                        .decode_and_unescape_value(reader.decoder())
+                        .decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )
                         .map_err(|err| PdfError::InvalidInput(err.to_string()))?;
                     match local(attr.key.as_ref()) {
                         b"top" => region.top = parse_coord(&value),
