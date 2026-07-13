@@ -143,9 +143,9 @@ cargo fmt --all
 git diff --check
 ```
 
-The corpus, macOS, release-build, installer, and real-provider scenarios have
-not yet been run for this branch. The continuation log below records the full
-workspace suite, exact CI clippy command, MSRV check, and GitHub publication.
+At this historical checkpoint, the corpus, macOS, release-build, installer,
+and real-provider scenarios had not yet been run for this branch. The
+continuation log below records the later evidence.
 
 ## Claude continuation log (2026-07-10/11)
 
@@ -627,6 +627,14 @@ Automated gate status on 2026-07-13:
   x86_64/aarch64 macOS, x86_64/aarch64 Linux, Windows MSVC, and global
   archive/checksum/shell/PowerShell-installer generation for v2.4.0; host and
   announce correctly skipped on the PR.
+- DONE (installer execution) — the generated PowerShell installer fetched the
+  packaged Windows MSVC archive through its documented download override,
+  installed into an isolated local directory, and the installed executable
+  reported `bookforge 2.4.0`. Temporary native run
+  <https://github.com/JunjoSick/bookforge/actions/runs/29285316303> independently
+  passed the generated shell installer and version assertion on x86_64 and
+  aarch64 macOS plus x86_64 and aarch64 Linux. The dispatch-only workflow was
+  removed after capturing the evidence.
 - DONE — the owner's mock dashboard correction click-path and subsequent
   store/event/report/log inspection are recorded above. Automated dashboard
   CSRF/API, lease-aware controls, correction/retry, live reconfiguration, and
@@ -639,14 +647,10 @@ Automated gate status on 2026-07-13:
 
 Still required before tagging:
 
-- execute the generated shell/PowerShell installers on native macOS, Linux,
-  and Windows and verify `bookforge --version` after installation (artifact
-  generation is proven; installer execution is not yet proven);
 - run the selected real-provider correction, guided-retry, pause, and live
   reconfiguration scenario and inspect its persisted events/store/output;
-- after those two manual/credentialed gates, push the restored plan-only dist
-  config plus final evidence, then require the final-head CI, RustSec, and
-  CodeQL checks to be green.
+- after that credentialed gate, push its final evidence, then require the
+  final-head CI, RustSec, and CodeQL checks to be green.
 
 ## Constraints to preserve
 
