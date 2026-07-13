@@ -11,6 +11,8 @@ BookForge v2.4.1 is a security-gate maintenance release.
   failures.
 - Added GitHub/Sigstore provenance attestations for release assets so users
   can verify that downloads were produced by BookForge's release workflow.
+- Hardened the lifecycle release gate against child-process scheduling delays
+  on loaded Linux CI runners.
 
 ## v2.4.0 - 2026-07-13
 

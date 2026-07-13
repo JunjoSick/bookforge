@@ -3201,11 +3201,11 @@ fn job_id_from_events(path: &Path) -> String {
 fn wait_for_job_id_in_store(temp: &TempDir) -> String {
     let db = temp.path().join(".bookforge/jobs.sqlite");
     // The lifecycle suite runs many child CLI processes in parallel. A loaded
-    // shared CI runner can take more than ten seconds to schedule a newly
-    // spawned worker even though the store appears immediately once it runs.
-    // Keep the success path unchanged while giving process startup enough
-    // headroom to avoid a scheduler-induced release-gate flake.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // shared CI runner has taken slightly more than thirty seconds to schedule
+    // a newly spawned worker even though the store appears immediately once it
+    // runs. Keep the success path unchanged while giving process startup enough
+    // headroom, and avoid adding pressure with a tight disk/SQLite polling loop.
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if db.exists()
             && let Ok(store) = JobStore::open(&db)
@@ -3219,7 +3219,7 @@ fn wait_for_job_id_in_store(temp: &TempDir) -> String {
             "timed out waiting for a job id in {}",
             db.display()
         );
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
