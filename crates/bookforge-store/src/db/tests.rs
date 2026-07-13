@@ -1462,6 +1462,111 @@ fn migrate_is_idempotent_v1_2() {
 }
 
 #[test]
+fn migrate_pre_v2_4_database_adds_correction_audit_fields_without_data_loss() {
+    let db_path = temp_path("pre_v2_4_human_corrections.sqlite");
+    {
+        let conn = Connection::open(&db_path).expect("legacy db opens");
+        for migration in [
+            include_str!("../../migrations/0001_initial.sql"),
+            include_str!("../../migrations/0002_v1_0_1_input_snapshot.sql"),
+            include_str!("../../migrations/0003_v1_1_token_usage_and_flags.sql"),
+            include_str!("../../migrations/0004_v1_2_glossary_terms.sql"),
+            include_str!("../../migrations/0005_v1_2_1_nullable_glossary_candidate_targets.sql"),
+            include_str!("../../migrations/0006_v1_3_context_styles_entities.sql"),
+        ] {
+            conn.execute_batch(migration)
+                .expect("pre-v2.4 migration should apply");
+        }
+        conn.execute_batch(
+            "
+            INSERT INTO _migrations (version, name, applied_at) VALUES
+              (1, 'initial', 'legacy'),
+              (2, 'v1_0_1_input_snapshot', 'legacy'),
+              (3, 'v1_1_segment_flags', 'legacy'),
+              (4, 'v1_2_glossary_terms', 'legacy'),
+              (5, 'v1_2_1_nullable_glossary_candidate_targets', 'legacy'),
+              (6, 'v1_3_context_styles_entities', 'legacy');
+            INSERT INTO jobs
+              (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+            VALUES
+              ('legacy_job', 'legacy_hash', 'Italian', 'mock', 'mock-prefix',
+               'succeeded', 'created', 'updated');
+            INSERT INTO segments
+              (id, job_id, section_id, ordinal, source_hash, prompt_version,
+               provider, model, status)
+            VALUES
+              ('legacy_segment', 'legacy_job', 'section_0', 0, 'source_hash', 'v2',
+               'mock', 'mock-prefix', 'succeeded');
+            INSERT INTO translations
+              (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
+            VALUES
+              ('legacy_segment', 'legacy_job', 'Traduzione esistente',
+               'mock', 'mock-prefix', 'v2', 'created');
+            INSERT INTO translation_blocks
+              (segment_id, job_id, block_id, translated_text)
+            VALUES
+              ('legacy_segment', 'legacy_job', 'b_000000', 'Traduzione esistente');
+            ",
+        )
+        .expect("legacy data should initialize");
+    }
+
+    let store = JobStore::open(&db_path).expect("pre-v2.4 store opens and migrates");
+    {
+        let conn = store.conn.borrow();
+        let row = conn
+            .query_row(
+                "SELECT translated_text, origin, human_corrected, corrected_at
+                 FROM translations
+                 WHERE job_id = 'legacy_job' AND segment_id = 'legacy_segment'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .expect("legacy translation should survive migration");
+        assert_eq!(row.0, "Traduzione esistente");
+        assert_eq!(row.1, "model");
+        assert!(!row.2);
+        assert_eq!(row.3, None);
+
+        let block_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM translation_blocks
+                 WHERE job_id = 'legacy_job' AND segment_id = 'legacy_segment'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy blocks should survive migration");
+        assert_eq!(block_count, 1);
+
+        let version: i64 = conn
+            .query_row(
+                "SELECT version FROM _migrations WHERE name = 'v2_4_human_corrections'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v2.4 migration should be recorded");
+        assert_eq!(version, 7);
+    }
+    drop(store);
+
+    let reopened = JobStore::open(&db_path).expect("v2.4 migration should be idempotent");
+    assert!(
+        !reopened
+            .translation_is_human_corrected("legacy_job", "legacy_segment")
+            .expect("legacy correction state should load")
+    );
+    drop(reopened);
+    let _ = fs::remove_file(&db_path);
+}
+
+#[test]
 fn migrate_rebuilds_glossary_terms_with_nullable_target_text() {
     let db_path = temp_path("glossary_nullable_target.sqlite");
     {
