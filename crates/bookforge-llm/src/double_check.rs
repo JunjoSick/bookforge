@@ -472,6 +472,7 @@ where
         .map_err(|e| LlmError::Provider(e.to_string()))?;
 
     wait_for_double_check_pause(config, "double-check audit").await?;
+    let (runtime_config_revision, provider_max_attempts) = config.request_runtime_metadata();
 
     let response = provider
         .complete(CompletionRequest {
@@ -485,6 +486,8 @@ where
                 prompt_version: Some(library.double_check_batch.version.clone()),
                 provider: Some(config.provider.clone()),
                 model: Some(config.model.clone()),
+                runtime_config_revision,
+                provider_max_attempts,
                 ..RequestMetadata::default()
             },
         })
@@ -606,6 +609,7 @@ where
         .map_err(|e| LlmError::Provider(e.to_string()))?;
 
     wait_for_double_check_pause(config, "double-check correction").await?;
+    let (runtime_config_revision, provider_max_attempts) = config.request_runtime_metadata();
 
     let response = provider
         .complete(CompletionRequest {
@@ -619,6 +623,8 @@ where
                 prompt_version: Some(library.correct_batch.version.clone()),
                 provider: Some(config.provider.clone()),
                 model: Some(config.model.clone()),
+                runtime_config_revision,
+                provider_max_attempts,
                 ..RequestMetadata::default()
             },
         })
@@ -904,6 +910,7 @@ mod tests {
             style: None,
             entities: None,
             pause_signal: None,
+            runtime_settings: None,
         }
     }
 

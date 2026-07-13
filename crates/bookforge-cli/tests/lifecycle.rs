@@ -1757,18 +1757,346 @@ fn cli_pause_and_resume_live_mock_run() {
 }
 
 #[test]
+fn cli_live_reconfigure_updates_later_single_requests_and_cleans_runtime_files() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("single-live-reconfigure-events.jsonl");
+    let output = temp.path().join("single-live-reconfigure.epub");
+    let mut child = spawn_controlled_single_mock_translate(&temp, &events, &output);
+    let job_id = wait_for_job_id_in_store(&temp);
+    wait_for_events(&events, |events| {
+        !request_started_payloads(events).is_empty()
+    });
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "reconfigure",
+            &job_id,
+            "--concurrency",
+            "2",
+            "--provider-max-attempts",
+            "3",
+            "--batch-max-output-tokens",
+            "1024",
+        ])
+        .assert()
+        .success();
+
+    let status = child.wait().expect("translate child should exit");
+    assert!(status.success(), "translate child failed: {status}");
+    let final_events = wait_for_event_count(&events, "TranslationFinished", 1);
+    let requests = request_started_payloads(&final_events);
+    assert!(requests.len() > 1, "fixture should make several requests");
+    assert_eq!(
+        requests[0]
+            .get("runtime_config_revision")
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "the in-flight request must retain the baseline revision"
+    );
+    assert!(requests.iter().skip(1).any(|request| {
+        request
+            .get("runtime_config_revision")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1)
+            && request
+                .get("provider_max_attempts")
+                .and_then(serde_json::Value::as_u64)
+                == Some(3)
+    }));
+    assert_no_duplicate_segments(&segment_finished_ids(&final_events));
+    assert!(output.exists());
+    assert!(
+        !overrides_path(&temp, &job_id).exists(),
+        "successful completion should consume the sidecar"
+    );
+    assert!(
+        !runtime_path(&temp, &job_id).exists(),
+        "clean worker exit should remove its lease"
+    );
+}
+
+#[test]
+fn cli_live_reconfigure_repartitions_pending_batch_work() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("batch-live-reconfigure-events.jsonl");
+    let output = temp.path().join("batch-live-reconfigure.epub");
+    let mut child = spawn_controlled_mock_translate(&temp, &events, &output);
+    let job_id = wait_for_job_id_in_store(&temp);
+    wait_for_events(&events, |events| {
+        !request_started_payloads(events).is_empty()
+    });
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "reconfigure",
+            &job_id,
+            "--batch-max-items",
+            "4",
+            "--batch-target-tokens",
+            "100000",
+            "--concurrency",
+            "2",
+            "--provider-max-attempts",
+            "4",
+            "--batch-max-output-tokens",
+            "1024",
+            "--adaptive-concurrency",
+            "false",
+            "--adaptive-batch-sizing",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    let status = child.wait().expect("translate child should exit");
+    assert!(status.success(), "translate child failed: {status}");
+    let final_events = wait_for_event_count(&events, "TranslationFinished", 1);
+    let requests = request_started_payloads(&final_events);
+    assert!(requests.len() > 1);
+    assert_eq!(
+        requests[0]
+            .get("runtime_config_revision")
+            .and_then(serde_json::Value::as_u64),
+        Some(0)
+    );
+    assert!(requests.iter().skip(1).any(|request| {
+        request
+            .get("runtime_config_revision")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1)
+            && request
+                .get("provider_max_attempts")
+                .and_then(serde_json::Value::as_u64)
+                == Some(4)
+            && request
+                .get("items")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|items| items > 1)
+    }));
+    assert_no_duplicate_segments(&segment_finished_ids(&final_events));
+    assert!(!overrides_path(&temp, &job_id).exists());
+    assert!(!runtime_path(&temp, &job_id).exists());
+}
+
+#[test]
+fn cli_stop_preserves_runtime_overrides_and_resume_consumes_them() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("stop-runtime-reconfigure-events.jsonl");
+    let output = temp.path().join("stop-runtime-reconfigure.epub");
+    let mut child = spawn_controlled_mock_translate(&temp, &events, &output);
+    let job_id = wait_for_job_id_in_store(&temp);
+    wait_for_events(&events, |events| {
+        !request_started_payloads(events).is_empty()
+    });
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "reconfigure",
+            &job_id,
+            "--concurrency",
+            "2",
+            "--provider-max-attempts",
+            "4",
+            "--batch-max-items",
+            "3",
+        ])
+        .assert()
+        .success();
+    wait_for_event_count(&events, "RuntimeConfigChanged", 1);
+    write_control_file(&control_path(&temp, &job_id), ControlCommand::Stop)
+        .expect("stop control should write");
+
+    let status = child.wait().expect("translate child should exit");
+    assert!(status.success(), "translate child failed: {status}");
+    wait_for_job_status(&temp, &job_id, "stopped");
+    let stopped_events = read_jsonl(&events);
+    assert_eq!(event_count(&stopped_events, "TranslationFinished"), 0);
+    let initially_finished = segment_finished_ids(&stopped_events);
+    assert!(
+        overrides_path(&temp, &job_id).exists(),
+        "Stop must preserve durable runtime overrides for resume"
+    );
+    assert!(
+        !runtime_path(&temp, &job_id).exists(),
+        "the stopped worker exited cleanly and should release its lease"
+    );
+
+    let resume_events = temp.path().join("stop-runtime-resume-events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "resume",
+            &job_id,
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            resume_events.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let resumed = wait_for_event_count(&resume_events, "TranslationFinished", 1);
+    assert!(request_started_payloads(&resumed).iter().any(|request| {
+        request
+            .get("runtime_config_revision")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1)
+            && request
+                .get("provider_max_attempts")
+                .and_then(serde_json::Value::as_u64)
+                == Some(4)
+    }));
+    let resumed_finished = segment_finished_ids(&resumed);
+    for id in initially_finished {
+        assert!(
+            !resumed_finished.contains(&id),
+            "resume retranslated already checkpointed segment {id}"
+        );
+    }
+    assert!(
+        !overrides_path(&temp, &job_id).exists(),
+        "successful resume should consume the sidecar"
+    );
+    assert!(!runtime_path(&temp, &job_id).exists());
+}
+
+#[test]
+fn killed_worker_leaves_a_stale_recoverable_runtime_lease() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("crash-runtime-lease-events.jsonl");
+    let output = temp.path().join("crash-runtime-lease.epub");
+    let mut child = spawn_controlled_mock_translate(&temp, &events, &output);
+    let job_id = wait_for_job_id_in_store(&temp);
+    let lease_path = runtime_path(&temp, &job_id);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !lease_path.exists() {
+        assert!(Instant::now() < deadline, "runtime lease should appear");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    child.kill().expect("worker should be killable");
+    let _ = child.wait().expect("killed worker should reap");
+    assert!(
+        lease_path.exists(),
+        "a process crash cannot clean its lease; the stale file enables recovery"
+    );
+    thread::sleep(Duration::from_millis(3_150));
+    let lease: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&lease_path).expect("stale lease should remain readable"),
+    )
+    .expect("runtime lease should remain valid JSON");
+    let heartbeat = lease["heartbeat_at_ms"]
+        .as_u64()
+        .expect("lease heartbeat should be numeric");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after epoch")
+        .as_millis() as u64;
+    assert!(
+        now.saturating_sub(heartbeat) > 3_000,
+        "killed worker lease should age beyond the dashboard stale threshold"
+    );
+}
+
+#[test]
+fn cli_finalize_stages_snapshot_runtime_settings_at_stage_boundaries() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("stage-live-reconfigure-events.jsonl");
+    let output = temp.path().join("stage-live-reconfigure.epub");
+    let mut child = spawn_finalize_stage_delay_mock_translate(
+        &temp,
+        &events,
+        &output,
+        &[
+            ("BOOKFORGE_MOCK_QA_DELAY_MS", "1500"),
+            ("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS", "200"),
+        ],
+    );
+    let job_id = wait_for_job_id_in_store(&temp);
+    wait_for_request_started_prefix(&events, "qa_");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "reconfigure",
+            &job_id,
+            "--qa",
+            "off",
+            "--double-check",
+            "off",
+            "--validate-output",
+            "true",
+            "--provider-max-attempts",
+            "4",
+        ])
+        .assert()
+        .success();
+
+    let status = child.wait().expect("translate child should exit");
+    assert!(status.success(), "translate child failed: {status}");
+    let final_events = wait_for_event_count(&events, "TranslationFinished", 1);
+    let qa_started = final_events
+        .iter()
+        .position(|event| {
+            request_started_id(event)
+                .as_deref()
+                .is_some_and(|id| id.starts_with("qa_"))
+        })
+        .expect("QA request should start under the baseline stage snapshot");
+    let changed = final_events
+        .iter()
+        .position(|event| event.get("RuntimeConfigChanged").is_some())
+        .expect("runtime change should be recorded");
+    let qa_finished = final_events
+        .iter()
+        .position(|event| {
+            event
+                .get("RequestFinished")
+                .and_then(|payload| payload.get("request_id"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.starts_with("qa_"))
+        })
+        .expect("in-flight QA request should finish");
+    assert!(
+        qa_started < changed && changed < qa_finished,
+        "the runtime edit should land while the frozen QA stage is in flight"
+    );
+    assert!(
+        request_started_ids(&final_events)
+            .iter()
+            .all(|id| !id.starts_with("double_check_") && !id.starts_with("repair_")),
+        "double-check disabled at its later stage boundary must not dispatch"
+    );
+    assert!(
+        temp.path()
+            .join("stage-live-reconfigure.validation.json")
+            .exists(),
+        "validation enabled at its stage boundary should write a report"
+    );
+    assert!(!overrides_path(&temp, &job_id).exists());
+    assert!(!runtime_path(&temp, &job_id).exists());
+}
+
+#[test]
 fn cli_stop_then_resume_mock_run() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let events = temp.path().join("events.jsonl");
     let output = temp.path().join("out.epub");
     let mut child = spawn_controlled_mock_translate(&temp, &events, &output);
     let job_id = wait_for_job_id_in_store(&temp);
-    thread::sleep(Duration::from_millis(50));
     let control_path = temp
         .path()
         .join(".bookforge/runs")
         .join(&job_id)
         .join("control");
+    // Stop only after the first provider request is observably in flight. The
+    // former fixed 50 ms sleep could fire before dispatch on a fast machine,
+    // leaving no completed request to checkpoint. Stop still lets that
+    // in-flight mock request finish while preventing the next dispatch.
+    wait_for_events(&events, |events| batch_request_started_count(events) == 1);
     write_control_file(&control_path, ControlCommand::Stop).expect("stop control should write");
 
     let status = child.wait().expect("translate child should exit");
@@ -2692,6 +3020,43 @@ fn spawn_controlled_mock_translate(temp: &TempDir, events: &Path, output: &Path)
     cmd.spawn().expect("controlled translate should spawn")
 }
 
+fn spawn_controlled_single_mock_translate(
+    temp: &TempDir,
+    events: &Path,
+    output: &Path,
+) -> process::Child {
+    let input = fixture_input();
+    let mut cmd = process::Command::new(assert_cmd::cargo::cargo_bin("bookforge"));
+    cmd.current_dir(temp.path())
+        .env("BOOKFORGE_MOCK_DELAY_MS", "400")
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--profile",
+            "safe",
+            "--max-segment-tokens",
+            "1",
+            "--context-window",
+            "0",
+            "--concurrency",
+            "1",
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ]);
+    cmd.spawn()
+        .expect("controlled single-segment translate should spawn")
+}
+
 fn spawn_finalize_controlled_mock_translate(
     temp: &TempDir,
     events: &Path,
@@ -2860,6 +3225,20 @@ fn control_path(temp: &TempDir, job_id: &str) -> PathBuf {
         .join("control")
 }
 
+fn overrides_path(temp: &TempDir, job_id: &str) -> PathBuf {
+    temp.path()
+        .join(".bookforge/runs")
+        .join(job_id)
+        .join("overrides.json")
+}
+
+fn runtime_path(temp: &TempDir, job_id: &str) -> PathBuf {
+    temp.path()
+        .join(".bookforge/runs")
+        .join(job_id)
+        .join("runtime.json")
+}
+
 fn wait_for_event_count(path: &Path, key: &str, min_count: usize) -> Vec<serde_json::Value> {
     wait_for_events(path, |events| event_count(events, key) >= min_count)
 }
@@ -3015,6 +3394,13 @@ fn finalize_request_started_ids(events: &[serde_json::Value]) -> Vec<String> {
 
 fn request_started_ids(events: &[serde_json::Value]) -> Vec<String> {
     events.iter().filter_map(request_started_id).collect()
+}
+
+fn request_started_payloads(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|event| event.get("RequestStarted"))
+        .collect()
 }
 
 fn finalize_request_started_between_pause_and_resume(events: &[serde_json::Value]) -> Vec<String> {

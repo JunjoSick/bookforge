@@ -240,6 +240,8 @@ mod tests {
             bilingual_css: None,
             fallback: None,
             finalize: bookforge_core::FinalizeCheckpointSnapshot::default(),
+            qa_mode: "off".to_string(),
+            validate_output: false,
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         }
     }

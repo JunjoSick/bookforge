@@ -78,7 +78,18 @@ pub struct RunConfigSnapshot {
     pub fallback: Option<FallbackRunConfigSnapshot>,
     #[serde(default)]
     pub finalize: FinalizeCheckpointSnapshot,
+    /// CLI QA scope captured outside `ResolvedRunSettings` (off, suspicious,
+    /// or all). Kept as a string so the core snapshot does not depend on the
+    /// CLI's clap enum.
+    #[serde(default = "default_qa_mode")]
+    pub qa_mode: String,
+    #[serde(default)]
+    pub validate_output: bool,
     pub settings: ResolvedRunSettingsSnapshot,
+}
+
+fn default_qa_mode() -> String {
+    "off".to_string()
 }
 
 fn default_context_budget_tokens() -> usize {

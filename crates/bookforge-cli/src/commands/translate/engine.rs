@@ -8,8 +8,8 @@ use bookforge_store::JobStore;
 use crate::checkpoint::CheckpointWriter;
 
 use super::{
-    CheckpointContext, checkpointing::finalize_writer, translate_and_checkpoint,
-    translate_and_checkpoint_batch,
+    CheckpointContext, ProgressRequestProvider, checkpointing::finalize_writer,
+    translate_and_checkpoint, translate_and_checkpoint_batch,
 };
 
 pub(crate) struct CheckpointRunContext<'a> {
@@ -46,6 +46,7 @@ pub(crate) fn batch_run_config(
         style: run_config.style.clone(),
         entities: run_config.entities.clone(),
         pause_signal: run_config.pause_signal.clone(),
+        runtime_settings: run_config.runtime_settings.clone(),
     }
 }
 
@@ -97,7 +98,7 @@ where
         .await
     } else {
         translate_and_checkpoint(
-            provider,
+            ProgressRequestProvider::new(provider, progress),
             pending_segments,
             &controlled_config,
             checkpoint_context,

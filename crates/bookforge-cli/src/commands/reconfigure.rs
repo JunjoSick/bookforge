@@ -1,13 +1,17 @@
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result};
 use bookforge_core::{
     GlossaryFormat, ProviderPreset, ResolvedRunSettings,
     config::{ContextScope, DoubleCheckMode, TranslationProfile},
-    run_dir_for_job,
+    now_ms, run_dir_for_job,
 };
 use bookforge_store::JobStore;
 use clap::Args;
@@ -103,8 +107,13 @@ pub struct ReconfigureArgs {
     provider_preset: Option<ProviderPreset>,
 }
 
+const OVERRIDES_SCHEMA_VERSION: u32 = 1;
+const OVERRIDES_LOCK_WAIT: Duration = Duration::from_secs(5);
+const OVERRIDES_STALE_LOCK_AGE: Duration = Duration::from_secs(30);
+static OVERRIDES_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct RunConfigOverrides {
     pub batch_max_output_tokens: Option<u32>,
     pub batch_max_items: Option<usize>,
@@ -155,7 +164,7 @@ impl RunConfigOverrides {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.batch_max_output_tokens.is_none()
             && self.batch_max_items.is_none()
             && self.batch_target_tokens.is_none()
@@ -167,6 +176,114 @@ impl RunConfigOverrides {
             && self.adaptive_concurrency.is_none()
             && self.adaptive_batch_sizing.is_none()
     }
+
+    fn validate(&self) -> Result<()> {
+        let mut zero_fields = Vec::new();
+        if self.batch_max_output_tokens == Some(0) {
+            zero_fields.push("batch-max-output-tokens");
+        }
+        if self.batch_max_items == Some(0) {
+            zero_fields.push("batch-max-items");
+        }
+        if self.batch_target_tokens == Some(0) {
+            zero_fields.push("batch-target-tokens");
+        }
+        if self.concurrency == Some(0) {
+            zero_fields.push("concurrency");
+        }
+        if self.provider_max_attempts == Some(0) {
+            zero_fields.push("provider-max-attempts");
+        }
+        if zero_fields.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "runtime settings must be greater than zero: {}",
+            zero_fields.join(", ")
+        )
+    }
+
+    pub(crate) fn changed_fields(&self) -> Vec<String> {
+        let mut fields = Vec::new();
+        if self.batch_max_output_tokens.is_some() {
+            fields.push("batch-max-output-tokens".to_string());
+        }
+        if self.batch_max_items.is_some() {
+            fields.push("batch-max-items".to_string());
+        }
+        if self.batch_target_tokens.is_some() {
+            fields.push("batch-target-tokens".to_string());
+        }
+        if self.concurrency.is_some() {
+            fields.push("concurrency".to_string());
+        }
+        if self.qa.is_some() {
+            fields.push("qa".to_string());
+        }
+        if self.double_check.is_some() {
+            fields.push("double-check".to_string());
+        }
+        if self.validate_output.is_some() {
+            fields.push("validate-output".to_string());
+        }
+        if self.provider_max_attempts.is_some() {
+            fields.push("provider-max-attempts".to_string());
+        }
+        if self.adaptive_concurrency.is_some() {
+            fields.push("adaptive-concurrency".to_string());
+        }
+        if self.adaptive_batch_sizing.is_some() {
+            fields.push("adaptive-batch-sizing".to_string());
+        }
+        fields
+    }
+
+    pub(crate) fn application_boundaries(&self) -> Vec<String> {
+        let mut boundaries = Vec::new();
+        if self.concurrency.is_some()
+            || self.provider_max_attempts.is_some()
+            || self.adaptive_concurrency.is_some()
+            || self.batch_max_output_tokens.is_some()
+        {
+            boundaries.push("next_request".to_string());
+        }
+        if self.batch_max_items.is_some()
+            || self.batch_target_tokens.is_some()
+            || self.adaptive_batch_sizing.is_some()
+        {
+            boundaries.push("next_batch".to_string());
+        }
+        if self.qa.is_some() || self.double_check.is_some() || self.validate_output.is_some() {
+            boundaries.push("next_stage".to_string());
+        }
+        boundaries
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct OverridesEnvelope {
+    schema_version: u32,
+    revision: u64,
+    updated_at_ms: u64,
+    overrides: RunConfigOverrides,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoadedOverrides {
+    pub revision: u64,
+    pub updated_at_ms: u64,
+    pub overrides: RunConfigOverrides,
+}
+
+impl LoadedOverrides {
+    fn legacy(overrides: RunConfigOverrides) -> Self {
+        Self {
+            revision: 0,
+            updated_at_ms: 0,
+            overrides,
+        }
+    }
 }
 
 pub async fn run(args: ReconfigureArgs) -> Result<()> {
@@ -177,17 +294,17 @@ pub async fn run(args: ReconfigureArgs) -> Result<()> {
             "no mutable settings provided; reconfigure accepts cache-safe scheduling, budget, QA, double-check, validation, provider-attempt, and adaptive flags"
         );
     }
+    incoming.validate()?;
 
     let store = JobStore::open_default()?;
     let Some(job) = store.get_job(&args.job_id)? else {
         anyhow::bail!("job '{}' was not found", args.job_id);
     };
-    if job.status != "paused" {
+    if !matches!(job.status.as_str(), "running" | "paused" | "stopped") {
         anyhow::bail!(
-            "job '{}' is '{}'; reconfigure only applies to paused jobs. Run `bookforge pause {}` first, or start a fresh run for immutable settings.",
+            "job '{}' is '{}'; reconfigure applies only to running, paused, or stopped jobs with remaining work",
             args.job_id,
-            job.status,
-            args.job_id
+            job.status
         );
     }
     if store.load_job_config_snapshot(&args.job_id)?.is_none() {
@@ -197,12 +314,11 @@ pub async fn run(args: ReconfigureArgs) -> Result<()> {
         );
     }
 
-    let existing = load_overrides_for_job(&args.job_id)?;
-    let merged = incoming.merge(existing.unwrap_or_default());
-    let path = write_overrides_for_job(&args.job_id, &merged)?;
+    let (path, loaded) = write_merged_overrides_for_job(&args.job_id, incoming)?;
     println!("Reconfigured: {}", args.job_id);
     println!("Overrides: {}", path.display());
-    for line in describe_overrides(&merged) {
+    println!("Revision: {}", loaded.revision);
+    for line in describe_overrides(&loaded.overrides) {
         println!("  {line}");
     }
     println!("Apply: {}", apply_instructions(&args.job_id));
@@ -240,6 +356,10 @@ pub(crate) fn apply_overrides_to_settings(
 }
 
 pub(crate) fn load_overrides_for_job(job_id: &str) -> Result<Option<RunConfigOverrides>> {
+    Ok(load_overrides_document_for_job(job_id)?.map(|loaded| loaded.overrides))
+}
+
+pub(crate) fn load_overrides_document_for_job(job_id: &str) -> Result<Option<LoadedOverrides>> {
     load_overrides_from_path(&overrides_path_for_job(job_id))
 }
 
@@ -258,7 +378,7 @@ pub(crate) fn overrides_path_for_job(job_id: &str) -> PathBuf {
 
 pub(crate) fn apply_instructions(job_id: &str) -> String {
     format!(
-        "Stop the paused run first: `bookforge stop {job_id}`, then `bookforge resume {job_id}` to apply overrides. If the paused process is already gone, use `bookforge resume {job_id} --force`."
+        "A live worker applies this revision at the next safe boundary. If no worker is alive, run `bookforge resume {job_id}` (or `bookforge resume {job_id} --force` for a stale paused status)."
     )
 }
 
@@ -311,26 +431,178 @@ fn push_opt<T: ToString>(lines: &mut Vec<String>, name: &str, value: Option<T>) 
     }
 }
 
-fn load_overrides_from_path(path: &Path) -> Result<Option<RunConfigOverrides>> {
+fn load_overrides_from_path(path: &Path) -> Result<Option<LoadedOverrides>> {
     match fs::read_to_string(path) {
-        Ok(contents) => serde_json::from_str(&contents)
-            .map(Some)
-            .with_context(|| format!("failed to parse {}", path.display())),
+        Ok(contents) => {
+            let value: serde_json::Value = serde_json::from_str(&contents)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+            let loaded =
+                if value.get("schema_version").is_some() || value.get("overrides").is_some() {
+                    let envelope: OverridesEnvelope = serde_json::from_value(value)
+                        .with_context(|| format!("failed to parse {}", path.display()))?;
+                    if envelope.schema_version != OVERRIDES_SCHEMA_VERSION {
+                        anyhow::bail!(
+                            "unsupported runtime override schema {} in {}; expected {}",
+                            envelope.schema_version,
+                            path.display(),
+                            OVERRIDES_SCHEMA_VERSION
+                        );
+                    }
+                    LoadedOverrides {
+                        revision: envelope.revision,
+                        updated_at_ms: envelope.updated_at_ms,
+                        overrides: envelope.overrides,
+                    }
+                } else {
+                    LoadedOverrides::legacy(
+                        serde_json::from_value(value)
+                            .with_context(|| format!("failed to parse {}", path.display()))?,
+                    )
+                };
+            loaded.overrides.validate()?;
+            Ok(Some(loaded))
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
     }
 }
 
-fn write_overrides_for_job(job_id: &str, overrides: &RunConfigOverrides) -> Result<PathBuf> {
+pub(crate) fn write_merged_overrides_for_job(
+    job_id: &str,
+    incoming: RunConfigOverrides,
+) -> Result<(PathBuf, LoadedOverrides)> {
     let path = overrides_path_for_job(job_id);
+    let loaded = write_merged_overrides_at_path(&path, incoming)?;
+    Ok((path, loaded))
+}
+
+fn write_merged_overrides_at_path(
+    path: &Path,
+    incoming: RunConfigOverrides,
+) -> Result<LoadedOverrides> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let json = serde_json::to_string_pretty(overrides)?;
-    fs::write(&path, format!("{json}\n"))
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(path)
+    let _lock = OverridesFileLock::acquire(path)?;
+    // A reader must retain its last valid in-memory snapshot when the durable
+    // document is corrupt. A writer, however, is the recovery mechanism: once
+    // it owns the cross-process lock it may replace an unreadable document with
+    // a fresh revision-1 envelope instead of making every future edit fail.
+    let existing = load_overrides_from_path(path)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| LoadedOverrides {
+            revision: 0,
+            updated_at_ms: 0,
+            overrides: RunConfigOverrides::default(),
+        });
+    let overrides = incoming.merge(existing.overrides);
+    overrides.validate()?;
+    let loaded = LoadedOverrides {
+        revision: existing.revision.saturating_add(1),
+        updated_at_ms: now_ms(),
+        overrides,
+    };
+    write_overrides_atomically(path, &loaded)?;
+    Ok(loaded)
+}
+
+fn write_overrides_atomically(path: &Path, loaded: &LoadedOverrides) -> Result<()> {
+    let envelope = OverridesEnvelope {
+        schema_version: OVERRIDES_SCHEMA_VERSION,
+        revision: loaded.revision,
+        updated_at_ms: loaded.updated_at_ms,
+        overrides: loaded.overrides.clone(),
+    };
+    let json = serde_json::to_string_pretty(&envelope)?;
+    let suffix = OVERRIDES_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("overrides.json");
+    let staged = path.with_file_name(format!(
+        ".{file_name}.staged-{}-{suffix}",
+        std::process::id()
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staged)
+            .with_context(|| format!("failed to create {}", staged.display()))?;
+        file.write_all(format!("{json}\n").as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&staged, path).with_context(|| {
+            format!(
+                "failed to atomically replace {} with {}",
+                path.display(),
+                staged.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    write_result
+}
+
+struct OverridesFileLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl OverridesFileLock {
+    fn acquire(overrides_path: &Path) -> Result<Self> {
+        let path = overrides_path.with_extension("lock");
+        let deadline = Instant::now() + OVERRIDES_LOCK_WAIT;
+        loop {
+            match OpenOptions::new().create_new(true).write(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(
+                        file,
+                        "pid={} acquired_at_ms={}",
+                        std::process::id(),
+                        now_ms()
+                    )?;
+                    file.sync_all()?;
+                    return Ok(Self { path, _file: file });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "timed out waiting for runtime override lock {}",
+                            path.display()
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to acquire {}", path.display()));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for OverridesFileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age >= OVERRIDES_STALE_LOCK_AGE)
 }
 
 fn reject_immutable_changes(args: &ReconfigureArgs) -> Result<()> {
@@ -479,5 +751,104 @@ mod tests {
         assert!(settings.adaptive_concurrency);
         assert!(!settings.batch.adaptive_sizing);
         assert_eq!(settings.double_check.mode, DoubleCheckMode::Semantic);
+    }
+
+    #[test]
+    fn legacy_flat_sidecar_loads_as_revision_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overrides.json");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&RunConfigOverrides {
+                concurrency: Some(3),
+                ..RunConfigOverrides::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_overrides_from_path(&path)
+            .unwrap()
+            .expect("legacy sidecar should load");
+
+        assert_eq!(loaded.revision, 0);
+        assert_eq!(loaded.updated_at_ms, 0);
+        assert_eq!(loaded.overrides.concurrency, Some(3));
+    }
+
+    #[test]
+    fn revisioned_sidecar_merges_and_atomically_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overrides.json");
+
+        let first = write_merged_overrides_at_path(
+            &path,
+            RunConfigOverrides {
+                concurrency: Some(2),
+                ..RunConfigOverrides::default()
+            },
+        )
+        .unwrap();
+        let second = write_merged_overrides_at_path(
+            &path,
+            RunConfigOverrides {
+                batch_max_items: Some(4),
+                ..RunConfigOverrides::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first.revision, 1);
+        assert_eq!(second.revision, 2);
+        assert_eq!(second.overrides.concurrency, Some(2));
+        assert_eq!(second.overrides.batch_max_items, Some(4));
+        assert_eq!(load_overrides_from_path(&path).unwrap().unwrap(), second);
+        assert!(!path.with_extension("lock").exists());
+        let leftovers = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".staged-"))
+            .count();
+        assert_eq!(leftovers, 0, "atomic writer must clean staged siblings");
+    }
+
+    #[test]
+    fn sidecar_rejects_zero_and_unknown_settings() {
+        let zero = RunConfigOverrides {
+            concurrency: Some(0),
+            ..RunConfigOverrides::default()
+        };
+        assert!(
+            zero.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("concurrency")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overrides.json");
+        fs::write(&path, r#"{"concurrency":2,"surprise":true}"#).unwrap();
+        let error = load_overrides_from_path(&path).expect_err("unknown field must reject");
+        assert!(error.to_string().contains("failed to parse"));
+    }
+
+    #[test]
+    fn writer_recovers_an_unreadable_sidecar_with_a_fresh_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overrides.json");
+        fs::write(&path, r#"{"concurrency":0,"surprise":true}"#).unwrap();
+
+        let recovered = write_merged_overrides_at_path(
+            &path,
+            RunConfigOverrides {
+                concurrency: Some(3),
+                ..RunConfigOverrides::default()
+            },
+        )
+        .expect("a locked writer should recover a corrupt sidecar");
+
+        assert_eq!(recovered.revision, 1);
+        assert_eq!(recovered.overrides.concurrency, Some(3));
+        assert_eq!(load_overrides_from_path(&path).unwrap(), Some(recovered));
     }
 }

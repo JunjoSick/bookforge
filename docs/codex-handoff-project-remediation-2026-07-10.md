@@ -355,8 +355,187 @@ Do not skip this item.
 
 ### True live reconfiguration
 
-Design complete in `docs/design-live-reconfiguration.md`; implementation has
-not started. Current behavior remains sidecar + stop/resume.
+Design complete in `docs/design-live-reconfiguration.md`. Implementation is
+AUTOMATED-COMPLETE in the uncommitted worktree as of 2026-07-13. Commit/push
+and the selected real-provider acceptance run remain; the historical restart
+and WIP-review notes below are retained only as provenance.
+
+#### Live implementation checkpoint (Codex, 2026-07-13)
+
+This checkpoint supersedes both historical subsections below.
+
+- Atomic revisioned overrides, shared validation, last-valid recovery,
+  runtime channels/events/replay state, provider-attempt snapshots, dynamic
+  single and batch dispatch, adjustable concurrency, stable batch work keys,
+  pending repartition, and finalize-stage snapshots are implemented.
+- Runtime leases and launch claims make dashboard controls worker-aware.
+  Resume signals a fresh worker, launches one replacement for stopped/crashed
+  work, adds `--force` for a dead paused worker, deduplicates concurrent clicks,
+  recognizes finalize-only work, and rejects completed jobs.
+- The Progress screen contains the typed ten-field Runtime settings editor and
+  immutable identity/revision/lease state. Runtime events refresh it without a
+  page reload. Review retry guidance now uses an inline textarea with
+  Cancel/Queue/Stop and the explicit stop-before-retry instruction.
+- Lifecycle coverage proves live single/batch changes, request revision and
+  attempt metadata, finalize-stage freezing, stop/crash preservation, resume
+  consumption without retranslating checkpoints, successful sidecar/lease
+  cleanup, and stale crash leases. The old fixed-sleep stop/resume test was
+  made event-driven and passes repeatedly.
+- Focused and full engine/CLI suites pass (154 engine; 159 CLI unit; 45 CLI
+  lifecycle; 16 round-trip). Formatting, exact CI clippy with warnings denied,
+  and the Rust 1.88 all-target workspace check pass on Windows. After replacing
+  the old fixed-sleep lifecycle flake with an event-driven boundary, the clean
+  linked workspace suite passes in full: 159 CLI unit, 45 lifecycle, 16
+  round-trip, 59 core, 154 LLM, 31 PDF, and 34 store tests, plus EPUB and
+  documentation tests.
+
+Next: review/clean generated files, update the draft PR with the
+live-reconfiguration commit, confirm Linux/Windows CI, then begin
+behavior-neutral modularization.
+
+#### Historical restart checkpoint (superseded)
+
+This subsection supersedes the older WIP review immediately below it. The app
+had to be restarted because its approval state was malfunctioning. Stop here:
+the worktree is intentionally dirty and must be continued in place.
+
+- Branch/HEAD: `codex/project-remediation` at `b809e598`.
+- Do not discard, reset, or broadly rewrite the dirty tree. There are 18
+  modified Rust files plus this handoff.
+- `crates/bookforge-cli/.bookforge/` is an untracked generated test artifact;
+  inspect it before removing it and never commit it.
+- The last fully verified checkpoint predates the newest lease/dashboard
+  edits. Run formatting and a targeted CLI check before making further edits.
+
+Use the Windows gnullvm toolchain because this host's default GNU linker is
+missing `libgcc_eh`:
+
+```powershell
+$llvm='C:\Users\gangi\AppData\Local\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\llvm-mingw-20260616-ucrt-x86_64\bin'
+$env:PATH="$llvm;$env:PATH"
+cargo fmt --all
+cargo +stable-x86_64-pc-windows-gnullvm check -p bookforge-cli --all-targets --locked
+```
+
+Implemented in the current uncommitted tree:
+
+- removed the obsolete paused-resume override rejection; overrides are loaded
+  and published before Resume is applied, with focused tests;
+- corrupt sidecars can be recovered by the next atomic writer while readers
+  keep last-valid behavior;
+- provider attempt limits and runtime revision are frozen per request and
+  recorded additively in request metadata/events;
+- batch dispatch now leaves genuinely pending work available for revision-time
+  repartition, with per-item retry/escalation bookkeeping and live adaptive
+  concurrency behavior;
+- CLI-owned `JobRuntimeSettings` snapshots QA, double-check, validation, and
+  engine settings at stage/request boundaries;
+- persisted run snapshots now include additive QA mode and output-validation
+  fields, and successful finalization clears overrides;
+- `runtime.json` worker leases, heartbeats, owner-safe cleanup, stale detection,
+  and deduplicating `resume.launch` claims are implemented in `control.rs`;
+- dashboard GET/POST `/api/jobs/{id}/reconfigure` handlers and lease-aware
+  Pause/Stop/Resume behavior are largely implemented in `serve.rs`. Resume now
+  signals a fresh worker or spawns `bookforge resume <id> --ui quiet` when no
+  worker is live.
+
+Focused tests that passed before the newest lease/dashboard edits cover sidecar
+recovery/order, provider-attempt freezing, additive event compatibility,
+single and batch runtime boundaries, pending-batch merging, adaptive-concurrency
+enablement, and limiter shrink. A targeted CLI all-target check also passed at
+that earlier point. The lease tests and newest dashboard handlers have not yet
+been compiled or run.
+
+First continuation task:
+
+1. Run the formatting/check commands above and fix only errors from the current
+   WIP (likely around the new lease-aware dashboard handlers or new
+   `RunConfigSnapshot` fields).
+2. Finish the Progress-screen runtime settings panel and event rendering in
+   `serve.rs`.
+3. Replace `window.prompt` in `bfReviewRetry` with an inline textarea plus
+   Cancel/Queue controls and the explicit instruction that a running/paused job
+   must be stopped before a retry is queued. This is the owner's requested UI
+   follow-up; the underlying retry behavior already works.
+4. Add dashboard API/CSRF tests, fresh/stale lease and launch-dedup tests, then
+   stage-boundary lifecycle/race coverage. Run the full llm/cli suites.
+5. Update this subsection with exact commands/results, commit the coherent live
+   reconfiguration milestone, and push draft PR #27. Only then begin the
+   modularization milestone and final release gate.
+
+Potential review points, not established bugs: verify Windows
+`CommandExt::creation_flags` compiles through Tokio's command wrapper; ensure
+isolated dashboard tests do not leak global `.bookforge` state; verify a newly
+written sidecar is observed before a stage boundary; and confirm launch claims
+remain until the new worker clears them or they become stale.
+
+#### Historical review of the work-in-progress (superseded)
+
+Implemented and looking correct (roughly steps 1–4 of the design's
+implementation order):
+
+- versioned `overrides.json` envelope with schema version, monotonic
+  revision, zero-value rejection, legacy flat fallback, atomic staged write,
+  and an `overrides.lock` writer lock with stale-lease recovery;
+- `ControlFileWatcher` publishes immutable `EngineRuntimeSettings` snapshots
+  through a Tokio `watch` channel, emitting additive `RuntimeConfigChanged`/
+  `RuntimeConfigRejected` events (deduped per revision / per error);
+- `RunState` gains revision/changed-fields/rejection (serde-defaulted);
+- single-segment scheduler snapshots concurrency + output budget per
+  dispatch; batch scheduler uses an `AdaptiveLimiter` (including a real
+  shrink fix: idle permits are consumed immediately so waiters cannot exceed
+  a lowered target — with test) and rebuilds sizing per revision;
+- escalation bookkeeping is now keyed by ordered item IDs
+  (`batch_work_key`), surviving repartition, and carried onto split parts;
+- all four run entry points (translate real/mock, resume, fallback pass)
+  wire the watcher channel through `TranslationRunConfig.runtime_settings`
+  (`None` preserves old behavior);
+- race tests exist with gated providers for concurrency shrink (single +
+  batch) and budget change on later requests.
+
+Findings to fix before continuing:
+
+1. FAILING TEST: `paused_fast_resume_with_overrides_errors_with_apply_guidance`
+   (resume.rs:1301) — `apply_instructions()` was reworded for the live-worker
+   model and no longer contains "bookforge stop <id>". Decide the real fix:
+   under this design a live fast-resume of a paused worker should be ALLOWED
+   with pending overrides (the watcher applies them), so the guard in
+   `live_fast_resume_paused_job` likely becomes obsolete rather than the
+   message being patched. Workspace test run stops at this failure, so
+   lifecycle/roundtrip suites have not run against the WIP.
+2. ORDERING BUG (design invariant): in `control.rs` the watcher loop runs
+   `poller.poll(&signal)` (applying Pause/Resume/Stop) BEFORE reloading the
+   overrides sidecar. The design requires reloading overrides before applying
+   Resume so reconfigure-then-resume never dispatches under the previous
+   revision. Swap the order (load/publish overrides first, then poll) and add
+   the planned pause→reconfigure→resume scheduler test.
+3. Recovery nit: `write_merged_overrides_at_path` reloads the existing
+   sidecar through the validating loader, so a corrupt/invalid sidecar makes
+   every future reconfigure fail until the file is hand-deleted. Writers
+   should treat unreadable existing content as revision-0 default (or surface
+   an explicit `--reset`), while readers keep last-valid behavior.
+
+Not yet implemented (matches design steps 3b, 5, 6, 7):
+
+- provider-side `provider_max_attempts` snapshot in
+  `OpenAiCompatibleProvider` and `adaptive_concurrency` application — both
+  fields currently ride in `EngineRuntimeSettings` but nothing consumes them;
+- `RequestStarted` extensions (`runtime_config_revision`,
+  `provider_max_attempts`);
+- runtime lease `runtime.json` + lease-aware dashboard Resume/spawn;
+- QA/double-check/validate stage-boundary snapshots and terminal
+  sidecar/lease cleanup;
+- dashboard GET/POST reconfigure API, Progress-screen panel, inline
+  retry-hint UI;
+- most of the design's unit/scheduler/lifecycle test matrix.
+
+Minor observations (acceptable, just be aware): the watcher re-emits
+`RuntimeConfigChanged` once at every process start when a sidecar already
+exists (informative, additive); a legacy revision-0 sidecar intentionally
+does not instantiate a runtime batch sizer.
+
+Current behavior for jobs without overrides remains unchanged
+(sidecar + stop/resume fallback preserved).
 
 Recommended design:
 

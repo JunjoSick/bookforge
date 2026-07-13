@@ -149,6 +149,8 @@ struct AppState {
     /// resolved once at startup instead of per-request) while letting tests
     /// point a router at an isolated temp-dir store without touching CWD.
     store_path: PathBuf,
+    #[cfg(test)]
+    resume_launches: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 /// The default job store path, relative to the current directory — identical
@@ -174,6 +176,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         host_port: local.port(),
         keys: Arc::new(Mutex::new(HashMap::new())),
         store_path: default_store_path(),
+        #[cfg(test)]
+        resume_launches: None,
     };
 
     let app = dashboard_router(state);
@@ -201,6 +205,10 @@ fn dashboard_router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{id}", get(job_detail))
+        .route(
+            "/api/jobs/{id}/reconfigure",
+            get(job_reconfigure).post(update_job_reconfigure),
+        )
         .route("/api/jobs/{id}/events", get(job_events))
         .route("/api/jobs/{id}/review", get(job_review))
         .route(
@@ -342,6 +350,67 @@ async fn job_detail(
             Json(json!({ "error": format!("no job '{id}'") })),
         )
             .into_response()),
+    }
+}
+
+async fn job_reconfigure(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Response, AppError> {
+    let store_path = state.store_path.clone();
+    let outcome =
+        tokio::task::spawn_blocking(move || runtime_settings_view(&store_path, &id)).await?;
+    match outcome {
+        Ok(Some(view)) => Ok(Json(view).into_response()),
+        Ok(None) => Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such job or run snapshot" })),
+        )
+            .into_response()),
+        Err(error) => Ok(bad_request(&error.to_string())),
+    }
+}
+
+async fn update_job_reconfigure(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(incoming): Json<super::reconfigure::RunConfigOverrides>,
+) -> Result<Response, AppError> {
+    if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+    if incoming.is_empty() {
+        return Ok(bad_request("select at least one runtime setting"));
+    }
+    let store_path = state.store_path.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<RuntimeSettingsView> {
+        let store = JobStore::open(&store_path)?;
+        let Some(job) = store.get_job(&id)? else {
+            anyhow::bail!("no such job");
+        };
+        if !matches!(job.status.as_str(), "running" | "paused" | "stopped") {
+            anyhow::bail!(
+                "job '{}' is {}; runtime settings are editable only while running, paused, or stopped",
+                id,
+                job.status
+            );
+        }
+        if store.load_job_config_snapshot(&id)?.is_none() {
+            anyhow::bail!("job '{}' has no resumable run snapshot", id);
+        }
+        let (_path, written) =
+            super::reconfigure::write_merged_overrides_for_job(&id, incoming)?;
+        let mut view = runtime_settings_view(&store_path, &id)?
+            .ok_or_else(|| anyhow::anyhow!("job disappeared after reconfiguration"))?;
+        view.revision = written.revision;
+        Ok(view)
+    })
+    .await?;
+
+    match outcome {
+        Ok(view) => Ok(Json(view).into_response()),
+        Err(error) => Ok(bad_request(&error.to_string())),
     }
 }
 
@@ -573,7 +642,111 @@ async fn resume_job(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    control_job(id, state, headers, ControlCommand::Resume).await
+    if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+    let store_path = state.store_path.clone();
+    let lookup = id.clone();
+    let action = tokio::task::spawn_blocking(move || -> Result<Option<(bool, bool, bool)>> {
+        let store = JobStore::open(&store_path)?;
+        let Some(job) = store.get_job(&lookup)? else {
+            return Ok(None);
+        };
+        let live = matches!(
+            crate::control::runtime_lease_state(&lookup),
+            crate::control::RuntimeLeaseState::Fresh(_)
+        );
+        let resumable = !store.resumable_segment_ids(&lookup)?.is_empty()
+            || (job_status_has_unfinished_pipeline_work(&job.status)
+                && store.load_job_config_snapshot(&lookup)?.is_some());
+        let force = !live && job.status == "paused";
+        Ok(Some((live, resumable, force)))
+    })
+    .await??;
+    let Some((live, resumable, force)) = action else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such job" })),
+        )
+            .into_response());
+    };
+    if live {
+        let path = crate::control::request_job_control(&id, ControlCommand::Resume)?;
+        return Ok(Json(json!({
+            "command": "resume",
+            "mode": "signaled",
+            "control_path": path,
+        }))
+        .into_response());
+    }
+    if !resumable {
+        return Ok(bad_request(
+            "the worker is not alive and this job has no resumable work",
+        ));
+    }
+
+    let Some(mut launch_claim) = crate::control::RuntimeLaunchClaim::acquire(&id)? else {
+        return Ok(Json(json!({
+            "command": "resume",
+            "mode": "launching",
+        }))
+        .into_response());
+    };
+    #[cfg(test)]
+    if let Some(launches) = &state.resume_launches {
+        launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        launch_claim.persist_until_worker();
+        return Ok(Json(json!({
+            "command": "resume",
+            "mode": "spawned",
+            "pid": 0,
+            "forced": force,
+        }))
+        .into_response());
+    }
+    let executable =
+        std::env::current_exe().context("failed to locate the BookForge executable")?;
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("resume")
+        .arg(&id)
+        .arg("--ui")
+        .arg("quiet")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if force {
+        // A paused job normally expects to signal its original process. A
+        // missing/stale lease proves that process is unavailable, so the
+        // replacement must use the CLI's explicit dead-worker escape hatch.
+        command.arg("--force");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn().context("failed to launch resume worker")?;
+    let pid = child.id();
+    if let Some(status) = child_exit_status_after(&mut child, CHILD_STARTUP_CHECK).await?
+        && !status.success()
+    {
+        return Ok(bad_request(&format!(
+            "resume worker exited immediately with {status}"
+        )));
+    }
+    launch_claim.persist_until_worker();
+    Ok(Json(json!({
+        "command": "resume",
+        "mode": "spawned",
+        "pid": pid,
+        "forced": force,
+    }))
+    .into_response())
+}
+
+fn job_status_has_unfinished_pipeline_work(status: &str) -> bool {
+    matches!(status, "running" | "paused" | "stopped")
 }
 
 async fn stop_job(
@@ -599,22 +772,32 @@ async fn control_job(
         if store.get_job(&id)?.is_none() {
             return Ok(None);
         }
+        if !matches!(
+            crate::control::runtime_lease_state(&id),
+            crate::control::RuntimeLeaseState::Fresh(_)
+        ) {
+            anyhow::bail!(
+                "no live worker is available for {}; refresh the job and use Resume to launch one",
+                command.as_str()
+            );
+        }
         let path = crate::control::request_job_control(&id, command)?;
         Ok(Some(path.display().to_string()))
     })
-    .await??;
+    .await?;
 
     match outcome {
-        Some(path) => Ok(Json(json!({
+        Ok(Some(path)) => Ok(Json(json!({
             "command": command.as_str(),
             "control_path": path,
         }))
         .into_response()),
-        None => Ok((
+        Ok(None) => Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such job" })),
         )
             .into_response()),
+        Err(error) => Ok(bad_request(&error.to_string())),
     }
 }
 
@@ -1298,6 +1481,183 @@ struct JobDetail {
     state: RunState,
 }
 
+#[derive(Debug, Serialize)]
+struct RuntimeMutableSettings {
+    batch_max_output_tokens: Option<u32>,
+    batch_max_items: usize,
+    batch_target_tokens: usize,
+    concurrency: usize,
+    qa: crate::QaMode,
+    double_check: bookforge_core::DoubleCheckMode,
+    validate_output: bool,
+    provider_max_attempts: usize,
+    adaptive_concurrency: bool,
+    adaptive_batch_sizing: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeIdentity {
+    provider: String,
+    model: String,
+    source_language: Option<String>,
+    target_language: String,
+    profile: String,
+    prompt_version: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeLeaseView {
+    state: &'static str,
+    pid: Option<u32>,
+    instance_id: Option<String>,
+    heartbeat_at_ms: Option<u64>,
+    last_loaded_revision: Option<u64>,
+    last_applied_revision: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeSettingsView {
+    effective: RuntimeMutableSettings,
+    overrides: super::reconfigure::RunConfigOverrides,
+    revision: u64,
+    applied_revision: u64,
+    changed_fields: Vec<String>,
+    next_boundary: Vec<String>,
+    application_state: &'static str,
+    live: bool,
+    editable: bool,
+    resumable_work: bool,
+    lease: RuntimeLeaseView,
+    identity: RuntimeIdentity,
+}
+
+fn runtime_settings_view(
+    store_path: &std::path::Path,
+    id: &str,
+) -> Result<Option<RuntimeSettingsView>> {
+    let store = JobStore::open(store_path)?;
+    let Some(job) = store.get_job(id)? else {
+        return Ok(None);
+    };
+    let Some(snapshot) = store.load_job_config_snapshot(id)? else {
+        return Ok(None);
+    };
+    let mut settings = snapshot.settings.to_settings();
+    let loaded = super::reconfigure::load_overrides_document_for_job(id)?;
+    let (revision, overrides) = loaded
+        .map(|loaded| (loaded.revision, loaded.overrides))
+        .unwrap_or_default();
+    super::reconfigure::apply_overrides_to_settings(&mut settings, &overrides);
+    let qa = overrides
+        .qa
+        .unwrap_or_else(|| crate::QaMode::from_snapshot(&snapshot.qa_mode));
+    let validate_output = overrides
+        .validate_output
+        .unwrap_or(snapshot.validate_output);
+    let changed_fields = overrides.changed_fields();
+    let next_boundary = overrides.application_boundaries();
+    let (lease, live, applied_revision) = match crate::control::runtime_lease_state(id) {
+        crate::control::RuntimeLeaseState::Fresh(lease) => (
+            RuntimeLeaseView {
+                state: "fresh",
+                pid: Some(lease.pid),
+                instance_id: Some(lease.instance_id.clone()),
+                heartbeat_at_ms: Some(lease.heartbeat_at_ms),
+                last_loaded_revision: Some(lease.last_loaded_revision),
+                last_applied_revision: Some(lease.last_applied_revision),
+                error: None,
+            },
+            true,
+            lease.last_applied_revision,
+        ),
+        crate::control::RuntimeLeaseState::Stale(lease) => (
+            RuntimeLeaseView {
+                state: "stale",
+                pid: Some(lease.pid),
+                instance_id: Some(lease.instance_id.clone()),
+                heartbeat_at_ms: Some(lease.heartbeat_at_ms),
+                last_loaded_revision: Some(lease.last_loaded_revision),
+                last_applied_revision: Some(lease.last_applied_revision),
+                error: None,
+            },
+            false,
+            lease.last_applied_revision,
+        ),
+        crate::control::RuntimeLeaseState::Missing => (
+            RuntimeLeaseView {
+                state: "missing",
+                pid: None,
+                instance_id: None,
+                heartbeat_at_ms: None,
+                last_loaded_revision: None,
+                last_applied_revision: None,
+                error: None,
+            },
+            false,
+            0,
+        ),
+        crate::control::RuntimeLeaseState::Invalid(error) => (
+            RuntimeLeaseView {
+                state: "invalid",
+                pid: None,
+                instance_id: None,
+                heartbeat_at_ms: None,
+                last_loaded_revision: None,
+                last_applied_revision: None,
+                error: Some(error),
+            },
+            false,
+            0,
+        ),
+    };
+    // Translation is only one part of the resumable pipeline. A stopped,
+    // paused, or orphaned-running job may have no pending segments while QA,
+    // double-check, rebuild, validation, or reporting still remains.
+    let resumable_work = !store.resumable_segment_ids(id)?.is_empty()
+        || job_status_has_unfinished_pipeline_work(&job.status);
+    let editable = job_status_has_unfinished_pipeline_work(&job.status) && resumable_work;
+    let application_state = if !live {
+        "resume_required"
+    } else if revision > applied_revision {
+        "next_boundary"
+    } else {
+        "live"
+    };
+    Ok(Some(RuntimeSettingsView {
+        effective: RuntimeMutableSettings {
+            batch_max_output_tokens: settings.provider.batch_max_output_tokens,
+            batch_max_items: settings.batch.max_items,
+            batch_target_tokens: settings.batch.target_tokens,
+            concurrency: settings.scheduler.concurrency,
+            qa,
+            double_check: settings.double_check.mode,
+            validate_output,
+            provider_max_attempts: settings.provider.provider_max_attempts,
+            adaptive_concurrency: settings.adaptive_concurrency,
+            adaptive_batch_sizing: settings.batch.adaptive_sizing,
+        },
+        overrides,
+        revision,
+        applied_revision,
+        changed_fields,
+        next_boundary,
+        application_state,
+        live,
+        editable,
+        resumable_work,
+        lease,
+        identity: RuntimeIdentity {
+            provider: snapshot.provider,
+            model: snapshot.model,
+            source_language: snapshot.source_language,
+            target_language: snapshot.target_language,
+            profile: format!("{:?}", snapshot.profile),
+            prompt_version: snapshot.prompt_version,
+        },
+    }))
+}
+
 #[derive(Serialize)]
 struct DashboardOptions {
     languages: &'static [&'static str],
@@ -1597,6 +1957,21 @@ main{min-height:calc(100vh - 60px)}
 .live{display:flex;align-items:center;gap:6px;font:400 12px var(--sans);color:var(--muted)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--faint)}
 .dot.on{background:var(--good);box-shadow:0 0 8px var(--good)}
+.runtime-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:16px}
+.runtime-head .title{font:600 17px var(--serif);color:var(--ink)}
+.runtime-head .meta{font:400 11.5px/1.5 var(--mono);color:var(--muted);margin-top:3px}
+.runtime-state{font:600 10px var(--sans);text-transform:uppercase;letter-spacing:.05em;padding:5px 9px;border-radius:12px;color:var(--muted);background:var(--chip)}
+.runtime-state.live{color:var(--good);background:var(--goodbg)}
+.runtime-state.stale,.runtime-state.invalid{color:var(--warn);background:var(--chip)}
+.runtime-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(185px,1fr));gap:11px}
+.runtime-field{display:flex;flex-direction:column;gap:6px;font:600 10px var(--sans);text-transform:uppercase;letter-spacing:.04em;color:var(--faint)}
+.runtime-field .inp{padding:9px 11px;font:500 12.5px var(--mono);text-transform:none;letter-spacing:0}
+.runtime-check{display:flex;align-items:center;gap:8px;min-height:38px;padding:9px 11px;border:1px solid var(--line);border-radius:10px;background:var(--card);font:500 12px var(--sans);text-transform:none;letter-spacing:0;color:var(--muted)}
+.runtime-check input{accent-color:var(--accent)}
+.runtime-identity{margin-top:15px;padding-top:13px;border-top:1px solid var(--line);font:400 11px/1.6 var(--mono);color:var(--faint);word-break:break-word}
+.runtime-foot{display:flex;align-items:center;gap:11px;margin-top:15px;flex-wrap:wrap}
+.runtime-feedback{font:400 11.5px var(--sans);color:var(--muted)}
+.runtime-feedback.bad{color:var(--danger)}
 
 @media (max-width:720px){.wrap{padding:28px 18px 70px}.book-grid{grid-template-columns:1fr}.wiz{display:block;min-height:0}.rail{width:auto;border-right:none;border-bottom:1px solid var(--line);padding:18px 20px}.steps{flex-direction:row;overflow:auto}.step{flex:none}.wizsummary{display:none}.wizpanel{padding:24px 20px 34px}.lang-row{flex-wrap:wrap}.swap{margin-bottom:0}.tiers{flex-direction:column}.prog-top{display:block}.prog-eta{text-align:left;margin-top:8px}.prog-actions{flex-wrap:wrap}}
 
@@ -1637,6 +2012,13 @@ main{min-height:calc(100vh - 60px)}
 .rev-edit{width:100%;min-height:120px;resize:vertical;border:1px solid var(--line);border-radius:9px;padding:12px;background:var(--card);color:var(--ink);font:400 15px/1.6 var(--serif)}
 .rev-edit:focus{outline:none;border-color:var(--accent)}
 .rev-save-row{display:flex;align-items:center;gap:10px;margin-top:14px}.rev-save-status{font:400 11px var(--sans);color:var(--muted)}
+.rev-hint{margin-top:14px;padding:14px;border:1px solid var(--accentline);border-radius:11px;background:var(--card)}
+.rev-hint[hidden]{display:none}
+.rev-hint label{display:block;font:600 11px var(--sans);color:var(--ink);margin-bottom:7px}
+.rev-hint textarea{width:100%;min-height:82px;resize:vertical;border:1px solid var(--line);border-radius:9px;padding:10px 11px;background:var(--soft);color:var(--ink);font:400 13px/1.5 var(--sans)}
+.rev-hint textarea:focus{outline:none;border-color:var(--accent)}
+.rev-hint .note{font:500 11.5px/1.5 var(--sans);color:var(--warn);margin:8px 0 10px}
+.rev-hint .actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .rev-note{margin-top:14px;padding:11px 13px;border-radius:9px;background:var(--card);border:1px solid var(--accentline);font:400 12.5px/1.5 var(--sans);color:var(--muted)}
 .rev-note b{color:var(--warn)}
 .rev-empty{flex:1;display:flex;align-items:center;justify-content:center;color:var(--muted);width:100%}
@@ -1746,6 +2128,9 @@ const App = {
   options: { languages: ["English","Italian","Spanish","French","German"], providers: [] },
   providerKeys: {},
   wizard: null,
+  runtimeSettings: null,
+  runtimeJob: null,
+  runtimeRefreshPending: false,
 };
 
 function freshWizard() {
@@ -2046,9 +2431,19 @@ async function renderProgress(stage) {
   const id = App.selected;
   if (!id) { stage.innerHTML = `<div class="wrap"><div class="empty">Open a translation from the library to watch its progress.</div></div>`; return; }
   stage.innerHTML = `<div class="wrap"><div class="empty">Loading job…</div></div>`;
-  let d;
-  try { const r = await fetch("/api/jobs/" + encodeURIComponent(id)); if (!r.ok) throw new Error(); d = await r.json(); }
+  let d, runtime = null;
+  try {
+    const [jobResponse, runtimeResponse] = await Promise.all([
+      fetch("/api/jobs/" + encodeURIComponent(id)),
+      fetch("/api/jobs/" + encodeURIComponent(id) + "/reconfigure"),
+    ]);
+    if (!jobResponse.ok) throw new Error();
+    d = await jobResponse.json();
+    if (runtimeResponse.ok) runtime = await runtimeResponse.json();
+  }
   catch (e) { stage.innerHTML = `<div class="wrap"><div class="empty">Could not load this job.</div></div>`; return; }
+  App.runtimeSettings = runtime;
+  App.runtimeJob = id;
   const title = titleFromPath(d.input_path);
   stage.innerHTML = `<div class="wrap">
     <div class="prog-hero"><div class="prog-cover">${esc(title.charAt(0))}</div>
@@ -2067,13 +2462,90 @@ async function renderProgress(stage) {
         <button class="btn btn-ghost" onclick="bfGo('review',{selected:'${esc(d.id)}'})">Open review →</button>
         <button class="btn btn-ghost" id="retrybtn" onclick="bfRetry('${esc(d.id)}')">Retry failed / needs-review</button></div></div>
     <div class="stat-grid" id="stats"></div>
+    <div id="runtime-panel"></div>
     <p class="sectlabel">Live activity</p>
     <div class="logbox scr" id="events"><div class="logline">waiting…</div></div>
     <div style="margin-top:16px"><p class="sectlabel">Issues</p><div class="logbox scr" id="issues"><div class="logline">none</div></div></div>
     <span class="toast" id="toast" style="font:400 12px var(--sans);color:var(--muted)"></span>
     </div>`;
+  drawRuntimeSettings(runtime);
   updateState(d.state || {});
   openStream(id);
+}
+function runtimeOption(value, current, label) { return `<option value="${esc(value)}" ${value===current?"selected":""}>${esc(label||value)}</option>`; }
+function drawRuntimeSettings(view) {
+  const panel = $("#runtime-panel"); if (!panel) return;
+  if (!view) { panel.innerHTML = `<div class="prog-card"><div class="runtime-head"><div><div class="title">Runtime settings</div><div class="meta">No resumable run snapshot is available.</div></div></div></div>`; return; }
+  const e = view.effective || {}, ident = view.identity || {}, lease = view.lease || {};
+  const disabled = view.editable ? "" : "disabled";
+  const boundaries = (view.next_boundary || []).map(v => v.replace(/_/g," ")).join(", ") || "none pending";
+  const leaseNote = lease.state === "fresh" ? `worker ${lease.pid || "?"} - applied r${view.applied_revision || 0}` : `${lease.state || "missing"} worker - Resume required`;
+  panel.innerHTML = `<div class="prog-card">
+    <div class="runtime-head"><div><div class="title">Runtime settings</div><div class="meta">revision r${view.revision || 0} - ${esc(leaseNote)} - boundary: ${esc(boundaries)}</div></div><span class="runtime-state ${esc(lease.state || "missing")}">${esc(view.application_state || "resume_required")}</span></div>
+    <div class="runtime-grid">
+      <label class="runtime-field">Batch output tokens<input class="inp" id="rt-output" type="number" min="1" value="${e.batch_max_output_tokens == null ? "" : esc(e.batch_max_output_tokens)}" placeholder="provider default" ${disabled}></label>
+      <label class="runtime-field">Batch max items<input class="inp" id="rt-items" type="number" min="1" value="${esc(e.batch_max_items)}" ${disabled}></label>
+      <label class="runtime-field">Batch target tokens<input class="inp" id="rt-target" type="number" min="1" value="${esc(e.batch_target_tokens)}" ${disabled}></label>
+      <label class="runtime-field">Concurrency<input class="inp" id="rt-concurrency" type="number" min="1" value="${esc(e.concurrency)}" ${disabled}></label>
+      <label class="runtime-field">Provider attempts<input class="inp" id="rt-attempts" type="number" min="1" value="${esc(e.provider_max_attempts)}" ${disabled}></label>
+      <label class="runtime-field">QA<select class="inp" id="rt-qa" ${disabled}>${runtimeOption("off",e.qa,"Off")}${runtimeOption("suspicious",e.qa,"Suspicious")}${runtimeOption("all",e.qa,"All")}</select></label>
+      <label class="runtime-field">Double-check<select class="inp" id="rt-double" ${disabled}>${runtimeOption("Off",e.double_check,"Off")}${runtimeOption("Formatting",e.double_check,"Formatting")}${runtimeOption("Semantic",e.double_check,"Semantic")}${runtimeOption("Full",e.double_check,"Full")}</select></label>
+      <label class="runtime-field"><span>Validation</span><span class="runtime-check"><input id="rt-validate" type="checkbox" ${e.validate_output?"checked":""} ${disabled}> Validate output</span></label>
+      <label class="runtime-field"><span>Adaptive concurrency</span><span class="runtime-check"><input id="rt-adaptive-concurrency" type="checkbox" ${e.adaptive_concurrency?"checked":""} ${disabled}> Enabled</span></label>
+      <label class="runtime-field"><span>Adaptive batch sizing</span><span class="runtime-check"><input id="rt-adaptive-batch" type="checkbox" ${e.adaptive_batch_sizing?"checked":""} ${disabled}> Enabled</span></label>
+    </div>
+    <div class="runtime-identity">Immutable identity: ${esc(ident.provider || "-")} / ${esc(ident.model || "-")} - ${esc(ident.source_language || "auto")} to ${esc(ident.target_language || "-")} - ${esc(ident.profile || "-")} - prompt ${esc(ident.prompt_version || "-")}</div>
+    <div class="runtime-foot"><button class="btn btn-primary" id="runtime-save" onclick="bfSaveRuntimeSettings()" ${disabled}>Save runtime settings</button><span class="runtime-feedback" id="runtime-feedback">${view.editable ? "Changes apply at the named request, batch, or stage boundary." : (view.resumable_work ? "This job is not in an editable state." : "No resumable work remains.")}</span></div>
+  </div>`;
+}
+function runtimePositiveInt(id, label, optional) {
+  const el = $(id), raw = el ? el.value.trim() : "";
+  if (optional && raw === "") return null;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) throw new Error(`${label} must be a positive integer`);
+  return value;
+}
+async function bfSaveRuntimeSettings() {
+  const view = App.runtimeSettings, feedback = $("#runtime-feedback"), button = $("#runtime-save");
+  if (!view || !view.editable) return;
+  let values;
+  try {
+    values = {
+      batch_max_output_tokens: runtimePositiveInt("#rt-output","batch output tokens",true),
+      batch_max_items: runtimePositiveInt("#rt-items","batch max items",false),
+      batch_target_tokens: runtimePositiveInt("#rt-target","batch target tokens",false),
+      concurrency: runtimePositiveInt("#rt-concurrency","concurrency",false),
+      provider_max_attempts: runtimePositiveInt("#rt-attempts","provider attempts",false),
+      qa: $("#rt-qa").value,
+      double_check: $("#rt-double").value,
+      validate_output: $("#rt-validate").checked,
+      adaptive_concurrency: $("#rt-adaptive-concurrency").checked,
+      adaptive_batch_sizing: $("#rt-adaptive-batch").checked,
+    };
+  } catch (e) { if (feedback) { feedback.textContent=e.message; feedback.classList.add("bad"); } return; }
+  const payload = {}, previous = view.effective || {};
+  Object.keys(values).forEach(key => { if (values[key] !== previous[key] && !(key === "batch_max_output_tokens" && values[key] === null)) payload[key] = values[key]; });
+  if (!Object.keys(payload).length) { if (feedback) { feedback.textContent="No runtime settings changed."; feedback.classList.remove("bad"); } return; }
+  if (button) button.disabled = true;
+  if (feedback) { feedback.textContent="Saving..."; feedback.classList.remove("bad"); }
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(App.selected)}/reconfigure`, {method:"POST",headers:{"Content-Type":"application/json",[CSRF_HEADER]:CSRF_TOKEN},body:JSON.stringify(payload)});
+    const body = await r.json(); if (!r.ok) throw new Error(body.error || "runtime update failed");
+    App.runtimeSettings = body; drawRuntimeSettings(body);
+    const next = (body.next_boundary || []).map(v => v.replace(/_/g," ")).join(", ");
+    const out = $("#runtime-feedback"); if (out) out.textContent = `Saved revision r${body.revision} - ${body.live ? (next || "live") : "Resume required"}`;
+  } catch (e) { if (feedback) { feedback.textContent=e.message || "runtime update failed"; feedback.classList.add("bad"); } }
+  finally { const current=$("#runtime-save"); if (current) current.disabled=false; }
+}
+async function refreshRuntimeSettings() {
+  const id = App.selected;
+  if (!id || App.runtimeRefreshPending || App.screen !== "progress") return;
+  App.runtimeRefreshPending = true;
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/reconfigure`);
+    if (r.ok && App.screen === "progress" && App.selected === id) { App.runtimeSettings = await r.json(); App.runtimeJob=id; drawRuntimeSettings(App.runtimeSettings); }
+  } catch (_) {}
+  finally { App.runtimeRefreshPending=false; }
 }
 function setLive(on, txt) { const dt = $("#livedot"), tx = $("#livetxt"); if (dt) dt.classList.toggle("on", on); if (tx) tx.textContent = txt; }
 function updateState(s) {
@@ -2101,13 +2573,19 @@ function updateState(s) {
   if (ebox) { const evs = s.recent_events || [];
     ebox.innerHTML = evs.length ? evs.slice().reverse().map(fmtEvent).join("") : `<div class="logline">waiting…</div>`;
   }
+  const runtimeRevision = Number(s.runtime_config_revision || 0);
+  if (runtimeRevision && (!App.runtimeSettings || runtimeRevision > Number(App.runtimeSettings.applied_revision || 0))) refreshRuntimeSettings();
+  if (s.runtime_config_rejection) {
+    const feedback = $("#runtime-feedback");
+    if (feedback) { feedback.textContent = `Rejected: ${s.runtime_config_rejection}`; feedback.classList.add("bad"); }
+  }
 }
 function fmtEvent(ev) {
   const key = Object.keys(ev)[0]; const v = ev[key] || {}; let cls = "", body = key;
   switch (key) {
     case "SegmentFinished": body = `segment ${shorten(v.segment_id,18)} → ${v.status}`; if (v.status==="failed") cls="bad"; else if (v.status==="needs_review") cls="warn"; break;
     case "SegmentStarted": body = `segment ${shorten(v.segment_id,18)} started`; break;
-    case "RequestStarted": body = `request started (${v.active_requests}/${v.target_concurrency})`; break;
+    case "RequestStarted": { const audit = [v.runtime_config_revision == null ? null : `r${v.runtime_config_revision}`, v.provider_max_attempts == null ? null : `${v.provider_max_attempts} attempts`].filter(Boolean).join(" - "); body = `request started (${v.active_requests}/${v.target_concurrency})${audit ? " - " + audit : ""}`; break; }
     case "RequestFinished": body = `request ${v.status} · ${v.latency_ms}ms`; if (v.status!=="ok"&&v.status!=="succeeded") cls="warn"; break;
     case "StageStarted": body = `stage: ${v.stage}`; break;
     case "StageFinished": body = `stage complete: ${v.stage}`; break;
@@ -2117,6 +2595,8 @@ function fmtEvent(ev) {
     case "JobResumed": body = `resumed`; cls="good"; break;
     case "CheckpointFlushed": body = `checkpoint flushed (${v.flushed_count})`; break;
     case "ConcurrencyChanged": body = `concurrency ${v.previous} → ${v.current} (${v.reason})`; break;
+    case "RuntimeConfigChanged": body = `runtime r${v.revision}: ${(v.changed_fields || []).join(", ") || "updated"} -> ${(v.application || []).join(", ") || "next boundary"}`; cls="good"; break;
+    case "RuntimeConfigRejected": body = `runtime config rejected${v.revision == null ? "" : " r" + v.revision}: ${shorten(v.message || "invalid settings",90)}`; cls="bad"; break;
     case "Warning": body = `⚠ ${v.kind}: ${shorten(v.message,90)}`; cls="warn"; break;
     case "Error": body = `✗ ${v.kind}: ${shorten(v.message,90)}`; cls="bad"; break;
     case "TranslationFinished": body = `finished: ${v.succeeded} ok, ${v.cached} cached, ${v.needs_review} review, ${v.failed} failed`; cls="good"; break;
@@ -2160,7 +2640,12 @@ async function bfJobControl(id, command) {
       if (command === "pause") setProgressStatus("paused");
       if (command === "resume") setProgressStatus("running");
       if (command === "stop") setProgressStatus("stopped");
-      if (toast) toast.textContent = `${command} requested`;
+      let message = `${command} requested`;
+      if (command === "resume" && j.mode === "signaled") message = "Resume signaled to the live worker.";
+      if (command === "resume" && j.mode === "spawned") message = `Resume worker started${j.pid ? " (PID " + j.pid + ")" : ""}.`;
+      if (command === "resume" && j.mode === "launching") message = "A resume worker is already starting.";
+      if (toast) toast.textContent = message;
+      setTimeout(refreshRuntimeSettings, 350);
     } else {
       if (toast) toast.textContent = j.error || `${command} failed`;
     }
@@ -2193,11 +2678,11 @@ async function renderReview(stage) {
     doc = await r.json();
     if (!r.ok) { stage.innerHTML = `<div class="wrap"><div class="empty">${esc(doc.error || "Review is not available for this job.")}</div></div>`; return; }
   } catch (e) { stage.innerHTML = `<div class="wrap"><div class="empty">Could not load review.</div></div>`; return; }
-  App.review = { doc, idx: 0, filter: "all" };
+  App.review = { doc, idx: 0, filter: "all", hintOpen: false, hintText: "", notice: "" };
   drawReview();
 }
-function bfReviewPick(i) { App.review.idx = i; drawReview(); }
-function bfReviewNav(d) { const n = (App.review.doc.segments || []).length; App.review.idx = Math.max(0, Math.min(n - 1, App.review.idx + d)); drawReview(); }
+function bfReviewPick(i) { App.review.idx = i; App.review.hintOpen=false; App.review.hintText=""; App.review.notice=""; drawReview(); }
+function bfReviewNav(d) { const n = (App.review.doc.segments || []).length; App.review.idx = Math.max(0, Math.min(n - 1, App.review.idx + d)); App.review.hintOpen=false; App.review.hintText=""; App.review.notice=""; drawReview(); }
 function bfReviewFilter(f) { App.review.filter = f; drawReview(); }
 async function bfReviewFlag() {
   const R = App.review, seg = R.doc.segments[R.idx]; if (!seg) return;
@@ -2228,17 +2713,37 @@ async function bfReviewSave() {
   } catch (e) { if (status) status.textContent = e.message || "correction failed"; }
   finally { if (button) button.disabled = false; }
 }
-async function bfReviewRetry() {
+function bfReviewRetry() {
+  const R = App.review, seg = R && R.doc.segments[R.idx]; if (!seg || seg.human_corrected) return;
+  R.hintOpen = true;
+  const panel = $("#rev-hint-panel"), input = $("#rev-hint-text");
+  if (panel) panel.hidden = false;
+  if (input) { input.value = R.hintText || ""; input.focus(); }
+}
+function bfReviewRetryCancel() {
+  const R = App.review; if (!R) return;
+  R.hintOpen = false; R.hintText = "";
+  const panel = $("#rev-hint-panel"); if (panel) panel.hidden = true;
+}
+async function bfReviewStopForRetry() {
+  const status = $("#rev-save-status"); if (status) status.textContent = "requesting stop…";
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(App.selected)}/stop`, {method:"POST",headers:{[CSRF_HEADER]:CSRF_TOKEN}});
+    const body = await r.json(); if (!r.ok) throw new Error(body.error || "stop failed");
+    if (status) status.textContent = "Stop requested. Wait for the worker to stop, then queue the retry.";
+  } catch (e) { if (status) status.textContent = e.message || "stop failed"; }
+}
+async function bfReviewRetrySubmit() {
   const R = App.review, seg = R && R.doc.segments[R.idx]; if (!seg) return;
-  const guidance = window.prompt("Optional guidance for the next translation attempt:", "") ?? null;
-  if (guidance === null) return;
-  const status = $("#rev-save-status"); if (status) status.textContent = "marking segment for retry…";
+  const input = $("#rev-hint-text"), guidance = input ? input.value.trim() : "";
+  R.hintText = guidance;
+  const status = $("#rev-save-status"); if (status) status.textContent = "queuing segment retry…";
   try {
     const r = await fetch(`/api/jobs/${encodeURIComponent(App.selected)}/segments/${encodeURIComponent(seg.segment_id)}/retry`, {
       method:"POST", headers:{"Content-Type":"application/json",[CSRF_HEADER]:CSRF_TOKEN}, body:JSON.stringify({guidance})
     });
     const body = await r.json(); if (!r.ok) throw new Error(body.error || "retry request failed");
-    seg.status = "retry_pending"; if (status) status.textContent = `retry queued · resume ${App.selected}`; drawReview();
+    seg.status = "retry_pending"; R.hintOpen=false; R.hintText=""; R.notice=`Retry queued. Resume ${App.selected}.`; drawReview();
   } catch (e) { if (status) status.textContent = e.message || "retry request failed"; }
 }
 function drawReview() {
@@ -2270,12 +2775,13 @@ function drawReview() {
     const notes = (cur.soft_warnings || []).map(w =>
       `<div class="rev-note"><b>⚑ ${esc((w.kind || "note").replace(/_/g, " "))}</b> — ${esc(w.message || "")}</div>`).join("");
     const blockEditors = (cur.blocks || []).map(block => `<div class="rev-block"><div class="rev-block-id">${esc(block.block_id)}</div><textarea class="rev-edit" data-block-id="${esc(block.block_id)}">${esc(block.target_text || "")}</textarea></div>`).join("");
+    const hintPanel = `<div class="rev-hint" id="rev-hint-panel" ${R.hintOpen ? "" : "hidden"}><label for="rev-hint-text">Guidance for the next translation attempt (optional)</label><textarea id="rev-hint-text" oninput="App.review.hintText=this.value" placeholder="Explain terminology, tone, or a specific correction.">${esc(R.hintText || "")}</textarea><div class="note">Stop the job before queuing a retry. Running and paused jobs reject retry changes.</div><div class="actions"><button class="btn btn-primary" onclick="bfReviewRetrySubmit()">Queue retry</button><button class="btn btn-ghost" onclick="bfReviewRetryCancel()">Cancel</button><button class="btn btn-ghost" onclick="bfReviewStopForRetry()">Stop job</button></div></div>`;
     main = `<div class="rev-bar"><span class="ref">${esc(ref)} · ${esc(cur.status)}${cur.human_corrected ? " · manual" : ""}</span>
         <div class="rev-nav"><button class="rev-flag ${flagged ? "on" : ""}" onclick="bfReviewFlag()">⚑ ${flagged ? "Flagged" : "Flag"}</button>
           <button class="rev-btn" onclick="bfReviewNav(-1)">←</button><button class="rev-btn" onclick="bfReviewNav(1)">→</button></div></div>
       <div class="rev-cols scr">
         <div class="rev-col"><div class="cl">Source · ${esc(doc.source_language || "auto")}</div><div class="rev-text">${esc(cur.source_text)}</div></div>
-        <div class="rev-col tgt"><div class="cl">Translation · ${esc(doc.target_language)}</div>${blockEditors}<div class="rev-save-row"><button class="btn btn-primary" id="rev-save" onclick="bfReviewSave()">Save & rebuild</button><button class="btn btn-ghost" onclick="bfReviewRetry()" ${cur.human_corrected ? "disabled" : ""}>Re-translate with hint</button><span class="rev-save-status" id="rev-save-status">${cur.human_corrected ? "human correction saved" : ""}</span></div>${notes}</div>
+        <div class="rev-col tgt"><div class="cl">Translation · ${esc(doc.target_language)}</div>${blockEditors}<div class="rev-save-row"><button class="btn btn-primary" id="rev-save" onclick="bfReviewSave()">Save & rebuild</button><button class="btn btn-ghost" onclick="bfReviewRetry()" ${cur.human_corrected ? "disabled" : ""}>Re-translate with hint</button><span class="rev-save-status" id="rev-save-status">${R.notice || (cur.human_corrected ? "human correction saved" : "")}</span></div>${hintPanel}${notes}</div>
       </div>`;
   }
   $("#stage").innerHTML = `<div class="review">
@@ -2443,6 +2949,7 @@ mod tests {
             host_port: 8765,
             keys: Arc::new(Mutex::new(HashMap::new())),
             store_path: default_store_path(),
+            resume_launches: None,
         }
     }
 
@@ -2653,23 +3160,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_endpoint_rejects_missing_dashboard_token() {
+    async fn control_endpoints_reject_missing_dashboard_token() {
         use axum::{body::Body, http::Request};
         use tower::ServiceExt;
 
-        let response = dashboard_router(test_state("token-123"))
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/jobs/not-real/pause")
-                    .header("host", TEST_HOST)
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("route should respond");
+        let router = dashboard_router(test_state("token-123"));
+        for command in ["pause", "resume", "stop"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/jobs/not-real/{command}"))
+                        .header("host", TEST_HOST)
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("route should respond");
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{command}");
+        }
     }
 
     #[tokio::test]
@@ -2798,6 +3309,24 @@ mod tests {
         ] {
             assert!(DASHBOARD_HTML.contains(marker), "missing {marker}");
         }
+    }
+
+    #[test]
+    fn dashboard_ships_runtime_editor_and_inline_retry_guidance() {
+        for marker in [
+            "function drawRuntimeSettings",
+            "function bfSaveRuntimeSettings",
+            "RuntimeConfigChanged",
+            "function bfReviewRetrySubmit",
+            "Stop the job before queuing a retry",
+            "function bfReviewStopForRetry",
+        ] {
+            assert!(DASHBOARD_HTML.contains(marker), "missing {marker}");
+        }
+        assert!(
+            !DASHBOARD_HTML.contains("window.prompt"),
+            "retry guidance must use the inline editor"
+        );
     }
 
     #[test]
@@ -3025,6 +3554,8 @@ mod tests {
             bilingual_css: None,
             fallback: None,
             finalize: bookforge_core::run_snapshot::FinalizeCheckpointSnapshot::default(),
+            qa_mode: "off".to_string(),
+            validate_output: false,
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
         store
@@ -3070,6 +3601,384 @@ mod tests {
             )
             .await
             .expect("route should respond")
+    }
+
+    async fn get_route(router: &Router, uri: &str) -> Response {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("host", TEST_HOST)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond")
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        serde_json::from_slice(&bytes).expect("response should be JSON")
+    }
+
+    fn make_stopped_fixture_resumable(fixture: &MutationFixture) {
+        let store = JobStore::open(&fixture.store_path).expect("store should reopen");
+        store
+            .request_segment_retry(&fixture.job_id, &fixture.segment_b, None)
+            .expect("completed segment should become retry-pending");
+        store
+            .mark_job_stopped(&fixture.job_id)
+            .expect("job should become stopped");
+    }
+
+    fn clean_runtime_files(job_id: &str) {
+        let _ = std::fs::remove_dir_all(bookforge_core::run_dir_for_job(job_id));
+    }
+
+    #[tokio::test]
+    async fn dashboard_reconfigure_is_typed_revisioned_and_csrf_protected() {
+        let fixture = build_mutation_fixture();
+        make_stopped_fixture_resumable(&fixture);
+        clean_runtime_files(&fixture.job_id);
+        let router = dashboard_router(test_state_with_store(
+            &fixture.csrf,
+            fixture.store_path.clone(),
+        ));
+        let uri = format!("/api/jobs/{}/reconfigure", fixture.job_id);
+
+        let initial = get_route(&router, &uri).await;
+        assert_eq!(initial.status(), StatusCode::OK);
+        let initial = response_json(initial).await;
+        assert_eq!(initial["revision"], 0);
+        assert_eq!(initial["applied_revision"], 0);
+        assert_eq!(initial["application_state"], "resume_required");
+        assert_eq!(initial["lease"]["state"], "missing");
+        assert_eq!(initial["identity"]["provider"], "mock");
+        assert_eq!(initial["identity"]["model"], "mock-identity");
+        assert_eq!(initial["editable"], true);
+
+        let body = json!({ "concurrency": 2 });
+        let missing = post_json(&router, &uri, None, body.clone()).await;
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+        let wrong = post_json(&router, &uri, Some("wrong-token"), body).await;
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !crate::commands::reconfigure::overrides_path_for_job(&fixture.job_id).exists(),
+            "rejected mutations must not create a sidecar"
+        );
+
+        let unknown = post_json(
+            &router,
+            &uri,
+            Some(&fixture.csrf),
+            json!({ "model": "immutable-model" }),
+        )
+        .await;
+        assert!(unknown.status().is_client_error());
+        assert!(
+            !crate::commands::reconfigure::overrides_path_for_job(&fixture.job_id).exists(),
+            "unknown or immutable fields must not create a sidecar"
+        );
+
+        let first = post_json(
+            &router,
+            &uri,
+            Some(&fixture.csrf),
+            json!({
+                "batch_max_output_tokens": 12000,
+                "batch_max_items": 2,
+                "batch_target_tokens": 3000,
+                "concurrency": 2,
+                "qa": "all",
+                "double_check": "Formatting",
+                "validate_output": true,
+                "provider_max_attempts": 5,
+                "adaptive_concurrency": false,
+                "adaptive_batch_sizing": false
+            }),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = response_json(first).await;
+        assert_eq!(first["revision"], 1);
+        assert_eq!(first["effective"]["concurrency"], 2);
+        assert_eq!(first["effective"]["qa"], "all");
+        assert_eq!(first["effective"]["double_check"], "Formatting");
+        assert_eq!(first["effective"]["validate_output"], true);
+        assert_eq!(first["application_state"], "resume_required");
+        let fields = first["changed_fields"]
+            .as_array()
+            .expect("changed fields should be an array");
+        assert!(fields.iter().any(|field| field == "concurrency"));
+        assert!(fields.iter().any(|field| field == "qa"));
+        let boundaries = first["next_boundary"]
+            .as_array()
+            .expect("boundaries should be an array");
+        for boundary in ["next_request", "next_batch", "next_stage"] {
+            assert!(boundaries.iter().any(|value| value == boundary));
+        }
+
+        let second = post_json(
+            &router,
+            &uri,
+            Some(&fixture.csrf),
+            json!({ "concurrency": 3 }),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second = response_json(second).await;
+        assert_eq!(second["revision"], 2);
+        assert_eq!(second["effective"]["concurrency"], 3);
+        assert_eq!(second["effective"]["batch_max_items"], 2);
+
+        let replayed = response_json(get_route(&router, &uri).await).await;
+        assert_eq!(replayed["revision"], 2);
+        assert_eq!(replayed["effective"]["concurrency"], 3);
+
+        clean_runtime_files(&fixture.job_id);
+    }
+
+    #[tokio::test]
+    async fn dashboard_controls_require_a_fresh_lease_and_signal_one_when_present() {
+        let fixture = build_mutation_fixture();
+        make_stopped_fixture_resumable(&fixture);
+        clean_runtime_files(&fixture.job_id);
+        let router = dashboard_router(test_state_with_store(
+            &fixture.csrf,
+            fixture.store_path.clone(),
+        ));
+
+        for command in ["pause", "stop"] {
+            let response = post_json(
+                &router,
+                &format!("/api/jobs/{}/{}", fixture.job_id, command),
+                Some(&fixture.csrf),
+                json!({}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let payload = response_json(response).await;
+            assert!(
+                payload["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("no live worker")
+            );
+        }
+
+        let lease = crate::control::RuntimeLease {
+            schema_version: 1,
+            instance_id: "dashboard-test-worker".to_string(),
+            pid: std::process::id(),
+            process_started_at_ms: bookforge_core::now_ms(),
+            heartbeat_at_ms: bookforge_core::now_ms(),
+            last_loaded_revision: 4,
+            last_applied_revision: 4,
+        };
+        let runtime_path = crate::control::runtime_path_for_job(&fixture.job_id);
+        std::fs::create_dir_all(runtime_path.parent().expect("runtime parent"))
+            .expect("runtime directory should exist");
+        std::fs::write(
+            &runtime_path,
+            serde_json::to_vec_pretty(&lease).expect("lease should serialize"),
+        )
+        .expect("lease should write");
+
+        let view = response_json(
+            get_route(
+                &router,
+                &format!("/api/jobs/{}/reconfigure", fixture.job_id),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(view["lease"]["state"], "fresh");
+        assert_eq!(view["live"], true);
+        assert_eq!(view["applied_revision"], 4);
+
+        let resume = post_json(
+            &router,
+            &format!("/api/jobs/{}/resume", fixture.job_id),
+            Some(&fixture.csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(resume.status(), StatusCode::OK);
+        let resume = response_json(resume).await;
+        assert_eq!(resume["mode"], "signaled");
+        assert_eq!(
+            bookforge_core::read_control_file(&bookforge_core::control_path_for_job(
+                &fixture.job_id
+            ))
+            .expect("control file should read"),
+            bookforge_core::ControlCommand::Resume
+        );
+
+        clean_runtime_files(&fixture.job_id);
+    }
+
+    #[tokio::test]
+    async fn dashboard_missing_worker_resume_launches_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = build_mutation_fixture();
+        make_stopped_fixture_resumable(&fixture);
+        clean_runtime_files(&fixture.job_id);
+        let launches = Arc::new(AtomicUsize::new(0));
+        let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+        state.resume_launches = Some(launches.clone());
+        let router = dashboard_router(state);
+        let uri = format!("/api/jobs/{}/resume", fixture.job_id);
+
+        let (first, second) = tokio::join!(
+            post_json(&router, &uri, Some(&fixture.csrf), json!({})),
+            post_json(&router, &uri, Some(&fixture.csrf), json!({}))
+        );
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        let first = response_json(first).await;
+        let second = response_json(second).await;
+        let modes = [
+            first["mode"].as_str().unwrap_or_default(),
+            second["mode"].as_str().unwrap_or_default(),
+        ];
+        assert!(modes.contains(&"spawned"));
+        assert!(modes.contains(&"launching"));
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            1,
+            "the atomic launch claim must deduplicate concurrent Resume clicks"
+        );
+
+        clean_runtime_files(&fixture.job_id);
+    }
+
+    #[tokio::test]
+    async fn dashboard_resume_recognizes_finalize_only_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = build_mutation_fixture();
+        let store = JobStore::open(&fixture.store_path).expect("store should reopen");
+        assert!(
+            store
+                .resumable_segment_ids(&fixture.job_id)
+                .expect("segment lookup should succeed")
+                .is_empty(),
+            "the fixture should have no translation work left"
+        );
+        store
+            .mark_job_stopped(&fixture.job_id)
+            .expect("job should become stopped during finalization");
+        clean_runtime_files(&fixture.job_id);
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+        state.resume_launches = Some(launches.clone());
+        let router = dashboard_router(state);
+
+        let view = response_json(
+            get_route(
+                &router,
+                &format!("/api/jobs/{}/reconfigure", fixture.job_id),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(view["resumable_work"], true);
+        assert_eq!(view["editable"], true);
+
+        let response = post_json(
+            &router,
+            &format!("/api/jobs/{}/resume", fixture.job_id),
+            Some(&fixture.csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["mode"], "spawned");
+        assert_eq!(response["forced"], false);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+
+        clean_runtime_files(&fixture.job_id);
+    }
+
+    #[tokio::test]
+    async fn dashboard_resume_forces_relaunch_of_a_dead_paused_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = build_mutation_fixture();
+        let store = JobStore::open(&fixture.store_path).expect("store should reopen");
+        store
+            .mark_job_paused(&fixture.job_id)
+            .expect("job should become paused");
+        clean_runtime_files(&fixture.job_id);
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+        state.resume_launches = Some(launches.clone());
+        let router = dashboard_router(state);
+        let response = post_json(
+            &router,
+            &format!("/api/jobs/{}/resume", fixture.job_id),
+            Some(&fixture.csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["mode"], "spawned");
+        assert_eq!(response["forced"], true);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+
+        clean_runtime_files(&fixture.job_id);
+    }
+
+    #[tokio::test]
+    async fn dashboard_resume_rejects_a_completed_job_without_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = build_mutation_fixture();
+        clean_runtime_files(&fixture.job_id);
+        let launches = Arc::new(AtomicUsize::new(0));
+        let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+        state.resume_launches = Some(launches.clone());
+        let router = dashboard_router(state);
+
+        let view = response_json(
+            get_route(
+                &router,
+                &format!("/api/jobs/{}/reconfigure", fixture.job_id),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(view["resumable_work"], false);
+        assert_eq!(view["editable"], false);
+
+        let response = post_json(
+            &router,
+            &format!("/api/jobs/{}/resume", fixture.job_id),
+            Some(&fixture.csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response_json(response).await["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no resumable work")
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+
+        clean_runtime_files(&fixture.job_id);
     }
 
     #[tokio::test]

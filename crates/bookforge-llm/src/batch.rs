@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque, hash_map::Entry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc},
+    sync::{Semaphore, TryAcquireError, mpsc},
     task::JoinSet,
 };
 
@@ -17,7 +17,7 @@ use crate::{
     CompletionRequest, FinishReason, LlmError, LlmProvider, PromptLibrary, ProviderRateController,
     RequestMetadata, RequestStatus, ResponseFormat, SegmentTranslation, Substitutions,
     TelemetryLog, TranslationRunConfig,
-    concurrency::{PauseSignal, PauseState},
+    concurrency::{AdaptiveLimiter, AdaptivePermit, PauseSignal, PauseState},
 };
 
 enum BatchWorkerResult {
@@ -33,7 +33,7 @@ struct BatchWorkerOutput {
     max_output_tokens: u32,
     output_escalated: bool,
     next_max_output_tokens: Option<u32>,
-    request_permit: Option<OwnedSemaphorePermit>,
+    request_permit: Option<AdaptivePermit>,
 }
 
 struct RepairWorkerOutput {
@@ -396,9 +396,13 @@ impl BatchModeSizing {
             max_items: initial_max_items,
             initial_target_tokens,
             initial_max_items,
-            min_tokens: mode.min_tokens(),
+            // Explicit user/runtime limits below the adaptive defaults are
+            // still authoritative. They become the floor for this sizing
+            // epoch; adaptation may grow from them but must not silently
+            // clamp them upward on construction.
+            min_tokens: initial_target_tokens.min(mode.min_tokens()).max(1),
             max_tokens: mode.max_tokens(),
-            min_items: mode.min_items(),
+            min_items: initial_max_items.min(mode.min_items()).max(1),
             max_items_cap: mode.max_items_cap(),
             recent: VecDeque::new(),
             last_increase: None,
@@ -1261,6 +1265,55 @@ fn split_batch_with_config(
     batches
 }
 
+fn take_batch_output_override(
+    overrides_by_item: &mut HashMap<String, u32>,
+    batch: &TranslationBatch,
+) -> Option<u32> {
+    batch
+        .items
+        .iter()
+        .filter_map(|item| overrides_by_item.remove(&item.item_id))
+        .max()
+}
+
+fn set_batch_output_override(
+    overrides_by_item: &mut HashMap<String, u32>,
+    batch: &TranslationBatch,
+    max_output_tokens: u32,
+) {
+    for item in &batch.items {
+        overrides_by_item.insert(item.item_id.clone(), max_output_tokens);
+    }
+}
+
+fn increment_batch_item_attempts(
+    attempts_by_item: &mut HashMap<String, usize>,
+    batch: &TranslationBatch,
+) -> usize {
+    let next = batch
+        .items
+        .iter()
+        .filter_map(|item| attempts_by_item.get(&item.item_id).copied())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    for item in &batch.items {
+        attempts_by_item.insert(item.item_id.clone(), next);
+    }
+    next
+}
+
+fn adaptive_sizer_mut<'a>(
+    runtime_sizer: &'a mut Option<(u64, bool, BatchSizer)>,
+    fallback: Option<&'a mut BatchSizer>,
+) -> Option<&'a mut BatchSizer> {
+    match runtime_sizer {
+        Some((_, true, sizer)) => Some(sizer),
+        Some((_, false, _)) => None,
+        None => fallback,
+    }
+}
+
 fn normalize_batch_for_current_sizer(
     batch: TranslationBatch,
     sizer: Option<&BatchSizer>,
@@ -1276,6 +1329,46 @@ fn normalize_batch_for_current_sizer(
         return vec![batch];
     }
     repack_batch_with_config(batch, target_tokens, max_items, config)
+}
+
+fn repartition_pending_batches(
+    pending: &mut VecDeque<TranslationBatch>,
+    sizer: &BatchSizer,
+    config: Option<&TranslationRunConfig>,
+    revision: u64,
+) {
+    if pending.is_empty() {
+        return;
+    }
+
+    let mut groups = Vec::<TranslationBatch>::new();
+    for batch in pending.drain(..) {
+        if let Some(group) = groups.last_mut()
+            && group.mode == batch.mode
+            && group.kind == batch.kind
+            && group.section_id == batch.section_id
+        {
+            group.items.extend(batch.items);
+            group.token_estimate = batch_token_estimate(&group.items, config);
+            continue;
+        }
+        groups.push(batch);
+    }
+
+    let mut rebuilt = VecDeque::new();
+    for (group_index, mut group) in groups.into_iter().enumerate() {
+        group.id = format!("runtime_r{revision}_{group_index}");
+        group.token_estimate = batch_token_estimate(&group.items, config);
+        let target_tokens = sizer.target_tokens_for_mode(group.mode);
+        let max_items = sizer.max_items_for_mode(group.mode);
+        rebuilt.extend(repack_batch_with_config(
+            group,
+            target_tokens,
+            max_items,
+            config,
+        ));
+    }
+    *pending = rebuilt;
 }
 
 #[cfg(test)]
@@ -1467,9 +1560,15 @@ where
             .collect::<HashMap<_, _>>(),
     );
     let config = Arc::new(config.clone());
-    let concurrency = config.scheduler.concurrency.max(1);
     let pause_signal = config.pause_signal.clone();
-    let request_semaphore = Arc::new(Semaphore::new(concurrency));
+    let initial_concurrency = config.scheduler.concurrency.max(1);
+    let request_limiter = Arc::new(AdaptiveLimiter::new_with_bounds(
+        initial_concurrency,
+        1,
+        Semaphore::MAX_PERMITS,
+        Duration::ZERO,
+        Some(progress.clone()),
+    ));
 
     let all_items: HashMap<String, TranslationBatchItem> = batches
         .iter()
@@ -1495,11 +1594,13 @@ where
     let mut all_results: Vec<BatchTranslationResult> = Vec::new();
     let mut pending: Vec<TranslationBatch> = batches;
     let max_rounds = 3usize;
-    let mut single_invalid_attempts: HashMap<String, usize> = HashMap::new();
-    let mut transient_attempts: HashMap<String, usize> = HashMap::new();
-    let mut escalated_output_tokens: HashMap<String, u32> = HashMap::new();
+    let mut single_invalid_attempts_by_item: HashMap<String, usize> = HashMap::new();
+    let mut transient_attempts_by_item: HashMap<String, usize> = HashMap::new();
+    let mut escalated_output_tokens_by_item: HashMap<String, u32> = HashMap::new();
     let mut truncation_alert = TruncationAlertState::default();
     let mut stop_dispatch = false;
+    let mut runtime_sizer: Option<(u64, bool, BatchSizer)> = None;
+    let mut repartitioned_revision: Option<u64> = None;
 
     for _round in 0..max_rounds {
         if pending.is_empty() || stop_dispatch {
@@ -1517,22 +1618,85 @@ where
             while !pending_queue.is_empty() && !stop_dispatch {
                 if let Some(signal) = pause_signal.as_ref() {
                     on_control_boundary(signal)?;
-                    if signal.state() == PauseState::Stopped {
-                        stop_dispatch = true;
-                        break;
+                    match signal.state() {
+                        PauseState::Running => {}
+                        PauseState::Paused => break,
+                        PauseState::Stopped => {
+                            stop_dispatch = true;
+                            break;
+                        }
                     }
+                }
+
+                let runtime_snapshot = config
+                    .runtime_settings
+                    .as_ref()
+                    .map(|receiver| receiver.borrow().clone());
+                if let Some(runtime) = runtime_snapshot.as_ref() {
+                    if request_limiter.current() != runtime.concurrency {
+                        request_limiter.set_target(runtime.concurrency.max(1), "runtime_config");
+                    }
+                    if runtime.revision > 0
+                        && runtime_sizer
+                            .as_ref()
+                            .is_none_or(|(revision, _, _)| *revision != runtime.revision)
+                    {
+                        runtime_sizer = Some((
+                            runtime.revision,
+                            runtime.batch.adaptive_sizing,
+                            BatchSizer::with_progress(
+                                runtime.batch.target_tokens,
+                                runtime.batch.max_items,
+                                progress.clone(),
+                            ),
+                        ));
+                    }
+                    if runtime.revision > 0
+                        && repartitioned_revision != Some(runtime.revision)
+                        && let Some((_, _, sizer)) = runtime_sizer.as_ref()
+                    {
+                        repartition_pending_batches(
+                            &mut pending_queue,
+                            sizer,
+                            Some(config.as_ref()),
+                            runtime.revision,
+                        );
+                        repartitioned_revision = Some(runtime.revision);
+                    }
+                }
+
+                let dispatch_concurrency = runtime_snapshot
+                    .as_ref()
+                    .map(|runtime| runtime.concurrency)
+                    .unwrap_or(config.scheduler.concurrency)
+                    .max(1);
+                if tasks.len() >= dispatch_concurrency {
+                    break;
                 }
 
                 let Some(batch) = pending_queue.pop_front() else {
                     break;
                 };
-                let output_override = escalated_output_tokens.remove(&batch.id);
-                let mut normalized = normalize_batch_for_current_sizer(
-                    batch,
-                    batch_sizer.as_deref(),
-                    Some(config.as_ref()),
-                );
+                let pending_output_override =
+                    take_batch_output_override(&mut escalated_output_tokens_by_item, &batch);
+                let active_sizer = runtime_sizer
+                    .as_ref()
+                    .map(|(_, _, sizer)| sizer)
+                    .or(batch_sizer.as_deref());
+                let mut normalized =
+                    normalize_batch_for_current_sizer(batch, active_sizer, Some(config.as_ref()));
+                if let Some(output_override) = pending_output_override {
+                    for part in &normalized {
+                        set_batch_output_override(
+                            &mut escalated_output_tokens_by_item,
+                            part,
+                            output_override,
+                        );
+                    }
+                }
                 let batch = normalized.remove(0);
+                let output_override =
+                    take_batch_output_override(&mut escalated_output_tokens_by_item, &batch);
                 for extra in normalized.into_iter().rev() {
                     pending_queue.push_front(extra);
                 }
@@ -1545,9 +1709,10 @@ where
                 let provider = provider.clone();
                 let library = library.clone();
                 let config = config.clone();
+                let runtime_settings = config.runtime_settings.clone();
                 let rate_controller = rate_controller.clone();
                 let progress = progress.clone();
-                let request_semaphore = request_semaphore.clone();
+                let request_limiter = request_limiter.clone();
                 let section_titles = section_titles.clone();
                 let pause_signal = pause_signal.clone();
 
@@ -1577,6 +1742,12 @@ where
                         };
                     }
                     let request_permit = loop {
+                        if let Some(receiver) = runtime_settings.as_ref() {
+                            let target = receiver.borrow().concurrency.max(1);
+                            if request_limiter.current() != target {
+                                request_limiter.set_target(target, "runtime_config");
+                            }
+                        }
                         if let Some(signal) = pause_signal.as_ref()
                             && signal.wait_until_running_or_stopped().await == PauseState::Stopped
                         {
@@ -1591,7 +1762,7 @@ where
                                 request_permit: None,
                             };
                         }
-                        match request_semaphore.clone().try_acquire_owned() {
+                        match request_limiter.try_acquire() {
                             Ok(permit) => break permit,
                             Err(TryAcquireError::NoPermits) => {
                                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1613,7 +1784,13 @@ where
                         }
                     };
 
-                    let permit = match rate_controller.as_ref() {
+                    let adaptive_concurrency = runtime_settings
+                        .as_ref()
+                        .map(|receiver| receiver.borrow().adaptive_concurrency)
+                        // Existing library callers express the enabled state by
+                        // supplying a controller and no runtime receiver.
+                        .unwrap_or_else(|| rate_controller.is_some());
+                    let permit = match rate_controller.as_ref().filter(|_| adaptive_concurrency) {
                         Some(controller) => match controller.acquire().await {
                             Ok(permit) => Some(permit),
                             Err(_) => {
@@ -1633,6 +1810,15 @@ where
                         },
                         None => None,
                     };
+
+                    let mut effective_config = config.as_ref().clone();
+                    if let Some(receiver) = runtime_settings.as_ref() {
+                        let runtime = receiver.borrow().clone();
+                        effective_config.scheduler.concurrency = runtime.concurrency.max(1);
+                        effective_config.batch_max_output_tokens = runtime.batch_max_output_tokens;
+                        effective_config.runtime_settings = Some(runtime.frozen_receiver());
+                    }
+                    let config = Arc::new(effective_config);
 
                     let context_pairs = match strict_context_pairs {
                         Some(pairs) => pairs,
@@ -1656,6 +1842,8 @@ where
                         .flatten();
 
                     let request_id = format!("batch_{}", batch.id);
+                    let (runtime_config_revision, provider_max_attempts) =
+                        config.request_runtime_metadata();
                     progress.emit(bookforge_core::ProgressEvent::RequestStarted {
                         request_id: request_id.clone(),
                         batch_id: Some(batch.id.clone()),
@@ -1668,6 +1856,8 @@ where
                         max_output_tokens: Some(max_output_tokens),
                         active_requests: 0,
                         target_concurrency: config.scheduler.concurrency,
+                        runtime_config_revision,
+                        provider_max_attempts,
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
 
@@ -1698,6 +1888,20 @@ where
                         request_permit: Some(request_permit),
                     }
                 });
+            }
+
+            if tasks.is_empty() {
+                if stop_dispatch || pending_queue.is_empty() {
+                    continue;
+                }
+                if let Some(signal) = pause_signal.as_ref()
+                    && signal.state() == PauseState::Paused
+                    && wait_for_batch_resume_or_stop(signal, &mut on_control_boundary).await?
+                        == PauseState::Stopped
+                {
+                    stop_dispatch = true;
+                }
+                continue;
             }
 
             let joined = match pause_signal.as_ref() {
@@ -1792,14 +1996,21 @@ where
                 error_kind: None,
             });
 
-            if let Some(ref controller) = rate_controller {
+            let adaptive_concurrency = config
+                .runtime_settings
+                .as_ref()
+                .map(|receiver| receiver.borrow().adaptive_concurrency)
+                .unwrap_or_else(|| rate_controller.is_some());
+            if let Some(controller) = rate_controller.as_ref().filter(|_| adaptive_concurrency) {
                 controller.observe(request_status, latency_ms);
             }
 
             match result {
                 Ok(batch_result) => {
                     truncation_alert.observe_resolved();
-                    if let Some(ref mut sizer) = batch_sizer {
+                    if let Some(sizer) =
+                        adaptive_sizer_mut(&mut runtime_sizer, batch_sizer.as_deref_mut())
+                    {
                         sizer.on_success_for_mode(batch.mode, latency_ms);
                     }
                     // Publish completed segments to the context registry as
@@ -1872,7 +2083,11 @@ where
                         ),
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
-                    escalated_output_tokens.insert(batch.id.clone(), next_max_output_tokens);
+                    set_batch_output_override(
+                        &mut escalated_output_tokens_by_item,
+                        &batch,
+                        next_max_output_tokens,
+                    );
                     pending_queue.push_back(batch);
                 }
                 Err(LlmError::InvalidResponse(_)) if batch.kind == BatchKind::Repair => {
@@ -1918,7 +2133,9 @@ where
                 Err(error @ LlmError::InvalidResponse(_))
                     if request_status == RequestStatus::Truncated && batch.items.len() == 1 =>
                 {
-                    if let Some(ref mut sizer) = batch_sizer {
+                    if let Some(sizer) =
+                        adaptive_sizer_mut(&mut runtime_sizer, batch_sizer.as_deref_mut())
+                    {
                         sizer.on_truncation_for_mode(batch.mode);
                     }
                     truncation_alert.observe_unresolved(&progress);
@@ -1958,11 +2175,9 @@ where
                 }
                 Err(error @ LlmError::InvalidResponse(_)) if batch.items.len() == 1 => {
                     truncation_alert.observe_resolved();
-                    let attempts = single_invalid_attempts
-                        .entry(batch.id.clone())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                    if *attempts < config.scheduler.max_attempts.max(1) {
+                    let attempts =
+                        increment_batch_item_attempts(&mut single_invalid_attempts_by_item, &batch);
+                    if attempts < config.scheduler.max_attempts.max(1) {
                         progress.emit(bookforge_core::ProgressEvent::Warning {
                             kind: "single_item_batch_invalid_response_retry".to_string(),
                             message: format!(
@@ -2009,7 +2224,9 @@ where
                     }
                 }
                 Err(LlmError::InvalidResponse(_)) if batch.items.len() > 1 => {
-                    if let Some(ref mut sizer) = batch_sizer {
+                    if let Some(sizer) =
+                        adaptive_sizer_mut(&mut runtime_sizer, batch_sizer.as_deref_mut())
+                    {
                         if request_status == RequestStatus::Truncated {
                             sizer.on_truncation_for_mode(batch.mode);
                         } else {
@@ -2052,11 +2269,9 @@ where
                 }
                 Err(ref error) if is_transient(error) && batch.kind == BatchKind::Translation => {
                     truncation_alert.observe_resolved();
-                    let attempts = transient_attempts
-                        .entry(batch.id.clone())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                    if *attempts < config.scheduler.max_attempts.max(1) {
+                    let attempts =
+                        increment_batch_item_attempts(&mut transient_attempts_by_item, &batch);
+                    if attempts < config.scheduler.max_attempts.max(1) {
                         progress.emit(bookforge_core::ProgressEvent::Warning {
                             kind: "batch_transient_retry".to_string(),
                             message: format!(
@@ -2319,7 +2534,19 @@ where
         let mut repair_tasks = JoinSet::<RepairWorkerOutput>::new();
 
         while !repair_batches.is_empty() || !repair_tasks.is_empty() {
-            while repair_tasks.len() < concurrency {
+            loop {
+                let runtime_snapshot = config
+                    .runtime_settings
+                    .as_ref()
+                    .map(|receiver| receiver.borrow().clone());
+                let concurrency = runtime_snapshot
+                    .as_ref()
+                    .map(|runtime| runtime.concurrency)
+                    .unwrap_or(config.scheduler.concurrency)
+                    .max(1);
+                if repair_tasks.len() >= concurrency {
+                    break;
+                }
                 let Some(repair_batch) = repair_batches.pop_front() else {
                     break;
                 };
@@ -2331,7 +2558,13 @@ where
 
                 let provider = provider.clone();
                 let library = library.clone();
-                let config = config.clone();
+                let mut task_config = config.as_ref().clone();
+                if let Some(runtime) = runtime_snapshot {
+                    task_config.scheduler.concurrency = runtime.concurrency.max(1);
+                    task_config.batch_max_output_tokens = runtime.batch_max_output_tokens;
+                    task_config.runtime_settings = Some(runtime.frozen_receiver());
+                }
+                let config = Arc::new(task_config);
                 let repair_errors = repair_errors.clone();
                 let progress = progress.clone();
                 let section_titles = section_titles.clone();
@@ -2342,6 +2575,8 @@ where
                     let max_output_tokens =
                         capped_batch_max_output_tokens(&repair_batch, &config, is_reasoning);
                     let request_id = format!("batch_{}", repair_batch.id);
+                    let (runtime_config_revision, provider_max_attempts) =
+                        config.request_runtime_metadata();
 
                     progress.emit(bookforge_core::ProgressEvent::RequestStarted {
                         request_id: request_id.clone(),
@@ -2355,6 +2590,8 @@ where
                         max_output_tokens: Some(max_output_tokens),
                         active_requests: 0,
                         target_concurrency: config.scheduler.concurrency,
+                        runtime_config_revision,
+                        provider_max_attempts,
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
 
@@ -2410,7 +2647,21 @@ where
                                     response_format: ResponseFormat::Json,
                                     temperature: 0.1,
                                     max_output_tokens: Some(max_output_tokens),
-                                    metadata: RequestMetadata::default(),
+                                    metadata: RequestMetadata {
+                                        segment_id: Some(format!("batch_{}", repair_batch.id)),
+                                        block_ids: repair_batch
+                                            .items
+                                            .iter()
+                                            .map(|item| item.block_id.0.clone())
+                                            .collect(),
+                                        prompt_template: Some(repair_template.name.clone()),
+                                        prompt_version: Some(repair_template.version.clone()),
+                                        provider: Some(config.provider.clone()),
+                                        model: Some(config.model.clone()),
+                                        source_checksum: None,
+                                        runtime_config_revision,
+                                        provider_max_attempts,
+                                    },
                                 })
                                 .await
                             {
@@ -2753,6 +3004,7 @@ async fn translate_one_batch(
 
     let max_tokens = max_output_tokens_override
         .unwrap_or_else(|| capped_batch_max_output_tokens(&batch, config, provider.is_reasoning()));
+    let (runtime_config_revision, provider_max_attempts) = config.request_runtime_metadata();
 
     let response = provider
         .complete(CompletionRequest {
@@ -2769,6 +3021,8 @@ async fn translate_one_batch(
                 provider: Some(config.provider.clone()),
                 model: Some(config.model.clone()),
                 source_checksum: None,
+                runtime_config_revision,
+                provider_max_attempts,
             },
         })
         .await;
@@ -3980,6 +4234,7 @@ mod tests {
         assert_eq!(split[1].items.len(), 2);
     }
 
+    use crate::EngineRuntimeSettings;
     use crate::provider::{
         CompletionRequest, CompletionResponse, LlmProvider as LlmProviderTrait,
         ProviderCapabilities, Result as ProviderResult,
@@ -4159,6 +4414,7 @@ mod tests {
             style: None,
             entities: None,
             pause_signal: None,
+            runtime_settings: None,
         }
     }
 
@@ -4732,6 +4988,66 @@ mod tests {
         }
     }
 
+    type CapturedRequestBudgets = Arc<Mutex<Vec<(usize, Option<u32>)>>>;
+
+    #[derive(Clone)]
+    struct GatedPromptEchoProvider {
+        started: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Semaphore>,
+        budgets: CapturedRequestBudgets,
+    }
+
+    impl GatedPromptEchoProvider {
+        fn new() -> Self {
+            Self {
+                started: Arc::new(AtomicUsize::new(0)),
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+                budgets: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl LlmProviderTrait for GatedPromptEchoProvider {
+        async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+            let request_index = self.started.fetch_add(1, Ordering::AcqRel);
+            self.budgets
+                .lock()
+                .unwrap()
+                .push((request_index, request.max_output_tokens));
+            self.release
+                .acquire()
+                .await
+                .expect("test gate should remain open")
+                .forget();
+            let item_ids = item_ids_from_batch_prompt(&request.user);
+            Ok(CompletionResponse {
+                content: serde_json::json!({
+                    "items": item_ids
+                        .into_iter()
+                        .map(|id| serde_json::json!({
+                            "id": id,
+                            "translation": format!("[it] {id}"),
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+                .to_string(),
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(1),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 0,
+                raw: serde_json::json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
     fn item_ids_from_batch_prompt(user_prompt: &str) -> Vec<String> {
         let Some(after_input) = user_prompt.split("Input:\n").nth(1) else {
             return Vec::new();
@@ -5070,5 +5386,406 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(10), run)
             .await
             .expect("batch scheduler must not deadlock");
+    }
+
+    #[tokio::test]
+    async fn live_batch_settings_bound_dispatch_and_update_later_request_budget() {
+        let segment = make_segment(
+            "seg_live",
+            (0..4)
+                .map(|index| plain_block(&format!("text_{index}")))
+                .collect(),
+            vec![],
+        );
+        let segments = vec![segment];
+        let batch_config = BatchConfig {
+            enabled: true,
+            target_tokens: 16_000,
+            max_items: 1,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches =
+            build_translation_batches(&segments, &batch_config, TranslationProfile::Balanced);
+        assert_eq!(batches.len(), 4);
+
+        let provider = GatedPromptEchoProvider::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut config = test_run_config();
+        config.scheduler.concurrency = 2;
+        let mut runtime = EngineRuntimeSettings {
+            revision: 1,
+            batch: batch_config,
+            batch_max_output_tokens: Some(256),
+            concurrency: 2,
+            provider_max_attempts: 1,
+            adaptive_concurrency: false,
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
+        config.runtime_settings = Some(receiver);
+
+        let run_provider = provider.clone();
+        let run_segments = segments.clone();
+        let run_events = events.clone();
+        let run = tokio::spawn(async move {
+            translate_batches_with_callback(
+                run_provider,
+                batches,
+                &run_segments,
+                &config,
+                Arc::new(TelemetryLog::new()),
+                None,
+                None,
+                Arc::new(RecordingProgress { events: run_events }),
+                None,
+                |_| Ok(()),
+            )
+            .await
+            .expect("batch translation should finish")
+        });
+
+        wait_for_atomic_count(&provider.started, 2).await;
+        runtime.revision = 2;
+        runtime.concurrency = 1;
+        runtime.batch_max_output_tokens = Some(1_024);
+        sender.send_replace(runtime);
+        provider.release.add_permits(2);
+
+        wait_for_atomic_count(&provider.started, 3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            provider.started.load(Ordering::Acquire),
+            3,
+            "fourth batch must wait after the live concurrency shrink"
+        );
+
+        provider.release.add_permits(1);
+        wait_for_atomic_count(&provider.started, 4).await;
+        provider.release.add_permits(1);
+        let translations = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("run should finish")
+            .expect("task should join");
+        assert_eq!(translations.len(), 1);
+        let mut indexed_budgets = provider.budgets.lock().unwrap().clone();
+        indexed_budgets.sort_unstable_by_key(|(request_index, _)| *request_index);
+        let budgets = indexed_budgets
+            .into_iter()
+            .map(|(_, budget)| budget)
+            .collect::<Vec<_>>();
+        assert_eq!(budgets.len(), 4);
+        assert_eq!(budgets[..2], [Some(256), Some(256)]);
+        assert_eq!(budgets[2..], [Some(512), Some(512)]);
+        let request_revisions = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                bookforge_core::ProgressEvent::RequestStarted {
+                    runtime_config_revision,
+                    provider_max_attempts,
+                    ..
+                } => Some((*runtime_config_revision, *provider_max_attempts)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            request_revisions,
+            vec![
+                (Some(1), Some(1)),
+                (Some(1), Some(1)),
+                (Some(2), Some(1)),
+                (Some(2), Some(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_batch_revision_merges_only_unstarted_items() {
+        let segment = make_segment(
+            "seg_repartition",
+            (0..4)
+                .map(|index| plain_block(&format!("text_{index}")))
+                .collect(),
+            vec![],
+        );
+        let segments = vec![segment];
+        let batch_config = BatchConfig {
+            enabled: true,
+            target_tokens: 16_000,
+            max_items: 1,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches =
+            build_translation_batches(&segments, &batch_config, TranslationProfile::Balanced);
+        assert_eq!(batches.len(), 4);
+
+        let provider = GatedPromptEchoProvider::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut config = test_run_config();
+        config.scheduler.concurrency = 1;
+        let mut runtime = EngineRuntimeSettings {
+            revision: 1,
+            batch: batch_config,
+            batch_max_output_tokens: None,
+            concurrency: 1,
+            provider_max_attempts: 1,
+            adaptive_concurrency: false,
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
+        config.runtime_settings = Some(receiver);
+
+        let run_provider = provider.clone();
+        let run_segments = segments.clone();
+        let run_events = events.clone();
+        let run = tokio::spawn(async move {
+            translate_batches_with_callback(
+                run_provider,
+                batches,
+                &run_segments,
+                &config,
+                Arc::new(TelemetryLog::new()),
+                None,
+                None,
+                Arc::new(RecordingProgress { events: run_events }),
+                None,
+                |_| Ok(()),
+            )
+            .await
+            .expect("batch translation should finish")
+        });
+
+        wait_for_atomic_count(&provider.started, 1).await;
+        runtime.revision = 2;
+        runtime.batch.max_items = 3;
+        sender.send_replace(runtime);
+        provider.release.add_permits(1);
+
+        wait_for_atomic_count(&provider.started, 2).await;
+        provider.release.add_permits(1);
+        let translations = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("run should finish")
+            .expect("task should join");
+        assert_eq!(translations.len(), 1);
+        assert_eq!(
+            provider.started.load(Ordering::Acquire),
+            2,
+            "the three unstarted one-item batches should merge into one request"
+        );
+        let request_shapes = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                bookforge_core::ProgressEvent::RequestStarted {
+                    items,
+                    runtime_config_revision,
+                    ..
+                } => Some((*items, *runtime_config_revision)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(request_shapes, vec![(1, Some(1)), (3, Some(2))]);
+    }
+
+    #[tokio::test]
+    async fn paused_batch_reconfigure_repartitions_before_resume_dispatch() {
+        let segment = make_segment(
+            "seg_paused_repartition",
+            (0..4)
+                .map(|index| plain_block(&format!("text_{index}")))
+                .collect(),
+            vec![],
+        );
+        let segments = vec![segment];
+        let batch_config = BatchConfig {
+            enabled: true,
+            target_tokens: 16_000,
+            max_items: 1,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches =
+            build_translation_batches(&segments, &batch_config, TranslationProfile::Balanced);
+        assert_eq!(batches.len(), 4);
+
+        let provider = GatedPromptEchoProvider::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let signal = crate::PauseSignal::new();
+        signal.pause();
+        let mut config = test_run_config();
+        config.scheduler.concurrency = 1;
+        config.pause_signal = Some(signal.clone());
+        let mut runtime = EngineRuntimeSettings {
+            revision: 1,
+            batch: batch_config,
+            batch_max_output_tokens: None,
+            concurrency: 1,
+            provider_max_attempts: 1,
+            adaptive_concurrency: false,
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
+        config.runtime_settings = Some(receiver);
+
+        let run_provider = provider.clone();
+        let run_segments = segments.clone();
+        let run_events = events.clone();
+        let run = tokio::spawn(async move {
+            translate_batches_with_callback(
+                run_provider,
+                batches,
+                &run_segments,
+                &config,
+                Arc::new(TelemetryLog::new()),
+                None,
+                None,
+                Arc::new(RecordingProgress { events: run_events }),
+                None,
+                |_| Ok(()),
+            )
+            .await
+            .expect("batch translation should finish")
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(provider.started.load(Ordering::Acquire), 0);
+        runtime.revision = 2;
+        runtime.batch.max_items = 4;
+        runtime.provider_max_attempts = 3;
+        sender.send_replace(runtime);
+        signal.resume();
+
+        wait_for_atomic_count(&provider.started, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            provider.started.load(Ordering::Acquire),
+            1,
+            "all pending items should repartition into the new one-request shape"
+        );
+        provider.release.add_permits(1);
+        let translations = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("run should finish")
+            .expect("task should join");
+        assert_eq!(translations.len(), 1);
+        let request_shapes = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                bookforge_core::ProgressEvent::RequestStarted {
+                    items,
+                    runtime_config_revision,
+                    provider_max_attempts,
+                    ..
+                } => Some((*items, *runtime_config_revision, *provider_max_attempts)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(request_shapes, vec![(4, Some(2), Some(3))]);
+    }
+
+    #[tokio::test]
+    async fn live_adaptive_concurrency_enable_gates_later_requests() {
+        let segment = make_segment(
+            "seg_adaptive_live",
+            (0..4)
+                .map(|index| plain_block(&format!("text_{index}")))
+                .collect(),
+            vec![],
+        );
+        let segments = vec![segment];
+        let batch_config = BatchConfig {
+            enabled: true,
+            target_tokens: 16_000,
+            max_items: 1,
+            adaptive_sizing: false,
+            split_on_json_failure: true,
+            repair_invalid_items: true,
+        };
+        let batches =
+            build_translation_batches(&segments, &batch_config, TranslationProfile::Balanced);
+
+        let provider = GatedPromptEchoProvider::new();
+        let mut config = test_run_config();
+        config.scheduler.concurrency = 2;
+        let mut runtime = EngineRuntimeSettings {
+            revision: 1,
+            batch: batch_config,
+            batch_max_output_tokens: None,
+            concurrency: 2,
+            provider_max_attempts: 1,
+            adaptive_concurrency: false,
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
+        config.runtime_settings = Some(receiver);
+        let adaptive_limiter = Arc::new(AdaptiveLimiter::new_with_bounds(
+            1,
+            1,
+            4,
+            Duration::ZERO,
+            None,
+        ));
+        let controller = Arc::new(ProviderRateController::new(
+            adaptive_limiter,
+            crate::RateControllerConfig::for_target(1),
+        ));
+
+        let run_provider = provider.clone();
+        let run_segments = segments.clone();
+        let run = tokio::spawn(async move {
+            translate_batches_with_callback(
+                run_provider,
+                batches,
+                &run_segments,
+                &config,
+                Arc::new(TelemetryLog::new()),
+                Some(controller),
+                None,
+                Arc::new(bookforge_core::NullProgressSink),
+                None,
+                |_| Ok(()),
+            )
+            .await
+            .expect("batch translation should finish")
+        });
+
+        wait_for_atomic_count(&provider.started, 2).await;
+        runtime.revision = 2;
+        runtime.adaptive_concurrency = true;
+        sender.send_replace(runtime);
+        provider.release.add_permits(2);
+
+        wait_for_atomic_count(&provider.started, 3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            provider.started.load(Ordering::Acquire),
+            3,
+            "enabling the one-permit adaptive gate must hold the fourth request"
+        );
+        provider.release.add_permits(1);
+        wait_for_atomic_count(&provider.started, 4).await;
+        provider.release.add_permits(1);
+
+        let translations = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("run should finish")
+            .expect("task should join");
+        assert_eq!(translations.len(), 1);
+    }
+
+    async fn wait_for_atomic_count(value: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while value.load(Ordering::Acquire) < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("request count should be reached");
     }
 }

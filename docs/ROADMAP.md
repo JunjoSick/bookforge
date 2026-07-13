@@ -2540,10 +2540,12 @@ blocker for the non-developer audience.
 
 #### 10.1.3 Mini-spec: On-the-fly settings reconfiguration (added 2026-07-06, owner-approved)
 
-> **Implemented on main after v2.3.0; scheduled for v2.4.0.** The current
-> implementation is CLI-first and deliberately retains the stopped/dead-paused
-> resume boundary described below. True in-process application is follow-up
-> work, together with the dashboard surface.
+> **Implemented for v2.4.0 on the project-remediation branch.** Revisioned
+> overrides now apply in-process at request, unstarted-batch, and finalize-stage
+> boundaries. The CLI and dashboard share validation and persistence; a runtime
+> lease lets dashboard Resume signal a live worker or launch one replacement
+> after stop/crash. Automated acceptance is complete; the selected real-provider
+> run remains part of the final release gate.
 
 **Goal.** Adjust *cache-safe* run settings on an existing (initially: paused)
 job and have `resume` apply them — without starting a fresh run and losing
@@ -2563,21 +2565,20 @@ seam to amend them.
    toggles.
 2. **Persistence: an overrides sidecar.** Write
    `.bookforge/runs/<job-id>/overrides.json` (additive, no migration — matches
-   the control-file architecture from §10.1.1). On `resume` (and on a live
-   run's next batch boundary, if feasible later), merge the overrides over the
-   loaded `RunConfigSnapshot`.
-   For v1, live fast-resume of an already-paused process cannot apply pending
-   overrides because that process keeps its in-memory scheduler settings. Stop
-   the paused run first and then `resume`, or use `resume --force` only when the
-   paused process is already gone; full live application remains deferred.
+   the control-file architecture from §10.1.1). A long-lived runtime watcher
+   validates and publishes immutable snapshots to the live scheduler. Resume
+   preloads the same durable document before its first dispatch, so stopped and
+   crashed workers use identical effective settings without a startup race.
 3. **Guardrails — reject cache-affecting settings.** Only settings that change
    *how remaining work is scheduled/budgeted* are mutable. Immutable
    (would make partial output inconsistent or invalidate the cache):
    provider, model, source/target language, profile, context window/scope,
    prompt version, glossary/style/entity inputs. Attempting to change these
    fails with a clear message explaining a fresh run is required and why.
-4. **Surfaces.** CLI now. Dashboard later: the Advanced panel, editable on a
-   paused job's Progress screen (pairs with §10.1.2).
+4. **Surfaces.** The CLI, status output, additive progress events, terminal UI,
+   and the dashboard Progress screen expose the effective revision. The
+   dashboard editor is available for running, paused, and stopped jobs with
+   unfinished translation or finalize work.
 
 **Acceptance.**
 1. Reconfigure a paused job's `--batch-max-output-tokens` + `--batch-max-items`,
@@ -2588,9 +2589,9 @@ seam to amend them.
 3. Overrides are auditable (visible in `status`), additive, and a job with no
    overrides resumes exactly as today.
 
-**Out of scope (for v1):** live reconfiguration of a *running* (non-paused)
-job mid-batch; changing the model/provider mid-job; reconfiguring completed
-jobs.
+**Out of scope:** mutating an in-flight provider request or an already-started
+finalize stage; changing model/provider or any cache-affecting identity;
+reconfiguring completed jobs.
 
 **Effort:** ~1 day CLI + snapshot-merge. **Priority:** high — small, and it
 removes a real "lost all my progress to change one number" cliff.

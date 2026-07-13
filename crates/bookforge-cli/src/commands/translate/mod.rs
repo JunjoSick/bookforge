@@ -42,7 +42,7 @@ use crate::LanguageArgs;
 use crate::{
     ProviderArgs as CliProviderArgs, QaMode,
     checkpoint::{CheckpointCommand, CheckpointSender, CheckpointWriter},
-    commands::glossary::read_glossary_file,
+    commands::{glossary::read_glossary_file, reconfigure},
     default_output_path,
 };
 
@@ -600,13 +600,17 @@ async fn run_mock_translation(
     )?;
     let pause_signal = bookforge_llm::PauseSignal::new();
     let stop_cancel_token = tokio_util::sync::CancellationToken::new();
-    let _control_watcher = crate::control::ControlFileWatcher::spawn_with_stop_cancel(
+    let control_watcher = crate::control::ControlFileWatcher::spawn_with_stop_cancel(
         store.path().to_path_buf(),
         job.id.clone(),
         progress.clone(),
         pause_signal.clone(),
         stop_cancel_token.clone(),
+        settings.clone(),
+        cli_args.qa,
+        cli_args.validate_output,
     );
+    let job_runtime_settings = control_watcher.job_runtime_settings();
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
         target_language: config.target_language.clone(),
@@ -626,6 +630,7 @@ async fn run_mock_translation(
         style: style.run_config.clone(),
         entities: entities.run_config.clone(),
         pause_signal: Some(pause_signal.clone()),
+        runtime_settings: Some(control_watcher.runtime_settings()),
     }; // mock
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     let mut translations = apply_cached_translations(
@@ -680,13 +685,15 @@ async fn run_mock_translation(
         print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
         return Ok(());
     }
+    let qa_runtime = job_runtime_settings.borrow().clone();
+    let qa_run_config = crate::control::freeze_run_config_for_stage(&run_config, &qa_runtime);
     let qa_reviews = qa_reviews_for_mode(
         ProgressRequestProvider::new(provider.clone(), progress.clone()),
         &segments,
         &translations,
-        &run_config,
-        &settings.qa,
-        cli_args.qa,
+        &qa_run_config,
+        &qa_runtime.settings.qa,
+        qa_runtime.qa,
     )
     .await;
     if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
@@ -717,7 +724,10 @@ async fn run_mock_translation(
         print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
         return Ok(());
     }
-    if settings.double_check.mode != DoubleCheckMode::Off
+    let double_check_runtime = job_runtime_settings.borrow().clone();
+    let double_check_run_config =
+        crate::control::freeze_run_config_for_stage(&run_config, &double_check_runtime);
+    if double_check_runtime.settings.double_check.mode != DoubleCheckMode::Off
         && !snapshot.finalize.double_check_complete
     {
         println!("Double-check: auditing translations...");
@@ -725,8 +735,8 @@ async fn run_mock_translation(
             ProgressRequestProvider::new(provider.clone(), progress.clone()),
             &segments,
             &translations,
-            &run_config,
-            &settings.double_check,
+            &double_check_run_config,
+            &double_check_runtime.settings.double_check,
         )
         .await
         {
@@ -746,7 +756,7 @@ async fn run_mock_translation(
         persist_corrected_translations(
             &store,
             &job.id,
-            &run_config,
+            &double_check_run_config,
             &translations,
             &changed_segment_ids,
         )?;
@@ -770,6 +780,7 @@ async fn run_mock_translation(
             return Ok(());
         }
     }
+    let validation_runtime = job_runtime_settings.borrow().clone();
     print_summary_rebuild_and_report(
         &store,
         &job,
@@ -779,13 +790,14 @@ async fn run_mock_translation(
         &qa_reviews,
         config,
         &rebuild_options,
-        cli_args.validate_output,
+        validation_runtime.validate_output,
         cli_args.strict_epubcheck,
         human_stdout_enabled(cli_args.ui),
     )?;
     let summary = store
         .summary(&job.id)?
         .ok_or_else(|| anyhow::anyhow!("job '{}' summary unavailable", job.id))?;
+    reconfigure::clear_overrides_for_job(&job.id)?;
     progress.emit(bookforge_core::ProgressEvent::ArtifactWritten {
         path: config.output.display().to_string(),
         timestamp_ms: bookforge_core::progress::now_ms(),
@@ -995,13 +1007,17 @@ async fn run_openai_compatible_translation(
         &cache_namespace,
     )?;
     let pause_signal = bookforge_llm::PauseSignal::new();
-    let _control_watcher = crate::control::ControlFileWatcher::spawn_with_stop_cancel(
+    let control_watcher = crate::control::ControlFileWatcher::spawn_with_stop_cancel(
         store.path().to_path_buf(),
         job.id.clone(),
         progress.clone(),
         pause_signal.clone(),
         cancel_token.clone(),
+        settings.clone(),
+        cli_args.qa,
+        cli_args.validate_output,
     );
+    let job_runtime_settings = control_watcher.job_runtime_settings();
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
         target_language: config.target_language.clone(),
@@ -1021,6 +1037,7 @@ async fn run_openai_compatible_translation(
         style: style.run_config.clone(),
         entities: entities.run_config.clone(),
         pause_signal: Some(pause_signal.clone()),
+        runtime_settings: Some(control_watcher.runtime_settings()),
     };
     let mut translations = apply_cached_translations(
         &segments,
@@ -1083,6 +1100,7 @@ async fn run_openai_compatible_translation(
         progress.clone(),
         started,
         &mut snapshot,
+        &job_runtime_settings,
     )
     .await?;
 
@@ -1120,6 +1138,7 @@ async fn finish_translation_pipeline(
     progress: Arc<dyn bookforge_core::ProgressSink>,
     started: std::time::Instant,
     snapshot: &mut RunConfigSnapshot,
+    job_runtime_settings: &tokio::sync::watch::Receiver<crate::control::JobRuntimeSettings>,
 ) -> Result<()> {
     translations.sort_by_key(|t| t.ordinal);
 
@@ -1137,13 +1156,16 @@ async fn finish_translation_pipeline(
         print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
         return Ok(());
     }
+    let qa_runtime = job_runtime_settings.borrow().clone();
+    let qa_run_config =
+        crate::control::freeze_run_config_for_stage(&controlled_run_config, &qa_runtime);
     let qa_reviews = qa_reviews_for_mode(
         ProgressRequestProvider::new(provider.clone(), progress.clone()),
         segments,
         translations,
-        &controlled_run_config,
-        &settings.qa,
-        cli_args.qa,
+        &qa_run_config,
+        &qa_runtime.settings.qa,
+        qa_runtime.qa,
     )
     .await;
 
@@ -1176,6 +1198,9 @@ async fn finish_translation_pipeline(
         print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
         return Ok(());
     }
+    let double_check_runtime = job_runtime_settings.borrow().clone();
+    let double_check_run_config =
+        crate::control::freeze_run_config_for_stage(&controlled_run_config, &double_check_runtime);
     if !snapshot.finalize.double_check_complete
         && run_double_check_pass(DoubleCheckPass {
             provider,
@@ -1185,8 +1210,8 @@ async fn finish_translation_pipeline(
             translations,
             store,
             job_id: &job.id,
-            config: &controlled_run_config,
-            settings,
+            config: &double_check_run_config,
+            settings: &double_check_runtime.settings,
             progress: progress.clone(),
         })
         .await?
@@ -1212,6 +1237,7 @@ async fn finish_translation_pipeline(
             return Ok(());
         }
     }
+    let validation_runtime = job_runtime_settings.borrow().clone();
     print_summary_rebuild_and_report(
         store,
         job,
@@ -1221,13 +1247,14 @@ async fn finish_translation_pipeline(
         &qa_reviews,
         config,
         rebuild_options,
-        cli_args.validate_output,
+        validation_runtime.validate_output,
         cli_args.strict_epubcheck,
         human_stdout_enabled(cli_args.ui),
     )?;
     let summary = store
         .summary(&job.id)?
         .ok_or_else(|| anyhow::anyhow!("job '{}' summary unavailable", job.id))?;
+    reconfigure::clear_overrides_for_job(&job.id)?;
     progress.emit(bookforge_core::ProgressEvent::ArtifactWritten {
         path: config.output.display().to_string(),
         timestamp_ms: bookforge_core::progress::now_ms(),
@@ -1319,6 +1346,8 @@ where
                 max_output_tokens,
                 active_requests: 1,
                 target_concurrency: 1,
+                runtime_config_revision: metadata.runtime_config_revision,
+                provider_max_attempts: metadata.provider_max_attempts,
                 timestamp_ms: bookforge_core::progress::now_ms(),
             });
 
@@ -1465,7 +1494,11 @@ where
     use std::sync::Arc;
     let telemetry = Arc::new(TelemetryLog::new());
 
-    let rate_controller = if settings.adaptive_concurrency {
+    // Keep the adaptive controller alive even while disabled so a live
+    // revision can enable it at the next request boundary without rebuilding
+    // or losing its limiter state. The batch engine bypasses it while the
+    // current runtime snapshot has adaptive concurrency disabled.
+    let rate_controller = {
         let limiter = Arc::new(AdaptiveLimiter::new_with_bounds(
             settings.scheduler.concurrency.max(1),
             1,
@@ -1477,8 +1510,6 @@ where
             limiter,
             RateControllerConfig::for_target(settings.scheduler.concurrency.max(1)),
         )))
-    } else {
-        None
     };
 
     let mut batch_sizer = settings.batch.adaptive_sizing.then(|| {
@@ -1696,6 +1727,7 @@ pub(crate) async fn run_fallback_pass(
         style: primary_run_config.style.clone(),
         entities: primary_run_config.entities.clone(),
         pause_signal: Some(primary_run_config.pause_signal.clone().unwrap_or_default()),
+        runtime_settings: primary_run_config.runtime_settings.clone(),
     }; // fallback_run_config
 
     let writer = CheckpointWriter::spawn(store.path().to_path_buf(), Arc::new(NullProgressSink));
@@ -2560,6 +2592,7 @@ mod tests {
             style: None,
             entities: None,
             pause_signal: None,
+            runtime_settings: None,
         };
 
         let error = translate_with_scheduler_guard(
@@ -2668,6 +2701,7 @@ mod tests {
             style: None,
             entities: None,
             pause_signal: None,
+            runtime_settings: None,
         };
         let mut control = crate::control::ControlFilePoller::new_with_path(
             &store,

@@ -230,6 +230,24 @@ pub(crate) enum QaMode {
     All,
 }
 
+impl QaMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Suspicious => "suspicious",
+            Self::All => "all",
+        }
+    }
+
+    pub(crate) fn from_snapshot(value: &str) -> Self {
+        match value {
+            "suspicious" => Self::Suspicious,
+            "all" => Self::All,
+            _ => Self::Off,
+        }
+    }
+}
+
 fn default_output_path(input: &std::path::Path, target: &str) -> PathBuf {
     let stem = input
         .file_stem()

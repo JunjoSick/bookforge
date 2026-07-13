@@ -1,7 +1,7 @@
 # Live reconfiguration design
 
-Status: accepted implementation plan for the v2.4 remediation milestone  
-Date: 2026-07-11  
+Status: implemented on `codex/project-remediation`; real-provider acceptance remains a release gate
+Date: accepted 2026-07-11; implementation verified 2026-07-13
 Source: `docs/codex-handoff-project-remediation-2026-07-10.md` and ROADMAP
 §§10.1.3–10.1.4
 
@@ -89,8 +89,10 @@ and resume.
 Add a CLI-owned `JobRuntimeSettings` containing:
 
 - revision and the complete effective `ResolvedRunSettings`;
-- QA mode and `validate_output`, which currently live outside that structure;
-- the validated override field names for audit/UI display.
+- QA mode and `validate_output`, which live outside that structure.
+
+The durable override document remains the source for validated changed-field
+names used by events and the dashboard.
 
 Derive an engine-facing `EngineRuntimeSettings` containing only batch config,
 target concurrency, provider attempt limit, and adaptive toggles. Add an
@@ -98,12 +100,12 @@ optional `tokio::sync::watch::Receiver<EngineRuntimeSettings>` to
 `TranslationRunConfig`. `None` preserves current behavior for library callers
 and existing tests.
 
-Refactor `ControlFileWatcher` into a long-lived `JobRuntimeWatcher`. It keeps one
-store/poller instance, watches both control and override sidecars, publishes
-only validated immutable snapshots, and emits a rejection once per invalid
-content hash. At each control boundary it reloads overrides before applying a
-Resume command, so a sequential reconfigure-then-resume cannot dispatch under
-the previous revision.
+Extend the existing `ControlFileWatcher` into the long-lived job runtime
+watcher. It keeps one store/poller instance, watches both control and override
+sidecars, publishes only validated immutable snapshots, and emits a rejection
+once per invalid content hash. At each control boundary it reloads overrides
+before applying a Resume command, so a sequential reconfigure-then-resume
+cannot dispatch under the previous revision.
 
 ### Boundary semantics
 
@@ -155,9 +157,10 @@ instance ID prevents a stale PID from being treated as the current worker.
 `POST /api/jobs/{id}/resume` then behaves as follows:
 
 - fresh lease: write the Resume control command and return `mode: "signaled"`;
-- stale/missing lease plus resumable segments: spawn the current executable as
-  `bookforge resume <id> --ui quiet`, return `mode: "spawned"`, and surface
-  startup failure;
+- stale/missing lease plus resumable translation or finalize work: spawn the
+  current executable as `bookforge resume <id> --ui quiet`, adding `--force`
+  for a dead paused worker, return `mode: "spawned"`, and surface startup
+  failure;
 - no resumable work: return an actionable 400 instead of pretending the job is
   running.
 
@@ -232,6 +235,29 @@ The existing `RuntimeConfigResolved` remains the initial full snapshot event.
   CSRF protections and use an isolated store;
 - a missing/stale worker makes dashboard Resume spawn one process exactly once
   (concurrent clicks are deduplicated by an atomic launch claim).
+
+### Automated implementation evidence (2026-07-13)
+
+- The engine suite passes 154 tests, including request snapshotting, live
+  single/batch concurrency and budget changes, pause/reconfigure/resume
+  ordering, stop precedence, channel closure, pending repartition, adaptive
+  naming, escalation, and limiter growth/shrink.
+- The CLI suite passes 159 unit, 45 lifecycle, and 16 round-trip tests. The
+  lifecycle coverage exercises live single/batch runs, finalize-stage
+  snapshots, stop/resume sidecar persistence, successful cleanup, and stale
+  crash leases. Dashboard route tests use an isolated store and cover typed
+  revisioned edits, CSRF/Host protection, lease-aware controls, finalize-only
+  work, dead-paused forced relaunch, launch deduplication, and completed-job
+  rejection.
+- `cargo fmt --all --check`, the exact all-target/all-feature CI clippy command
+  with warnings denied, and the Rust 1.88 workspace all-target check pass on
+  Windows. After replacing the documented fixed-sleep stop/resume flake with
+  an event-driven boundary, the clean linked workspace run passes in full:
+  159 CLI unit, 45 lifecycle, 16 round-trip, 59 core, 154 LLM, 31 PDF, and 34
+  store tests, plus EPUB and documentation tests.
+- The embedded dashboard JavaScript passes a Node syntax check. The earlier
+  manual correction/dashboard exercise remains green; the real-provider steps
+  below are intentionally deferred to the final release gate.
 
 ### Manual acceptance
 

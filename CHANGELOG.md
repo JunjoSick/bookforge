@@ -5,12 +5,25 @@
 BookForge main now carries a distinct development version so source builds
 cannot be confused with the published v2.3.0 artifacts.
 
-- Added cache-safe job reconfiguration through `bookforge reconfigure`, with
-  auditable overrides that apply when a stopped or dead paused job resumes.
+- Added revisioned, atomic live job reconfiguration through the CLI and the
+  dashboard. Cache-safe concurrency, request-budget, retry, adaptive sizing,
+  QA, double-check, and validation settings now apply at explicit request,
+  batch, or finalize-stage boundaries without changing in-flight requests or
+  retranslating completed segments.
+- Added worker leases and lease-aware dashboard controls: Resume signals a
+  live worker or safely launches one replacement for a stopped, crashed, or
+  dead-paused job, with concurrent launch attempts deduplicated.
+- Added durable, auditable human corrections and flags to the CLI and Review
+  dashboard. Corrected segments are frozen against model/QA/cache overwrites,
+  guided retries persist across resume, and retry guidance now uses an inline
+  editor with explicit Stop/Resume workflow.
+- Added Windows workspace CI, Dependabot coverage, RustSec auditing, and Rust
+  CodeQL analysis; the new workflows have been exercised on the v2.4 draft PR.
 - Added escalation-first handling for truncated batch responses and prominent
   systemic-truncation alerts across CLI, watch, and dashboard surfaces.
-- Fixed resume override handling, adaptive batch override propagation, stale
-  override cleanup, and dashboard wizard API-key retention.
+- Fixed resume override ordering, adaptive batch override propagation, stale
+  override cleanup, a stop/resume lifecycle timing race, and dashboard wizard
+  API-key retention.
 - Bumped the batch translate prompts (plain, marker-safe, run-preserving, and
   their compact variants) from v2 to v3 to teach models about a per-item
   `retry_guidance` field; the batch prompt cache tag moved from `batch_v2`

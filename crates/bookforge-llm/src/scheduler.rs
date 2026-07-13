@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bookforge_core::{
-    config::{ContextScope, TranslationProfile},
+    config::{BatchConfig, ContextScope, ResolvedRunSettings, TranslationProfile},
     glossary::{GlossaryFormat, GlossaryPromptTerm},
     ir::BlockId,
     scheduler::SchedulerConfig,
@@ -11,7 +11,10 @@ use bookforge_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinSet,
+};
 
 use crate::{
     concurrency::{PauseSignal, PauseState},
@@ -55,6 +58,52 @@ pub struct TranslationRunConfig {
     pub entities: Option<EntityRunConfig>,
     /// Cooperative control signal checked before dispatching each new segment.
     pub pause_signal: Option<PauseSignal>,
+    /// Optional live, cache-safe runtime settings. Each dispatcher snapshots
+    /// this receiver only at a documented request/batch boundary.
+    pub runtime_settings: Option<watch::Receiver<EngineRuntimeSettings>>,
+}
+
+impl TranslationRunConfig {
+    pub(crate) fn request_runtime_metadata(&self) -> (Option<u64>, Option<usize>) {
+        self.runtime_settings
+            .as_ref()
+            .map(|receiver| {
+                let runtime = receiver.borrow();
+                (
+                    Some(runtime.revision),
+                    Some(runtime.provider_max_attempts.max(1)),
+                )
+            })
+            .unwrap_or((None, None))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineRuntimeSettings {
+    pub revision: u64,
+    pub batch: BatchConfig,
+    pub batch_max_output_tokens: Option<u32>,
+    pub concurrency: usize,
+    pub provider_max_attempts: usize,
+    pub adaptive_concurrency: bool,
+}
+
+impl EngineRuntimeSettings {
+    pub fn from_resolved(revision: u64, settings: &ResolvedRunSettings) -> Self {
+        Self {
+            revision,
+            batch: settings.batch.clone(),
+            batch_max_output_tokens: settings.provider.batch_max_output_tokens,
+            concurrency: settings.scheduler.concurrency.max(1),
+            provider_max_attempts: settings.provider.provider_max_attempts.max(1),
+            adaptive_concurrency: settings.adaptive_concurrency,
+        }
+    }
+
+    pub(crate) fn frozen_receiver(self) -> watch::Receiver<Self> {
+        let (_sender, receiver) = watch::channel(self);
+        receiver
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,7 +590,6 @@ where
     let library = Arc::new(PromptLibrary::global().clone());
     let provider = Arc::new(provider);
     let config = Arc::new(config.clone());
-    let concurrency = config.scheduler.concurrency;
     let pause_signal = config.pause_signal.clone();
     let mut dispatch_segments = segments.to_vec();
     dispatch_segments.sort_by_key(|segment| segment.ordinal);
@@ -551,7 +599,7 @@ where
 
     let mut translations = Vec::with_capacity(segments.len());
     loop {
-        while !stop_dispatch && next_index < dispatch_segments.len() && tasks.len() < concurrency {
+        while !stop_dispatch && next_index < dispatch_segments.len() {
             if let Some(signal) = pause_signal.as_ref() {
                 on_control_boundary(signal)?;
                 match signal.state() {
@@ -571,11 +619,32 @@ where
                     PauseState::Paused => break,
                 }
             }
+            // A paused dispatcher may have waited while the watcher published
+            // a newer revision. Snapshot only after the control boundary so a
+            // Resume can never release work under the pre-pause settings.
+            let runtime_snapshot = config
+                .runtime_settings
+                .as_ref()
+                .map(|receiver| receiver.borrow().clone());
+            let concurrency = runtime_snapshot
+                .as_ref()
+                .map(|runtime| runtime.concurrency)
+                .unwrap_or(config.scheduler.concurrency)
+                .max(1);
+            if tasks.len() >= concurrency {
+                break;
+            }
 
             let segment = dispatch_segments[next_index].clone();
             next_index += 1;
             let provider = provider.clone();
-            let config = config.clone();
+            let mut task_config = config.as_ref().clone();
+            if let Some(runtime) = runtime_snapshot {
+                task_config.scheduler.concurrency = runtime.concurrency.max(1);
+                task_config.batch_max_output_tokens = runtime.batch_max_output_tokens;
+                task_config.runtime_settings = Some(runtime.frozen_receiver());
+            }
+            let config = Arc::new(task_config);
             let library = library.clone();
 
             tasks.spawn(async move {
@@ -700,6 +769,7 @@ where
     P: LlmProvider,
 {
     let rendered = render_qa_prompt(&library.qa, segment, translation, config)?;
+    let (runtime_config_revision, provider_max_attempts) = config.request_runtime_metadata();
     let response = provider
         .complete(CompletionRequest {
             system: rendered.system,
@@ -715,6 +785,8 @@ where
                 provider: Some(config.provider.clone()),
                 model: Some(config.model.clone()),
                 source_checksum: Some(segment.checksum.clone()),
+                runtime_config_revision,
+                provider_max_attempts,
             },
         })
         .await?;
@@ -976,6 +1048,7 @@ where
     let max_output_tokens = config
         .max_output_tokens
         .unwrap_or_else(|| max_output_tokens(segment, mode, provider.is_reasoning()));
+    let (runtime_config_revision, provider_max_attempts) = config.request_runtime_metadata();
     let request = CompletionRequest {
         system: rendered.system,
         user: rendered.user,
@@ -990,6 +1063,8 @@ where
             provider: Some(config.provider.clone()),
             model: Some(config.model.clone()),
             source_checksum: Some(segment.checksum.clone()),
+            runtime_config_revision,
+            provider_max_attempts,
         },
     };
     let response = provider.complete(request).await?;
@@ -1779,6 +1854,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_concurrency_shrink_bounds_later_segment_dispatch() {
+        let segments = (0..4)
+            .map(|ordinal| segment(&format!("seg_{ordinal}"), ordinal, vec![("b0", "Text")]))
+            .collect::<Vec<_>>();
+        let provider = GatedProvider::new();
+        let mut cfg = config();
+        cfg.scheduler.concurrency = 2;
+        let mut runtime = EngineRuntimeSettings {
+            revision: 1,
+            batch: TranslationProfile::V1Fast.resolve().batch,
+            batch_max_output_tokens: None,
+            concurrency: 2,
+            provider_max_attempts: 1,
+            adaptive_concurrency: false,
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
+        cfg.runtime_settings = Some(receiver);
+
+        let run_provider = provider.clone();
+        let run = tokio::spawn(async move {
+            translate_segments(run_provider, &segments, &cfg)
+                .await
+                .expect("translation should finish")
+        });
+
+        wait_for_request_count(&provider.started, 2).await;
+        runtime.revision = 2;
+        runtime.concurrency = 1;
+        sender.send_replace(runtime);
+        provider.release.add_permits(2);
+
+        wait_for_request_count(&provider.started, 3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            provider.started.load(Ordering::Acquire),
+            3,
+            "after shrinking to one, the fourth request must wait for the third"
+        );
+
+        provider.release.add_permits(1);
+        wait_for_request_count(&provider.started, 4).await;
+        provider.release.add_permits(1);
+        let translations = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("run should finish")
+            .expect("task should join");
+        assert_eq!(translations.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn pause_reconfigure_resume_dispatches_only_the_new_revision() {
+        let segments = (0..2)
+            .map(|ordinal| segment(&format!("seg_{ordinal}"), ordinal, vec![("b0", "Text")]))
+            .collect::<Vec<_>>();
+        let provider = GatedProvider::new();
+        let signal = PauseSignal::new();
+        signal.pause();
+        let mut cfg = config();
+        cfg.scheduler.concurrency = 1;
+        cfg.pause_signal = Some(signal.clone());
+        let mut runtime = EngineRuntimeSettings {
+            revision: 1,
+            batch: TranslationProfile::V1Fast.resolve().batch,
+            batch_max_output_tokens: Some(512),
+            concurrency: 1,
+            provider_max_attempts: 1,
+            adaptive_concurrency: false,
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
+        cfg.runtime_settings = Some(receiver);
+
+        let run_provider = provider.clone();
+        let run = tokio::spawn(async move {
+            translate_segments(run_provider, &segments, &cfg)
+                .await
+                .expect("translation should finish")
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(provider.started.load(Ordering::Acquire), 0);
+
+        runtime.revision = 2;
+        runtime.provider_max_attempts = 4;
+        sender.send_replace(runtime);
+        signal.resume();
+
+        wait_for_request_count(&provider.started, 1).await;
+        provider.release.add_permits(1);
+        wait_for_request_count(&provider.started, 2).await;
+        provider.release.add_permits(1);
+        let translations = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("run should finish")
+            .expect("task should join");
+        assert_eq!(translations.len(), 2);
+        let metadata = provider.metadata.lock().expect("metadata log mutex");
+        assert_eq!(metadata.len(), 2);
+        assert!(metadata.iter().all(|entry| {
+            entry.runtime_config_revision == Some(2) && entry.provider_max_attempts == Some(4)
+        }));
+    }
+
+    #[tokio::test]
+    async fn closed_runtime_channel_retains_its_last_snapshot() {
+        let mut cfg = config();
+        let runtime = EngineRuntimeSettings {
+            revision: 5,
+            batch: TranslationProfile::V1Fast.resolve().batch,
+            batch_max_output_tokens: Some(768),
+            concurrency: 1,
+            provider_max_attempts: 3,
+            adaptive_concurrency: false,
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(runtime);
+        cfg.runtime_settings = Some(receiver);
+        drop(sender);
+
+        assert_eq!(cfg.request_runtime_metadata(), (Some(5), Some(3)));
+        let translations = translate_segments(
+            MockProvider::new(MockMode::PrefixTarget, "Italian"),
+            &[segment("seg_a", 0, vec![("b0", "First")])],
+            &cfg,
+        )
+        .await
+        .expect("a closed sender must not fail an active run");
+        assert_eq!(translations.len(), 1);
+        assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn stop_wins_over_a_runtime_revision_before_dispatch() {
+        let provider = GatedProvider::new();
+        let signal = PauseSignal::new();
+        signal.stop();
+        let mut cfg = config();
+        cfg.pause_signal = Some(signal);
+        let mut runtime = EngineRuntimeSettings {
+            revision: 1,
+            batch: TranslationProfile::V1Fast.resolve().batch,
+            batch_max_output_tokens: None,
+            concurrency: 2,
+            provider_max_attempts: 1,
+            adaptive_concurrency: false,
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
+        cfg.runtime_settings = Some(receiver);
+        runtime.revision = 2;
+        runtime.concurrency = 4;
+        sender.send_replace(runtime);
+
+        let translations = translate_segments(
+            provider.clone(),
+            &[segment("seg_a", 0, vec![("b0", "First")])],
+            &cfg,
+        )
+        .await
+        .expect("stop should terminate dispatch cleanly");
+        assert!(translations.is_empty());
+        assert_eq!(provider.started.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
     async fn non_batch_context_waiters_do_not_consume_scheduler_permits() {
         let segments = vec![
             segment("seg_d", 3, vec![("b0", "Fourth")]),
@@ -2244,6 +2480,7 @@ mod tests {
             style: None,
             entities: None,
             pause_signal: None,
+            runtime_settings: None,
         }
     }
 
@@ -2317,6 +2554,58 @@ mod tests {
     struct BlockingProvider {
         started: Arc<AtomicUsize>,
         release: Arc<tokio::sync::Notify>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct GatedProvider {
+        started: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Semaphore>,
+        metadata: Arc<std::sync::Mutex<Vec<RequestMetadata>>>,
+    }
+
+    impl GatedProvider {
+        fn new() -> Self {
+            Self {
+                started: Arc::new(AtomicUsize::new(0)),
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+                metadata: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl LlmProvider for GatedProvider {
+        async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+            self.started.fetch_add(1, Ordering::AcqRel);
+            self.metadata
+                .lock()
+                .expect("metadata log mutex")
+                .push(request.metadata.clone());
+            self.release
+                .acquire()
+                .await
+                .expect("test gate should remain open")
+                .forget();
+            Ok(CompletionResponse {
+                content: serde_json::json!({
+                    "segment_id": request.metadata.segment_id.unwrap_or_default(),
+                    "translation": "Tradotto"
+                })
+                .to_string(),
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(1),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 0,
+                raw: serde_json::json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
     }
 
     impl BlockingProvider {

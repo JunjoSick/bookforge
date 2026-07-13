@@ -75,6 +75,13 @@ pub struct RequestMetadata {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub source_checksum: Option<String>,
+    /// Runtime override revision frozen at the request boundary. `None` is
+    /// retained for library callers that do not opt into live settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_config_revision: Option<u64>,
+    /// Provider-internal attempt limit frozen for this complete call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_max_attempts: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -771,7 +778,11 @@ impl LlmProvider for OpenAiCompatibleProvider {
             body["response_format"] = json!({"type": "json_object"});
         }
 
-        let max_attempts = self.config.provider_max_attempts.max(1);
+        let max_attempts = request
+            .metadata
+            .provider_max_attempts
+            .unwrap_or(self.config.provider_max_attempts)
+            .max(1);
         let body_len = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
         let max_backoff = Duration::from_secs(self.config.max_backoff_seconds);
         let policy = self.config.retry_after_policy;
@@ -1335,6 +1346,85 @@ mod tests {
                 .response_format_supported
                 .load(std::sync::atomic::Ordering::Relaxed),
             "response_format_supported should be false after 400 fallback"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn request_metadata_freezes_provider_attempts_per_call() {
+        use std::sync::{Arc, atomic::AtomicUsize};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let server_count = request_count.clone();
+        let server_handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                server_count.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 8_192];
+                let _ = stream.read(&mut buf).await;
+                let body = br#"{"error":{"message":"retry me"}}"#;
+                let header = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://{addr}"),
+            // Local providers intentionally permit an absent API key.
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            model: "test-model".to_string(),
+            timeout_seconds: 10,
+            provider_max_attempts: 6,
+            thinking_disabled: true,
+            retry_after_policy: RetryAfterPolicy::RespectHeader,
+            max_backoff_seconds: 1,
+            max_idle_per_host: 4,
+            json_mode: bookforge_core::JsonMode::PromptOnly,
+        })
+        .unwrap();
+        let request = |revision, attempts| CompletionRequest {
+            system: "translate".to_string(),
+            user: "hello".to_string(),
+            response_format: ResponseFormat::Json,
+            temperature: 0.2,
+            max_output_tokens: Some(256),
+            metadata: RequestMetadata {
+                runtime_config_revision: Some(revision),
+                provider_max_attempts: Some(attempts),
+                ..RequestMetadata::default()
+            },
+        };
+
+        provider
+            .complete(request(1, 2))
+            .await
+            .expect_err("the test server always fails");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+        provider
+            .complete(request(2, 4))
+            .await
+            .expect_err("the test server always fails");
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            6,
+            "the later call must use its new frozen attempt limit"
         );
 
         server_handle.abort();

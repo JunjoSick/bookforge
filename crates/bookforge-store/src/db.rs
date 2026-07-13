@@ -3363,6 +3363,8 @@ mod tests {
             bilingual_css: None,
             fallback: None,
             finalize: bookforge_core::run_snapshot::FinalizeCheckpointSnapshot::default(),
+            qa_mode: "off".to_string(),
+            validate_output: false,
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
 
@@ -3457,6 +3459,8 @@ mod tests {
             bilingual_css: None,
             fallback: None,
             finalize: bookforge_core::run_snapshot::FinalizeCheckpointSnapshot::default(),
+            qa_mode: "off".to_string(),
+            validate_output: false,
             settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
         };
 

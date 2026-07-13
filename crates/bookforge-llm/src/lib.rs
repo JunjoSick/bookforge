@@ -31,9 +31,9 @@ pub use rate_controller::{
     ProviderRateController, RateControllerConfig, RequestObservation, RequestStatus,
 };
 pub use scheduler::{
-    CompletedContext, ContextRegistry, ContextRunConfig, EntityRunConfig, GlossaryRunConfig,
-    QaIssue, QaSegmentReview, SegmentTranslation, StyleRunConfig, TranslationRunConfig,
-    qa_segments, translate_segments, translate_segments_with_callback,
+    CompletedContext, ContextRegistry, ContextRunConfig, EngineRuntimeSettings, EntityRunConfig,
+    GlossaryRunConfig, QaIssue, QaSegmentReview, SegmentTranslation, StyleRunConfig,
+    TranslationRunConfig, qa_segments, translate_segments, translate_segments_with_callback,
     translate_segments_with_control,
 };
 pub use telemetry::{TelemetryLog, telemetry_summary};
