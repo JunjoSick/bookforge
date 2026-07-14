@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.4.1 - 2026-07-14
+
+BookForge v2.4.1 is a security-gate maintenance release.
+
+- Replaced the yanked transitive `spin 0.9.8` lockfile entry with the
+  compatible, non-yanked `spin 0.9.9` release.
+- Granted the RustSec workflow the minimal Checks API permission it needs to
+  report audit results without turning dependency warnings into workflow
+  failures.
+- Added GitHub/Sigstore provenance attestations for release assets so users
+  can verify that downloads were produced by BookForge's release workflow.
+- Hardened the lifecycle release gate against child-process scheduling delays
+  on loaded Linux CI runners.
+
 ## v2.4.0 - 2026-07-13
 
 BookForge v2.4.0 closes the local review loop and makes safe runtime tuning
