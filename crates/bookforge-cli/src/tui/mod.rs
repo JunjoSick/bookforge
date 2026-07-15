@@ -141,6 +141,161 @@ pub struct TuiApp {
     status_message: Option<String>,
 }
 
+/// Static metadata shown by the attached audiobook dashboard.
+pub struct AudioTuiInfo {
+    pub title: String,
+    pub input: String,
+    pub output: String,
+    pub provider: String,
+    pub model: String,
+    pub voice: String,
+    pub total: usize,
+}
+
+/// Attached terminal dashboard for audiobook synthesis. The durable source of
+/// truth remains `manifest.json`; this renderer consumes the same per-chunk
+/// notifications that update that checkpoint.
+pub struct AudioTuiApp {
+    terminal: DefaultTerminal,
+    info: AudioTuiInfo,
+    done: usize,
+    cached: usize,
+    current_chapter: String,
+    status: String,
+    quit: bool,
+}
+
+impl AudioTuiApp {
+    pub fn new(info: AudioTuiInfo) -> Result<Self> {
+        Ok(Self {
+            terminal: ratatui::try_init()?,
+            info,
+            done: 0,
+            cached: 0,
+            current_chapter: "Planning audio".to_string(),
+            status: "running".to_string(),
+            quit: false,
+        })
+    }
+
+    pub fn update(&mut self, progress: &bookforge_audio::Progress) {
+        self.done = progress.done;
+        self.current_chapter = progress.chapter_title.clone();
+        if progress.skipped {
+            self.cached += 1;
+        }
+    }
+
+    pub fn finish(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+    }
+
+    pub fn pump_input(&mut self) -> Result<bool> {
+        while event::poll(Duration::ZERO)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                let ctrl_c =
+                    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+                if ctrl_c || matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                    self.quit = true;
+                }
+            }
+        }
+        Ok(self.quit)
+    }
+
+    pub fn draw(&mut self) -> Result<()> {
+        let Self {
+            terminal,
+            info,
+            done,
+            cached,
+            current_chapter,
+            status,
+            ..
+        } = self;
+        terminal.draw(|frame| {
+            render_audio_dashboard(frame, info, *done, *cached, current_chapter, status);
+        })?;
+        Ok(())
+    }
+
+    pub fn restore(&mut self) -> Result<()> {
+        ratatui::try_restore()?;
+        Ok(())
+    }
+}
+
+impl Drop for AudioTuiApp {
+    fn drop(&mut self) {
+        let _ = ratatui::try_restore();
+    }
+}
+
+fn render_audio_dashboard(
+    frame: &mut Frame,
+    info: &AudioTuiInfo,
+    done: usize,
+    cached: usize,
+    current_chapter: &str,
+    status: &str,
+) {
+    let areas = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Length(3),
+        Constraint::Min(5),
+        Constraint::Length(1),
+    ])
+    .split(frame.area());
+    let header = Text::from(vec![
+        Line::from(vec![
+            Span::styled(
+                "BookForge Audiobook",
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  {}", info.title)),
+        ]),
+        Line::from(format!("{} → {}", info.input, info.output)),
+        Line::from(format!(
+            "{} / {} · voice {}",
+            info.provider, info.model, info.voice
+        )),
+    ]);
+    frame.render_widget(Paragraph::new(header).block(Block::bordered()), areas[0]);
+
+    let ratio = if info.total == 0 {
+        0.0
+    } else {
+        (done as f64 / info.total as f64).clamp(0.0, 1.0)
+    };
+    frame.render_widget(
+        Gauge::default()
+            .block(Block::bordered().title(" Synthesis "))
+            .gauge_style(Style::new().fg(Color::Cyan))
+            .ratio(ratio)
+            .label(format!("{done}/{}", info.total)),
+        areas[1],
+    );
+
+    let synthesized = done.saturating_sub(cached);
+    let details = Text::from(vec![
+        Line::from(format!("Current: {current_chapter}")),
+        Line::from(format!(
+            "Synthesized: {synthesized}   Cached: {cached}   Remaining: {}",
+            info.total.saturating_sub(done)
+        )),
+        Line::from(format!("Status: {status}")),
+        Line::from("Progress is checkpointed to manifest.json after every chunk."),
+    ]);
+    frame.render_widget(Paragraph::new(details).block(Block::bordered()), areas[2]);
+    frame.render_widget(
+        Paragraph::new(" q/Esc cancel and exit ").style(Style::new().fg(Color::DarkGray)),
+        areas[3],
+    );
+}
+
 impl TuiApp {
     /// Enter the alternate screen + raw mode and create the dashboard.
     pub fn new(mode: TuiMode) -> Result<Self> {
@@ -654,6 +809,39 @@ mod tests {
         assert!(text.contains("3 ok"), "succeeded count missing");
         assert!(text.contains("3/10"), "gauge label missing");
         assert!(text.contains("q quit"), "watch footer missing");
+    }
+
+    #[test]
+    fn audiobook_dashboard_renders_progress_and_provider_details() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let info = AudioTuiInfo {
+            title: "Source Book".to_string(),
+            input: "source.epub".to_string(),
+            output: "source.audiobook".to_string(),
+            provider: "gemini".to_string(),
+            model: "gemini-tts".to_string(),
+            voice: "Kore".to_string(),
+            total: 12,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(90, 18)).unwrap();
+        terminal
+            .draw(|frame| render_audio_dashboard(frame, &info, 5, 2, "Chapter 3", "running"))
+            .unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("BookForge Audiobook"));
+        assert!(text.contains("gemini / gemini-tts · voice Kore"));
+        assert!(text.contains("5/12"));
+        assert!(text.contains("Synthesized: 3"));
+        assert!(text.contains("Cached: 2"));
+        assert!(text.contains("q/Esc cancel"));
     }
 
     #[test]

@@ -17,6 +17,9 @@ use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileO
 pub struct ReflowOptions {
     pub dry_run: bool,
     pub aggressive: bool,
+    /// Remove conservative pdftohtml page anchors, running headers,
+    /// whitespace furniture, and bold folios before paragraph merging.
+    pub pdf_cleanup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +44,10 @@ pub struct ReflowTotals {
     pub paragraphs_before: usize,
     pub paragraphs_after: usize,
     pub merge_count: usize,
+    pub removed_furniture: usize,
+    /// XHTML resources positively identified as pdftohtml output while
+    /// `pdf_cleanup` was enabled.
+    pub pdf_documents_detected: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -164,7 +171,9 @@ fn write_archive_entries(
             report.totals.paragraphs_before += outcome.paragraphs_before;
             report.totals.paragraphs_after += outcome.paragraphs_after;
             report.totals.merge_count += outcome.merges.len();
-            if !outcome.merges.is_empty() {
+            report.totals.removed_furniture += outcome.removed_furniture;
+            report.totals.pdf_documents_detected += usize::from(outcome.pdf_document_detected);
+            if outcome.changed {
                 report.totals.files_touched += 1;
                 report.merges.extend(outcome.merges);
                 outcome.xhtml.into_bytes()
@@ -194,6 +203,9 @@ struct ResourceReflow {
     paragraphs_before: usize,
     paragraphs_after: usize,
     merges: Vec<ReflowMergeRecord>,
+    removed_furniture: usize,
+    pdf_document_detected: bool,
+    changed: bool,
 }
 
 fn reflow_xhtml_resource(
@@ -202,16 +214,25 @@ fn reflow_xhtml_resource(
     options: &ReflowOptions,
 ) -> Result<ResourceReflow> {
     let (mut nodes, paragraphs_before) = parse_xml(xhtml)?;
+    let pdf_document_detected = options.pdf_cleanup && is_pdftohtml_document(xhtml);
+    let removed_furniture = if pdf_document_detected {
+        cleanup_pdf_nodes(&mut nodes)?
+    } else {
+        0
+    };
     let mut merges = Vec::new();
     reflow_nodes(&mut nodes, resource, options, &mut merges)?;
     let paragraphs_after = count_paragraphs(&nodes);
 
-    if merges.is_empty() {
+    if merges.is_empty() && removed_furniture == 0 {
         return Ok(ResourceReflow {
             xhtml: xhtml.to_string(),
             paragraphs_before,
             paragraphs_after,
             merges,
+            removed_furniture,
+            pdf_document_detected,
+            changed: false,
         });
     }
 
@@ -227,7 +248,178 @@ fn reflow_xhtml_resource(
         paragraphs_before,
         paragraphs_after,
         merges,
+        removed_furniture,
+        pdf_document_detected,
+        changed: true,
     })
+}
+
+fn is_pdftohtml_document(xhtml: &str) -> bool {
+    let lower = xhtml.to_ascii_lowercase();
+    lower.contains("name=\"generator\" content=\"pdftohtml")
+        || lower.contains("name='generator' content='pdftohtml")
+}
+
+fn cleanup_pdf_nodes(nodes: &mut Vec<XmlNode>) -> Result<usize> {
+    let mut removed = 0usize;
+    for node in nodes.iter_mut() {
+        if let XmlNode::Element(element) = node {
+            removed += cleanup_pdf_nodes(&mut element.children)?;
+            if local_name(element.start.name().as_ref()) == b"p" {
+                removed += remove_trailing_pdf_folio(&mut element.children)?;
+            }
+        }
+    }
+
+    let mut index = 0usize;
+    while index < nodes.len() {
+        if is_numeric_heading(&nodes[index])? || is_pdf_whitespace_paragraph(&nodes[index])? {
+            nodes.remove(index);
+            removed += 1;
+            continue;
+        }
+
+        if is_page_anchor_paragraph(&nodes[index])? {
+            let anchor_text = paragraph_text(&nodes[index])?.unwrap_or_default();
+            let anchor_only_or_header =
+                anchor_text.trim().is_empty() || is_short_running_header(anchor_text.trim());
+            if anchor_only_or_header {
+                let anchor_only = anchor_text.trim().is_empty();
+                nodes.remove(index);
+                removed += 1;
+
+                // When pdftohtml emits the page anchor in an empty p, the
+                // running header is the next visible short paragraph.
+                if anchor_only {
+                    while index < nodes.len() && is_whitespace_node(&nodes[index])? {
+                        nodes.remove(index);
+                    }
+                    if index < nodes.len()
+                        && paragraph_text(&nodes[index])?
+                            .as_deref()
+                            .is_some_and(is_short_running_header)
+                    {
+                        nodes.remove(index);
+                        removed += 1;
+                    }
+                }
+                continue;
+            }
+        }
+        index += 1;
+    }
+    Ok(removed)
+}
+
+fn paragraph_text(node: &XmlNode) -> Result<Option<String>> {
+    match node {
+        XmlNode::Element(element) if local_name(element.start.name().as_ref()) == b"p" => {
+            Ok(Some(visible_text(&element.children)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn is_short_running_header(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty()
+        && text.chars().count() <= 80
+        && text.split_whitespace().count() <= 8
+        && !ends_with_terminal_punctuation(text)
+        && !text.to_ascii_uppercase().contains("CAPITOLO")
+}
+
+fn is_numeric_heading(node: &XmlNode) -> Result<bool> {
+    let XmlNode::Element(element) = node else {
+        return Ok(false);
+    };
+    if !matches!(
+        local_name(element.start.name().as_ref()),
+        b"h1" | b"h2" | b"h3"
+    ) {
+        return Ok(false);
+    }
+    let text = visible_text(&element.children)?;
+    Ok(!text.trim().is_empty()
+        && text
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ch.is_whitespace()))
+}
+
+fn is_pdf_whitespace_paragraph(node: &XmlNode) -> Result<bool> {
+    let XmlNode::Element(element) = node else {
+        return Ok(false);
+    };
+    if local_name(element.start.name().as_ref()) != b"p" {
+        return Ok(false);
+    }
+    let class = attr_value_unescaped(&element.start, b"class")?.unwrap_or_default();
+    Ok(matches!(class.as_str(), "whitespace1" | "softbreak")
+        && visible_text(&element.children)?.trim().is_empty())
+}
+
+fn is_page_anchor_paragraph(node: &XmlNode) -> Result<bool> {
+    let XmlNode::Element(element) = node else {
+        return Ok(false);
+    };
+    Ok(local_name(element.start.name().as_ref()) == b"p"
+        && contains_page_anchor(&element.children)?)
+}
+
+fn contains_page_anchor(nodes: &[XmlNode]) -> Result<bool> {
+    for node in nodes {
+        let start = match node {
+            XmlNode::Element(element) => Some(&element.start),
+            XmlNode::Empty { start } => Some(start),
+            XmlNode::Leaf(_) => None,
+        };
+        if let Some(start) = start
+            && local_name(start.name().as_ref()) == b"a"
+            && attr_value_unescaped(start, b"id")?
+                .as_deref()
+                .is_some_and(is_pdf_page_anchor_id)
+        {
+            return Ok(true);
+        }
+        if let XmlNode::Element(element) = node
+            && contains_page_anchor(&element.children)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_pdf_page_anchor_id(id: &str) -> bool {
+    id.strip_prefix('p')
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn remove_trailing_pdf_folio(nodes: &mut Vec<XmlNode>) -> Result<usize> {
+    let Some(index) = nodes
+        .iter()
+        .rposition(|node| !is_whitespace_node(node).unwrap_or(false))
+    else {
+        return Ok(0);
+    };
+    let XmlNode::Element(element) = &nodes[index] else {
+        return Ok(0);
+    };
+    if local_name(element.start.name().as_ref()) != b"b"
+        || attr_value_unescaped(&element.start, b"class")?.as_deref() != Some("calibre7")
+    {
+        return Ok(0);
+    }
+    let text = visible_text(&element.children)?;
+    if text.trim().is_empty()
+        || !text
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ch.is_whitespace())
+    {
+        return Ok(0);
+    }
+    nodes.remove(index);
+    Ok(1)
 }
 
 #[derive(Debug, Clone)]
@@ -1070,6 +1262,37 @@ mod tests {
         assert!(outcome.xhtml.contains("<p>Hello world.</p>"));
         assert_eq!(outcome.paragraphs_before, 2);
         assert_eq!(outcome.paragraphs_after, 1);
+    }
+
+    #[test]
+    fn pdf_cleanup_removes_furniture_then_merges_page_spanning_paragraph() {
+        let xhtml = r#"<html><head><meta name="generator" content="pdftohtml 0.36"/></head><body>
+            <p class="calibre1">La frase continua <b class="calibre7">27</b></p>
+            <p class="whitespace1">&#160;</p>
+            <p class="calibre1"><a id="p28"></a></p>
+            <p class="calibre1">Il Mondo al Contrario</p>
+            <p class="calibre1">nella pagina seguente.</p>
+        </body></html>"#;
+        let outcome = reflow_xhtml_resource(
+            xhtml,
+            "chapter.xhtml",
+            &ReflowOptions {
+                aggressive: true,
+                pdf_cleanup: true,
+                ..ReflowOptions::default()
+            },
+        )
+        .expect("PDF-derived fixture should clean and reflow");
+
+        assert_eq!(outcome.removed_furniture, 4);
+        assert_eq!(outcome.merges.len(), 1);
+        assert!(
+            outcome
+                .xhtml
+                .contains("La frase continua nella pagina seguente.")
+        );
+        assert!(!outcome.xhtml.contains("Il Mondo al Contrario"));
+        assert!(!outcome.xhtml.contains(">27<"));
     }
 
     #[test]

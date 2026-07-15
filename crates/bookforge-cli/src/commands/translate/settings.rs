@@ -35,6 +35,22 @@ pub fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
         settings.apply_provider_preset_runtime(preset.runtime);
     }
 
+    // Built-in target styles can carry conservative planning defaults. Toki
+    // Pona commonly expands dense source prose several-fold, so the ordinary
+    // v1-fast 12k/16k units would predictably truncate before adaptive
+    // splitting converged. Apply the policy before explicit CLI overrides.
+    if let Some(policy) =
+        bookforge_core::style::built_in_sizing_policy_for_target(&args.language.target)
+    {
+        settings.segmentation.max_segment_tokens = settings
+            .segmentation
+            .max_segment_tokens
+            .min(policy.max_segment_tokens);
+        settings.batch.target_tokens = settings.batch.target_tokens.min(policy.batch_target_tokens);
+        settings.batch.max_items = settings.batch.max_items.min(policy.batch_max_items);
+        settings.batch.adaptive_sizing = policy.adaptive_sizing;
+    }
+
     if let Some(v) = args.max_segment_tokens {
         settings.segmentation.max_segment_tokens = v;
     }

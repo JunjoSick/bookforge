@@ -27,6 +27,10 @@ pub struct ReflowArgs {
     /// Enable opt-in relaxed paragraph merging for proper-noun and quoted continuations.
     #[arg(long)]
     pub aggressive: bool,
+
+    /// Clean conservative pdftohtml page furniture before merging.
+    #[arg(long)]
+    pub pdf_cleanup: bool,
 }
 
 pub async fn run(args: ReflowArgs) -> Result<()> {
@@ -44,6 +48,7 @@ pub async fn run(args: ReflowArgs) -> Result<()> {
         &ReflowOptions {
             dry_run: args.dry_run,
             aggressive: args.aggressive,
+            pdf_cleanup: args.pdf_cleanup,
         },
     )
     .with_context(|| format!("reflowing {}", args.input.display()))?;
@@ -55,6 +60,10 @@ pub async fn run(args: ReflowArgs) -> Result<()> {
     println!("Files checked: {}", outcome.report.totals.files_checked);
     println!("Files touched: {}", outcome.report.totals.files_touched);
     println!("Merges: {}", outcome.report.totals.merge_count);
+    println!(
+        "Removed PDF furniture: {}",
+        outcome.report.totals.removed_furniture
+    );
     println!(
         "Paragraphs: {} -> {}",
         outcome.report.totals.paragraphs_before, outcome.report.totals.paragraphs_after

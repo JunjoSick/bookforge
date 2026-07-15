@@ -412,6 +412,38 @@ BookForge invokes EPUBCheck when it is available. Set
 `epubcheck.jar`. Missing EPUBCheck is reported as `status: unavailable` and is
 non-fatal. Use `--strict-epubcheck` to make warnings fail validation.
 
+Generate an audiobook from an EPUB with OpenAI-compatible, Gemini, ElevenLabs,
+or local text-to-speech providers:
+
+The input may be the original source EPUB or a translated EPUB; translation is
+not a prerequisite. The same flow is available from the terminal UI and the
+local browser dashboard (`bookforge serve`).
+
+```bash
+export OPENAI_API_KEY=...
+cargo run -p bookforge-cli -- audiobook book.epub --voice alloy --format mp3
+cargo run -p bookforge-cli -- audiobook book.epub --provider mock --ui tui
+```
+
+Native provider examples:
+
+```bash
+cargo run -p bookforge-cli -- audiobook book.epub --provider gemini --voice Kore --format wav
+cargo run -p bookforge-cli -- audiobook book.epub --provider elevenlabs --voice <VOICE_ID> --format mp3
+```
+
+BookForge owns the structure here the same way it does for translation: it
+extracts chapter prose (skipping the OPF metadata and table of contents),
+splits it into sentence-boundary chunks under the provider's character limit,
+and writes one content-and-settings-hashed audio file per chunk plus a
+`manifest.json`. Re-running resumes matching chunks, while a changed model,
+voice, speed, instructions, or source text gets a new hash. Point `--base-url`
+at a local server (for example kokoro-fastapi) to synthesize offline, and pass
+`--stitch` (or `--m4b`) to join the chunks with ffmpeg when it is installed.
+Use `--provider mock --dry-run` to preview the chapter and chunk counts without
+spending anything. See [docs/audiobooks.md](docs/audiobooks.md) for the full
+option list.
+
 ## QA Modes
 
 Translation always runs hard validators before committing a segment. The optional LLM QA pass is controlled with:
@@ -518,6 +550,7 @@ crates/bookforge-core   IR, segmentation, shared config
 crates/bookforge-epub   EPUB inspect/read/rebuild
 crates/bookforge-llm    prompts, providers, scheduler, validators
 crates/bookforge-llm/prompts  Versioned prompt templates
+crates/bookforge-audio  Audiobook TTS: chunking, providers, stitch
 crates/bookforge-store  SQLite checkpoint store
 crates/bookforge-cli    CLI commands and reports
 docs/                   Architecture notes

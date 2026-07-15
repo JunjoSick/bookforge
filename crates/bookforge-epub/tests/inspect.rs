@@ -201,6 +201,48 @@ fn rebuild_replace_options_are_byte_identical_to_default_rebuild() {
 }
 
 #[test]
+fn bilingual_rebuild_keeps_document_language_and_marks_only_translation() {
+    let fixture = create_minimal_epub();
+    let book = read_epub(&fixture).expect("fixture should parse into IR");
+    let body_block = book
+        .blocks
+        .iter()
+        .find(|block| block_text(block) == "Hello from chapter 1.")
+        .expect("body paragraph should be extracted");
+    let output = std::env::temp_dir().join(format!(
+        "bookforge-bilingual-language-{}.epub",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&output);
+
+    rebuild_epub_with_options(
+        &book,
+        &[BlockTranslation {
+            block_id: body_block.id.clone(),
+            text: "Ciao dal capitolo uno.".to_string(),
+        }],
+        &output,
+        &RebuildOptions {
+            target_language: Some("Italian".to_string()),
+            mode: BilingualMode::AppendBlock,
+            ..RebuildOptions::default()
+        },
+    )
+    .expect("bilingual rebuild should succeed");
+
+    let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+    let mut chapter = String::new();
+    archive
+        .by_name("OEBPS/chapter1.xhtml")
+        .unwrap()
+        .read_to_string(&mut chapter)
+        .unwrap();
+    let root = chapter.split_once("<head").unwrap().0;
+    assert!(!root.contains("lang=\"it\""));
+    assert!(chapter.contains("class=\"bookforge-translation\" lang=\"it\""));
+}
+
+#[test]
 fn parses_complex_generated_fixture_shapes() {
     let fixture = create_epub_fixture(
         "complex",

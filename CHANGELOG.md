@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased
+
+## v2.5.0 - 2026-07-15
+
+- Added audiobook generation: `bookforge audiobook <book.epub>` narrates an
+  EPUB chapter by chapter through any OpenAI-compatible text-to-speech
+  endpoint (OpenAI, or a local server such as kokoro-fastapi via
+  `--base-url`). Deterministic Rust owns structure — chapter extraction that
+  skips the OPF metadata and table of contents, sentence-boundary chunking
+  under the provider character limit, atomic per-chunk writes, file-based
+  resume keyed by content and synthesis settings, and a JSON manifest — while
+  the provider only ever sees a text chunk and returns audio bytes. The hosted
+  default is `gpt-4o-mini-tts`, with optional pronunciation/delivery
+  instructions. Optional `--stitch`/`--m4b` join the parts with
+  ffmpeg (with chapter markers when ffprobe is present), degrading gracefully
+  when ffmpeg is absent. A deterministic mock provider backs `--dry-run` and
+  the offline test suite. New `bookforge-audio` crate. See
+  [docs/audiobooks.md](docs/audiobooks.md).
+- Added native Gemini and ElevenLabs audiobook providers. Gemini Generate
+  Content TTS decodes its 24 kHz PCM response into WAV by default and supports
+  prompted delivery guidance. ElevenLabs uses its voice-ID path, `xi-api-key`
+  authentication, native `model_id` payload, and MP3/Opus/WAV/PCM formats.
+- Added `bookforge audiobook --prune` to remove audio chunk files left over
+  from earlier runs (a different voice, model, speed, format, or edited source
+  text) that the current plan no longer uses. It never deletes the current
+  run's chunks, the stitched per-chapter outputs, the assembled `.m4b`, or the
+  manifest, and `--prune --dry-run` reports what would be removed without
+  deleting anything.
+- Added Toki Pona as a first-class translation target: selecting it
+  automatically activates a tested minimalist-language translation contract,
+  it is offered in the dashboard language list, and the repo ships an editable style sheet
+  (`docs/styles/toki-pona.style.toml`) plus a run guide
+  ([docs/toki-pona.md](docs/toki-pona.md)) covering model choice, name
+  tokiponization, and why suspicious-mode QA is a poor fit for a ~120-word
+  target language.
+- Added matching audiobook workflows to the full-screen terminal UI and local
+  browser dashboard. Audiobooks can be generated directly from any source
+  EPUB; translation is optional.
+- Hardened EPUB rebuilding so source-language chapter labels and nested NCX
+  navigation remain intact, and made ordinary EPUB reading lossless by moving
+  PDF-derived cleanup behind the explicit reflow command.
+- Added a conservative Toki Pona profile with 200-token, single-item
+  requests, marker-safe fallback, and validation that rejects suspect output
+  instead of semantically rewriting it.
+- Added durable audiobook operation manifests, real in-flight request
+  telemetry, provider payload/signature validation, redirect-safe API-key
+  handling, corrupt-cache recovery, and retry/backoff improvements.
+
 ## v2.4.1 - 2026-07-14
 
 BookForge v2.4.1 is a security-gate maintenance release.

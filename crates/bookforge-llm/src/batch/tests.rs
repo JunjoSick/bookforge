@@ -353,6 +353,13 @@ fn marker_safe_clamp_does_not_affect_turbo_target() {
 }
 
 #[test]
+fn toki_pona_repairs_are_single_item_to_bound_output_and_isolate_failures() {
+    assert_eq!(repair_batch_item_limit("Toki Pona"), 1);
+    assert_eq!(repair_batch_item_limit("toki pona"), 1);
+    assert_eq!(repair_batch_item_limit("Italian"), 16);
+}
+
+#[test]
 fn batch_sizer_respects_plain_mode_clamps() {
     let sizer = BatchSizer::new(64_000, 512);
     assert_eq!(sizer.target_tokens_for_mode(BatchMode::Plain), 32_000);
@@ -416,7 +423,8 @@ fn batch_output_budget_accounts_for_many_short_json_items() {
         section_id: bookforge_core::ir::SectionId("test_section".to_string()),
     };
 
-    let budget = batch_max_output_tokens(&batch, TranslationProfile::V1Fast, false, false);
+    let budget =
+        batch_max_output_tokens(&batch, TranslationProfile::V1Fast, false, false, None, None);
 
     assert!(
         budget >= 1_000,
@@ -439,10 +447,66 @@ fn deepseek_batches_can_use_extended_output_budget() {
     };
 
     assert_eq!(
-        batch_max_output_tokens(&batch, TranslationProfile::V1Fast, false, false),
+        batch_max_output_tokens(&batch, TranslationProfile::V1Fast, false, false, None, None,),
         16_384
     );
-    assert!(batch_max_output_tokens(&batch, TranslationProfile::V1Fast, false, true) > 16_384);
+    assert!(
+        batch_max_output_tokens(&batch, TranslationProfile::V1Fast, false, true, None, None,)
+            > 16_384
+    );
+}
+
+#[test]
+fn highly_expansive_target_gets_safe_initial_batch_output_budget() {
+    let batch = TranslationBatch {
+        id: "expansive-target".to_string(),
+        ordinal: 0,
+        mode: BatchMode::Plain,
+        kind: BatchKind::Translation,
+        token_estimate: 1_500,
+        items: vec![batch_item("item", "source text")],
+        section_id: bookforge_core::ir::SectionId("test_section".to_string()),
+    };
+
+    let ordinary =
+        batch_max_output_tokens(&batch, TranslationProfile::V1Fast, false, true, None, None);
+    let toki_pona = batch_max_output_tokens(
+        &batch,
+        TranslationProfile::V1Fast,
+        false,
+        true,
+        Some(20),
+        Some(4_096),
+    );
+    assert!(toki_pona > ordinary);
+    assert!(toki_pona >= 30_000);
+}
+
+#[test]
+fn highly_expansive_target_has_safe_floor_for_short_batches() {
+    let batch = TranslationBatch {
+        id: "short-expansive-target".to_string(),
+        ordinal: 0,
+        mode: BatchMode::Plain,
+        kind: BatchKind::Translation,
+        token_estimate: 226,
+        items: vec![batch_item(
+            "item",
+            "short but semantically dense source text",
+        )],
+        section_id: bookforge_core::ir::SectionId("test_section".to_string()),
+    };
+
+    let toki_pona = batch_max_output_tokens(
+        &batch,
+        TranslationProfile::V1Fast,
+        false,
+        true,
+        Some(20),
+        Some(4_096),
+    );
+
+    assert_eq!(toki_pona, 4_712);
 }
 
 #[test]
@@ -643,7 +707,7 @@ fn missing_marker_close_fails_batch_item_validation() {
     let mut item = batch_item("marked", "<m1>source</m1>");
     item.required_markers = vec!["m1".to_string()];
 
-    let error = batch_item_validation_error(&item, "<m1>translated", false, None)
+    let error = batch_item_validation_error(&item, "<m1>translated", false, None, None)
         .expect("missing marker close should fail");
 
     assert!(error.contains("missing closing tag"), "got: {error}");
@@ -657,7 +721,7 @@ fn copied_source_prose_fails_batch_item_validation() {
             target language, so this item must enter the normal retry and review pipeline.";
     let item = batch_item("copied", source);
 
-    let error = batch_item_validation_error(&item, source, true, Some("Chapter 1"))
+    let error = batch_item_validation_error(&item, source, true, Some("Chapter 1"), None)
         .expect("long unchanged source prose should fail");
 
     assert!(error.contains("unchanged from the source-language prose"));
@@ -689,7 +753,7 @@ fn copied_source_prose_fails_internal_batch_response_validation() {
     let section_titles = HashMap::from([(item.segment_id.0.clone(), "Chapter 1".to_string())]);
 
     let result =
-        parse_batch_response_with_validation(&batch, &response, true, Some(&section_titles))
+        parse_batch_response_with_validation(&batch, &response, true, Some(&section_titles), None)
             .expect("valid JSON should parse");
 
     assert!(result.translations.is_empty());
@@ -934,6 +998,42 @@ struct RecordingSequenceProvider {
     max_output_tokens: Arc<Mutex<Vec<Option<u32>>>>,
 }
 
+struct DelayedSecondBatchProvider {
+    first_item_id: String,
+    second_item_id: String,
+}
+
+impl LlmProviderTrait for DelayedSecondBatchProvider {
+    async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+        let (item_id, translation) = if request.user.contains(&self.first_item_id) {
+            (self.first_item_id.clone(), "Ciao")
+        } else {
+            assert!(request.user.contains(&self.second_item_id));
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            (self.second_item_id.clone(), "Addio")
+        };
+        Ok(CompletionResponse {
+            content: serde_json::json!({
+                "items": [{"id": item_id, "translation": translation}]
+            })
+            .to_string(),
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            finish_reason: FinishReason::Stop,
+            provider_latency_ms: 0,
+            raw: serde_json::json!({}),
+        })
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_response_format: true,
+            supports_usage_tokens: true,
+        }
+    }
+}
+
 impl RecordingSequenceProvider {
     fn new(
         responses: Vec<RecordedResponse>,
@@ -1124,6 +1224,42 @@ fn batch_items_include_segment_glossary() {
 }
 
 #[test]
+fn turbo_batches_keep_internal_markers_but_hide_them_from_the_model() {
+    let block = SegmentBlock {
+        block_id: bookforge_core::ir::BlockId("block1".to_string()),
+        kind: "paragraph".to_string(),
+        text: "Before <m1>bold</m1> 42".to_string(),
+        text_runs: Vec::new(),
+        protected_spans: vec!["42".to_string()],
+    };
+    let segment = make_segment("seg1", vec![block], vec!["m1".to_string()]);
+    let batch_config = BatchConfig {
+        enabled: true,
+        target_tokens: 1000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batch =
+        build_translation_batches(&[segment], &batch_config, TranslationProfile::TurboTextOnly)
+            .into_iter()
+            .next()
+            .unwrap();
+
+    assert_eq!(batch.mode, BatchMode::TurboTextOnly);
+    assert_eq!(batch.items[0].source_text, "Before <m1>bold</m1> 42");
+    assert!(batch.items[0].required_markers.is_empty());
+    assert_eq!(batch.items[0].protected_spans, ["42"]);
+
+    let rendered = render_batch_items(&batch, &test_run_config());
+    assert!(!rendered.contains("<m1>"));
+    assert!(!rendered.contains("</m1>"));
+    assert!(rendered.contains("Before bold 42"));
+    assert!(rendered.contains("\"protected\":[\"42\"]"));
+}
+
+#[test]
 fn batch_prompt_overhead_repacks_glossary_heavy_items() {
     let seg1 = make_segment("seg1", vec![plain_block("Hello")], vec![]);
     let seg2 = make_segment("seg2", vec![plain_block("Goodbye")], vec![]);
@@ -1169,16 +1305,20 @@ async fn batch_length_finish_reason_returns_invalid_response() {
     let provider = Arc::new(StubProvider::new(StubBehavior::FinishLength));
     let library = Arc::new(PromptLibrary::global().clone());
     let config = test_run_config();
+    let section_titles = HashMap::new();
 
     let result = translate_one_batch(
         provider,
         library,
         batch,
-        &config,
-        None,
-        Vec::new(),
-        false,
-        &HashMap::new(),
+        BatchTranslationRequest {
+            config: &config,
+            max_output_tokens_override: None,
+            context_pairs: Vec::new(),
+            validate_source_copy: false,
+            section_titles: &section_titles,
+            compact_retry_attempt: 0,
+        },
     )
     .await;
     match result {
@@ -1197,16 +1337,20 @@ async fn batch_truncated_error_is_not_swallowed() {
     )));
     let library = Arc::new(PromptLibrary::global().clone());
     let config = test_run_config();
+    let section_titles = HashMap::new();
 
     let result = translate_one_batch(
         provider,
         library,
         batch,
-        &config,
-        None,
-        Vec::new(),
-        false,
-        &HashMap::new(),
+        BatchTranslationRequest {
+            config: &config,
+            max_output_tokens_override: None,
+            context_pairs: Vec::new(),
+            validate_source_copy: false,
+            section_titles: &section_titles,
+            compact_retry_attempt: 0,
+        },
     )
     .await;
     match result {
@@ -1293,7 +1437,119 @@ async fn batch_truncation_retries_same_batch_with_escalated_budget() {
 }
 
 #[tokio::test]
-async fn batch_truncation_escalated_retry_survives_adaptive_renaming() {
+async fn single_item_truncation_retries_once_with_same_compact_budget() {
+    let segment = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+    let segments = vec![segment];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1_000,
+        max_items: 1,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let item_id = batches[0].items[0].item_id.clone();
+    let max_tokens = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingSequenceProvider::new(
+        vec![
+            RecordedResponse::FinishLength,
+            RecordedResponse::ItemsFromBatch(vec![(item_id, "Ciao".to_string())]),
+        ],
+        max_tokens.clone(),
+    );
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let progress = Arc::new(RecordingProgress {
+        events: events.clone(),
+    });
+
+    let translations = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &test_run_config(),
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        progress,
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("compact retry should succeed");
+
+    assert_eq!(translations.len(), 1);
+    let budgets = max_tokens.lock().unwrap().clone();
+    assert_eq!(budgets.len(), 2);
+    assert_eq!(budgets[1], budgets[0]);
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            bookforge_core::ProgressEvent::Warning { kind, .. }
+                if kind == "single_item_batch_compact_retry"
+        )
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, bookforge_core::ProgressEvent::BatchSplit { .. }))
+    );
+}
+
+#[tokio::test]
+async fn completed_batch_segments_are_published_before_the_whole_run_finishes() {
+    let segments = vec![
+        make_segment("seg1", vec![plain_block("Hello")], vec![]),
+        make_segment("seg2", vec![plain_block("Goodbye")], vec![]),
+    ];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1_000,
+        max_items: 1,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    assert_eq!(batches.len(), 2);
+    let provider = DelayedSecondBatchProvider {
+        first_item_id: batches[0].items[0].item_id.clone(),
+        second_item_id: batches[1].items[0].item_id.clone(),
+    };
+    let published = Arc::new(AtomicUsize::new(0));
+    let published_for_callback = published.clone();
+    let run_config = test_run_config();
+    let run = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &run_config,
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(bookforge_core::NullProgressSink),
+        None,
+        move |_| {
+            published_for_callback.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    );
+    tokio::pin!(run);
+
+    tokio::select! {
+        result = &mut run => panic!("run finished before delayed batch: {result:?}"),
+        () = tokio::time::sleep(std::time::Duration::from_millis(75)) => {}
+    }
+    assert_eq!(published.load(Ordering::SeqCst), 1);
+
+    let translations = run.await.expect("batch run");
+    assert_eq!(translations.len(), 2);
+    assert_eq!(published.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn single_item_compact_retry_survives_adaptive_renaming() {
     let long_source = "long ".repeat(3_600);
     let seg = make_segment("seg1", vec![plain_block(&long_source)], vec![]);
     let segments = vec![seg];
@@ -1344,14 +1600,14 @@ async fn batch_truncation_escalated_retry_survives_adaptive_renaming() {
         |_| Ok(()),
     )
     .await
-    .expect("escalated retry should survive adaptive renaming");
+    .expect("compact retry should survive adaptive renaming");
 
     assert_eq!(translations.len(), 1);
     let budgets = max_tokens.lock().unwrap().clone();
     assert_eq!(budgets.len(), 2);
-    assert!(
-        budgets[1].unwrap() > budgets[0].unwrap(),
-        "second request should keep the escalated output budget after adaptive renaming: {budgets:?}"
+    assert_eq!(
+        budgets[1], budgets[0],
+        "compact anti-repetition retry should keep the bounded budget after adaptive renaming"
     );
     let events = events.lock().unwrap();
     assert!(
@@ -1717,6 +1973,75 @@ fn item_ids_from_batch_prompt(user_prompt: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|item| item.get("id")?.as_str().map(ToString::to_string))
         .collect()
+}
+
+struct RepairOrderingSink(Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+impl bookforge_core::ProgressSink for RepairOrderingSink {
+    fn emit(&self, event: bookforge_core::ProgressEvent) {
+        if matches!(
+            event,
+            bookforge_core::ProgressEvent::BatchRepairFinished { .. }
+        ) {
+            self.0.lock().unwrap().push("repair_finished");
+        }
+    }
+}
+
+#[tokio::test]
+async fn completed_repair_publishes_segment_before_repair_phase_finishes() {
+    let segment = make_segment(
+        "seg1",
+        vec![plain_block("Hello"), plain_block("World")],
+        vec![],
+    );
+    let segments = vec![segment];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let first_item_id = batches[0].items[0].item_id.clone();
+    let second_item_id = batches[0].items[1].item_id.clone();
+    let provider = SequenceProvider::new(vec![
+        serde_json::json!({
+            "items": [{"id": first_item_id, "translation": "[it] Hello"}],
+        })
+        .to_string(),
+        serde_json::json!({
+            "items": [{"id": second_item_id, "translation": "[it] World"}],
+        })
+        .to_string(),
+    ]);
+    let ordering = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::new(RepairOrderingSink(ordering.clone()));
+    let callback_ordering = ordering.clone();
+
+    let translations = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &test_run_config(),
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        sink,
+        None,
+        move |translation| {
+            assert_eq!(translation.status, SegmentStatus::Succeeded);
+            callback_ordering.lock().unwrap().push("callback");
+            Ok(())
+        },
+    )
+    .await
+    .expect("repair should complete");
+
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+    assert_eq!(*ordering.lock().unwrap(), ["callback", "repair_finished"]);
 }
 
 #[tokio::test]

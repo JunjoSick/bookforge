@@ -110,6 +110,53 @@ fn cli_translate_mock_quiet_writes_output_report_and_events() {
 }
 
 #[test]
+fn cli_italian_to_toki_pona_activates_built_in_translation_contract() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = fixture_input();
+    let output = temp.path().join("lipu.epub");
+    let events = temp.path().join("events.jsonl");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--source",
+            "Italian",
+            "--target",
+            "Toki Pona",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--ui",
+            "quiet",
+            "--progress-jsonl",
+            events.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    let job_id = job_id_from_events(&events);
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
+    let snapshot = store
+        .load_job_config_snapshot(&job_id)
+        .expect("snapshot loads")
+        .expect("snapshot exists");
+    assert_eq!(snapshot.source_language.as_deref(), Some("Italian"));
+    assert_eq!(snapshot.target_language, "Toki Pona");
+    assert!(snapshot.style_rendered_block.contains("Toki Pona grammar"));
+    assert!(
+        snapshot
+            .style_rendered_block
+            .contains("Do not soften, endorse, rebut")
+    );
+}
+
+#[test]
 fn cli_translate_unsupported_provider_exits_failure() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let input = fixture_input();
@@ -1726,18 +1773,30 @@ fn cli_pause_and_resume_live_mock_run() {
         1,
         "batch pause should not start another provider request after first completion"
     );
-    let finished_at_pause = segment_finished_ids(&paused_events);
-    thread::sleep(Duration::from_millis(400));
-    assert_eq!(
-        segment_finished_ids(&read_jsonl(&events)).len(),
-        finished_at_pause.len(),
-        "paused run should not dispatch more segments"
-    );
+    // A provider request already in flight when the pause landed may still
+    // record its segment after JobPaused is emitted — an in-flight request
+    // cannot be un-sent. Let the run settle, then assert the invariant that
+    // actually matters: while parked it starts no *new* provider request and
+    // dispatches no further work. Because no new request starts, no segment
+    // beyond the single in-flight batch can finish.
+    let settle_deadline = Instant::now() + Duration::from_secs(3);
+    let mut settled = segment_finished_ids(&read_jsonl(&events));
+    loop {
+        thread::sleep(Duration::from_millis(150));
+        let next = segment_finished_ids(&read_jsonl(&events));
+        let stable = next.len() == settled.len();
+        settled = next;
+        if stable || Instant::now() >= settle_deadline {
+            break;
+        }
+    }
     assert_eq!(
         batch_request_started_count(&read_jsonl(&events)),
         1,
         "paused batch run should not start another provider request while parked"
     );
+    assert_no_duplicate_segments(&settled);
+    wait_for_job_status(&temp, &job_id, "paused");
 
     bookforge()
         .current_dir(temp.path())

@@ -1045,9 +1045,15 @@ where
         mode.temperature_default()
     };
 
-    let max_output_tokens = config
-        .max_output_tokens
-        .unwrap_or_else(|| max_output_tokens(segment, mode, provider.is_reasoning()));
+    let max_output_tokens = config.max_output_tokens.unwrap_or_else(|| {
+        max_output_tokens(
+            segment,
+            mode,
+            provider.is_reasoning(),
+            &config.target_language,
+            config.provider.eq_ignore_ascii_case("deepseek"),
+        )
+    });
     let (runtime_config_revision, provider_max_attempts) = config.request_runtime_metadata();
     let request = CompletionRequest {
         system: rendered.system,
@@ -1096,7 +1102,13 @@ where
     })
 }
 
-fn max_output_tokens(segment: &Segment, mode: TranslationMode, reasoning: bool) -> u32 {
+fn max_output_tokens(
+    segment: &Segment,
+    mode: TranslationMode,
+    reasoning: bool,
+    target_language: &str,
+    extended_output: bool,
+) -> u32 {
     let source_tokens = segment.source.token_estimate.max(1);
     let block_overhead = segment.source.blocks.len().saturating_mul(128);
     let marker_overhead = match mode {
@@ -1114,14 +1126,27 @@ fn max_output_tokens(segment: &Segment, mode: TranslationMode, reasoning: bool) 
             .sum::<usize>()
             .saturating_mul(32),
     };
-    let source_multiplier: usize = if reasoning { 8 } else { 3 };
-    let max_cap: usize = if reasoning { 32_768 } else { 8_192 };
+    let built_in_policy = bookforge_core::style::built_in_sizing_policy_for_target(target_language);
+    let built_in_multiplier = built_in_policy
+        .map(|policy| policy.output_token_multiplier)
+        .unwrap_or(0);
+    let built_in_minimum = built_in_policy
+        .map(|policy| policy.min_output_tokens as usize)
+        .unwrap_or(512);
+    let source_multiplier: usize = (if reasoning { 8 } else { 3 }).max(built_in_multiplier);
+    let max_cap: usize = if reasoning || extended_output {
+        32_768
+    } else if built_in_multiplier > 0 {
+        16_384
+    } else {
+        8_192
+    };
     let estimate = source_tokens
         .saturating_mul(source_multiplier)
         .saturating_add(block_overhead)
         .saturating_add(marker_overhead)
         .max(512);
-    estimate.min(max_cap) as u32
+    estimate.max(built_in_minimum).min(max_cap) as u32
 }
 
 fn render_prompt(

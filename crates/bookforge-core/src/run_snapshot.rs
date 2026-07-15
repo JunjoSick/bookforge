@@ -21,6 +21,8 @@ pub struct RunConfigSnapshot {
     pub report_markdown_path: Option<PathBuf>,
     pub source_language: Option<String>,
     pub target_language: String,
+    #[serde(default)]
+    pub creator: Option<String>,
     pub provider: String,
     pub model: String,
     pub base_url: Option<String>,

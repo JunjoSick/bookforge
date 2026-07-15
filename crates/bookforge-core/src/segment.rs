@@ -200,6 +200,7 @@ pub fn block_kind_label(kind: BlockKind) -> &'static str {
         BlockKind::Footnote => "footnote",
         BlockKind::Caption => "caption",
         BlockKind::Code => "code",
+        BlockKind::PageFurniture => "page_furniture",
         BlockKind::Unknown => "unknown",
     }
 }
@@ -249,7 +250,7 @@ pub fn build_segments(book: &Book, config: &SegmentationConfig) -> Result<Vec<Se
             // to the model both mistranslates it and destroys intentional
             // whitespace. Excluded blocks are never patched, so the
             // original markup survives rebuild byte-for-byte.
-            if matches!(block.kind, BlockKind::Code) {
+            if matches!(block.kind, BlockKind::Code | BlockKind::PageFurniture) {
                 continue;
             }
             let block_tokens = block.token_estimate.max(1);

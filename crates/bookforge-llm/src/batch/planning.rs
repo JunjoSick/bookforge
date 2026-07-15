@@ -368,32 +368,20 @@ pub fn build_translation_batches(
 
     let turbo = profile == TranslationProfile::TurboTextOnly;
 
-    fn strip_markers(text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let chars: Vec<char> = text.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '<'
-                && i + 1 < chars.len()
-                && let Some(end) = chars[i..].iter().position(|&c| c == '>')
-            {
-                i += end + 1;
-                out.push(' ');
-                continue;
-            }
-            out.push(chars[i]);
-            i += 1;
-        }
-        out
-    }
-
     let mut items: Vec<TranslationBatchItem> = Vec::new();
     let mut ordinal = 0usize;
 
     for segment in segments {
         for block in &segment.source.blocks {
             let (source_text, required_markers, protected_spans) = if turbo {
-                (strip_markers(&block.text), Vec::new(), Vec::new())
+                (
+                    // Keep the marker-bearing source internally so the parser can
+                    // restore valid inline templates after a text-only response.
+                    // Rendering removes the markers before sending text to the LLM.
+                    block.text.clone(),
+                    Vec::new(),
+                    block.protected_spans.clone(),
+                )
             } else {
                 (
                     block.text.clone(),
@@ -419,7 +407,7 @@ pub fn build_translation_batches(
         }
     }
 
-    group_batches(items, config)
+    group_batches(items, config, turbo.then_some(BatchMode::TurboTextOnly))
 }
 
 pub fn account_for_batch_prompt_overhead(
@@ -440,7 +428,11 @@ pub fn account_for_batch_prompt_overhead(
         .collect()
 }
 
-fn group_batches(items: Vec<TranslationBatchItem>, config: &BatchConfig) -> Vec<TranslationBatch> {
+fn group_batches(
+    items: Vec<TranslationBatchItem>,
+    config: &BatchConfig,
+    forced_mode: Option<BatchMode>,
+) -> Vec<TranslationBatch> {
     // Partition items by (section_id, mode) before token-budget packing.
     // Section partitioning is the invariant that lets the sliding-context
     // fence work in batch mode: a batch never crosses a chapter boundary,
@@ -451,7 +443,10 @@ fn group_batches(items: Vec<TranslationBatchItem>, config: &BatchConfig) -> Vec<
         Vec<TranslationBatchItem>,
     > = HashMap::new();
     for item in items {
-        let key = (item.section_id.clone(), item.mode());
+        let key = (
+            item.section_id.clone(),
+            forced_mode.unwrap_or_else(|| item.mode()),
+        );
         section_mode_groups.entry(key).or_default().push(item);
     }
 

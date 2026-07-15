@@ -1,0 +1,50 @@
+# Global style sheet for translations into Toki Pona.
+#
+# Import once (`bookforge style import docs/styles/toki-pona.style.toml`) or
+# pass per run with `--style docs/styles/toki-pona.style.toml`.
+
+[meta]
+schema_version = 1
+target_language = "Toki Pona"
+
+[meta.scope]
+kind = "global"
+
+[register]
+narration = "plain declarative toki pona in sitelen Lasina (Latin orthography), lowercase except proper names"
+dialogue_default = "direct speech introduced with a colon after a phrase ending in the particle e or with 'x li toki e ni:'"
+loanword_policy = "tokiponize proper names into capitalized modifier form following toki pona phonotactics; keep the original spelling in parentheses at first mention only"
+
+[voice]
+narrator_register = "neutral, concrete, and concise; prefer several short sentences over one long sentence"
+preserve_anglicisms = false
+
+[do_not]
+translate_terms = []
+preserve_punctuation = [":", "«", "»"]
+
+[free_text]
+instructions = """
+Translate into Toki Pona, the minimalist constructed language.
+- Use only the standard vocabulary: the ~120 words of pu plus the widely
+  accepted nimi ku suli. Do not invent new words.
+- Closed lowercase vocabulary (use no other lowercase words): a, akesi, ala, alasa, ale, ali, anpa, ante, anu, awen, e, en, epiku, esun, ijo, ike, ilo, insa, jaki, jan, jasima, jelo, jo, kala, kalama, kama, kasi, ken, kepeken, kijetesantakalu, kili, kin, kipisi, kiwen, ko, kokosila, kon, ku, kule, kulupu, kute, la, lanpan, lape, laso, lawa, leko, len, lete, li, lili, linja, linluwi, lipu, loje, lon, luka, lukin, lupa, ma, mama, mani, meli, meso, mi, mije, misikeke, moku, moli, monsi, monsuta, mu, mun, musi, mute, n, namako, nanpa, nasa, nasin, nena, ni, nimi, noka, o, oko, olin, ona, open, pake, pakala, pali, palisa, pan, pana, pi, pilin, pimeja, pini, pipi, poka, poki, pona, pu, sama, seli, selo, seme, sewi, sijelo, sike, sin, sina, sinpin, sitelen, soko, sona, soweli, suli, suno, supa, suwi, tan, taso, tawa, telo, tenpo, toki, tomo, tonsi, tu, unpa, uta, utala, walo, wan, waso, wawa, weka, wile.
+- Word order: subject li predicate; direct objects with e; prepositional
+  phrases after the verb phrase; modifiers follow their head word.
+- Proper names become capitalized tokiponized modifiers attached to a head
+  noun: people as "jan Name", places as "ma Name", organizations as
+  "kulupu Name", books as "lipu Name". Tokiponize following toki pona
+  phonotactics (open syllables, allowed consonants), e.g. "Roberto
+  Vannacci" -> "jan Lopeto Wanasi".
+- Keep digits as digits. Do not attempt exact large numbers in words; when a
+  number is rhetorical rather than exact, "mute" is acceptable.
+- Render chapter labels with ordinary Toki Pona, for example "lipu nanpa VI",
+  while preserving the protected Roman numeral exactly. Do not invent a
+  pseudo-Toki structural word.
+- Toki Pona cannot carry dense abstract prose word-for-word. Restate each
+  sentence's core meaning plainly. Break long source sentences into several
+  short Toki Pona sentences. Preserve the author's argument, stance, tone,
+  and rhetorical intent; do not soften, editorialize, or add commentary.
+- Keep every inline marker, protected span, and footnote reference exactly
+  where the contract requires.
+"""

@@ -259,9 +259,11 @@ async fn run_mock_translation(
         progress.clone(),
         pause_signal.clone(),
         stop_cancel_token.clone(),
-        settings.clone(),
-        cli_args.qa,
-        cli_args.validate_output,
+        crate::control::ControlBaseline {
+            settings: settings.clone(),
+            qa: cli_args.qa,
+            validate_output: cli_args.validate_output,
+        },
     );
     let job_runtime_settings = control_watcher.job_runtime_settings();
     let run_config = TranslationRunConfig {
@@ -656,9 +658,11 @@ async fn run_openai_compatible_translation(
         progress.clone(),
         pause_signal.clone(),
         cancel_token.clone(),
-        settings.clone(),
-        cli_args.qa,
-        cli_args.validate_output,
+        crate::control::ControlBaseline {
+            settings: settings.clone(),
+            qa: cli_args.qa,
+            validate_output: cli_args.validate_output,
+        },
     );
     let job_runtime_settings = control_watcher.job_runtime_settings();
     let run_config = TranslationRunConfig {

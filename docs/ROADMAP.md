@@ -2427,6 +2427,30 @@ So this section is a **sketch**, not a commitment. Re-evaluate after v1.8 ships.
   a reminder if it didn't ship as a point release.
 - **Proper Pause + Stop for in-flight translations.** Promoted from a
   sketch to a scheduled mini-spec — see §10.1.1 below.
+- **Unified operation/job envelope (`OperationKind::{Translation, Audiobook}`).**
+  Audiobook generation shipped in v2.5.0 with its *own* durable
+  `AudiobookManifest` checkpoint — per-chunk progress that survives a restart
+  — rather than being forced into the translation `SegmentTranslation` job
+  model. That standalone manifest is a **deliberate temporary solution and
+  works today**. The future refactor: introduce a common operation envelope so
+  `RunState`, the JSONL event log, the store schema, the TUI, and the web APIs
+  all carry an `OperationKind`, with audio-specific events (plan created, chunk
+  started/finished/cached, stitching, final artifact) reusing the translation
+  surfaces instead of duplicating them. Deferred until a third operation kind
+  or WebUI audio-progress demand justifies the unification; do **not** force
+  audio chunks into `SegmentTranslation` in the meantime. (Owner decision
+  2026-07-15: keep the temporary manifest for now, unify later.)
+- **Generalize the reflow running-header heuristic (consideration).**
+  `is_short_running_header` in `crates/bookforge-epub/src/reflow.rs` carries a
+  book-specific `!contains("CAPITOLO")` carve-out — Italian for "chapter" — so
+  a chapter label that arrives as a `<p>` (PDF-derived) is not stripped as a
+  running header. It is inert for non-Italian books and only *protects*
+  content, but it is language-specific logic sitting in a general code path.
+  Under consideration (owner 2026-07-15, "seems redundant"): either replace it
+  with a language-agnostic signal (a general chapter-label/numeral test, or
+  gate on the detected source language) or confirm it is redundant — headings
+  are normally real `<h*>` elements that never reach this `<p>`-only path — and
+  remove it. Low priority; no correctness impact today.
 
 #### 10.1.1 Mini-spec: Pause + Stop (added 2026-07-03, ready to schedule)
 

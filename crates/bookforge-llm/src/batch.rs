@@ -5,7 +5,10 @@ use bookforge_core::{
     segment::{BlockTranslation, Segment, SegmentId, SegmentStatus, SegmentTextRun},
 };
 use std::collections::{HashMap, VecDeque, hash_map::Entry};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
 use tokio::{
     sync::{Semaphore, TryAcquireError, mpsc},
@@ -29,11 +32,14 @@ use escalation::batch_max_output_tokens;
 use escalation::{
     TruncationAlertState, capped_batch_max_output_tokens, next_escalated_batch_max_output_tokens,
 };
+#[cfg(test)]
+use execution::{
+    BatchTranslationRequest, repair_batch_item_limit, request_status_for_controller,
+    translate_one_batch,
+};
 pub use execution::{
     collect_repair_items, translate_batches_with_callback, translate_batches_with_control,
 };
-#[cfg(test)]
-use execution::{request_status_for_controller, translate_one_batch};
 #[cfg(test)]
 use planning::repack_batch;
 pub use planning::{account_for_batch_prompt_overhead, build_translation_batches, split_batch};

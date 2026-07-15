@@ -6,6 +6,7 @@ pub(super) fn batch_item_validation_error(
     translation: &str,
     validate_source_copy: bool,
     section_title: Option<&str>,
+    target_language: Option<&str>,
 ) -> Option<String> {
     if let Some(error) = bookforge_core::marker::marker_structure_error(translation) {
         return Some(error);
@@ -33,6 +34,16 @@ pub(super) fn batch_item_validation_error(
         }
     }
     if let Some(error) = source_copy_error(item, translation, validate_source_copy, section_title) {
+        return Some(error);
+    }
+    if let Some(error) = target_language.and_then(|target_language| {
+        crate::validation::target_language_validation_error(
+            target_language,
+            &item.source_text,
+            translation,
+            &item.protected_spans,
+        )
+    }) {
         return Some(error);
     }
     None
@@ -94,7 +105,7 @@ pub fn parse_batch_response(
     batch: &TranslationBatch,
     response_json: &str,
 ) -> Result<BatchTranslationResult, String> {
-    parse_batch_response_with_validation(batch, response_json, false, None)
+    parse_batch_response_with_validation(batch, response_json, false, None, None)
 }
 
 pub(super) fn parse_batch_response_with_validation(
@@ -102,6 +113,7 @@ pub(super) fn parse_batch_response_with_validation(
     response_json: &str,
     validate_source_copy: bool,
     section_titles: Option<&HashMap<String, String>>,
+    target_language: Option<&str>,
 ) -> Result<BatchTranslationResult, String> {
     let content = response_json.trim();
 
@@ -113,11 +125,16 @@ pub(super) fn parse_batch_response_with_validation(
                 batch.mode == BatchMode::TurboTextOnly,
                 validate_source_copy,
                 section_titles,
+                target_language,
             )
         }
-        BatchMode::RunPreserving => {
-            parse_run_batch_response(batch, content, validate_source_copy, section_titles)
-        }
+        BatchMode::RunPreserving => parse_run_batch_response(
+            batch,
+            content,
+            validate_source_copy,
+            section_titles,
+            target_language,
+        ),
     }
 }
 
@@ -127,6 +144,7 @@ fn parse_text_batch_response(
     turbo: bool,
     validate_source_copy: bool,
     section_titles: Option<&HashMap<String, String>>,
+    target_language: Option<&str>,
 ) -> Result<BatchTranslationResult, String> {
     let parsed: BatchTextResponse =
         serde_json::from_str(content).map_err(|e| format!("invalid batch JSON: {e}"))?;
@@ -178,18 +196,39 @@ fn parse_text_batch_response(
             .and_then(|titles| titles.get(&request_item.segment_id.0))
             .map(String::as_str);
         let validation_error = if turbo {
-            source_copy_error(
-                request_item,
-                &translation,
-                validate_source_copy,
-                section_title,
-            )
+            request_item
+                .protected_spans
+                .iter()
+                .find(|span| {
+                    !span.trim().is_empty()
+                        && !crate::validation::protected_span_present(span, &translation)
+                })
+                .map(|span| format!("protected span missing: {span}"))
+                .or_else(|| {
+                    source_copy_error(
+                        request_item,
+                        &translation,
+                        validate_source_copy,
+                        section_title,
+                    )
+                })
+                .or_else(|| {
+                    target_language.and_then(|target_language| {
+                        crate::validation::target_language_validation_error(
+                            target_language,
+                            &request_item.source_text,
+                            &translation,
+                            &request_item.protected_spans,
+                        )
+                    })
+                })
         } else {
             batch_item_validation_error(
                 request_item,
                 &translation,
                 validate_source_copy,
                 section_title,
+                target_language,
             )
         };
         if let Some(error) = validation_error {
@@ -205,6 +244,11 @@ fn parse_text_batch_response(
             continue;
         }
 
+        let translation = if turbo {
+            wrap_text_only_translation_with_source_markers(&request_item.source_text, &translation)
+        } else {
+            translation
+        };
         translations.push(BatchItemTranslation {
             item_id: item.id.clone(),
             segment_id: request_item.segment_id.clone(),
@@ -245,6 +289,7 @@ fn parse_run_batch_response(
     content: &str,
     validate_source_copy: bool,
     section_titles: Option<&HashMap<String, String>>,
+    target_language: Option<&str>,
 ) -> Result<BatchTranslationResult, String> {
     let parsed: BatchRunResponse =
         serde_json::from_str(content).map_err(|e| format!("invalid batch JSON: {e}"))?;
@@ -353,7 +398,8 @@ fn parse_run_batch_response(
                     .to_string()
             })
             .collect();
-        let translation = joined.join("");
+        let joined_translation = joined.join("");
+        let translation = joined_translation;
         let section_title = section_titles
             .and_then(|titles| titles.get(&request_item.segment_id.0))
             .map(String::as_str);
@@ -362,6 +408,7 @@ fn parse_run_batch_response(
             &translation,
             validate_source_copy,
             section_title,
+            target_language,
         ) {
             failures.push(BatchItemFailure {
                 item_id: item.id.clone(),
@@ -417,12 +464,24 @@ pub(super) fn render_batch_items(
         .items
         .iter()
         .map(|item| {
+            let turbo = batch.mode == BatchMode::TurboTextOnly;
+            let source_text = if turbo {
+                bookforge_core::marker::strip_marker_tokens(&item.source_text)
+            } else {
+                item.source_text.clone()
+            };
+            let required_markers = if turbo {
+                Vec::new()
+            } else {
+                item.required_markers.clone()
+            };
+            let protected_spans = item.protected_spans.clone();
             let mut obj = serde_json::json!({
                 "id": item.item_id,
                 "kind": item.kind,
-                "text": item.source_text,
-                "required_markers": item.required_markers,
-                "protected": item.protected_spans,
+                "text": source_text,
+                "required_markers": required_markers,
+                "protected": protected_spans,
             })
             .as_object()
             .cloned()
@@ -470,4 +529,71 @@ pub(super) fn render_batch_items(
         .collect();
 
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn wrap_text_only_translation_with_source_markers(source: &str, translation: &str) -> String {
+    let mut prefix = String::new();
+    let mut rest = source;
+    while let Some(index) = rest.find('<') {
+        let tag = &rest[index..];
+        if let Some(open) = bookforge_core::marker::parse_paired_marker_open(tag) {
+            prefix.push_str(&tag[..open.len]);
+            prefix.push_str(&format!("</{}>", open.tag_name));
+            rest = &tag[open.len..];
+        } else if let Some(empty) = bookforge_core::marker::parse_empty_marker(tag) {
+            prefix.push_str(&tag[..empty.len]);
+            rest = &tag[empty.len..];
+        } else if let Some(close) = bookforge_core::marker::parse_marker_close(tag) {
+            rest = &tag[close.len..];
+        } else {
+            rest = &tag[1..];
+        }
+    }
+    let translation = bookforge_core::marker::strip_marker_tokens(translation);
+    if prefix.is_empty() {
+        return translation;
+    }
+    format!("{prefix}{translation}")
+}
+
+#[cfg(test)]
+mod text_only_marker_tests {
+    use super::wrap_text_only_translation_with_source_markers;
+
+    #[test]
+    fn text_only_retry_preserves_markers_without_applying_source_formatting_to_all_text() {
+        let wrapped = wrap_text_only_translation_with_source_markers(
+            "Before <m1>bold</m1> and <m2>italic <m3>nested</m3></m2>.",
+            "toki pona pi lipu ni",
+        );
+
+        assert_eq!(
+            bookforge_core::marker::marker_ids_in_text(&wrapped),
+            ["m1", "m2", "m3"]
+        );
+        assert!(bookforge_core::marker::marker_structure_error(&wrapped).is_none());
+        assert_eq!(wrapped, "<m1></m1><m2></m2><m3></m3>toki pona pi lipu ni");
+    }
+
+    #[test]
+    fn preserves_empty_source_markers_once() {
+        let wrapped = wrap_text_only_translation_with_source_markers(
+            "Text <ref id=\"r1\"/> after",
+            "toki sin",
+        );
+
+        assert_eq!(bookforge_core::marker::marker_ids_in_text(&wrapped), ["r1"]);
+        assert!(bookforge_core::marker::marker_structure_error(&wrapped).is_none());
+    }
+
+    #[test]
+    fn strips_model_supplied_markers_before_restoring_source_template() {
+        let wrapped = wrap_text_only_translation_with_source_markers(
+            "Text <m1>bold</m1>",
+            "<m1>toki pona</m1>",
+        );
+
+        assert_eq!(wrapped, "<m1></m1>toki pona");
+        assert_eq!(bookforge_core::marker::marker_ids_in_text(&wrapped), ["m1"]);
+    }
 }

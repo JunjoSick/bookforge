@@ -192,6 +192,7 @@ pub(crate) fn regenerate_report_after_correction(
 pub fn rebuild_options_from_snapshot(snapshot: &RunConfigSnapshot) -> RebuildOptions {
     RebuildOptions {
         target_language: Some(snapshot.target_language.clone()),
+        creator: snapshot.creator.clone(),
         mode: snapshot.bilingual_mode,
         bilingual_separator: snapshot.bilingual_separator.clone(),
         bilingual_style: snapshot.bilingual_style,
