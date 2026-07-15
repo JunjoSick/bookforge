@@ -41,17 +41,28 @@ pub(crate) struct EstimateResult {
 
 pub(crate) fn estimate_epub(
     input: &Path,
+    target_language: &str,
     provider: &str,
     model: Option<&str>,
     pricing_path: Option<&Path>,
 ) -> Result<EstimateResult> {
     let book = read_epub(input)?;
-    let segments = build_segments(&book, &SegmentationConfig::default())?;
+    let mut segmentation = SegmentationConfig::default();
+    let sizing = bookforge_core::style::built_in_sizing_policy_for_target(target_language);
+    if let Some(policy) = sizing {
+        segmentation.max_segment_tokens = segmentation
+            .max_segment_tokens
+            .min(policy.max_segment_tokens);
+    }
+    let segments = build_segments(&book, &segmentation)?;
     let input_tokens = segments
         .iter()
         .map(|segment| segment.source.token_estimate as u64)
         .sum::<u64>();
-    let output_tokens = (input_tokens as f64 * 1.15).ceil() as u64;
+    let output_tokens = sizing.map_or_else(
+        || (input_tokens as f64 * 1.15).ceil() as u64,
+        |policy| input_tokens.saturating_mul(policy.output_token_multiplier as u64),
+    );
     let model = model
         .map(str::to_string)
         .unwrap_or_else(|| default_model(provider).to_string());
@@ -72,6 +83,7 @@ pub(crate) fn estimate_epub(
 pub async fn run(args: EstimateArgs) -> Result<()> {
     let result = estimate_epub(
         &args.input,
+        &args.language.target,
         &args.provider.provider,
         args.provider.model.as_deref(),
         args.pricing.as_deref(),

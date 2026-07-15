@@ -359,6 +359,12 @@ pub(crate) struct ControlFileWatcher {
     lease_instance_id: String,
 }
 
+pub(crate) struct ControlBaseline {
+    pub settings: ResolvedRunSettings,
+    pub qa: QaMode,
+    pub validate_output: bool,
+}
+
 impl ControlFileWatcher {
     pub(crate) fn spawn_with_stop_cancel(
         store_path: PathBuf,
@@ -366,9 +372,7 @@ impl ControlFileWatcher {
         progress: Arc<dyn ProgressSink>,
         signal: PauseSignal,
         stop_cancel_token: CancellationToken,
-        baseline_settings: ResolvedRunSettings,
-        baseline_qa: QaMode,
-        baseline_validate_output: bool,
+        baseline: ControlBaseline,
     ) -> Self {
         Self::spawn_inner(
             store_path,
@@ -376,9 +380,7 @@ impl ControlFileWatcher {
             progress,
             signal,
             Some(stop_cancel_token),
-            baseline_settings,
-            baseline_qa,
-            baseline_validate_output,
+            baseline,
         )
     }
 
@@ -388,10 +390,13 @@ impl ControlFileWatcher {
         progress: Arc<dyn ProgressSink>,
         signal: PauseSignal,
         stop_cancel_token: Option<CancellationToken>,
-        baseline_settings: ResolvedRunSettings,
-        baseline_qa: QaMode,
-        baseline_validate_output: bool,
+        baseline: ControlBaseline,
     ) -> Self {
+        let ControlBaseline {
+            settings: baseline_settings,
+            qa: baseline_qa,
+            validate_output: baseline_validate_output,
+        } = baseline;
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let job_id = job_id.into();
@@ -722,9 +727,11 @@ mod tests {
             Arc::new(NullProgressSink),
             PauseSignal::new(),
             CancellationToken::new(),
-            baseline,
-            QaMode::Off,
-            false,
+            ControlBaseline {
+                settings: baseline,
+                qa: QaMode::Off,
+                validate_output: false,
+            },
         );
         let mut receiver = watcher.runtime_settings();
         if receiver.borrow().revision != 7 {
@@ -775,9 +782,11 @@ mod tests {
             Arc::new(NullProgressSink),
             PauseSignal::new(),
             CancellationToken::new(),
-            TranslationProfile::V1Fast.resolve(),
-            QaMode::Off,
-            false,
+            ControlBaseline {
+                settings: TranslationProfile::V1Fast.resolve(),
+                qa: QaMode::Off,
+                validate_output: false,
+            },
         );
 
         let first = match runtime_lease_state(&job.id) {
@@ -845,9 +854,11 @@ mod tests {
             }),
             signal,
             CancellationToken::new(),
-            TranslationProfile::V1Fast.resolve(),
-            QaMode::Off,
-            false,
+            ControlBaseline {
+                settings: TranslationProfile::V1Fast.resolve(),
+                qa: QaMode::Off,
+                validate_output: false,
+            },
         );
 
         tokio::time::timeout(Duration::from_secs(2), async {

@@ -1,5 +1,13 @@
 use super::*;
 
+pub(super) fn repair_batch_item_limit(target_language: &str) -> usize {
+    if target_language.trim().eq_ignore_ascii_case("Toki Pona") {
+        1
+    } else {
+        16
+    }
+}
+
 enum BatchWorkerResult {
     Provider(Result<BatchTranslationResult, LlmError>),
     StoppedUnfinished,
@@ -21,6 +29,21 @@ struct RepairWorkerOutput {
     result: Result<BatchTranslationResult, LlmError>,
     latency_ms: u64,
     max_output_tokens: u32,
+}
+
+struct InFlightRequestGuard(Arc<AtomicUsize>);
+
+impl InFlightRequestGuard {
+    fn start(counter: Arc<AtomicUsize>) -> (Self, usize) {
+        let active = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        (Self(counter), active)
+    }
+}
+
+impl Drop for InFlightRequestGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn is_transient(err: &LlmError) -> bool {
@@ -157,6 +180,7 @@ where
         Duration::ZERO,
         Some(progress.clone()),
     ));
+    let active_requests = Arc::new(AtomicUsize::new(0));
 
     let all_items: HashMap<String, TranslationBatchItem> = batches
         .iter()
@@ -177,7 +201,8 @@ where
         .iter()
         .map(|s| (s.id.0.clone(), s.block_ids.len()))
         .collect();
-    let mut pending_segment_blocks: HashMap<String, HashMap<BlockId, String>> = HashMap::new();
+    let mut pending_segment_translations: HashMap<String, SegmentTranslation> = HashMap::new();
+    let mut incrementally_finalized_segment_ids = std::collections::HashSet::<String>::new();
 
     let mut all_results: Vec<BatchTranslationResult> = Vec::new();
     let mut pending: Vec<TranslationBatch> = batches;
@@ -185,6 +210,7 @@ where
     let mut single_invalid_attempts_by_item: HashMap<String, usize> = HashMap::new();
     let mut transient_attempts_by_item: HashMap<String, usize> = HashMap::new();
     let mut escalated_output_tokens_by_item: HashMap<String, u32> = HashMap::new();
+    let mut compact_retry_attempts_by_item: HashMap<String, usize> = HashMap::new();
     let mut truncation_alert = TruncationAlertState::default();
     let mut stop_dispatch = false;
     let mut runtime_sizer: Option<(u64, bool, BatchSizer)> = None;
@@ -285,6 +311,12 @@ where
                 let batch = normalized.remove(0);
                 let output_override =
                     take_batch_output_override(&mut escalated_output_tokens_by_item, &batch);
+                let compact_retry_attempt = batch
+                    .items
+                    .iter()
+                    .filter_map(|item| compact_retry_attempts_by_item.get(&item.item_id).copied())
+                    .max()
+                    .unwrap_or(0);
                 for extra in normalized.into_iter().rev() {
                     pending_queue.push_front(extra);
                 }
@@ -303,6 +335,7 @@ where
                 let request_limiter = request_limiter.clone();
                 let section_titles = section_titles.clone();
                 let pause_signal = pause_signal.clone();
+                let active_requests = active_requests.clone();
 
                 tasks.spawn(async move {
                     let output_escalated = output_override.is_some();
@@ -432,6 +465,8 @@ where
                     let request_id = format!("batch_{}", batch.id);
                     let (runtime_config_revision, provider_max_attempts) =
                         config.request_runtime_metadata();
+                    let (_in_flight, active_request_count) =
+                        InFlightRequestGuard::start(active_requests);
                     progress.emit(bookforge_core::ProgressEvent::RequestStarted {
                         request_id: request_id.clone(),
                         batch_id: Some(batch.id.clone()),
@@ -442,7 +477,7 @@ where
                         items: batch.items.len(),
                         estimated_input_tokens: batch.token_estimate,
                         max_output_tokens: Some(max_output_tokens),
-                        active_requests: 0,
+                        active_requests: active_request_count,
                         target_concurrency: config.scheduler.concurrency,
                         runtime_config_revision,
                         provider_max_attempts,
@@ -453,11 +488,14 @@ where
                         provider.clone(),
                         library.clone(),
                         batch.clone(),
-                        &config,
-                        Some(max_output_tokens),
-                        context_pairs,
-                        validate_source_copy,
-                        &section_titles,
+                        BatchTranslationRequest {
+                            config: &config,
+                            max_output_tokens_override: Some(max_output_tokens),
+                            context_pairs,
+                            validate_source_copy,
+                            section_titles: &section_titles,
+                            compact_retry_attempt,
+                        },
                     )
                     .await;
                     let latency_ms = started.elapsed().as_millis() as u64;
@@ -595,6 +633,9 @@ where
 
             match result {
                 Ok(batch_result) => {
+                    for item in &batch.items {
+                        compact_retry_attempts_by_item.remove(&item.item_id);
+                    }
                     truncation_alert.observe_resolved();
                     if let Some(sizer) =
                         adaptive_sizer_mut(&mut runtime_sizer, batch_sizer.as_deref_mut())
@@ -606,54 +647,138 @@ where
                     // don't participate (they're fixing prior translations,
                     // not producing new ones — and they carry the sentinel
                     // empty section_id).
-                    if let Some(registry) = config.context_registry.as_deref()
-                        && batch.kind == BatchKind::Translation
-                    {
+                    if batch.kind == BatchKind::Translation {
                         for item in &batch_result.translations {
                             let key = item.segment_id.0.clone();
                             let Some(source_item) = all_items.get(&item.item_id) else {
                                 continue;
                             };
-                            pending_segment_blocks
+                            let Some(segment) = segments_by_id.get(&key) else {
+                                continue;
+                            };
+                            let entry = pending_segment_translations
                                 .entry(key.clone())
-                                .or_default()
-                                .insert(source_item.block_id.clone(), item.text.clone());
+                                .or_insert_with(|| SegmentTranslation {
+                                    segment_id: segment.id.clone(),
+                                    ordinal: segment.ordinal,
+                                    block_ids: segment.block_ids.clone(),
+                                    blocks: Vec::new(),
+                                    checksum: segment.checksum.clone(),
+                                    status: SegmentStatus::Succeeded,
+                                    template: "batch".to_string(),
+                                    error: None,
+                                    input_tokens: None,
+                                    input_cached_tokens: None,
+                                    output_tokens: None,
+                                    tokens_estimated: false,
+                                });
+                            add_usage(entry, item);
+                            if !entry
+                                .blocks
+                                .iter()
+                                .any(|block| block.block_id == source_item.block_id)
+                            {
+                                entry.blocks.push(BlockTranslation {
+                                    block_id: source_item.block_id.clone(),
+                                    text: item.text.clone(),
+                                });
+                            }
                             let expected = segment_block_expected
                                 .get(&key)
                                 .copied()
                                 .unwrap_or(usize::MAX);
-                            if pending_segment_blocks[&key].len() >= expected
-                                && let Some(segment) = segments_by_id.get(&key)
-                            {
-                                let blocks = pending_segment_blocks.remove(&key).unwrap();
-                                let joined = segment
-                                    .block_ids
-                                    .iter()
-                                    .filter_map(|block_id| blocks.get(block_id))
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join("\n\n");
-                                registry.pre_populate_text(
-                                    segment,
-                                    joined,
-                                    SegmentStatus::Succeeded,
+                            if entry.blocks.len() >= expected {
+                                let mut completed = pending_segment_translations
+                                    .remove(&key)
+                                    .expect("completed segment accumulator");
+                                let (blocks, missing, extra, duplicate) = order_blocks_by_segment(
+                                    &completed.block_ids,
+                                    std::mem::take(&mut completed.blocks),
                                 );
+                                if missing.is_empty() && extra.is_empty() && duplicate.is_empty() {
+                                    completed.blocks = blocks;
+                                    if let Some(registry) = config.context_registry.as_deref() {
+                                        let joined = completed
+                                            .blocks
+                                            .iter()
+                                            .map(|block| block.text.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join("\n\n");
+                                        registry.pre_populate_text(
+                                            segment,
+                                            joined,
+                                            SegmentStatus::Succeeded,
+                                        );
+                                    }
+                                    if let Some(ref tx) = finalized_tx {
+                                        tx.send(completed.clone()).await.map_err(|_| {
+                                            LlmError::Provider(
+                                                "finalized segment channel closed".to_string(),
+                                            )
+                                        })?;
+                                    }
+                                    on_segment(&completed)?;
+                                    incrementally_finalized_segment_ids.insert(key);
+                                }
                             }
                         }
                         // Failures must also unblock the fence so downstream
                         // batches don't deadlock waiting on a segment that
                         // will never publish a Succeeded entry.
-                        for failure in &batch_result.failures {
-                            if let Some(segment) = segments_by_id.get(&failure.segment_id.0) {
-                                registry.pre_populate_text(
-                                    segment,
-                                    String::new(),
-                                    SegmentStatus::Failed,
-                                );
+                        if let Some(registry) = config.context_registry.as_deref() {
+                            for failure in &batch_result.failures {
+                                if let Some(segment) = segments_by_id.get(&failure.segment_id.0) {
+                                    registry.pre_populate_text(
+                                        segment,
+                                        String::new(),
+                                        SegmentStatus::Failed,
+                                    );
+                                }
                             }
                         }
                     }
                     all_results.push(batch_result);
+                }
+                Err(LlmError::InvalidResponse(_))
+                    if batch.kind == BatchKind::Translation
+                        && request_status == RequestStatus::Truncated
+                        && batch.items.len() == 1
+                        && batch
+                            .items
+                            .iter()
+                            .filter_map(|item| {
+                                compact_retry_attempts_by_item.get(&item.item_id).copied()
+                            })
+                            .max()
+                            .unwrap_or(0)
+                            < 3 =>
+                {
+                    let attempt = batch
+                        .items
+                        .iter()
+                        .filter_map(|item| {
+                            compact_retry_attempts_by_item.get(&item.item_id).copied()
+                        })
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    for item in &batch.items {
+                        compact_retry_attempts_by_item.insert(item.item_id.clone(), attempt);
+                    }
+                    set_batch_output_override(
+                        &mut escalated_output_tokens_by_item,
+                        &batch,
+                        max_output_tokens,
+                    );
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "single_item_batch_compact_retry".to_string(),
+                        message: format!(
+                            "single-item batch {} exhausted max_output_tokens {}; compact anti-repetition retry {attempt}/3",
+                            batch.id, max_output_tokens,
+                        ),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    pending_queue.push_back(batch);
                 }
                 Err(LlmError::InvalidResponse(_))
                     if batch.kind == BatchKind::Translation
@@ -765,7 +890,26 @@ where
                     truncation_alert.observe_resolved();
                     let attempts =
                         increment_batch_item_attempts(&mut single_invalid_attempts_by_item, &batch);
-                    if attempts < config.scheduler.max_attempts.max(1) {
+                    let compact_retry_limit =
+                        if bookforge_core::style::built_in_sizing_policy_for_target(
+                            &config.target_language,
+                        )
+                        .is_some()
+                        {
+                            4
+                        } else {
+                            config.scheduler.max_attempts.max(1)
+                        };
+                    if attempts < compact_retry_limit {
+                        for item in &batch.items {
+                            compact_retry_attempts_by_item
+                                .insert(item.item_id.clone(), attempts.min(3));
+                        }
+                        set_batch_output_override(
+                            &mut escalated_output_tokens_by_item,
+                            &batch,
+                            max_output_tokens,
+                        );
                         progress.emit(bookforge_core::ProgressEvent::Warning {
                             kind: "single_item_batch_invalid_response_retry".to_string(),
                             message: format!(
@@ -1092,11 +1236,12 @@ where
                 .map(|(failure, _)| (failure.item_id.clone(), failure.error.clone()))
                 .collect(),
         );
+        let repair_batch_item_limit = repair_batch_item_limit(&config.target_language);
         let mut repair_batches: VecDeque<TranslationBatch> = repair_items
             .iter()
             .map(|(_, item)| item.clone())
             .collect::<Vec<_>>()
-            .chunks(16)
+            .chunks(repair_batch_item_limit)
             .enumerate()
             .map(|(idx, items)| {
                 let items = items.to_vec();
@@ -1156,6 +1301,7 @@ where
                 let repair_errors = repair_errors.clone();
                 let progress = progress.clone();
                 let section_titles = section_titles.clone();
+                let active_requests = active_requests.clone();
 
                 repair_tasks.spawn(async move {
                     let started = std::time::Instant::now();
@@ -1165,6 +1311,8 @@ where
                     let request_id = format!("batch_{}", repair_batch.id);
                     let (runtime_config_revision, provider_max_attempts) =
                         config.request_runtime_metadata();
+                    let (_in_flight, active_request_count) =
+                        InFlightRequestGuard::start(active_requests);
 
                     progress.emit(bookforge_core::ProgressEvent::RequestStarted {
                         request_id: request_id.clone(),
@@ -1176,7 +1324,7 @@ where
                         items: repair_batch.items.len(),
                         estimated_input_tokens: repair_batch.token_estimate,
                         max_output_tokens: Some(max_output_tokens),
-                        active_requests: 0,
+                        active_requests: active_request_count,
                         target_concurrency: config.scheduler.concurrency,
                         runtime_config_revision,
                         provider_max_attempts,
@@ -1209,6 +1357,22 @@ where
                             })
                         })
                         .collect();
+                    let guidance_json: Vec<serde_json::Value> = repair_batch
+                        .items
+                        .iter()
+                        .filter_map(|item| {
+                            config
+                                .glossary
+                                .guidance_by_segment
+                                .get(&item.segment_id.0)
+                                .map(|guidance| {
+                                    serde_json::json!({
+                                        "id": item.item_id,
+                                        "guidance": guidance,
+                                    })
+                                })
+                        })
+                        .collect();
 
                     let mut vars = Substitutions::new();
                     vars.raw(
@@ -1218,6 +1382,26 @@ where
                     .raw(
                         "errors_json",
                         serde_json::to_string(&errors_json).unwrap_or_default(),
+                    )
+                    .raw(
+                        "guidance_json",
+                        serde_json::to_string(&guidance_json).unwrap_or_default(),
+                    )
+                    .raw(
+                        "source_language",
+                        config
+                            .source_language
+                            .as_deref()
+                            .unwrap_or("source language"),
+                    )
+                    .raw("target_language", &config.target_language)
+                    .raw(
+                        "style_block",
+                        config
+                            .style
+                            .as_ref()
+                            .map(|style| style.rendered_block.as_str())
+                            .unwrap_or(""),
                     );
 
                     let repair_template = if config.compact_prompts {
@@ -1259,6 +1443,8 @@ where
                                         &response.content,
                                         validate_source_copy,
                                         Some(&section_titles),
+                                        (!config.provider.eq_ignore_ascii_case("mock"))
+                                            .then_some(config.target_language.as_str()),
                                     ) {
                                         Ok(mut repaired) => {
                                             repaired.input_tokens = response.input_tokens;
@@ -1344,6 +1530,7 @@ where
                         let Some(source_item) = all_items.get(&translation.item_id) else {
                             continue;
                         };
+                        let mut completed_segment = None;
                         if let Some(existing) =
                             segment_translations.get_mut(&translation.segment_id.0)
                         {
@@ -1362,6 +1549,32 @@ where
                                 });
                             }
                             repaired_count += 1;
+
+                            if !incrementally_finalized_segment_ids
+                                .contains(&translation.segment_id.0)
+                            {
+                                let mut candidate = existing.clone();
+                                let (blocks, missing, extra, duplicate) = order_blocks_by_segment(
+                                    &candidate.block_ids,
+                                    std::mem::take(&mut candidate.blocks),
+                                );
+                                if missing.is_empty() && extra.is_empty() && duplicate.is_empty() {
+                                    candidate.blocks = blocks;
+                                    completed_segment = Some(candidate);
+                                }
+                            }
+                        }
+                        if let Some(completed) = completed_segment {
+                            if let Some(ref tx) = finalized_tx {
+                                tx.send(completed.clone()).await.map_err(|_| {
+                                    LlmError::Provider(
+                                        "finalized segment channel closed".to_string(),
+                                    )
+                                })?;
+                            }
+                            on_segment(&completed)?;
+                            incrementally_finalized_segment_ids
+                                .insert(completed.segment_id.0.clone());
                         }
                     }
                 }
@@ -1416,6 +1629,9 @@ where
     });
 
     for translation in &mut translations {
+        if incrementally_finalized_segment_ids.contains(&translation.segment_id.0) {
+            continue;
+        }
         if let Some(ref tx) = finalized_tx {
             tx.send(translation.clone())
                 .await
@@ -1444,16 +1660,29 @@ where
     }
 }
 
+pub(super) struct BatchTranslationRequest<'a> {
+    pub config: &'a TranslationRunConfig,
+    pub max_output_tokens_override: Option<u32>,
+    pub context_pairs: Vec<crate::scheduler::CompletedContext>,
+    pub validate_source_copy: bool,
+    pub section_titles: &'a HashMap<String, String>,
+    pub compact_retry_attempt: usize,
+}
+
 pub(super) async fn translate_one_batch(
     provider: Arc<impl LlmProvider>,
     library: Arc<PromptLibrary>,
     batch: TranslationBatch,
-    config: &TranslationRunConfig,
-    max_output_tokens_override: Option<u32>,
-    context_pairs: Vec<crate::scheduler::CompletedContext>,
-    validate_source_copy: bool,
-    section_titles: &HashMap<String, String>,
+    request: BatchTranslationRequest<'_>,
 ) -> Result<BatchTranslationResult, LlmError> {
+    let BatchTranslationRequest {
+        config,
+        max_output_tokens_override,
+        context_pairs,
+        validate_source_copy,
+        section_titles,
+        compact_retry_attempt,
+    } = request;
     let context_block = crate::scheduler::render_context_pairs(&context_pairs);
     let items_json = render_batch_items(&batch, config);
     let template = if config.compact_prompts {
@@ -1502,9 +1731,14 @@ pub(super) async fn translate_one_batch(
     )
     .raw("items_json", items_json);
 
-    let rendered = template
+    let mut rendered = template
         .render(&vars)
         .map_err(|e| LlmError::Provider(e.to_string()))?;
+    if compact_retry_attempt > 0 {
+        rendered.user.push_str(&format!(
+            "\n\nRECOVERY MODE {compact_retry_attempt}: Return one compact JSON object only. Translate every item exactly once. Do not repeat any word, sentence, item, or explanation. End immediately after the closing brace."
+        ));
+    }
 
     let max_tokens = max_output_tokens_override
         .unwrap_or_else(|| capped_batch_max_output_tokens(&batch, config, provider.is_reasoning()));
@@ -1515,7 +1749,12 @@ pub(super) async fn translate_one_batch(
             system: rendered.system,
             user: rendered.user,
             response_format: ResponseFormat::Json,
-            temperature: 0.2,
+            temperature: match compact_retry_attempt {
+                0 => 0.2,
+                1 => 0.0,
+                2 => 0.4,
+                _ => 0.7,
+            },
             max_output_tokens: Some(max_tokens),
             metadata: RequestMetadata {
                 segment_id: Some(format!("batch_{}", batch.id)),
@@ -1544,6 +1783,8 @@ pub(super) async fn translate_one_batch(
                 &resp.content,
                 validate_source_copy,
                 Some(section_titles),
+                (!config.provider.eq_ignore_ascii_case("mock"))
+                    .then_some(config.target_language.as_str()),
             )
             .map_err(LlmError::InvalidResponse)?;
             result.input_tokens = resp.input_tokens;

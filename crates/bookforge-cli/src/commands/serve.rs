@@ -62,6 +62,15 @@ const PROVIDER_KEY_ENVS: &[(&str, &str)] = &[
     ("openrouter", "OPENROUTER_API_KEY"),
     ("openai-compatible", "OPENAI_API_KEY"),
 ];
+const AUDIO_PROVIDER_KEY_ENVS: &[(&str, &str)] = &[
+    ("openai", "OPENAI_API_KEY"),
+    ("gemini", "GEMINI_API_KEY"),
+    ("elevenlabs", "ELEVENLABS_API_KEY"),
+];
+const AUDIO_OPENAI_MODELS: &[&str] = &["gpt-4o-mini-tts", "tts-1", "tts-1-hd"];
+const AUDIO_GEMINI_MODELS: &[&str] = &["gemini-3.1-flash-tts-preview"];
+const AUDIO_ELEVENLABS_MODELS: &[&str] = &["eleven_multilingual_v2", "eleven_flash_v2_5"];
+const AUDIO_MOCK_MODELS: &[&str] = &["mock-silence"];
 
 const LANGUAGE_OPTIONS: &[&str] = &[
     "English",
@@ -92,6 +101,7 @@ const LANGUAGE_OPTIONS: &[&str] = &[
     "Indonesian",
     "Vietnamese",
     "Thai",
+    "Toki Pona",
 ];
 
 const MOCK_MODELS: &[&str] = &["mock-identity", "mock-prefix-target", "mock-uppercase"];
@@ -140,6 +150,8 @@ struct AppState {
     /// the lifetime of the server: never written to disk, never logged, and
     /// only injected into spawned runs through the child's environment.
     keys: Arc<Mutex<HashMap<String, String>>>,
+    /// Browser-launched audiobook operations that can still be cancelled.
+    audio_cancels: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// Path to the job store's sqlite database, resolved once when the server
     /// (or, in tests, a router) is constructed. Handlers open a fresh
     /// [`JobStore`] against this path per request rather than calling
@@ -175,6 +187,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         csrf_token: generate_csrf_token()?,
         host_port: local.port(),
         keys: Arc::new(Mutex::new(HashMap::new())),
+        audio_cancels: Arc::new(Mutex::new(HashMap::new())),
         store_path: default_store_path(),
         #[cfg(test)]
         resume_launches: None,
@@ -232,6 +245,10 @@ fn dashboard_router(state: AppState) -> Router {
         .route("/api/providers", get(provider_status))
         .route("/api/estimate", post(estimate_translate))
         .route("/api/translate", post(launch_translate))
+        .route("/api/audiobook", post(launch_audiobook))
+        .route("/api/audiobooks/{id}", get(audiobook_status))
+        .route("/api/audiobooks/{id}/cancel", post(cancel_audiobook))
+        .route("/api/audiobooks/{id}/artifact", get(audiobook_artifact))
         .route("/api/glossary", get(list_glossary).post(add_glossary))
         .route("/api/glossary/{id}", delete(remove_glossary))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
@@ -916,6 +933,9 @@ async fn launch_translate(
     if let Some(profile) = field_value(&fields, "profile") {
         command.arg("--profile").arg(profile);
     }
+    if provider == "deepseek" {
+        command.arg("--no-thinking");
+    }
     // Advanced tuning from the wizard, each validated before forwarding so the
     // child never receives arbitrary argv from the browser.
     if let Some(concurrency) = field_value(&fields, "concurrency")
@@ -984,6 +1004,457 @@ async fn launch_translate(
     .into_response())
 }
 
+/// Launch audiobook synthesis directly from an uploaded source or translated
+/// EPUB. Progress is durable: the audio builder creates `manifest.json` before
+/// its first provider request and atomically checkpoints it after every chunk.
+async fn launch_audiobook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Response, AppError> {
+    if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name = "upload.epub".to_string();
+    let mut fields = HashMap::<String, String>::new();
+    while let Some(field) = multipart.next_field().await? {
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "file" {
+            if let Some(value) = field.file_name().filter(|value| !value.is_empty()) {
+                file_name = value.to_string();
+            }
+            file_bytes = Some(field.bytes().await?.to_vec());
+        } else {
+            fields.insert(name, field.text().await?);
+        }
+    }
+    let Some(bytes) = file_bytes.filter(|bytes| !bytes.is_empty()) else {
+        return Ok(bad_request("upload an EPUB file"));
+    };
+
+    let provider = field_value(&fields, "provider").unwrap_or_else(|| "mock".to_string());
+    if !matches!(
+        provider.as_str(),
+        "mock" | "openai" | "gemini" | "elevenlabs"
+    ) {
+        return Ok(bad_request("unsupported audiobook provider"));
+    }
+    let model = field_value(&fields, "model").unwrap_or_else(|| match provider.as_str() {
+        "openai" => "gpt-4o-mini-tts".to_string(),
+        "gemini" => "gemini-3.1-flash-tts-preview".to_string(),
+        "elevenlabs" => "eleven_multilingual_v2".to_string(),
+        _ => "mock-silence".to_string(),
+    });
+    let voice = field_value(&fields, "voice").or_else(|| match provider.as_str() {
+        "openai" => Some("alloy".to_string()),
+        "gemini" => Some("Kore".to_string()),
+        "mock" => Some("mock".to_string()),
+        _ => None,
+    });
+    let Some(voice) = voice else {
+        return Ok(bad_request("ElevenLabs requires a voice ID"));
+    };
+    let format = field_value(&fields, "format").unwrap_or_else(|| {
+        if matches!(provider.as_str(), "gemini" | "mock") {
+            "wav".to_string()
+        } else {
+            "mp3".to_string()
+        }
+    });
+    let allowed_format = matches!(
+        format.as_str(),
+        "mp3" | "opus" | "aac" | "flac" | "wav" | "pcm"
+    );
+    if !allowed_format {
+        return Ok(bad_request("unsupported audio format"));
+    }
+    if provider == "mock" && format != "wav" {
+        return Ok(bad_request("the mock provider supports WAV only"));
+    }
+    if provider == "gemini" && !matches!(format.as_str(), "wav" | "pcm") {
+        return Ok(bad_request("Gemini supports WAV or PCM only"));
+    }
+    if provider == "elevenlabs" && matches!(format.as_str(), "aac" | "flac") {
+        return Ok(bad_request("ElevenLabs supports MP3, Opus, WAV, or PCM"));
+    }
+
+    let speed = field_value(&fields, "speed")
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    if !speed.is_finite() || !(0.25..=4.0).contains(&speed) {
+        return Ok(bad_request("speed must be between 0.25 and 4.0"));
+    }
+    if provider == "gemini" && (speed - 1.0).abs() > f32::EPSILON {
+        return Ok(bad_request("Gemini does not expose playback-speed control"));
+    }
+    let instructions = field_value(&fields, "instructions");
+    if provider == "elevenlabs" && instructions.is_some() {
+        return Ok(bad_request(
+            "ElevenLabs does not accept free-form instructions",
+        ));
+    }
+    let make_m4b = truthy_field(&fields, "m4b");
+    let stitch_audio = truthy_field(&fields, "stitch") || make_m4b;
+    if stitch_audio && format == "pcm" {
+        return Ok(bad_request(
+            "raw PCM cannot be stitched; choose a container format",
+        ));
+    }
+    if make_m4b && !bookforge_audio::ffmpeg_available() {
+        return Ok(bad_request("ffmpeg is required to create an M4B"));
+    }
+    let base_url = field_value(&fields, "base_url");
+    if base_url
+        .as_deref()
+        .is_some_and(|value| !dashboard_audio_base_url_allowed(value))
+    {
+        return Ok(bad_request(
+            "base URL must use HTTPS, except for loopback HTTP endpoints",
+        ));
+    }
+
+    let key_slot = format!("audio:{provider}");
+    let supplied_key = (provider != "mock")
+        .then(|| field_value(&fields, "api_key"))
+        .flatten();
+    let key = if let Some(key) = supplied_key {
+        lock_keys(&state)?.insert(key_slot.clone(), key.clone());
+        Some(key)
+    } else {
+        lock_keys(&state)?.get(&key_slot).cloned()
+    };
+    if provider != "mock"
+        && key.is_none()
+        && !audio_provider_env_has_key(&provider)
+        && !(provider == "openai" && base_url.as_deref().is_some_and(audio_base_url_is_loopback))
+    {
+        return Ok(bad_request("TTS provider API key is required"));
+    }
+
+    let stem = sanitize_component(strip_epub_suffix(&file_name));
+    let sequence = ESTIMATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = format!("{}-{sequence}-{stem}", now_ms());
+    let upload_dir = PathBuf::from(UPLOAD_DIR);
+    std::fs::create_dir_all(&upload_dir)?;
+    let input_path = upload_dir.join(format!("audiobook-{id}.epub"));
+    let out_dir = upload_dir.join(format!("audiobook-{id}"));
+    std::fs::write(&input_path, bytes)?;
+    let inspect_path = input_path.clone();
+    if let Err(error) =
+        tokio::task::spawn_blocking(move || bookforge_epub::inspect_epub(&inspect_path)).await?
+    {
+        let _ = std::fs::remove_file(&input_path);
+        return Ok(bad_request(&format!("could not read EPUB: {error}")));
+    }
+    std::fs::create_dir_all(&out_dir)?;
+    write_audio_process_state(&out_dir, "starting", None, None)?;
+
+    let max_chars = field_value(&fields, "max_chars")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2_000)
+        .clamp(1, 4_096);
+    let concurrency = field_value(&fields, "concurrency")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 16);
+
+    let exe = std::env::current_exe()?;
+    let mut command = tokio::process::Command::new(exe);
+    command
+        .arg("audiobook")
+        .arg(&input_path)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--provider")
+        .arg(&provider)
+        .arg("--model")
+        .arg(&model)
+        .arg("--voice")
+        .arg(&voice)
+        .arg("--format")
+        .arg(&format)
+        .arg("--speed")
+        .arg(speed.to_string())
+        .arg("--max-chars")
+        .arg(max_chars.to_string())
+        .arg("--concurrency")
+        .arg(concurrency.to_string())
+        .arg("--ui")
+        .arg("quiet");
+    if let Some(instructions) = instructions {
+        command.arg("--instructions").arg(instructions);
+    }
+    if let Some(base_url) = base_url {
+        command.arg("--base-url").arg(base_url);
+    }
+    if make_m4b {
+        command.arg("--m4b");
+    } else if stitch_audio {
+        command.arg("--stitch");
+    }
+    if provider != "mock"
+        && let Some(key) = key
+    {
+        let env = audio_provider_key_env(&provider).expect("audio provider was validated");
+        command.arg("--api-key-env").arg(env);
+        command.env(env, key);
+    }
+
+    let mut child = command
+        .spawn()
+        .context("failed to spawn audiobook process")?;
+    let pid = child.id();
+    write_audio_process_state(&out_dir, "running", pid, None)?;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    state
+        .audio_cancels
+        .lock()
+        .map_err(|_| anyhow::anyhow!("audiobook cancellation registry is unavailable"))?
+        .insert(id.clone(), cancel.clone());
+    let monitor_dir = out_dir.clone();
+    let monitor_id = id.clone();
+    let cancel_registry = state.audio_cancels.clone();
+    tokio::spawn(async move {
+        let operation_state = tokio::select! {
+            status = child.wait() => match status {
+                Ok(status) if status.success() => ("succeeded", None),
+                Ok(status) => ("failed", Some(format!("audiobook process exited with {status}"))),
+                Err(error) => ("failed", Some(format!("could not wait for audiobook process: {error}"))),
+            },
+            _ = cancel.cancelled() => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                ("cancelled", None)
+            }
+        };
+        let _ = write_audio_process_state(
+            &monitor_dir,
+            operation_state.0,
+            pid,
+            operation_state.1.as_deref(),
+        );
+        if let Ok(mut registry) = cancel_registry.lock() {
+            registry.remove(&monitor_id);
+        }
+    });
+
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "input_path": input_path.display().to_string(),
+        "out_dir": out_dir.display().to_string(),
+        "provider": provider,
+        "model": model,
+        "voice": voice,
+        "pid": pid,
+    }))
+    .into_response())
+}
+
+async fn audiobook_status(AxumPath(id): AxumPath<String>) -> Result<Response, AppError> {
+    if !valid_audiobook_id(&id) {
+        return Ok(bad_request("invalid audiobook operation id"));
+    }
+    let out_dir = PathBuf::from(UPLOAD_DIR).join(format!("audiobook-{id}"));
+    if !out_dir.is_dir() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no such audiobook operation"})),
+        )
+            .into_response());
+    }
+    let manifest_path = out_dir.join("manifest.json");
+    let process_path = out_dir.join("process.json");
+    let process: serde_json::Value = std::fs::read(&process_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| json!({"status": "starting"}));
+    let mut payload: serde_json::Value = std::fs::read(&manifest_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| {
+            json!({
+                "status": "starting",
+                "completed_chunks": 0,
+                "chunks": [],
+            })
+        });
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("id".to_string(), json!(id));
+        object.insert("out_dir".to_string(), json!(out_dir.display().to_string()));
+        object.insert("process".to_string(), process.clone());
+        match process.get("status").and_then(serde_json::Value::as_str) {
+            Some("failed") => {
+                object.insert("status".to_string(), json!("failed"));
+                object.insert(
+                    "error".to_string(),
+                    process
+                        .get("error")
+                        .cloned()
+                        .unwrap_or_else(|| json!("audiobook process failed")),
+                );
+            }
+            Some("cancelled") => {
+                object.insert("status".to_string(), json!("cancelled"));
+            }
+            _ => {}
+        }
+        if out_dir.join("audiobook.m4b").is_file() {
+            object.insert(
+                "artifact".to_string(),
+                json!(out_dir.join("audiobook.m4b").display().to_string()),
+            );
+        }
+    }
+    Ok(Json(payload).into_response())
+}
+
+async fn cancel_audiobook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, AppError> {
+    if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+    if !valid_audiobook_id(&id) {
+        return Ok(bad_request("invalid audiobook operation id"));
+    }
+    let cancel = state
+        .audio_cancels
+        .lock()
+        .map_err(|_| anyhow::anyhow!("audiobook cancellation registry is unavailable"))?
+        .get(&id)
+        .cloned();
+    let Some(cancel) = cancel else {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "audiobook operation is not running in this server"})),
+        )
+            .into_response());
+    };
+    cancel.cancel();
+    Ok(Json(json!({"ok": true, "status": "cancelling"})).into_response())
+}
+
+async fn audiobook_artifact(AxumPath(id): AxumPath<String>) -> Result<Response, AppError> {
+    if !valid_audiobook_id(&id) {
+        return Ok(bad_request("invalid audiobook operation id"));
+    }
+    let out_dir = PathBuf::from(UPLOAD_DIR).join(format!("audiobook-{id}"));
+    let m4b_path = out_dir.join("audiobook.m4b");
+    let (path, content_type, download_name) = if m4b_path.is_file() {
+        (m4b_path, "audio/mp4", "audiobook.m4b")
+    } else {
+        let archive_dir = out_dir.clone();
+        let archive =
+            tokio::task::spawn_blocking(move || ensure_audio_download_zip(&archive_dir)).await??;
+        (archive, "application/zip", "audiobook-audio.zip")
+    };
+    let Ok(file) = tokio::fs::File::open(&path).await else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "audiobook artifact is not available"})),
+        )
+            .into_response());
+    };
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                if download_name.ends_with(".m4b") {
+                    "attachment; filename=\"audiobook.m4b\""
+                } else {
+                    "attachment; filename=\"audiobook-audio.zip\""
+                },
+            ),
+        ],
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+    )
+        .into_response())
+}
+
+fn ensure_audio_download_zip(out_dir: &std::path::Path) -> Result<PathBuf> {
+    use std::io::{Read, Write};
+
+    let archive_path = out_dir.join("audiobook-audio.zip");
+    if archive_path.is_file() {
+        return Ok(archive_path);
+    }
+    let manifest_path = out_dir.join("manifest.json");
+    let manifest: bookforge_audio::AudiobookManifest = serde_json::from_slice(
+        &std::fs::read(&manifest_path)
+            .with_context(|| format!("failed to read {}", manifest_path.display()))?,
+    )?;
+    let staged = out_dir.join("audiobook-audio.zip.tmp");
+    let _ = std::fs::remove_file(&staged);
+    let file = std::fs::File::create(&staged)?;
+    let mut archive = zip::ZipWriter::new(file);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    archive.start_file("manifest.json", options)?;
+    archive.write_all(&std::fs::read(&manifest_path)?)?;
+    for chunk in &manifest.chunks {
+        let name = std::path::Path::new(&chunk.file);
+        if name.file_name().and_then(|value| value.to_str()) != Some(chunk.file.as_str()) {
+            anyhow::bail!("unsafe audio filename in manifest");
+        }
+        let source = out_dir.join(&chunk.file);
+        let mut source_file = std::fs::File::open(&source)
+            .with_context(|| format!("failed to read audio part {}", source.display()))?;
+        archive.start_file(&chunk.file, options)?;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = source_file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            archive.write_all(&buffer[..read])?;
+        }
+    }
+    archive.finish()?;
+    if let Err(error) = std::fs::rename(&staged, &archive_path) {
+        let _ = std::fs::remove_file(&staged);
+        if !archive_path.is_file() {
+            return Err(error.into());
+        }
+    }
+    Ok(archive_path)
+}
+
+fn valid_audiobook_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 160
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn write_audio_process_state(
+    out_dir: &std::path::Path,
+    status: &str,
+    pid: Option<u32>,
+    error: Option<&str>,
+) -> Result<()> {
+    let path = out_dir.join("process.json");
+    let temp = out_dir.join("process.part.tmp");
+    let bytes = serde_json::to_vec_pretty(&json!({
+        "status": status,
+        "pid": pid,
+        "error": error,
+        "updated_at_ms": now_ms(),
+    }))?;
+    std::fs::write(&temp, bytes)?;
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    std::fs::rename(temp, path)?;
+    Ok(())
+}
+
 async fn child_exit_status_after(
     child: &mut tokio::process::Child,
     delay: Duration,
@@ -1026,6 +1497,7 @@ async fn estimate_translate(
         return Ok(bad_request("unsupported provider"));
     }
     let model = field_value(&fields, "model");
+    let target = field_value(&fields, "target").unwrap_or_else(|| "Italian".to_string());
 
     let result = tokio::task::spawn_blocking(move || {
         let seq = ESTIMATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1036,7 +1508,8 @@ async fn estimate_translate(
             seq
         ));
         std::fs::write(&path, &bytes)?;
-        let outcome = super::estimate::estimate_epub(&path, &provider, model.as_deref(), None);
+        let outcome =
+            super::estimate::estimate_epub(&path, &target, &provider, model.as_deref(), None);
         let _ = std::fs::remove_file(&path);
         outcome
     })
@@ -1067,6 +1540,13 @@ async fn provider_status(
         let configured = remembered.contains_key(*provider)
             || std::env::var(env).map(|v| !v.is_empty()).unwrap_or(false);
         status.insert((*provider).to_string(), json!(configured));
+    }
+    for (provider, env) in AUDIO_PROVIDER_KEY_ENVS {
+        let configured = remembered.contains_key(&format!("audio:{provider}"))
+            || std::env::var(env)
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+        status.insert(format!("audio:{provider}"), json!(configured));
     }
     Ok(Json(serde_json::Value::Object(status)))
 }
@@ -1240,6 +1720,37 @@ fn supported_provider(provider: &str) -> bool {
     provider == "mock" || provider_key_env(provider).is_some()
 }
 
+fn audio_provider_key_env(provider: &str) -> Option<&'static str> {
+    AUDIO_PROVIDER_KEY_ENVS
+        .iter()
+        .find_map(|(known, env)| (*known == provider).then_some(*env))
+}
+
+fn audio_provider_env_has_key(provider: &str) -> bool {
+    audio_provider_key_env(provider)
+        .and_then(|env| std::env::var(env).ok())
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn audio_base_url_is_loopback(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+}
+
+fn dashboard_audio_base_url_allowed(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        url.host().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && (url.scheme() == "https"
+                || (url.scheme() == "http" && audio_base_url_is_loopback(value)))
+    })
+}
+
 fn dashboard_base_url_uses_https(base_url: &str) -> bool {
     reqwest::Url::parse(base_url).is_ok_and(|url| url.scheme() == "https" && url.host().is_some())
 }
@@ -1300,6 +1811,61 @@ fn dashboard_options_payload() -> DashboardOptions {
                 requires_key: true,
             },
         ],
+        audio_providers: vec![
+            AudioProviderOption {
+                id: "mock",
+                label: "mock (offline test)",
+                models: AUDIO_MOCK_MODELS,
+                default_model: "mock-silence",
+                default_voice: "mock",
+                formats: &["wav"],
+                default_format: "wav",
+                requires_voice: false,
+                requires_key: false,
+                supports_instructions: false,
+                supports_speed: true,
+            },
+            AudioProviderOption {
+                id: "openai",
+                label: "OpenAI-compatible",
+                models: AUDIO_OPENAI_MODELS,
+                default_model: "gpt-4o-mini-tts",
+                default_voice: "alloy",
+                formats: &["mp3", "opus", "aac", "flac", "wav", "pcm"],
+                default_format: "mp3",
+                requires_voice: false,
+                requires_key: true,
+                supports_instructions: true,
+                supports_speed: true,
+            },
+            AudioProviderOption {
+                id: "gemini",
+                label: "Gemini TTS",
+                models: AUDIO_GEMINI_MODELS,
+                default_model: "gemini-3.1-flash-tts-preview",
+                default_voice: "Kore",
+                formats: &["wav", "pcm"],
+                default_format: "wav",
+                requires_voice: false,
+                requires_key: true,
+                supports_instructions: true,
+                supports_speed: false,
+            },
+            AudioProviderOption {
+                id: "elevenlabs",
+                label: "ElevenLabs",
+                models: AUDIO_ELEVENLABS_MODELS,
+                default_model: "eleven_multilingual_v2",
+                default_voice: "",
+                formats: &["mp3", "opus", "wav", "pcm"],
+                default_format: "mp3",
+                requires_voice: true,
+                requires_key: true,
+                supports_instructions: false,
+                supports_speed: true,
+            },
+        ],
+        ffmpeg_available: bookforge_audio::ffmpeg_available(),
     }
 }
 
@@ -1308,6 +1874,11 @@ fn field_value(fields: &HashMap<String, String>, key: &str) -> Option<String> {
         .get(key)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn truthy_field(fields: &HashMap<String, String>, key: &str) -> bool {
+    field_value(fields, key)
+        .is_some_and(|value| matches!(value.as_str(), "true" | "on" | "1" | "yes"))
 }
 
 fn strip_epub_suffix(name: &str) -> &str {
@@ -1662,6 +2233,8 @@ fn runtime_settings_view(
 struct DashboardOptions {
     languages: &'static [&'static str],
     providers: Vec<ProviderOption>,
+    audio_providers: Vec<AudioProviderOption>,
+    ffmpeg_available: bool,
 }
 
 #[derive(Serialize)]
@@ -1672,6 +2245,21 @@ struct ProviderOption {
     default_model: &'static str,
     requires_base_url: bool,
     requires_key: bool,
+}
+
+#[derive(Serialize)]
+struct AudioProviderOption {
+    id: &'static str,
+    label: &'static str,
+    models: &'static [&'static str],
+    default_model: &'static str,
+    default_voice: &'static str,
+    formats: &'static [&'static str],
+    default_format: &'static str,
+    requires_voice: bool,
+    requires_key: bool,
+    supports_instructions: bool,
+    supports_speed: bool,
 }
 
 impl JobDetail {
@@ -1804,6 +2392,7 @@ mod tests {
             csrf_token: token.to_string(),
             host_port: 8765,
             keys: Arc::new(Mutex::new(HashMap::new())),
+            audio_cancels: Arc::new(Mutex::new(HashMap::new())),
             store_path: default_store_path(),
             resume_launches: None,
         }
@@ -1881,6 +2470,7 @@ mod tests {
         let options = dashboard_options_payload();
         assert!(options.languages.contains(&"Italian"));
         assert!(options.languages.contains(&"English"));
+        assert!(options.languages.contains(&"Toki Pona"));
 
         let deepseek = options
             .providers
@@ -1896,6 +2486,23 @@ mod tests {
             .find(|provider| provider.id == "openrouter")
             .expect("openrouter provider option should exist");
         assert!(openrouter.models.contains(&"google/gemini-2.5-flash"));
+
+        let gemini_tts = options
+            .audio_providers
+            .iter()
+            .find(|provider| provider.id == "gemini")
+            .expect("Gemini TTS provider option should exist");
+        assert_eq!(gemini_tts.default_voice, "Kore");
+        assert_eq!(gemini_tts.formats, &["wav", "pcm"]);
+        assert!(!gemini_tts.supports_speed);
+
+        let elevenlabs = options
+            .audio_providers
+            .iter()
+            .find(|provider| provider.id == "elevenlabs")
+            .expect("ElevenLabs provider option should exist");
+        assert!(elevenlabs.requires_voice);
+        assert!(!elevenlabs.supports_instructions);
     }
 
     #[test]
@@ -2013,6 +2620,57 @@ mod tests {
             .expect("route should respond");
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn audiobook_endpoint_rejects_missing_dashboard_token() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let body =
+            "--B\r\nContent-Disposition: form-data; name=\"provider\"\r\n\r\nmock\r\n--B--\r\n";
+        let response = dashboard_router(test_state("token-123"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/audiobook")
+                    .header("host", TEST_HOST)
+                    .header("content-type", "multipart/form-data; boundary=B")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn audiobook_cancel_rejects_missing_dashboard_token() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let response = dashboard_router(test_state("token-123"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/audiobooks/example/cancel")
+                    .header("host", TEST_HOST)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn audiobook_operation_ids_cannot_escape_the_upload_directory() {
+        assert!(valid_audiobook_id("1234-safe_id"));
+        for invalid in ["", "../escape", "with/slash", "with.dot", "with space"] {
+            assert!(!valid_audiobook_id(invalid), "accepted {invalid:?}");
+        }
     }
 
     #[tokio::test]
@@ -2158,6 +2816,7 @@ mod tests {
         for marker in [
             "function renderLibrary",
             "function renderWizard",
+            "function renderAudiobook",
             "function renderProgress",
             "function drawReview",
             "function drawValidation",
@@ -2171,12 +2830,12 @@ mod tests {
     fn dashboard_assets_reassemble_byte_stably() {
         use sha2::{Digest, Sha256};
 
-        assert_eq!(DASHBOARD_HTML.len(), 82_407);
+        assert_eq!(DASHBOARD_HTML.len(), 94_924);
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
         assert_eq!(
             format!("{:x}", Sha256::digest(DASHBOARD_HTML.as_bytes())),
-            "7a37e7095182825d2f63afec9776214ce7f99ea33464ad1e86ea43342767ce9b"
+            "f16c434797d2768c46271e5a262da64713f8dfb45646ee06437fcf6a39795d5b"
         );
 
         let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");
@@ -2405,6 +3064,7 @@ mod tests {
             report_markdown_path: None,
             source_language: Some("English".to_string()),
             target_language: "Italian".to_string(),
+            creator: None,
             provider: "mock".to_string(),
             model: "mock-identity".to_string(),
             base_url: None,

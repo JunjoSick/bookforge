@@ -63,6 +63,10 @@ pub struct TranslateArgs {
     #[arg(long)]
     pub out: Option<PathBuf>,
 
+    /// Override dc:creator in the rebuilt EPUB metadata.
+    #[arg(long)]
+    pub creator: Option<String>,
+
     #[arg(long, value_enum, default_value_t = BilingualMode::Replace)]
     pub mode: BilingualMode,
 

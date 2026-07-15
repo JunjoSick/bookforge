@@ -40,9 +40,11 @@ const App = {
   jobs: [],
   selected: null,
   es: null,
-  options: { languages: ["English","Italian","Spanish","French","German"], providers: [] },
+  options: { languages: ["English","Italian","Spanish","French","German"], providers: [], audio_providers: [], ffmpeg_available: false },
   providerKeys: {},
   wizard: null,
+  audioWizard: null,
+  audioSelected: null,
   runtimeSettings: null,
   runtimeJob: null,
   runtimeRefreshPending: false,
@@ -55,6 +57,14 @@ function freshWizard() {
     apiKey:"", baseUrl:"", estimate:null, status:"" };
 }
 
+function freshAudioWizard() {
+  const canM4b = App.options.ffmpeg_available === true;
+  return { file:null, fileName:"", provider:"openai", model:"gpt-4o-mini-tts",
+    voice:"alloy", format:"mp3", speed:1, maxChars:2000, concurrency:4,
+    instructions:"", baseUrl:"", apiKey:"", stitch:canM4b, m4b:canM4b,
+    launching:false, status:"" };
+}
+
 function applyTheme() {
   document.documentElement.setAttribute("data-theme", App.theme);
   $("#sun").classList.toggle("on", App.theme === "light");
@@ -64,8 +74,9 @@ function bfTheme() { App.theme = App.theme === "dark" ? "light" : "dark"; localS
 
 function bfGo(screen, opts) { Object.assign(App, opts || {}); App.screen = screen; if (screen !== "progress") closeStream(); render(); }
 function bfStartNew() { App.wizard = freshWizard(); App.screen = "wizard"; closeStream(); render(); }
+function bfStartAudiobook() { App.audioWizard = freshAudioWizard(); App.audioSelected = null; localStorage.removeItem("bf-audiobook-id"); App.screen = "audiobook"; closeStream(); render(); }
 
-const NAV = [["library","Library"],["progress","Progress"],["review","Review"],["validation","Validation"],["glossary","Glossary"]];
+const NAV = [["library","Library"],["audiobook","Audiobooks"],["progress","Progress"],["review","Review"],["validation","Validation"],["glossary","Glossary"]];
 function renderNav() {
   const active = App.screen === "wizard" ? "library" : App.screen;
   $("#nav").innerHTML = NAV.map(([id,label]) =>
@@ -78,6 +89,7 @@ function render() {
   switch (App.screen) {
     case "library": return renderLibrary(stage);
     case "wizard": return renderWizard(stage);
+    case "audiobook": return renderAudiobook(stage);
     case "progress": return renderProgress(stage);
     case "review": return renderReview(stage);
     case "validation": return renderValidation(stage);
@@ -200,6 +212,7 @@ function syncWizInputs() {
   const w = App.wizard; if (!w) return;
   const from = $("#w_from"); if (from) w.from = from.value.trim();
   const to = $("#w_to"); if (to) w.to = to.value.trim();
+  if (w.to.toLowerCase() === "toki pona" && w.qa === "suspicious") w.qa = "off";
   const key = $("#w_key"); if (key) w.apiKey = key.value;
   const base = $("#w_base"); if (base) w.baseUrl = base.value.trim();
   const conc = $("#w_conc"); if (conc) w.concurrency = Math.max(1, Math.min(16, parseInt(conc.value,10) || 1));
@@ -212,7 +225,11 @@ function bfPickFile(input) {
   renderWizard($("#stage"));
 }
 function bfSwapLangs() { syncWizInputs(); const w = App.wizard; const t = w.from; w.from = w.to; w.to = t; renderWizBody(); }
-function bfPickTo(name) { syncWizInputs(); App.wizard.to = name; renderWizBody(); }
+function bfPickTo(name) {
+  syncWizInputs(); App.wizard.to = name;
+  if (name.toLowerCase() === "toki pona" && App.wizard.qa === "suspicious") App.wizard.qa = "off";
+  renderWizBody();
+}
 function bfPickTier(id) {
   const q = QUALITY.find(q => q.id === id); if (!q) return;
   const w = App.wizard; w.quality = id; w.profile = q.profile; w.provider = q.provider; w.model = q.model;
@@ -339,6 +356,137 @@ async function trySelectPending(inputPath, attempt) {
   const match = jobs.find(j => j.input_path === inputPath);
   if (match) { bfGo("progress", { selected: match.id }); return; }
   setTimeout(() => trySelectPending(inputPath, attempt + 1), 900);
+}
+
+/* ---------------- Audiobooks ---------------- */
+function audioProviderOption(id) {
+  return (App.options.audio_providers || []).find(p => p.id === id)
+    || { id:"mock", label:"mock", models:["mock-silence"], default_model:"mock-silence",
+      default_voice:"mock", formats:["wav"], default_format:"wav", requires_key:false,
+      requires_voice:false, supports_instructions:false, supports_speed:true };
+}
+function bfAudioProvider(id) {
+  syncAudioInputs();
+  const w = App.audioWizard, p = audioProviderOption(id);
+  w.provider = id; w.model = p.default_model; w.voice = p.default_voice;
+  w.format = p.default_format; w.speed = 1; w.instructions = ""; w.status = "";
+  renderAudiobook($("#stage"));
+}
+function bfAudioFormat(format) { syncAudioInputs(); App.audioWizard.format = format; renderAudiobook($("#stage")); }
+function bfAudioPickFile(input) {
+  const file = input.files && input.files[0]; if (!file) return;
+  App.audioWizard.file = file; App.audioWizard.fileName = file.name; renderAudiobook($("#stage"));
+}
+function syncAudioInputs() {
+  const w = App.audioWizard; if (!w) return;
+  const model = $("#a_model"); if (model) w.model = model.value.trim();
+  const voice = $("#a_voice"); if (voice) w.voice = voice.value.trim();
+  const speed = $("#a_speed"); if (speed) w.speed = Number(speed.value) || 1;
+  const maxChars = $("#a_chars"); if (maxChars) w.maxChars = Math.max(1, Math.min(4096, parseInt(maxChars.value,10)||2000));
+  const concurrency = $("#a_conc"); if (concurrency) w.concurrency = Math.max(1, Math.min(16, parseInt(concurrency.value,10)||4));
+  const instructions = $("#a_instructions"); if (instructions) w.instructions = instructions.value.trim();
+  const baseUrl = $("#a_base"); if (baseUrl) w.baseUrl = baseUrl.value.trim();
+  const key = $("#a_key"); if (key) w.apiKey = key.value;
+  const stitch = $("#a_stitch"); if (stitch) w.stitch = stitch.checked;
+  const m4b = $("#a_m4b"); if (m4b) w.m4b = m4b.checked;
+}
+function audioToast(message) { const el = $("#audio-status"); if (el) el.textContent = message; if (App.audioWizard) App.audioWizard.status = message; }
+
+function renderAudiobook(stage) {
+  if (App.audioSelected) return renderAudiobookProgress(stage, App.audioSelected);
+  const w = App.audioWizard || (App.audioWizard = freshAudioWizard());
+  const p = audioProviderOption(w.provider);
+  const needsKey = p.requires_key && App.providerKeys[`audio:${w.provider}`] !== true;
+  const providerChips = (App.options.audio_providers || []).map(provider =>
+    `<div class="chip ${w.provider===provider.id?"on":""}" onclick="bfAudioProvider('${provider.id}')">${esc(provider.label)}</div>`).join("");
+  const formatChips = (p.formats || []).map(format =>
+    `<div class="chip ${w.format===format?"on":""}" onclick="bfAudioFormat('${format}')">${format.toUpperCase()}</div>`).join("");
+  stage.innerHTML = `<div class="wrap">
+    <div class="pagehead"><div><h1>Create an audiobook</h1><p>Narrate an original or translated EPUB directly. Translation is optional.</p></div>
+      <button class="btn btn-ghost" onclick="bfGo('library')">Back to library</button></div>
+    <div class="wizpanel" style="max-width:920px;margin:0 auto">
+      <div class="kicker">Source EPUB</div>
+      <div class="drop ${w.file?"has":""}" onclick="$('#audio-file').click()">
+        ${w.file ? `<div class="fname">${esc(w.fileName)}</div><div style="color:var(--muted);font-size:12px;margin-top:6px">Click to choose another EPUB</div>` : `<div>Drop an <b>EPUB</b> here or click to browse.</div>`}
+      </div><input type="file" id="audio-file" accept=".epub" hidden onchange="bfAudioPickFile(this)">
+      <div class="field-label" style="margin-top:20px">Speech provider</div><div class="chips">${providerChips}</div>
+      <div class="adv-grid" style="margin-top:18px">
+        <div><div class="field-label">Model</div><input class="inp" id="a_model" value="${esc(w.model)}" list="audio-models"></div>
+        <div><div class="field-label">${p.requires_voice?"Voice ID":"Voice"}</div><input class="inp" id="a_voice" value="${esc(w.voice)}" placeholder="${p.requires_voice?"Required ElevenLabs voice ID":"Voice name"}"></div>
+        <div><div class="field-label">Speed</div><input class="inp" id="a_speed" type="number" min="0.25" max="4" step="0.05" value="${w.speed}" ${p.supports_speed?"":"disabled"}></div>
+        <div><div class="field-label">Characters per request</div><input class="inp" id="a_chars" type="number" min="1" max="4096" value="${w.maxChars}"></div>
+        <div><div class="field-label">Concurrency</div><input class="inp" id="a_conc" type="number" min="1" max="16" value="${w.concurrency}"></div>
+        <div><div class="field-label">Format</div><div class="chips">${formatChips}</div></div>
+      </div>
+      <datalist id="audio-models">${(p.models||[]).map(model=>`<option value="${esc(model)}">`).join("")}</datalist>
+      ${p.supports_instructions?`<div class="field-label" style="margin-top:18px">Narration instructions</div><textarea class="inp" id="a_instructions" rows="3" placeholder="Tone, pronunciation, or delivery guidance">${esc(w.instructions)}</textarea>`:""}
+      ${w.provider==="openai"?`<div class="field-label" style="margin-top:18px">Optional OpenAI-compatible base URL</div><input class="inp" id="a_base" value="${esc(w.baseUrl)}" placeholder="https://api.openai.com/v1 or http://127.0.0.1:8880/v1">`:""}
+      ${needsKey?`<div class="field-label" style="margin-top:18px">API key</div><input class="inp" id="a_key" type="password" autocomplete="off" placeholder="Held in memory for this dashboard session"><div class="keyline">The key is injected into the child process and is never put on the command line or disk.</div>`:""}
+      <div class="facts" style="margin-top:20px">
+        <label class="fact"><div class="k">Chapter files</div><div class="v"><input id="a_stitch" type="checkbox" ${w.stitch?"checked":""}> Stitch each chapter</div></label>
+        <label class="fact"><div class="k">Single book</div><div class="v"><input id="a_m4b" type="checkbox" ${w.m4b?"checked":""} ${App.options.ffmpeg_available?"":"disabled"}> Create M4B${App.options.ffmpeg_available?"":" (ffmpeg unavailable)"}</div></label>
+      </div>
+      <div class="wizfoot" style="padding:22px 0 0"><span class="launchstatus" id="audio-status">${esc(w.status||"")}</span><span class="grow"></span>
+        <button class="btn btn-primary" id="audio-launch" onclick="bfLaunchAudiobook()">Start audiobook</button></div>
+    </div></div>`;
+}
+
+async function bfLaunchAudiobook() {
+  syncAudioInputs(); const w = App.audioWizard, p = audioProviderOption(w.provider);
+  if (!w.file) return audioToast("choose an EPUB file");
+  if (!w.model) return audioToast("model is required");
+  if (p.requires_voice && !w.voice) return audioToast("ElevenLabs voice ID is required");
+  if (w.launching) return; w.launching = true;
+  const button = $("#audio-launch"); if (button) { button.disabled=true; button.textContent="Starting…"; }
+  audioToast("uploading and planning…");
+  const fd = new FormData(); fd.append("file", w.file); fd.append("provider", w.provider);
+  fd.append("model", w.model); fd.append("voice", w.voice); fd.append("format", w.format);
+  fd.append("speed", String(w.speed)); fd.append("max_chars", String(w.maxChars)); fd.append("concurrency", String(w.concurrency));
+  if (w.instructions) fd.append("instructions", w.instructions); if (w.baseUrl) fd.append("base_url", w.baseUrl);
+  if (w.apiKey) fd.append("api_key", w.apiKey); if (w.stitch) fd.append("stitch", "true"); if (w.m4b) fd.append("m4b", "true");
+  try {
+    const response = await fetch("/api/audiobook", {method:"POST", headers:{[CSRF_HEADER]:CSRF_TOKEN}, body:fd});
+    const result = await response.json();
+    if (!response.ok) { w.launching=false; if(button){button.disabled=false;button.textContent="Start audiobook";} return audioToast(result.error||"launch failed"); }
+    await loadProviderStatus(); App.audioSelected = result.id; localStorage.setItem("bf-audiobook-id", result.id); renderAudiobook($("#stage"));
+  } catch (error) { w.launching=false; if(button){button.disabled=false;button.textContent="Start audiobook";} audioToast("launch failed"); }
+}
+
+async function renderAudiobookProgress(stage, id) {
+  stage.innerHTML = `<div class="wrap"><div class="pagehead"><div><h1>Audiobook progress</h1><p>Every completed chunk is durably checkpointed.</p></div><button class="btn btn-primary" onclick="bfStartAudiobook()">+ New audiobook</button></div><div class="wizpanel" id="audio-progress"><div class="empty">Loading…</div></div></div>`;
+  await pollAudiobook(id);
+}
+async function pollAudiobook(id) {
+  if (App.screen !== "audiobook" || App.audioSelected !== id) return;
+  let data; try { const response=await fetch(`/api/audiobooks/${encodeURIComponent(id)}`); data=await response.json(); if(!response.ok) throw new Error(); }
+  catch(error) { const panel=$("#audio-progress"); if(panel) panel.innerHTML=`<div class="empty">Could not load this audiobook operation.</div>`; return; }
+  const chunks = data.chunks || [], done = data.completed_chunks || 0, total = chunks.length, progress = pct(done,total);
+  const processStatus = data.process && data.process.status;
+  let status = data.status || processStatus || "starting";
+  if (status === "succeeded" && processStatus === "running") status = "stitching";
+  const panel = $("#audio-progress"); if (!panel) return;
+  panel.innerHTML = `<div class="facts">
+      <div class="fact"><div class="k">Status</div><div class="v"><span class="badge ${badgeClass(status)}">${esc(status)}</span></div></div>
+      <div class="fact"><div class="k">Provider</div><div class="v mono">${esc(data.synthesis_id||"planning")}</div></div>
+      <div class="fact"><div class="k">Voice</div><div class="v">${esc(data.voice||"—")}</div></div>
+      <div class="fact"><div class="k">Progress</div><div class="v mono">${done}/${total||"?"}</div></div>
+    </div><div class="bar-track" style="margin:22px 0"><div class="bar-fill" style="width:${progress}%"></div></div>
+    <div class="costbox"><div><div class="ck">Output</div><div class="mono" style="margin-top:8px;word-break:break-all">${esc(data.artifact||data.out_dir||"")}</div></div><div class="cm">${progress}% complete<br>${num(chunks.reduce((sum,chunk)=>sum+(chunk.chars||0),0))} characters planned</div></div>
+    <div class="wizfoot" style="padding:18px 0 0"><span class="grow"></span>
+      ${!["succeeded","failed","cancelled"].includes(status)?`<button class="btn btn-ghost" onclick="bfCancelAudiobook('${esc(id)}')">Cancel</button>`:""}
+      ${status==="succeeded"?`<a class="btn btn-primary" href="/api/audiobooks/${encodeURIComponent(id)}/artifact">Download ${data.artifact?"M4B":"audio ZIP"}</a>`:""}
+    </div>${data.error?`<div class="empty" style="color:var(--bad)">${esc(data.error)}</div>`:""}`;
+  if (!["succeeded","failed","cancelled"].includes(status)) setTimeout(()=>pollAudiobook(id), 800);
+}
+async function bfCancelAudiobook(id) {
+  try {
+    const response = await fetch(`/api/audiobooks/${encodeURIComponent(id)}/cancel`, {method:"POST", headers:{[CSRF_HEADER]:CSRF_TOKEN}});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "cancel failed");
+    pollAudiobook(id);
+  } catch (error) {
+    const panel=$("#audio-progress"); if(panel) panel.insertAdjacentHTML("beforeend", `<div class="empty" style="color:var(--bad)">${esc(error.message||"cancel failed")}</div>`);
+  }
 }
 
 /* ---------------- Progress ---------------- */
@@ -839,6 +987,7 @@ async function loadProviderStatus() {
 }
 async function boot() {
   applyTheme();
+  App.audioSelected = localStorage.getItem("bf-audiobook-id");
   await Promise.all([loadOptions(), loadProviderStatus()]);
   render();
   // Keep the library list live while it's on screen (statuses/progress advance).

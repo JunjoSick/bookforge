@@ -256,7 +256,7 @@ impl PromptLibrary {
         )
         .expect("embedded batch run-preserving template must parse");
         let batch_repair =
-            PromptTemplate::parse("translate_batch_repair", "v2", BATCH_REPAIR_TEMPLATE_SOURCE)
+            PromptTemplate::parse("translate_batch_repair", "v3", BATCH_REPAIR_TEMPLATE_SOURCE)
                 .expect("embedded batch repair template must parse");
         let batch_plain_compact = PromptTemplate::parse(
             "translate_batch_plain_compact",
@@ -278,7 +278,7 @@ impl PromptLibrary {
         .expect("embedded batch run-preserving compact template must parse");
         let batch_repair_compact = PromptTemplate::parse(
             "translate_batch_repair_compact",
-            "v2",
+            "v3",
             BATCH_REPAIR_COMPACT_TEMPLATE_SOURCE,
         )
         .expect("embedded batch repair compact template must parse");
@@ -433,8 +433,8 @@ mod tests {
         // `retry_guidance` field and moved from v2 to v3 so the cross-job
         // translation cache (keyed on segments.prompt_version) does not
         // serve up translations produced under the old prompt text.
-        // translate_batch_repair(_compact) and the single-segment / QA
-        // templates were not touched and must stay at their prior versions.
+        // Repair prompts also use v3 because they now receive target-language
+        // style and per-item retry guidance.
         let library = PromptLibrary::embedded();
         assert_eq!(library.batch_plain.version, "v3");
         assert_eq!(library.batch_marker_safe.version, "v3");
@@ -443,8 +443,8 @@ mod tests {
         assert_eq!(library.batch_marker_safe_compact.version, "v3");
         assert_eq!(library.batch_run_preserving_compact.version, "v3");
 
-        assert_eq!(library.batch_repair.version, "v2");
-        assert_eq!(library.batch_repair_compact.version, "v2");
+        assert_eq!(library.batch_repair.version, "v3");
+        assert_eq!(library.batch_repair_compact.version, "v3");
         assert_eq!(library.plain.version, "v2");
         assert_eq!(library.marker_safe.version, "v2");
         assert_eq!(library.run_preserving.version, "v2");
@@ -510,5 +510,7 @@ mod tests {
         assert!(prompt.to_ascii_lowercase().contains("repair"));
         assert!(prompt.contains("{{errors_json}}"));
         assert!(prompt.contains("{{items_json}}"));
+        assert!(prompt.contains("{{guidance_json}}"));
+        assert!(prompt.contains("{{target_language}}"));
     }
 }

@@ -1,0 +1,100 @@
+# Book-level terminology for Roberto Vannacci's "Il mondo al contrario".
+# These tokiponizations are editorial conventions, not unique spellings;
+# review and change them before the paid run if you prefer another convention.
+
+[meta]
+schema_version = 1
+source_language = "Italian"
+target_language = "Toki Pona"
+
+[meta.scope]
+kind = "book"
+id = "il-mondo-al-contrario"
+
+[[term]]
+source = "Il mondo al contrario"
+target = "ma pi nasin ante"
+category = "phrase"
+case_sensitive = false
+always_active = true
+notes = "Working Toki Pona title; confirm this editorial choice during review."
+
+[[term]]
+source = "Roberto Vannacci"
+target = "jan Lopeto Wanasi"
+category = "person"
+case_sensitive = true
+always_active = true
+notes = "Full-name tokiponization chosen for this project."
+
+[[term]]
+source = "Vannacci"
+target = "jan Wanasi"
+category = "person"
+case_sensitive = true
+always_active = true
+notes = "Surname-only form; retain consistently after the first mention."
+
+[[term]]
+source = "Italia"
+target = "ma Italija"
+category = "place"
+case_sensitive = false
+always_active = true
+notes = "Canonical country name for this edition; do not alternate with Itali or Italia."
+
+[[term]]
+source = "italiano"
+target = "pi ma Italija"
+category = "phrase"
+case_sensitive = false
+always_active = false
+notes = "Inflect by restructuring around the governed head noun; this is not a standalone phrase."
+
+[[term]]
+source = "milione"
+target = "nanpa 1,000,000"
+category = "other"
+case_sensitive = false
+always_active = false
+notes = "Keep the exact Arabic value; never invent milijon variants or expand it as repeated luka/mute."
+
+[[term]]
+source = "nucleare"
+target = "pi wawa lili"
+category = "phrase"
+case_sensitive = false
+always_active = false
+notes = "Controlled core-vocabulary circumlocution; adapt grammar to the governed noun."
+
+[[term]]
+source = "atomo"
+target = "ijo lili"
+category = "object"
+case_sensitive = false
+always_active = false
+notes = "Use core vocabulary; do not coin atomi."
+
+[[term]]
+source = "molecola"
+target = "kulupu pi ijo lili"
+category = "object"
+case_sensitive = false
+always_active = false
+notes = "Use core vocabulary; do not coin molekule."
+
+[[term]]
+source = "clima"
+target = "nasin tenpo pi kon seli"
+category = "phrase"
+case_sensitive = false
+always_active = false
+notes = "Controlled core-vocabulary circumlocution."
+
+[[term]]
+source = "biotecnologia"
+target = "nasin sona pi ijo lon"
+category = "phrase"
+case_sensitive = false
+always_active = false
+notes = "Use established core words; do not coin bioteknoloji."

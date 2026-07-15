@@ -69,6 +69,97 @@ pub struct StyleSheet {
     pub do_not: DoNotFields,
 }
 
+/// Runtime sizing hints that accompany a built-in target-language style.
+///
+/// Some compact-vocabulary languages need substantially more output tokens
+/// than their source text. Planning for that expansion before the first API
+/// call avoids paying for predictable truncation-and-split retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranslationSizingPolicy {
+    pub max_segment_tokens: usize,
+    pub batch_target_tokens: usize,
+    pub batch_max_items: usize,
+    pub output_token_multiplier: usize,
+    pub min_output_tokens: u32,
+    pub adaptive_sizing: bool,
+}
+
+/// Return target-specific planning hints for built-in linguistic styles.
+/// Explicit CLI sizing options remain authoritative over these defaults.
+pub fn built_in_sizing_policy_for_target(target_language: &str) -> Option<TranslationSizingPolicy> {
+    if !target_language.trim().eq_ignore_ascii_case("Toki Pona") {
+        return None;
+    }
+
+    Some(TranslationSizingPolicy {
+        max_segment_tokens: 200,
+        batch_target_tokens: 200,
+        batch_max_items: 1,
+        output_token_multiplier: 20,
+        min_output_tokens: 4_096,
+        adaptive_sizing: false,
+    })
+}
+
+/// Return the built-in guidance for translation targets that need more than
+/// the generic "translate naturally" prompt. Built-ins are deliberately
+/// global and lowest-priority: stored and per-run style sheets are merged
+/// after them and can refine every scalar field.
+pub fn built_in_style_for_target(target_language: &str) -> Option<StyleSheet> {
+    if !target_language.trim().eq_ignore_ascii_case("Toki Pona") {
+        return None;
+    }
+
+    Some(StyleSheet {
+        scope_kind: GlossaryScopeKind::Global,
+        scope_id: None,
+        target_language: "Toki Pona".to_string(),
+        register: RegisterFields {
+            narration: Some(
+                "plain declarative toki pona in sitelen Lasina (Latin orthography), lowercase except proper names"
+                    .to_string(),
+            ),
+            dialogue_default: Some(
+                "direct speech introduced with 'li toki e ni:' or another grammatically complete speech clause"
+                    .to_string(),
+            ),
+            loanword_policy: Some(
+                "tokiponize proper names into capitalized modifiers following toki pona phonotactics; retain the original spelling at first mention when needed for identification"
+                    .to_string(),
+            ),
+            ..RegisterFields::default()
+        },
+        voice: VoiceFields {
+            narrator_register: Some(
+                "neutral, concrete, and concise; prefer several short sentences over one overloaded sentence"
+                    .to_string(),
+            ),
+            preserve_anglicisms: Some(false),
+            ..VoiceFields::default()
+        },
+        free_text_instructions: Some(
+            r#"Translate into Toki Pona, the minimalist constructed language.
+- Use established Toki Pona vocabulary. Do not invent words to imitate the source language.
+- Closed lowercase vocabulary (use no other lowercase words): a, akesi, ala, alasa, ale, ali, anpa, ante, anu, awen, e, en, epiku, esun, ijo, ike, ilo, insa, jaki, jan, jasima, jelo, jo, kala, kalama, kama, kasi, ken, kepeken, kijetesantakalu, kili, kin, kipisi, kiwen, ko, kokosila, kon, ku, kule, kulupu, kute, la, lanpan, lape, laso, lawa, leko, len, lete, li, lili, linja, linluwi, lipu, loje, lon, luka, lukin, lupa, ma, mama, mani, meli, meso, mi, mije, misikeke, moku, moli, monsi, monsuta, mu, mun, musi, mute, n, namako, nanpa, nasa, nasin, nena, ni, nimi, noka, o, oko, olin, ona, open, pake, pakala, pali, palisa, pan, pana, pi, pilin, pimeja, pini, pipi, poka, poki, pona, pu, sama, seli, selo, seme, sewi, sijelo, sike, sin, sina, sinpin, sitelen, soko, sona, soweli, suli, suno, supa, suwi, tan, taso, tawa, telo, tenpo, toki, tomo, tonsi, tu, unpa, uta, utala, walo, wan, waso, wawa, weka, wile.
+- Follow Toki Pona grammar: modifiers follow their head; use li and e correctly; put prepositional phrases after the phrase they modify.
+- Bare mi and sina subjects omit li: write "mi pona" and "sina sona", never "mi li pona" or "sina li sona". A modified subject may use li.
+- en coordinates subjects only. Do not use en as a general translation of Italian "e"; repeat e for multiple objects, repeat li for multiple predicates, or split the sentence.
+- pi regroups a following phrase of at least two words. Never translate Italian "di" mechanically as pi, and never write a one-word phrase such as "pi pona".
+- Render proper names as capitalized tokiponized modifiers with a suitable head noun such as jan, ma, kulupu, or lipu. Keep names consistent throughout the book.
+- Preserve every Arabic digit and protected Roman chapter numeral exactly. Do not spell exact numbers with repeated luka or mute; never repeat the same word three times in a row.
+- Use ordinary Toki Pona plus the unchanged protected Roman numeral for chapter headings, for example lipu nanpa VI. Do not translate or calculate the numeral.
+- Use only established Toki Pona words and capitalized proper names. Circumlocute technical concepts with core vocabulary; never invent lowercase words such as milijon, nukiliya, atomi, molekule, or bioteknoloji.
+- Translate every source-language prose fragment, even when it begins or ends mid-sentence because of a page break. Never copy Italian prose through as a fallback.
+- Put whitespace after sentence-ending punctuation; never fuse the end of one sentence to the next word.
+- Dense abstract prose cannot be mapped word for word. Preserve every claim and logical relation by restating it concretely, splitting long source sentences into multiple short sentences when necessary.
+- Preserve the author's position, tone, emphasis, and rhetorical intent. Do not soften, endorse, rebut, summarize, omit, or add commentary.
+- Preserve every inline marker, protected span, and footnote reference exactly as required by the output contract."#
+                .to_string(),
+        ),
+        do_not: DoNotFields::default(),
+    })
+}
+
 /// Merge multiple style sheets following `book > series > global`
 /// precedence (mirrors [`crate::glossary::merge_scope_terms`]). For
 /// scalar Optional fields, the highest-priority non-`None` wins. For
@@ -276,6 +367,25 @@ mod tests {
     #[test]
     fn merge_returns_none_for_empty_input() {
         assert!(merge_style_sheets(&[]).is_none());
+    }
+
+    #[test]
+    fn toki_pona_has_built_in_translation_guidance() {
+        let sheet = built_in_style_for_target("  toki pona  ").expect("built-in style");
+        let sizing =
+            built_in_sizing_policy_for_target("  toki pona  ").expect("built-in sizing policy");
+        let rendered = render_style_block(Some(&sheet));
+        assert_eq!(sheet.target_language, "Toki Pona");
+        assert!(rendered.contains("Toki Pona grammar"));
+        assert!(rendered.contains("Do not soften, endorse, rebut"));
+        assert_eq!(sizing.max_segment_tokens, 200);
+        assert_eq!(sizing.batch_target_tokens, 200);
+        assert_eq!(sizing.batch_max_items, 1);
+        assert_eq!(sizing.output_token_multiplier, 20);
+        assert_eq!(sizing.min_output_tokens, 4_096);
+        assert!(!sizing.adaptive_sizing);
+        assert!(built_in_style_for_target("Italian").is_none());
+        assert!(built_in_sizing_policy_for_target("Italian").is_none());
     }
 
     #[test]

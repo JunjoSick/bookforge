@@ -133,6 +133,7 @@ fn block_kind_label(kind: BlockKind) -> &'static str {
         BlockKind::Footnote => "footnote",
         BlockKind::Caption => "caption",
         BlockKind::Code => "code",
+        BlockKind::PageFurniture => "page_furniture",
         BlockKind::Unknown => "unknown",
     }
 }

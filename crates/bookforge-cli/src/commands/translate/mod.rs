@@ -16,14 +16,14 @@ use bookforge_epub::read_epub;
 #[cfg(test)]
 use bookforge_llm::translate_segments;
 use bookforge_llm::{
-    AdaptiveLimiter, CompletionRequest, CompletionResponse, ContextRegistry, ContextRunConfig,
-    EntityRunConfig, GlossaryRunConfig, LlmError, LlmProvider, MockMode, MockProvider,
-    OpenAiCompatibleConfig, OpenAiCompatibleProvider, ProviderCapabilities, ProviderRateController,
-    QaSegmentReview, RateControllerConfig, SegmentTranslation, StyleRunConfig, TelemetryLog,
-    TranslationRunConfig, account_for_batch_prompt_overhead, build_translation_batches,
-    qa_segments_parallel, run_double_check, telemetry_summary, translate_batches_with_callback,
-    translate_batches_with_control, translate_segments_with_callback,
-    translate_segments_with_control,
+    AdaptiveLimiter, BatchMode, CompletionRequest, CompletionResponse, ContextRegistry,
+    ContextRunConfig, EntityRunConfig, GlossaryRunConfig, LlmError, LlmProvider, MockMode,
+    MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, ProviderCapabilities,
+    ProviderRateController, QaSegmentReview, RateControllerConfig, SegmentTranslation,
+    StyleRunConfig, TelemetryLog, TranslationRunConfig, account_for_batch_prompt_overhead,
+    build_translation_batches, qa_segments_parallel, run_double_check, telemetry_summary,
+    translate_batches_with_callback, translate_batches_with_control,
+    translate_segments_with_callback, translate_segments_with_control,
 };
 use bookforge_store::{CreateJob, JobRecord, JobStore, SaveTranslation};
 use clap::Args;
@@ -214,7 +214,13 @@ pub(crate) fn prepare_style_run_config(
         })?;
     }
     let stored = store.load_active_style_sheets(target_language, book_id, series_id)?;
-    let mut parsed: Vec<bookforge_core::style::StyleSheet> = Vec::new();
+    // Target-specific built-ins establish the minimum viable translation
+    // contract. User sheets are appended afterwards, so equal-scope scalar
+    // values from an explicit sheet win during the stable merge.
+    let mut parsed: Vec<bookforge_core::style::StyleSheet> =
+        bookforge_core::style::built_in_style_for_target(target_language)
+            .into_iter()
+            .collect();
     for record in &stored {
         match crate::commands::style::parse_style_toml(&record.content_toml) {
             Ok(sheet) => parsed.push(sheet),
@@ -560,11 +566,9 @@ pub(crate) async fn translate_and_checkpoint_batch<P>(
 where
     P: LlmProvider,
 {
-    let batches = account_for_batch_prompt_overhead(
-        build_translation_batches(segments, &settings.batch, settings.profile),
-        &settings.batch,
-        config,
-    );
+    let mut batches = build_translation_batches(segments, &settings.batch, settings.profile);
+    apply_text_only_retry_guidance(&mut batches, config);
+    let batches = account_for_batch_prompt_overhead(batches, &settings.batch, config);
 
     if batches.is_empty() {
         return translate_and_checkpoint(provider, segments, config, checkpoint, control).await;
@@ -715,6 +719,33 @@ where
             )?;
             Err(anyhow::anyhow!(message))
         }
+    }
+}
+
+fn apply_text_only_retry_guidance(
+    batches: &mut [bookforge_llm::TranslationBatch],
+    config: &TranslationRunConfig,
+) {
+    if !config
+        .target_language
+        .trim()
+        .eq_ignore_ascii_case("Toki Pona")
+    {
+        return;
+    }
+    for batch in batches {
+        let use_text_only = !batch.items.is_empty()
+            && batch.items.iter().all(|item| {
+                config
+                    .glossary
+                    .guidance_by_segment
+                    .get(&item.segment_id.0)
+                    .is_some_and(|guidance| guidance.contains("[bookforge:text-only]"))
+            });
+        if !use_text_only {
+            continue;
+        }
+        batch.mode = BatchMode::TurboTextOnly;
     }
 }
 

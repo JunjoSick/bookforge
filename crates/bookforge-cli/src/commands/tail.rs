@@ -212,6 +212,7 @@ mod tests {
             report_markdown_path: None,
             source_language: Some("English".to_string()),
             target_language: "Italian".to_string(),
+            creator: None,
             provider: "mock".to_string(),
             model: "mock-prefix-target".to_string(),
             base_url: None,

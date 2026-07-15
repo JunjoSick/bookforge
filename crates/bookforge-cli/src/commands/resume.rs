@@ -7,7 +7,8 @@ use std::{
 
 use anyhow::Result;
 use bookforge_core::{
-    ControlCommand, ProgressEvent, ProgressSink, ResolvedRunSettings, RunConfigSnapshot,
+    ControlCommand, ProgressEvent, ProgressSink, ResolvedRunSettings, ResolvedRunSettingsSnapshot,
+    RunConfigSnapshot,
     config::DoubleCheckMode,
     merge_scope_terms,
     progress::now_ms,
@@ -142,7 +143,9 @@ fn load_resume_overrides_for_status(
     job_status: &str,
 ) -> Result<Option<reconfigure::RunConfigOverrides>> {
     match job_status {
-        "paused" | "stopped" => reconfigure::load_overrides_for_job(job_id),
+        "paused" | "stopped" | "retry_pending" | "needs_review" | "failed" => {
+            reconfigure::load_overrides_for_job(job_id)
+        }
         _ => Ok(None),
     }
 }
@@ -243,6 +246,11 @@ async fn run_inner(
         .unwrap_or(snapshot.validate_output);
     if let Some(overrides) = overrides.as_ref() {
         reconfigure::apply_overrides_to_settings(&mut settings, overrides);
+        // A successfully applied dashboard revision becomes the durable
+        // baseline for later retry/resume waves. The sidecar is intentionally
+        // cleared at terminal finalization, so failing to snapshot the merged
+        // settings silently reverted the next retry to the original limits.
+        snapshot.settings = ResolvedRunSettingsSnapshot::from_settings(&settings);
     }
     if let Some(value) = args.concurrency {
         settings.scheduler.concurrency = value.max(1);
@@ -352,9 +360,11 @@ async fn run_inner(
         progress.clone(),
         pause_signal.clone(),
         stop_cancel_token.clone(),
-        settings.clone(),
-        qa_mode,
-        validate_output,
+        crate::control::ControlBaseline {
+            settings: settings.clone(),
+            qa: qa_mode,
+            validate_output,
+        },
     );
     let job_runtime_settings = control_watcher.job_runtime_settings();
     let run_config = TranslationRunConfig {
@@ -1460,6 +1470,16 @@ mod tests {
         let runtime = runtime_config_event(&events);
 
         assert_eq!(runtime.batch_max_output_tokens, Some(12_000));
+        let persisted = fixture
+            .store
+            .load_job_config_snapshot(&fixture.job.id)
+            .expect("snapshot lookup should work")
+            .expect("snapshot should remain present");
+        assert_eq!(
+            persisted.settings.provider.batch_max_output_tokens,
+            Some(12_000),
+            "applied overrides must survive later retry waves"
+        );
         assert!(
             !path.exists(),
             "successful terminal resume should remove overrides sidecar"
@@ -1479,6 +1499,26 @@ mod tests {
         );
         reconfigure::clear_overrides_for_job(&fixture.job.id)
             .expect("stale sidecar should clean up");
+    }
+
+    #[test]
+    fn retry_pending_resume_loads_a_durable_override_sidecar() {
+        let job_id = format!("retry_pending_overrides_{}", std::process::id());
+        let path = write_overrides_sidecar(
+            &job_id,
+            &reconfigure::RunConfigOverrides {
+                batch_max_output_tokens: Some(4_096),
+                ..reconfigure::RunConfigOverrides::default()
+            },
+        );
+
+        let loaded = load_resume_overrides_for_status(&job_id, "retry_pending")
+            .expect("retry-pending resume should read its sidecar")
+            .expect("override should be present");
+        assert_eq!(loaded.batch_max_output_tokens, Some(4_096));
+
+        reconfigure::clear_overrides_for_job(&job_id).expect("sidecar should clean up");
+        assert!(!path.exists());
     }
 
     #[tokio::test]
@@ -1809,6 +1849,7 @@ mod tests {
             report_markdown_path: None,
             source_language: Some("English".to_string()),
             target_language: "Italian".to_string(),
+            creator: None,
             provider: "mock".to_string(),
             model: "mock-prefix-target".to_string(),
             base_url: None,

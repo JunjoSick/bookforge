@@ -85,6 +85,10 @@ pub enum BlockKind {
     Footnote,
     Caption,
     Code,
+    /// Repeated PDF-conversion headers, footers, and standalone folios.
+    /// These blocks are kept addressable so rebuild can remove their
+    /// visible text deterministically, but are never sent to the model.
+    PageFurniture,
     Unknown,
 }
 

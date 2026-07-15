@@ -6,6 +6,164 @@ const MIN_SOURCE_CHARS: usize = 120;
 const MIN_OVERLAP_WORDS: usize = 30;
 const COPIED_WORD_RATIO: f64 = 0.92;
 
+const TOKI_PONA_WORDS: &[&str] = &[
+    "a",
+    "akesi",
+    "ala",
+    "alasa",
+    "ale",
+    "ali",
+    "anpa",
+    "ante",
+    "anu",
+    "awen",
+    "e",
+    "en",
+    "esun",
+    "ijo",
+    "ike",
+    "ilo",
+    "insa",
+    "jaki",
+    "jan",
+    "jelo",
+    "jo",
+    "kala",
+    "kalama",
+    "kama",
+    "kasi",
+    "ken",
+    "kepeken",
+    "kili",
+    "kiwen",
+    "ko",
+    "kon",
+    "kule",
+    "kulupu",
+    "kute",
+    "la",
+    "lape",
+    "laso",
+    "lawa",
+    "len",
+    "lete",
+    "li",
+    "lili",
+    "linja",
+    "lipu",
+    "loje",
+    "lon",
+    "luka",
+    "lukin",
+    "lupa",
+    "ma",
+    "mama",
+    "mani",
+    "meli",
+    "mi",
+    "mije",
+    "moku",
+    "moli",
+    "monsi",
+    "mu",
+    "mun",
+    "musi",
+    "mute",
+    "nanpa",
+    "nasa",
+    "nasin",
+    "nena",
+    "ni",
+    "nimi",
+    "noka",
+    "o",
+    "olin",
+    "ona",
+    "open",
+    "pakala",
+    "pali",
+    "palisa",
+    "pan",
+    "pana",
+    "pi",
+    "pilin",
+    "pimeja",
+    "pini",
+    "pipi",
+    "poka",
+    "poki",
+    "pona",
+    "pu",
+    "sama",
+    "seli",
+    "selo",
+    "seme",
+    "sewi",
+    "sijelo",
+    "sike",
+    "sin",
+    "sina",
+    "sinpin",
+    "sitelen",
+    "sona",
+    "soweli",
+    "suli",
+    "suno",
+    "supa",
+    "suwi",
+    "tan",
+    "taso",
+    "tawa",
+    "telo",
+    "tenpo",
+    "toki",
+    "tomo",
+    "tu",
+    "unpa",
+    "uta",
+    "utala",
+    "walo",
+    "wan",
+    "waso",
+    "wawa",
+    "weka",
+    "wile",
+    // Commonly documented nimi ku suli / established extended words. The
+    // built-in style permits established vocabulary, but never ad-hoc
+    // Italian-looking technical coinages.
+    "epiku",
+    "jasima",
+    "kijetesantakalu",
+    "kin",
+    "kipisi",
+    "kokosila",
+    "ku",
+    "lanpan",
+    "leko",
+    "linluwi",
+    "meso",
+    "misikeke",
+    "monsuta",
+    "n",
+    "namako",
+    "oko",
+    "pake",
+    "soko",
+    "tonsi",
+];
+
+const ITALIAN_STOP_WORDS: &[&str] = &[
+    "ad", "agli", "ai", "al", "alla", "alle", "allo", "anche", "avere", "che", "chi", "ci", "come",
+    "con", "contro", "cui", "da", "dal", "dalla", "dalle", "dagli", "dei", "del", "della", "delle",
+    "degli", "di", "dove", "dopo", "ed", "era", "erano", "essere", "fa", "fare", "fatto", "fino",
+    "fra", "gli", "ha", "hanno", "ho", "il", "in", "io", "la", "le", "lei", "lo", "loro", "lui",
+    "ma", "molto", "nei", "nel", "nella", "nelle", "negli", "noi", "non", "ogni", "per", "perche",
+    "poi", "prima", "puo", "quale", "quando", "quanto", "quello", "quella", "quelli", "quelle",
+    "questa", "queste", "questi", "questo", "qui", "se", "sei", "senza", "sia", "siano", "siamo",
+    "siete", "sono", "sotto", "su", "sul", "sulla", "sulle", "tra", "tre", "tu", "tutti", "tutto",
+    "una", "uno", "voi",
+];
+
 pub(crate) fn should_validate_source_copy(
     provider: &str,
     source_language: Option<&str>,
@@ -29,17 +187,19 @@ pub(crate) fn source_copy_validation_error(
     }
 
     let source_normalized = normalized_prose(source);
-    if source_normalized.chars().count() < MIN_SOURCE_CHARS {
-        return None;
-    }
     if looks_like_page_reference(&source_normalized)
         || looks_like_bilingual_gloss(&source_normalized)
     {
         return None;
     }
     let translation_normalized = normalized_prose(translation);
-    if source_normalized == translation_normalized {
+    if !source_normalized.is_empty()
+        && source_normalized.eq_ignore_ascii_case(&translation_normalized)
+    {
         return Some("translation is unchanged from the source-language prose".to_string());
+    }
+    if source_normalized.chars().count() < MIN_SOURCE_CHARS {
+        return None;
     }
 
     let source_words = words(&source_normalized);
@@ -59,9 +219,414 @@ pub(crate) fn source_copy_validation_error(
     None
 }
 
+/// Conservative hard gates for the built-in Toki Pona style. These checks
+/// deliberately cover failures that can be detected without judging the
+/// translation's politics or semantic choices: source-language leakage,
+/// invented lowercase vocabulary, invalid particle patterns, and runaway
+/// repetition. Proper names remain allowed when capitalized.
+pub(crate) fn target_language_validation_error(
+    target_language: &str,
+    source: &str,
+    translation: &str,
+    protected_spans: &[String],
+) -> Option<String> {
+    if !target_language.trim().eq_ignore_ascii_case("Toki Pona") {
+        return None;
+    }
+
+    let mut prose = strip_marker_tokens(translation);
+    for span in protected_spans {
+        prose = redact_protected_span(&prose, span);
+    }
+    let raw_words = word_tokens(&prose);
+    if raw_words.is_empty() {
+        return None;
+    }
+    let lower = raw_words
+        .iter()
+        .map(|word| fold_latin_word(word))
+        .collect::<Vec<_>>();
+    let source_web_words = source_web_words(source);
+    let source_words = word_tokens(source)
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let italian = lower
+        .iter()
+        .filter(|word| {
+            ITALIAN_STOP_WORDS.contains(&word.as_str()) && !TOKI_PONA_WORDS.contains(&word.as_str())
+        })
+        .count();
+    if italian >= 3 || (raw_words.len() >= 12 && italian * 8 >= raw_words.len()) {
+        return Some(format!(
+            "Toki Pona translation retains {italian} Italian function words"
+        ));
+    }
+
+    for (index, (raw, folded)) in raw_words.iter().zip(&lower).enumerate() {
+        let proper_name = raw.chars().next().is_some_and(char::is_uppercase)
+            && raw.chars().skip(1).any(char::is_lowercase)
+            && index > 0
+            && matches!(
+                lower[index - 1].as_str(),
+                "jan" | "ma" | "kulupu" | "lipu" | "nimi" | "toki" | "nasin" | "soweli"
+            );
+        let roman_numeral = is_roman_numeral(raw);
+        let preserved_acronym = raw.len() <= 5
+            && raw.chars().all(|ch| ch.is_ascii_uppercase())
+            && !ITALIAN_STOP_WORDS.contains(&folded.as_str())
+            && source_words.contains(raw);
+        let preserved_web_word = source_web_words.iter().any(|word| word == folded);
+        if !proper_name
+            && !roman_numeral
+            && !preserved_acronym
+            && !preserved_web_word
+            && !TOKI_PONA_WORDS.contains(&folded.as_str())
+        {
+            return Some(format!(
+                "unapproved lowercase word in strict Toki Pona output: {raw}"
+            ));
+        }
+    }
+
+    for window in lower.windows(2) {
+        if matches!(window, [subject, particle] if (subject == "mi" || subject == "sina") && particle == "li")
+        {
+            return Some(format!(
+                "bare Toki Pona subject '{}' must not be followed by li",
+                window[0]
+            ));
+        }
+    }
+
+    if let Some(word) = adjacent_repeated_word(&prose) {
+        return Some(format!("pathological repeated Toki Pona word: {word}"));
+    }
+
+    if let Some(error) = short_pi_phrase_error(&prose) {
+        return Some(error);
+    }
+    if let Some(error) = non_subject_en_error(&prose) {
+        return Some(error);
+    }
+    if raw_words.len() == 1
+        && matches!(
+            lower[0].as_str(),
+            "li" | "e" | "pi" | "la" | "en" | "o" | "anu"
+        )
+    {
+        return Some(format!(
+            "orphan Toki Pona grammatical particle: {}",
+            lower[0]
+        ));
+    }
+
+    None
+}
+
+fn adjacent_repeated_word(text: &str) -> Option<String> {
+    let words = word_spans_outside_markers(text);
+    words.windows(3).find_map(|window| {
+        (window[0].lower == window[1].lower
+            && window[1].lower == window[2].lower
+            && text[window[0].end..window[1].start]
+                .chars()
+                .all(char::is_whitespace)
+            && text[window[1].end..window[2].start]
+                .chars()
+                .all(char::is_whitespace))
+        .then(|| window[0].lower.clone())
+    })
+}
+
+#[derive(Debug)]
+struct WordSpan {
+    start: usize,
+    end: usize,
+    lower: String,
+}
+
+fn word_spans_outside_markers(text: &str) -> Vec<WordSpan> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    let mut in_marker = false;
+    let url_ranges = protected_url_ranges(text);
+    let mut url_index = 0usize;
+    for (index, ch) in text.char_indices() {
+        while url_ranges
+            .get(url_index)
+            .is_some_and(|(_, end)| *end <= index)
+        {
+            url_index += 1;
+        }
+        if url_ranges
+            .get(url_index)
+            .is_some_and(|(url_start, url_end)| *url_start <= index && index < *url_end)
+        {
+            if let Some(word_start) = start.take() {
+                spans.push(WordSpan {
+                    start: word_start,
+                    end: index,
+                    lower: fold_latin_word(&text[word_start..index]),
+                });
+            }
+            continue;
+        }
+        if in_marker {
+            if ch == '>' {
+                in_marker = false;
+            }
+            continue;
+        }
+        if ch == '<' {
+            if let Some(word_start) = start.take() {
+                spans.push(WordSpan {
+                    start: word_start,
+                    end: index,
+                    lower: fold_latin_word(&text[word_start..index]),
+                });
+            }
+            in_marker = true;
+        } else if ch.is_alphabetic() {
+            start.get_or_insert(index);
+        } else if let Some(word_start) = start.take() {
+            spans.push(WordSpan {
+                start: word_start,
+                end: index,
+                lower: fold_latin_word(&text[word_start..index]),
+            });
+        }
+    }
+    if let Some(word_start) = start {
+        spans.push(WordSpan {
+            start: word_start,
+            end: text.len(),
+            lower: fold_latin_word(&text[word_start..]),
+        });
+    }
+    spans
+}
+
+fn protected_url_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut starts = text
+        .match_indices("https://")
+        .chain(text.match_indices("http://"))
+        .map(|(start, _)| start)
+        .collect::<Vec<_>>();
+    starts.sort_unstable();
+    starts
+        .into_iter()
+        .map(|start| {
+            let end = text[start..]
+                .char_indices()
+                .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '<' | '"' | '“' | '”'))
+                .map_or(text.len(), |(offset, _)| start + offset);
+            (start, end)
+        })
+        .collect()
+}
+
+fn source_web_words(source: &str) -> Vec<String> {
+    source
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|ch: char| {
+                ch.is_ascii_punctuation() && !matches!(ch, '/' | ':' | '.' | '-' | '_')
+            })
+        })
+        .filter(|token| {
+            token.contains("://")
+                || token.contains('/')
+                || [".com", ".org", ".net", ".edu", ".gov", ".it", ".eu", ".uk"]
+                    .iter()
+                    .any(|suffix| token.to_ascii_lowercase().contains(suffix))
+        })
+        .flat_map(word_tokens)
+        .map(|word| fold_latin_word(&word))
+        .filter(|word| {
+            word.len() >= 4
+                || matches!(
+                    word.as_str(),
+                    "com" | "org" | "net" | "edu" | "gov" | "eu" | "it" | "uk"
+                )
+        })
+        .collect()
+}
+
+fn is_roman_numeral(word: &str) -> bool {
+    !word.is_empty()
+        && word.len() <= 12
+        && word
+            .chars()
+            .all(|ch| matches!(ch, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M'))
+}
+
+fn redact_protected_span(text: &str, span: &str) -> String {
+    if span.is_empty() {
+        return text.to_string();
+    }
+    if span.chars().all(char::is_alphanumeric) {
+        let mut output = String::with_capacity(text.len());
+        let mut cursor = 0usize;
+        for (start, _) in text.match_indices(span) {
+            let end = start + span.len();
+            let left_boundary = text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_alphanumeric());
+            let right_boundary = text[end..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_alphanumeric());
+            if left_boundary && right_boundary {
+                output.push_str(&text[cursor..start]);
+                output.push(' ');
+                cursor = end;
+            }
+        }
+        output.push_str(&text[cursor..]);
+        output
+    } else {
+        text.replace(span, " ")
+    }
+}
+
+fn word_tokens(text: &str) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_alphabetic() || matches!(ch, '\'' | '’') {
+            current.push(ch);
+        } else if !current.is_empty() {
+            output.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        output.push(current);
+    }
+    output
+}
+
+fn fold_latin_word(word: &str) -> String {
+    word.to_lowercase()
+        .chars()
+        .map(|ch| match ch {
+            'à' | 'á' | 'â' | 'ä' => 'a',
+            'è' | 'é' | 'ê' | 'ë' => 'e',
+            'ì' | 'í' | 'î' | 'ï' => 'i',
+            'ò' | 'ó' | 'ô' | 'ö' => 'o',
+            'ù' | 'ú' | 'û' | 'ü' => 'u',
+            '’' => '\'',
+            other => other,
+        })
+        .collect()
+}
+
+fn short_pi_phrase_error(text: &str) -> Option<String> {
+    let tokens = toki_tokens(text);
+    for (index, token) in tokens.iter().enumerate() {
+        if token != "pi" {
+            continue;
+        }
+        let following = tokens[index + 1..]
+            .iter()
+            .take_while(|word| {
+                !matches!(
+                    word.as_str(),
+                    "." | "!"
+                        | "?"
+                        | ";"
+                        | ":"
+                        | "\""
+                        | "“"
+                        | "”"
+                        | "("
+                        | ")"
+                        | "–"
+                        | "—"
+                        | "li"
+                        | "e"
+                        | "la"
+                        | "en"
+                        | "o"
+                )
+            })
+            .filter(|word| word.chars().any(char::is_alphabetic))
+            .count();
+        if following < 2 {
+            let context_start = index.saturating_sub(8);
+            let context_end = (index + 10).min(tokens.len());
+            return Some(format!(
+                "pi must group at least two following words; offending context: {}",
+                tokens[context_start..context_end].join(" ")
+            ));
+        }
+    }
+    None
+}
+
+fn non_subject_en_error(text: &str) -> Option<String> {
+    for sentence in text.split(['.', '!', '?', ';', ':', '—', '–']) {
+        let words = word_tokens(sentence)
+            .into_iter()
+            .map(|word| fold_latin_word(&word))
+            .collect::<Vec<_>>();
+        for (index, word) in words.iter().enumerate() {
+            if word != "en" {
+                continue;
+            }
+            let before = &words[..index];
+            let after = &words[index + 1..];
+            let local_start = before
+                .iter()
+                .rposition(|word| matches!(word.as_str(), "la" | "o"))
+                .map_or(0, |position| position + 1);
+            let local_before = &before[local_start..];
+            let first_boundary = after
+                .iter()
+                .find(|word| matches!(word.as_str(), "li" | "e" | "la" | "o"));
+            let subject_join = first_boundary.is_some_and(|word| word == "li")
+                && !local_before
+                    .iter()
+                    .any(|word| matches!(word.as_str(), "li" | "e"));
+            if !subject_join {
+                return Some("en may only coordinate subjects in strict Toki Pona".to_string());
+            }
+        }
+    }
+    None
+}
+
+fn toki_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_alphabetic() {
+            current.push(ch.to_ascii_lowercase());
+        } else {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            if is_toki_phrase_boundary_char(ch) {
+                tokens.push(ch.to_string());
+            }
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_toki_phrase_boundary_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | '!' | '?' | ';' | ':' | '"' | '“' | '”' | '(' | ')' | '–' | '—'
+    )
+}
+
 pub(crate) fn protected_span_present(span: &str, translation: &str) -> bool {
     dangling_numeric_span(span)
-        || translation.contains(span)
+        || exact_protected_span_present(span, translation)
         || compact_numeric_punctuation_span(span)
             .is_some_and(|expected| compact_ascii_whitespace(translation).contains(&expected))
         || canonical_decimal_number(span).is_some_and(|expected| {
@@ -69,6 +634,29 @@ pub(crate) fn protected_span_present(span: &str, translation: &str) -> bool {
                 .iter()
                 .any(|candidate| canonical_decimal_number(candidate).as_deref() == Some(&expected))
         })
+}
+
+fn exact_protected_span_present(span: &str, translation: &str) -> bool {
+    translation.match_indices(span).any(|(start, _)| {
+        let end = start + span.len();
+        let left_boundary = span
+            .chars()
+            .next()
+            .is_none_or(|first| !first.is_alphanumeric())
+            || translation[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_alphanumeric());
+        let right_boundary = span
+            .chars()
+            .next_back()
+            .is_none_or(|last| !last.is_alphanumeric())
+            || translation[end..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_alphanumeric());
+        left_boundary && right_boundary
+    })
 }
 
 fn normalized_prose(text: &str) -> String {
@@ -300,7 +888,7 @@ mod tests {
             )
             .is_none()
         );
-        assert!(source_copy_validation_error("A short title", "A short title", None).is_none());
+        assert!(source_copy_validation_error("A short title", "A short title", None).is_some());
     }
 
     #[test]
@@ -364,5 +952,132 @@ mod tests {
             "5.16",
             "Si noti che questa forma di rettificazione deriva dai canali aperti."
         ));
+    }
+
+    #[test]
+    fn toki_pona_gate_rejects_source_leakage_and_invented_words() {
+        assert!(
+            target_language_validation_error(
+                "Toki Pona",
+                "Il mondo della nostra societa non cambia.",
+                "jan li toki e ni. il mondo della nostra societa non cambia.",
+                &[],
+            )
+            .is_some_and(|error| error.contains("Italian"))
+        );
+        assert!(
+            target_language_validation_error(
+                "Toki Pona",
+                "La biotecnologia cambia.",
+                "jan li toki e bioteknoloji.",
+                &[],
+            )
+            .is_some_and(|error| error.contains("bioteknoloji"))
+        );
+    }
+
+    #[test]
+    fn toki_pona_gate_allows_core_words_names_and_protected_foreign_text() {
+        assert_eq!(
+            target_language_validation_error(
+                "Toki Pona",
+                "Roberto parla dell'Italia usando https://example.com.",
+                "jan Lopeto li toki e nimi Italia lon lipu https://example.com.",
+                &["https://example.com".to_string()],
+            ),
+            None
+        );
+        assert_eq!(
+            target_language_validation_error(
+                "Toki Pona",
+                "See https://ourworldindata.org/stages-of-growth and https://europa.eu",
+                "lipu ourworldindata en lipu europa eu li toki e ni.",
+                &[],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn toki_pona_gate_rejects_known_grammar_and_repetition_failures() {
+        for invalid in [
+            "mi li jan pona.",
+            "mi lukin e jan en soweli.",
+            "jan li toki e luka luka luka.",
+        ] {
+            assert!(
+                target_language_validation_error("Toki Pona", "", invalid, &[]).is_some(),
+                "expected strict Toki Pona rejection for {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn toki_pona_gate_allows_acronyms_protected_labels_and_roman_numerals() {
+        assert_eq!(
+            target_language_validation_error(
+                "Toki Pona",
+                "ISBN 123, CO e sapiens, capitolo IX",
+                "ISBN 123 li toki e CO e sapiens lon lipu nanpa IX.",
+                &["123".to_string(), "sapiens".to_string()],
+            ),
+            None
+        );
+        assert!(
+            target_language_validation_error(
+                "Toki Pona",
+                "capitolo IX",
+                "lipu nanpa IX li toki e PIJETA.",
+                &[],
+            )
+            .is_some_and(|error| error.contains("PIJETA"))
+        );
+    }
+
+    #[test]
+    fn toki_pona_gate_does_not_allow_untranslated_lowercase_source_prose() {
+        let source = "The latest outlook projects that world energy consumption will grow.";
+        assert!(
+            target_language_validation_error("Toki Pona", source, source, &[])
+                .is_some_and(|error| error.contains("unapproved lowercase word"))
+        );
+    }
+
+    #[test]
+    fn toki_pona_gate_rejects_capitalized_foreign_words_without_a_name_head() {
+        assert!(
+            target_language_validation_error(
+                "Toki Pona",
+                "Energia pulita.",
+                "Energia li pona.",
+                &[],
+            )
+            .is_some_and(|error| error.contains("Energia"))
+        );
+    }
+
+    #[test]
+    fn toki_pona_gate_rejects_errors_instead_of_rewriting_meaning() {
+        for invalid in [
+            "mi li pona.",
+            "ijo pi pona li lon.",
+            "jan li toki e luka luka luka.",
+            "ma italia li lon.",
+        ] {
+            assert!(
+                target_language_validation_error("Toki Pona", "", invalid, &[]).is_some(),
+                "invalid model output must be retried, not rewritten: {invalid:?}"
+            );
+        }
+
+        assert_eq!(
+            target_language_validation_error(
+                "Toki Pona",
+                "OPEC e U",
+                "kulupu OPEC li toki e U.",
+                &[],
+            ),
+            None
+        );
     }
 }

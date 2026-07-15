@@ -19,7 +19,7 @@ use commands::serve;
 #[cfg(feature = "tui")]
 use commands::watch;
 use commands::{
-    control as control_commands, convert, correct, doctor, entity, estimate, glossary,
+    audiobook, control as control_commands, convert, correct, doctor, entity, estimate, glossary,
     ingest_flags, inspect, reconfigure, reflow, resume, retry, review, status, style, tail,
     translate, validate,
 };
@@ -56,6 +56,7 @@ enum Command {
     Convert(convert::ConvertArgs),
     Reflow(reflow::ReflowArgs),
     Inspect(inspect::InspectArgs),
+    Audiobook(audiobook::AudiobookArgs),
     Estimate(estimate::EstimateArgs),
     Translate(Box<translate::TranslateArgs>),
     Pause(control_commands::PauseArgs),
@@ -118,6 +119,7 @@ async fn run_command(command: Command, cancel_token: CancellationToken) -> Resul
         Command::Convert(args) => convert::run(args).await,
         Command::Reflow(args) => reflow::run(args).await,
         Command::Inspect(args) => inspect::run(args).await,
+        Command::Audiobook(args) => audiobook::run(args, cancel_token).await,
         Command::Estimate(args) => estimate::run(args).await,
         Command::Translate(args) => translate::run(*args, cancel_token).await,
         Command::Pause(args) => control_commands::pause(args).await,

@@ -1274,9 +1274,42 @@ fn detect_protected_spans(text: &str) -> Vec<ProtectedSpan> {
                 text,
             }),
     );
+    spans.extend(
+        detect_chapter_numeral_spans(text)
+            .into_iter()
+            .map(|text| ProtectedSpan {
+                kind: ProtectedSpanKind::Number,
+                text,
+            }),
+    );
     spans.sort_by(|left, right| left.text.cmp(&right.text));
     spans.dedup_by(|left, right| left.kind == right.kind && left.text == right.text);
     spans
+}
+
+fn detect_chapter_numeral_spans(text: &str) -> Vec<String> {
+    let tokens = text
+        .split_whitespace()
+        .map(trim_token)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    tokens
+        .windows(2)
+        .filter_map(|window| {
+            let [label, numeral] = window else {
+                return None;
+            };
+            (label.eq_ignore_ascii_case("capitolo") && is_roman_numeral(numeral))
+                .then(|| (*numeral).to_string())
+        })
+        .collect()
+}
+
+fn is_roman_numeral(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| matches!(ch, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M'))
 }
 
 fn protected_span_kind(value: &str) -> Option<ProtectedSpanKind> {
@@ -1422,7 +1455,14 @@ fn looks_like_protected_number(value: &str) -> bool {
     if digit_count == 0 {
         return false;
     }
-    if digit_count >= 2 {
+    if value.ends_with("st")
+        || value.ends_with("nd")
+        || value.ends_with("rd")
+        || value.ends_with("th")
+    {
+        return true;
+    }
+    if digit_count >= 1 {
         return value.chars().all(|ch| {
             ch.is_ascii_digit()
                 || matches!(
@@ -1431,7 +1471,7 @@ fn looks_like_protected_number(value: &str) -> bool {
                 )
         });
     }
-    value.ends_with("st") || value.ends_with("nd") || value.ends_with("rd") || value.ends_with("th")
+    false
 }
 
 fn read_archive_text(archive: &mut ZipArchive<File>, path: &str) -> Result<String> {
@@ -1816,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_spans_do_not_overflag_single_digits() {
+    fn protected_spans_preserve_all_exact_digits() {
         let spans = detect_protected_spans(
             "Chapter 1 cites https://example.com, file.txt, #anchor, and pages 12-14.",
         );
@@ -1825,11 +1865,58 @@ mod tests {
             .map(|span| span.text.as_str())
             .collect::<Vec<_>>();
 
-        assert!(!texts.contains(&"1"));
+        assert!(texts.contains(&"1"));
         assert!(texts.contains(&"https://example.com"));
         assert!(texts.contains(&"file.txt"));
         assert!(texts.contains(&"#anchor"));
         assert!(texts.contains(&"12-14"));
+    }
+
+    #[test]
+    fn protected_spans_preserve_roman_chapter_numbers_only_in_heading_context() {
+        let chapter = detect_protected_spans("CAPITOLO I Il buonsenso");
+        assert!(chapter.iter().any(|span| span.text == "I"));
+
+        let prose = detect_protected_spans("I cittadini leggono il libro");
+        assert!(!prose.iter().any(|span| span.text == "I"));
+    }
+
+    #[test]
+    fn reading_pdf_derived_markup_is_lossless() {
+        let section_id = SectionId("section".to_string());
+        let xhtml = r#"<html><body>
+            <meta name="generator" content="pdftohtml"/>
+            <h2>1984</h2>
+            <p>Gli argomenti sono dedicati al primo capitolo di questo libro.</p>
+            <p>Il Mondo al Contrario</p><p>CAPITOLO X</p>
+            <p>Il Mondo al Contrario</p><p>CAPITOLO X</p>
+            <p>Il Mondo al Contrario</p>
+            <p>Il Mondo al Contrario</p>
+        </body></html>"#;
+        let blocks =
+            extract_blocks(xhtml, "chapter.xhtml", &section_id, 0).expect("fixture should parse");
+
+        let visible = blocks.iter().map(block_visible_text).collect::<Vec<_>>();
+        assert!(visible.contains(&"1984".to_string()));
+        assert_eq!(
+            visible.iter().filter(|text| *text == "CAPITOLO X").count(),
+            2
+        );
+        assert!(visible.contains(
+            &"Gli argomenti sono dedicati al primo capitolo di questo libro.".to_string()
+        ));
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|text| *text == "Il Mondo al Contrario")
+                .count(),
+            4
+        );
+        assert!(
+            blocks
+                .iter()
+                .all(|block| block.kind != BlockKind::PageFurniture)
+        );
     }
 
     #[test]

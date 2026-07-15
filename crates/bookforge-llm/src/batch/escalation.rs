@@ -31,8 +31,10 @@ pub(super) fn batch_max_output_tokens(
     profile: TranslationProfile,
     reasoning: bool,
     extended_output: bool,
+    target_output_multiplier: Option<u32>,
+    target_min_output_tokens: Option<u32>,
 ) -> u32 {
-    let base_multiplier = match batch.mode {
+    let base_multiplier: u32 = match batch.mode {
         BatchMode::Plain => 3,
         BatchMode::MarkerSafe => 4,
         BatchMode::RunPreserving => 5,
@@ -42,7 +44,8 @@ pub(super) fn batch_max_output_tokens(
         base_multiplier * 3
     } else {
         base_multiplier
-    };
+    }
+    .max(target_output_multiplier.unwrap_or(0));
     // JSON output has a fixed envelope per item (ID, keys, quoting, commas)
     // that source-token estimates do not capture. Without this allowance,
     // batches of many short labels can receive a 512-token budget and
@@ -58,7 +61,8 @@ pub(super) fn batch_max_output_tokens(
     } else {
         if reasoning { 32_768 } else { 16_384 }
     };
-    estimate.clamp(512, max)
+    let minimum = target_min_output_tokens.unwrap_or(512).clamp(512, max);
+    estimate.clamp(minimum, max)
 }
 
 pub(super) fn capped_batch_max_output_tokens(
@@ -67,7 +71,19 @@ pub(super) fn capped_batch_max_output_tokens(
     reasoning: bool,
 ) -> u32 {
     let extended_output = config.provider.eq_ignore_ascii_case("deepseek");
-    let computed = batch_max_output_tokens(batch, config.profile, reasoning, extended_output);
+    let target_policy =
+        bookforge_core::style::built_in_sizing_policy_for_target(&config.target_language);
+    let target_output_multiplier =
+        target_policy.map(|policy| policy.output_token_multiplier as u32);
+    let target_min_output_tokens = target_policy.map(|policy| policy.min_output_tokens);
+    let computed = batch_max_output_tokens(
+        batch,
+        config.profile,
+        reasoning,
+        extended_output,
+        target_output_multiplier,
+        target_min_output_tokens,
+    );
     let user_cap = config.batch_max_output_tokens.or(config.max_output_tokens);
     bookforge_core::config::cap_output_tokens(
         computed,

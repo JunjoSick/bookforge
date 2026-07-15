@@ -1,3 +1,4 @@
+pub mod audiobook;
 pub mod control;
 pub mod convert;
 pub mod correct;

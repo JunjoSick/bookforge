@@ -28,6 +28,7 @@ const DEFAULT_APPEND_TEXT_SEPARATOR: &str = " / ";
 #[derive(Debug, Clone)]
 pub struct RebuildOptions {
     pub target_language: Option<String>,
+    pub creator: Option<String>,
     pub mode: BilingualMode,
     pub bilingual_separator: String,
     pub bilingual_style: BilingualStyle,
@@ -38,6 +39,7 @@ impl Default for RebuildOptions {
     fn default() -> Self {
         Self {
             target_language: None,
+            creator: None,
             mode: BilingualMode::Replace,
             bilingual_separator: DEFAULT_APPEND_TEXT_SEPARATOR.to_string(),
             bilingual_style: BilingualStyle::Minimal,
@@ -121,14 +123,22 @@ fn write_rebuilt_epub(
         .iter()
         .map(|translation| (&translation.block_id, translation.text.as_str()))
         .collect::<HashMap<_, _>>();
-    let patches = book
+    let prepared_patches = book
         .blocks
         .iter()
         .filter_map(|block| {
-            translations_by_block
-                .get(&block.id)
-                .map(|translation| (block, *translation))
+            if matches!(block.kind, bookforge_core::ir::BlockKind::PageFurniture) {
+                Some((block, String::new()))
+            } else {
+                translations_by_block
+                    .get(&block.id)
+                    .map(|translation| (block, (*translation).to_string()))
+            }
         })
+        .collect::<Vec<_>>();
+    let patches = prepared_patches
+        .iter()
+        .map(|(block, translation)| (*block, translation.as_str()))
         .collect::<Vec<_>>();
     let patches_by_href = patches_by_href(book, &patches);
     let archive_names = archive_entry_names(&mut archive)?;
@@ -155,7 +165,7 @@ fn write_rebuilt_epub(
 
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let output_bytes = if let Some(file_patches) = patches_by_href.get(name.as_str()) {
+        let mut output_bytes = if let Some(file_patches) = patches_by_href.get(name.as_str()) {
             let xhtml = String::from_utf8(bytes).map_err(|err| {
                 BookforgeError::InvalidInput(format!("XHTML resource '{name}' is not UTF-8: {err}"))
             })?;
@@ -185,7 +195,10 @@ fn write_rebuilt_epub(
             })?;
             xhtml.into_bytes()
         } else if name == book.id.0 {
-            if options.target_language.is_some() || stylesheet.is_some() {
+            if options.target_language.is_some()
+                || options.creator.is_some()
+                || stylesheet.is_some()
+            {
                 let opf = String::from_utf8(bytes).map_err(|err| {
                     BookforgeError::InvalidInput(format!(
                         "OPF resource '{name}' is not UTF-8: {err}"
@@ -208,6 +221,25 @@ fn write_rebuilt_epub(
         } else {
             bytes
         };
+
+        if options.target_language.is_some()
+            && matches!(options.mode, BilingualMode::Replace)
+            && is_xhtml_resource_name(name.as_str())
+        {
+            let xhtml = String::from_utf8(output_bytes).map_err(|err| {
+                BookforgeError::InvalidInput(format!("XHTML resource '{name}' is not UTF-8: {err}"))
+            })?;
+            let xhtml = patch_xhtml_language(
+                &xhtml,
+                options.target_language.as_deref().unwrap_or_default(),
+            )?;
+            validate_xml(&xhtml).map_err(|err| {
+                BookforgeError::InvalidInput(format!(
+                    "language-patched XHTML '{name}' failed validation: {err}"
+                ))
+            })?;
+            output_bytes = xhtml.into_bytes();
+        }
 
         writer.start_file(name, deflated)?;
         writer.write_all(&output_bytes)?;
@@ -490,6 +522,10 @@ fn patch_opf_for_rebuild(
         }
         _ => opf.to_string(),
     };
+
+    if let Some(creator) = options.creator.as_deref() {
+        patched = patch_opf_creator(&patched, creator)?;
+    }
 
     if let Some(href) = stylesheet_href {
         patched = patch_opf_stylesheet_manifest(&patched, href)?;
@@ -807,6 +843,7 @@ fn epub_language_tag(language: &str) -> String {
         "norwegian" => "no",
         "danish" => "da",
         "finnish" => "fi",
+        "toki pona" => "tok",
         // Unknown language names (multi-word, non-ASCII, unmapped) cannot
         // be emitted verbatim: `lang="Haitian Creole"` is not a valid
         // BCP 47 tag and fails EPUBCheck. `und` is the BCP 47 code for
@@ -815,6 +852,134 @@ fn epub_language_tag(language: &str) -> String {
         _ => "und",
     }
     .to_string()
+}
+
+fn patch_opf_creator(opf: &str, creator: &str) -> Result<String> {
+    let mut reader = Reader::from_str(opf);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut in_creator = false;
+    let mut wrote_creator = false;
+    let mut found_creator = false;
+    let mut inserted_creator = false;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element)
+                if !found_creator && local_name(element.name().as_ref()) == b"creator" =>
+            {
+                found_creator = true;
+                in_creator = true;
+                wrote_creator = false;
+                writer.write_event(Event::Start(element))?;
+            }
+            Event::Empty(element)
+                if !found_creator && local_name(element.name().as_ref()) == b"creator" =>
+            {
+                found_creator = true;
+                writer.write_event(Event::Start(element.to_owned()))?;
+                writer.write_event(Event::Text(BytesText::new(creator)))?;
+                writer.write_event(Event::End(element.to_end()))?;
+            }
+            Event::Text(_) | Event::CData(_) | Event::GeneralRef(_) if in_creator => {
+                if !wrote_creator {
+                    writer.write_event(Event::Text(BytesText::new(creator)))?;
+                    wrote_creator = true;
+                }
+            }
+            Event::End(element)
+                if in_creator && local_name(element.name().as_ref()) == b"creator" =>
+            {
+                if !wrote_creator {
+                    writer.write_event(Event::Text(BytesText::new(creator)))?;
+                }
+                in_creator = false;
+                writer.write_event(Event::End(element))?;
+            }
+            Event::End(element)
+                if !found_creator
+                    && !inserted_creator
+                    && local_name(element.name().as_ref()) == b"metadata" =>
+            {
+                let mut creator_element = quick_xml::events::BytesStart::new("dc:creator");
+                creator_element.push_attribute(("xmlns:dc", "http://purl.org/dc/elements/1.1/"));
+                writer.write_event(Event::Start(creator_element))?;
+                writer.write_event(Event::Text(BytesText::new(creator)))?;
+                writer.write_event(Event::End(BytesEnd::new("dc:creator")))?;
+                inserted_creator = true;
+                writer.write_event(Event::End(element))?;
+            }
+            Event::Eof => break,
+            event => writer.write_event(event)?,
+        }
+    }
+
+    if !found_creator && !inserted_creator {
+        return Ok(opf.to_string());
+    }
+    String::from_utf8(writer.into_inner()).map_err(|err| {
+        BookforgeError::InvalidInput(format!("creator-patched OPF is not valid UTF-8: {err}"))
+    })
+}
+
+fn patch_xhtml_language(xhtml: &str, target_language: &str) -> Result<String> {
+    let language_tag = epub_language_tag(target_language);
+    let mut reader = Reader::from_str(xhtml);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) if local_name(element.name().as_ref()) == b"html" => {
+                write_xhtml_root_with_language(&mut writer, &element, &language_tag, false)?;
+            }
+            Event::Empty(element) if local_name(element.name().as_ref()) == b"html" => {
+                write_xhtml_root_with_language(&mut writer, &element, &language_tag, true)?;
+            }
+            Event::Eof => break,
+            event => writer.write_event(event)?,
+        }
+    }
+
+    String::from_utf8(writer.into_inner()).map_err(|err| {
+        BookforgeError::InvalidInput(format!("language-patched XHTML is not valid UTF-8: {err}"))
+    })
+}
+
+fn write_xhtml_root_with_language(
+    writer: &mut Writer<Vec<u8>>,
+    source: &quick_xml::events::BytesStart<'_>,
+    language_tag: &str,
+    empty: bool,
+) -> Result<()> {
+    let source_name = source.name();
+    let name = String::from_utf8_lossy(source_name.as_ref()).into_owned();
+    let mut element = quick_xml::events::BytesStart::new(name.as_str());
+    let mut attributes = Vec::<(String, String)>::new();
+    for attr in source.attributes() {
+        let attr = attr.map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+        if key == "lang" || key == "xml:lang" {
+            continue;
+        }
+        let value = attr
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+            .into_owned();
+        attributes.push((key, value));
+    }
+    for (key, value) in &attributes {
+        element.push_attribute((key.as_str(), value.as_str()));
+    }
+    if !language_tag.is_empty() {
+        element.push_attribute(("lang", language_tag));
+        element.push_attribute(("xml:lang", language_tag));
+    }
+    if empty {
+        writer.write_event(Event::Empty(element))?;
+    } else {
+        writer.write_event(Event::Start(element))?;
+    }
+    Ok(())
 }
 
 fn local_name(name: &[u8]) -> &[u8] {
@@ -1176,6 +1341,10 @@ fn write_replace_block(
     path: &[usize],
     skipped_blocks: &mut usize,
 ) -> Result<()> {
+    if patch.translation.trim().is_empty() {
+        write_events_without_visible_text(writer, &buffered.events)?;
+        return Ok(());
+    }
     if buffered.has_inline_children {
         match patch
             .block
@@ -1206,6 +1375,21 @@ fn write_replace_block(
         }
     } else {
         writer.write_event(Event::Text(BytesText::new(patch.translation)))?;
+    }
+    Ok(())
+}
+
+fn write_events_without_visible_text(
+    writer: &mut Writer<Vec<u8>>,
+    events: &[Event<'static>],
+) -> Result<()> {
+    for event in events {
+        if !matches!(
+            event,
+            Event::Text(_) | Event::CData(_) | Event::GeneralRef(_)
+        ) {
+            writer.write_event(event.borrow())?;
+        }
     }
     Ok(())
 }
@@ -2237,6 +2421,7 @@ mod tests {
     #[test]
     fn epub_language_tag_maps_known_names_and_falls_back_to_und() {
         assert_eq!(epub_language_tag("Italian"), "it");
+        assert_eq!(epub_language_tag("Toki Pona"), "tok");
         assert_eq!(epub_language_tag("Brazilian Portuguese"), "pt-BR");
         assert_eq!(epub_language_tag("it"), "it");
         assert_eq!(epub_language_tag("pt-BR"), "pt-br");
@@ -2244,6 +2429,35 @@ mod tests {
         // Unmapped multi-word names must not leak into lang attributes.
         assert_eq!(epub_language_tag("Haitian Creole"), "und");
         assert_eq!(epub_language_tag("Neapolitan"), "und");
+    }
+
+    #[test]
+    fn patch_opf_creator_replaces_damaged_unknown_metadata() {
+        let opf = r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:creator role="aut">Unknown</dc:creator></metadata></package>"#;
+        let patched = patch_opf_creator(opf, "Roberto Vannacci").expect("creator should patch");
+
+        assert!(patched.contains(">Roberto Vannacci</dc:creator>"));
+        assert!(!patched.contains(">Unknown</dc:creator>"));
+    }
+
+    #[test]
+    fn patch_opf_creator_inserts_creator_when_metadata_has_none() {
+        let opf = r#"<package xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:language>it</dc:language></metadata></package>"#;
+        let patched = patch_opf_creator(opf, "Roberto Vannacci").expect("creator should insert");
+
+        assert!(patched.contains(">Roberto Vannacci</dc:creator>"));
+        validate_xml(&patched).expect("creator-patched OPF should remain XML");
+    }
+
+    #[test]
+    fn patch_xhtml_language_replaces_empty_and_source_language_attributes() {
+        let source = r#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="en"><body><p>toki</p></body></html>"#;
+        let patched = patch_xhtml_language(source, "Toki Pona").expect("language should patch");
+
+        assert!(patched.contains("lang=\"tok\""));
+        assert!(patched.contains("xml:lang=\"tok\""));
+        assert!(!patched.contains("xml:lang=\"en\""));
+        validate_xml(&patched).expect("patched XHTML should stay valid");
     }
 
     #[test]
@@ -2775,6 +2989,7 @@ mod tests {
     fn append_options(mode: BilingualMode) -> RebuildOptions {
         RebuildOptions {
             target_language: Some("Italian".to_string()),
+            creator: None,
             mode,
             bilingual_separator: DEFAULT_APPEND_TEXT_SEPARATOR.to_string(),
             bilingual_style: BilingualStyle::Minimal,

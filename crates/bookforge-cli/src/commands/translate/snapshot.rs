@@ -59,6 +59,7 @@ pub(crate) fn persist_snapshot(
         report_markdown_path: Some(reports.markdown),
         source_language: cli_args.language.source.clone(),
         target_language: cli_args.language.target.clone(),
+        creator: cli_args.creator.clone(),
         provider: provider_args.provider.clone(),
         model: model.to_string(),
         base_url,

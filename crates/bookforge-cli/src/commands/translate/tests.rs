@@ -8,6 +8,56 @@ use bookforge_core::{
 };
 use std::{fs, time::SystemTime};
 
+#[test]
+fn toki_pona_text_only_retry_guidance_downgrades_only_the_targeted_batch() {
+    let mut retry_segment = segment("retry_seg", 0);
+    retry_segment.source.blocks[0].text = "<m1>Source</m1>".to_string();
+    retry_segment.source.text = retry_segment.source.blocks[0].text.clone();
+    let batch_config = bookforge_core::config::BatchConfig {
+        enabled: true,
+        target_tokens: 400,
+        max_items: 4,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let mut batches =
+        build_translation_batches(&[retry_segment], &batch_config, TranslationProfile::V1Fast);
+    assert_eq!(batches[0].mode, BatchMode::MarkerSafe);
+
+    let mut config = TranslationRunConfig {
+        source_language: Some("Italian".to_string()),
+        target_language: "Toki Pona".to_string(),
+        provider: "mock".to_string(),
+        model: "mock".to_string(),
+        prompt_version: "v1".to_string(),
+        temperature: 0.2,
+        scheduler: SchedulerConfig::default(),
+        profile: TranslationProfile::V1Fast,
+        model_context_tokens: None,
+        max_output_tokens: None,
+        batch_max_output_tokens: None,
+        compact_prompts: true,
+        glossary: GlossaryRunConfig::default(),
+        context: ContextRunConfig::default(),
+        context_registry: None,
+        style: None,
+        entities: None,
+        pause_signal: None,
+        runtime_settings: None,
+    };
+    config.glossary.guidance_by_segment.insert(
+        "retry_seg".to_string(),
+        "[bookforge:text-only] preserve meaning over inline formatting".to_string(),
+    );
+
+    apply_text_only_retry_guidance(&mut batches, &config);
+
+    assert_eq!(batches[0].mode, BatchMode::TurboTextOnly);
+    assert!(batches[0].items[0].source_text.contains("m1"));
+    assert_eq!(batches[0].items[0].required_markers, ["m1"]);
+}
+
 #[tokio::test]
 async fn scheduler_guard_preserves_completed_segments_on_run_level_error() {
     let db_path = temp_path("jobs.sqlite");
@@ -377,6 +427,28 @@ fn persisted_glossary_is_selected_when_source_is_auto() {
 }
 
 #[test]
+fn toki_pona_translation_automatically_activates_built_in_style() {
+    let db_path = temp_path("toki_pona_style.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    let prepared = prepare_style_run_config(&store, &[], "Toki Pona", None, None)
+        .expect("Toki Pona style should prepare");
+
+    let run_config = prepared
+        .run_config
+        .expect("built-in style should be active");
+    assert!(run_config.rendered_block.contains("Toki Pona grammar"));
+    assert!(
+        run_config
+            .rendered_block
+            .contains("Preserve every claim and logical relation")
+    );
+    assert_eq!(run_config.fingerprint, prepared.fingerprint);
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
 fn glossary_format_changes_cache_fingerprint() {
     let term = GlossaryTerm {
         id: Some(1),
@@ -733,6 +805,7 @@ fn translate_args_with_preset(
         provider_max_attempts: None,
         validation_max_attempts: None,
         out: None,
+        creator: None,
         mode: bookforge_core::BilingualMode::Replace,
         bilingual_css: None,
         bilingual_style: bookforge_core::BilingualStyle::Minimal,
@@ -811,4 +884,30 @@ fn provider_preset_runtime_is_reflected_in_resolved_settings() {
         bookforge_core::RetryAfterPolicy::RespectHeader
     );
     assert_eq!(settings.provider.max_idle_per_host, 8);
+}
+
+#[test]
+fn toki_pona_style_applies_expansion_aware_sizing_before_first_request() {
+    let mut args = translate_args_with_preset(None);
+    args.language.target = "Toki Pona".to_string();
+
+    let settings = resolve_settings(&args);
+    assert_eq!(settings.segmentation.max_segment_tokens, 200);
+    assert_eq!(settings.batch.target_tokens, 200);
+    assert_eq!(settings.batch.max_items, 1);
+    assert!(!settings.batch.adaptive_sizing);
+}
+
+#[test]
+fn explicit_toki_pona_sizing_overrides_built_in_style_policy() {
+    let mut args = translate_args_with_preset(None);
+    args.language.target = "Toki Pona".to_string();
+    args.max_segment_tokens = Some(2_000);
+    args.batch_target_tokens = Some(2_500);
+    args.batch_max_items = Some(24);
+
+    let settings = resolve_settings(&args);
+    assert_eq!(settings.segmentation.max_segment_tokens, 2_000);
+    assert_eq!(settings.batch.target_tokens, 2_500);
+    assert_eq!(settings.batch.max_items, 24);
 }
