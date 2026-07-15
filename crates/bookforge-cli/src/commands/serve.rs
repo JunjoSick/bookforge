@@ -2833,8 +2833,10 @@ mod tests {
         assert_eq!(DASHBOARD_HTML.len(), 94_924);
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
+        let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
+        let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
-            format!("{:x}", Sha256::digest(DASHBOARD_HTML.as_bytes())),
+            digest_hex,
             "f16c434797d2768c46271e5a262da64713f8dfb45646ee06437fcf6a39795d5b"
         );
 
