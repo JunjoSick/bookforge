@@ -171,7 +171,98 @@ fn default_store_path() -> PathBuf {
     PathBuf::from(".bookforge/jobs.sqlite")
 }
 
+/// Ensure the process working directory can hold the `.bookforge` data root.
+///
+/// If the current directory already accepts a `.bookforge` write we keep it
+/// (preserving the CLI convention of storing runs alongside the project). If it
+/// doesn't — the typical outcome when the app is launched from the desktop
+/// shell with a read-only working directory — we move to a per-user data
+/// directory and switch the process there, so every CWD-relative `.bookforge`
+/// path (uploads, the job store, run outputs, and any child the dashboard
+/// spawns, which inherits this directory) resolves to a writable location.
+fn ensure_writable_workdir() -> Result<()> {
+    if data_root_is_writable(std::path::Path::new(".")) {
+        return Ok(());
+    }
+
+    let fallback =
+        stable_data_dir().context("could not determine a writable data directory for BookForge")?;
+    std::fs::create_dir_all(&fallback)
+        .with_context(|| format!("failed to create data directory {}", fallback.display()))?;
+    if !data_root_is_writable(&fallback) {
+        return Err(anyhow::anyhow!(
+            "data directory {} is not writable",
+            fallback.display()
+        ));
+    }
+    std::env::set_current_dir(&fallback)
+        .with_context(|| format!("failed to switch to data directory {}", fallback.display()))?;
+    println!(
+        "  working directory was not writable; storing data in {}",
+        fallback.display()
+    );
+    Ok(())
+}
+
+/// Return true when a `.bookforge` directory can be created and written under
+/// `base`. A directory that merely exists isn't enough — it may be read-only —
+/// so this probes with an actual file write and cleans up after itself.
+fn data_root_is_writable(base: &std::path::Path) -> bool {
+    let root = base.join(".bookforge");
+    if std::fs::create_dir_all(&root).is_err() {
+        return false;
+    }
+    let probe = root.join(".write-probe");
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// A stable, per-user directory to fall back to when the working directory is
+/// read-only. Prefers the platform's local application-data location and falls
+/// back to the user's home directory.
+fn stable_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(local).join("BookForge"));
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(profile).join("BookForge"));
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(xdg).join("bookforge"));
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(home).join(".local/share/bookforge"));
+        }
+        None
+    }
+}
+
 pub async fn run(args: ServeArgs) -> Result<()> {
+    // The dashboard and every run it spawns write their state under a
+    // `.bookforge` directory resolved relative to the process working
+    // directory. When BookForge is launched from the desktop shell — a Start
+    // Menu shortcut, an installer, or a URL/protocol handler — that working
+    // directory is often a location the user cannot write to (e.g.
+    // `C:\Windows\System32` or `C:\Program Files\…`), which surfaced as
+    // "Access is denied. (os error 5)" the moment a translation tried to
+    // persist its upload. Relocate to a stable, per-user data directory when
+    // the current one isn't writable so the web flow works regardless of how
+    // the process was started. A writable CWD (the usual CLI case) is left
+    // untouched, so `bookforge serve` from a project folder still keeps its
+    // `.bookforge` there.
+    ensure_writable_workdir()?;
+
     let addr: SocketAddr = args
         .bind
         .parse()
@@ -2830,14 +2921,14 @@ mod tests {
     fn dashboard_assets_reassemble_byte_stably() {
         use sha2::{Digest, Sha256};
 
-        assert_eq!(DASHBOARD_HTML.len(), 94_924);
+        assert_eq!(DASHBOARD_HTML.len(), 96_386);
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
         let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
         let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
             digest_hex,
-            "f16c434797d2768c46271e5a262da64713f8dfb45646ee06437fcf6a39795d5b"
+            "c8a0125fd9096f1a0fbf8b61c3907378dce1c5692bc0f592a3f05526bbb07c34"
         );
 
         let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");
