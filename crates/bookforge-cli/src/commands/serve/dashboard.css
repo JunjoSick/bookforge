@@ -98,6 +98,7 @@ main{min-height:calc(100vh - 60px)}
 .field-label{font:600 11px var(--sans);text-transform:uppercase;letter-spacing:.06em;color:var(--faint);margin-bottom:7px}
 .drop{margin-top:6px;padding:26px 20px;border:1.5px dashed var(--line);border-radius:14px;background:var(--soft);text-align:center;cursor:pointer}
 .drop.has{border-style:solid;border-color:var(--accentline);background:var(--card)}
+.drop.dragging{border-style:solid;border-color:var(--accent);background:var(--card)}
 .drop b{color:var(--accent)}
 .drop .fname{font:600 14px var(--serif);color:var(--ink)}
 .inp{width:100%;border-radius:10px;padding:12px 14px;background:var(--card);border:1px solid var(--line);font:500 14px var(--sans);color:var(--ink)}

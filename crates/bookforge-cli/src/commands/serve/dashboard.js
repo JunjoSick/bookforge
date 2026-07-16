@@ -181,7 +181,8 @@ function bfWizBack() { syncWizInputs(); if (App.wizard.step > 0) { App.wizard.st
 function renderWizBody() {
   const w = App.wizard, body = $("#wizbody"); if (!body) return;
   if (w.step === 0) {
-    body.innerHTML = `<div class="drop ${w.file?"has":""}" onclick="$('#fileinput').click()">
+    body.innerHTML = `<div class="drop ${w.file?"has":""}" onclick="$('#fileinput').click()"
+        ondragover="bfDragOver(event)" ondragenter="bfDragOver(event)" ondragleave="bfDragLeave(event)" ondrop="bfDropFile(event)">
       ${w.file ? `<div class="fname">${esc(w.fileName)}</div><div style="color:var(--muted);font-size:12px;margin-top:6px">Click to choose a different file</div>`
                : `<div>Drop an <b>EPUB</b> here or click to browse.</div>`}
       </div><input type="file" id="fileinput" accept=".epub" hidden onchange="bfPickFile(this)">`;
@@ -221,6 +222,24 @@ function syncWizInputs() {
 function bfPickFile(input) {
   const f = input.files && input.files[0];
   if (!f) return;
+  App.wizard.file = f; App.wizard.fileName = f.name; App.wizard.estimate = null;
+  renderWizard($("#stage"));
+}
+/* Drag-and-drop onto a .drop zone. dragover/dragenter must preventDefault or the
+   browser navigates to the dropped file instead of firing our drop handler. */
+function bfDragOver(e) { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = "copy"; e.currentTarget.classList.add("dragging"); }
+function bfDragLeave(e) { e.currentTarget.classList.remove("dragging"); }
+function bfDroppedEpub(e) {
+  e.preventDefault();
+  if (e.currentTarget) e.currentTarget.classList.remove("dragging");
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!f) return null;
+  if (!/\.epub$/i.test(f.name)) return null;
+  return f;
+}
+function bfDropFile(e) {
+  const f = bfDroppedEpub(e);
+  if (!f) { toastWiz("drop an EPUB (.epub) file"); return; }
   App.wizard.file = f; App.wizard.fileName = f.name; App.wizard.estimate = null;
   renderWizard($("#stage"));
 }
@@ -377,6 +396,11 @@ function bfAudioPickFile(input) {
   const file = input.files && input.files[0]; if (!file) return;
   App.audioWizard.file = file; App.audioWizard.fileName = file.name; renderAudiobook($("#stage"));
 }
+function bfAudioDropFile(e) {
+  const f = bfDroppedEpub(e);
+  if (!f) { audioToast("drop an EPUB (.epub) file"); return; }
+  App.audioWizard.file = f; App.audioWizard.fileName = f.name; renderAudiobook($("#stage"));
+}
 function syncAudioInputs() {
   const w = App.audioWizard; if (!w) return;
   const model = $("#a_model"); if (model) w.model = model.value.trim();
@@ -406,7 +430,8 @@ function renderAudiobook(stage) {
       <button class="btn btn-ghost" onclick="bfGo('library')">Back to library</button></div>
     <div class="wizpanel" style="max-width:920px;margin:0 auto">
       <div class="kicker">Source EPUB</div>
-      <div class="drop ${w.file?"has":""}" onclick="$('#audio-file').click()">
+      <div class="drop ${w.file?"has":""}" onclick="$('#audio-file').click()"
+          ondragover="bfDragOver(event)" ondragenter="bfDragOver(event)" ondragleave="bfDragLeave(event)" ondrop="bfAudioDropFile(event)">
         ${w.file ? `<div class="fname">${esc(w.fileName)}</div><div style="color:var(--muted);font-size:12px;margin-top:6px">Click to choose another EPUB</div>` : `<div>Drop an <b>EPUB</b> here or click to browse.</div>`}
       </div><input type="file" id="audio-file" accept=".epub" hidden onchange="bfAudioPickFile(this)">
       <div class="field-label" style="margin-top:20px">Speech provider</div><div class="chips">${providerChips}</div>
