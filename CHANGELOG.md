@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## v2.5.1 - 2026-07-16
+
+- Fixed drag-and-drop uploads in the dashboard. The translation and audiobook
+  "drop" zones looked droppable but only responded to clicks — dragging an
+  EPUB onto them did nothing. They now handle drag-and-drop, validate the
+  `.epub` extension, and highlight while a file is dragged over them.
+- Fixed "Access is denied. (os error 5)" when starting a translation from the
+  dashboard. The server and the runs it spawns persist state under a
+  `.bookforge` directory resolved relative to the process working directory.
+  Launched from the desktop shell (a Start Menu shortcut, an installer, or a
+  URL/protocol handler), that directory is often read-only (for example
+  `System32` or `Program Files`), so the first upload write failed. `bookforge
+  serve` now relocates to a per-user data directory (`%LOCALAPPDATA%\BookForge`
+  on Windows, `$XDG_DATA_HOME`/`$HOME` elsewhere) when the working directory
+  is not writable, and leaves a writable working directory untouched.
+
 ## v2.5.0 - 2026-07-15
 
 - Added audiobook generation: `bookforge audiobook <book.epub>` narrates an
