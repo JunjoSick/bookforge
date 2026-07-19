@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use bookforge_audio::{
     AudioFormat, AudiobookOptions, ElevenLabsTtsConfig, ElevenLabsTtsProvider, GeminiTtsConfig,
     GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider, Progress,
-    StitchOptions, build_audiobook, plan_chunks, stitch, validate_options,
+    StitchOptions, build_audiobook, elevenlabs_model_max_input_chars, plan_chunks, stitch,
+    validate_options,
 };
 use bookforge_epub::{ReflowOptions, read_epub, reflow_epub};
 use clap::{Args, ValueEnum};
@@ -243,6 +244,12 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                 .model
                 .clone()
                 .unwrap_or_else(|| "eleven_multilingual_v2".to_string());
+            let model_limit = elevenlabs_model_max_input_chars(&model);
+            if args.max_chars > model_limit {
+                anyhow::bail!(
+                    "ElevenLabs model {model} is limited to {model_limit} characters; set --max-chars to {model_limit} or less"
+                );
+            }
             let base_url = args
                 .base_url
                 .as_deref()

@@ -5,6 +5,25 @@ use super::{
     required_api_key, send_with_retry, validate_audio_payload, validate_path_component,
 };
 
+/// Absolute maximum Unicode characters accepted by an ElevenLabs TTS model.
+pub const ELEVENLABS_MAX_INPUT_CHARS: usize = 40_000;
+
+/// Return the documented per-request character limit for an ElevenLabs model.
+///
+/// Unknown models use the conservative long-form default rather than the
+/// absolute Flash/Turbo ceiling. ElevenLabs can add models without BookForge
+/// knowing their contract yet, and rejecting locally is safer than spending a
+/// provider request that cannot succeed.
+pub fn elevenlabs_model_max_input_chars(model: &str) -> usize {
+    match model {
+        "eleven_flash_v2_5" | "eleven_turbo_v2_5" => 40_000,
+        "eleven_flash_v2" | "eleven_turbo_v2" => 30_000,
+        "eleven_v3" => 5_000,
+        "eleven_multilingual_v1" | "eleven_multilingual_v2" => 10_000,
+        _ => 10_000,
+    }
+}
+
 /// Configuration for ElevenLabs' native text-to-speech endpoint.
 #[derive(Debug, Clone)]
 pub struct ElevenLabsTtsConfig {
@@ -68,6 +87,14 @@ impl ElevenLabsTtsProvider {
 
 impl TtsProvider for ElevenLabsTtsProvider {
     async fn synthesize(&self, request: SpeechRequest) -> Result<AudioClip> {
+        let input_chars = request.text.chars().count();
+        let model_limit = elevenlabs_model_max_input_chars(&self.config.model);
+        if input_chars > model_limit {
+            return Err(TtsError::Provider(format!(
+                "ElevenLabs model {} is limited to {model_limit} characters; received {input_chars}",
+                self.config.model
+            )));
+        }
         let endpoint = self.endpoint(&request.voice, request.format)?;
         let api_key = required_api_key(&self.config.api_key_env)?;
         let body = elevenlabs_request_body(&self.config.model, &request);
@@ -159,6 +186,34 @@ mod tests {
             elevenlabs_output_format(AudioFormat::Aac),
             Err(TtsError::UnsupportedFormat("aac"))
         ));
+    }
+
+    #[tokio::test]
+    async fn rejects_input_above_provider_character_limit_before_network() {
+        let provider = ElevenLabsTtsProvider::new(ElevenLabsTtsConfig::hosted(None)).unwrap();
+        let mut oversized = request(AudioFormat::Mp3);
+        oversized.text = "a".repeat(10_001);
+
+        let error = provider.synthesize(oversized).await.unwrap_err();
+        assert!(error.to_string().contains("limited to 10000 characters"));
+    }
+
+    #[test]
+    fn model_character_limits_match_elevenlabs_contracts() {
+        assert_eq!(elevenlabs_model_max_input_chars("eleven_v3"), 5_000);
+        assert_eq!(
+            elevenlabs_model_max_input_chars("eleven_multilingual_v2"),
+            10_000
+        );
+        assert_eq!(
+            elevenlabs_model_max_input_chars("eleven_flash_v2_5"),
+            40_000
+        );
+        assert_eq!(
+            elevenlabs_model_max_input_chars("eleven_turbo_v2_5"),
+            40_000
+        );
+        assert_eq!(elevenlabs_model_max_input_chars("future-model"), 10_000);
     }
 
     #[tokio::test]

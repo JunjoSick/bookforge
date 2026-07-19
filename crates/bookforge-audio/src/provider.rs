@@ -12,7 +12,10 @@ use tokio_util::sync::CancellationToken;
 mod elevenlabs;
 mod gemini;
 
-pub use elevenlabs::{ElevenLabsTtsConfig, ElevenLabsTtsProvider};
+pub use elevenlabs::{
+    ELEVENLABS_MAX_INPUT_CHARS, ElevenLabsTtsConfig, ElevenLabsTtsProvider,
+    elevenlabs_model_max_input_chars,
+};
 pub use gemini::{GeminiTtsConfig, GeminiTtsProvider};
 
 /// Output container/codec requested from the provider. The string form is

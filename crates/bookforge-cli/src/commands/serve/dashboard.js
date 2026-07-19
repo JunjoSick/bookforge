@@ -382,16 +382,26 @@ function audioProviderOption(id) {
   return (App.options.audio_providers || []).find(p => p.id === id)
     || { id:"mock", label:"mock", models:["mock-silence"], default_model:"mock-silence",
       default_voice:"mock", formats:["wav"], default_format:"wav", requires_key:false,
-      requires_voice:false, supports_instructions:false, supports_speed:true };
+      requires_voice:false, supports_instructions:false, supports_speed:true, max_chars:40000 };
+}
+function audioProviderMaxChars(provider, model) {
+  if (provider.id === "elevenlabs") {
+    const limits = { eleven_v3:5000, eleven_multilingual_v1:10000, eleven_multilingual_v2:10000,
+      eleven_flash_v2:30000, eleven_turbo_v2:30000, eleven_flash_v2_5:40000, eleven_turbo_v2_5:40000 };
+    return limits[model] || 10000;
+  }
+  return Math.max(1, Number(provider.max_chars) || 4096);
 }
 function bfAudioProvider(id) {
   syncAudioInputs();
   const w = App.audioWizard, p = audioProviderOption(id);
   w.provider = id; w.model = p.default_model; w.voice = p.default_voice;
+  w.maxChars = Math.min(w.maxChars, audioProviderMaxChars(p, w.model));
   w.format = p.default_format; w.speed = 1; w.instructions = ""; w.status = "";
   renderAudiobook($("#stage"));
 }
 function bfAudioFormat(format) { syncAudioInputs(); App.audioWizard.format = format; renderAudiobook($("#stage")); }
+function bfAudioModel() { syncAudioInputs(); const w=App.audioWizard, p=audioProviderOption(w.provider); w.maxChars=Math.min(w.maxChars,audioProviderMaxChars(p,w.model)); renderAudiobook($("#stage")); }
 function bfAudioPickFile(input) {
   const file = input.files && input.files[0]; if (!file) return;
   App.audioWizard.file = file; App.audioWizard.fileName = file.name; renderAudiobook($("#stage"));
@@ -406,7 +416,7 @@ function syncAudioInputs() {
   const model = $("#a_model"); if (model) w.model = model.value.trim();
   const voice = $("#a_voice"); if (voice) w.voice = voice.value.trim();
   const speed = $("#a_speed"); if (speed) w.speed = Number(speed.value) || 1;
-  const maxChars = $("#a_chars"); if (maxChars) w.maxChars = Math.max(1, Math.min(4096, parseInt(maxChars.value,10)||2000));
+  const maxChars = $("#a_chars"); if (maxChars) w.maxChars = Math.max(1, Math.min(audioProviderMaxChars(audioProviderOption(w.provider), w.model), parseInt(maxChars.value,10)||2000));
   const concurrency = $("#a_conc"); if (concurrency) w.concurrency = Math.max(1, Math.min(16, parseInt(concurrency.value,10)||4));
   const instructions = $("#a_instructions"); if (instructions) w.instructions = instructions.value.trim();
   const baseUrl = $("#a_base"); if (baseUrl) w.baseUrl = baseUrl.value.trim();
@@ -436,10 +446,10 @@ function renderAudiobook(stage) {
       </div><input type="file" id="audio-file" accept=".epub" hidden onchange="bfAudioPickFile(this)">
       <div class="field-label" style="margin-top:20px">Speech provider</div><div class="chips">${providerChips}</div>
       <div class="adv-grid" style="margin-top:18px">
-        <div><div class="field-label">Model</div><input class="inp" id="a_model" value="${esc(w.model)}" list="audio-models"></div>
+        <div><div class="field-label">Model</div><input class="inp" id="a_model" value="${esc(w.model)}" list="audio-models" onchange="bfAudioModel()"></div>
         <div><div class="field-label">${p.requires_voice?"Voice ID":"Voice"}</div><input class="inp" id="a_voice" value="${esc(w.voice)}" placeholder="${p.requires_voice?"Required ElevenLabs voice ID":"Voice name"}"></div>
         <div><div class="field-label">Speed</div><input class="inp" id="a_speed" type="number" min="0.25" max="4" step="0.05" value="${w.speed}" ${p.supports_speed?"":"disabled"}></div>
-        <div><div class="field-label">Characters per request</div><input class="inp" id="a_chars" type="number" min="1" max="4096" value="${w.maxChars}"></div>
+        <div><div class="field-label">Characters per request</div><input class="inp" id="a_chars" type="number" min="1" max="${audioProviderMaxChars(p,w.model)}" value="${w.maxChars}"></div>
         <div><div class="field-label">Concurrency</div><input class="inp" id="a_conc" type="number" min="1" max="16" value="${w.concurrency}"></div>
         <div><div class="field-label">Format</div><div class="chips">${formatChips}</div></div>
       </div>

@@ -18,8 +18,8 @@ the local browser dashboard started by `bookforge serve`.
    skipped — you do not want a table of contents read aloud. Inline markers
    are stripped so the narrator hears clean prose.
 3. **Chunk** each chapter on sentence boundaries into pieces under
-   `--max-chars` (default 2000; OpenAI's hard limit is 4096). Chunking is a
-   pure function of the text, so a resumed run re-derives the exact same
+   `--max-chars` (default 2000; the maximum is provider-specific). Chunking is
+   a pure function of the text, so a resumed run re-derives the exact same
    chunks.
 4. **Synthesize** each chunk through the TTS provider, `--concurrency` at a
    time, writing `chapter-NNN-part-NNN-<hash>.<ext>` atomically (temp file then
@@ -89,7 +89,8 @@ removed without deleting anything. Stitched per-chapter outputs, the assembled
 
   ElevenLabs does not expose a free-form instructions field on this endpoint.
   Configure the selected voice in ElevenLabs, use `--speed`, or place
-  model-supported audio tags directly in the source text.
+  model-supported audio tags directly in the source text. BookForge enforces
+  the selected model's per-request character limit.
 
 - **`mock`** — a deterministic, offline provider that emits valid silent WAV
   clips scaled to the text length. Its format is always `wav`; BookForge uses
@@ -135,6 +136,10 @@ completed chunk files remain available for a resumed stitch.
 
 - Hosted OpenAI speech requests are capped at 4096 input characters; BookForge
   rejects a larger `--max-chars` value for that endpoint.
+- ElevenLabs limits are model-specific: 40,000 input characters for Flash and
+  Turbo v2.5, 10,000 for Multilingual v2, and 5,000 for Eleven v3. The CLI and
+  dashboard reject larger values, and the provider checks the final request as
+  a last line of defense.
 - Gemini TTS supports WAV and raw PCM in BookForge. ElevenLabs supports MP3,
   Opus, WAV, and raw PCM; some high-sample-rate formats require a qualifying
   ElevenLabs plan.

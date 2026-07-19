@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Audiobook chapter extraction now recognizes canonical Toki Pona headings
+  such as `lipu nanpa VI` and can recover chapter boundaries from legacy
+  BookForge translations that used the old `KAPITELO` label.
+- ElevenLabs audiobook requests now enforce each model's documented character
+  limit consistently in the CLI, dashboard, server, and provider layer: 40,000
+  for Flash/Turbo v2.5, 10,000 for Multilingual v2, and 5,000 for Eleven v3.
+
 ## v2.5.1 - 2026-07-16
 
 - Fixed drag-and-drop uploads in the dashboard. The translation and audiobook

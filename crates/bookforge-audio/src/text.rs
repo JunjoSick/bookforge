@@ -59,7 +59,10 @@ pub fn chapters_from_book_with_options(book: &Book, pdf_page_grouping: bool) -> 
     let sections = book
         .sections
         .iter()
-        .filter(|section| is_narratable_section(&section.href, &navigation_hrefs))
+        .filter(|section| {
+            !section.id.0.starts_with("sec_nav_")
+                && is_narratable_section(&section.href, &navigation_hrefs)
+        })
         .collect::<Vec<_>>();
 
     // Some PDF converters emit one XHTML spine item per physical page. In
@@ -291,18 +294,55 @@ fn chapter_label_key(text: &str) -> Option<String> {
         "capítulo",
         "capitulo",
     ];
-    let mut words = text.split_whitespace();
-    let label = words.next()?.trim_matches(|ch: char| !ch.is_alphabetic());
+    let normalized_words = text
+        .split_whitespace()
+        .map(|word| word.trim_matches(|ch: char| !ch.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let label = *normalized_words.first()?;
+
+    // Canonical Toki Pona chapter headings keep the protected Roman numeral:
+    // `lipu nanpa VI`. Requiring a Roman numeral prevents ordinary phrases
+    // such as `lipu nanpa 17 ...` from becoming accidental chapter breaks.
+    if normalized_words.len() >= 3
+        && label.eq_ignore_ascii_case("lipu")
+        && normalized_words[1].eq_ignore_ascii_case("nanpa")
+        && is_roman_number(normalized_words[2])
+    {
+        return Some(format!(
+            "lipu nanpa {}",
+            normalized_words[2].to_ascii_uppercase()
+        ));
+    }
+
+    // Early BookForge Toki Pona output used the non-standard KAPITELO label.
+    // Recognize it when narrating existing files, but translation prompts and
+    // validation continue to require ordinary `lipu nanpa <Roman>`.
+    if label.eq_ignore_ascii_case("kapitelo")
+        && normalized_words.len() >= 2
+        && normalized_words.len() <= 5
+        && normalized_words[1..].iter().all(|word| {
+            is_roman_number(word)
+                || matches!(
+                    word.to_ascii_lowercase().as_str(),
+                    "wan" | "tu" | "luka" | "mute" | "ale"
+                )
+        })
+    {
+        return Some(
+            normalized_words
+                .iter()
+                .map(|word| word.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+
     if !LABELS.iter().any(|known| label.eq_ignore_ascii_case(known)) {
         return None;
     }
-    let number = words
-        .next()?
-        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
-    let roman = !number.is_empty()
-        && number
-            .chars()
-            .all(|ch| matches!(ch.to_ascii_uppercase(), 'I' | 'V' | 'X' | 'L' | 'C'));
+    let number = *normalized_words.get(1)?;
+    let roman = is_roman_number(number);
     if !number.chars().all(|ch| ch.is_ascii_digit()) && !roman {
         return None;
     }
@@ -311,6 +351,13 @@ fn chapter_label_key(text: &str) -> Option<String> {
         label.to_ascii_lowercase(),
         number.to_ascii_uppercase()
     ))
+}
+
+fn is_roman_number(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| matches!(ch.to_ascii_uppercase(), 'I' | 'V' | 'X' | 'L' | 'C'))
 }
 
 fn embedded_chapter_label_offset(text: &str) -> Option<usize> {
@@ -349,7 +396,13 @@ fn should_join_across_page(left: &str, right: &str) -> bool {
 /// extensions alone would incorrectly read the table of contents aloud.
 fn is_narratable_section(href: &str, navigation_hrefs: &std::collections::HashSet<String>) -> bool {
     let path = normalized_href(href);
-    !(path.ends_with(".opf") || path.ends_with(".ncx") || navigation_hrefs.contains(&path))
+    let is_navigation = navigation_hrefs.iter().any(|navigation| {
+        path == *navigation
+            || path
+                .strip_suffix(navigation)
+                .is_some_and(|prefix| prefix.ends_with('/'))
+    });
+    !(path.ends_with(".opf") || path.ends_with(".ncx") || is_navigation)
 }
 
 fn normalized_href(href: &str) -> String {
@@ -599,6 +652,7 @@ mod tests {
         assert!(!is_narratable_section("OEBPS/package.OPF", &nav));
         assert!(!is_narratable_section("toc.ncx", &nav));
         assert!(!is_narratable_section("TEXT/navigation.xhtml#toc", &nav));
+        assert!(!is_narratable_section("OEBPS/Text/navigation.xhtml", &nav));
         assert!(is_narratable_section("text/chapter-1.xhtml", &nav));
         assert!(is_narratable_section("chapter.html#frag", &nav));
         assert!(is_printed_toc_heading("INDICE"));
@@ -609,6 +663,15 @@ mod tests {
             "Cap. I / Il Buonsenso Pag. 1 Cap. II / La natura Pag. 8"
         ));
         assert!(is_front_matter_heading("Nota dell’autore"));
+        assert_eq!(
+            chapter_label_key("lipu nanpa VI"),
+            Some("lipu nanpa VI".to_string())
+        );
+        assert!(chapter_label_key("lipu nanpa 17 li toki e ni").is_none());
+        assert_eq!(
+            chapter_label_key("KAPITELO LUKA WAN"),
+            Some("KAPITELO LUKA WAN".to_string())
+        );
     }
 
     #[test]
