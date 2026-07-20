@@ -188,10 +188,17 @@ fn segment(id: &str, ordinal: usize) -> Segment {
 }
 
 fn temp_path(name: &str) -> PathBuf {
+    // A per-call counter guarantees a unique path even when two parallel tests
+    // hit the same timestamp — the OS clock is coarse on some platforms
+    // (notably Windows), so pid + nanos alone can collide and let one test's
+    // cleanup race another's setup.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(
-        "bookforge-store-test-{}-{}-{name}",
+        "bookforge-store-test-{}-{}-{}-{name}",
         std::process::id(),
-        unix_timestamp_nanos()
+        unix_timestamp_nanos(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
 }
 

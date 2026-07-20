@@ -334,12 +334,18 @@ mod tests {
     }
 
     fn temp_path(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
+        // Counter disambiguates calls that share a timestamp (the clock is
+        // coarse on some platforms), keeping parallel tests off each other's
+        // temp files.
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "bookforge-chk-test-{}-{nanos}-{name}",
+            "bookforge-chk-test-{}-{nanos}-{seq}-{name}",
             std::process::id()
         ))
     }
