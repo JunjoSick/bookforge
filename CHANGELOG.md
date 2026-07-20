@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added optional OCR recovery for low-confidence PDF pages through
+  OpenAI-compatible endpoints, including the SGLang-specific Unlimited-OCR
+  dialect, retrying blocking HTTP client, `action=ocr` reporting, and a
+  loopback-friendly endpoint doctor.
+- Added an Unlimited-OCR deployment guide and helper script for serializing
+  SGLang's custom no-repeat n-gram logit processor.
 - Audiobook chapter extraction now recognizes canonical Toki Pona headings
   such as `lipu nanpa VI` and can recover chapter boundaries from legacy
   BookForge translations that used the old `KAPITELO` label.

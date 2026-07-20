@@ -5,7 +5,7 @@ use bookforge_llm::{
     CompletionRequest, LlmProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
     RequestMetadata, ResponseFormat,
 };
-use bookforge_pdf::PopplerTools;
+use bookforge_pdf::{HttpOcrClient, OcrConfig, PopplerTools};
 use bookforge_store::run_doctor;
 
 #[derive(Debug, Args)]
@@ -21,6 +21,10 @@ pub struct DoctorArgs {
     /// Check provider health
     #[arg(long)]
     pub provider: Option<String>,
+
+    /// Check an OpenAI-compatible OCR endpoint.
+    #[arg(long)]
+    pub ocr_endpoint: Option<String>,
 
     /// Model to test with
     #[arg(long)]
@@ -64,10 +68,68 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
         .await?;
     }
 
+    if let Some(endpoint) = &args.ocr_endpoint {
+        ran = true;
+        run_ocr_doctor(
+            endpoint,
+            args.model.as_deref(),
+            args.api_key_env.as_deref(),
+            args.timeout_seconds,
+        )
+        .await?;
+    }
+
     if !ran {
         run_storage_doctor().await?;
     }
 
+    Ok(())
+}
+
+async fn run_ocr_doctor(
+    endpoint: &str,
+    model: Option<&str>,
+    api_key_env: Option<&str>,
+    timeout_seconds: u64,
+) -> anyhow::Result<()> {
+    let mut config = OcrConfig::new(endpoint);
+    if let Some(model) = model {
+        config.model = model.to_string();
+    }
+    if let Some(api_key_env) = api_key_env {
+        config.api_key_env = api_key_env.to_string();
+    }
+    config.timeout_seconds = timeout_seconds;
+    let display_endpoint = config.base_url.clone();
+    let display_model = config.model.clone();
+
+    println!("OCR endpoint:");
+    println!("  Base URL: {display_endpoint}");
+    println!("  Model: {display_model}");
+
+    let result = tokio::task::spawn_blocking(move || {
+        HttpOcrClient::new(config).and_then(|client| client.health_check())
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("OCR health-check worker failed: {error}"))?;
+
+    match result {
+        Ok(models) => {
+            println!("  Reachable: yes");
+            if models.is_empty() {
+                println!("  Models: (none reported)");
+            } else {
+                println!("  Models: {}", models.join(", "));
+            }
+        }
+        Err(error) => {
+            println!("  Reachable: no");
+            println!("  Error: {error}");
+            println!(
+                "  Hint: OCR_API_KEY is only needed for non-loopback endpoints (or set --api-key-env to another variable)."
+            );
+        }
+    }
     Ok(())
 }
 

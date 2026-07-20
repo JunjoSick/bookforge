@@ -31,6 +31,7 @@ pub struct ConversionReport {
     pub tables: usize,
     pub equations: usize,
     pub low_confidence_pages: usize,
+    pub ocr_pages: usize,
     pub page_stats: Vec<PageStats>,
     pub warnings: Vec<String>,
 }
@@ -100,6 +101,10 @@ impl ConversionReport {
             tables: metrics.tables,
             equations: metrics.equations,
             low_confidence_pages: page_stats.iter().filter(|page| page.low_confidence).count(),
+            ocr_pages: page_stats
+                .iter()
+                .filter(|page| page.low_confidence_action.as_deref() == Some("ocr"))
+                .count(),
             page_stats,
             warnings,
         }
@@ -107,7 +112,7 @@ impl ConversionReport {
 
     pub fn summary(&self) -> String {
         let mut out = format!(
-            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nImages: {} extracted, {} figure block(s)\nTables: {} crop(s)\nEquations: {} crop(s)\nLow-confidence pages: {}\nText coverage vs pdftotext: {:.1}% ({} reconstructed + {} preserved as images / {} baseline characters)\n",
+            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nImages: {} extracted, {} figure block(s)\nTables: {} crop(s)\nEquations: {} crop(s)\nLow-confidence pages: {}\nOCR-recovered pages: {}\nText coverage vs pdftotext: {:.1}% ({} reconstructed + {} preserved as images / {} baseline characters)\n",
             self.pages,
             self.blocks,
             self.two_column_pages,
@@ -116,6 +121,7 @@ impl ConversionReport {
             self.tables,
             self.equations,
             self.low_confidence_pages,
+            self.ocr_pages,
             self.coverage_percent,
             self.reconstructed_chars,
             self.media_preserved_chars,
@@ -273,6 +279,37 @@ mod tests {
                     && warning.contains("action=preserve"))
         );
         assert!(report.summary().contains("Low-confidence pages: 1"));
+    }
+
+    #[test]
+    fn ocr_recovered_pages_are_counted_and_summarized() {
+        let report = ConversionReport::build(
+            "in.pdf",
+            "out.epub",
+            vec![PageStats {
+                page: 4,
+                lines: 1,
+                chars: 4,
+                baseline_chars: 100,
+                two_column: false,
+                low_confidence: true,
+                low_confidence_action: Some("ocr".to_string()),
+            }],
+            ReportMetrics {
+                blocks: 1,
+                reconstructed_chars: 4,
+                media_preserved_chars: 0,
+                baseline_chars: 100,
+                images: 0,
+                figures: 0,
+                tables: 0,
+                equations: 0,
+                layout_warnings: Vec::new(),
+            },
+        );
+
+        assert_eq!(report.ocr_pages, 1);
+        assert!(report.summary().contains("OCR-recovered pages: 1"));
     }
 
     #[test]

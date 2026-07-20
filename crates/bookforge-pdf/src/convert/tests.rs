@@ -860,7 +860,7 @@ exit 9
         pdftoppm: Some(pdftoppm),
     };
 
-    let result = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools);
+    let result = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None);
 
     assert!(result.is_err());
     assert!(
@@ -903,7 +903,7 @@ XML
         pdftoppm: None,
     };
 
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
         .expect("conversion should succeed without optional image tools");
 
     assert!(output.exists());
@@ -974,7 +974,7 @@ printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
         pdfimages: Some(pdfimages),
         pdftoppm: Some(pdftoppm),
     };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
         .expect("conversion should succeed");
 
     assert_eq!(outcome.report.images, 1);
@@ -1039,7 +1039,7 @@ fn convert_pdf_snaps_figure_crop_above_caption_boundary_fixture() {
         pdfimages: Some(pdfimages),
         pdftoppm: Some(pdftoppm),
     };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
         .expect("conversion should succeed");
 
     assert_eq!(outcome.report.images, 2);
@@ -1108,7 +1108,7 @@ fn convert_pdf_groups_multipanel_figure_fixture_as_one_captioned_crop() {
         pdfimages: Some(pdfimages),
         pdftoppm: Some(pdftoppm),
     };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
         .expect("conversion should succeed");
 
     assert_eq!(outcome.report.images, 2);
@@ -1164,7 +1164,7 @@ fn convert_pdf_preserves_vector_chart_fixture_as_captioned_crop() {
         pdfimages: Some(pdfimages),
         pdftoppm: Some(pdftoppm),
     };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
         .expect("conversion should succeed");
 
     assert_eq!(outcome.report.images, 0);
@@ -1238,7 +1238,7 @@ printf 'This paragraph\ncontinues after the figure.\n'
         pdfimages: Some(pdfimages),
         pdftoppm: Some(pdftoppm),
     };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
         .expect("conversion should succeed");
 
     assert!(
@@ -1308,7 +1308,7 @@ printf 'Body before table.\nTable 1. Scores.\nMetric 2019 2020\nA 0.91 0.93\nB 0
         pdfimages: Some(pdfimages),
         pdftoppm: Some(pdftoppm),
     };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
         .expect("conversion should succeed");
 
     assert_eq!(outcome.report.tables, 1);
@@ -1403,7 +1403,7 @@ printf 'Body before equation.\nE = mc^2\nBody after equation.\n'
         pdfimages: Some(pdfimages),
         pdftoppm: Some(pdftoppm),
     };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
         .expect("conversion should succeed");
 
     assert_eq!(outcome.report.tables, 0);
@@ -1477,7 +1477,7 @@ printf 'The energy term E = mc^2 appears inline.\n'
         pdfimages: Some(pdfimages),
         pdftoppm: Some(pdftoppm),
     };
-    convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+    convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
         .expect("conversion should succeed");
 
     let book = bookforge_epub::read_epub(&output).expect("converted EPUB should be readable");
@@ -1522,7 +1522,7 @@ fn convert_pdf_does_not_crop_model_parameter_prose_as_equation() {
         pdfimages: Some(pdfimages),
         pdftoppm: Some(pdftoppm),
     };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
         .expect("conversion should succeed");
 
     assert_eq!(outcome.report.tables, 0);
@@ -1586,7 +1586,7 @@ printf 'Tiny plus many baseline characters that the XML reconstruction did not r
         pdfimages: Some(pdfimages),
         pdftoppm: Some(pdftoppm),
     };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools)
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
         .expect("conversion should succeed");
 
     assert_eq!(outcome.report.low_confidence_pages, 1);
@@ -1666,7 +1666,7 @@ printf 'Tiny plus many baseline characters that the XML reconstruction did not r
         low_confidence: LowConfidenceMode::Preserve,
         ..ConvertOptions::default()
     };
-    let outcome = convert_pdf_with_tools(&input, &output, &options, &tools)
+    let outcome = convert_pdf_with_tools(&input, &output, &options, &tools, None)
         .expect("conversion should succeed");
 
     assert_eq!(outcome.report.low_confidence_pages, 1);

@@ -10,15 +10,17 @@
 pub mod convert;
 pub mod epub;
 pub mod model;
+pub mod ocr;
 pub mod parse;
 pub mod reconstruct;
 pub mod report;
 pub mod tools;
 
-pub use convert::{ConvertOptions, ConvertOutcome, convert_pdf};
+pub use convert::{ConvertOptions, ConvertOutcome, convert_pdf, convert_pdf_with_ocr};
 pub use model::{
     ColumnMode, DocBlock, ImageAsset, ImageRegion, Line, LowConfidenceMode, Page, Span,
 };
+pub use ocr::{HttpOcrClient, OcrConfig, OcrDialect, OcrEngine, OcrError};
 pub use parse::parse_pdf2xml;
 pub use reconstruct::reconstruct;
 pub use report::ConversionReport;
@@ -40,6 +42,9 @@ pub enum PdfError {
 
     #[error("zip: {0}")]
     Zip(#[from] zip::result::ZipError),
+
+    #[error("OCR: {0}")]
+    Ocr(#[from] ocr::OcrError),
 }
 
 pub type Result<T> = std::result::Result<T, PdfError>;
