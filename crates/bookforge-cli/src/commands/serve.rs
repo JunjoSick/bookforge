@@ -70,10 +70,10 @@ const AUDIO_PROVIDER_KEY_ENVS: &[(&str, &str)] = &[
 const AUDIO_OPENAI_MODELS: &[&str] = &["gpt-4o-mini-tts", "tts-1", "tts-1-hd"];
 const AUDIO_GEMINI_MODELS: &[&str] = &["gemini-3.1-flash-tts-preview"];
 const AUDIO_ELEVENLABS_MODELS: &[&str] = &[
-    "eleven_multilingual_v2",
     "eleven_v3",
     "eleven_flash_v2_5",
     "eleven_turbo_v2_5",
+    "eleven_multilingual_v2",
 ];
 const AUDIO_MOCK_MODELS: &[&str] = &["mock-silence"];
 
@@ -1184,6 +1184,11 @@ async fn launch_audiobook(
     }
     if provider == "gemini" && (speed - 1.0).abs() > f32::EPSILON {
         return Ok(bad_request("Gemini does not expose playback-speed control"));
+    }
+    if provider == "elevenlabs" && model == "eleven_v3" && (speed - 1.0).abs() > f32::EPSILON {
+        return Ok(bad_request(
+            "eleven_v3 does not support speed control; use speed 1.0",
+        ));
     }
     let instructions = field_value(&fields, "instructions");
     if provider == "elevenlabs" && instructions.is_some() {
@@ -2619,6 +2624,8 @@ mod tests {
             .expect("ElevenLabs provider option should exist");
         assert!(elevenlabs.requires_voice);
         assert!(!elevenlabs.supports_instructions);
+        assert_eq!(elevenlabs.models.first(), Some(&"eleven_v3"));
+        assert_eq!(elevenlabs.default_model, "eleven_multilingual_v2");
         assert_eq!(elevenlabs.max_chars, 10_000);
         assert_eq!(audio_provider_max_chars("openai", "anything"), 4_096);
         assert_eq!(audio_provider_max_chars("elevenlabs", "eleven_v3"), 5_000);

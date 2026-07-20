@@ -8,6 +8,13 @@
 - ElevenLabs audiobook requests now enforce each model's documented character
   limit consistently in the CLI, dashboard, server, and provider layer: 40,000
   for Flash/Turbo v2.5, 10,000 for Multilingual v2, and 5,000 for Eleven v3.
+- ElevenLabs live audiobook runs now auto-select the first available compatible
+  model in the preference order Eleven v3, Flash v2.5, Turbo v2.5, then
+  Multilingual v2, with a warning and Multilingual v2 fallback if preflight
+  fails. Explicit models still bypass preflight, and dry runs stay offline.
+- ElevenLabs requests now omit `voice_settings` at the default speed, reject
+  speed changes with Eleven v3, and list dashboard models in preference order
+  while retaining Multilingual v2 as the dashboard default.
 
 ## v2.5.1 - 2026-07-16
 

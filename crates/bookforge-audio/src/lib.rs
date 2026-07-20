@@ -27,9 +27,10 @@ pub use builder::{
 };
 pub use cleanup::{StaleChunk, find_stale_chunks, remove_stale_chunks};
 pub use provider::{
-    AudioClip, AudioFormat, ELEVENLABS_MAX_INPUT_CHARS, ElevenLabsTtsConfig, ElevenLabsTtsProvider,
-    GeminiTtsConfig, GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider,
-    SpeechRequest, TtsError, TtsProvider, elevenlabs_model_max_input_chars,
+    AudioClip, AudioFormat, ELEVENLABS_MAX_INPUT_CHARS, ELEVENLABS_PREFERRED_MODELS,
+    ElevenLabsTtsConfig, ElevenLabsTtsProvider, GeminiTtsConfig, GeminiTtsProvider,
+    MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider, SpeechRequest, TtsError, TtsProvider,
+    elevenlabs_model_max_input_chars, resolve_preferred_elevenlabs_model,
 };
 pub use stitch::{StitchOptions, StitchReport, ffmpeg_available, stitch};
 pub use text::{Chapter, chapters_from_book, chunk_text};

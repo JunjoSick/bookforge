@@ -78,8 +78,13 @@ removed without deleting anything. Stitched per-chapter outputs, the assembled
 
 - **`elevenlabs`** - ElevenLabs' native text-to-speech API, authenticated with
   `ELEVENLABS_API_KEY` by default. Pass an ElevenLabs voice ID with `--voice`;
-  voice names are not interchangeable with IDs. The default model is
-  `eleven_multilingual_v2`. Supported outputs are MP3, Opus, WAV, and PCM.
+  voice names are not interchangeable with IDs. When `--model` is omitted on
+  a live run, BookForge checks the account's available TTS models and selects
+  the first compatible model in this order: `eleven_v3`,
+  `eleven_flash_v2_5`, `eleven_turbo_v2_5`, then
+  `eleven_multilingual_v2`. An explicit `--model` bypasses auto-selection. A
+  dry run stays offline and reports the static `eleven_multilingual_v2`
+  default instead. Supported outputs are MP3, Opus, WAV, and PCM.
 
   ```bash
   bookforge audiobook book.epub --provider elevenlabs \
@@ -89,8 +94,9 @@ removed without deleting anything. Stitched per-chapter outputs, the assembled
 
   ElevenLabs does not expose a free-form instructions field on this endpoint.
   Configure the selected voice in ElevenLabs, use `--speed`, or place
-  model-supported audio tags directly in the source text. BookForge enforces
-  the selected model's per-request character limit.
+  model-supported audio tags directly in the source text. `eleven_v3` does not
+  support speed control on the TTS endpoint, so it requires `--speed 1.0`.
+  BookForge enforces the selected model's per-request character limit.
 
 - **`mock`** — a deterministic, offline provider that emits valid silent WAV
   clips scaled to the text length. Its format is always `wav`; BookForge uses
