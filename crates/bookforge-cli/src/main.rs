@@ -53,31 +53,55 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Convert a PDF into a translation-ready EPUB.
     Convert(convert::ConvertArgs),
+    /// Repair paragraph flow in an EPUB without translating it.
     Reflow(reflow::ReflowArgs),
+    /// Inspect EPUB structure and translatable text coverage.
     Inspect(inspect::InspectArgs),
+    /// Generate resumable audiobook files from an EPUB.
     Audiobook(audiobook::AudiobookArgs),
+    /// Estimate translation tokens and provider cost.
     Estimate(estimate::EstimateArgs),
+    /// Translate an EPUB and checkpoint every completed segment.
     Translate(Box<translate::TranslateArgs>),
+    /// Ask a running job to pause after its current safe boundary.
     Pause(control_commands::PauseArgs),
+    /// Change cache-safe settings for an active or resumable job.
     Reconfigure(reconfigure::ReconfigureArgs),
+    /// Continue an interrupted, paused, stopped, or incomplete job.
     Resume(resume::ResumeArgs),
+    /// Ask a running job to stop after its current safe boundary.
     Stop(control_commands::StopArgs),
+    /// Replace a checkpointed segment with a validated human correction.
     Correct(correct::CorrectArgs),
+    /// Generate a side-by-side HTML review for a translation job.
     Review(review::ReviewArgs),
+    /// Import flags exported from a review page.
     IngestFlags(ingest_flags::IngestFlagsArgs),
+    /// Manage terminology and glossary candidates.
     Glossary(glossary::GlossaryArgs),
+    /// Mark failed or review-needed segments for another attempt.
     Retry(retry::RetryArgs),
+    /// Validate an EPUB and optionally run EPUBCheck.
     Validate(validate::ValidateArgs),
+    /// Measure provider latency and throughput with synthetic requests.
     Benchmark(Box<translate::BenchmarkArgs>),
+    /// Check storage, provider, PDF, and OCR dependencies.
     Doctor(doctor::DoctorArgs),
+    /// Manage reusable named-entity guidance.
     Entities(entity::EntitiesArgs),
+    /// Show persisted state, progress, and performance for a job.
     Status(status::StatusArgs),
+    /// Manage reusable translation style guidance.
     Style(style::StyleArgs),
+    /// Print recent events from a job's durable event log.
     Tail(tail::TailArgs),
     #[cfg(feature = "tui")]
+    /// Monitor and control a job in a full-screen terminal UI.
     Watch(watch::WatchArgs),
     #[cfg(feature = "serve")]
+    /// Run the local browser dashboard.
     Serve(serve::ServeArgs),
 }
 
@@ -346,5 +370,21 @@ mod tests {
         let help = String::from_utf8(help).expect("help should be utf-8");
 
         assert!(help.contains("Run `bookforge` without a command"));
+    }
+
+    #[test]
+    fn every_top_level_command_has_help_text() {
+        let command = Cli::command();
+        let missing = command
+            .get_subcommands()
+            .filter(|subcommand| subcommand.get_about().is_none())
+            .map(|subcommand| subcommand.get_name().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "top-level commands without help text: {}",
+            missing.join(", ")
+        );
     }
 }

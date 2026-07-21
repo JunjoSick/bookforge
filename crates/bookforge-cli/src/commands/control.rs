@@ -4,11 +4,13 @@ use clap::Args;
 
 #[derive(Debug, Args)]
 pub struct PauseArgs {
+    /// Job to pause. The worker checkpoints completed work before parking.
     pub job_id: String,
 }
 
 #[derive(Debug, Args)]
 pub struct StopArgs {
+    /// Job to stop. Completed work remains resumable from its checkpoints.
     pub job_id: String,
 }
 

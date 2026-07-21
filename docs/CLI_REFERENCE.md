@@ -1,0 +1,303 @@
+# BookForge CLI guide
+
+This guide explains how the commands fit together. Run `bookforge <command>
+--help` for the complete, version-specific option list.
+
+Examples below assume that BookForge is installed. From a source checkout,
+replace `bookforge` with `cargo run -p bookforge-cli --`.
+
+## Before you run a command
+
+BookForge stores its job database and run artifacts under `.bookforge/` in the
+current working directory. Start later commands such as `status`, `resume`, and
+`review` from the same directory where you started the translation. This also
+means that two folders can have independent BookForge job libraries.
+
+Provider keys can be pasted into the local dashboard for that server session,
+or supplied to CLI commands through environment variables. See
+[PROVIDERS.md](PROVIDERS.md) for provider presets, endpoints, and key names.
+
+## Command map
+
+| Command | Purpose |
+| --- | --- |
+| `serve` | Run the local browser dashboard. Running `bookforge` with no command does the same thing and opens the browser. |
+| `inspect` | Report EPUB structure, metadata, and translatable text coverage. |
+| `estimate` | Estimate input/output tokens and price before a hosted-provider run. |
+| `translate` | Start a checkpointed EPUB translation. |
+| `watch` | Monitor and control a job in a full-screen terminal UI. |
+| `status` | Print persisted progress, settings, token use, artifacts, and performance. |
+| `tail` | Print recent durable job events, optionally as JSON. |
+| `pause` | Park a running worker at the next safe boundary. |
+| `stop` | Ask a running worker to checkpoint and exit at the next safe boundary. |
+| `reconfigure` | Change cache-safe scheduling and quality settings for remaining work. |
+| `resume` | Continue a paused, stopped, interrupted, or incomplete job. |
+| `retry` | Mark failed or review-needed segments as `retry_pending`. |
+| `review` | Generate a private, side-by-side HTML review page. |
+| `ingest-flags` | Import flags exported by the static review page. |
+| `correct` | Save a validated human correction and rebuild the output EPUB. |
+| `validate` | Run BookForge structural checks and EPUBCheck when available. |
+| `convert` | Convert a PDF into a translation-ready EPUB. |
+| `reflow` | Repair paragraph flow in an EPUB without translating it. |
+| `glossary` | Manage terminology and extract book-specific candidates. |
+| `style` | Manage reusable translation-style guidance. |
+| `entities` | Manage names, target forms, gender, and role guidance. |
+| `doctor` | Check storage, provider access, PDF tools, or an OCR endpoint. |
+| `benchmark` | Measure provider latency and throughput with synthetic requests. |
+| `audiobook` | Generate resumable audio chunks and optional stitched audio from an EPUB. |
+
+## A complete translation workflow
+
+Inspect the source before spending provider tokens. The coverage report calls
+out visible text that BookForge would not send for translation.
+
+```bash
+bookforge inspect book.epub
+```
+
+Test storage and provider access, then estimate the run:
+
+```bash
+bookforge doctor --storage
+bookforge doctor --provider openrouter --model google/gemini-2.5-flash-lite
+bookforge estimate book.epub \
+  --source English \
+  --target Italian \
+  --provider openrouter \
+  --model google/gemini-2.5-flash-lite
+```
+
+Start the translation. Presets bundle a provider, model, endpoint, and suitable
+defaults; explicit provider flags remain available when you need them.
+
+```bash
+bookforge translate book.epub \
+  --source English \
+  --target Italian \
+  --provider-preset open-router-paid-fast \
+  --concurrency 4 \
+  --validate-output \
+  --out book.it.epub
+```
+
+The command prints a job ID. Keep it: every lifecycle, monitoring, review, and
+recovery command uses that stable ID.
+
+```bash
+bookforge status <job-id>
+bookforge watch <job-id>
+bookforge tail <job-id> --last 40
+```
+
+After translation, review and validate the output:
+
+```bash
+bookforge review <job-id> --open
+bookforge validate book.it.epub --report book.it.validation.json
+```
+
+The review HTML and JSON include the book's full source and translated text.
+Treat `.bookforge/runs/<job-id>/review/` as private data.
+
+## Job lifecycle and recovery
+
+Pause and stop are cooperative. An in-flight provider request or finalization
+step may finish before the worker reaches a safe boundary.
+
+```bash
+bookforge pause <job-id>
+bookforge resume <job-id>
+
+bookforge stop <job-id>
+bookforge resume <job-id>
+```
+
+`pause` parks the current worker. `stop` asks it to exit while preserving all
+completed checkpoints. `resume` first tries to wake a live worker and otherwise
+starts one replacement worker. Avoid `resume --force` unless a paused worker is
+known to be gone; forcing a second live worker can duplicate requests.
+
+`retry` changes segment state but does not itself run the provider. Mark the
+desired scope and then resume:
+
+```bash
+bookforge retry <job-id> --only failed
+bookforge retry <job-id> --only needs-review
+bookforge resume <job-id>
+```
+
+Completed compatible segments are loaded from checkpoints or cache rather than
+translated again. The input snapshot and run configuration recorded with the
+job protect resume behavior from later changes to the original input.
+
+For the persistence model and state transitions, see
+[CHECKPOINTING.md](CHECKPOINTING.md).
+
+## Change a run safely
+
+`reconfigure` applies only to work that has not crossed the relevant boundary.
+It never mutates an in-flight request or retranslates completed segments.
+
+```bash
+bookforge reconfigure <job-id> \
+  --concurrency 2 \
+  --batch-target-tokens 2400 \
+  --provider-max-attempts 4 \
+  --qa suspicious
+```
+
+Mutable settings include concurrency, batch item/token budgets, provider
+attempts, adaptive concurrency and batch sizing, QA, double-check mode, and
+output validation. Provider, model, language, prompt, context, glossary, style,
+entity, profile, and segmentation changes are rejected because they would make
+existing checkpoints incompatible. Start a new job for those changes.
+
+The command records a revisioned override file under the job's run directory.
+`status` shows active overrides and the worker reports when it applies them.
+
+## Review, flag, and correct
+
+The static review page can export `flags.json`. Importing the file persists the
+flags; wrong-translation flags mark segments as needing review, while accepted
+name guidance can seed the glossary.
+
+```bash
+bookforge review <job-id> --open
+bookforge ingest-flags <job-id> --flags flags.json
+bookforge retry <job-id> --only needs-review
+bookforge resume <job-id>
+```
+
+For a one-block segment, apply an exact human correction directly:
+
+```bash
+bookforge correct <job-id> --segment <segment-id> --text "Corrected translation"
+```
+
+Use a file for long text. A multi-block segment requires JSON containing every
+block in that segment:
+
+```json
+{
+  "blocks": [
+    {"block_id": "block-1", "text": "First corrected block."},
+    {"block_id": "block-2", "text": "Second corrected block."}
+  ]
+}
+```
+
+```bash
+bookforge correct <job-id> --segment <segment-id> --from-file correction.json
+```
+
+BookForge validates marker constraints, stages and validates a rebuilt EPUB,
+then persists the correction and atomically replaces the output. Saved human
+corrections are protected from later cache, QA, and model overwrites.
+
+## Bilingual output
+
+Translation and output layout are separate. `replace` writes only the target
+text; the append modes retain the source and add the target text.
+
+```bash
+bookforge translate book.epub \
+  --target Italian \
+  --provider-preset open-router-paid-fast \
+  --mode append-block \
+  --bilingual-style minimal \
+  --out book.bilingual.epub
+```
+
+Available modes are `replace`, `append-text`, and `append-block`. Because mode
+is a rebuild concern, compatible translations can be reused when you switch
+between them.
+
+## PDF ingestion and EPUB reflow
+
+PDF conversion requires Poppler. Check the dependency before a large run:
+
+```bash
+bookforge doctor --pdf
+bookforge convert paper.pdf --out paper.epub
+bookforge inspect paper.epub
+```
+
+Review the conversion report before translating. It records text coverage,
+layout decisions, preserved media, and low-confidence pages. See
+[EPUB_PIPELINE.md](EPUB_PIPELINE.md) for pipeline details.
+
+`reflow` is an explicit preprocessing command for broken paragraph flow; normal
+EPUB reading does not silently rewrite the source.
+
+```bash
+bookforge reflow source.epub --output source.reflowed.epub --dry-run
+bookforge reflow source.epub --output source.reflowed.epub
+```
+
+Use `--aggressive` only after reviewing the dry-run report. Use `--pdf-cleanup`
+for EPUBs produced from PDF HTML where page furniture remains.
+
+## Glossaries, styles, and entities
+
+These three stores provide reusable guidance at global, series, or book scope:
+
+- `glossary` maps source terms to required target terms.
+- `style` describes register, voice, and unwanted tendencies.
+- `entities` records names, target forms, gender, and narrative roles.
+
+Inspect nested command help before editing a store:
+
+```bash
+bookforge glossary --help
+bookforge style --help
+bookforge entities --help
+```
+
+You can also pass TOML files directly to `translate` with repeatable
+`--glossary`, `--style`, and `--entities` flags. Stored scoped guidance is
+selected with `--book-id` and `--series-id`. Files and stored guidance are
+fingerprinted into the job configuration so incompatible cache entries are not
+reused.
+
+## Validation, diagnostics, and machine-readable progress
+
+BookForge always applies its deterministic translation validators. `validate`
+checks a completed EPUB and uses EPUBCheck when it can find it:
+
+```bash
+bookforge validate output.epub
+bookforge validate output.epub --strict-epubcheck
+```
+
+Set `BOOKFORGE_EPUBCHECK` to an EPUBCheck executable, its directory, or an
+`epubcheck.jar` when automatic discovery is insufficient. Without EPUBCheck,
+the report records `unavailable`; BookForge's own checks still run.
+
+For automation, select JSON progress and a durable event file:
+
+```bash
+bookforge translate book.epub \
+  --target Italian \
+  --provider mock \
+  --model mock-prefix-target \
+  --ui json \
+  --progress-jsonl .bookforge/runs/example/events.jsonl
+```
+
+Use `tail <job-id> --json` for persisted event objects after launch. See
+[events.md](events.md) for the event schema and folding rules.
+
+## Audiobooks
+
+Audiobook generation is independent of translation; its input can be a source
+or translated EPUB. A dry run shows chapter and chunk counts without calling a
+provider:
+
+```bash
+bookforge audiobook book.epub --provider mock --dry-run
+bookforge audiobook book.epub --voice alloy --format mp3 --stitch
+```
+
+See [audiobooks.md](audiobooks.md) for providers, formats, resume hashing,
+pruning, ffmpeg stitching, and M4B assembly.
+
