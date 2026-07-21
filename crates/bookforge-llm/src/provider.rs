@@ -152,6 +152,7 @@ impl LlmProvider for MockProvider {
         if let Some(delay_ms) = mock_delay_ms(template) {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
+        await_mock_release_gate().await;
 
         if self.mode == MockMode::MalformedJson {
             return Ok(CompletionResponse {
@@ -397,6 +398,35 @@ fn transform_text(mode: MockMode, target_language: &str, source: &str) -> String
         MockMode::PrefixTarget => format!("[{target_language}] {source}"),
         MockMode::Uppercase => source.to_uppercase(),
         MockMode::MalformedJson => unreachable!("handled above"),
+    }
+}
+
+/// Park every mock request until the file named by `BOOKFORGE_MOCK_RELEASE_FILE`
+/// exists.
+///
+/// `BOOKFORGE_MOCK_DELAY_MS` only widens a timing window; a lifecycle test that
+/// needs a provider request to still be in flight while it drives a control-file
+/// transition has to guess how much of that window the machine will eat, which
+/// makes it flaky under parallel load. This gate turns the window into a
+/// handshake: the run emits `RequestStarted`, blocks here, and the test releases
+/// it once it has observed the state it wanted to set up. The elapsed bound only
+/// exists so a test that panics before writing the release file cannot leave an
+/// immortal child process behind.
+async fn await_mock_release_gate() {
+    let Ok(path) = std::env::var("BOOKFORGE_MOCK_RELEASE_FILE") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            warn!(
+                path = %path.display(),
+                "mock release gate timed out; continuing without release"
+            );
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
     }
 }
 

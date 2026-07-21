@@ -598,20 +598,20 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
 
     let fallback_tui_output = args.ui == UiMode::Tui && !use_tui;
     let stitch_report = if postprocess {
-        Some(stitch_output(
-            &report.manifest_path,
-            &out_dir,
+        Some(stitch_output(StitchRequest {
+            manifest_path: &report.manifest_path,
+            out_dir: &out_dir,
+            book: &book,
             format,
             make_m4b,
-            args.m4b,
-            args.single,
-            args.gap_chapter_ms,
-            args.gap_title_ms,
-            args.gap_paragraph_ms,
-            args.loudnorm,
-            &book,
-            human_output || fallback_tui_output,
-        )?)
+            require_m4b: args.m4b,
+            make_single: args.single,
+            gap_chapter_ms: args.gap_chapter_ms,
+            gap_title_ms: args.gap_title_ms,
+            gap_paragraph_ms: args.gap_paragraph_ms,
+            loudnorm: args.loudnorm,
+            human_output: human_output || fallback_tui_output,
+        })?)
     } else {
         None
     };
@@ -1102,9 +1102,16 @@ async fn synthesize(
     Ok(report)
 }
 
-fn stitch_output(
-    manifest_path: &std::path::Path,
-    out_dir: &std::path::Path,
+/// Inputs for [`stitch_output`], named at the call site.
+///
+/// Four of these are bools, and two of them differ only in intent:
+/// `make_m4b` means "assemble an m4b if ffmpeg can", while `require_m4b` means
+/// "the user asked for one, so failing to build it is an error". As positional
+/// arguments they sat next to each other and were easy to transpose.
+struct StitchRequest<'a> {
+    manifest_path: &'a std::path::Path,
+    out_dir: &'a std::path::Path,
+    book: &'a bookforge_core::ir::Book,
     format: AudioFormat,
     make_m4b: bool,
     require_m4b: bool,
@@ -1113,9 +1120,25 @@ fn stitch_output(
     gap_title_ms: u32,
     gap_paragraph_ms: u32,
     loudnorm: bool,
-    book: &bookforge_core::ir::Book,
     human_output: bool,
-) -> Result<bookforge_audio::StitchReport> {
+}
+
+fn stitch_output(request: StitchRequest<'_>) -> Result<bookforge_audio::StitchReport> {
+    let StitchRequest {
+        manifest_path,
+        out_dir,
+        book,
+        format,
+        make_m4b,
+        require_m4b,
+        make_single,
+        gap_chapter_ms,
+        gap_title_ms,
+        gap_paragraph_ms,
+        loudnorm,
+        human_output,
+    } = request;
+
     let manifest_json = std::fs::read_to_string(manifest_path)
         .with_context(|| format!("failed to read manifest {}", manifest_path.display()))?;
     let manifest: bookforge_audio::AudiobookManifest =

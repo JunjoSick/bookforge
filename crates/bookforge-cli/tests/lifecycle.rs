@@ -1753,9 +1753,13 @@ fn cli_pause_and_resume_live_mock_run() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let events = temp.path().join("events.jsonl");
     let output = temp.path().join("out.epub");
-    let mut child = spawn_controlled_mock_translate(&temp, &events, &output);
+    // The mock parks every request until `release` exists, so the pause below
+    // lands at an observed point — one request started, none able to finish —
+    // instead of racing the mock's fixed delay against machine load.
+    let release = temp.path().join("mock-release");
+    let mut child = spawn_gated_mock_translate(&temp, &events, &output, &release);
     let job_id = wait_for_job_id_in_store(&temp);
-    thread::sleep(Duration::from_millis(50));
+    wait_for_first_batch_request(&events);
     let control_path = temp
         .path()
         .join(".bookforge/runs")
@@ -1771,31 +1775,32 @@ fn cli_pause_and_resume_live_mock_run() {
     assert_eq!(
         batch_request_started_count(&paused_events),
         1,
-        "batch pause should not start another provider request after first completion"
+        "batch pause should not start another provider request while one is in flight"
     );
-    // A provider request already in flight when the pause landed may still
-    // record its segment after JobPaused is emitted — an in-flight request
-    // cannot be un-sent. Let the run settle, then assert the invariant that
-    // actually matters: while parked it starts no *new* provider request and
-    // dispatches no further work. Because no new request starts, no segment
-    // beyond the single in-flight batch can finish.
-    let settle_deadline = Instant::now() + Duration::from_secs(3);
-    let mut settled = segment_finished_ids(&read_jsonl(&events));
-    loop {
-        thread::sleep(Duration::from_millis(150));
-        let next = segment_finished_ids(&read_jsonl(&events));
-        let stable = next.len() == settled.len();
-        settled = next;
-        if stable || Instant::now() >= settle_deadline {
-            break;
-        }
-    }
+    // Guards the setup itself: if the gate ever stops holding the request, this
+    // fails loudly instead of quietly turning the assertions above back into a
+    // race against the mock delay.
     assert_eq!(
-        batch_request_started_count(&read_jsonl(&events)),
+        batch_request_finished_count(&paused_events),
+        0,
+        "gated mock should still hold the first request in flight when the pause lands"
+    );
+
+    // The pause is acknowledged, so release the gated request. A request already
+    // in flight when the pause landed may still record its segment after
+    // JobPaused is emitted — an in-flight request cannot be un-sent — but once
+    // it settles the dispatch loop must park rather than start a new one.
+    // `RequestFinished` is emitted after the worker is joined and the control
+    // boundary re-polled, which makes it the point where a second request would
+    // have been dispatched had the pause not taken effect.
+    fs::write(&release, "release").expect("mock release file should write");
+    let settled = wait_for_events(&events, |events| batch_request_finished_count(events) >= 1);
+    assert_eq!(
+        batch_request_started_count(&settled),
         1,
         "paused batch run should not start another provider request while parked"
     );
-    assert_no_duplicate_segments(&settled);
+    assert_no_duplicate_segments(&segment_finished_ids(&settled));
     wait_for_job_status(&temp, &job_id, "paused");
 
     bookforge()
@@ -1813,6 +1818,38 @@ fn cli_pause_and_resume_live_mock_run() {
     );
     assert_no_duplicate_segments(&segment_finished_ids(&final_events));
     assert!(output.exists(), "resumed live run should write output");
+}
+
+/// A parked run must still honour a stop.
+///
+/// Pause deliberately has no timeout — a paused job waits indefinitely, which is
+/// the feature — so `stop` is the only in-band way to terminate one. If that
+/// transition ever regresses, a paused job becomes unkillable except by
+/// `TerminateProcess`, and every abandoned pause turns into a permanent orphan.
+#[test]
+fn cli_stop_terminates_a_parked_paused_run() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let events = temp.path().join("paused-stop-events.jsonl");
+    let output = temp.path().join("paused-stop.epub");
+    let release = temp.path().join("mock-release");
+    let mut child = spawn_gated_mock_translate(&temp, &events, &output, &release);
+    let job_id = wait_for_job_id_in_store(&temp);
+    wait_for_first_batch_request(&events);
+    let control_path = control_path(&temp, &job_id);
+    write_control_file(&control_path, ControlCommand::Pause).expect("pause control should write");
+    wait_for_job_status(&temp, &job_id, "paused");
+    wait_for_event_count(&events, "JobPaused", 1);
+
+    // Let the gated request settle so the run is parked in the paused dispatch
+    // loop with no work in flight — the state an abandoned pause leaves behind.
+    fs::write(&release, "release").expect("mock release file should write");
+    wait_for_events(&events, |events| batch_request_finished_count(events) >= 1);
+
+    write_control_file(&control_path, ControlCommand::Stop).expect("stop control should write");
+    let status = wait_for_child_exit(&mut child, Duration::from_secs(30))
+        .expect("paused run should exit after a stop control; it stayed parked instead");
+    assert!(status.success(), "stopped translate child failed: {status}");
+    wait_for_job_status(&temp, &job_id, "stopped");
 }
 
 #[test]
@@ -2144,7 +2181,8 @@ fn cli_stop_then_resume_mock_run() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let events = temp.path().join("events.jsonl");
     let output = temp.path().join("out.epub");
-    let mut child = spawn_controlled_mock_translate(&temp, &events, &output);
+    let release = temp.path().join("mock-release");
+    let mut child = spawn_gated_mock_translate(&temp, &events, &output, &release);
     let job_id = wait_for_job_id_in_store(&temp);
     let control_path = temp
         .path()
@@ -2155,8 +2193,15 @@ fn cli_stop_then_resume_mock_run() {
     // former fixed 50 ms sleep could fire before dispatch on a fast machine,
     // leaving no completed request to checkpoint. Stop still lets that
     // in-flight mock request finish while preventing the next dispatch.
-    wait_for_events(&events, |events| batch_request_started_count(events) == 1);
+    //
+    // The gate is what makes "in flight" hold still: waiting on RequestStarted
+    // alone leaves a window where request 1 finishes and request 2 dispatches
+    // before the stop lands, which breaks the one-request assertion below.
+    // Parking request 1 until the stop is written closes that window, and the
+    // release then lets it finish so there is a checkpointed segment to resume.
+    wait_for_first_batch_request(&events);
     write_control_file(&control_path, ControlCommand::Stop).expect("stop control should write");
+    fs::write(&release, "release").expect("mock release file should write");
 
     let status = child.wait().expect("translate child should exit");
     assert!(status.success(), "translate child failed: {status}");
@@ -3045,7 +3090,64 @@ fn translate_quiet_input(temp: &TempDir, input: &Path, model: &str) -> Translate
     }
 }
 
-fn spawn_controlled_mock_translate(temp: &TempDir, events: &Path, output: &Path) -> process::Child {
+/// A spawned CLI child that is killed if the test unwinds before reaping it.
+///
+/// Pause has no timeout — a paused job waits indefinitely, which is the feature
+/// — so a test that panics between "pause" and "resume/stop" leaves a parked
+/// `bookforge` process behind for as long as the machine stays up. This guard
+/// only cleans up after a *failing* test. It deliberately does not stand in for
+/// the product behaviour: that a parked run can still be terminated in-band is
+/// asserted by `cli_stop_terminates_a_parked_paused_run`, so a regression there
+/// fails loudly instead of being quietly reaped from outside.
+struct ChildGuard(process::Child);
+
+impl std::ops::Deref for ChildGuard {
+    type Target = process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn spawn_controlled_mock_translate(temp: &TempDir, events: &Path, output: &Path) -> ChildGuard {
+    spawn_controlled_mock_translate_inner(temp, events, output, None)
+}
+
+/// The same run as [`spawn_controlled_mock_translate`], except every mock
+/// provider request parks until `release` exists. Tests that must drive a
+/// control-file transition while a request is in flight use this instead of
+/// racing `BOOKFORGE_MOCK_DELAY_MS`: they wait for `RequestStarted`, do their
+/// setup, then create `release` to let the request finish.
+fn spawn_gated_mock_translate(
+    temp: &TempDir,
+    events: &Path,
+    output: &Path,
+    release: &Path,
+) -> ChildGuard {
+    spawn_controlled_mock_translate_inner(temp, events, output, Some(release))
+}
+
+fn spawn_controlled_mock_translate_inner(
+    temp: &TempDir,
+    events: &Path,
+    output: &Path,
+    release: Option<&Path>,
+) -> ChildGuard {
     let input = fixture_input();
     let mut cmd = process::Command::new(assert_cmd::cargo::cargo_bin("bookforge"));
     cmd.current_dir(temp.path())
@@ -3076,14 +3178,17 @@ fn spawn_controlled_mock_translate(temp: &TempDir, events: &Path, output: &Path)
             "--out",
             output.to_str().unwrap(),
         ]);
-    cmd.spawn().expect("controlled translate should spawn")
+    if let Some(release) = release {
+        cmd.env("BOOKFORGE_MOCK_RELEASE_FILE", release);
+    }
+    ChildGuard(cmd.spawn().expect("controlled translate should spawn"))
 }
 
 fn spawn_controlled_single_mock_translate(
     temp: &TempDir,
     events: &Path,
     output: &Path,
-) -> process::Child {
+) -> ChildGuard {
     let input = fixture_input();
     let mut cmd = process::Command::new(assert_cmd::cargo::cargo_bin("bookforge"));
     cmd.current_dir(temp.path())
@@ -3112,15 +3217,17 @@ fn spawn_controlled_single_mock_translate(
             "--out",
             output.to_str().unwrap(),
         ]);
-    cmd.spawn()
-        .expect("controlled single-segment translate should spawn")
+    ChildGuard(
+        cmd.spawn()
+            .expect("controlled single-segment translate should spawn"),
+    )
 }
 
 fn spawn_finalize_controlled_mock_translate(
     temp: &TempDir,
     events: &Path,
     output: &Path,
-) -> process::Child {
+) -> ChildGuard {
     spawn_finalize_stage_delay_mock_translate(
         temp,
         events,
@@ -3137,7 +3244,7 @@ fn spawn_finalize_stage_delay_mock_translate(
     events: &Path,
     output: &Path,
     envs: &[(&str, &str)],
-) -> process::Child {
+) -> ChildGuard {
     let input = fixture_input();
     let mut cmd = process::Command::new(assert_cmd::cargo::cargo_bin("bookforge"));
     cmd.current_dir(temp.path())
@@ -3184,15 +3291,17 @@ fn spawn_finalize_stage_delay_mock_translate(
     for (name, value) in envs {
         cmd.env(name, value);
     }
-    cmd.spawn()
-        .expect("finalize-controlled translate should spawn")
+    ChildGuard(
+        cmd.spawn()
+            .expect("finalize-controlled translate should spawn"),
+    )
 }
 
 fn spawn_finalize_fallback_mock_translate(
     temp: &TempDir,
     events: &Path,
     output: &Path,
-) -> process::Child {
+) -> ChildGuard {
     let input = fixture_input();
     let mut cmd = process::Command::new(assert_cmd::cargo::cargo_bin("bookforge"));
     cmd.current_dir(temp.path())
@@ -3229,8 +3338,10 @@ fn spawn_finalize_fallback_mock_translate(
             "--out",
             output.to_str().unwrap(),
         ]);
-    cmd.spawn()
-        .expect("finalize-fallback translate should spawn")
+    ChildGuard(
+        cmd.spawn()
+            .expect("finalize-fallback translate should spawn"),
+    )
 }
 
 fn sha256_file(path: &Path) -> String {
@@ -3325,9 +3436,30 @@ fn wait_for_request_finished_prefix(path: &Path, prefix: &str) -> Vec<serde_json
 
 fn wait_for_events(
     path: &Path,
+    ready: impl FnMut(&[serde_json::Value]) -> bool,
+) -> Vec<serde_json::Value> {
+    wait_for_events_within(path, Duration::from_secs(10), ready)
+}
+
+/// Wait for the first provider request of a run.
+///
+/// Unlike the warm-run waiters, this one spans the child's cold start: parsing
+/// and segmenting the fixture happens between the job row appearing in the store
+/// and the first `RequestStarted`, and a loaded machine can stretch that well
+/// past the ten-second budget. Match the process-startup headroom that
+/// [`wait_for_job_id_in_store`] already allows for the same reason.
+fn wait_for_first_batch_request(path: &Path) -> Vec<serde_json::Value> {
+    wait_for_events_within(path, Duration::from_secs(60), |events| {
+        batch_request_started_count(events) >= 1
+    })
+}
+
+fn wait_for_events_within(
+    path: &Path,
+    timeout: Duration,
     mut ready: impl FnMut(&[serde_json::Value]) -> bool,
 ) -> Vec<serde_json::Value> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + timeout;
     loop {
         if path.exists() {
             let events = read_jsonl_lenient(path);
@@ -3363,6 +3495,29 @@ fn wait_for_job_status(temp: &TempDir, job_id: &str, expected: &str) {
             "timed out waiting for job {job_id} status {expected}; actual={actual:?}"
         );
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Wait for `child` to exit, returning `None` if it outlives `timeout`.
+///
+/// On timeout the child is killed and reaped: a test asserting that a process
+/// exits must not leave that process running when the assertion fails, and a
+/// bounded wait keeps a regression from hanging the suite instead of failing it.
+fn wait_for_child_exit(
+    child: &mut process::Child,
+    timeout: Duration,
+) -> Option<process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().expect("child exit status should poll") {
+            Some(status) => return Some(status),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
     }
 }
 
@@ -3438,6 +3593,19 @@ fn batch_request_started_count(events: &[serde_json::Value]) -> usize {
         .filter(|event| {
             event
                 .get("RequestStarted")
+                .and_then(|payload| payload.get("batch_id"))
+                .and_then(|value| value.as_str())
+                .is_some()
+        })
+        .count()
+}
+
+fn batch_request_finished_count(events: &[serde_json::Value]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            event
+                .get("RequestFinished")
                 .and_then(|payload| payload.get("batch_id"))
                 .and_then(|value| value.as_str())
                 .is_some()
