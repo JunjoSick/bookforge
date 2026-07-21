@@ -21,11 +21,14 @@ use super::{
 
 #[derive(Debug, Args)]
 pub struct CorrectArgs {
+    /// Translation job containing the segment to correct.
     pub job_id: String,
 
+    /// Stable segment ID shown by the review page or job report.
     #[arg(long)]
     pub segment: String,
 
+    /// Replacement text for a segment that contains exactly one block.
     #[arg(
         long,
         conflicts_with = "from_file",
@@ -33,6 +36,7 @@ pub struct CorrectArgs {
     )]
     pub text: Option<String>,
 
+    /// Plain text, or a JSON correction document for a multi-block segment.
     #[arg(long, value_name = "PATH", conflicts_with = "text")]
     pub from_file: Option<PathBuf>,
 }
