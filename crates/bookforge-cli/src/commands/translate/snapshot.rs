@@ -134,16 +134,34 @@ struct InputSnapshot {
     sha256: String,
 }
 
+#[cfg(unix)]
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)
+}
+
 fn snapshot_input_epub(
     store: &JobStore,
     job: &JobRecord,
     input: &Path,
 ) -> anyhow::Result<InputSnapshot> {
     let run_dir = PathBuf::from(".bookforge/runs").join(&job.id);
-    fs::create_dir_all(&run_dir)?;
+    create_private_dir_all(&run_dir)?;
     let epub_path = run_dir.join("input.epub");
     let sha_path = run_dir.join("input.sha256");
 
+    // A hard link shares its mode with the source inode, so Unix must copy in
+    // order to make the private snapshot 0600 without modifying the input.
+    #[cfg(unix)]
+    let sha256 = copy_and_hash(input, &epub_path)?;
+    #[cfg(not(unix))]
     let sha256 = match fs::hard_link(input, &epub_path) {
         Ok(()) => sha256_file(&epub_path)?,
         Err(_) => copy_and_hash(input, &epub_path)?,
@@ -157,7 +175,7 @@ fn snapshot_input_epub(
 
 fn copy_and_hash(input: &Path, output: &Path) -> anyhow::Result<String> {
     let mut reader = fs::File::open(input)?;
-    let mut writer = fs::File::create(output)?;
+    let mut writer = create_private_snapshot_file(output)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
 
@@ -173,6 +191,32 @@ fn copy_and_hash(input: &Path, output: &Path) -> anyhow::Result<String> {
     Ok(hex_digest(hasher.finalize().as_slice()))
 }
 
+#[cfg(unix)]
+fn create_private_snapshot_file(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    // The creation mode is already private; normalize owner bits in case the
+    // process has an unusually restrictive umask.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn create_private_snapshot_file(path: &Path) -> std::io::Result<fs::File> {
+    fs::File::create(path)
+}
+
+#[cfg(not(unix))]
 fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let mut reader = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -194,4 +238,41 @@ fn hex_digest(bytes: &[u8]) -> String {
         write!(&mut output, "{byte:02x}").expect("writing to string cannot fail");
     }
     output
+}
+
+#[cfg(all(test, unix))]
+mod unix_permissions_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn snapshot_directory_and_file_are_private() {
+        let root = tempfile::tempdir().expect("test directory should be created");
+        let run_dir = root.path().join(".bookforge/runs/test-job");
+        create_private_dir_all(&run_dir).expect("run directory should be created");
+        let input = root.path().join("source.epub");
+        fs::write(&input, b"private book contents").expect("input should be written");
+        let snapshot = run_dir.join("input.epub");
+
+        copy_and_hash(&input, &snapshot).expect("snapshot should be copied");
+
+        for directory in [
+            root.path().join(".bookforge"),
+            root.path().join(".bookforge/runs"),
+            run_dir,
+        ] {
+            let mode = fs::metadata(&directory)
+                .expect("directory metadata should be readable")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "unexpected mode for {}", directory.display());
+        }
+        let snapshot_mode = fs::metadata(&snapshot)
+            .expect("snapshot metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(snapshot_mode, 0o600);
+    }
 }
