@@ -180,6 +180,7 @@ mod tests {
             format,
             speed: 1.0,
             instructions: Some("Speak clearly.".to_string()),
+            ..SpeechRequest::default()
         }
     }
 

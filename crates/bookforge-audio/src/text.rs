@@ -11,6 +11,34 @@
 use bookforge_core::ir::{Block, BlockId, BlockKind, Book};
 use bookforge_core::marker::strip_marker_tokens;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NarrationBlockKind {
+    Title,
+    Heading(u8),
+    Paragraph,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrationBlock {
+    pub kind: NarrationBlockKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChunkKind {
+    Title,
+    Heading,
+    #[default]
+    Body,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrationChunk {
+    pub kind: ChunkKind,
+    pub text: String,
+}
+
 /// One narratable chapter: the visible prose of a single spine section,
 /// with a display title used for filenames and (when stitched) chapter
 /// markers.
@@ -19,15 +47,22 @@ pub struct Chapter {
     /// Zero-based position in reading order.
     pub index: usize,
     pub title: String,
-    /// Clean prose with inline markers removed and blocks joined by blank
-    /// lines. Empty for sections that carry no readable text (cover images,
-    /// nav documents).
-    pub text: String,
+    /// Clean narratable blocks with inline markers removed. Empty for
+    /// sections that carry no readable text (cover images, nav documents).
+    pub blocks: Vec<NarrationBlock>,
 }
 
 impl Chapter {
+    pub fn text(&self) -> String {
+        self.blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.text.trim().is_empty()
+        self.blocks.iter().all(|block| block.text.trim().is_empty())
     }
 }
 
@@ -84,7 +119,8 @@ pub fn chapters_from_book_with_options(book: &Book, pdf_page_grouping: bool) -> 
         .into_iter()
         .enumerate()
         .map(|(index, section)| {
-            let mut paragraphs: Vec<String> = Vec::new();
+            let mut blocks = Vec::new();
+            let mut first_heading = true;
             for block_id in &section.block_ids {
                 let Some(block) = block_index.get(block_id) else {
                     continue;
@@ -94,7 +130,15 @@ pub fn chapters_from_book_with_options(book: &Book, pdf_page_grouping: bool) -> 
                 }
                 let text = clean_block_text(block);
                 if !text.is_empty() {
-                    paragraphs.push(text);
+                    let kind = match block.kind {
+                        BlockKind::Heading(_) if first_heading => {
+                            first_heading = false;
+                            NarrationBlockKind::Title
+                        }
+                        BlockKind::Heading(level) => NarrationBlockKind::Heading(level),
+                        _ => NarrationBlockKind::Paragraph,
+                    };
+                    blocks.push(NarrationBlock { kind, text });
                 }
             }
             let title = section
@@ -106,7 +150,7 @@ pub fn chapters_from_book_with_options(book: &Book, pdf_page_grouping: bool) -> 
             Chapter {
                 index,
                 title,
-                text: paragraphs.join("\n\n"),
+                blocks,
             }
         })
         .collect()
@@ -141,12 +185,12 @@ fn chapters_from_pdf_pages(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "Front matter".to_string());
-    let mut paragraphs = Vec::<String>::new();
+    let mut blocks = Vec::<NarrationBlock>::new();
     let mut printed_toc = false;
     let mut printed_toc_roman_folio = false;
 
     for section in sections {
-        let mut page_start = paragraphs.len();
+        let mut page_start = blocks.len();
         for block_id in &section.block_ids {
             let Some(block) = block_index.get(block_id) else {
                 continue;
@@ -175,13 +219,13 @@ fn chapters_from_pdf_pages(
             if chapter_label_key(&text).is_some() {
                 printed_toc = false;
                 printed_toc_roman_folio = false;
-                if !paragraphs.is_empty() {
+                if !blocks.is_empty() {
                     chapters.push(Chapter {
                         index: chapters.len(),
                         title,
-                        text: paragraphs.join("\n\n"),
+                        blocks,
                     });
-                    paragraphs.clear();
+                    blocks = Vec::new();
                     page_start = 0;
                 }
                 title = text.clone();
@@ -201,26 +245,36 @@ fn chapters_from_pdf_pages(
             {
                 continue;
             }
-            paragraphs.push(text);
+            let kind = if chapter_label_key(&text).is_some() {
+                NarrationBlockKind::Title
+            } else {
+                match block.kind {
+                    BlockKind::Heading(level) => NarrationBlockKind::Heading(level),
+                    _ => NarrationBlockKind::Paragraph,
+                }
+            };
+            blocks.push(NarrationBlock { kind, text });
         }
 
         // Join only a paragraph that actually crosses a physical page. Do
         // not flatten ordinary paragraph boundaries within the page.
         if page_start > 0
-            && paragraphs.len() > page_start
-            && should_join_across_page(&paragraphs[page_start - 1], &paragraphs[page_start])
+            && blocks.len() > page_start
+            && blocks[page_start - 1].kind == NarrationBlockKind::Paragraph
+            && blocks[page_start].kind == NarrationBlockKind::Paragraph
+            && should_join_across_page(&blocks[page_start - 1].text, &blocks[page_start].text)
         {
-            let right = paragraphs.remove(page_start);
-            paragraphs[page_start - 1].push(' ');
-            paragraphs[page_start - 1].push_str(&right);
+            let right = blocks.remove(page_start).text;
+            blocks[page_start - 1].text.push(' ');
+            blocks[page_start - 1].text.push_str(&right);
         }
     }
 
-    if !paragraphs.is_empty() {
+    if !blocks.is_empty() {
         chapters.push(Chapter {
             index: chapters.len(),
             title,
-            text: paragraphs.join("\n\n"),
+            blocks,
         });
     }
     chapters
@@ -450,7 +504,67 @@ fn collapse_whitespace(text: &str) -> String {
 /// `max_chars` counts Unicode scalar values, not bytes; every returned
 /// chunk is a valid string and non-empty. Returns an empty vector for
 /// blank input.
+pub fn chunk_blocks(blocks: &[NarrationBlock], max_chars: usize) -> Vec<NarrationChunk> {
+    let max_chars = max_chars.max(1);
+    let mut chunks = Vec::new();
+    let mut paragraphs = Vec::new();
+
+    let flush_paragraphs =
+        |paragraphs: &mut Vec<&str>, chunks: &mut Vec<NarrationChunk>| {
+            if paragraphs.is_empty() {
+                return;
+            }
+            let text = paragraphs.join("\n\n");
+            chunks.extend(chunk_body_text(&text, max_chars).into_iter().map(|text| {
+                NarrationChunk {
+                    kind: ChunkKind::Body,
+                    text,
+                }
+            }));
+            paragraphs.clear();
+        };
+
+    for block in blocks {
+        match block.kind {
+            NarrationBlockKind::Paragraph => paragraphs.push(block.text.as_str()),
+            NarrationBlockKind::Title | NarrationBlockKind::Heading(_) => {
+                flush_paragraphs(&mut paragraphs, &mut chunks);
+                let kind = match block.kind {
+                    NarrationBlockKind::Title => ChunkKind::Title,
+                    NarrationBlockKind::Heading(_) => ChunkKind::Heading,
+                    NarrationBlockKind::Paragraph => unreachable!(),
+                };
+                let text = block.text.trim();
+                if !text.is_empty() {
+                    let pieces = if text.chars().count() > max_chars {
+                        split_long_unit(text, max_chars)
+                    } else {
+                        vec![text.to_string()]
+                    };
+                    chunks.extend(pieces.into_iter().map(|text| NarrationChunk { kind, text }));
+                }
+            }
+        }
+    }
+    flush_paragraphs(&mut paragraphs, &mut chunks);
+    chunks
+}
+
+/// Compatibility wrapper for callers that have unstructured prose.
 pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
+    chunk_blocks(
+        &[NarrationBlock {
+            kind: NarrationBlockKind::Paragraph,
+            text: text.to_string(),
+        }],
+        max_chars,
+    )
+    .into_iter()
+    .map(|chunk| chunk.text)
+    .collect()
+}
+
+fn chunk_body_text(text: &str, max_chars: usize) -> Vec<String> {
     let max_chars = max_chars.max(1);
     let mut chunks: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -746,18 +860,112 @@ mod tests {
         assert_eq!(chapters[0].title, "Test Book");
         assert_eq!(chapters[1].title, "CAPITOLO I:");
         assert_eq!(chapters[2].title, "CAPITOLO II");
+        assert_eq!(chapters[1].blocks[0].kind, NarrationBlockKind::Title);
+        assert_eq!(chapters[1].blocks[0].text, "CAPITOLO I:");
+        assert_eq!(chapters[2].blocks[0].kind, NarrationBlockKind::Title);
         assert!(
             chapters
                 .iter()
-                .all(|chapter| !chapter.text.contains("Repeated Book Title"))
+                .all(|chapter| !chapter.text().contains("Repeated Book Title"))
         );
         assert!(
             chapters
                 .iter()
-                .all(|chapter| chapter.text.lines().all(|line| {
+                .all(|chapter| chapter.text().lines().all(|line| {
                     let line = line.trim();
                     line.is_empty() || !line.chars().all(|ch| ch.is_ascii_digit())
                 }))
         );
+    }
+
+    #[test]
+    fn headings_are_typed_and_section_title_appears_once() {
+        use bookforge_core::ir::{
+            Block, BlockId, BookFormat, BookId, DomPath, Metadata, Section, SectionId, TextRun,
+        };
+
+        let section_id = SectionId("section".to_string());
+        let make_block = |id: &str, kind, text: &str| Block {
+            id: BlockId(id.to_string()),
+            section_id: section_id.clone(),
+            kind,
+            dom_path: DomPath(vec![0]),
+            text_runs: vec![TextRun {
+                id: format!("{id}-run"),
+                text: text.to_string(),
+            }],
+            inline_marks: Vec::new(),
+            protected_spans: Vec::new(),
+            token_estimate: 1,
+        };
+        let book = Book {
+            source_path: None,
+            id: BookId("headings".to_string()),
+            format: BookFormat::Epub,
+            metadata: Metadata::default(),
+            manifest: Vec::new(),
+            spine: Vec::new(),
+            sections: vec![Section {
+                id: section_id.clone(),
+                href: "chapter.xhtml".to_string(),
+                spine_index: 0,
+                title: Some("The Title".to_string()),
+                heading_level: Some(1),
+                block_ids: vec![
+                    BlockId("title".to_string()),
+                    BlockId("body".to_string()),
+                    BlockId("heading".to_string()),
+                ],
+                prev: None,
+                next: None,
+            }],
+            blocks: vec![
+                make_block("title", BlockKind::Heading(1), "The Title"),
+                make_block("body", BlockKind::Paragraph, "Body text."),
+                make_block("heading", BlockKind::Heading(2), "A Subheading"),
+            ],
+        };
+
+        let chapters = chapters_from_book(&book);
+        assert_eq!(chapters[0].blocks[0].kind, NarrationBlockKind::Title);
+        assert_eq!(chapters[0].blocks[2].kind, NarrationBlockKind::Heading(2));
+        assert_eq!(
+            chapters[0]
+                .blocks
+                .iter()
+                .filter(|block| block.text == "The Title")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn chunk_blocks_keeps_titles_and_headings_separate_from_body() {
+        let blocks = vec![
+            NarrationBlock {
+                kind: NarrationBlockKind::Title,
+                text: "The Title".to_string(),
+            },
+            NarrationBlock {
+                kind: NarrationBlockKind::Paragraph,
+                text: "First body sentence.".to_string(),
+            },
+            NarrationBlock {
+                kind: NarrationBlockKind::Heading(2),
+                text: "A Heading".to_string(),
+            },
+            NarrationBlock {
+                kind: NarrationBlockKind::Paragraph,
+                text: "Second body sentence.".to_string(),
+            },
+        ];
+
+        let chunks = chunk_blocks(&blocks, 100);
+        assert_eq!(chunks[0].kind, ChunkKind::Title);
+        assert_eq!(chunks[0].text, "The Title");
+        assert_eq!(chunks[1].kind, ChunkKind::Body);
+        assert_eq!(chunks[2].kind, ChunkKind::Heading);
+        assert_eq!(chunks[2].text, "A Heading");
+        assert_eq!(chunks[3].kind, ChunkKind::Body);
     }
 }

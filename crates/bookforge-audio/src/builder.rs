@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::provider::{AudioFormat, SpeechRequest, TtsProvider};
-use crate::text::{chapters_from_book_with_options, chunk_text};
+use crate::provider::{AudioFormat, SpeechRequest, TextNormalization, TtsProvider};
+use crate::text::{ChunkKind, chapters_from_book_with_options, chunk_blocks};
 
 /// Knobs for a single audiobook build.
 #[derive(Debug, Clone)]
@@ -34,6 +34,14 @@ pub struct AudiobookOptions {
     pub synthesis_id: String,
     /// Optional voice delivery/pronunciation guidance.
     pub instructions: Option<String>,
+    /// Neighboring chunk context sent to providers that support continuity.
+    /// Zero disables context entirely.
+    pub context_chars: usize,
+    pub seed: Option<u32>,
+    pub language_code: Option<String>,
+    pub text_normalization: Option<TextNormalization>,
+    pub heading_break_tag: Option<String>,
+    pub chapter_filter: Option<std::collections::BTreeSet<usize>>,
     /// Group physical pdftohtml pages around explicit chapter headings.
     /// This must only be enabled from a positive source-format signal.
     pub pdf_page_grouping: bool,
@@ -50,6 +58,12 @@ impl Default for AudiobookOptions {
             concurrency: 4,
             synthesis_id: "default".to_string(),
             instructions: None,
+            context_chars: 300,
+            seed: None,
+            language_code: None,
+            text_normalization: None,
+            heading_break_tag: None,
+            chapter_filter: None,
             pdf_page_grouping: false,
         }
     }
@@ -61,6 +75,8 @@ pub struct ChunkRecord {
     pub chapter_index: usize,
     pub chapter_title: String,
     pub part: usize,
+    #[serde(default)]
+    pub kind: ChunkKind,
     pub file: String,
     pub chars: usize,
     /// Hash of text plus every synthesis setting that can alter the audio.
@@ -108,6 +124,16 @@ pub struct AudiobookManifest {
     pub max_chars: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_normalization: Option<TextNormalization>,
+    #[serde(default)]
+    pub gaps: GapSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
     pub chapters: usize,
     pub chunks: Vec<ChunkRecord>,
     #[serde(default)]
@@ -118,6 +144,13 @@ pub struct AudiobookManifest {
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapSettings {
+    pub chapter_ms: u32,
+    pub title_ms: u32,
+    pub paragraph_ms: u32,
 }
 
 /// Summary returned to the caller after a build.
@@ -176,7 +209,10 @@ struct PlannedChunk {
     chapter_index: usize,
     chapter_title: String,
     part: usize,
+    kind: ChunkKind,
     text: String,
+    previous_text: Option<String>,
+    next_text: Option<String>,
     synthesis_sha256: String,
     path: PathBuf,
 }
@@ -190,6 +226,7 @@ pub fn plan_chunks(book: &Book, options: &AudiobookOptions) -> Vec<ChunkRecord> 
             chapter_index: chunk.chapter_index,
             chapter_title: chunk.chapter_title,
             part: chunk.part,
+            kind: chunk.kind,
             file: chunk
                 .path
                 .file_name()
@@ -212,26 +249,79 @@ fn build_plan(book: &Book, options: &AudiobookOptions) -> Vec<PlannedChunk> {
         if chapter.is_empty() {
             continue;
         }
-        let chunks = chunk_text(&chapter.text, options.max_chars);
-        for (part_idx, text) in chunks.into_iter().enumerate() {
-            let synthesis_sha256 = synthesis_hash(&text, options);
-            let file_name = format!(
-                "chapter-{:03}-part-{:03}-{}.{ext}",
-                chapter.index + 1,
-                part_idx + 1,
-                &synthesis_sha256[..16]
-            );
+        if options
+            .chapter_filter
+            .as_ref()
+            .is_some_and(|filter| !filter.contains(&(chapter.index + 1)))
+        {
+            continue;
+        }
+        let chunks = chunk_blocks(&chapter.blocks, options.max_chars);
+        for (part_idx, mut chunk) in chunks.into_iter().enumerate() {
+            if matches!(chunk.kind, ChunkKind::Title | ChunkKind::Heading)
+                && let Some(tag) = options.heading_break_tag.as_deref()
+                && !tag.is_empty()
+            {
+                chunk.text.push(' ');
+                chunk.text.push_str(tag);
+            }
             planned.push(PlannedChunk {
                 chapter_index: chapter.index,
                 chapter_title: chapter.title.clone(),
                 part: part_idx + 1,
-                text,
-                synthesis_sha256,
-                path: options.out_dir.join(file_name),
+                kind: chunk.kind,
+                text: chunk.text,
+                previous_text: None,
+                next_text: None,
+                synthesis_sha256: String::new(),
+                path: PathBuf::new(),
             });
         }
     }
+
+    for index in 0..planned.len() {
+        let previous_text = index.checked_sub(1).and_then(|previous| {
+            (planned[previous].chapter_index == planned[index].chapter_index)
+                .then(|| context_slice(&planned[previous].text, options.context_chars, true))
+                .flatten()
+        });
+        let next_text = planned.get(index + 1).and_then(|next| {
+            (next.chapter_index == planned[index].chapter_index)
+                .then(|| context_slice(&next.text, options.context_chars, false))
+                .flatten()
+        });
+        let synthesis_sha256 = synthesis_hash(
+            &planned[index].text,
+            planned[index].kind,
+            previous_text.as_deref(),
+            next_text.as_deref(),
+            options,
+        );
+        let file_name = format!(
+            "chapter-{:03}-part-{:03}-{}.{ext}",
+            planned[index].chapter_index + 1,
+            planned[index].part,
+            &synthesis_sha256[..16]
+        );
+        planned[index].previous_text = previous_text;
+        planned[index].next_text = next_text;
+        planned[index].synthesis_sha256 = synthesis_sha256;
+        planned[index].path = options.out_dir.join(file_name);
+    }
     planned
+}
+
+fn context_slice(text: &str, chars: usize, from_end: bool) -> Option<String> {
+    if chars == 0 || text.is_empty() {
+        return None;
+    }
+    if from_end {
+        let mut slice = text.chars().rev().take(chars).collect::<Vec<_>>();
+        slice.reverse();
+        Some(slice.into_iter().collect())
+    } else {
+        Some(text.chars().take(chars).collect())
+    }
 }
 
 /// Synthesize an audiobook. Existing non-empty files are treated as already
@@ -273,6 +363,7 @@ where
             chapter_index: chunk.chapter_index,
             chapter_title: chunk.chapter_title.clone(),
             part: chunk.part,
+            kind: chunk.kind,
             file: file_name_of(&chunk.path),
             chars: chunk.text.chars().count(),
             synthesis_sha256: chunk.synthesis_sha256.clone(),
@@ -290,7 +381,7 @@ where
         .len();
     let manifest_path = options.out_dir.join("manifest.json");
     let manifest = Arc::new(Mutex::new(AudiobookManifest {
-        schema_version: 2,
+        schema_version: 3,
         title: book.metadata.title.clone(),
         synthesis_id: options.synthesis_id.clone(),
         voice: options.voice.clone(),
@@ -298,6 +389,15 @@ where
         speed: options.speed,
         max_chars: options.max_chars,
         instructions: options.instructions.clone(),
+        seed: options.seed,
+        language: options.language_code.clone(),
+        text_normalization: options.text_normalization,
+        gaps: GapSettings {
+            chapter_ms: 1_200,
+            title_ms: 800,
+            paragraph_ms: 0,
+        },
+        author: (!book.metadata.creators.is_empty()).then(|| book.metadata.creators.join(", ")),
         chapters,
         chunks: records,
         completed_chunks: 0,
@@ -316,6 +416,9 @@ where
         let format = options.format;
         let speed = options.speed;
         let instructions = options.instructions.clone();
+        let seed = options.seed;
+        let language_code = options.language_code.clone();
+        let text_normalization = options.text_normalization;
         let done = Arc::clone(&done);
         let synthesized = Arc::clone(&synthesized);
         let skipped = Arc::clone(&skipped);
@@ -344,6 +447,11 @@ where
                         format,
                         speed,
                         instructions,
+                        previous_text: chunk.previous_text.clone(),
+                        next_text: chunk.next_text.clone(),
+                        seed,
+                        language_code,
+                        text_normalization,
                     })
                     .await?;
                 if clip.format != format {
@@ -567,20 +675,62 @@ pub fn validate_options(options: &AudiobookOptions) -> Result<()> {
     Ok(())
 }
 
-fn synthesis_hash(text: &str, options: &AudiobookOptions) -> String {
+fn synthesis_hash(
+    text: &str,
+    kind: ChunkKind,
+    previous_text: Option<&str>,
+    next_text: Option<&str>,
+    options: &AudiobookOptions,
+) -> String {
+    synthesis_hash_with_version(
+        "bookforge-audio-v2",
+        text,
+        kind,
+        previous_text,
+        next_text,
+        options,
+    )
+}
+
+fn synthesis_hash_with_version(
+    version: &str,
+    text: &str,
+    kind: ChunkKind,
+    previous_text: Option<&str>,
+    next_text: Option<&str>,
+    options: &AudiobookOptions,
+) -> String {
     let mut hasher = Sha256::new();
+    let seed = options
+        .seed
+        .map(|seed| seed.to_string())
+        .unwrap_or_default();
     for value in [
-        "bookforge-audio-v1",
+        version,
         &options.synthesis_id,
         &options.voice,
         options.format.as_api_str(),
         &options.speed.to_bits().to_string(),
         options.instructions.as_deref().unwrap_or(""),
         text,
+        seed.as_str(),
+        options.language_code.as_deref().unwrap_or(""),
+        options
+            .text_normalization
+            .map(TextNormalization::as_str)
+            .unwrap_or(""),
+        previous_text.unwrap_or(""),
+        next_text.unwrap_or(""),
+        match kind {
+            ChunkKind::Title => "title",
+            ChunkKind::Heading => "heading",
+            ChunkKind::Body => "body",
+        },
     ] {
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
+    // Neighbor context deliberately means editing chunk N invalidates N±1.
     let digest = hasher.finalize();
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -638,7 +788,11 @@ mod tests {
         let make_block = |id: &str, section: &str, text: &str| Block {
             id: BlockId(id.to_string()),
             section_id: SectionId(section.to_string()),
-            kind: BlockKind::Paragraph,
+            kind: if matches!(id, "b1" | "b3") {
+                BlockKind::Heading(1)
+            } else {
+                BlockKind::Paragraph
+            },
             dom_path: DomPath(vec![0]),
             text_runs: vec![TextRun {
                 id: format!("{id}_r0"),
@@ -705,6 +859,153 @@ mod tests {
         // File names are zero-padded and format-suffixed.
         assert!(plan[0].file.starts_with("chapter-001-part-001"));
         assert_eq!(plan[0].synthesis_sha256.len(), 64);
+        for chapter_index in [0, 1] {
+            assert_eq!(
+                plan.iter()
+                    .find(|chunk| chunk.chapter_index == chapter_index)
+                    .unwrap()
+                    .kind,
+                ChunkKind::Title
+            );
+        }
+    }
+
+    #[test]
+    fn context_slices_are_unicode_safe_and_zero_disables_them() {
+        assert_eq!(context_slice("aé日z", 2, false).as_deref(), Some("aé"));
+        assert_eq!(context_slice("aé日z", 2, true).as_deref(), Some("日z"));
+        assert_eq!(context_slice("aé日z", 99, false).as_deref(), Some("aé日z"));
+        assert_eq!(context_slice("aé日z", 0, false), None);
+    }
+
+    #[test]
+    fn planned_context_stops_at_chapter_boundaries() {
+        let options = AudiobookOptions {
+            max_chars: 40,
+            context_chars: 8,
+            ..AudiobookOptions::default()
+        };
+        let plan = build_plan(&book_with_sections(), &options);
+        for pair in plan.windows(2) {
+            if pair[0].chapter_index != pair[1].chapter_index {
+                assert_eq!(pair[0].next_text, None);
+                assert_eq!(pair[1].previous_text, None);
+            }
+        }
+        assert!(plan.iter().any(|chunk| chunk.next_text.is_some()));
+    }
+
+    #[test]
+    fn heading_break_tag_is_appended_only_to_structural_chunks() {
+        let options = AudiobookOptions {
+            heading_break_tag: Some("<break time=\"0.6s\" />".to_string()),
+            ..AudiobookOptions::default()
+        };
+        let plan = build_plan(&book_with_sections(), &options);
+        assert!(plan[0].text.ends_with(" <break time=\"0.6s\" />"));
+        assert!(
+            plan.iter()
+                .filter(|chunk| chunk.kind == ChunkKind::Body)
+                .all(|chunk| !chunk.text.contains("<break"))
+        );
+    }
+
+    #[test]
+    fn synthesis_hash_changes_for_every_new_consistency_input_and_kind() {
+        let options = AudiobookOptions::default();
+        let base = synthesis_hash("text", ChunkKind::Body, None, None, &options);
+
+        let mut changed = options.clone();
+        changed.seed = Some(7);
+        assert_ne!(
+            base,
+            synthesis_hash("text", ChunkKind::Body, None, None, &changed)
+        );
+
+        let mut changed = options.clone();
+        changed.language_code = Some("it".to_string());
+        assert_ne!(
+            base,
+            synthesis_hash("text", ChunkKind::Body, None, None, &changed)
+        );
+
+        let mut changed = options.clone();
+        changed.text_normalization = Some(TextNormalization::Auto);
+        assert_ne!(
+            base,
+            synthesis_hash("text", ChunkKind::Body, None, None, &changed)
+        );
+
+        assert_ne!(
+            base,
+            synthesis_hash("text", ChunkKind::Body, Some("before"), None, &options)
+        );
+        assert_ne!(
+            base,
+            synthesis_hash("text", ChunkKind::Body, None, Some("after"), &options)
+        );
+        assert_ne!(
+            base,
+            synthesis_hash("text", ChunkKind::Title, None, None, &options)
+        );
+    }
+
+    #[test]
+    fn synthesis_hash_uses_v2_cache_tag() {
+        let options = AudiobookOptions::default();
+        let actual = synthesis_hash("text", ChunkKind::Body, None, None, &options);
+        assert_eq!(
+            actual,
+            synthesis_hash_with_version(
+                "bookforge-audio-v2",
+                "text",
+                ChunkKind::Body,
+                None,
+                None,
+                &options,
+            )
+        );
+        assert_ne!(
+            actual,
+            synthesis_hash_with_version(
+                "bookforge-audio-v1",
+                "text",
+                ChunkKind::Body,
+                None,
+                None,
+                &options,
+            )
+        );
+    }
+
+    #[test]
+    fn v2_manifest_without_new_fields_still_deserializes() {
+        let json = serde_json::json!({
+            "schema_version": 2,
+            "title": "Old Book",
+            "synthesis_id": "mock:model",
+            "voice": "voice",
+            "format": "wav",
+            "speed": 1.0,
+            "max_chars": 2000,
+            "chapters": 1,
+            "chunks": [{
+                "chapter_index": 0,
+                "chapter_title": "One",
+                "part": 1,
+                "file": "chapter-001-part-001-old.wav",
+                "chars": 10,
+                "synthesis_sha256": "0"
+            }]
+        });
+        let manifest: AudiobookManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(manifest.schema_version, 2);
+        assert_eq!(manifest.chunks[0].kind, ChunkKind::Body);
+        assert_eq!(manifest.seed, None);
+        assert_eq!(manifest.language, None);
+        assert_eq!(manifest.text_normalization, None);
+        assert_eq!(manifest.gaps, GapSettings::default());
+        assert_eq!(manifest.author, None);
     }
 
     #[tokio::test]
