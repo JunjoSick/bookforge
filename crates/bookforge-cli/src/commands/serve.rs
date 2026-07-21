@@ -16,11 +16,12 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
+    ffi::OsString,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, ExitStatus},
-    sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -54,6 +55,10 @@ const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Briefly check a detached translation child before reporting launch success.
 const CHILD_STARTUP_CHECK: Duration = Duration::from_millis(150);
+
+const ELEVENLABS_BASE_URL: &str = "https://api.elevenlabs.io/v1";
+const ELEVENLABS_VOICE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const ELEVENLABS_VOICE_TIMEOUT_SECONDS: u64 = 10;
 
 /// Cloud providers the dashboard form offers, paired with the env var their
 /// runs read a key from when one is configured in the operator's environment.
@@ -130,6 +135,11 @@ const CSRF_TOKEN_PLACEHOLDER: &str = "__BOOKFORGE_CSRF_TOKEN__";
 /// millisecond never collide on a path (and delete each other's input mid-parse).
 static ESTIMATE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `fetch_elevenlabs_subscription` resolves its key through a configured
+/// environment-variable name. Serialize the narrowly-scoped temporary key used
+/// for dashboard-session credentials, which otherwise live only in `AppState`.
+static ELEVENLABS_QUOTA_ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
 #[derive(Debug, clap::Args)]
 pub struct ServeArgs {
     /// Address to bind. Must be loopback because the dashboard is unauthenticated
@@ -155,6 +165,9 @@ struct AppState {
     /// the lifetime of the server: never written to disk, never logged, and
     /// only injected into spawned runs through the child's environment.
     keys: Arc<Mutex<HashMap<String, String>>>,
+    /// Recently fetched public voice metadata. API keys remain exclusively in
+    /// `keys` (or the provider environment) and are never cached here.
+    elevenlabs_voices: Arc<Mutex<Option<ElevenLabsVoiceCache>>>,
     /// Browser-launched audiobook operations that can still be cancelled.
     audio_cancels: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// Path to the job store's sqlite database, resolved once when the server
@@ -168,6 +181,12 @@ struct AppState {
     store_path: PathBuf,
     #[cfg(test)]
     resume_launches: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[derive(Clone)]
+struct ElevenLabsVoiceCache {
+    fetched_at: Instant,
+    voices: Vec<bookforge_audio::ElevenLabsVoice>,
 }
 
 /// The default job store path, relative to the current directory — identical
@@ -283,6 +302,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         csrf_token: generate_csrf_token()?,
         host_port: local.port(),
         keys: Arc::new(Mutex::new(HashMap::new())),
+        elevenlabs_voices: Arc::new(Mutex::new(None)),
         audio_cancels: Arc::new(Mutex::new(HashMap::new())),
         store_path: default_store_path(),
         #[cfg(test)]
@@ -339,8 +359,10 @@ fn dashboard_router(state: AppState) -> Router {
         .route("/api/jobs/{id}/stop", post(stop_job))
         .route("/api/options", get(dashboard_options))
         .route("/api/providers", get(provider_status))
+        .route("/api/audio/voices", get(audio_voices))
         .route("/api/estimate", post(estimate_translate))
         .route("/api/translate", post(launch_translate))
+        .route("/api/audiobook/estimate", post(estimate_audiobook))
         .route("/api/audiobook", post(launch_audiobook))
         .route("/api/audiobooks/{id}", get(audiobook_status))
         .route("/api/audiobooks/{id}/cancel", post(cancel_audiobook))
@@ -1100,6 +1122,170 @@ async fn launch_translate(
     .into_response())
 }
 
+/// Plan audiobook synthesis from an uploaded EPUB without making provider
+/// requests. Parsing and chunk construction are blocking, so both happen off
+/// the async worker after the upload has been saved to a temporary path.
+async fn estimate_audiobook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Response, AppError> {
+    if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut fields = HashMap::<String, String>::new();
+    while let Some(field) = multipart.next_field().await? {
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "file" {
+            file_bytes = Some(field.bytes().await?.to_vec());
+        } else {
+            fields.insert(name, field.text().await?);
+        }
+    }
+    let Some(bytes) = file_bytes.filter(|bytes| !bytes.is_empty()) else {
+        return Ok(bad_request("upload an EPUB file"));
+    };
+
+    let provider = field_value(&fields, "provider").unwrap_or_else(|| "mock".to_string());
+    if !matches!(
+        provider.as_str(),
+        "mock" | "openai" | "gemini" | "elevenlabs"
+    ) {
+        return Ok(bad_request("unsupported audiobook provider"));
+    }
+    let model = field_value(&fields, "model").unwrap_or_else(|| match provider.as_str() {
+        "openai" => "gpt-4o-mini-tts".to_string(),
+        "gemini" => "gemini-3.1-flash-tts-preview".to_string(),
+        "elevenlabs" => String::new(),
+        _ => "mock-silence".to_string(),
+    });
+    let max_chars = match fields.get("max_chars") {
+        Some(value) => match value.trim().parse::<usize>() {
+            Ok(value) => value,
+            Err(_) => return Ok(bad_request("max_chars must be a positive integer")),
+        },
+        None => 2_000,
+    };
+    let provider_max_chars = audio_provider_max_chars(&provider, &model);
+    if max_chars == 0 || max_chars > provider_max_chars {
+        return Ok(bad_request(&format!(
+            "{provider} accepts between 1 and {provider_max_chars} characters per request"
+        )));
+    }
+    let chapter_filter = match field_value(&fields, "chapters") {
+        Some(value) => match super::audiobook::parse_chapter_ranges(&value) {
+            Ok(chapters) => Some(chapters),
+            Err(error) => return Ok(bad_request(&format!("invalid chapters: {error}"))),
+        },
+        None => None,
+    };
+
+    let sequence = ESTIMATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_path = std::env::temp_dir().join(format!(
+        "bookforge-audio-estimate-{}-{}-{sequence}.epub",
+        std::process::id(),
+        now_ms(),
+    ));
+    std::fs::write(&temp_path, bytes)?;
+    let plan_path = temp_path.clone();
+    let plan_result = tokio::task::spawn_blocking(move || -> Result<(usize, usize, usize)> {
+        let book = bookforge_epub::read_epub(&plan_path)?;
+        let options = bookforge_audio::AudiobookOptions {
+            max_chars,
+            chapter_filter,
+            ..bookforge_audio::AudiobookOptions::default()
+        };
+        let plan = bookforge_audio::plan_chunks(&book, &options);
+        let chapters = plan
+            .iter()
+            .map(|chunk| chunk.chapter_index)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let characters = plan.iter().map(|chunk| chunk.chars).sum();
+        Ok((chapters, plan.len(), characters))
+    })
+    .await;
+    let _ = std::fs::remove_file(&temp_path);
+    let result = match plan_result? {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(bad_request(&format!(
+                "could not estimate audiobook: {error}"
+            )));
+        }
+    };
+    let (chapters, chunks, characters) = result;
+    let cost = crate::audio_cost::estimate_audio_cost(&provider, &model, characters);
+    let mut payload = json!({
+        "chapters": chapters,
+        "chunks": chunks,
+        "characters": characters,
+        "est_cost_usd": cost.and_then(|value| value.usd),
+        "est_credits": cost.and_then(|value| value.credits),
+    });
+
+    if provider == "elevenlabs"
+        && let Some(api_key) = resolve_audio_provider_key(&state, "elevenlabs")?
+        && let Some(subscription) = fetch_dashboard_elevenlabs_subscription(&api_key, &model).await
+    {
+        let remaining = subscription
+            .character_limit
+            .saturating_sub(subscription.character_count);
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "quota".to_string(),
+                json!({
+                    "remaining": remaining,
+                    "limit": subscription.character_limit,
+                    "fits": characters as u128 <= remaining as u128,
+                }),
+            );
+        }
+    }
+
+    Ok(Json(payload).into_response())
+}
+
+struct TemporaryEnvKey(String);
+
+impl Drop for TemporaryEnvKey {
+    fn drop(&mut self) {
+        // SAFETY: the name is unique to this request and access to temporary
+        // ElevenLabs quota variables is serialized by `ELEVENLABS_QUOTA_ENV_LOCK`.
+        unsafe { std::env::remove_var(&self.0) };
+    }
+}
+
+async fn fetch_dashboard_elevenlabs_subscription(
+    api_key: &str,
+    model: &str,
+) -> Option<bookforge_audio::ElevenLabsSubscription> {
+    let lock = ELEVENLABS_QUOTA_ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+    let _guard = lock.lock().await;
+    let sequence = ESTIMATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let env_name = format!(
+        "BOOKFORGE_DASHBOARD_ELEVENLABS_KEY_{}_{}",
+        std::process::id(),
+        sequence
+    );
+    // SAFETY: this request-unique name is never read or written outside the
+    // serialized section guarded above, and the RAII guard removes it on every
+    // return path (including cancellation).
+    unsafe { std::env::set_var(&env_name, api_key) };
+    let _temporary_key = TemporaryEnvKey(env_name.clone());
+    let mut config = bookforge_audio::ElevenLabsTtsConfig::hosted(
+        (!model.is_empty()).then(|| model.to_string()),
+    );
+    config.api_key_env = env_name;
+    config.timeout_seconds = ELEVENLABS_VOICE_TIMEOUT_SECONDS;
+    config.max_attempts = 2;
+    bookforge_audio::fetch_elevenlabs_subscription(&config)
+        .await
+        .ok()
+}
+
 /// Launch audiobook synthesis directly from an uploaded source or translated
 /// EPUB. Progress is durable: the audio builder creates `manifest.json` before
 /// its first provider request and atomically checkpoints it after every chunk.
@@ -1140,9 +1326,10 @@ async fn launch_audiobook(
     let model = field_value(&fields, "model").unwrap_or_else(|| match provider.as_str() {
         "openai" => "gpt-4o-mini-tts".to_string(),
         "gemini" => "gemini-3.1-flash-tts-preview".to_string(),
-        "elevenlabs" => "eleven_multilingual_v2".to_string(),
+        "elevenlabs" => String::new(),
         _ => "mock-silence".to_string(),
     });
+    let auto_model = provider == "elevenlabs" && model.is_empty();
     let voice = field_value(&fields, "voice").or_else(|| match provider.as_str() {
         "openai" => Some("alloy".to_string()),
         "gemini" => Some("Kore".to_string()),
@@ -1201,6 +1388,11 @@ async fn launch_audiobook(
         .unwrap_or(2_000);
     let provider_max_chars = audio_provider_max_chars(&provider, &model);
     if max_chars == 0 || max_chars > provider_max_chars {
+        if auto_model {
+            return Ok(bad_request(
+                "ElevenLabs Auto accepts between 1 and 10000 characters per request; pick eleven_flash_v2_5 explicitly for larger values",
+            ));
+        }
         return Ok(bad_request(&format!(
             "{provider} accepts between 1 and {provider_max_chars} characters per request"
         )));
@@ -1209,6 +1401,41 @@ async fn launch_audiobook(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(4)
         .clamp(1, 16);
+    let gap_chapter_ms = match parse_audio_gap(&fields, "gap_chapter_ms") {
+        Ok(value) => value,
+        Err(error) => return Ok(bad_request(&error)),
+    };
+    let gap_title_ms = match parse_audio_gap(&fields, "gap_title_ms") {
+        Ok(value) => value,
+        Err(error) => return Ok(bad_request(&error)),
+    };
+    let seed = match field_value(&fields, "seed") {
+        Some(value) => match value.parse::<u32>() {
+            Ok(value) => Some(value),
+            Err(_) => return Ok(bad_request("seed must be a valid unsigned 32-bit integer")),
+        },
+        None => None,
+    };
+    let language = match fields.get("language") {
+        Some(value) => {
+            let value = value.trim();
+            if !valid_audio_language(value) {
+                return Ok(bad_request(
+                    "language must be a code such as it, en-US, or pt-BR",
+                ));
+            }
+            Some(value.to_string())
+        }
+        None => None,
+    };
+    let advanced = AudiobookCommandOptions {
+        gap_chapter_ms,
+        gap_title_ms,
+        single: truthy_field(&fields, "single"),
+        loudnorm: truthy_field(&fields, "loudnorm"),
+        seed,
+        language,
+    };
     let make_m4b = truthy_field(&fields, "m4b");
     let stitch_audio = truthy_field(&fields, "stitch") || make_m4b;
     if stitch_audio && format == "pcm" {
@@ -1237,7 +1464,7 @@ async fn launch_audiobook(
         lock_keys(&state)?.insert(key_slot.clone(), key.clone());
         Some(key)
     } else {
-        lock_keys(&state)?.get(&key_slot).cloned()
+        resolve_audio_provider_key(&state, &provider)?
     };
     if provider != "mock"
         && key.is_none()
@@ -1263,47 +1490,30 @@ async fn launch_audiobook(
         return Ok(bad_request(&format!("could not read EPUB: {error}")));
     }
     std::fs::create_dir_all(&out_dir)?;
-    write_audio_process_state(&out_dir, "starting", None, None)?;
+    write_audio_process_state(&out_dir, "starting", None, None, auto_model)?;
 
     let exe = std::env::current_exe()?;
     let mut command = tokio::process::Command::new(exe);
-    command
-        .arg("audiobook")
-        .arg(&input_path)
-        .arg("--out")
-        .arg(&out_dir)
-        .arg("--provider")
-        .arg(&provider)
-        .arg("--model")
-        .arg(&model)
-        .arg("--voice")
-        .arg(&voice)
-        .arg("--format")
-        .arg(&format)
-        .arg("--speed")
-        .arg(speed.to_string())
-        .arg("--max-chars")
-        .arg(max_chars.to_string())
-        .arg("--concurrency")
-        .arg(concurrency.to_string())
-        .arg("--ui")
-        .arg("quiet");
-    if let Some(instructions) = instructions {
-        command.arg("--instructions").arg(instructions);
-    }
-    if let Some(base_url) = base_url {
-        command.arg("--base-url").arg(base_url);
-    }
-    if make_m4b {
-        command.arg("--m4b");
-    } else if stitch_audio {
-        command.arg("--stitch");
-    }
-    if provider != "mock"
-        && let Some(key) = key
-    {
-        let env = audio_provider_key_env(&provider).expect("audio provider was validated");
-        command.arg("--api-key-env").arg(env);
+    let api_key_env = (provider != "mock" && key.is_some())
+        .then(|| audio_provider_key_env(&provider).expect("audio provider was validated"));
+    command.args(audiobook_command_args(
+        &input_path,
+        &out_dir,
+        &provider,
+        (!auto_model).then_some(model.as_str()),
+        &voice,
+        &format,
+        speed,
+        max_chars,
+        concurrency,
+        instructions.as_deref(),
+        base_url.as_deref(),
+        make_m4b,
+        stitch_audio,
+        api_key_env,
+        &advanced,
+    ));
+    if let (Some(env), Some(key)) = (api_key_env, key) {
         command.env(env, key);
     }
 
@@ -1311,7 +1521,7 @@ async fn launch_audiobook(
         .spawn()
         .context("failed to spawn audiobook process")?;
     let pid = child.id();
-    write_audio_process_state(&out_dir, "running", pid, None)?;
+    write_audio_process_state(&out_dir, "running", pid, None, auto_model)?;
     let cancel = tokio_util::sync::CancellationToken::new();
     state
         .audio_cancels
@@ -1339,6 +1549,7 @@ async fn launch_audiobook(
             operation_state.0,
             pid,
             operation_state.1.as_deref(),
+            auto_model,
         );
         if let Ok(mut registry) = cancel_registry.lock() {
             registry.remove(&monitor_id);
@@ -1356,6 +1567,131 @@ async fn launch_audiobook(
         "pid": pid,
     }))
     .into_response())
+}
+
+#[derive(Debug, Default)]
+struct AudiobookCommandOptions {
+    gap_chapter_ms: Option<u32>,
+    gap_title_ms: Option<u32>,
+    single: bool,
+    loudnorm: bool,
+    seed: Option<u32>,
+    language: Option<String>,
+}
+
+fn clamp_audio_gap(value: u32) -> u32 {
+    value.min(10_000)
+}
+
+fn parse_audio_gap(
+    fields: &HashMap<String, String>,
+    name: &str,
+) -> std::result::Result<Option<u32>, String> {
+    let Some(value) = fields.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| format!("{name} must be a non-negative integer"))?;
+    Ok(Some(clamp_audio_gap(value)))
+}
+
+fn valid_audio_language(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let Some(primary) = parts.next() else {
+        return false;
+    };
+    if !(2..=3).contains(&primary.len()) || !primary.bytes().all(|byte| byte.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    parts.all(|part| {
+        (2..=8).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audiobook_command_args(
+    input_path: &Path,
+    out_dir: &Path,
+    provider: &str,
+    model: Option<&str>,
+    voice: &str,
+    format: &str,
+    speed: f32,
+    max_chars: usize,
+    concurrency: usize,
+    instructions: Option<&str>,
+    base_url: Option<&str>,
+    make_m4b: bool,
+    stitch_audio: bool,
+    api_key_env: Option<&str>,
+    advanced: &AudiobookCommandOptions,
+) -> Vec<OsString> {
+    let mut args = vec![
+        "audiobook".into(),
+        input_path.as_os_str().to_owned(),
+        "--out".into(),
+        out_dir.as_os_str().to_owned(),
+        "--provider".into(),
+        provider.into(),
+    ];
+    if let Some(model) = model.filter(|value| !value.is_empty()) {
+        args.extend([OsString::from("--model"), model.into()]);
+    }
+    args.extend([
+        "--voice".into(),
+        voice.into(),
+        "--format".into(),
+        format.into(),
+        "--speed".into(),
+        speed.to_string().into(),
+        "--max-chars".into(),
+        max_chars.to_string().into(),
+        "--concurrency".into(),
+        concurrency.to_string().into(),
+        "--ui".into(),
+        "quiet".into(),
+    ]);
+    if let Some(instructions) = instructions {
+        args.extend([OsString::from("--instructions"), instructions.into()]);
+    }
+    if let Some(base_url) = base_url {
+        args.extend([OsString::from("--base-url"), base_url.into()]);
+    }
+    if make_m4b {
+        args.push("--m4b".into());
+    } else if stitch_audio {
+        args.push("--stitch".into());
+    }
+    if let Some(env) = api_key_env {
+        args.extend([OsString::from("--api-key-env"), env.into()]);
+    }
+    if let Some(gap) = advanced.gap_chapter_ms {
+        args.extend([OsString::from("--gap-chapter-ms"), gap.to_string().into()]);
+    }
+    if let Some(gap) = advanced.gap_title_ms {
+        args.extend([OsString::from("--gap-title-ms"), gap.to_string().into()]);
+    }
+    if advanced.single {
+        args.push("--single".into());
+    }
+    if advanced.loudnorm {
+        args.push("--loudnorm".into());
+    }
+    if let Some(seed) = advanced.seed {
+        args.extend([OsString::from("--seed"), seed.to_string().into()]);
+    }
+    if let Some(language) = advanced.language.as_deref() {
+        args.extend([OsString::from("--language"), language.into()]);
+    }
+    args
+}
+
+fn resolved_model_from_synthesis_id(synthesis_id: &str) -> Option<&str> {
+    let (_, model) = synthesis_id.rsplit_once(':')?;
+    (!model.is_empty()).then_some(model)
 }
 
 async fn audiobook_status(AxumPath(id): AxumPath<String>) -> Result<Response, AppError> {
@@ -1386,10 +1722,16 @@ async fn audiobook_status(AxumPath(id): AxumPath<String>) -> Result<Response, Ap
                 "chunks": [],
             })
         });
+    let resolved_model = payload
+        .get("synthesis_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(resolved_model_from_synthesis_id)
+        .map(str::to_string);
     if let Some(object) = payload.as_object_mut() {
         object.insert("id".to_string(), json!(id));
         object.insert("out_dir".to_string(), json!(out_dir.display().to_string()));
         object.insert("process".to_string(), process.clone());
+        object.insert("resolved_model".to_string(), json!(resolved_model));
         match process.get("status").and_then(serde_json::Value::as_str) {
             Some("failed") => {
                 object.insert("status".to_string(), json!("failed"));
@@ -1444,7 +1786,15 @@ async fn cancel_audiobook(
     Ok(Json(json!({"ok": true, "status": "cancelling"})).into_response())
 }
 
-async fn audiobook_artifact(AxumPath(id): AxumPath<String>) -> Result<Response, AppError> {
+#[derive(Deserialize)]
+struct ArtifactQuery {
+    disposition: Option<String>,
+}
+
+async fn audiobook_artifact(
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ArtifactQuery>,
+) -> Result<Response, AppError> {
     if !valid_audiobook_id(&id) {
         return Ok(bad_request("invalid audiobook operation id"));
     }
@@ -1465,17 +1815,17 @@ async fn audiobook_artifact(AxumPath(id): AxumPath<String>) -> Result<Response, 
         )
             .into_response());
     };
+    let inline = query.disposition.as_deref() == Some("inline");
+    let content_disposition = match (inline, download_name.ends_with(".m4b")) {
+        (true, true) => "inline; filename=\"audiobook.m4b\"",
+        (true, false) => "inline; filename=\"audiobook-audio.zip\"",
+        (false, true) => "attachment; filename=\"audiobook.m4b\"",
+        (false, false) => "attachment; filename=\"audiobook-audio.zip\"",
+    };
     Ok((
         [
             (axum::http::header::CONTENT_TYPE, content_type),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                if download_name.ends_with(".m4b") {
-                    "attachment; filename=\"audiobook.m4b\""
-                } else {
-                    "attachment; filename=\"audiobook-audio.zip\""
-                },
-            ),
+            (axum::http::header::CONTENT_DISPOSITION, content_disposition),
         ],
         axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
     )
@@ -1543,6 +1893,7 @@ fn write_audio_process_state(
     status: &str,
     pid: Option<u32>,
     error: Option<&str>,
+    auto_model: bool,
 ) -> Result<()> {
     let path = out_dir.join("process.json");
     let temp = out_dir.join("process.part.tmp");
@@ -1550,6 +1901,7 @@ fn write_audio_process_state(
         "status": status,
         "pid": pid,
         "error": error,
+        "auto_model": auto_model,
         "updated_at_ms": now_ms(),
     }))?;
     std::fs::write(&temp, bytes)?;
@@ -1654,6 +2006,68 @@ async fn provider_status(
         status.insert(format!("audio:{provider}"), json!(configured));
     }
     Ok(Json(serde_json::Value::Object(status)))
+}
+
+#[derive(Deserialize)]
+struct AudioVoicesQuery {
+    provider: Option<String>,
+}
+
+async fn audio_voices(
+    State(state): State<AppState>,
+    Query(query): Query<AudioVoicesQuery>,
+) -> Result<Response, AppError> {
+    if query.provider.as_deref() != Some("elevenlabs") {
+        return Ok(bad_request(
+            "voice listing is available for ElevenLabs only",
+        ));
+    }
+
+    let Some(api_key) = resolve_audio_provider_key(&state, "elevenlabs")? else {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "ElevenLabs API key is not configured" })),
+        )
+            .into_response());
+    };
+
+    if let Some(voices) = state
+        .elevenlabs_voices
+        .lock()
+        .map_err(|_| anyhow::anyhow!("ElevenLabs voice cache is unavailable"))?
+        .as_ref()
+        .filter(|cache| cache.fetched_at.elapsed() < ELEVENLABS_VOICE_CACHE_TTL)
+        .map(|cache| cache.voices.clone())
+    {
+        return Ok(Json(json!({ "voices": voices })).into_response());
+    }
+
+    let voices = match bookforge_audio::list_elevenlabs_voices(
+        ELEVENLABS_BASE_URL,
+        &api_key,
+        ELEVENLABS_VOICE_TIMEOUT_SECONDS,
+    )
+    .await
+    {
+        Ok(voices) => voices,
+        Err(_) => {
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": "could not load ElevenLabs voices" })),
+            )
+                .into_response());
+        }
+    };
+    *state
+        .elevenlabs_voices
+        .lock()
+        .map_err(|_| anyhow::anyhow!("ElevenLabs voice cache is unavailable"))? =
+        Some(ElevenLabsVoiceCache {
+            fetched_at: Instant::now(),
+            voices: voices.clone(),
+        });
+
+    Ok(Json(json!({ "voices": voices })).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -1837,6 +2251,16 @@ fn audio_provider_env_has_key(provider: &str) -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
+fn resolve_audio_provider_key(state: &AppState, provider: &str) -> Result<Option<String>> {
+    let key_slot = format!("audio:{provider}");
+    if let Some(key) = lock_keys(state)?.get(&key_slot).cloned() {
+        return Ok(Some(key));
+    }
+    Ok(audio_provider_key_env(provider)
+        .and_then(|env| std::env::var(env).ok())
+        .filter(|value| !value.is_empty()))
+}
+
 fn audio_base_url_is_loopback(value: &str) -> bool {
     reqwest::Url::parse(value)
         .ok()
@@ -1927,6 +2351,7 @@ fn dashboard_options_payload() -> DashboardOptions {
                 default_format: "wav",
                 requires_voice: false,
                 requires_key: false,
+                supports_auto_model: false,
                 supports_instructions: false,
                 supports_speed: true,
                 max_chars: 40_000,
@@ -1941,6 +2366,7 @@ fn dashboard_options_payload() -> DashboardOptions {
                 default_format: "mp3",
                 requires_voice: false,
                 requires_key: true,
+                supports_auto_model: false,
                 supports_instructions: true,
                 supports_speed: true,
                 max_chars: 4_096,
@@ -1955,6 +2381,7 @@ fn dashboard_options_payload() -> DashboardOptions {
                 default_format: "wav",
                 requires_voice: false,
                 requires_key: true,
+                supports_auto_model: false,
                 supports_instructions: true,
                 supports_speed: false,
                 max_chars: 4_096,
@@ -1963,12 +2390,13 @@ fn dashboard_options_payload() -> DashboardOptions {
                 id: "elevenlabs",
                 label: "ElevenLabs",
                 models: AUDIO_ELEVENLABS_MODELS,
-                default_model: "eleven_multilingual_v2",
+                default_model: "",
                 default_voice: "",
                 formats: &["mp3", "opus", "wav", "pcm"],
                 default_format: "mp3",
                 requires_voice: true,
                 requires_key: true,
+                supports_auto_model: true,
                 supports_instructions: false,
                 supports_speed: true,
                 max_chars: bookforge_audio::elevenlabs_model_max_input_chars(
@@ -1990,6 +2418,7 @@ fn field_value(fields: &HashMap<String, String>, key: &str) -> Option<String> {
 fn audio_provider_max_chars(provider: &str, model: &str) -> usize {
     match provider {
         "mock" => 40_000,
+        "elevenlabs" if model.is_empty() => 10_000,
         "elevenlabs" => bookforge_audio::elevenlabs_model_max_input_chars(model),
         "openai" | "gemini" => 4_096,
         _ => 4_096,
@@ -2378,6 +2807,7 @@ struct AudioProviderOption {
     default_format: &'static str,
     requires_voice: bool,
     requires_key: bool,
+    supports_auto_model: bool,
     supports_instructions: bool,
     supports_speed: bool,
     max_chars: usize,
@@ -2513,6 +2943,7 @@ mod tests {
             csrf_token: token.to_string(),
             host_port: 8765,
             keys: Arc::new(Mutex::new(HashMap::new())),
+            elevenlabs_voices: Arc::new(Mutex::new(None)),
             audio_cancels: Arc::new(Mutex::new(HashMap::new())),
             store_path: default_store_path(),
             resume_launches: None,
@@ -2623,11 +3054,13 @@ mod tests {
             .find(|provider| provider.id == "elevenlabs")
             .expect("ElevenLabs provider option should exist");
         assert!(elevenlabs.requires_voice);
+        assert!(elevenlabs.supports_auto_model);
         assert!(!elevenlabs.supports_instructions);
         assert_eq!(elevenlabs.models.first(), Some(&"eleven_v3"));
-        assert_eq!(elevenlabs.default_model, "eleven_multilingual_v2");
+        assert_eq!(elevenlabs.default_model, "");
         assert_eq!(elevenlabs.max_chars, 10_000);
         assert_eq!(audio_provider_max_chars("openai", "anything"), 4_096);
+        assert_eq!(audio_provider_max_chars("elevenlabs", ""), 10_000);
         assert_eq!(audio_provider_max_chars("elevenlabs", "eleven_v3"), 5_000);
         assert_eq!(
             audio_provider_max_chars("elevenlabs", "eleven_flash_v2_5"),
@@ -2773,6 +3206,152 @@ mod tests {
             .expect("route should respond");
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn audiobook_estimate_endpoint_rejects_missing_dashboard_token() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let body =
+            "--B\r\nContent-Disposition: form-data; name=\"provider\"\r\n\r\nmock\r\n--B--\r\n";
+        let response = dashboard_router(test_state("token-123"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/audiobook/estimate")
+                    .header("host", TEST_HOST)
+                    .header("content-type", "multipart/form-data; boundary=B")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_voices_without_key_returns_conflict() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let response = dashboard_router(test_state("token-123"))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/audio/voices?provider=elevenlabs")
+                    .header("host", TEST_HOST)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn resolved_model_uses_last_synthesis_id_colon() {
+        assert_eq!(
+            resolved_model_from_synthesis_id(
+                "elevenlabs:https://api.elevenlabs.io:443/v1:eleven_v3"
+            ),
+            Some("eleven_v3")
+        );
+    }
+
+    #[test]
+    fn audiobook_command_args_omit_auto_model_and_include_explicit_model() {
+        let build = |model| {
+            audiobook_command_args(
+                Path::new("book.epub"),
+                Path::new("audio-out"),
+                "elevenlabs",
+                model,
+                "voice-id",
+                "mp3",
+                1.0,
+                2_000,
+                4,
+                None,
+                None,
+                true,
+                true,
+                Some("ELEVENLABS_API_KEY"),
+                &AudiobookCommandOptions::default(),
+            )
+        };
+
+        let auto = build(None);
+        assert!(!auto.iter().any(|arg| arg == "--model"));
+
+        let explicit = build(Some("eleven_flash_v2_5"));
+        let model_flag = explicit
+            .iter()
+            .position(|arg| arg == "--model")
+            .expect("explicit model should add --model");
+        assert_eq!(
+            explicit.get(model_flag + 1),
+            Some(&OsString::from("eleven_flash_v2_5"))
+        );
+    }
+
+    #[test]
+    fn audiobook_command_args_include_only_advanced_flags_that_are_set() {
+        let build = |advanced: &AudiobookCommandOptions| {
+            audiobook_command_args(
+                Path::new("book.epub"),
+                Path::new("audio-out"),
+                "elevenlabs",
+                Some("eleven_flash_v2_5"),
+                "voice-id",
+                "mp3",
+                1.0,
+                2_000,
+                4,
+                None,
+                None,
+                true,
+                true,
+                Some("ELEVENLABS_API_KEY"),
+                advanced,
+            )
+        };
+
+        let defaults = build(&AudiobookCommandOptions::default());
+        for flag in ["--single", "--loudnorm", "--seed", "--language"] {
+            assert!(!defaults.iter().any(|arg| arg == flag), "included {flag}");
+        }
+
+        let configured = build(&AudiobookCommandOptions {
+            single: true,
+            loudnorm: true,
+            seed: Some(u32::MAX),
+            language: Some("pt-BR".to_string()),
+            ..AudiobookCommandOptions::default()
+        });
+        for flag in ["--single", "--loudnorm", "--seed", "--language"] {
+            assert!(configured.iter().any(|arg| arg == flag), "omitted {flag}");
+        }
+        assert!(configured.iter().any(|arg| arg == "4294967295"));
+        assert!(configured.iter().any(|arg| arg == "pt-BR"));
+    }
+
+    #[test]
+    fn audiobook_language_validation_matches_dashboard_contract() {
+        for valid in ["it", "en-US", "pt-BR"] {
+            assert!(valid_audio_language(valid), "rejected {valid:?}");
+        }
+        for invalid in ["../etc", "toolongtoken", ""] {
+            assert!(!valid_audio_language(invalid), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn audiobook_gap_values_are_clamped_to_ten_seconds() {
+        assert_eq!(clamp_audio_gap(0), 0);
+        assert_eq!(clamp_audio_gap(600), 600);
+        assert_eq!(clamp_audio_gap(99_999), 10_000);
     }
 
     #[tokio::test]
@@ -2951,6 +3530,9 @@ mod tests {
             "function drawReview",
             "function drawValidation",
             "function renderGlossary",
+            "function bfAudioEstimate",
+            "/api/audiobook/estimate",
+            "Advanced",
         ] {
             assert!(DASHBOARD_HTML.contains(marker), "missing {marker}");
         }
@@ -2960,14 +3542,14 @@ mod tests {
     fn dashboard_assets_reassemble_byte_stably() {
         use sha2::{Digest, Sha256};
 
-        assert_eq!(DASHBOARD_HTML.len(), 97_182);
+        assert_eq!(DASHBOARD_HTML.len(), 106_868);
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
         let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
         let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
             digest_hex,
-            "6a7999e04b3714c0669b72387e4834ba6620b42585d3ca963797f8258da61440"
+            "648276dd25726153a19ea34c262f756193a8256addc1d04e62453914285f9690"
         );
 
         let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");
