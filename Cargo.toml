@@ -33,10 +33,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 quick-xml = { version = "0.41", features = ["escape-html"] }
 zip = "8.6"
-# Held at 0.37 deliberately: 0.40 pulls a libsqlite3-sys that uses the
+# Held below 0.40 deliberately: 0.40 pulls a libsqlite3-sys that uses the
 # `cfg_select!` macro, which does not exist in our MSRV (see docs/msrv-audit.md
-# for why the floor is 1.88 and what it buys). Raising this means raising the
-# MSRV. Dependabot is told to skip >=0.40 in .github/dependabot.yml.
+# for why the floor is 1.88 and what it buys). Raising past 0.39 means raising
+# the MSRV. Dependabot is told to skip >=0.40 in .github/dependabot.yml.
 rusqlite = { version = "0.39", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip", "brotli"], default-features = false }
 base64 = "0.22"
