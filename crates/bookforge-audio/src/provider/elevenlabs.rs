@@ -297,7 +297,7 @@ fn elevenlabs_request_body(model: &str, request: &SpeechRequest) -> serde_json::
         "text": request.text,
         "model_id": model,
     });
-    if !((request.speed - 1.0).abs() < f32::EPSILON) {
+    if (request.speed - 1.0).abs() >= f32::EPSILON {
         body["voice_settings"] = serde_json::json!({"speed": request.speed});
     }
     if let Some(previous_text) = &request.previous_text {
