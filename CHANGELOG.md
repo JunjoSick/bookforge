@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- **Breaking:** existing audio chunk caches are invalidated by the
+  `bookforge-audio-v2` synthesis hash and manifest schema 3. The manifest adds
+  narration kind, seed, language, text-normalization, gaps, and author data
+  while retaining serde-defaulted backward reads. Rerun audiobook jobs with
+  `--prune` to remove superseded chunk files (`--prune --dry-run` previews the
+  cleanup).
+- Audiobook narration now preserves document hierarchy: chapter titles and
+  in-section headings are emitted as separate typed chunks instead of being
+  packed into body prose. Stitching adds configurable chapter, title/heading,
+  and paragraph silence (1200/800/0 ms by default), with automatic ElevenLabs
+  `<break>` tags on supported v2 models.
+- ElevenLabs synthesis now supplies up to 300 characters of same-chapter
+  `previous_text` and `next_text` for smoother joins, plus optional `--seed`,
+  `--language`, and `--text-normalization` controls. Language codes are sent
+  only to Flash/Turbo v2.5 and are warned-and-dropped for Multilingual v2 and
+  Eleven v3, whose APIs reject them.
+- A chaptered `audiobook.m4b` with chapter markers and title/author metadata is
+  now the default deliverable when ffmpeg is available; `--no-book-file` opts
+  out and `--single` adds a flat audio file for on-the-go listening. Added
+  configurable whole-book `--loudnorm` while leaving per-chapter files
+  unnormalized.
+- Added schema-1 per-character TTS pricing in
+  `pricing/audio-providers.json`, estimated dollar/credit cost in audiobook
+  plan and dry-run output, and a non-fatal ElevenLabs subscription-quota
+  preflight. Added one-based chapter subset selection with `--chapters` and
+  ElevenLabs account voice discovery with `--list-voices`.
+- Brought the browser audiobook workflow to CLI parity: ElevenLabs now offers
+  `Auto (recommended)` model selection and a server-side voice-list proxy at
+  `GET /api/audio/voices`; pre-launch estimates from
+  `POST /api/audiobook/estimate` include cost and quota; progress is grouped by
+  chapter; and completed `.m4b` files can be played in-page. An Advanced
+  section exposes chapter pause, flat-file output, loudness normalization,
+  seed, and language.
 - Added optional OCR recovery for low-confidence PDF pages through
   OpenAI-compatible endpoints, including the SGLang-specific Unlimited-OCR
   dialect, retrying blocking HTTP client, `action=ocr` reporting, and a
