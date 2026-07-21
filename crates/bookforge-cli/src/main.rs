@@ -1,3 +1,4 @@
+mod audio_cost;
 mod checkpoint;
 mod commands;
 mod control;

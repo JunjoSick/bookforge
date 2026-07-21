@@ -41,7 +41,7 @@ const OPF: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 const CHAPTER_ONE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">
-<head><title>Chapter One</title></head>
+<head></head>
 <body>
 <h1>The First Chapter</h1>
 <p>This is the first paragraph. It has a couple of sentences to narrate.</p>
@@ -51,7 +51,7 @@ const CHAPTER_ONE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 const CHAPTER_TWO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">
-<head><title>Chapter Two</title></head>
+<head></head>
 <body>
 <h1>The Second Chapter</h1>
 <p>The second chapter also has prose. Every sentence here should reach the narrator.</p>
@@ -120,7 +120,7 @@ fn audiobook_mock_writes_files_and_manifest() {
 
     let manifest_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(manifest_json["schema_version"], 2);
+    assert_eq!(manifest_json["schema_version"], 3);
     assert_eq!(manifest_json["status"], "succeeded");
     assert_eq!(
         manifest_json["completed_chunks"],
@@ -131,6 +131,16 @@ fn audiobook_mock_writes_files_and_manifest() {
     let chunks = manifest_json["chunks"].as_array().unwrap();
     assert!(chunks.len() >= 2);
     assert_eq!(chunks[0]["synthesis_sha256"].as_str().unwrap().len(), 64);
+    if std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        assert!(
+            out.join("audiobook.m4b").exists(),
+            "ffmpeg availability should make the chapter-marked book file the default"
+        );
+    }
 }
 
 #[test]
@@ -195,6 +205,7 @@ fn elevenlabs_dry_run_without_model_uses_static_default_offline() {
 
     bookforge()
         .current_dir(temp.path())
+        .env_remove("ELEVENLABS_API_KEY")
         .args([
             "audiobook",
             input.to_str().unwrap(),
@@ -431,6 +442,7 @@ fn audiobook_elevenlabs_dry_run_accepts_native_provider_options() {
 
     let assert = bookforge()
         .current_dir(temp.path())
+        .env_remove("ELEVENLABS_API_KEY")
         .args([
             "audiobook",
             input.to_str().unwrap(),
@@ -449,6 +461,177 @@ fn audiobook_elevenlabs_dry_run_accepts_native_provider_options() {
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     assert!(stdout.contains("Voice: JBFqnCBsd6RMkjVDRZzb | Format: mp3"));
     assert!(stdout.contains("Model: eleven_flash_v2_5"));
+}
+
+#[test]
+fn audiobook_chapter_filter_keeps_global_chapter_numbering() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    let out = temp.path().join("audio-chapter-2");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "mock",
+            "--out",
+            out.to_str().unwrap(),
+            "--chapters",
+            "2",
+            "--no-book-file",
+        ])
+        .assert()
+        .success();
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    let chunks = manifest["chunks"].as_array().unwrap();
+    assert!(!chunks.is_empty());
+    assert!(chunks.iter().all(|chunk| chunk["chapter_index"] == 1));
+    assert!(chunks.iter().all(|chunk| {
+        chunk["file"]
+            .as_str()
+            .is_some_and(|file| file.starts_with("chapter-002-part-"))
+    }));
+    assert_eq!(manifest["chapters"], 1);
+}
+
+#[test]
+fn audiobook_manifest_keeps_title_in_its_own_first_part() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    let out = temp.path().join("audio-title-kind");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "mock",
+            "--out",
+            out.to_str().unwrap(),
+            "--chapters",
+            "1",
+            "--no-book-file",
+        ])
+        .assert()
+        .success();
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    let first = &manifest["chunks"].as_array().unwrap()[0];
+    assert_eq!(first["part"], 1);
+    assert_eq!(first["kind"], "title");
+    assert_eq!(first["chars"], "The First Chapter".chars().count());
+}
+
+#[test]
+fn audiobook_list_voices_requires_elevenlabs_provider() {
+    bookforge()
+        .args(["audiobook", "--list-voices"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "--list-voices requires --provider elevenlabs",
+        ));
+}
+
+#[test]
+fn audiobook_requires_input_without_list_voices() {
+    bookforge()
+        .args(["audiobook", "--provider", "mock"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("INPUT is required"));
+}
+
+#[test]
+fn audiobook_seed_rejects_non_elevenlabs_provider() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    bookforge()
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "mock",
+            "--seed",
+            "7",
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "--seed is supported only with --provider elevenlabs",
+        ));
+}
+
+#[test]
+fn audiobook_dry_run_uses_audio_pricing_override() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    let pricing = temp.path().join("audio-pricing.json");
+    fs::write(
+        &pricing,
+        r#"{
+          "schema_version": 1,
+          "updated_at": "2026-07-20",
+          "providers": {
+            "mock": {
+              "mock-silence": {
+                "usd_per_million_chars": 1000000.0,
+                "credits_per_char": null,
+                "note": "one dollar per character for an exact test"
+              }
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+
+    bookforge()
+        .current_dir(temp.path())
+        .env("BOOKFORGE_AUDIO_PRICING_PATH", &pricing)
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "mock",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Estimated cost: ~$"))
+        .stdout(predicates::str::contains(".00"));
+}
+
+#[test]
+fn unsupported_elevenlabs_language_warns_instead_of_failing() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+
+    bookforge()
+        .current_dir(temp.path())
+        .env_remove("ELEVENLABS_API_KEY")
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "v",
+            "--model",
+            "eleven_multilingual_v2",
+            "--language",
+            "en-US",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("rejects language_code"));
 }
 
 #[test]
