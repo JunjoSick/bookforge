@@ -1,12 +1,32 @@
 use tokio_util::sync::CancellationToken;
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use super::{
-    AudioClip, AudioFormat, Result, SpeechRequest, TtsError, TtsProvider, base_url_is_loopback,
-    build_http_client, required_api_key, send_with_retry, validate_audio_payload,
-    validate_path_component,
+    AudioClip, AudioFormat, MAX_AUDIO_RESPONSE_BODY_BYTES, MAX_JSON_RESPONSE_BODY_BYTES, Result,
+    SpeechRequest, TtsError, TtsProvider, base_url_is_loopback, build_http_client,
+    required_api_key, send_with_retry, validate_audio_payload, validate_path_component,
 };
+
+const ELEVENLABS_METADATA_MAX_ATTEMPTS: usize = 2;
+
+struct ApiKey(String);
+
+impl ApiKey {
+    fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ApiKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ApiKey(***)")
+    }
+}
 
 /// Absolute maximum Unicode characters accepted by an ElevenLabs TTS model.
 pub const ELEVENLABS_MAX_INPUT_CHARS: usize = 40_000;
@@ -38,26 +58,62 @@ pub struct ElevenLabsSubscription {
 pub async fn fetch_elevenlabs_subscription(
     config: &ElevenLabsTtsConfig,
 ) -> Result<ElevenLabsSubscription> {
-    let endpoint = format!(
-        "{}/user/subscription",
-        config.base_url.trim_end_matches('/')
-    );
     let api_key = if base_url_is_loopback(&config.base_url) {
         std::env::var(&config.api_key_env)
             .ok()
             .filter(|value| !value.trim().is_empty())
     } else {
         Some(required_api_key(&config.api_key_env)?)
-    };
-    let client = build_http_client(config.timeout_seconds)?;
+    }
+    .map(ApiKey::new);
+    fetch_elevenlabs_subscription_request(
+        &config.base_url,
+        api_key.as_ref(),
+        config.timeout_seconds,
+        config.max_attempts,
+    )
+    .await
+}
+
+/// Fetch ElevenLabs subscription usage with a caller-supplied API key.
+///
+/// This path never reads or mutates the process environment.
+pub async fn fetch_elevenlabs_subscription_with_key(
+    base_url: &str,
+    api_key: &str,
+    timeout_seconds: u64,
+) -> Result<ElevenLabsSubscription> {
+    let api_key = ApiKey::new(api_key);
+    fetch_elevenlabs_subscription_request(
+        base_url,
+        Some(&api_key),
+        timeout_seconds,
+        ELEVENLABS_METADATA_MAX_ATTEMPTS,
+    )
+    .await
+}
+
+async fn fetch_elevenlabs_subscription_request(
+    base_url: &str,
+    api_key: Option<&ApiKey>,
+    timeout_seconds: u64,
+    max_attempts: usize,
+) -> Result<ElevenLabsSubscription> {
+    let endpoint = format!("{}/user/subscription", base_url.trim_end_matches('/'));
+    let client = build_http_client(timeout_seconds)?;
     let cancel_token = CancellationToken::new();
-    let payload = send_with_retry(&cancel_token, config.max_attempts, || {
-        let mut request = client.get(&endpoint);
-        if let Some(api_key) = api_key.as_deref() {
-            request = request.header("xi-api-key", api_key);
-        }
-        request
-    })
+    let payload = send_with_retry(
+        &cancel_token,
+        max_attempts,
+        MAX_JSON_RESPONSE_BODY_BYTES,
+        || {
+            let mut request = client.get(&endpoint);
+            if let Some(api_key) = api_key {
+                request = request.header("xi-api-key", api_key.expose());
+            }
+            request
+        },
+    )
     .await?;
     serde_json::from_slice(&payload.bytes).map_err(|error| {
         TtsError::Provider(format!(
@@ -76,12 +132,16 @@ pub async fn list_elevenlabs_voices(
         voices: Vec<ElevenLabsVoice>,
     }
 
+    let api_key = ApiKey::new(api_key);
     let endpoint = format!("{}/voices", base_url.trim_end_matches('/'));
     let client = build_http_client(timeout_seconds)?;
     let cancel_token = CancellationToken::new();
-    let payload = send_with_retry(&cancel_token, 2, || {
-        client.get(&endpoint).header("xi-api-key", api_key)
-    })
+    let payload = send_with_retry(
+        &cancel_token,
+        ELEVENLABS_METADATA_MAX_ATTEMPTS,
+        MAX_JSON_RESPONSE_BODY_BYTES,
+        || client.get(&endpoint).header("xi-api-key", api_key.expose()),
+    )
     .await?;
     let response: VoicesResponse = serde_json::from_slice(&payload.bytes).map_err(|error| {
         TtsError::Provider(format!(
@@ -120,16 +180,22 @@ pub async fn resolve_preferred_elevenlabs_model(
             .filter(|value| !value.trim().is_empty())
     } else {
         Some(required_api_key(&config.api_key_env)?)
-    };
+    }
+    .map(ApiKey::new);
     let client = build_http_client(config.timeout_seconds)?;
     let cancel_token = CancellationToken::new();
-    let payload = send_with_retry(&cancel_token, config.max_attempts.min(2), || {
-        let mut request = client.get(&endpoint);
-        if let Some(api_key) = api_key.as_deref() {
-            request = request.header("xi-api-key", api_key);
-        }
-        request
-    })
+    let payload = send_with_retry(
+        &cancel_token,
+        config.max_attempts.min(ELEVENLABS_METADATA_MAX_ATTEMPTS),
+        MAX_JSON_RESPONSE_BODY_BYTES,
+        || {
+            let mut request = client.get(&endpoint);
+            if let Some(api_key) = api_key.as_ref() {
+                request = request.header("xi-api-key", api_key.expose());
+            }
+            request
+        },
+    )
     .await?;
     let value: serde_json::Value = serde_json::from_slice(&payload.bytes).map_err(|error| {
         TtsError::Provider(format!(
@@ -259,14 +325,19 @@ impl TtsProvider for ElevenLabsTtsProvider {
             )));
         }
         let endpoint = self.endpoint(&request.voice, request.format)?;
-        let api_key = required_api_key(&self.config.api_key_env)?;
+        let api_key = ApiKey::new(required_api_key(&self.config.api_key_env)?);
         let body = elevenlabs_request_body(&self.config.model, &request);
-        let payload = send_with_retry(&self.cancel_token, self.config.max_attempts, || {
-            self.client
-                .post(endpoint.clone())
-                .header("xi-api-key", &api_key)
-                .json(&body)
-        })
+        let payload = send_with_retry(
+            &self.cancel_token,
+            self.config.max_attempts,
+            MAX_AUDIO_RESPONSE_BODY_BYTES,
+            || {
+                self.client
+                    .post(endpoint.clone())
+                    .header("xi-api-key", api_key.expose())
+                    .json(&body)
+            },
+        )
         .await?;
         validate_audio_payload(
             request.format,
@@ -321,7 +392,9 @@ fn elevenlabs_request_body(model: &str, request: &SpeechRequest) -> serde_json::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::test_support::one_request_server;
+    use crate::provider::test_support::{
+        one_request_server, one_request_server_with_content_length,
+    };
     use std::time::Duration;
 
     fn request(format: AudioFormat) -> SpeechRequest {
@@ -333,6 +406,14 @@ mod tests {
             instructions: None,
             ..SpeechRequest::default()
         }
+    }
+
+    #[test]
+    fn api_key_debug_is_redacted() {
+        let secret = "elevenlabs-secret-that-must-not-leak";
+        let debug = format!("{:?}", ApiKey::new(secret));
+        assert_eq!(debug, "ApiKey(***)");
+        assert!(!debug.contains(secret));
     }
 
     #[test]
@@ -552,12 +633,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscription_get_parses_counts_and_sends_key() {
+    async fn explicit_key_subscription_get_parses_counts_and_sends_key() {
         let body = serde_json::json!({"character_count": 123, "character_limit": 456});
         let (base_url, captured) =
             one_request_server(body.to_string().into_bytes(), "application/json");
-        let key_env = "BOOKFORGE_ELEVENLABS_SUBSCRIPTION_TEST_KEY";
-        unsafe { std::env::set_var(key_env, "subscription-key") };
+        let subscription =
+            fetch_elevenlabs_subscription_with_key(&base_url, "explicit-subscription-key", 5)
+                .await
+                .unwrap();
+
+        assert_eq!(subscription.character_count, 123);
+        assert_eq!(subscription.character_limit, 456);
+        let raw = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(raw.starts_with("GET /v1/user/subscription HTTP/1.1"));
+        assert!(
+            raw.to_ascii_lowercase()
+                .contains("xi-api-key: explicit-subscription-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn config_subscription_wrapper_resolves_key_from_environment() {
+        let body = serde_json::json!({"character_count": 123, "character_limit": 456});
+        let (base_url, captured) =
+            one_request_server(body.to_string().into_bytes(), "application/json");
+        let key_env = "BOOKFORGE_ELEVENLABS_SUBSCRIPTION_WRAPPER_TEST_KEY";
+        unsafe { std::env::set_var(key_env, "wrapper-subscription-key") };
         let subscription = fetch_elevenlabs_subscription(&resolver_config(base_url, key_env))
             .await
             .unwrap();
@@ -568,8 +669,40 @@ mod tests {
         assert!(raw.starts_with("GET /v1/user/subscription HTTP/1.1"));
         assert!(
             raw.to_ascii_lowercase()
-                .contains("xi-api-key: subscription-key")
+                .contains("xi-api-key: wrapper-subscription-key")
         );
+    }
+
+    #[tokio::test]
+    async fn config_subscription_wrapper_allows_missing_key_on_loopback() {
+        let body = serde_json::json!({"character_count": 12, "character_limit": 34});
+        let (base_url, captured) =
+            one_request_server(body.to_string().into_bytes(), "application/json");
+        let key_env = "BOOKFORGE_ELEVENLABS_SUBSCRIPTION_LOOPBACK_MISSING_TEST_KEY";
+        unsafe { std::env::remove_var(key_env) };
+        let subscription = fetch_elevenlabs_subscription(&resolver_config(base_url, key_env))
+            .await
+            .unwrap();
+
+        assert_eq!(subscription.character_count, 12);
+        assert_eq!(subscription.character_limit, 34);
+        let raw = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!raw.to_ascii_lowercase().contains("xi-api-key:"));
+    }
+
+    #[tokio::test]
+    async fn subscription_rejects_oversized_json_before_buffering_body() {
+        let (base_url, _) = one_request_server_with_content_length(
+            b"{}".to_vec(),
+            "application/json",
+            MAX_JSON_RESPONSE_BODY_BYTES as u64 + 1,
+        );
+        let error = fetch_elevenlabs_subscription_with_key(&base_url, "oversize-key", 5)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TtsError::Provider(_)));
+        assert!(error.to_string().contains("8388608-byte limit"));
     }
 
     #[tokio::test]

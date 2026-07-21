@@ -15,9 +15,17 @@ mod gemini;
 pub use elevenlabs::{
     ELEVENLABS_MAX_INPUT_CHARS, ELEVENLABS_PREFERRED_MODELS, ElevenLabsSubscription,
     ElevenLabsTtsConfig, ElevenLabsTtsProvider, ElevenLabsVoice, elevenlabs_model_max_input_chars,
-    fetch_elevenlabs_subscription, list_elevenlabs_voices, resolve_preferred_elevenlabs_model,
+    fetch_elevenlabs_subscription, fetch_elevenlabs_subscription_with_key, list_elevenlabs_voices,
+    resolve_preferred_elevenlabs_model,
 };
 pub use gemini::{GeminiTtsConfig, GeminiTtsProvider};
+
+// Audio clips may be long, so allow up to 64 MiB while still preventing an
+// untrusted provider from streaming an unbounded response into memory.
+pub(super) const MAX_AUDIO_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
+// JSON metadata and provider error responses should remain much smaller.
+pub(super) const MAX_JSON_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PROVIDER_ERROR_DETAIL_CHARS: usize = 300;
 
 /// Output container/codec requested from the provider. The string form is
 /// what OpenAI-compatible endpoints expect in `response_format`, and the
@@ -217,13 +225,18 @@ impl TtsProvider for OpenAiTtsProvider {
         );
         let body = speech_request_body(&self.config.model, &request);
 
-        let payload = send_with_retry(&self.cancel_token, self.config.max_attempts, || {
-            let mut builder = self.client.post(&endpoint).json(&body);
-            if let Some(key) = api_key.as_deref() {
-                builder = builder.bearer_auth(key);
-            }
-            builder
-        })
+        let payload = send_with_retry(
+            &self.cancel_token,
+            self.config.max_attempts,
+            MAX_AUDIO_RESPONSE_BODY_BYTES,
+            || {
+                let mut builder = self.client.post(&endpoint).json(&body);
+                if let Some(key) = api_key.as_deref() {
+                    builder = builder.bearer_auth(key);
+                }
+                builder
+            },
+        )
         .await?;
         validate_audio_payload(
             request.format,
@@ -277,6 +290,7 @@ pub(super) fn validate_path_component(value: &str, label: &str) -> Result<()> {
 pub(super) async fn send_with_retry<F>(
     cancel_token: &CancellationToken,
     max_attempts: usize,
+    max_success_body_bytes: usize,
     build_request: F,
 ) -> Result<HttpPayload>
 where
@@ -302,13 +316,11 @@ where
                         .get(reqwest::header::CONTENT_TYPE)
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_string);
-                    let bytes = tokio::select! {
-                        _ = cancel_token.cancelled() => return Err(TtsError::Cancelled),
-                        result = response.bytes() => result?,
-                    };
+                    let bytes =
+                        read_response_body(response, max_success_body_bytes, cancel_token).await?;
                     if !bytes.is_empty() {
                         return Ok(HttpPayload {
-                            bytes: bytes.to_vec(),
+                            bytes,
                             content_type,
                         });
                     }
@@ -318,8 +330,13 @@ where
                 } else {
                     let retryable = status.is_server_error() || status.as_u16() == 429;
                     let retry_after = retry_after_delay(response.headers());
-                    let detail = response.text().await.unwrap_or_default();
-                    let detail = detail.chars().take(300).collect::<String>();
+                    let detail =
+                        read_response_body(response, MAX_JSON_RESPONSE_BODY_BYTES, cancel_token)
+                            .await?;
+                    let detail = String::from_utf8_lossy(&detail)
+                        .chars()
+                        .take(MAX_PROVIDER_ERROR_DETAIL_CHARS)
+                        .collect::<String>();
                     last_error = Some(TtsError::Provider(format!("HTTP {status}: {detail}")));
                     if !retryable {
                         break;
@@ -357,6 +374,44 @@ where
         }
     }
     Err(last_error.unwrap_or_else(|| TtsError::Provider("no attempts were made".to_string())))
+}
+
+async fn read_response_body(
+    mut response: reqwest::Response,
+    max_body_bytes: usize,
+    cancel_token: &CancellationToken,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_body_bytes as u64)
+    {
+        return Err(response_body_too_large(max_body_bytes));
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .unwrap_or(0)
+        .min(max_body_bytes.min(64 * 1024) as u64) as usize;
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    loop {
+        let chunk = tokio::select! {
+            _ = cancel_token.cancelled() => return Err(TtsError::Cancelled),
+            result = response.chunk() => result?,
+        };
+        let Some(chunk) = chunk else {
+            return Ok(bytes);
+        };
+        if chunk.len() > max_body_bytes.saturating_sub(bytes.len()) {
+            return Err(response_body_too_large(max_body_bytes));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+}
+
+fn response_body_too_large(max_body_bytes: usize) -> TtsError {
+    TtsError::Provider(format!(
+        "provider response body exceeds the {max_body_bytes}-byte limit"
+    ))
 }
 
 fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -438,6 +493,15 @@ pub(super) mod test_support {
         response_body: Vec<u8>,
         content_type: &str,
     ) -> (String, mpsc::Receiver<String>) {
+        let content_length = response_body.len() as u64;
+        one_request_server_with_content_length(response_body, content_type, content_length)
+    }
+
+    pub fn one_request_server_with_content_length(
+        response_body: Vec<u8>,
+        content_type: &str,
+        content_length: u64,
+    ) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock listener");
         let address = listener.local_addr().expect("mock address");
         let content_type = content_type.to_string();
@@ -470,8 +534,7 @@ pub(super) mod test_support {
                 }
             }
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                response_body.len()
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
             );
             stream
                 .write_all(response.as_bytes())
@@ -650,6 +713,28 @@ mod tests {
         let a = provider.synthesize(request.clone()).await.unwrap();
         let b = provider.synthesize(request).await.unwrap();
         assert_eq!(a.bytes, b.bytes);
+    }
+
+    #[tokio::test]
+    async fn rejects_audio_response_with_oversized_content_length_before_buffering_body() {
+        let (base_url, _) = test_support::one_request_server_with_content_length(
+            b"ID3small-body".to_vec(),
+            "audio/mpeg",
+            MAX_AUDIO_RESPONSE_BODY_BYTES as u64 + 1,
+        );
+        let client = build_http_client(5).unwrap();
+        let cancel_token = CancellationToken::new();
+        let error = match send_with_retry(&cancel_token, 1, MAX_AUDIO_RESPONSE_BODY_BYTES, || {
+            client.get(&base_url)
+        })
+        .await
+        {
+            Ok(_) => panic!("oversized response should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, TtsError::Provider(_)));
+        assert!(error.to_string().contains("67108864-byte limit"));
     }
 
     #[test]
