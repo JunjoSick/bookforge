@@ -18,7 +18,7 @@ of translation quality.
 
 ## Status
 
-BookForge v2.0 is usable for EPUB translation, PDF-to-EPUB ingestion, and
+BookForge v2.5.1 is usable for EPUB translation, PDF-to-EPUB ingestion, and
 local browser-based translation runs:
 
 - EPUB inspect, parse, segment, and rebuild
@@ -32,7 +32,8 @@ local browser-based translation runs:
 - Ollama and llama.cpp local-model presets
 - Bounded parallel segment translation with `--concurrency`
 - SQLite checkpoint store
-- Resume and retry commands
+- Cooperative pause, stop, resume, retry, and replacement-worker recovery
+- Live, cache-safe reconfiguration of concurrency, budgets, retries, and QA
 - Status and tail commands for persisted jobs
 - Live monitoring: terminal dashboard (`watch` / `--ui tui`) and a local
   browser dashboard (`serve`) over a shared, replayable run-state layer
@@ -44,10 +45,27 @@ local browser-based translation runs:
   command line
 - Segment-level cache reuse for compatible prior translations
 - Static side-by-side review HTML with flag export/import
+- Validated human corrections that are protected from model and cache overwrites
+- Replace and bilingual append output modes
 - QA reports in JSON and Markdown
 - Optional LLM QA review pass
 - Cost estimates for known provider/model pairs
 - Externalized, overridable provider pricing
+- Resumable audiobook generation with hosted and local TTS providers
+
+## Documentation
+
+| If you want to... | Start here |
+| --- | --- |
+| Install BookForge and run a first browser translation | [Install and setup](#install-and-setup) |
+| Understand every CLI command and a full job workflow | [CLI guide](docs/CLI_REFERENCE.md) |
+| Configure hosted or local translation providers | [Provider guide](docs/PROVIDERS.md) |
+| Diagnose installation, job, provider, EPUB, PDF, or audio problems | [Troubleshooting](docs/TROUBLESHOOTING.md) |
+| Understand checkpoints, resume, and cache reuse | [Checkpointing](docs/CHECKPOINTING.md) |
+| Generate audiobooks | [Audiobooks](docs/audiobooks.md) |
+| Understand EPUB parsing and rebuilding | [EPUB pipeline](docs/EPUB_PIPELINE.md) |
+| Understand the system design and crate boundaries | [Architecture](docs/ARCHITECTURE.md) |
+| Contribute code or documentation | [Contributing](CONTRIBUTING.md) |
 
 ## Install And Setup
 
@@ -202,6 +220,15 @@ directory; on Windows use the poppler-windows release zip):
 cargo run -p bookforge-cli -- convert paper.pdf --out paper.epub
 ```
 
+The converter detects one- and two-column layouts per page, repairs hyphenated
+line breaks, joins paragraphs across pages, and maps oversized fonts to
+headings. When Poppler's optional rendering and image tools are available, it
+also preserves detected figures, tables, and equations as page crops.
+Low-confidence pages can be linearized, preserved as images, or sent to a
+configured OCR endpoint. The generated fidelity report compares reconstructed
+text with the raw `pdftotext` baseline and itemizes layout decisions. Review
+that report and run `inspect` before spending translation tokens.
+
 For scanned or otherwise low-confidence pages, add an OpenAI-compatible OCR
 server. Successful pages are reported with `action=ocr`; local loopback
 servers do not require an API key:
@@ -213,15 +240,6 @@ cargo run -p bookforge-cli -- convert scan.pdf --out scan.epub \
 
 See [docs/pdf-ocr.md](docs/pdf-ocr.md) for the recommended Unlimited-OCR
 SGLang setup and the vLLM alternative.
-
-The converter detects two-column layouts per page (scientific papers),
-repairs hyphenated line breaks, joins paragraphs across pages, and maps
-oversized fonts to headings. It prints a fidelity report comparing the
-reconstructed text against the raw `pdftotext` baseline — check that
-coverage number (and `inspect` on the result) before spending tokens.
-Figures, tables, equations, and low-confidence page fallbacks are preserved or
-reported according to the conversion options; complex layouts still require
-review.
 
 Inspect an EPUB:
 

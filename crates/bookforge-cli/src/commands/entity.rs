@@ -20,9 +20,13 @@ pub struct EntitiesArgs {
 
 #[derive(Debug, Subcommand)]
 enum EntitiesCommand {
+    /// List stored entity sheets.
     List(ListArgs),
+    /// Import entities from a BookForge TOML file.
     Import(ImportArgs),
+    /// Remove all entities in a selected scope.
     Clear(ClearArgs),
+    /// Show the merged entity guidance for a translation context.
     Show(ShowArgs),
 }
 

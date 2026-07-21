@@ -20,10 +20,15 @@ pub struct StyleArgs {
 
 #[derive(Debug, Subcommand)]
 enum StyleCommand {
+    /// List stored style sheets.
     List(ListArgs),
+    /// Import a BookForge style TOML file.
     Import(ImportArgs),
+    /// Export a stored style sheet to TOML.
     Export(ExportArgs),
+    /// Remove all style sheets in a selected scope.
     Clear(ClearArgs),
+    /// Show the merged style guidance for a translation context.
     Show(ShowArgs),
 }
 
