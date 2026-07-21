@@ -20,13 +20,21 @@ pub struct GlossaryArgs {
 
 #[derive(Debug, Subcommand)]
 enum GlossaryCommand {
+    /// List stored terms, optionally filtered by scope or language pair.
     List(ListArgs),
+    /// Add one source-to-target term.
     Add(AddArgs),
+    /// Remove a term by its numeric ID.
     Remove(RemoveArgs),
+    /// Remove all terms in a selected scope.
     Clear(ClearArgs),
+    /// Import terms from a BookForge glossary TOML file.
     Import(ImportArgs),
+    /// Export matching terms to a BookForge glossary TOML file.
     Export(ExportArgs),
+    /// Find repeated names and terms in an EPUB for later review.
     ExtractCandidates(ExtractCandidatesArgs),
+    /// Interactively accept, translate, or reject extracted candidates.
     ReviewCandidates(ReviewCandidatesArgs),
 }
 

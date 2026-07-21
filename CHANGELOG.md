@@ -2,6 +2,62 @@
 
 ## Unreleased
 
+## v2.6.0 - 2026-07-21
+
+- **Breaking:** existing audio chunk caches are invalidated by the
+  `bookforge-audio-v2` synthesis hash and manifest schema 3. The manifest adds
+  narration kind, seed, language, text-normalization, gaps, and author data
+  while retaining serde-defaulted backward reads. Rerun audiobook jobs with
+  `--prune` to remove superseded chunk files (`--prune --dry-run` previews the
+  cleanup).
+- Audiobook narration now preserves document hierarchy: chapter titles and
+  in-section headings are emitted as separate typed chunks instead of being
+  packed into body prose. Stitching adds configurable chapter, title/heading,
+  and paragraph silence (1200/800/0 ms by default), with automatic ElevenLabs
+  `<break>` tags on supported v2 models.
+- ElevenLabs synthesis now supplies up to 300 characters of same-chapter
+  `previous_text` and `next_text` for smoother joins, plus optional `--seed`,
+  `--language`, and `--text-normalization` controls. Language codes are sent
+  only to Flash/Turbo v2.5 and are warned-and-dropped for every other model or
+  provider.
+- A chaptered `audiobook.m4b` with chapter markers and title/artist metadata is
+  now the default deliverable when ffmpeg is available; `--no-book-file` opts
+  out and `--single` adds a flat audio file for on-the-go listening. Added
+  configurable whole-book `--loudnorm` while leaving per-chapter files
+  unnormalized.
+- Added schema-1 per-character TTS pricing in
+  `crates/bookforge-cli/pricing/audio-providers.json`, estimated dollar/credit
+  cost in audiobook plan and dry-run output, and a non-fatal ElevenLabs
+  subscription-quota preflight. Pricing figures are estimates; provider billing
+  is authoritative. Added one-based chapter subset selection with `--chapters` and
+  ElevenLabs account voice discovery with `--list-voices`.
+- Brought the browser audiobook workflow to CLI parity: ElevenLabs now offers
+  `Auto (recommended)` model selection and a server-side voice-list proxy at
+  `GET /api/audio/voices`; pre-launch estimates from
+  `POST /api/audiobook/estimate` include cost and quota; progress is grouped by
+  chapter; and completed `.m4b` files can be played in-page. An Advanced
+  section exposes chapter pause, flat-file output, loudness normalization,
+  seed, and language.
+- Added optional OCR recovery for low-confidence PDF pages through
+  OpenAI-compatible endpoints, including the SGLang-specific Unlimited-OCR
+  dialect, retrying blocking HTTP client, `action=ocr` reporting, and a
+  loopback-friendly endpoint doctor.
+- Added an Unlimited-OCR deployment guide and helper script for serializing
+  SGLang's custom no-repeat n-gram logit processor.
+- Audiobook chapter extraction now recognizes canonical Toki Pona headings
+  such as `lipu nanpa VI` and can recover chapter boundaries from legacy
+  BookForge translations that used the old `KAPITELO` label.
+- ElevenLabs audiobook requests now enforce each model's documented character
+  limit consistently in the CLI, dashboard, server, and provider layer: 40,000
+  for Flash/Turbo v2.5, 10,000 for Multilingual v2, and 5,000 for Eleven v3.
+- ElevenLabs live audiobook runs now auto-select the first available compatible
+  model in the preference order Eleven v3, Flash v2.5, Turbo v2.5, then
+  Multilingual v2, with a warning and Multilingual v2 fallback if preflight
+  fails. Explicit models still bypass preflight, and dry runs stay offline.
+- ElevenLabs requests now omit `voice_settings` at the default speed, reject
+  speed changes with Eleven v3, and list dashboard models in preference order
+  while retaining Multilingual v2 as the dashboard default.
+
 ## v2.5.1 - 2026-07-16
 
 - Fixed drag-and-drop uploads in the dashboard. The translation and audiobook

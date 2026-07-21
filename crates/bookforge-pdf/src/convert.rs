@@ -17,6 +17,7 @@ use crate::{
         ColumnMode, DocBlock, Fragment, ImageAsset, ImageRegion, LowConfidenceMode, Page, Span,
         normalize_text_key, spans_text,
     },
+    ocr::OcrEngine,
     parse::parse_pdf2xml,
     reconstruct::{AnchoredBlock, BlockAnchor, PageStats, reconstruct},
     report::{ConversionReport, LOW_CONFIDENCE_COVERAGE_RATIO, ReportMetrics},
@@ -39,7 +40,7 @@ use detection::{
 #[cfg(test)]
 use rendering::remove_blocks_in_region;
 use rendering::{
-    PageCropRenderer, image_asset, insert_figure_blocks, media_asset,
+    PageCropRenderer, image_asset, insert_figure_blocks, media_asset, ocr_low_confidence_pages,
     preserve_low_confidence_pages, render_figure_crop,
 };
 use reporting::{baseline_page_char_counts, mark_low_confidence_pages, media_layout_warnings};
@@ -78,8 +79,17 @@ pub fn convert_pdf(
     output: &Path,
     options: &ConvertOptions,
 ) -> Result<ConvertOutcome> {
+    convert_pdf_with_ocr(input, output, options, None)
+}
+
+pub fn convert_pdf_with_ocr(
+    input: &Path,
+    output: &Path,
+    options: &ConvertOptions,
+    ocr: Option<&dyn OcrEngine>,
+) -> Result<ConvertOutcome> {
     let tools = PopplerTools::discover()?;
-    convert_pdf_with_tools(input, output, options, &tools)
+    convert_pdf_with_tools(input, output, options, &tools, ocr)
 }
 
 fn convert_pdf_with_tools(
@@ -87,6 +97,7 @@ fn convert_pdf_with_tools(
     output: &Path,
     options: &ConvertOptions,
     tools: &PopplerTools,
+    ocr: Option<&dyn OcrEngine>,
 ) -> Result<ConvertOutcome> {
     let xml = tools.pdf_to_xml(input)?;
     let pages = parse_pdf2xml(&xml)?;
@@ -98,7 +109,8 @@ fn convert_pdf_with_tools(
     for (stats, chars) in page_stats.iter_mut().zip(baseline_page_chars) {
         stats.baseline_chars = chars;
     }
-    let low_confidence_pages = mark_low_confidence_pages(&mut page_stats, options.low_confidence);
+    let mut low_confidence_pages =
+        mark_low_confidence_pages(&mut page_stats, options.low_confidence);
 
     let media_dir = scoped_temp_dir("bookforge-pdf-media")?;
     let image_dir = scoped_temp_dir("bookforge-pdf-images")?;
@@ -134,6 +146,23 @@ fn convert_pdf_with_tools(
     let mut blocks = reconstruction.blocks;
     let media_preserved_chars =
         insert_figure_blocks(&mut blocks, figure_blocks, &mut layout_warnings);
+    if let Some(engine) = ocr {
+        let ocr_page_dir = scoped_temp_dir("bookforge-pdf-ocr-pages")?;
+        let mut render = |page_number| {
+            let path = tools.render_page_png(input, page_number, &ocr_page_dir)?;
+            Ok(fs::read(path)?)
+        };
+        let ocr_outcome =
+            ocr_low_confidence_pages(engine, &mut render, &mut blocks, &low_confidence_pages);
+        let _ = fs::remove_dir_all(&ocr_page_dir);
+        for stats in &mut page_stats {
+            if ocr_outcome.recovered.contains(&stats.page) {
+                stats.low_confidence_action = Some("ocr".to_string());
+            }
+        }
+        low_confidence_pages.retain(|page| !ocr_outcome.recovered.contains(page));
+        layout_warnings.extend(ocr_outcome.warnings);
+    }
     if options.low_confidence == LowConfidenceMode::Preserve {
         layout_warnings.extend(preserve_low_confidence_pages(
             input,

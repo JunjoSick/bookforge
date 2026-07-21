@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 #[cfg(feature = "tui")]
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -7,14 +8,16 @@ use anyhow::{Context, Result};
 use bookforge_audio::{
     AudioFormat, AudiobookOptions, ElevenLabsTtsConfig, ElevenLabsTtsProvider, GeminiTtsConfig,
     GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider, Progress,
-    StitchOptions, build_audiobook, plan_chunks, stitch, validate_options,
+    StitchOptions, TextNormalization, build_audiobook, elevenlabs_model_max_input_chars,
+    fetch_elevenlabs_subscription, list_elevenlabs_voices, plan_chunks,
+    resolve_preferred_elevenlabs_model, stitch, validate_options,
 };
 use bookforge_epub::{ReflowOptions, read_epub, reflow_epub};
 use clap::{Args, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio_util::sync::CancellationToken;
 
-use crate::progress::UiMode;
+use crate::{audio_cost::AudioCost, progress::UiMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -55,10 +58,35 @@ impl AudioFormatArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum BreakTagsArg {
+    Auto,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum TextNormalizationArg {
+    Auto,
+    On,
+    Off,
+}
+
+impl TextNormalizationArg {
+    fn into_audio(self) -> TextNormalization {
+        match self {
+            Self::Auto => TextNormalization::Auto,
+            Self::On => TextNormalization::On,
+            Self::Off => TextNormalization::Off,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct AudiobookArgs {
     /// Source EPUB to narrate.
-    pub input: PathBuf,
+    pub input: Option<PathBuf>,
 
     /// Output directory for the audio files and manifest. Defaults to
     /// `<input-stem>.audiobook`.
@@ -111,14 +139,62 @@ pub struct AudiobookArgs {
     #[arg(long)]
     pub instructions: Option<String>,
 
+    /// Pause between chapters in milliseconds when stitching.
+    #[arg(long, default_value_t = 1_200)]
+    pub gap_chapter_ms: u32,
+
+    /// Pause after chapter titles and headings in milliseconds.
+    #[arg(long, default_value_t = 800)]
+    pub gap_title_ms: u32,
+
+    /// Pause between body chunks in milliseconds.
+    #[arg(long, default_value_t = 0)]
+    pub gap_paragraph_ms: u32,
+
+    /// Add supported ElevenLabs SSML-like breaks after headings.
+    #[arg(long, value_enum, default_value_t = BreakTagsArg::Auto)]
+    pub break_tags: BreakTagsArg,
+
+    /// Deterministic ElevenLabs synthesis seed.
+    #[arg(long)]
+    pub seed: Option<u32>,
+
+    /// Narration language code. Defaults to the EPUB language.
+    #[arg(long)]
+    pub language: Option<String>,
+
+    /// ElevenLabs text-normalization policy.
+    #[arg(long, value_enum, default_value_t = TextNormalizationArg::Auto)]
+    pub text_normalization: TextNormalizationArg,
+
+    /// Normalize loudness while assembling whole-book files.
+    #[arg(long, default_value_t = false)]
+    pub loudnorm: bool,
+
+    /// Also assemble a flat whole-book file in the selected audio format.
+    #[arg(long, default_value_t = false)]
+    pub single: bool,
+
+    /// Narrate only these 1-based chapters (for example `1-3,7`).
+    #[arg(long, value_parser = parse_chapter_ranges)]
+    pub chapters: Option<BTreeSet<usize>>,
+
+    /// List the voices on an ElevenLabs account and exit.
+    #[arg(long, default_value_t = false)]
+    pub list_voices: bool,
+
     /// After synthesis, join each chapter's parts into one file with ffmpeg.
     #[arg(long, default_value_t = false)]
     pub stitch: bool,
 
-    /// Also assemble a single `.m4b` with chapter markers. Implies
-    /// `--stitch` and requires ffmpeg (and ffprobe for the markers).
+    /// Explicitly assemble a chapter-marked `.m4b`. This is already the
+    /// default when ffmpeg is available; the flag remains a strict override.
     #[arg(long, default_value_t = false)]
     pub m4b: bool,
+
+    /// Do not automatically create the default chapter-marked `.m4b`.
+    #[arg(long, default_value_t = false)]
+    pub no_book_file: bool,
 
     /// Print the chapter/chunk plan and exit without synthesizing.
     #[arg(long, default_value_t = false)]
@@ -137,13 +213,30 @@ pub struct AudiobookArgs {
     pub ui: UiMode,
 }
 
-pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
-    let (book, pdf_page_grouping) = read_epub_for_audio(&args.input)?;
+#[derive(Debug, Clone, Copy)]
+struct QuotaInfo {
+    remaining: u64,
+    limit: u64,
+}
 
-    let out_dir = args
-        .out
-        .clone()
-        .unwrap_or_else(|| default_out_dir(&args.input));
+pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
+    if args.list_voices {
+        return list_voices_and_exit(&args).await;
+    }
+    let input = args
+        .input
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("INPUT is required unless --list-voices is passed"))?;
+    if args.seed.is_some() && args.provider != AudioProviderKind::Elevenlabs {
+        anyhow::bail!("--seed is supported only with --provider elevenlabs");
+    }
+    if args.timeout_seconds == 0 {
+        anyhow::bail!("--timeout-seconds must be greater than zero");
+    }
+
+    let (book, pdf_page_grouping) = read_epub_for_audio(input)?;
+
+    let out_dir = args.out.clone().unwrap_or_else(|| default_out_dir(input));
     let format = args
         .format
         .map(AudioFormatArg::into_format)
@@ -157,7 +250,9 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         AudioProviderKind::Openai => args.voice.clone().unwrap_or_else(|| "alloy".to_string()),
         AudioProviderKind::Gemini => args.voice.clone().unwrap_or_else(|| "Kore".to_string()),
         AudioProviderKind::Elevenlabs => args.voice.clone().ok_or_else(|| {
-            anyhow::anyhow!("ElevenLabs requires --voice with an ElevenLabs voice ID")
+            anyhow::anyhow!(
+                "ElevenLabs requires --voice with an ElevenLabs voice ID; run `bookforge audiobook --list-voices --provider elevenlabs` to see the voices on your account"
+            )
         })?,
     };
     if args.provider == AudioProviderKind::Mock && format != AudioFormat::Wav {
@@ -185,15 +280,17 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             "ElevenLabs has no free-form instructions field; use --speed, voice settings stored in ElevenLabs, or inline model-supported audio tags"
         );
     }
-    if (args.stitch || args.m4b) && format == AudioFormat::Pcm {
+    let ffmpeg_available = bookforge_audio::ffmpeg_available();
+    let make_m4b = args.m4b || (!args.no_book_file && ffmpeg_available);
+    let postprocess = args.stitch || make_m4b || args.single;
+    if postprocess && format == AudioFormat::Pcm {
         anyhow::bail!(
-            "raw PCM does not carry the sample metadata needed for stitching; choose wav, mp3, opus, aac, or flac"
+            "raw PCM does not carry the sample metadata needed for stitching, --m4b, or --single; choose wav, mp3, opus, aac, or flac (or pass --no-book-file for per-chunk PCM output)"
         );
     }
-    if args.timeout_seconds == 0 {
-        anyhow::bail!("--timeout-seconds must be greater than zero");
-    }
 
+    let elevenlabs_dry_run_default =
+        args.provider == AudioProviderKind::Elevenlabs && args.model.is_none() && args.dry_run;
     let (model, synthesis_id) = match args.provider {
         AudioProviderKind::Mock => {
             let model = args
@@ -239,10 +336,41 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             (model.clone(), format!("gemini:{base_url}:{model}"))
         }
         AudioProviderKind::Elevenlabs => {
-            let model = args
-                .model
-                .clone()
-                .unwrap_or_else(|| "eleven_multilingual_v2".to_string());
+            let model = if let Some(model) = args.model.clone() {
+                model
+            } else if args.dry_run {
+                "eleven_multilingual_v2".to_string()
+            } else {
+                let mut config = ElevenLabsTtsConfig::hosted(None);
+                if let Some(base_url) = args.base_url.clone() {
+                    config.base_url = base_url;
+                }
+                if let Some(api_key_env) = args.api_key_env.clone() {
+                    config.api_key_env = api_key_env;
+                }
+                config.timeout_seconds = args.timeout_seconds.min(15);
+                match resolve_preferred_elevenlabs_model(
+                    &config,
+                    args.max_chars,
+                    (args.speed - 1.0).abs() > f32::EPSILON,
+                )
+                .await
+                {
+                    Ok(model) => model,
+                    Err(error) => {
+                        eprintln!(
+                            "warning: ElevenLabs model preflight failed ({error}); using default eleven_multilingual_v2"
+                        );
+                        "eleven_multilingual_v2".to_string()
+                    }
+                }
+            };
+            let model_limit = elevenlabs_model_max_input_chars(&model);
+            if args.max_chars > model_limit {
+                anyhow::bail!(
+                    "ElevenLabs model {model} is limited to {model_limit} characters; set --max-chars to {model_limit} or less"
+                );
+            }
             let base_url = args
                 .base_url
                 .as_deref()
@@ -251,6 +379,21 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             (model.clone(), format!("elevenlabs:{base_url}:{model}"))
         }
     };
+    if args.provider == AudioProviderKind::Elevenlabs
+        && model == "eleven_v3"
+        && (args.speed - 1.0).abs() > f32::EPSILON
+    {
+        anyhow::bail!(
+            "eleven_v3 has no speed control on the ElevenLabs TTS endpoint; use --speed 1.0 or pick another model"
+        );
+    }
+    let language_code = resolve_language_code(
+        args.provider,
+        &model,
+        args.language.as_deref(),
+        book.metadata.language.as_deref(),
+    );
+    let heading_break_tag = resolve_heading_break_tag(args.provider, &model, args.break_tags);
     let options = AudiobookOptions {
         out_dir: out_dir.clone(),
         voice: voice.clone(),
@@ -260,6 +403,13 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         concurrency: args.concurrency,
         synthesis_id,
         instructions: args.instructions.clone(),
+        context_chars: 300,
+        seed: args.seed,
+        language_code,
+        text_normalization: (args.provider == AudioProviderKind::Elevenlabs)
+            .then(|| args.text_normalization.into_audio()),
+        heading_break_tag,
+        chapter_filter: args.chapters.clone(),
         pdf_page_grouping,
     };
     validate_options(&options)?;
@@ -268,7 +418,7 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     if plan.is_empty() {
         anyhow::bail!(
             "no narratable text found in {} (cover-only or empty book?)",
-            args.input.display()
+            input.display()
         );
     }
     let chapter_count = plan
@@ -277,21 +427,44 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     let total_chars: usize = plan.iter().map(|chunk| chunk.chars).sum();
+    let provider_name = audio_provider_name(args.provider);
+    crate::audio_cost::load_audio_pricing()?;
+    let estimated_cost = crate::audio_cost::estimate_audio_cost(provider_name, &model, total_chars);
+    let cost_line = format_audio_cost_line(estimated_cost);
+    let quota = elevenlabs_quota_preflight(&args, &model, total_chars).await;
 
     let human_output = !matches!(args.ui, UiMode::Quiet | UiMode::Json | UiMode::Tui);
     if human_output {
-        println!("Input: {}", args.input.display());
+        println!("Input: {}", input.display());
         println!(
             "Title: {}",
             book.metadata.title.as_deref().unwrap_or("(untitled)")
         );
         println!("Output: {}", out_dir.display());
         println!("Voice: {voice} | Format: {}", format.extension());
-        println!("Model: {model}");
+        if elevenlabs_dry_run_default {
+            println!(
+                "Model: {model} (default; a live run auto-selects the best available ElevenLabs model)"
+            );
+        } else {
+            println!("Model: {model}");
+        }
         println!(
             "Plan: {chapter_count} chapters, {} chunks, {total_chars} characters",
             plan.len()
         );
+        println!("{cost_line}");
+        if let Some(quota) = quota {
+            println!(
+                "ElevenLabs quota: {} remaining of {}",
+                quota.remaining, quota.limit
+            );
+        }
+        if !ffmpeg_available && !args.no_book_file && !args.m4b {
+            eprintln!(
+                "warning: ffmpeg not found on PATH; only per-chunk audio files will be produced"
+            );
+        }
     }
 
     if args.dry_run {
@@ -309,6 +482,14 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                     "chapters": chapter_count,
                     "chunks": plan.len(),
                     "characters": total_chars,
+                    "provider": provider_name,
+                    "model": model,
+                    "estimated_cost_usd": estimated_cost.and_then(|cost| cost.usd),
+                    "estimated_credits": estimated_cost.and_then(|cost| cost.credits),
+                    "quota_remaining": quota.map(|quota| quota.remaining),
+                    "quota_limit": quota.map(|quota| quota.limit),
+                    "book_file": make_m4b,
+                    "single_file": args.single,
                     "dry_run": true,
                     "stale_chunks": stale.len(),
                     "stale_bytes": stale.iter().map(|chunk| chunk.bytes).sum::<u64>(),
@@ -321,6 +502,27 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             }
         }
         return Ok(());
+    }
+
+    if args.ui == UiMode::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "audiobook_plan",
+                "chapters": chapter_count,
+                "chunks": plan.len(),
+                "characters": total_chars,
+                "provider": provider_name,
+                "model": model,
+                "estimated_cost_usd": estimated_cost.and_then(|cost| cost.usd),
+                "estimated_credits": estimated_cost.and_then(|cost| cost.credits),
+                "quota_remaining": quota.map(|quota| quota.remaining),
+                "quota_limit": quota.map(|quota| quota.limit),
+                "book_file": make_m4b,
+                "single_file": args.single,
+                "dry_run": false,
+            })
+        );
     }
 
     #[cfg(feature = "tui")]
@@ -340,11 +542,13 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                 .title
                 .clone()
                 .unwrap_or_else(|| "(untitled)".to_string()),
-            input: args.input.display().to_string(),
+            input: input.display().to_string(),
             output: out_dir.display().to_string(),
-            provider: format!("{:?}", args.provider).to_ascii_lowercase(),
+            provider: provider_name.to_string(),
             model: model.clone(),
             voice: voice.clone(),
+            cost_line: Some(cost_line.clone()),
+            chapters_total: chapter_count,
             total: plan.len(),
         })?;
         app.draw()?;
@@ -393,12 +597,18 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     };
 
     let fallback_tui_output = args.ui == UiMode::Tui && !use_tui;
-    let stitch_report = if args.stitch || args.m4b {
+    let stitch_report = if postprocess {
         Some(stitch_output(
             &report.manifest_path,
             &out_dir,
             format,
+            make_m4b,
             args.m4b,
+            args.single,
+            args.gap_chapter_ms,
+            args.gap_title_ms,
+            args.gap_paragraph_ms,
+            args.loudnorm,
             &book,
             human_output || fallback_tui_output,
         )?)
@@ -414,6 +624,21 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             report.files.len()
         );
         println!("Manifest: {}", report.manifest_path.display());
+        let chapter_files = stitch_report
+            .as_ref()
+            .map_or(0, |result| result.chapter_files.len());
+        println!(
+            "Artifacts: {} chunk files, {chapter_files} chapter files, book file: {}, single file: {}",
+            report.files.len(),
+            stitch_report
+                .as_ref()
+                .and_then(|result| result.book_file.as_ref())
+                .map_or("none".to_string(), |path| path.display().to_string()),
+            stitch_report
+                .as_ref()
+                .and_then(|result| result.single_file.as_ref())
+                .map_or("none".to_string(), |path| path.display().to_string()),
+        );
     } else if args.ui == UiMode::Json {
         println!(
             "{}",
@@ -424,16 +649,18 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                 "cached": report.chunks_skipped,
                 "chunks": report.chunks_total,
                 "manifest": report.manifest_path,
+                "chunk_files": report.files,
                 "chapter_files": stitch_report.as_ref().map(|result| &result.chapter_files),
                 "audiobook": stitch_report.as_ref().and_then(|result| result.book_file.as_ref()),
+                "single_file": stitch_report.as_ref().and_then(|result| result.single_file.as_ref()),
                 "warnings": stitch_report.as_ref().map(|result| &result.warnings),
             })
         );
     }
 
-    if stitch_report.is_none() && human_output {
+    if stitch_report.is_none() && human_output && args.no_book_file {
         println!(
-            "Tip: pass --stitch to join each chapter into one file, or --m4b for a single audiobook file."
+            "Tip: pass --stitch to join each chapter, --m4b for a chapter-marked book, or --single for a flat whole-book file."
         );
     }
 
@@ -490,6 +717,213 @@ fn report_stale_chunks(stale: &[bookforge_audio::StaleChunk], deleted: bool) {
                 .unwrap_or_default(),
             format_bytes(chunk.bytes)
         );
+    }
+}
+
+pub(crate) fn parse_chapter_ranges(value: &str) -> Result<BTreeSet<usize>> {
+    let mut chapters = BTreeSet::new();
+    for raw_item in value.split(',') {
+        let item = raw_item.trim();
+        if item.is_empty() {
+            anyhow::bail!("chapter range contains an empty item");
+        }
+        if let Some((raw_start, raw_end)) = item.split_once('-') {
+            let start = parse_chapter_number(raw_start.trim())?;
+            let end = parse_chapter_number(raw_end.trim())?;
+            if start > end {
+                anyhow::bail!("chapter range {start}-{end} is reversed");
+            }
+            chapters.extend(start..=end);
+        } else {
+            chapters.insert(parse_chapter_number(item)?);
+        }
+    }
+    Ok(chapters)
+}
+
+fn parse_chapter_number(value: &str) -> Result<usize> {
+    let chapter = value
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("invalid chapter number '{value}'"))?;
+    if chapter == 0 {
+        anyhow::bail!("chapter numbers are 1-based; 0 is not valid");
+    }
+    Ok(chapter)
+}
+
+fn normalize_language_code(value: &str) -> Option<String> {
+    value
+        .trim()
+        .split(['-', '_'])
+        .next()
+        .filter(|primary| !primary.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn resolve_language_code(
+    provider: AudioProviderKind,
+    model: &str,
+    explicit: Option<&str>,
+    metadata: Option<&str>,
+) -> Option<String> {
+    let language = explicit
+        .and_then(normalize_language_code)
+        .or_else(|| metadata.and_then(normalize_language_code));
+    if provider == AudioProviderKind::Elevenlabs
+        && matches!(model, "eleven_flash_v2_5" | "eleven_turbo_v2_5")
+    {
+        return language;
+    }
+    if provider == AudioProviderKind::Elevenlabs && language.is_some() {
+        eprintln!(
+            "warning: ElevenLabs model {model} rejects language_code; ignoring {} language",
+            if explicit.is_some() {
+                "the explicit --language"
+            } else {
+                "the EPUB"
+            }
+        );
+    } else if explicit.is_some() {
+        eprintln!(
+            "warning: --language is only applied to ElevenLabs flash/turbo v2.5 models; ignoring it for {}",
+            audio_provider_name(provider)
+        );
+    }
+    None
+}
+
+fn resolve_heading_break_tag(
+    provider: AudioProviderKind,
+    model: &str,
+    setting: BreakTagsArg,
+) -> Option<String> {
+    (setting == BreakTagsArg::Auto
+        && provider == AudioProviderKind::Elevenlabs
+        && matches!(
+            model,
+            "eleven_flash_v2_5" | "eleven_turbo_v2_5" | "eleven_multilingual_v2"
+        ))
+    .then(|| "<break time=\"0.6s\" />".to_string())
+}
+
+fn audio_provider_name(provider: AudioProviderKind) -> &'static str {
+    match provider {
+        AudioProviderKind::Mock => "mock",
+        AudioProviderKind::Openai => "openai",
+        AudioProviderKind::Gemini => "gemini",
+        AudioProviderKind::Elevenlabs => "elevenlabs",
+    }
+}
+
+fn format_audio_cost_line(cost: Option<AudioCost>) -> String {
+    match cost {
+        Some(AudioCost {
+            usd: Some(usd),
+            credits: Some(credits),
+        }) => format!("Estimated cost: ~${usd:.2} / ~{credits:.0} credits"),
+        Some(AudioCost { usd: Some(usd), .. }) => format!("Estimated cost: ~${usd:.2}"),
+        Some(AudioCost {
+            credits: Some(credits),
+            ..
+        }) => format!("Estimated cost: ~{credits:.0} credits"),
+        _ => "Estimated cost: no pricing for this model".to_string(),
+    }
+}
+
+async fn list_voices_and_exit(args: &AudiobookArgs) -> Result<()> {
+    if args.provider != AudioProviderKind::Elevenlabs {
+        anyhow::bail!("--list-voices requires --provider elevenlabs");
+    }
+    if args.timeout_seconds == 0 {
+        anyhow::bail!("--timeout-seconds must be greater than zero");
+    }
+    let base_url = args
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.elevenlabs.io/v1");
+    validate_audio_base_url(base_url)?;
+    let key_env = args.api_key_env.as_deref().unwrap_or("ELEVENLABS_API_KEY");
+    let api_key = std::env::var(key_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("environment variable '{key_env}' is not set"))?;
+    let voices = list_elevenlabs_voices(base_url, &api_key, args.timeout_seconds)
+        .await
+        .context("failed to list ElevenLabs voices")?;
+    let id_width = voices
+        .iter()
+        .map(|voice| voice.voice_id.chars().count())
+        .chain(std::iter::once("voice_id".len()))
+        .max()
+        .unwrap_or("voice_id".len());
+    let name_width = voices
+        .iter()
+        .map(|voice| voice.name.chars().count())
+        .chain(std::iter::once("name".len()))
+        .max()
+        .unwrap_or("name".len());
+    println!("{:<id_width$}  {:<name_width$}  labels", "voice_id", "name");
+    for voice in voices {
+        let labels = if voice.labels.is_empty() {
+            "-".to_string()
+        } else {
+            voice
+                .labels
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!(
+            "{:<id_width$}  {:<name_width$}  {labels}",
+            voice.voice_id, voice.name
+        );
+    }
+    Ok(())
+}
+
+async fn elevenlabs_quota_preflight(
+    args: &AudiobookArgs,
+    model: &str,
+    planned_chars: usize,
+) -> Option<QuotaInfo> {
+    if args.provider != AudioProviderKind::Elevenlabs {
+        return None;
+    }
+    let key_env = args.api_key_env.as_deref().unwrap_or("ELEVENLABS_API_KEY");
+    let key_is_set = std::env::var(key_env)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    if args.dry_run && !key_is_set {
+        return None;
+    }
+    let mut config = ElevenLabsTtsConfig::hosted(Some(model.to_string()));
+    if let Some(base_url) = args.base_url.clone() {
+        config.base_url = base_url;
+    }
+    if let Some(api_key_env) = args.api_key_env.clone() {
+        config.api_key_env = api_key_env;
+    }
+    config.timeout_seconds = args.timeout_seconds.min(15);
+    match fetch_elevenlabs_subscription(&config).await {
+        Ok(subscription) => {
+            let remaining = subscription
+                .character_limit
+                .saturating_sub(subscription.character_count);
+            if planned_chars as u64 > remaining {
+                eprintln!(
+                    "warning: planned audiobook has {planned_chars} characters, exceeding the ElevenLabs quota of {remaining} remaining characters"
+                );
+            }
+            Some(QuotaInfo {
+                remaining,
+                limit: subscription.character_limit,
+            })
+        }
+        Err(error) => {
+            eprintln!("warning: ElevenLabs quota preflight failed ({error}); continuing");
+            None
+        }
     }
 }
 
@@ -673,6 +1107,12 @@ fn stitch_output(
     out_dir: &std::path::Path,
     format: AudioFormat,
     make_m4b: bool,
+    require_m4b: bool,
+    make_single: bool,
+    gap_chapter_ms: u32,
+    gap_title_ms: u32,
+    gap_paragraph_ms: u32,
+    loudnorm: bool,
     book: &bookforge_core::ir::Book,
     human_output: bool,
 ) -> Result<bookforge_audio::StitchReport> {
@@ -689,6 +1129,12 @@ fn stitch_output(
         extension: format.extension().to_string(),
         make_m4b,
         title: book.metadata.title.clone(),
+        gap_chapter_ms,
+        gap_title_ms,
+        gap_paragraph_ms,
+        loudnorm,
+        make_single,
+        author: (!book.metadata.creators.is_empty()).then(|| book.metadata.creators.join(", ")),
     };
     let result = stitch(&manifest, &stitch_options);
     if human_output {
@@ -699,13 +1145,21 @@ fn stitch_output(
             println!("Chapter files: {}", result.chapter_files.len());
         }
     }
-    if make_m4b && result.book_file.is_none() {
+    if require_m4b && result.book_file.is_none() {
         anyhow::bail!(
             "--m4b was requested, but audiobook.m4b could not be assembled; install ffmpeg and review the stitch warnings above"
         );
     }
+    if make_single && result.single_file.is_none() {
+        anyhow::bail!(
+            "--single was requested, but the flat whole-book file could not be assembled; install ffmpeg and review the stitch warnings above"
+        );
+    }
     if human_output && let Some(book_file) = &result.book_file {
         println!("Audiobook: {}", book_file.display());
+    }
+    if human_output && let Some(single_file) = &result.single_file {
+        println!("Single file: {}", single_file.display());
     }
     Ok(result)
 }
@@ -742,7 +1196,10 @@ fn validate_audio_base_url(value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_audio_base_url;
+    use super::{
+        AudioProviderKind, BreakTagsArg, normalize_language_code, parse_chapter_ranges,
+        resolve_heading_break_tag, resolve_language_code, validate_audio_base_url,
+    };
 
     #[test]
     fn audio_base_url_allows_https_and_loopback_http_only() {
@@ -751,5 +1208,94 @@ mod tests {
         assert!(validate_audio_base_url("http://127.0.0.1:8880/v1").is_ok());
         assert!(validate_audio_base_url("http://example.com/v1").is_err());
         assert!(validate_audio_base_url("https://token@example.com/v1").is_err());
+    }
+
+    #[test]
+    fn chapter_ranges_accept_singletons_ranges_and_whitespace() {
+        assert_eq!(
+            parse_chapter_ranges("1-3, 7").unwrap(),
+            [1, 2, 3, 7].into_iter().collect()
+        );
+        assert_eq!(
+            parse_chapter_ranges("4").unwrap(),
+            [4].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn chapter_ranges_reject_zero_reversed_empty_and_garbage() {
+        let zero = parse_chapter_ranges("0").unwrap_err().to_string();
+        assert!(zero.contains("1-based"));
+
+        let reversed = parse_chapter_ranges("5-2").unwrap_err().to_string();
+        assert!(reversed.contains("reversed"));
+
+        for value in ["", "1,,2", ",1", "1,"] {
+            let empty = parse_chapter_ranges(value).unwrap_err().to_string();
+            assert!(empty.contains("empty item"), "{value:?}: {empty}");
+        }
+
+        for value in ["x", "1-x", "1-2-3"] {
+            let garbage = parse_chapter_ranges(value).unwrap_err().to_string();
+            assert!(
+                garbage.contains("invalid chapter number"),
+                "{value:?}: {garbage}"
+            );
+        }
+    }
+
+    #[test]
+    fn language_normalization_uses_lowercase_primary_subtag() {
+        assert_eq!(normalize_language_code("en-US").as_deref(), Some("en"));
+        assert_eq!(normalize_language_code("PT_br").as_deref(), Some("pt"));
+        assert_eq!(normalize_language_code("  "), None);
+        assert_eq!(
+            resolve_language_code(
+                AudioProviderKind::Elevenlabs,
+                "eleven_flash_v2_5",
+                None,
+                Some("en-US")
+            )
+            .as_deref(),
+            Some("en")
+        );
+    }
+
+    #[test]
+    fn automatic_break_tags_follow_the_elevenlabs_model_policy() {
+        for model in [
+            "eleven_flash_v2_5",
+            "eleven_turbo_v2_5",
+            "eleven_multilingual_v2",
+        ] {
+            assert!(
+                resolve_heading_break_tag(AudioProviderKind::Elevenlabs, model, BreakTagsArg::Auto)
+                    .is_some()
+            );
+        }
+        assert!(
+            resolve_heading_break_tag(
+                AudioProviderKind::Elevenlabs,
+                "eleven_v3",
+                BreakTagsArg::Auto
+            )
+            .is_none()
+        );
+        assert!(
+            resolve_heading_break_tag(
+                AudioProviderKind::Openai,
+                "eleven_flash_v2_5",
+                BreakTagsArg::Auto
+            )
+            .is_none()
+        );
+        assert!(
+            resolve_heading_break_tag(
+                AudioProviderKind::Elevenlabs,
+                "eleven_flash_v2_5",
+                BreakTagsArg::Off
+            )
+            .is_none()
+        );
     }
 }
