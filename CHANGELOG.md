@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.6.0 - 2026-07-21
+
 - **Breaking:** existing audio chunk caches are invalidated by the
   `bookforge-audio-v2` synthesis hash and manifest schema 3. The manifest adds
   narration kind, seed, language, text-normalization, gaps, and author data
