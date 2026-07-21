@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -18,6 +18,8 @@ use quick_xml::{
     events::{BytesEnd, BytesText, Event},
 };
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
+
+use crate::archive_limits::{ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, validate_archive_metadata};
 
 const TRANSLATION_CLASS: &str = "bookforge-translation";
 const HEADING_TRANSLATION_CLASS: &str = "bookforge-heading-translation";
@@ -116,6 +118,7 @@ fn write_rebuilt_epub(
     })?;
     let source = File::open(source_path)?;
     let mut archive = ZipArchive::new(source)?;
+    let mut read_budget = validate_archive_metadata(&mut archive, DEFAULT_ARCHIVE_LIMITS)?;
     let output_file = File::create(output)?;
     let mut writer = ZipWriter::new(output_file);
 
@@ -144,14 +147,14 @@ fn write_rebuilt_epub(
     let archive_names = archive_entry_names(&mut archive)?;
     let stylesheet = stylesheet_plan(book.id.0.as_str(), &archive_names, options);
 
-    write_mimetype_first(&mut archive, &mut writer)?;
+    write_mimetype_first(&mut archive, &mut writer, &mut read_budget)?;
 
     let deflated = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .last_modified_time(deterministic_zip_time());
     let mut total_skipped = 0usize;
     for index in 0..archive.len() {
-        let mut file = archive.by_index(index)?;
+        let file = archive.by_index_raw(index)?;
         let name = file.name().to_string();
 
         if name == "mimetype" {
@@ -163,8 +166,23 @@ fn write_rebuilt_epub(
             continue;
         }
 
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        let requires_rebuild = patches_by_href.contains_key(name.as_str())
+            || (name == book.id.0
+                && (options.target_language.is_some()
+                    || options.creator.is_some()
+                    || stylesheet.is_some()))
+            || (options.target_language.is_some()
+                && matches!(options.mode, BilingualMode::Replace)
+                && is_xhtml_resource_name(name.as_str()));
+        if !requires_rebuild {
+            writer.raw_copy_file(file)?;
+            continue;
+        }
+
+        drop(file);
+        let mut file = archive.by_index(index)?;
+        let compressed_size = file.compressed_size();
+        let bytes = read_budget.read_entry(&mut file, &name, compressed_size)?;
         let mut output_bytes = if let Some(file_patches) = patches_by_href.get(name.as_str()) {
             let xhtml = String::from_utf8(bytes).map_err(|err| {
                 BookforgeError::InvalidInput(format!("XHTML resource '{name}' is not UTF-8: {err}"))
@@ -296,9 +314,17 @@ fn sibling_work_path(output: &Path, label: &str) -> PathBuf {
     ))
 }
 
-fn write_mimetype_first(source: &mut ZipArchive<File>, writer: &mut ZipWriter<File>) -> Result<()> {
-    let mut mimetype = String::new();
-    source.by_name("mimetype")?.read_to_string(&mut mimetype)?;
+fn write_mimetype_first(
+    source: &mut ZipArchive<File>,
+    writer: &mut ZipWriter<File>,
+    read_budget: &mut ArchiveReadBudget,
+) -> Result<()> {
+    let mut file = source.by_name("mimetype")?;
+    let compressed_size = file.compressed_size();
+    let bytes = read_budget.read_entry(&mut file, "mimetype", compressed_size)?;
+    let mimetype = String::from_utf8(bytes).map_err(|error| {
+        BookforgeError::InvalidInput(format!("EPUB mimetype is not UTF-8: {error}"))
+    })?;
     if mimetype.trim() != "application/epub+zip" {
         return Err(BookforgeError::InvalidInput(
             "EPUB mimetype must be application/epub+zip".to_string(),
@@ -316,7 +342,7 @@ fn write_mimetype_first(source: &mut ZipArchive<File>, writer: &mut ZipWriter<Fi
 fn archive_entry_names(archive: &mut ZipArchive<File>) -> Result<HashSet<String>> {
     let mut names = HashSet::new();
     for index in 0..archive.len() {
-        names.insert(archive.by_index(index)?.name().to_string());
+        names.insert(archive.by_index_raw(index)?.name().to_string());
     }
     Ok(names)
 }

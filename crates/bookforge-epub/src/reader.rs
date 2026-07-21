@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::Read,
     path::Path,
 };
 
@@ -18,6 +17,8 @@ use quick_xml::{
     events::{BytesStart, Event},
 };
 use zip::ZipArchive;
+
+use crate::archive_limits::{ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, validate_archive_metadata};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpubInspection {
@@ -84,10 +85,10 @@ struct PackageDocument {
 }
 
 pub fn read_epub(path: &Path) -> Result<Book> {
-    let mut archive = open_archive(path)?;
-    validate_mimetype(&mut archive)?;
-    let package_path = locate_package(&mut archive)?;
-    let package_xml = read_archive_text(&mut archive, &package_path)?;
+    let (mut archive, mut read_budget) = open_archive(path)?;
+    validate_mimetype(&mut archive, &mut read_budget)?;
+    let package_path = locate_package(&mut archive, &mut read_budget)?;
+    let package_xml = read_archive_text(&mut archive, &mut read_budget, &package_path)?;
     let mut package = parse_package(&package_xml)?;
     let package_dir = package_base_dir(&package_path);
     let manifest_by_id = package
@@ -126,7 +127,7 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         .enumerate()
     {
         let href = join_epub_path(&package_dir, &resource.href);
-        let ncx = read_archive_text(&mut archive, &href)?;
+        let ncx = read_archive_text(&mut archive, &mut read_budget, &href)?;
         let section_id = SectionId(format!("sec_toc_{toc_index:06}"));
         let mut toc_blocks = extract_ncx_text_blocks(&ncx, &section_id, blocks.len())?;
         if toc_blocks.is_empty() {
@@ -170,7 +171,7 @@ pub fn read_epub(path: &Path) -> Result<Book> {
             continue;
         }
 
-        let xhtml = read_archive_text(&mut archive, &href)?;
+        let xhtml = read_archive_text(&mut archive, &mut read_budget, &href)?;
         let section_id = SectionId(format!("sec_{spine_index:06}"));
         let mut section_blocks = extract_blocks(&xhtml, &href, &section_id, blocks.len())?;
         if section_blocks.is_empty() {
@@ -203,7 +204,7 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         .enumerate()
     {
         let href = join_epub_path(&package_dir, &resource.href);
-        let xhtml = read_archive_text(&mut archive, &href)?;
+        let xhtml = read_archive_text(&mut archive, &mut read_budget, &href)?;
         let section_id = SectionId(format!("sec_nav_{nav_index:06}"));
         let mut nav_blocks = extract_blocks(&xhtml, &href, &section_id, blocks.len())?;
         if nav_blocks.is_empty() {
@@ -247,11 +248,11 @@ pub fn read_epub(path: &Path) -> Result<Book> {
 }
 
 pub fn inspect_epub(path: &Path) -> Result<EpubInspection> {
-    let mut archive = open_archive(path)?;
-    validate_mimetype(&mut archive)?;
+    let (mut archive, mut read_budget) = open_archive(path)?;
+    validate_mimetype(&mut archive, &mut read_budget)?;
 
-    let package_path = locate_package(&mut archive)?;
-    let package_xml = read_archive_text(&mut archive, &package_path)?;
+    let package_path = locate_package(&mut archive, &mut read_budget)?;
+    let package_xml = read_archive_text(&mut archive, &mut read_budget, &package_path)?;
     let package = parse_package(&package_xml)?;
     let manifest_by_id = package
         .manifest
@@ -287,7 +288,7 @@ pub fn inspect_epub(path: &Path) -> Result<EpubInspection> {
 
         if is_xhtml_media_type(&resource.media_type) {
             let href = join_epub_path(&package_dir, &resource.href);
-            read_archive_text(&mut archive, &href)?;
+            read_archive_text(&mut archive, &mut read_budget, &href)?;
             xhtml_spine_count += 1;
         }
     }
@@ -313,10 +314,10 @@ pub fn inspect_epub(path: &Path) -> Result<EpubInspection> {
 /// versus how much the block extractor captures. Counts non-whitespace
 /// characters so block boundaries and indentation do not skew the ratio.
 pub fn text_coverage(path: &Path) -> Result<TextCoverage> {
-    let mut archive = open_archive(path)?;
-    validate_mimetype(&mut archive)?;
-    let package_path = locate_package(&mut archive)?;
-    let package_xml = read_archive_text(&mut archive, &package_path)?;
+    let (mut archive, mut read_budget) = open_archive(path)?;
+    validate_mimetype(&mut archive, &mut read_budget)?;
+    let package_path = locate_package(&mut archive, &mut read_budget)?;
+    let package_xml = read_archive_text(&mut archive, &mut read_budget, &package_path)?;
     let package = parse_package(&package_xml)?;
     let package_dir = package_base_dir(&package_path);
     let manifest_by_id = package
@@ -338,7 +339,7 @@ pub fn text_coverage(path: &Path) -> Result<TextCoverage> {
         }
 
         let href = join_epub_path(&package_dir, &resource.href);
-        let xhtml = read_archive_text(&mut archive, &href)?;
+        let xhtml = read_archive_text(&mut archive, &mut read_budget, &href)?;
         let section_id = SectionId(format!("sec_{spine_index:06}"));
         let blocks = extract_blocks(&xhtml, &href, &section_id, 0)?;
         let captured_chars = blocks
@@ -416,14 +417,18 @@ fn non_whitespace_chars(text: &str) -> usize {
     text.chars().filter(|ch| !ch.is_whitespace()).count()
 }
 
-fn open_archive(path: &Path) -> Result<ZipArchive<File>> {
+fn open_archive(path: &Path) -> Result<(ZipArchive<File>, ArchiveReadBudget)> {
     let file = File::open(path)?;
-    Ok(ZipArchive::new(file)?)
+    let mut archive = ZipArchive::new(file)?;
+    let read_budget = validate_archive_metadata(&mut archive, DEFAULT_ARCHIVE_LIMITS)?;
+    Ok((archive, read_budget))
 }
 
-fn validate_mimetype(archive: &mut ZipArchive<File>) -> Result<()> {
-    let mut mimetype = String::new();
-    archive.by_name("mimetype")?.read_to_string(&mut mimetype)?;
+fn validate_mimetype(
+    archive: &mut ZipArchive<File>,
+    read_budget: &mut ArchiveReadBudget,
+) -> Result<()> {
+    let mimetype = read_archive_text(archive, read_budget, "mimetype")?;
 
     if mimetype.trim() != "application/epub+zip" {
         return Err(BookforgeError::InvalidInput(
@@ -434,8 +439,11 @@ fn validate_mimetype(archive: &mut ZipArchive<File>) -> Result<()> {
     Ok(())
 }
 
-fn locate_package(archive: &mut ZipArchive<File>) -> Result<String> {
-    let container = read_archive_text(archive, "META-INF/container.xml")?;
+fn locate_package(
+    archive: &mut ZipArchive<File>,
+    read_budget: &mut ArchiveReadBudget,
+) -> Result<String> {
+    let container = read_archive_text(archive, read_budget, "META-INF/container.xml")?;
     let mut reader = Reader::from_str(&container);
     reader.config_mut().trim_text(true);
 
@@ -1474,11 +1482,17 @@ fn looks_like_protected_number(value: &str) -> bool {
     false
 }
 
-fn read_archive_text(archive: &mut ZipArchive<File>, path: &str) -> Result<String> {
+fn read_archive_text(
+    archive: &mut ZipArchive<File>,
+    read_budget: &mut ArchiveReadBudget,
+    path: &str,
+) -> Result<String> {
     let mut file = archive.by_name(path)?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    Ok(text)
+    let compressed_size = file.compressed_size();
+    let bytes = read_budget.read_entry(&mut file, path, compressed_size)?;
+    String::from_utf8(bytes).map_err(|error| {
+        BookforgeError::InvalidInput(format!("EPUB text entry '{path}' is not UTF-8: {error}"))
+    })
 }
 
 fn is_xhtml_media_type(media_type: &str) -> bool {
