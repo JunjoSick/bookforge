@@ -97,3 +97,33 @@ and the official action release pages for [checkout](https://github.com/actions/
 [upload-artifact](https://github.com/actions/upload-artifact/releases),
 [download-artifact](https://github.com/actions/download-artifact/releases), and
 [attest](https://github.com/actions/attest/releases).
+
+## Accepted risk: no local authentication on the dashboard (audit finding 5)
+
+**Status:** deliberately deferred, owner decision 2026-07-21.
+
+The dashboard binds to loopback and defends against cross-origin browser
+requests with a CSRF token, but the token is embedded in the unauthenticated
+index page. Any other process or user account on the same machine can therefore
+fetch the index, read the token, and then drive the dashboard: list and read
+books and reviews, control jobs, and launch provider requests that spend money
+using remembered or environment-supplied keys.
+
+This is accepted rather than fixed because the deployment is a single-user
+desktop where any local process able to reach the socket could equally read the
+key files directly, and because the realistic mitigations — a startup token in
+the opened URL, or a login prompt — put a credential step in front of daily,
+non-technical use for no gain against that threat model.
+
+**Revisit if any of these become true:**
+
+- the dashboard is ever bound to anything other than loopback, or exposed
+  through a tunnel or port forward;
+- the machine becomes multi-user, or runs untrusted local software;
+- provider spend per run grows enough that an unattended local caller could
+  incur meaningful cost.
+
+The intended fix, in preference order, is a random token minted at startup and
+included in the auto-opened URL, exchanged for an `HttpOnly; SameSite=Strict`
+session cookie, plus caps on concurrent jobs, upload size and provider spend.
+The rate limits are worth adding independently of authentication.
