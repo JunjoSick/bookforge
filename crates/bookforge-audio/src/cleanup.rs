@@ -121,6 +121,7 @@ mod tests {
             chapter_index: 0,
             chapter_title: "Ch".to_string(),
             part: 1,
+            kind: crate::text::ChunkKind::Body,
             file: file.to_string(),
             chars: 10,
             synthesis_sha256: "0".repeat(64),

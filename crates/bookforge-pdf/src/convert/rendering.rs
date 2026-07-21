@@ -1,5 +1,95 @@
 use super::*;
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct OcrPagesOutcome {
+    pub recovered: Vec<u32>,
+    pub warnings: Vec<String>,
+}
+
+pub(super) fn ocr_low_confidence_pages(
+    engine: &dyn OcrEngine,
+    render: &mut dyn FnMut(u32) -> Result<Vec<u8>>,
+    blocks: &mut Vec<AnchoredBlock>,
+    low_confidence_pages: &[u32],
+) -> OcrPagesOutcome {
+    let mut outcome = OcrPagesOutcome::default();
+    for page_number in low_confidence_pages {
+        let image = match render(*page_number) {
+            Ok(image) => image,
+            Err(error) => {
+                outcome.warnings.push(format!(
+                    "page {page_number}: OCR skipped because raster rendering failed: {error}"
+                ));
+                continue;
+            }
+        };
+        match engine.ocr_page(&image, *page_number) {
+            Ok(text) => {
+                replace_page_with_ocr_text(blocks, *page_number, &text);
+                outcome.recovered.push(*page_number);
+            }
+            Err(error) => outcome
+                .warnings
+                .push(format!("page {page_number}: OCR failed: {error}")),
+        }
+    }
+    outcome
+}
+
+fn replace_page_with_ocr_text(blocks: &mut Vec<AnchoredBlock>, page_number: u32, text: &str) {
+    let old_blocks = std::mem::take(blocks);
+    let mut insert_at = None;
+
+    for anchored in old_blocks {
+        if anchored.anchor.page == page_number {
+            insert_at.get_or_insert(blocks.len());
+            continue;
+        }
+        if anchored.anchor.page > page_number {
+            insert_at.get_or_insert(blocks.len());
+        }
+        blocks.push(anchored);
+    }
+
+    let insert_at = insert_at.unwrap_or(blocks.len());
+    let mut paragraphs = Vec::new();
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if !lines.is_empty() {
+                paragraphs.push(lines.join("\n"));
+                lines.clear();
+            }
+        } else {
+            lines.push(line);
+        }
+    }
+    if !lines.is_empty() {
+        paragraphs.push(lines.join("\n"));
+    }
+
+    for (offset, paragraph) in paragraphs.into_iter().enumerate() {
+        blocks.insert(
+            insert_at + offset,
+            AnchoredBlock {
+                block: DocBlock::Paragraph {
+                    spans: vec![Span {
+                        text: paragraph,
+                        bold: false,
+                        italic: false,
+                    }],
+                },
+                anchor: BlockAnchor {
+                    page: page_number,
+                    top: i32::try_from(offset).unwrap_or(i32::MAX),
+                    left: 0,
+                    width: 1,
+                },
+            },
+        );
+    }
+}
+
 pub(super) fn preserve_low_confidence_pages(
     input: &Path,
     pages: &[Page],
@@ -342,4 +432,103 @@ fn audit_snippet(text: &str) -> String {
     let mut snippet = normalized.chars().take(LIMIT).collect::<String>();
     snippet.push_str("...");
     snippet
+}
+
+#[cfg(test)]
+mod ocr_tests {
+    use crate::ocr::MockOcrEngine;
+
+    use super::*;
+
+    fn paragraph(page: u32, text: &str) -> AnchoredBlock {
+        AnchoredBlock {
+            block: DocBlock::Paragraph {
+                spans: vec![Span {
+                    text: text.to_string(),
+                    bold: false,
+                    italic: false,
+                }],
+            },
+            anchor: BlockAnchor {
+                page,
+                top: 10,
+                left: 10,
+                width: 100,
+            },
+        }
+    }
+
+    #[test]
+    fn successful_ocr_replaces_page_with_paragraphs() {
+        let engine = MockOcrEngine::success("First OCR paragraph.\n\nSecond OCR paragraph.");
+        let mut blocks = vec![paragraph(1, "garbage"), paragraph(2, "keep")];
+        let mut rendered = Vec::new();
+        let outcome = ocr_low_confidence_pages(
+            &engine,
+            &mut |page| {
+                rendered.push(page);
+                Ok(vec![1, 2, 3])
+            },
+            &mut blocks,
+            &[1],
+        );
+
+        assert_eq!(rendered, vec![1]);
+        assert_eq!(outcome.recovered, vec![1]);
+        assert!(outcome.warnings.is_empty());
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.block.text())
+                .collect::<Vec<_>>(),
+            vec!["First OCR paragraph.", "Second OCR paragraph.", "keep"]
+        );
+        assert_eq!(blocks[0].anchor.top, 0);
+        assert_eq!(blocks[1].anchor.top, 1);
+    }
+
+    #[test]
+    fn failed_ocr_leaves_page_blocks_intact_and_warns() {
+        let engine = MockOcrEngine::failure("offline");
+        let mut blocks = vec![paragraph(3, "original")];
+        let outcome =
+            ocr_low_confidence_pages(&engine, &mut |_page| Ok(vec![1, 2, 3]), &mut blocks, &[3]);
+
+        assert!(outcome.recovered.is_empty());
+        assert_eq!(blocks[0].block.text(), "original");
+        assert!(outcome.warnings[0].contains("page 3: OCR failed"));
+        assert!(outcome.warnings[0].contains("offline"));
+    }
+
+    #[test]
+    fn recovered_pages_are_excluded_from_later_preservation() {
+        let engine = MockOcrEngine::success("Recovered");
+        let mut blocks = vec![paragraph(1, "bad one"), paragraph(2, "bad two")];
+        let outcome =
+            ocr_low_confidence_pages(&engine, &mut |_page| Ok(vec![1, 2, 3]), &mut blocks, &[1]);
+        let mut preserve_pages = vec![1, 2];
+        preserve_pages.retain(|page| !outcome.recovered.contains(page));
+
+        for page in preserve_pages {
+            replace_page_with_preserved_image(
+                &mut blocks,
+                page,
+                ImageAsset {
+                    id: "preserved".to_string(),
+                    href: "images/preserved.png".to_string(),
+                    media_type: "image/png".to_string(),
+                    bytes: vec![1],
+                    page,
+                    top: Some(0),
+                    left: Some(0),
+                    width: Some(1),
+                    height: Some(1),
+                },
+            );
+        }
+
+        assert!(matches!(blocks[0].block, DocBlock::Paragraph { .. }));
+        assert_eq!(blocks[0].block.text(), "Recovered");
+        assert!(matches!(blocks[1].block, DocBlock::Figure { .. }));
+    }
 }

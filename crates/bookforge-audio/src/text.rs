@@ -11,6 +11,34 @@
 use bookforge_core::ir::{Block, BlockId, BlockKind, Book};
 use bookforge_core::marker::strip_marker_tokens;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NarrationBlockKind {
+    Title,
+    Heading(u8),
+    Paragraph,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrationBlock {
+    pub kind: NarrationBlockKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChunkKind {
+    Title,
+    Heading,
+    #[default]
+    Body,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrationChunk {
+    pub kind: ChunkKind,
+    pub text: String,
+}
+
 /// One narratable chapter: the visible prose of a single spine section,
 /// with a display title used for filenames and (when stitched) chapter
 /// markers.
@@ -19,15 +47,22 @@ pub struct Chapter {
     /// Zero-based position in reading order.
     pub index: usize,
     pub title: String,
-    /// Clean prose with inline markers removed and blocks joined by blank
-    /// lines. Empty for sections that carry no readable text (cover images,
-    /// nav documents).
-    pub text: String,
+    /// Clean narratable blocks with inline markers removed. Empty for
+    /// sections that carry no readable text (cover images, nav documents).
+    pub blocks: Vec<NarrationBlock>,
 }
 
 impl Chapter {
+    pub fn text(&self) -> String {
+        self.blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.text.trim().is_empty()
+        self.blocks.iter().all(|block| block.text.trim().is_empty())
     }
 }
 
@@ -59,7 +94,10 @@ pub fn chapters_from_book_with_options(book: &Book, pdf_page_grouping: bool) -> 
     let sections = book
         .sections
         .iter()
-        .filter(|section| is_narratable_section(&section.href, &navigation_hrefs))
+        .filter(|section| {
+            !section.id.0.starts_with("sec_nav_")
+                && is_narratable_section(&section.href, &navigation_hrefs)
+        })
         .collect::<Vec<_>>();
 
     // Some PDF converters emit one XHTML spine item per physical page. In
@@ -81,7 +119,8 @@ pub fn chapters_from_book_with_options(book: &Book, pdf_page_grouping: bool) -> 
         .into_iter()
         .enumerate()
         .map(|(index, section)| {
-            let mut paragraphs: Vec<String> = Vec::new();
+            let mut blocks = Vec::new();
+            let mut first_heading = true;
             for block_id in &section.block_ids {
                 let Some(block) = block_index.get(block_id) else {
                     continue;
@@ -91,7 +130,15 @@ pub fn chapters_from_book_with_options(book: &Book, pdf_page_grouping: bool) -> 
                 }
                 let text = clean_block_text(block);
                 if !text.is_empty() {
-                    paragraphs.push(text);
+                    let kind = match block.kind {
+                        BlockKind::Heading(_) if first_heading => {
+                            first_heading = false;
+                            NarrationBlockKind::Title
+                        }
+                        BlockKind::Heading(level) => NarrationBlockKind::Heading(level),
+                        _ => NarrationBlockKind::Paragraph,
+                    };
+                    blocks.push(NarrationBlock { kind, text });
                 }
             }
             let title = section
@@ -103,7 +150,7 @@ pub fn chapters_from_book_with_options(book: &Book, pdf_page_grouping: bool) -> 
             Chapter {
                 index,
                 title,
-                text: paragraphs.join("\n\n"),
+                blocks,
             }
         })
         .collect()
@@ -138,12 +185,12 @@ fn chapters_from_pdf_pages(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "Front matter".to_string());
-    let mut paragraphs = Vec::<String>::new();
+    let mut blocks = Vec::<NarrationBlock>::new();
     let mut printed_toc = false;
     let mut printed_toc_roman_folio = false;
 
     for section in sections {
-        let mut page_start = paragraphs.len();
+        let mut page_start = blocks.len();
         for block_id in &section.block_ids {
             let Some(block) = block_index.get(block_id) else {
                 continue;
@@ -172,13 +219,13 @@ fn chapters_from_pdf_pages(
             if chapter_label_key(&text).is_some() {
                 printed_toc = false;
                 printed_toc_roman_folio = false;
-                if !paragraphs.is_empty() {
+                if !blocks.is_empty() {
                     chapters.push(Chapter {
                         index: chapters.len(),
                         title,
-                        text: paragraphs.join("\n\n"),
+                        blocks,
                     });
-                    paragraphs.clear();
+                    blocks = Vec::new();
                     page_start = 0;
                 }
                 title = text.clone();
@@ -198,26 +245,36 @@ fn chapters_from_pdf_pages(
             {
                 continue;
             }
-            paragraphs.push(text);
+            let kind = if chapter_label_key(&text).is_some() {
+                NarrationBlockKind::Title
+            } else {
+                match block.kind {
+                    BlockKind::Heading(level) => NarrationBlockKind::Heading(level),
+                    _ => NarrationBlockKind::Paragraph,
+                }
+            };
+            blocks.push(NarrationBlock { kind, text });
         }
 
         // Join only a paragraph that actually crosses a physical page. Do
         // not flatten ordinary paragraph boundaries within the page.
         if page_start > 0
-            && paragraphs.len() > page_start
-            && should_join_across_page(&paragraphs[page_start - 1], &paragraphs[page_start])
+            && blocks.len() > page_start
+            && blocks[page_start - 1].kind == NarrationBlockKind::Paragraph
+            && blocks[page_start].kind == NarrationBlockKind::Paragraph
+            && should_join_across_page(&blocks[page_start - 1].text, &blocks[page_start].text)
         {
-            let right = paragraphs.remove(page_start);
-            paragraphs[page_start - 1].push(' ');
-            paragraphs[page_start - 1].push_str(&right);
+            let right = blocks.remove(page_start).text;
+            blocks[page_start - 1].text.push(' ');
+            blocks[page_start - 1].text.push_str(&right);
         }
     }
 
-    if !paragraphs.is_empty() {
+    if !blocks.is_empty() {
         chapters.push(Chapter {
             index: chapters.len(),
             title,
-            text: paragraphs.join("\n\n"),
+            blocks,
         });
     }
     chapters
@@ -291,18 +348,55 @@ fn chapter_label_key(text: &str) -> Option<String> {
         "capítulo",
         "capitulo",
     ];
-    let mut words = text.split_whitespace();
-    let label = words.next()?.trim_matches(|ch: char| !ch.is_alphabetic());
+    let normalized_words = text
+        .split_whitespace()
+        .map(|word| word.trim_matches(|ch: char| !ch.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let label = *normalized_words.first()?;
+
+    // Canonical Toki Pona chapter headings keep the protected Roman numeral:
+    // `lipu nanpa VI`. Requiring a Roman numeral prevents ordinary phrases
+    // such as `lipu nanpa 17 ...` from becoming accidental chapter breaks.
+    if normalized_words.len() >= 3
+        && label.eq_ignore_ascii_case("lipu")
+        && normalized_words[1].eq_ignore_ascii_case("nanpa")
+        && is_roman_number(normalized_words[2])
+    {
+        return Some(format!(
+            "lipu nanpa {}",
+            normalized_words[2].to_ascii_uppercase()
+        ));
+    }
+
+    // Early BookForge Toki Pona output used the non-standard KAPITELO label.
+    // Recognize it when narrating existing files, but translation prompts and
+    // validation continue to require ordinary `lipu nanpa <Roman>`.
+    if label.eq_ignore_ascii_case("kapitelo")
+        && normalized_words.len() >= 2
+        && normalized_words.len() <= 5
+        && normalized_words[1..].iter().all(|word| {
+            is_roman_number(word)
+                || matches!(
+                    word.to_ascii_lowercase().as_str(),
+                    "wan" | "tu" | "luka" | "mute" | "ale"
+                )
+        })
+    {
+        return Some(
+            normalized_words
+                .iter()
+                .map(|word| word.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+
     if !LABELS.iter().any(|known| label.eq_ignore_ascii_case(known)) {
         return None;
     }
-    let number = words
-        .next()?
-        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
-    let roman = !number.is_empty()
-        && number
-            .chars()
-            .all(|ch| matches!(ch.to_ascii_uppercase(), 'I' | 'V' | 'X' | 'L' | 'C'));
+    let number = *normalized_words.get(1)?;
+    let roman = is_roman_number(number);
     if !number.chars().all(|ch| ch.is_ascii_digit()) && !roman {
         return None;
     }
@@ -311,6 +405,13 @@ fn chapter_label_key(text: &str) -> Option<String> {
         label.to_ascii_lowercase(),
         number.to_ascii_uppercase()
     ))
+}
+
+fn is_roman_number(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| matches!(ch.to_ascii_uppercase(), 'I' | 'V' | 'X' | 'L' | 'C'))
 }
 
 fn embedded_chapter_label_offset(text: &str) -> Option<usize> {
@@ -349,7 +450,13 @@ fn should_join_across_page(left: &str, right: &str) -> bool {
 /// extensions alone would incorrectly read the table of contents aloud.
 fn is_narratable_section(href: &str, navigation_hrefs: &std::collections::HashSet<String>) -> bool {
     let path = normalized_href(href);
-    !(path.ends_with(".opf") || path.ends_with(".ncx") || navigation_hrefs.contains(&path))
+    let is_navigation = navigation_hrefs.iter().any(|navigation| {
+        path == *navigation
+            || path
+                .strip_suffix(navigation)
+                .is_some_and(|prefix| prefix.ends_with('/'))
+    });
+    !(path.ends_with(".opf") || path.ends_with(".ncx") || is_navigation)
 }
 
 fn normalized_href(href: &str) -> String {
@@ -397,7 +504,67 @@ fn collapse_whitespace(text: &str) -> String {
 /// `max_chars` counts Unicode scalar values, not bytes; every returned
 /// chunk is a valid string and non-empty. Returns an empty vector for
 /// blank input.
+pub fn chunk_blocks(blocks: &[NarrationBlock], max_chars: usize) -> Vec<NarrationChunk> {
+    let max_chars = max_chars.max(1);
+    let mut chunks = Vec::new();
+    let mut paragraphs = Vec::new();
+
+    let flush_paragraphs =
+        |paragraphs: &mut Vec<&str>, chunks: &mut Vec<NarrationChunk>| {
+            if paragraphs.is_empty() {
+                return;
+            }
+            let text = paragraphs.join("\n\n");
+            chunks.extend(chunk_body_text(&text, max_chars).into_iter().map(|text| {
+                NarrationChunk {
+                    kind: ChunkKind::Body,
+                    text,
+                }
+            }));
+            paragraphs.clear();
+        };
+
+    for block in blocks {
+        match block.kind {
+            NarrationBlockKind::Paragraph => paragraphs.push(block.text.as_str()),
+            NarrationBlockKind::Title | NarrationBlockKind::Heading(_) => {
+                flush_paragraphs(&mut paragraphs, &mut chunks);
+                let kind = match block.kind {
+                    NarrationBlockKind::Title => ChunkKind::Title,
+                    NarrationBlockKind::Heading(_) => ChunkKind::Heading,
+                    NarrationBlockKind::Paragraph => unreachable!(),
+                };
+                let text = block.text.trim();
+                if !text.is_empty() {
+                    let pieces = if text.chars().count() > max_chars {
+                        split_long_unit(text, max_chars)
+                    } else {
+                        vec![text.to_string()]
+                    };
+                    chunks.extend(pieces.into_iter().map(|text| NarrationChunk { kind, text }));
+                }
+            }
+        }
+    }
+    flush_paragraphs(&mut paragraphs, &mut chunks);
+    chunks
+}
+
+/// Compatibility wrapper for callers that have unstructured prose.
 pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
+    chunk_blocks(
+        &[NarrationBlock {
+            kind: NarrationBlockKind::Paragraph,
+            text: text.to_string(),
+        }],
+        max_chars,
+    )
+    .into_iter()
+    .map(|chunk| chunk.text)
+    .collect()
+}
+
+fn chunk_body_text(text: &str, max_chars: usize) -> Vec<String> {
     let max_chars = max_chars.max(1);
     let mut chunks: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -599,6 +766,7 @@ mod tests {
         assert!(!is_narratable_section("OEBPS/package.OPF", &nav));
         assert!(!is_narratable_section("toc.ncx", &nav));
         assert!(!is_narratable_section("TEXT/navigation.xhtml#toc", &nav));
+        assert!(!is_narratable_section("OEBPS/Text/navigation.xhtml", &nav));
         assert!(is_narratable_section("text/chapter-1.xhtml", &nav));
         assert!(is_narratable_section("chapter.html#frag", &nav));
         assert!(is_printed_toc_heading("INDICE"));
@@ -609,6 +777,15 @@ mod tests {
             "Cap. I / Il Buonsenso Pag. 1 Cap. II / La natura Pag. 8"
         ));
         assert!(is_front_matter_heading("Nota dell’autore"));
+        assert_eq!(
+            chapter_label_key("lipu nanpa VI"),
+            Some("lipu nanpa VI".to_string())
+        );
+        assert!(chapter_label_key("lipu nanpa 17 li toki e ni").is_none());
+        assert_eq!(
+            chapter_label_key("KAPITELO LUKA WAN"),
+            Some("KAPITELO LUKA WAN".to_string())
+        );
     }
 
     #[test]
@@ -683,18 +860,112 @@ mod tests {
         assert_eq!(chapters[0].title, "Test Book");
         assert_eq!(chapters[1].title, "CAPITOLO I:");
         assert_eq!(chapters[2].title, "CAPITOLO II");
+        assert_eq!(chapters[1].blocks[0].kind, NarrationBlockKind::Title);
+        assert_eq!(chapters[1].blocks[0].text, "CAPITOLO I:");
+        assert_eq!(chapters[2].blocks[0].kind, NarrationBlockKind::Title);
         assert!(
             chapters
                 .iter()
-                .all(|chapter| !chapter.text.contains("Repeated Book Title"))
+                .all(|chapter| !chapter.text().contains("Repeated Book Title"))
         );
         assert!(
             chapters
                 .iter()
-                .all(|chapter| chapter.text.lines().all(|line| {
+                .all(|chapter| chapter.text().lines().all(|line| {
                     let line = line.trim();
                     line.is_empty() || !line.chars().all(|ch| ch.is_ascii_digit())
                 }))
         );
+    }
+
+    #[test]
+    fn headings_are_typed_and_section_title_appears_once() {
+        use bookforge_core::ir::{
+            Block, BlockId, BookFormat, BookId, DomPath, Metadata, Section, SectionId, TextRun,
+        };
+
+        let section_id = SectionId("section".to_string());
+        let make_block = |id: &str, kind, text: &str| Block {
+            id: BlockId(id.to_string()),
+            section_id: section_id.clone(),
+            kind,
+            dom_path: DomPath(vec![0]),
+            text_runs: vec![TextRun {
+                id: format!("{id}-run"),
+                text: text.to_string(),
+            }],
+            inline_marks: Vec::new(),
+            protected_spans: Vec::new(),
+            token_estimate: 1,
+        };
+        let book = Book {
+            source_path: None,
+            id: BookId("headings".to_string()),
+            format: BookFormat::Epub,
+            metadata: Metadata::default(),
+            manifest: Vec::new(),
+            spine: Vec::new(),
+            sections: vec![Section {
+                id: section_id.clone(),
+                href: "chapter.xhtml".to_string(),
+                spine_index: 0,
+                title: Some("The Title".to_string()),
+                heading_level: Some(1),
+                block_ids: vec![
+                    BlockId("title".to_string()),
+                    BlockId("body".to_string()),
+                    BlockId("heading".to_string()),
+                ],
+                prev: None,
+                next: None,
+            }],
+            blocks: vec![
+                make_block("title", BlockKind::Heading(1), "The Title"),
+                make_block("body", BlockKind::Paragraph, "Body text."),
+                make_block("heading", BlockKind::Heading(2), "A Subheading"),
+            ],
+        };
+
+        let chapters = chapters_from_book(&book);
+        assert_eq!(chapters[0].blocks[0].kind, NarrationBlockKind::Title);
+        assert_eq!(chapters[0].blocks[2].kind, NarrationBlockKind::Heading(2));
+        assert_eq!(
+            chapters[0]
+                .blocks
+                .iter()
+                .filter(|block| block.text == "The Title")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn chunk_blocks_keeps_titles_and_headings_separate_from_body() {
+        let blocks = vec![
+            NarrationBlock {
+                kind: NarrationBlockKind::Title,
+                text: "The Title".to_string(),
+            },
+            NarrationBlock {
+                kind: NarrationBlockKind::Paragraph,
+                text: "First body sentence.".to_string(),
+            },
+            NarrationBlock {
+                kind: NarrationBlockKind::Heading(2),
+                text: "A Heading".to_string(),
+            },
+            NarrationBlock {
+                kind: NarrationBlockKind::Paragraph,
+                text: "Second body sentence.".to_string(),
+            },
+        ];
+
+        let chunks = chunk_blocks(&blocks, 100);
+        assert_eq!(chunks[0].kind, ChunkKind::Title);
+        assert_eq!(chunks[0].text, "The Title");
+        assert_eq!(chunks[1].kind, ChunkKind::Body);
+        assert_eq!(chunks[2].kind, ChunkKind::Heading);
+        assert_eq!(chunks[2].text, "A Heading");
+        assert_eq!(chunks[3].kind, ChunkKind::Body);
     }
 }

@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-audio"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "base64",
  "bookforge-core",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-cli"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-core"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "clap",
  "quick-xml",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-epub"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "bookforge-core",
  "quick-xml",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-llm"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "bookforge-core",
  "reqwest",
@@ -345,13 +345,15 @@ dependencies = [
 
 [[package]]
 name = "bookforge-pdf"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
+ "base64",
  "bookforge-core",
  "bookforge-epub",
  "crc32fast",
  "flate2",
  "quick-xml",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -362,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "bookforge-store"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "bookforge-core",
  "rusqlite",
@@ -894,6 +896,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07bbe89c50d7a535e539b8c17bc0b49bdb77747034daa8087407d655f3f7cc1d"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -901,6 +904,12 @@ name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+
+[[package]]
+name = "futures-io"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
 
 [[package]]
 name = "futures-sink"
@@ -921,7 +930,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
  "futures-core",
+ "futures-io",
+ "futures-sink",
  "futures-task",
+ "memchr",
  "pin-project-lite",
  "slab",
 ]
@@ -1921,7 +1933,9 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",

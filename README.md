@@ -229,6 +229,18 @@ configured OCR endpoint. The generated fidelity report compares reconstructed
 text with the raw `pdftotext` baseline and itemizes layout decisions. Review
 that report and run `inspect` before spending translation tokens.
 
+For scanned or otherwise low-confidence pages, add an OpenAI-compatible OCR
+server. Successful pages are reported with `action=ocr`; local loopback
+servers do not require an API key:
+
+```bash
+cargo run -p bookforge-cli -- convert scan.pdf --out scan.epub \
+  --ocr-endpoint http://127.0.0.1:10000/v1
+```
+
+See [docs/pdf-ocr.md](docs/pdf-ocr.md) for the recommended Unlimited-OCR
+SGLang setup and the vLLM alternative.
+
 Inspect an EPUB:
 
 ```bash
@@ -450,17 +462,38 @@ cargo run -p bookforge-cli -- audiobook book.epub --provider gemini --voice Kore
 cargo run -p bookforge-cli -- audiobook book.epub --provider elevenlabs --voice <VOICE_ID> --format mp3
 ```
 
-BookForge owns the structure here the same way it does for translation: it
-extracts chapter prose (skipping the OPF metadata and table of contents),
-splits it into sentence-boundary chunks under the provider's character limit,
-and writes one content-and-settings-hashed audio file per chunk plus a
-`manifest.json`. Re-running resumes matching chunks, while a changed model,
-voice, speed, instructions, or source text gets a new hash. Point `--base-url`
-at a local server (for example kokoro-fastapi) to synthesize offline, and pass
-`--stitch` (or `--m4b`) to join the chunks with ffmpeg when it is installed.
-Use `--provider mock --dry-run` to preview the chapter and chunk counts without
-spending anything. See [docs/audiobooks.md](docs/audiobooks.md) for the full
-option list.
+BookForge owns the structure here the same way it does for translation. Chapter
+titles and in-section headings are separate narration chunks, and stitching
+supports configurable chapter, title/heading, and paragraph pauses through
+`--gap-chapter-ms` (1200 by default), `--gap-title-ms` (800), and
+`--gap-paragraph-ms` (0). ElevenLabs `--break-tags auto|off` adds `<break>`
+tags only for Flash v2.5, Turbo v2.5, and Multilingual v2, never Eleven v3.
+
+ElevenLabs requests carry same-chapter `previous_text`/`next_text` context and
+support `--seed`, `--text-normalization auto|on|off`, and `--language`.
+Language defaults from the EPUB metadata, is sent only to Flash/Turbo v2.5,
+and is warned-and-dropped elsewhere. Use `--chapters 1-3,7` for a one-based
+subset or `--list-voices` to inspect the account's voices.
+
+With ffmpeg available, a normal run creates a chaptered `audiobook.m4b` with
+chapter markers and title/artist metadata. `--no-book-file` opts out,
+`--single` additionally creates a flat audio file, and `--loudnorm` normalizes
+only whole-book assembly; per-chapter files remain unnormalized. Point
+`--base-url` at a local server such as kokoro-fastapi to synthesize offline.
+
+Plans and dry runs use `crates/bookforge-cli/pricing/audio-providers.json` for
+cost estimates, and ElevenLabs performs a non-fatal quota preflight. The
+estimates are planning figures only; provider billing is authoritative. The
+browser dashboard adds ElevenLabs Auto model selection and a voice picker, a
+pre-launch cost/quota estimate, per-chapter progress, in-page playback, and
+Advanced controls for chapter pause, flat output, loudness, seed, and language.
+
+Runs write content-and-settings-hashed chunks plus a `manifest.json` and reuse
+matching chunks when resumed. The v2.6.0 cache tag `bookforge-audio-v2` and
+manifest schema 3 invalidate earlier audio chunk caches; rerun with `--prune`
+(`--prune --dry-run` previews cleanup). Use `--provider mock --dry-run` to
+preview a plan without spending. See [docs/audiobooks.md](docs/audiobooks.md)
+for the complete option and behavior reference.
 
 ## QA Modes
 

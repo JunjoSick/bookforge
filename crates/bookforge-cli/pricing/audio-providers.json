@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-07-20",
+  "providers": {
+    "elevenlabs": {
+      "eleven_v3": {
+        "usd_per_million_chars": null,
+        "credits_per_char": 0.27,
+        "note": "Estimate from a measured pay-as-you-go charge of about 0.27 credits per character."
+      },
+      "eleven_flash_v2_5": {
+        "usd_per_million_chars": null,
+        "credits_per_char": 0.14,
+        "note": "Estimate using the typical half-weight credit multiplier relative to v3-class models."
+      },
+      "eleven_turbo_v2_5": {
+        "usd_per_million_chars": null,
+        "credits_per_char": 0.14,
+        "note": "Estimate using the typical half-weight credit multiplier relative to v3-class models."
+      },
+      "eleven_multilingual_v2": {
+        "usd_per_million_chars": null,
+        "credits_per_char": 0.27,
+        "note": "Estimate using the measured v3-class pay-as-you-go credit weight."
+      }
+    },
+    "openai": {
+      "gpt-4o-mini-tts": {
+        "usd_per_million_chars": 15.0,
+        "credits_per_char": null,
+        "note": "Approximate character-equivalent estimate; this model is billed from text and generated-audio tokens."
+      },
+      "tts-1": {
+        "usd_per_million_chars": 15.0,
+        "credits_per_char": null,
+        "note": "Published character rate; actual provider billing is authoritative."
+      },
+      "tts-1-hd": {
+        "usd_per_million_chars": 30.0,
+        "credits_per_char": null,
+        "note": "Published character rate; actual provider billing is authoritative."
+      }
+    }
+  }
+}

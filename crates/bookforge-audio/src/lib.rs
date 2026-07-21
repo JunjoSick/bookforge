@@ -23,13 +23,18 @@ pub mod text;
 
 pub use builder::{
     AudiobookManifest, AudiobookOptions, AudiobookReport, AudiobookStatus, BuildError, ChunkRecord,
-    ChunkStatus, Progress, build_audiobook, plan_chunks, validate_options,
+    ChunkStatus, GapSettings, Progress, build_audiobook, plan_chunks, validate_options,
 };
 pub use cleanup::{StaleChunk, find_stale_chunks, remove_stale_chunks};
 pub use provider::{
-    AudioClip, AudioFormat, ElevenLabsTtsConfig, ElevenLabsTtsProvider, GeminiTtsConfig,
-    GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider, SpeechRequest,
-    TtsError, TtsProvider,
+    AudioClip, AudioFormat, ELEVENLABS_MAX_INPUT_CHARS, ELEVENLABS_PREFERRED_MODELS,
+    ElevenLabsSubscription, ElevenLabsTtsConfig, ElevenLabsTtsProvider, ElevenLabsVoice,
+    GeminiTtsConfig, GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider,
+    SpeechRequest, TextNormalization, TtsError, TtsProvider, elevenlabs_model_max_input_chars,
+    fetch_elevenlabs_subscription, list_elevenlabs_voices, resolve_preferred_elevenlabs_model,
 };
-pub use stitch::{StitchOptions, StitchReport, ffmpeg_available, stitch};
-pub use text::{Chapter, chapters_from_book, chunk_text};
+pub use stitch::{StitchOptions, StitchReport, ffmpeg_available, single_file_ffmpeg_args, stitch};
+pub use text::{
+    Chapter, ChunkKind, NarrationBlock, NarrationBlockKind, NarrationChunk, chapters_from_book,
+    chunk_blocks, chunk_text,
+};
