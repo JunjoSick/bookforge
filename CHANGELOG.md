@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## v2.6.1 - 2026-07-21
+
+- **Security:** ElevenLabs keys are no longer passed to the quota lookup through
+  a process environment variable. Setting `set_var` in a multi-threaded program
+  is unsound on Unix and let concurrently spawned children inherit the key.
+- **Security:** EPUB decompression is bounded by entry count, per-entry and total
+  uncompressed size, and compression ratio, enforced during the read so an entry
+  that understates its size in the header cannot expand unchecked.
+- **Security:** poppler invocations time out, have their output capped, and run
+  with a cleared environment plus a narrow allowlist, so a compromised tool no
+  longer sees every provider key. Temporary directories are randomized and 0700.
+- **Security:** provider responses, OCR responses and event-log lines are read
+  against explicit byte ceilings.
+- **Security:** `.bookforge` directories are created 0700 and EPUB snapshots 0600
+  on Unix, applied at creation.
+- **Security:** dashboard-spawned jobs receive only the provider key they need,
+  and dashboard responses carry CSP, `X-Frame-Options`, `nosniff`,
+  `Referrer-Policy` and `Cache-Control: no-store`. The Google Fonts dependency is
+  gone in favour of a system font stack.
+- **Security:** release workflow actions are pinned to commit SHAs via
+  `dist-workspace.toml`, so the pins survive workflow regeneration.
+- Fixed `eleven_v3` audiobook runs failing with `unsupported_model`: the request
+  carried `previous_text`/`next_text`, which that model rejects.
+- Fixed the ElevenLabs quota preflight comparing raw characters against a balance
+  denominated in credits, which warned about runs that comfortably fit.
+
 ## v2.6.0 - 2026-07-21
 
 - **Breaking:** existing audio chunk caches are invalidated by the
