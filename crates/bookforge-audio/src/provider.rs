@@ -12,7 +12,10 @@ use tokio_util::sync::CancellationToken;
 mod elevenlabs;
 mod gemini;
 
-pub use elevenlabs::{ElevenLabsTtsConfig, ElevenLabsTtsProvider};
+pub use elevenlabs::{
+    ELEVENLABS_MAX_INPUT_CHARS, ELEVENLABS_PREFERRED_MODELS, ElevenLabsTtsConfig,
+    ElevenLabsTtsProvider, elevenlabs_model_max_input_chars, resolve_preferred_elevenlabs_model,
+};
 pub use gemini::{GeminiTtsConfig, GeminiTtsProvider};
 
 /// Output container/codec requested from the provider. The string form is
@@ -465,7 +468,7 @@ fn local_api_key_is_optional(name: &str) -> bool {
     )
 }
 
-fn base_url_is_loopback(base_url: &str) -> bool {
+pub(super) fn base_url_is_loopback(base_url: &str) -> bool {
     reqwest::Url::parse(base_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))

@@ -69,7 +69,12 @@ const AUDIO_PROVIDER_KEY_ENVS: &[(&str, &str)] = &[
 ];
 const AUDIO_OPENAI_MODELS: &[&str] = &["gpt-4o-mini-tts", "tts-1", "tts-1-hd"];
 const AUDIO_GEMINI_MODELS: &[&str] = &["gemini-3.1-flash-tts-preview"];
-const AUDIO_ELEVENLABS_MODELS: &[&str] = &["eleven_multilingual_v2", "eleven_flash_v2_5"];
+const AUDIO_ELEVENLABS_MODELS: &[&str] = &[
+    "eleven_v3",
+    "eleven_flash_v2_5",
+    "eleven_turbo_v2_5",
+    "eleven_multilingual_v2",
+];
 const AUDIO_MOCK_MODELS: &[&str] = &["mock-silence"];
 
 const LANGUAGE_OPTIONS: &[&str] = &[
@@ -1180,12 +1185,30 @@ async fn launch_audiobook(
     if provider == "gemini" && (speed - 1.0).abs() > f32::EPSILON {
         return Ok(bad_request("Gemini does not expose playback-speed control"));
     }
+    if provider == "elevenlabs" && model == "eleven_v3" && (speed - 1.0).abs() > f32::EPSILON {
+        return Ok(bad_request(
+            "eleven_v3 does not support speed control; use speed 1.0",
+        ));
+    }
     let instructions = field_value(&fields, "instructions");
     if provider == "elevenlabs" && instructions.is_some() {
         return Ok(bad_request(
             "ElevenLabs does not accept free-form instructions",
         ));
     }
+    let max_chars = field_value(&fields, "max_chars")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2_000);
+    let provider_max_chars = audio_provider_max_chars(&provider, &model);
+    if max_chars == 0 || max_chars > provider_max_chars {
+        return Ok(bad_request(&format!(
+            "{provider} accepts between 1 and {provider_max_chars} characters per request"
+        )));
+    }
+    let concurrency = field_value(&fields, "concurrency")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 16);
     let make_m4b = truthy_field(&fields, "m4b");
     let stitch_audio = truthy_field(&fields, "stitch") || make_m4b;
     if stitch_audio && format == "pcm" {
@@ -1241,15 +1264,6 @@ async fn launch_audiobook(
     }
     std::fs::create_dir_all(&out_dir)?;
     write_audio_process_state(&out_dir, "starting", None, None)?;
-
-    let max_chars = field_value(&fields, "max_chars")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(2_000)
-        .clamp(1, 4_096);
-    let concurrency = field_value(&fields, "concurrency")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(4)
-        .clamp(1, 16);
 
     let exe = std::env::current_exe()?;
     let mut command = tokio::process::Command::new(exe);
@@ -1915,6 +1929,7 @@ fn dashboard_options_payload() -> DashboardOptions {
                 requires_key: false,
                 supports_instructions: false,
                 supports_speed: true,
+                max_chars: 40_000,
             },
             AudioProviderOption {
                 id: "openai",
@@ -1928,6 +1943,7 @@ fn dashboard_options_payload() -> DashboardOptions {
                 requires_key: true,
                 supports_instructions: true,
                 supports_speed: true,
+                max_chars: 4_096,
             },
             AudioProviderOption {
                 id: "gemini",
@@ -1941,6 +1957,7 @@ fn dashboard_options_payload() -> DashboardOptions {
                 requires_key: true,
                 supports_instructions: true,
                 supports_speed: false,
+                max_chars: 4_096,
             },
             AudioProviderOption {
                 id: "elevenlabs",
@@ -1954,6 +1971,9 @@ fn dashboard_options_payload() -> DashboardOptions {
                 requires_key: true,
                 supports_instructions: false,
                 supports_speed: true,
+                max_chars: bookforge_audio::elevenlabs_model_max_input_chars(
+                    "eleven_multilingual_v2",
+                ),
             },
         ],
         ffmpeg_available: bookforge_audio::ffmpeg_available(),
@@ -1965,6 +1985,15 @@ fn field_value(fields: &HashMap<String, String>, key: &str) -> Option<String> {
         .get(key)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn audio_provider_max_chars(provider: &str, model: &str) -> usize {
+    match provider {
+        "mock" => 40_000,
+        "elevenlabs" => bookforge_audio::elevenlabs_model_max_input_chars(model),
+        "openai" | "gemini" => 4_096,
+        _ => 4_096,
+    }
 }
 
 fn truthy_field(fields: &HashMap<String, String>, key: &str) -> bool {
@@ -2351,6 +2380,7 @@ struct AudioProviderOption {
     requires_key: bool,
     supports_instructions: bool,
     supports_speed: bool,
+    max_chars: usize,
 }
 
 impl JobDetail {
@@ -2594,6 +2624,15 @@ mod tests {
             .expect("ElevenLabs provider option should exist");
         assert!(elevenlabs.requires_voice);
         assert!(!elevenlabs.supports_instructions);
+        assert_eq!(elevenlabs.models.first(), Some(&"eleven_v3"));
+        assert_eq!(elevenlabs.default_model, "eleven_multilingual_v2");
+        assert_eq!(elevenlabs.max_chars, 10_000);
+        assert_eq!(audio_provider_max_chars("openai", "anything"), 4_096);
+        assert_eq!(audio_provider_max_chars("elevenlabs", "eleven_v3"), 5_000);
+        assert_eq!(
+            audio_provider_max_chars("elevenlabs", "eleven_flash_v2_5"),
+            40_000
+        );
     }
 
     #[test]
@@ -2921,14 +2960,14 @@ mod tests {
     fn dashboard_assets_reassemble_byte_stably() {
         use sha2::{Digest, Sha256};
 
-        assert_eq!(DASHBOARD_HTML.len(), 96_386);
+        assert_eq!(DASHBOARD_HTML.len(), 97_182);
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
         let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
         let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
             digest_hex,
-            "c8a0125fd9096f1a0fbf8b61c3907378dce1c5692bc0f592a3f05526bbb07c34"
+            "6a7999e04b3714c0669b72387e4834ba6620b42585d3ca963797f8258da61440"
         );
 
         let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");

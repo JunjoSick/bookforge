@@ -162,6 +162,113 @@ fn audiobook_dry_run_writes_nothing() {
 }
 
 #[test]
+fn audiobook_elevenlabs_enforces_model_character_limits() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "test-voice-id",
+            "--model",
+            "eleven_v3",
+            "--max-chars",
+            "5001",
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "eleven_v3 is limited to 5000 characters",
+        ));
+}
+
+#[test]
+fn elevenlabs_dry_run_without_model_uses_static_default_offline() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "v",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("eleven_multilingual_v2"))
+        .stdout(predicates::str::contains("auto-selects"));
+}
+
+#[test]
+fn elevenlabs_preflight_failure_warns_and_falls_back() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    let key_env = "BOOKFORGE_ELEVENLABS_PREFLIGHT_FALLBACK_TEST_KEY";
+
+    bookforge()
+        .current_dir(temp.path())
+        .env(key_env, "dummy-test-key")
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "v",
+            "--base-url",
+            "http://127.0.0.1:9",
+            "--api-key-env",
+            key_env,
+            "--timeout-seconds",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "warning: ElevenLabs model preflight failed",
+        ))
+        .stderr(predicates::str::contains(
+            "using default eleven_multilingual_v2",
+        ));
+}
+
+#[test]
+fn elevenlabs_v3_rejects_speed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "elevenlabs",
+            "--model",
+            "eleven_v3",
+            "--speed",
+            "1.2",
+            "--voice",
+            "v",
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("speed control"));
+}
+
+#[test]
 fn audiobook_resume_skips_existing_files() {
     let temp = tempfile::tempdir().expect("temp dir");
     let input = fixture(temp.path());
@@ -331,13 +438,17 @@ fn audiobook_elevenlabs_dry_run_accepts_native_provider_options() {
             "elevenlabs",
             "--voice",
             "JBFqnCBsd6RMkjVDRZzb",
+            "--model",
+            "eleven_flash_v2_5",
+            "--max-chars",
+            "40000",
             "--dry-run",
         ])
         .assert()
         .success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     assert!(stdout.contains("Voice: JBFqnCBsd6RMkjVDRZzb | Format: mp3"));
-    assert!(stdout.contains("Model: eleven_multilingual_v2"));
+    assert!(stdout.contains("Model: eleven_flash_v2_5"));
 }
 
 #[test]

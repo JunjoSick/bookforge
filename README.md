@@ -202,14 +202,26 @@ directory; on Windows use the poppler-windows release zip):
 cargo run -p bookforge-cli -- convert paper.pdf --out paper.epub
 ```
 
+For scanned or otherwise low-confidence pages, add an OpenAI-compatible OCR
+server. Successful pages are reported with `action=ocr`; local loopback
+servers do not require an API key:
+
+```bash
+cargo run -p bookforge-cli -- convert scan.pdf --out scan.epub \
+  --ocr-endpoint http://127.0.0.1:10000/v1
+```
+
+See [docs/pdf-ocr.md](docs/pdf-ocr.md) for the recommended Unlimited-OCR
+SGLang setup and the vLLM alternative.
+
 The converter detects two-column layouts per page (scientific papers),
 repairs hyphenated line breaks, joins paragraphs across pages, and maps
 oversized fonts to headings. It prints a fidelity report comparing the
 reconstructed text against the raw `pdftotext` baseline — check that
 coverage number (and `inspect` on the result) before spending tokens.
-Figures, tables-as-images, and low-confidence page fallbacks are
-roadmap items (ROADMAP §9b, phases P2–P4); for image-heavy PDFs expect
-text-only output for now.
+Figures, tables, equations, and low-confidence page fallbacks are preserved or
+reported according to the conversion options; complex layouts still require
+review.
 
 Inspect an EPUB:
 

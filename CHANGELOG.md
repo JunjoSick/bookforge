@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Added optional OCR recovery for low-confidence PDF pages through
+  OpenAI-compatible endpoints, including the SGLang-specific Unlimited-OCR
+  dialect, retrying blocking HTTP client, `action=ocr` reporting, and a
+  loopback-friendly endpoint doctor.
+- Added an Unlimited-OCR deployment guide and helper script for serializing
+  SGLang's custom no-repeat n-gram logit processor.
+- Audiobook chapter extraction now recognizes canonical Toki Pona headings
+  such as `lipu nanpa VI` and can recover chapter boundaries from legacy
+  BookForge translations that used the old `KAPITELO` label.
+- ElevenLabs audiobook requests now enforce each model's documented character
+  limit consistently in the CLI, dashboard, server, and provider layer: 40,000
+  for Flash/Turbo v2.5, 10,000 for Multilingual v2, and 5,000 for Eleven v3.
+- ElevenLabs live audiobook runs now auto-select the first available compatible
+  model in the preference order Eleven v3, Flash v2.5, Turbo v2.5, then
+  Multilingual v2, with a warning and Multilingual v2 fallback if preflight
+  fails. Explicit models still bypass preflight, and dry runs stay offline.
+- ElevenLabs requests now omit `voice_settings` at the default speed, reject
+  speed changes with Eleven v3, and list dashboard models in preference order
+  while retaining Multilingual v2 as the dashboard default.
+
 ## v2.5.1 - 2026-07-16
 
 - Fixed drag-and-drop uploads in the dashboard. The translation and audiobook

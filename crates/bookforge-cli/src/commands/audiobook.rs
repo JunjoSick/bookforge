@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use bookforge_audio::{
     AudioFormat, AudiobookOptions, ElevenLabsTtsConfig, ElevenLabsTtsProvider, GeminiTtsConfig,
     GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider, Progress,
-    StitchOptions, build_audiobook, plan_chunks, stitch, validate_options,
+    StitchOptions, build_audiobook, elevenlabs_model_max_input_chars, plan_chunks,
+    resolve_preferred_elevenlabs_model, stitch, validate_options,
 };
 use bookforge_epub::{ReflowOptions, read_epub, reflow_epub};
 use clap::{Args, ValueEnum};
@@ -194,6 +195,8 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         anyhow::bail!("--timeout-seconds must be greater than zero");
     }
 
+    let elevenlabs_dry_run_default =
+        args.provider == AudioProviderKind::Elevenlabs && args.model.is_none() && args.dry_run;
     let (model, synthesis_id) = match args.provider {
         AudioProviderKind::Mock => {
             let model = args
@@ -239,10 +242,41 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             (model.clone(), format!("gemini:{base_url}:{model}"))
         }
         AudioProviderKind::Elevenlabs => {
-            let model = args
-                .model
-                .clone()
-                .unwrap_or_else(|| "eleven_multilingual_v2".to_string());
+            let model = if let Some(model) = args.model.clone() {
+                model
+            } else if args.dry_run {
+                "eleven_multilingual_v2".to_string()
+            } else {
+                let mut config = ElevenLabsTtsConfig::hosted(None);
+                if let Some(base_url) = args.base_url.clone() {
+                    config.base_url = base_url;
+                }
+                if let Some(api_key_env) = args.api_key_env.clone() {
+                    config.api_key_env = api_key_env;
+                }
+                config.timeout_seconds = args.timeout_seconds.min(15);
+                match resolve_preferred_elevenlabs_model(
+                    &config,
+                    args.max_chars,
+                    (args.speed - 1.0).abs() > f32::EPSILON,
+                )
+                .await
+                {
+                    Ok(model) => model,
+                    Err(error) => {
+                        eprintln!(
+                            "warning: ElevenLabs model preflight failed ({error}); using default eleven_multilingual_v2"
+                        );
+                        "eleven_multilingual_v2".to_string()
+                    }
+                }
+            };
+            let model_limit = elevenlabs_model_max_input_chars(&model);
+            if args.max_chars > model_limit {
+                anyhow::bail!(
+                    "ElevenLabs model {model} is limited to {model_limit} characters; set --max-chars to {model_limit} or less"
+                );
+            }
             let base_url = args
                 .base_url
                 .as_deref()
@@ -251,6 +285,14 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             (model.clone(), format!("elevenlabs:{base_url}:{model}"))
         }
     };
+    if args.provider == AudioProviderKind::Elevenlabs
+        && model == "eleven_v3"
+        && (args.speed - 1.0).abs() > f32::EPSILON
+    {
+        anyhow::bail!(
+            "eleven_v3 has no speed control on the ElevenLabs TTS endpoint; use --speed 1.0 or pick another model"
+        );
+    }
     let options = AudiobookOptions {
         out_dir: out_dir.clone(),
         voice: voice.clone(),
@@ -287,7 +329,13 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         );
         println!("Output: {}", out_dir.display());
         println!("Voice: {voice} | Format: {}", format.extension());
-        println!("Model: {model}");
+        if elevenlabs_dry_run_default {
+            println!(
+                "Model: {model} (default; a live run auto-selects the best available ElevenLabs model)"
+            );
+        } else {
+            println!("Model: {model}");
+        }
         println!(
             "Plan: {chapter_count} chapters, {} chunks, {total_chars} characters",
             plan.len()

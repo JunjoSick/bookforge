@@ -12,6 +12,8 @@ bookforge-core = { version = "2.5.1", path = "../bookforge-core" }
 quick-xml.workspace = true
 crc32fast = "1.5.0"
 flate2 = "1.1.9"
+base64.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
