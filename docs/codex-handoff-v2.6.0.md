@@ -1,10 +1,14 @@
-# BookForge v3.0 — Codex handoff: audiobook narration quality + WebUI parity
+# BookForge v2.6.0 — Codex handoff: audiobook narration quality + WebUI parity
 
-**Status:** in progress. **Branch:** `feat/v3.0-audiobook` (stacked on `codex/audiobook-provider-and-chapter-fixes` / PR #40, with `main` merged in).
-**Worktree:** `tmp/worktrees/v3.0` — all v3.0 work happens there; `main`'s working tree carries unrelated uncommitted work and must not be touched.
+> **Renumbering note:** This work was drafted as v3.0 and renumbered to v2.6.0
+> before release. The branch and worktree names below intentionally retain
+> their original draft-era names.
+
+**Status:** v2.6.0 in progress. **Branch:** `feat/v3.0-audiobook` (stacked on `codex/audiobook-provider-and-chapter-fixes` / PR #40, with `main` merged in).
+**Worktree:** `tmp/worktrees/v3.0` — all audiobook milestone work happens there; `main`'s working tree carries unrelated uncommitted work and must not be touched.
 
 **How to use this document:** each `W#` brief below is a self-contained Codex task. Dispatch with
-`codex exec --full-auto "$(cat docs/codex-handoff-v3.0.md)"` scoped to one brief, or paste the brief plus the *Shared context* section. Workers never commit; the orchestrator reviews every diff, runs verification, and owns all live-credit spend.
+`codex exec --full-auto "$(cat docs/codex-handoff-v2.6.0.md)"` scoped to one brief, or paste the brief plus the *Shared context* section. Workers never commit; the orchestrator reviews every diff, runs verification, and owns all live-credit spend.
 
 **Execution order (dependency-driven — `bookforge-cli` will not compile until W1 lands):**
 | Phase | Workers | Why |
@@ -16,7 +20,7 @@
 
 ## Context
 
-Today's live E2E (the *Che fare* audiobook) exposed the limitations the user wants fixed for v3.0:
+Today's live E2E (the *Che fare* audiobook) exposed the limitations the user wants fixed for v2.6.0:
 
 1. **No narration hierarchy.** A chapter title is narrated as flat prose. Root cause: the section's first heading block produces `Chapter.title` *and* is emitted as the first paragraph of `Chapter.text`; `chunk_text` (`text.rs:400-440`) then packs that heading into the same chunk as the following body sentences, replacing the `\n\n` break with a single space. In-section h2–h6 headings are likewise flattened. The TTS request carries zero signal that a span is a title.
 2. **No true single-file output.** Only a chaptered `.m4b` exists, it requires an explicit flag, and it has no title/author metadata. No flat mp3.
@@ -24,7 +28,7 @@ Today's live E2E (the *Che fare* audiobook) exposed the limitations the user wan
 4. **Missing polish:** no loudness normalization, no inter-chapter/heading silence, no cost/quota estimate, no chapter-subset selection, no voice listing.
 5. **WebUI lags the CLI** — and it's the surface the user's partner actually uses: no auto-model, no voice picker, no playback, no cost/quota preview, none of the new knobs.
 
-**Goal:** v3.0 makes the audiobook *sound* like an audiobook (title/heading separation, consistent voice, clean joins), consolidates output, and brings all of it to the WebUI first.
+**Goal:** v2.6.0 makes the audiobook *sound* like an audiobook (title/heading separation, consistent voice, clean joins), consolidates output, and brings all of it to the WebUI first.
 
 **User decisions (locked):**
 - **Output:** chaptered file is the **default** deliverable (`.m4b` with chapter markers + title/author metadata, auto-enabled when ffmpeg is present). A **flat single mp3** is opt-in (`--single`, "flat mp3 for on-the-go" in the UI).
@@ -124,7 +128,7 @@ pub async fn fetch_elevenlabs_subscription(config: &ElevenLabsTtsConfig)
 
 ### W3 — docs skeleton *(Phase 1 — parallel with W1; touches no code)*
 **Owns:** `docs/ROADMAP.md`, `docs/audiobooks.md`, `CHANGELOG.md`.
-- ROADMAP: append `## 16. v3.0 — Audiobook narration quality & UI parity` immediately before `*End of document.*` (:2925), following the milestone template at :38-49 (Goal / Architectural rationale / Deliverables / Schema changes / CLI surface / Implementation notes / Out of scope / Acceptance criteria / Effort / Dependencies). Schema-changes section must list manifest v3, cache tag v2, and the new audio pricing file. Out of scope: per-chapter streaming route, `request_ids` serialization, OperationKind unification (§10.1), Range support on the artifact route. Acceptance criteria include one live end-to-end. Add a `v3.0` row to the §2 overview table (:113-125) with status `in progress`; bump the doc header to version 1.4.0 / 2026-07-20.
+- ROADMAP: append `## 16. v2.6.0 — Audiobook narration quality & UI parity` immediately before `*End of document.*` (:2925), following the milestone template at :38-49 (Goal / Architectural rationale / Deliverables / Schema changes / CLI surface / Implementation notes / Out of scope / Acceptance criteria / Effort / Dependencies). Schema-changes section must list manifest v3, cache tag v2, and the new audio pricing file. Out of scope: per-chapter streaming route, `request_ids` serialization, OperationKind unification (§10.1), Range support on the artifact route. Acceptance criteria include one live end-to-end. Add a `v2.6.0` row to the §2 overview table (:113-125) with status `in progress`; bump the doc header to version 1.4.0 / 2026-07-20.
 - `docs/audiobooks.md`: restructure for the full new flag surface (leave `TODO(worker)` markers for flags W4 finalizes); document gap semantics, the chaptered-by-default deliverable, flat-mp3 opt-in, `--list-voices`, quota/cost lines.
 - `CHANGELOG.md` `## Unreleased`: bullets for every WP, with a prominent **"existing audio chunk caches are invalidated (hash v2); rerun with `--prune`"** notice.
 
@@ -136,7 +140,7 @@ pub async fn fetch_elevenlabs_subscription(config: &ElevenLabsTtsConfig)
 - **Chaptered-by-default:** when ffmpeg is available a normal run now emits the chaptered `.m4b` (with title/author from `book.metadata`) without an explicit `--m4b`; add `--no-book-file` to opt out. Keep `--stitch`/`--m4b` working as explicit overrides. `--single` adds the flat file and is combinable.
 - `--chapters`: `parse_chapter_ranges(&str) -> Result<BTreeSet<usize>>` (1-based, matching printed chapter numbers; reject `0`, reversed ranges, garbage). Filter inside `build_plan` via `AudiobookOptions.chapter_filter` so plan/dry-run/manifest/serve all stay consistent; keep global chapter numbering in filenames.
 - `--list-voices`: make `input` optional and bail "INPUT is required" unless `--list-voices`; elevenlabs-only; print a `voice_id  name  labels` table. Improve the missing-`--voice` error to point at it.
-- **Cost + quota:** new `pricing/audio-providers.json` (`schema_version: 1`, per provider/model `{usd_per_million_chars?, credits_per_char?}`, at least one required; seed ElevenLabs from the observed **~0.27 credits/char** for v3 on payg plus published relative multipliers, and set `updated_at`). `audio_cost.rs` mirrors `cost.rs` (`include_str!`, `BOOKFORGE_AUDIO_PRICING_PATH` override, hard `schema_version == 1` check) exposing `estimate_audio_cost(provider, model, chars)`. Print `Estimated cost: ~$X.XX / ~N credits` after the existing `Plan:` line and add the fields to the `audiobook_plan` JSON event. On elevenlabs runs (live always; dry-run when the key env is set) call `fetch_elevenlabs_subscription` and print `ElevenLabs quota: N remaining of M`, warning when the plan exceeds it — **preflight failure is a warning, never fatal** (mirror the existing auto-selection fallback style).
+- **Cost + quota:** new `pricing/audio-providers.json` (`schema_version: 1`, per provider/model `{usd_per_million_chars?, credits_per_char?}`, at least one required; seed ElevenLabs from the observed **~0.27 credits/char** for `eleven_v3` on payg plus published relative multipliers, and set `updated_at`). `audio_cost.rs` mirrors `cost.rs` (`include_str!`, `BOOKFORGE_AUDIO_PRICING_PATH` override, hard `schema_version == 1` check) exposing `estimate_audio_cost(provider, model, chars)`. Print `Estimated cost: ~$X.XX / ~N credits` after the existing `Plan:` line and add the fields to the `audiobook_plan` JSON event. On elevenlabs runs (live always; dry-run when the key env is set) call `fetch_elevenlabs_subscription` and print `ElevenLabs quota: N remaining of M`, warning when the plan exceeds it — **preflight failure is a warning, never fatal** (mirror the existing auto-selection fallback style).
 - **TUI:** `AudioTuiInfo` gains a preformatted `cost_line: Option<String>` and `chapters_total`; render resolved model + cost; per-chapter progress if trivial.
 - **Tests:** `parse_chapter_ranges` unit tests; mock-provider `assert_cmd` runs asserting `--chapters 2` produces only chapter-002 records, that a `<h1>`+2`<p>` fixture yields the title alone in part 1 (inspect `manifest.json`), and both `--list-voices` misuse directions; `audio_cost` parse/reject-schema/lookup tests + a `BOOKFORGE_AUDIO_PRICING_PATH` temp-file test asserting the printed cost line; language-normalization unit test.
 
@@ -150,7 +154,7 @@ pub async fn fetch_elevenlabs_subscription(config: &ElevenLabsTtsConfig)
 - **Last step, once:** run `cargo test -p bookforge-cli --features serve dashboard_assets_reassemble_byte_stably`, take the actual byte length + SHA-256 from the failure output, update both literals in `serve.rs` (~:2924 and ~:2931). Add markers (`function bfAudioEstimate`, `Auto (recommended)`, `/api/audio/voices`) to the renderer/marker tests.
 
 ## Phase 4 — orchestrator
-Full `cargo test --workspace`; docs finalized (W3 `TODO(worker)` markers resolved against W4's real flags); release prep commit bumping all 7 crate versions to `3.0.0` + dated `## v3.0.0` CHANGELOG heading, mirroring commit `bd1faf11` (`git show bd1faf11` is the checklist). Tagging `v3.0.0` triggers cargo-dist `release.yml`.
+Full `cargo test --workspace`; docs finalized (W3 `TODO(worker)` markers resolved against W4's real flags); release prep commit bumping all 7 crate versions to `2.6.0` + dated `## v2.6.0` CHANGELOG heading, mirroring commit `bd1faf11` (`git show bd1faf11` is the checklist). Tagging `v2.6.0` triggers cargo-dist `release.yml`.
 
 ## Verification
 - `cargo test --workspace` green after each phase; all new tests offline/deterministic/Windows-friendly.

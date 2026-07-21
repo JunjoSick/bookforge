@@ -16,17 +16,18 @@
 - ElevenLabs synthesis now supplies up to 300 characters of same-chapter
   `previous_text` and `next_text` for smoother joins, plus optional `--seed`,
   `--language`, and `--text-normalization` controls. Language codes are sent
-  only to Flash/Turbo v2.5 and are warned-and-dropped for Multilingual v2 and
-  Eleven v3, whose APIs reject them.
-- A chaptered `audiobook.m4b` with chapter markers and title/author metadata is
+  only to Flash/Turbo v2.5 and are warned-and-dropped for every other model or
+  provider.
+- A chaptered `audiobook.m4b` with chapter markers and title/artist metadata is
   now the default deliverable when ffmpeg is available; `--no-book-file` opts
   out and `--single` adds a flat audio file for on-the-go listening. Added
   configurable whole-book `--loudnorm` while leaving per-chapter files
   unnormalized.
 - Added schema-1 per-character TTS pricing in
-  `pricing/audio-providers.json`, estimated dollar/credit cost in audiobook
-  plan and dry-run output, and a non-fatal ElevenLabs subscription-quota
-  preflight. Added one-based chapter subset selection with `--chapters` and
+  `crates/bookforge-cli/pricing/audio-providers.json`, estimated dollar/credit
+  cost in audiobook plan and dry-run output, and a non-fatal ElevenLabs
+  subscription-quota preflight. Pricing figures are estimates; provider billing
+  is authoritative. Added one-based chapter subset selection with `--chapters` and
   ElevenLabs account voice discovery with `--list-voices`.
 - Brought the browser audiobook workflow to CLI parity: ElevenLabs now offers
   `Auto (recommended)` model selection and a server-side voice-list proxy at

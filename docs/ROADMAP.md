@@ -1,14 +1,14 @@
-# BookForge — Technical Roadmap, v1.0.1 through v3.0
+# BookForge — Technical Roadmap, v1.0.1 through v2.6.0
 
 **Document version:** 1.4.0
-**Last updated:** 2026-07-20
+**Last updated:** 2026-07-21
 **Status:** historical roadmap plus active follow-up notes
 **Audience:** project maintainer + Claude Code (or any other coding agent) implementing
 the milestones below.
 
-> **Current status:** v2.4.0 is the release candidate on
-> `codex/project-remediation` (2026-07-13); v2.3.0 is the latest published
-> release.
+> **Current status:** v2.5.1 is the latest published release (2026-07-16),
+> and the v2.6.0 audiobook narration quality and UI-parity milestone is in
+> progress.
 > This document is kept for architectural invariants, shipped-milestone
 > context, and deferred follow-up work. For current user behavior, start
 > with `README.md`, `CHANGELOG.md`, and `docs/v2-web-dashboard-plan.md`;
@@ -23,7 +23,8 @@ the milestones below.
 > releases v2.0.0–v2.0.3; milestone v1.6 (PDF hardening) → release
 > v2.1.0 (2026-07-03); milestone v1.7 (bilingual output) → release
 > v2.2.0 (2026-07-04). Reflow and cooperative controls shipped in v2.3.0;
-> durable corrections and live reconfiguration are the v2.4.0 scope.
+> durable corrections and live reconfiguration shipped in v2.4.0; the initial
+> audiobook pipeline shipped in v2.5.0, followed by the v2.5.1 dashboard fix.
 
 ---
 
@@ -123,7 +124,7 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v1.7 | Bilingual output (§9b) | 5–8 days | passive (release notes only) | **shipped 2026-07-04 as release v2.2.0** |
 | v1.8 | Structural credibility (EPUBCheck + corpus; was the planned v1.5 scope, §8) | 10–14 days | README final rewrite citing corpus | **shipped 2026-06-20** |
 | v2.0 | Monitoring UI (`RunState`, `watch`, `--ui tui`, local `serve`) | shipped scope | release notes | shipped; patch line completed at v2.0.3 (2026-07-02) |
-| v3.0 | Audiobook narration quality & UI parity (§16) | 8–12 days | release notes and updated audiobook guide | in progress |
+| v2.6.0 | Audiobook narration quality & UI parity (§16) | 8–12 days | release notes and updated audiobook guide | in progress |
 
 Priority note (2026-06): the owner needs PDF translation more than
 bilingual output — scientific papers (figures/tables must survive) and
@@ -2395,7 +2396,7 @@ visible reader-facing defect in the owner's actual library.
 > **Status note (2026-07-03):** "v2" shipped (releases v2.0.0–v2.1.0)
 > with a scope chosen at the time — the monitoring UI plus web dashboard.
 > The candidates sketched below were written before that decision; read
-> them as a v2.x/v3 idea list, not as the shipped v2's contents.
+> them as an open-ended follow-up idea list, not as the shipped v2's contents.
 
 The v2 list is what's interesting *as of writing*. The real v2
 priorities will be informed by:
@@ -2923,7 +2924,7 @@ externalized memory. When in doubt, ask.
 
 ---
 
-## 16. v3.0 — Audiobook narration quality & UI parity
+## 16. v2.6.0 — Audiobook narration quality & UI parity
 
 ### 16.1 Goal
 
@@ -2962,11 +2963,11 @@ informed decision before spending provider credits.
 - ElevenLabs continuity controls: same-chapter `previous_text` and `next_text`
   context (300 characters on each side), a reproducible seed, supported
   language selection, and text-normalization policy.
-- A chaptered `audiobook.m4b`, with chapter markers and title/author metadata,
-  as the default deliverable when ffmpeg is present. Users may opt out of the
-  book file or additionally request a flat single audio file for on-the-go
-  listening. Optional whole-book loudness normalization targets
-  `I=-18:TP=-2:LRA=11`.
+- A chaptered `audiobook.m4b`, with chapter markers and title/artist metadata
+  (using the EPUB author as the artist), as the default deliverable when ffmpeg
+  is present. Users may opt out of the book file or additionally request a flat
+  single audio file for on-the-go listening. Optional whole-book loudness
+  normalization targets `I=-18:TP=-2:LRA=11`.
 - Per-character provider pricing, plan/dry-run cost estimates, and a non-fatal
   ElevenLabs subscription-quota preflight before live synthesis.
 - Chapter-range selection and provider-backed ElevenLabs voice listing in the
@@ -2986,10 +2987,12 @@ informed decision before spending provider credits.
 - The synthesis cache domain tag changes from `bookforge-audio-v1` to
   `bookforge-audio-v2`. The new hash includes narration kind, neighbor context,
   seed, language, and text normalization, deliberately invalidating every
-  existing audio chunk cache.
-- New `pricing/audio-providers.json`, with `schema_version: 1`, records
-  per-character TTS pricing by provider and model (expressed as cost per
-  million characters and/or credits per character).
+  existing audio chunk cache. This is a one-time compatibility break for
+  users' on-disk audio caches, not a semver-major CLI or API change; rerun with
+  `--prune` to remove superseded chunks.
+- New `crates/bookforge-cli/pricing/audio-providers.json`, with
+  `schema_version: 1`, records per-character TTS pricing by provider and model
+  (expressed as cost per million characters and/or credits per character).
 
 ### 16.5 CLI surface
 
@@ -3001,7 +3004,7 @@ informed decision before spending provider credits.
 - `--seed <U32>`, `--language <CODE>`, and
   `--text-normalization <auto|on|off>` expose ElevenLabs consistency controls.
   Language defaults from the book metadata and is sent only to Flash/Turbo
-  v2.5, because ElevenLabs rejects it on Multilingual v2.
+  v2.5; BookForge warns and drops it for every other model or provider.
 - `--loudnorm` normalizes assembled book files; per-chapter files remain
   untouched to avoid independently normalized chapter-to-chapter level jumps.
 - A normal run creates the chaptered `.m4b` when ffmpeg is available.
@@ -3058,12 +3061,12 @@ informed decision before spending provider credits.
 3. ElevenLabs request-contract tests show same-chapter context, seed, language,
    and text-normalization fields when configured, omit them at defaults, and
    never carry context across a chapter boundary.
-4. Changing any v3 synthesis input changes the `bookforge-audio-v2` hash; a v2
-   manifest remains readable, while every v1-tagged cached chunk is treated as
-   stale.
+4. Changing any newly hashed synthesis input changes the
+   `bookforge-audio-v2` hash; a v2 manifest remains readable, while every
+   v1-tagged cached chunk is treated as stale.
 5. With ffmpeg available, an ordinary run emits a playable chaptered `.m4b`
-   with title, author, and chapter markers; `--no-book-file` suppresses it,
-   `--single` adds the flat artifact, and `--loudnorm` applies only during
+   with title/artist metadata and chapter markers; `--no-book-file` suppresses
+   it, `--single` adds the flat artifact, and `--loudnorm` applies only during
    whole-book assembly.
 6. Plan and dry-run output report character count and estimated dollars and/or
    credits from schema-1 pricing. An ElevenLabs run reports remaining quota,

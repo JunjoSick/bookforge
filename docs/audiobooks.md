@@ -11,7 +11,7 @@ The workflow is available consistently in three places: the ordinary CLI, the
 full-screen terminal dashboard (`--ui tui`), and the Audiobooks screen in the
 local browser dashboard started by `bookforge serve`.
 
-> **Upgrading to v3.0 invalidates all existing audio chunk caches.** The cache
+> **Upgrading to v2.6.0 invalidates all existing audio chunk caches.** The cache
 > hash moved to `bookforge-audio-v2` and the manifest to schema 3. Rerun the
 > audiobook command with `--prune` to remove superseded v2.5 chunk files after
 > reviewing the new plan; use `--prune --dry-run` to preview what will be
@@ -37,8 +37,8 @@ local browser dashboard started by `bookforge serve`.
 6. **Manifest**: a schema-3 `manifest.json` records the plan, narration kind,
    synthesis settings, gap settings, author, and per-chunk metadata.
 7. **Assemble**: when ffmpeg is available, a normal run creates a chaptered
-   `audiobook.m4b` with chapter markers and title/author metadata. The chunks
-   remain the resumable units on disk.
+   `audiobook.m4b` with chapter markers and title/artist metadata (using the
+   EPUB author as the artist). The chunks remain the resumable units on disk.
 
 ## Narration hierarchy and continuity
 
@@ -184,24 +184,24 @@ their original numbers in the manifest and output filenames.
 | `--m4b` | automatic when ffmpeg is present | Explicitly request the chaptered `.m4b`. |
 
 `--language` normalizes metadata such as `en-US` to its primary subtag (`en`).
-ElevenLabs accepts this field only for Flash and Turbo v2.5. BookForge warns
-and drops it for Multilingual v2 and Eleven v3 because those APIs reject it.
+It is sent only to ElevenLabs Flash and Turbo v2.5. BookForge warns and drops
+it for every other model or provider.
 The `--text-normalization` setting maps to ElevenLabs'
 `apply_text_normalization` request field.
 
 ## Cost and quota preflight
 
 After the `Plan:` summary, BookForge estimates the narration price from the
-bundled schema-1 `pricing/audio-providers.json` table and prints the available
-dollar and/or provider-credit estimate, for example:
+bundled schema-1 `crates/bookforge-cli/pricing/audio-providers.json` table and
+prints the applicable dollar and/or provider-credit estimate, for example:
 
 ```text
 Estimated cost: ~$1.23 / ~4500 credits
 ```
 
 Pricing is per character, so changing chunk size does not change the estimate.
-Treat it as planning information rather than an invoice: provider plans and
-rates can change.
+These figures are planning estimates, not invoices: provider plans and rates
+can change, and the provider's own billing is authoritative.
 
 Before a live ElevenLabs run, BookForge queries `/v1/user/subscription` and
 prints a line such as `ElevenLabs quota: 12000 remaining of 20000`. It warns
@@ -212,7 +212,8 @@ preflight failure is always a warning and never prevents synthesis.
 ## Book files, stitching, and loudness
 
 When ffmpeg is on `PATH`, the default deliverable is `audiobook.m4b`, with
-chapter markers plus the EPUB's title and author metadata. `--no-book-file`
+chapter markers plus title/artist metadata drawn from the EPUB's title and
+author. `--no-book-file`
 opts out. `--single` adds one flat `audiobook.<format>`; with MP3 output this is
 the convenient single-file MP3 for players that do not need chapter markers.
 The two book outputs can be requested together.
@@ -234,11 +235,11 @@ fails clearly while preserving those chunks for a later resumed stitch.
 ## Resume and cache cleanup
 
 Re-run the same command and every matching hashed chunk already on disk is
-skipped. The v3 cache key covers the text, narration kind, provider/model
-identity, voice, format, speed, instructions, seed, language, normalization,
-and same-chapter neighbor context. An interrupted write is never accepted as a
-finished chunk. The run summary reports how many chunks were synthesized and
-reused.
+skipped. The `bookforge-audio-v2` cache key covers the text, narration kind,
+provider/model identity, voice, format, speed, instructions, seed, language,
+normalization, and same-chapter neighbor context. An interrupted write is
+never accepted as a finished chunk. The run summary reports how many chunks
+were synthesized and reused.
 
 Superseded chunks stay on disk so prior generations remain auditable. Pass
 `--prune` to remove chunk files the current run does not use and free the
@@ -248,7 +249,7 @@ never pruned.
 
 ## Browser dashboard
 
-The Audiobooks screen mirrors the CLI's v3 workflow:
+The Audiobooks screen mirrors the CLI's current workflow:
 
 - ElevenLabs offers `Auto (recommended)` model selection and retrieves the
   account's voices through a server-side proxy; the API key never reaches the
