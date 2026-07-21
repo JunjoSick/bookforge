@@ -1323,7 +1323,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn eleven_v3_gets_no_neighbour_context() {
         // ElevenLabs answers a v3 request carrying previous_text or next_text
         // with `unsupported_model`, which fails the whole run.

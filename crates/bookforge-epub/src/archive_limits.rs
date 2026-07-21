@@ -60,9 +60,7 @@ impl ArchiveReadBudget {
             .limits
             .max_total_uncompressed_size
             .saturating_sub(self.total_uncompressed_read);
-        let ratio_limit = compressed_size
-            .checked_mul(self.limits.max_entry_compression_ratio)
-            .unwrap_or(u64::MAX);
+        let ratio_limit = compressed_size.saturating_mul(self.limits.max_entry_compression_ratio);
         let read_limit = self
             .limits
             .max_entry_uncompressed_size
@@ -164,7 +162,7 @@ pub(crate) fn validate_archive_metadata<R: Read + Seek>(
 }
 
 fn exceeds_ratio(uncompressed: u64, compressed: u64, maximum_ratio: u64) -> bool {
-    uncompressed > compressed.checked_mul(maximum_ratio).unwrap_or(u64::MAX)
+    uncompressed > compressed.saturating_mul(maximum_ratio)
 }
 
 fn limit_error(message: String) -> BookforgeError {

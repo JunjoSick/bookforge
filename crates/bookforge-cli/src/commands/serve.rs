@@ -2328,9 +2328,11 @@ fn dashboard_child_environment_variable_allowed(name: &std::ffi::OsStr) -> bool 
         return true;
     }
 
+    // Exactly one of the following blocks compiles, so each is written as the
+    // function's trailing expression rather than an early return.
     #[cfg(windows)]
     {
-        return [
+        [
             "PATH",
             "SYSTEMROOT",
             "TEMP",
@@ -2340,15 +2342,15 @@ fn dashboard_child_environment_variable_allowed(name: &std::ffi::OsStr) -> bool 
             "LOCALAPPDATA",
         ]
         .iter()
-        .any(|allowed| name.eq_ignore_ascii_case(allowed));
+        .any(|allowed| name.eq_ignore_ascii_case(allowed))
     }
 
     #[cfg(unix)]
     {
-        return matches!(
+        matches!(
             name.as_ref(),
             "PATH" | "HOME" | "LANG" | "LANGUAGE" | "TMPDIR"
-        ) || name.starts_with("LC_");
+        ) || name.starts_with("LC_")
     }
 
     #[cfg(not(any(windows, unix)))]
