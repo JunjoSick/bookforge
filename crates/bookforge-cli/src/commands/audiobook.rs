@@ -403,7 +403,7 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         concurrency: args.concurrency,
         synthesis_id,
         instructions: args.instructions.clone(),
-        context_chars: 300,
+        context_chars: resolve_context_chars(args.provider, &model),
         seed: args.seed,
         language_code,
         text_normalization: (args.provider == AudioProviderKind::Elevenlabs)
@@ -431,7 +431,13 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     crate::audio_cost::load_audio_pricing()?;
     let estimated_cost = crate::audio_cost::estimate_audio_cost(provider_name, &model, total_chars);
     let cost_line = format_audio_cost_line(estimated_cost);
-    let quota = elevenlabs_quota_preflight(&args, &model, total_chars).await;
+    let quota = elevenlabs_quota_preflight(
+        &args,
+        &model,
+        total_chars,
+        estimated_cost.and_then(|cost| cost.credits),
+    )
+    .await;
 
     let human_output = !matches!(args.ui, UiMode::Quiet | UiMode::Json | UiMode::Tui);
     if human_output {
@@ -792,6 +798,19 @@ fn resolve_language_code(
     None
 }
 
+/// Characters of neighbouring-chunk context to send for prosody continuity.
+///
+/// `eleven_v3` rejects the request outright with `unsupported_model` when
+/// `previous_text` or `next_text` is present, so it gets none. Other providers
+/// ignore the fields, but sending nothing keeps them out of the cache hash.
+fn resolve_context_chars(provider: AudioProviderKind, model: &str) -> usize {
+    const DEFAULT_CONTEXT_CHARS: usize = 300;
+    if provider != AudioProviderKind::Elevenlabs || model == "eleven_v3" {
+        return 0;
+    }
+    DEFAULT_CONTEXT_CHARS
+}
+
 fn resolve_heading_break_tag(
     provider: AudioProviderKind,
     model: &str,
@@ -882,10 +901,19 @@ async fn list_voices_and_exit(args: &AudiobookArgs) -> Result<()> {
     Ok(())
 }
 
+/// Warn when the run will not fit in the account's remaining ElevenLabs quota.
+///
+/// The quota is denominated in the same units the pricing catalog calls
+/// credits, and models consume them at different rates per character — v3
+/// bills well under one per character on a pay-as-you-go plan. Comparing raw
+/// character count against the remaining balance therefore warns about runs
+/// that comfortably fit. Prefer the credit estimate and fall back to
+/// characters only when the model has no pricing entry.
 async fn elevenlabs_quota_preflight(
     args: &AudiobookArgs,
     model: &str,
     planned_chars: usize,
+    estimated_credits: Option<f64>,
 ) -> Option<QuotaInfo> {
     if args.provider != AudioProviderKind::Elevenlabs {
         return None;
@@ -910,10 +938,19 @@ async fn elevenlabs_quota_preflight(
             let remaining = subscription
                 .character_limit
                 .saturating_sub(subscription.character_count);
-            if planned_chars as u64 > remaining {
-                eprintln!(
-                    "warning: planned audiobook has {planned_chars} characters, exceeding the ElevenLabs quota of {remaining} remaining characters"
-                );
+            match estimated_credits {
+                Some(credits) if credits.ceil() as u64 > remaining => {
+                    eprintln!(
+                        "warning: planned audiobook needs about {} credits ({planned_chars} characters on {model}), exceeding the {remaining} remaining",
+                        credits.ceil() as u64
+                    );
+                }
+                None if planned_chars as u64 > remaining => {
+                    eprintln!(
+                        "warning: planned audiobook has {planned_chars} characters and {model} has no pricing entry, which may exceed the {remaining} remaining credits"
+                    );
+                }
+                _ => {}
             }
             Some(QuotaInfo {
                 remaining,
@@ -1221,7 +1258,8 @@ fn validate_audio_base_url(value: &str) -> Result<()> {
 mod tests {
     use super::{
         AudioProviderKind, BreakTagsArg, normalize_language_code, parse_chapter_ranges,
-        resolve_heading_break_tag, resolve_language_code, validate_audio_base_url,
+        resolve_context_chars, resolve_heading_break_tag, resolve_language_code,
+        validate_audio_base_url,
     };
 
     #[test]
@@ -1282,6 +1320,39 @@ mod tests {
             .as_deref(),
             Some("en")
         );
+    }
+
+    #[test]
+    #[test]
+    fn eleven_v3_gets_no_neighbour_context() {
+        // ElevenLabs answers a v3 request carrying previous_text or next_text
+        // with `unsupported_model`, which fails the whole run.
+        assert_eq!(
+            resolve_context_chars(AudioProviderKind::Elevenlabs, "eleven_v3"),
+            0
+        );
+        for model in [
+            "eleven_flash_v2_5",
+            "eleven_turbo_v2_5",
+            "eleven_multilingual_v2",
+        ] {
+            assert_eq!(
+                resolve_context_chars(AudioProviderKind::Elevenlabs, model),
+                300,
+                "{model} supports request stitching"
+            );
+        }
+        for provider in [
+            AudioProviderKind::Openai,
+            AudioProviderKind::Gemini,
+            AudioProviderKind::Mock,
+        ] {
+            assert_eq!(
+                resolve_context_chars(provider, "any-model"),
+                0,
+                "only ElevenLabs consumes neighbour context"
+            );
+        }
     }
 
     #[test]
