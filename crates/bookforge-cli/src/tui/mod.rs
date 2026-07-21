@@ -149,6 +149,8 @@ pub struct AudioTuiInfo {
     pub provider: String,
     pub model: String,
     pub voice: String,
+    pub cost_line: Option<String>,
+    pub chapters_total: usize,
     pub total: usize,
 }
 
@@ -280,15 +282,21 @@ fn render_audio_dashboard(
     );
 
     let synthesized = done.saturating_sub(cached);
-    let details = Text::from(vec![
+    let mut detail_lines = vec![
         Line::from(format!("Current: {current_chapter}")),
+        Line::from(format!("Resolved model: {}", info.model)),
         Line::from(format!(
             "Synthesized: {synthesized}   Cached: {cached}   Remaining: {}",
             info.total.saturating_sub(done)
         )),
+        Line::from(format!("Chapters: {} total", info.chapters_total)),
         Line::from(format!("Status: {status}")),
         Line::from("Progress is checkpointed to manifest.json after every chunk."),
-    ]);
+    ];
+    if let Some(cost_line) = &info.cost_line {
+        detail_lines.insert(2, Line::from(cost_line.clone()));
+    }
+    let details = Text::from(detail_lines);
     frame.render_widget(Paragraph::new(details).block(Block::bordered()), areas[2]);
     frame.render_widget(
         Paragraph::new(" q/Esc cancel and exit ").style(Style::new().fg(Color::DarkGray)),
@@ -822,6 +830,8 @@ mod tests {
             provider: "gemini".to_string(),
             model: "gemini-tts".to_string(),
             voice: "Kore".to_string(),
+            cost_line: Some("Estimated cost: ~$1.23".to_string()),
+            chapters_total: 4,
             total: 12,
         };
         let mut terminal = Terminal::new(TestBackend::new(90, 18)).unwrap();
@@ -841,6 +851,9 @@ mod tests {
         assert!(text.contains("5/12"));
         assert!(text.contains("Synthesized: 3"));
         assert!(text.contains("Cached: 2"));
+        assert!(text.contains("Resolved model: gemini-tts"));
+        assert!(text.contains("Estimated cost: ~$1.23"));
+        assert!(text.contains("Chapters: 4 total"));
         assert!(text.contains("q/Esc cancel"));
     }
 

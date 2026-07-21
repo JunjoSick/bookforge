@@ -45,6 +45,10 @@ const App = {
   wizard: null,
   audioWizard: null,
   audioSelected: null,
+  audioVoices: null,
+  audioVoicesLoading: false,
+  audioEstimateTimer: null,
+  audioEstimateRequest: 0,
   runtimeSettings: null,
   runtimeJob: null,
   runtimeRefreshPending: false,
@@ -62,7 +66,8 @@ function freshAudioWizard() {
   return { file:null, fileName:"", provider:"openai", model:"gpt-4o-mini-tts",
     voice:"alloy", format:"mp3", speed:1, maxChars:2000, concurrency:4,
     instructions:"", baseUrl:"", apiKey:"", stitch:canM4b, m4b:canM4b,
-    launching:false, status:"" };
+    advancedOpen:false, chapterGap:1200, single:false, loudnorm:false, seed:"", language:"",
+    estimate:null, launching:false, status:"" };
 }
 
 function applyTheme() {
@@ -382,7 +387,7 @@ function audioProviderOption(id) {
   return (App.options.audio_providers || []).find(p => p.id === id)
     || { id:"mock", label:"mock", models:["mock-silence"], default_model:"mock-silence",
       default_voice:"mock", formats:["wav"], default_format:"wav", requires_key:false,
-      requires_voice:false, supports_instructions:false, supports_speed:true, max_chars:40000 };
+      requires_voice:false, supports_auto_model:false, supports_instructions:false, supports_speed:true, max_chars:40000 };
 }
 function audioProviderMaxChars(provider, model) {
   if (provider.id === "elevenlabs") {
@@ -397,19 +402,19 @@ function bfAudioProvider(id) {
   const w = App.audioWizard, p = audioProviderOption(id);
   w.provider = id; w.model = p.default_model; w.voice = p.default_voice;
   w.maxChars = Math.min(w.maxChars, audioProviderMaxChars(p, w.model));
-  w.format = p.default_format; w.speed = 1; w.instructions = ""; w.status = "";
+  w.format = p.default_format; w.speed = 1; w.instructions = ""; w.status = ""; w.estimate = null;
   renderAudiobook($("#stage"));
 }
 function bfAudioFormat(format) { syncAudioInputs(); App.audioWizard.format = format; renderAudiobook($("#stage")); }
-function bfAudioModel() { syncAudioInputs(); const w=App.audioWizard, p=audioProviderOption(w.provider); w.maxChars=Math.min(w.maxChars,audioProviderMaxChars(p,w.model)); renderAudiobook($("#stage")); }
+function bfAudioModel() { syncAudioInputs(); const w=App.audioWizard, p=audioProviderOption(w.provider); w.maxChars=Math.min(w.maxChars,audioProviderMaxChars(p,w.model)); w.estimate=null; renderAudiobook($("#stage")); }
 function bfAudioPickFile(input) {
   const file = input.files && input.files[0]; if (!file) return;
-  App.audioWizard.file = file; App.audioWizard.fileName = file.name; renderAudiobook($("#stage"));
+  App.audioWizard.file = file; App.audioWizard.fileName = file.name; App.audioWizard.estimate = null; renderAudiobook($("#stage"));
 }
 function bfAudioDropFile(e) {
   const f = bfDroppedEpub(e);
   if (!f) { audioToast("drop an EPUB (.epub) file"); return; }
-  App.audioWizard.file = f; App.audioWizard.fileName = f.name; renderAudiobook($("#stage"));
+  App.audioWizard.file = f; App.audioWizard.fileName = f.name; App.audioWizard.estimate = null; renderAudiobook($("#stage"));
 }
 function syncAudioInputs() {
   const w = App.audioWizard; if (!w) return;
@@ -423,18 +428,88 @@ function syncAudioInputs() {
   const key = $("#a_key"); if (key) w.apiKey = key.value;
   const stitch = $("#a_stitch"); if (stitch) w.stitch = stitch.checked;
   const m4b = $("#a_m4b"); if (m4b) w.m4b = m4b.checked;
+  const chapterGap = $("#a_gap_chapter"); if (chapterGap) w.chapterGap = Math.max(0, Math.min(10000, parseInt(chapterGap.value,10)||0));
+  const single = $("#a_single"); if (single) w.single = single.checked;
+  const loudnorm = $("#a_loudnorm"); if (loudnorm) w.loudnorm = loudnorm.checked;
+  const seed = $("#a_seed"); if (seed) w.seed = seed.value.trim();
+  const language = $("#a_language"); if (language) w.language = language.value.trim();
 }
 function audioToast(message) { const el = $("#audio-status"); if (el) el.textContent = message; if (App.audioWizard) App.audioWizard.status = message; }
+
+function bfAudioEstimateDebounced() {
+  const w = App.audioWizard; if (!w) return;
+  syncAudioInputs(); w.estimate = null; App.audioEstimateRequest += 1;
+  const line = $("#audio-estimate"); if (line) line.hidden = true;
+  if (App.audioEstimateTimer) clearTimeout(App.audioEstimateTimer);
+  App.audioEstimateTimer = setTimeout(bfAudioEstimate, 300);
+}
+
+function audioEstimateHtml(estimate) {
+  if (!estimate) return "";
+  const parts = [`${num(estimate.chapters)} chapters`, `${num(estimate.chunks)} chunks`, `${num(estimate.characters)} characters`];
+  if (estimate.est_cost_usd != null) parts.push(`~$${Number(estimate.est_cost_usd).toFixed(2)}`);
+  if (estimate.est_credits != null) parts.push(`~${num(Math.round(Number(estimate.est_credits)))} credits`);
+  if (estimate.quota) {
+    const remaining = num(estimate.quota.remaining);
+    parts.push(estimate.quota.fits
+      ? `quota OK (${remaining} left)`
+      : `<span class="audio-estimate-bad">quota exceeded (${remaining} left)</span>`);
+  }
+  return parts.join(" Â· ");
+}
+
+async function bfAudioEstimate() {
+  const w = App.audioWizard; if (!w || !w.file || App.screen !== "audiobook" || App.audioSelected) return;
+  syncAudioInputs();
+  const request = ++App.audioEstimateRequest;
+  const fd = new FormData(); fd.append("file", w.file); fd.append("provider", w.provider);
+  if (w.model) fd.append("model", w.model);
+  fd.append("max_chars", String(w.maxChars));
+  try {
+    const response = await fetch("/api/audiobook/estimate", {method:"POST", headers:{[CSRF_HEADER]:CSRF_TOKEN}, body:fd});
+    const result = await response.json();
+    if (!response.ok || request !== App.audioEstimateRequest || App.audioWizard !== w) throw new Error();
+    w.estimate = result;
+    const line = $("#audio-estimate"); if (line) { line.innerHTML = audioEstimateHtml(result); line.hidden = false; }
+  } catch (error) {
+    if (request === App.audioEstimateRequest) { w.estimate = null; const line = $("#audio-estimate"); if (line) line.hidden = true; }
+  }
+}
+
+async function loadElevenLabsVoices() {
+  if (App.audioVoices !== null || App.audioVoicesLoading) return;
+  App.audioVoicesLoading = true;
+  try {
+    const response = await fetch("/api/audio/voices?provider=elevenlabs");
+    const result = await response.json();
+    App.audioVoices = response.ok && Array.isArray(result.voices) ? result.voices : [];
+  } catch (error) {
+    App.audioVoices = [];
+  } finally {
+    App.audioVoicesLoading = false;
+    if (App.screen === "audiobook" && App.audioWizard && App.audioWizard.provider === "elevenlabs" && !App.audioSelected) {
+      renderAudiobook($("#stage"));
+    }
+  }
+}
 
 function renderAudiobook(stage) {
   if (App.audioSelected) return renderAudiobookProgress(stage, App.audioSelected);
   const w = App.audioWizard || (App.audioWizard = freshAudioWizard());
   const p = audioProviderOption(w.provider);
+  const estimateLine = audioEstimateHtml(w.estimate);
   const needsKey = p.requires_key && App.providerKeys[`audio:${w.provider}`] !== true;
   const providerChips = (App.options.audio_providers || []).map(provider =>
     `<div class="chip ${w.provider===provider.id?"on":""}" onclick="bfAudioProvider('${provider.id}')">${esc(provider.label)}</div>`).join("");
   const formatChips = (p.formats || []).map(format =>
     `<div class="chip ${w.format===format?"on":""}" onclick="bfAudioFormat('${format}')">${format.toUpperCase()}</div>`).join("");
+  const modelField = p.supports_auto_model
+    ? `<select class="inp" id="a_model" onchange="bfAudioModel()"><option value="" ${w.model===""?"selected":""}>Auto (recommended)</option>${(p.models||[]).map(model=>`<option value="${esc(model)}" ${w.model===model?"selected":""}>${esc(model)}</option>`).join("")}</select>`
+    : `<input class="inp" id="a_model" value="${esc(w.model)}" list="audio-models" onchange="bfAudioModel()">`;
+  const voices = w.provider === "elevenlabs" && Array.isArray(App.audioVoices) ? App.audioVoices : [];
+  const voiceField = voices.length
+    ? `<select class="inp" id="a_voice"><option value="">Choose a voice</option>${voices.map(voice=>`<option value="${esc(voice.voice_id)}" ${w.voice===voice.voice_id?"selected":""}>${esc(voice.name)} — ${esc(voice.voice_id)}</option>`).join("")}</select>`
+    : `<input class="inp" id="a_voice" value="${esc(w.voice)}" placeholder="${p.requires_voice?"Required ElevenLabs voice ID":"Voice name"}">`;
   stage.innerHTML = `<div class="wrap">
     <div class="pagehead"><div><h1>Create an audiobook</h1><p>Narrate an original or translated EPUB directly. Translation is optional.</p></div>
       <button class="btn btn-ghost" onclick="bfGo('library')">Back to library</button></div>
@@ -446,10 +521,10 @@ function renderAudiobook(stage) {
       </div><input type="file" id="audio-file" accept=".epub" hidden onchange="bfAudioPickFile(this)">
       <div class="field-label" style="margin-top:20px">Speech provider</div><div class="chips">${providerChips}</div>
       <div class="adv-grid" style="margin-top:18px">
-        <div><div class="field-label">Model</div><input class="inp" id="a_model" value="${esc(w.model)}" list="audio-models" onchange="bfAudioModel()"></div>
-        <div><div class="field-label">${p.requires_voice?"Voice ID":"Voice"}</div><input class="inp" id="a_voice" value="${esc(w.voice)}" placeholder="${p.requires_voice?"Required ElevenLabs voice ID":"Voice name"}"></div>
+        <div><div class="field-label">Model</div>${modelField}</div>
+        <div><div class="field-label">${p.requires_voice?"Voice ID":"Voice"}</div>${voiceField}</div>
         <div><div class="field-label">Speed</div><input class="inp" id="a_speed" type="number" min="0.25" max="4" step="0.05" value="${w.speed}" ${p.supports_speed?"":"disabled"}></div>
-        <div><div class="field-label">Characters per request</div><input class="inp" id="a_chars" type="number" min="1" max="${audioProviderMaxChars(p,w.model)}" value="${w.maxChars}"></div>
+        <div><div class="field-label">Characters per request</div><input class="inp" id="a_chars" type="number" min="1" max="${audioProviderMaxChars(p,w.model)}" value="${w.maxChars}" oninput="bfAudioEstimateDebounced()"></div>
         <div><div class="field-label">Concurrency</div><input class="inp" id="a_conc" type="number" min="1" max="16" value="${w.concurrency}"></div>
         <div><div class="field-label">Format</div><div class="chips">${formatChips}</div></div>
       </div>
@@ -461,24 +536,46 @@ function renderAudiobook(stage) {
         <label class="fact"><div class="k">Chapter files</div><div class="v"><input id="a_stitch" type="checkbox" ${w.stitch?"checked":""}> Stitch each chapter</div></label>
         <label class="fact"><div class="k">Single book</div><div class="v"><input id="a_m4b" type="checkbox" ${w.m4b?"checked":""} ${App.options.ffmpeg_available?"":"disabled"}> Create M4B${App.options.ffmpeg_available?"":" (ffmpeg unavailable)"}</div></label>
       </div>
+      <details class="audio-advanced" ${w.advancedOpen?"open":""} ontoggle="if(App.audioWizard)App.audioWizard.advancedOpen=this.open">
+        <summary>Advanced</summary>
+        <div class="audio-advanced-body"><div class="adv-grid">
+          <div><div class="field-label">Chapter pause</div><select class="inp" id="a_gap_chapter">
+            <option value="0" ${w.chapterGap===0?"selected":""}>None</option>
+            <option value="600" ${w.chapterGap===600?"selected":""}>Short</option>
+            <option value="1200" ${w.chapterGap===1200?"selected":""}>Medium</option>
+            <option value="2000" ${w.chapterGap===2000?"selected":""}>Long</option>
+          </select></div>
+          <label class="audio-check"><input id="a_single" type="checkbox" ${w.single?"checked":""}> Flat audio file for on-the-go</label>
+          <label class="audio-check"><input id="a_loudnorm" type="checkbox" ${w.loudnorm?"checked":""}> Normalize loudness</label>
+          ${w.provider==="elevenlabs"?`<div><div class="field-label">Seed</div><input class="inp" id="a_seed" type="number" min="0" max="4294967295" step="1" value="${esc(w.seed)}" placeholder="unset"></div>
+          <div><div class="field-label">Language</div><input class="inp" id="a_language" value="${esc(w.language)}" placeholder="auto (from EPUB)"></div>`:""}
+        </div></div>
+      </details>
+      <div class="audio-estimate" id="audio-estimate" ${estimateLine?"":"hidden"}>${estimateLine}</div>
       <div class="wizfoot" style="padding:22px 0 0"><span class="launchstatus" id="audio-status">${esc(w.status||"")}</span><span class="grow"></span>
         <button class="btn btn-primary" id="audio-launch" onclick="bfLaunchAudiobook()">Start audiobook</button></div>
     </div></div>`;
+  if (w.provider === "elevenlabs" && App.providerKeys["audio:elevenlabs"] === true) loadElevenLabsVoices();
+  if (w.file && !w.estimate) bfAudioEstimateDebounced();
 }
 
 async function bfLaunchAudiobook() {
   syncAudioInputs(); const w = App.audioWizard, p = audioProviderOption(w.provider);
   if (!w.file) return audioToast("choose an EPUB file");
-  if (!w.model) return audioToast("model is required");
+  if (!w.model && !p.supports_auto_model) return audioToast("model is required");
   if (p.requires_voice && !w.voice) return audioToast("ElevenLabs voice ID is required");
   if (w.launching) return; w.launching = true;
   const button = $("#audio-launch"); if (button) { button.disabled=true; button.textContent="Starting…"; }
   audioToast("uploading and planning…");
   const fd = new FormData(); fd.append("file", w.file); fd.append("provider", w.provider);
-  fd.append("model", w.model); fd.append("voice", w.voice); fd.append("format", w.format);
+  if (w.model) fd.append("model", w.model); fd.append("voice", w.voice); fd.append("format", w.format);
   fd.append("speed", String(w.speed)); fd.append("max_chars", String(w.maxChars)); fd.append("concurrency", String(w.concurrency));
   if (w.instructions) fd.append("instructions", w.instructions); if (w.baseUrl) fd.append("base_url", w.baseUrl);
   if (w.apiKey) fd.append("api_key", w.apiKey); if (w.stitch) fd.append("stitch", "true"); if (w.m4b) fd.append("m4b", "true");
+  fd.append("gap_chapter_ms", String(w.chapterGap)); fd.append("gap_title_ms", String(Math.min(800, w.chapterGap)));
+  if (w.single) fd.append("single", "true"); if (w.loudnorm) fd.append("loudnorm", "true");
+  if (w.provider === "elevenlabs" && w.seed) fd.append("seed", w.seed);
+  if (w.provider === "elevenlabs" && w.language) fd.append("language", w.language);
   try {
     const response = await fetch("/api/audiobook", {method:"POST", headers:{[CSRF_HEADER]:CSRF_TOKEN}, body:fd});
     const result = await response.json();
@@ -491,6 +588,20 @@ async function renderAudiobookProgress(stage, id) {
   stage.innerHTML = `<div class="wrap"><div class="pagehead"><div><h1>Audiobook progress</h1><p>Every completed chunk is durably checkpointed.</p></div><button class="btn btn-primary" onclick="bfStartAudiobook()">+ New audiobook</button></div><div class="wizpanel" id="audio-progress"><div class="empty">Loading…</div></div></div>`;
   await pollAudiobook(id);
 }
+function audiobookChapterProgress(chunks) {
+  const chapters = [], byIndex = new Map();
+  for (const chunk of chunks) {
+    const key = String(chunk.chapter_index == null ? chapters.length : chunk.chapter_index);
+    let chapter = byIndex.get(key);
+    if (!chapter) {
+      chapter = { index:chunk.chapter_index, title:chunk.chapter_title || `Chapter ${chapters.length + 1}`, done:0, total:0 };
+      byIndex.set(key, chapter); chapters.push(chapter);
+    }
+    chapter.total += 1;
+    if (chunk.status === "synthesized" || chunk.status === "cached") chapter.done += 1;
+  }
+  return chapters;
+}
 async function pollAudiobook(id) {
   if (App.screen !== "audiobook" || App.audioSelected !== id) return;
   let data; try { const response=await fetch(`/api/audiobooks/${encodeURIComponent(id)}`); data=await response.json(); if(!response.ok) throw new Error(); }
@@ -499,16 +610,25 @@ async function pollAudiobook(id) {
   const processStatus = data.process && data.process.status;
   let status = data.status || processStatus || "starting";
   if (status === "succeeded" && processStatus === "running") status = "stitching";
+  const chapters = audiobookChapterProgress(chunks);
+  const chapterList = chapters.map(chapter => {
+    const complete = chapter.total > 0 && chapter.done === chapter.total;
+    return `<div class="audio-chapter ${complete?"complete":""}"><span class="audio-chapter-check">${complete?"✓":""}</span><span class="audio-chapter-title">${esc(chapter.title)}</span><span class="audio-chapter-count">${chapter.done}/${chapter.total}</span></div>`;
+  }).join("");
+  const autoSelected = data.process && data.process.auto_model === true;
   const panel = $("#audio-progress"); if (!panel) return;
   panel.innerHTML = `<div class="facts">
       <div class="fact"><div class="k">Status</div><div class="v"><span class="badge ${badgeClass(status)}">${esc(status)}</span></div></div>
       <div class="fact"><div class="k">Provider</div><div class="v mono">${esc(data.synthesis_id||"planning")}</div></div>
+      <div class="fact"><div class="k">Model</div><div class="v mono">${esc(data.resolved_model||"planning")}${autoSelected&&data.resolved_model?" (auto-selected)":""}</div></div>
       <div class="fact"><div class="k">Voice</div><div class="v">${esc(data.voice||"—")}</div></div>
       <div class="fact"><div class="k">Progress</div><div class="v mono">${done}/${total||"?"}</div></div>
     </div><div class="bar-track" style="margin:22px 0"><div class="bar-fill" style="width:${progress}%"></div></div>
+    ${chapterList?`<div class="audio-chapters"><div class="audio-chapters-head">Chapters</div><div class="audio-chapter-list">${chapterList}</div></div>`:""}
     <div class="costbox"><div><div class="ck">Output</div><div class="mono" style="margin-top:8px;word-break:break-all">${esc(data.artifact||data.out_dir||"")}</div></div><div class="cm">${progress}% complete<br>${num(chunks.reduce((sum,chunk)=>sum+(chunk.chars||0),0))} characters planned</div></div>
     <div class="wizfoot" style="padding:18px 0 0"><span class="grow"></span>
       ${!["succeeded","failed","cancelled"].includes(status)?`<button class="btn btn-ghost" onclick="bfCancelAudiobook('${esc(id)}')">Cancel</button>`:""}
+      ${status==="succeeded"&&data.artifact?`<audio class="audio-player" controls preload="none" src="/api/audiobooks/${encodeURIComponent(id)}/artifact?disposition=inline"></audio>`:""}
       ${status==="succeeded"?`<a class="btn btn-primary" href="/api/audiobooks/${encodeURIComponent(id)}/artifact">Download ${data.artifact?"M4B":"audio ZIP"}</a>`:""}
     </div>${data.error?`<div class="empty" style="color:var(--bad)">${esc(data.error)}</div>`:""}`;
   if (!["succeeded","failed","cancelled"].includes(status)) setTimeout(()=>pollAudiobook(id), 800);

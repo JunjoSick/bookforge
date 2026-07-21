@@ -13,20 +13,22 @@ mod elevenlabs;
 mod gemini;
 
 pub use elevenlabs::{
-    ELEVENLABS_MAX_INPUT_CHARS, ELEVENLABS_PREFERRED_MODELS, ElevenLabsTtsConfig,
-    ElevenLabsTtsProvider, elevenlabs_model_max_input_chars, resolve_preferred_elevenlabs_model,
+    ELEVENLABS_MAX_INPUT_CHARS, ELEVENLABS_PREFERRED_MODELS, ElevenLabsSubscription,
+    ElevenLabsTtsConfig, ElevenLabsTtsProvider, ElevenLabsVoice, elevenlabs_model_max_input_chars,
+    fetch_elevenlabs_subscription, list_elevenlabs_voices, resolve_preferred_elevenlabs_model,
 };
 pub use gemini::{GeminiTtsConfig, GeminiTtsProvider};
 
 /// Output container/codec requested from the provider. The string form is
 /// what OpenAI-compatible endpoints expect in `response_format`, and the
 /// extension is used for the files BookForge writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AudioFormat {
     Mp3,
     Opus,
     Aac,
     Flac,
+    #[default]
     Wav,
     Pcm,
 }
@@ -86,7 +88,25 @@ pub type Result<T> = std::result::Result<T, TtsError>;
 
 /// A single unit of text to narrate, plus the voice and format it should be
 /// rendered in.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextNormalization {
+    Auto,
+    On,
+    Off,
+}
+
+impl TextNormalization {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct SpeechRequest {
     pub text: String,
     pub voice: String,
@@ -98,6 +118,11 @@ pub struct SpeechRequest {
     /// `gpt-4o-mini-tts` model supports this; compatible providers may ignore
     /// it.
     pub instructions: Option<String>,
+    pub previous_text: Option<String>,
+    pub next_text: Option<String>,
+    pub seed: Option<u32>,
+    pub language_code: Option<String>,
+    pub text_normalization: Option<TextNormalization>,
 }
 
 /// Rendered audio bytes for one [`SpeechRequest`].
@@ -584,6 +609,7 @@ mod tests {
                 format: AudioFormat::Mp3,
                 speed: 1.0,
                 instructions: None,
+                ..SpeechRequest::default()
             })
             .await
             .expect_err("mock should reject mislabeled output");
@@ -600,6 +626,7 @@ mod tests {
                 format: AudioFormat::Wav,
                 speed: 1.0,
                 instructions: None,
+                ..SpeechRequest::default()
             })
             .await
             .expect("mock synthesis should succeed");
@@ -618,6 +645,7 @@ mod tests {
             format: AudioFormat::Wav,
             speed: 1.0,
             instructions: None,
+            ..SpeechRequest::default()
         };
         let a = provider.synthesize(request.clone()).await.unwrap();
         let b = provider.synthesize(request).await.unwrap();
@@ -632,6 +660,7 @@ mod tests {
             format: AudioFormat::Mp3,
             speed: 0.9,
             instructions: Some("Pronounce Toki Pona clearly.".to_string()),
+            ..SpeechRequest::default()
         };
         let body = speech_request_body("gpt-4o-mini-tts", &request);
         assert_eq!(body["model"], "gpt-4o-mini-tts");
