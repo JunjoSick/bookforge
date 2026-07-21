@@ -2,8 +2,9 @@ use base64::Engine as _;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    AudioClip, AudioFormat, Result, SpeechRequest, TtsError, TtsProvider, build_http_client,
-    pcm_s16le_mono_wav, required_api_key, send_with_retry, validate_path_component,
+    AudioClip, AudioFormat, MAX_AUDIO_RESPONSE_BODY_BYTES, Result, SpeechRequest, TtsError,
+    TtsProvider, build_http_client, pcm_s16le_mono_wav, required_api_key, send_with_retry,
+    validate_path_component,
 };
 
 /// Configuration for Google's Gemini Generate Content TTS endpoint.
@@ -75,12 +76,19 @@ impl TtsProvider for GeminiTtsProvider {
         let api_key = required_api_key(&self.config.api_key_env)?;
         let endpoint = self.endpoint();
         let body = gemini_request_body(&self.config.model, &request);
-        let response = send_with_retry(&self.cancel_token, self.config.max_attempts, || {
-            self.client
-                .post(&endpoint)
-                .header("x-goog-api-key", &api_key)
-                .json(&body)
-        })
+        // Gemini returns base64-encoded audio inside JSON, so this response
+        // needs the audio ceiling rather than the metadata ceiling.
+        let response = send_with_retry(
+            &self.cancel_token,
+            self.config.max_attempts,
+            MAX_AUDIO_RESPONSE_BODY_BYTES,
+            || {
+                self.client
+                    .post(&endpoint)
+                    .header("x-goog-api-key", &api_key)
+                    .json(&body)
+            },
+        )
         .await?;
         if response
             .content_type

@@ -10,6 +10,14 @@ use bookforge_core::{RetryAfterPolicy, marker::is_marker_token};
 
 pub type Result<T> = std::result::Result<T, LlmError>;
 
+/// Translation responses are request-bounded in normal use; 4 MiB leaves
+/// ample room for provider metadata while preventing hostile endpoints from
+/// growing the process without limit.
+const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Provider error bodies can be verbose, but only a short diagnostic belongs
+/// in errors and logs.
+const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 8 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
     #[error("provider error: {0}")]
@@ -874,9 +882,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
             let status = response.status();
 
             if status.is_success() {
-                let response_bytes = match cancelable(&self.cancel_token, response.bytes()).await {
+                let response_bytes = match cancelable(
+                    &self.cancel_token,
+                    read_provider_response_body(response),
+                )
+                .await
+                {
                     Ok(Ok(b)) => b,
-                    Ok(Err(error)) => {
+                    Ok(Err(LlmError::Http(error))) => {
                         warn!(
                             "provider: attempt {}/{} body read failed (status={status:#}): {error}",
                             attempt + 1,
@@ -903,6 +916,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         .await?;
                         continue;
                     }
+                    Ok(Err(error)) => return Err(error),
                     Err(_) => {
                         return Err(LlmError::Provider("interrupted by user".to_string()));
                     }
@@ -945,29 +959,32 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
             let status_code = status.as_u16();
             let retry_after = parse_retry_after(response.headers());
-            let response_body = match cancelable(&self.cancel_token, response.text()).await {
-                Ok(Ok(b)) => b,
-                Ok(Err(e)) => {
-                    last_error = Some(LlmError::Http(e));
-                    attempt += 1;
-                    if attempt >= max_attempts {
-                        return Err(last_error.expect("set above"));
+            let response_bytes =
+                match cancelable(&self.cancel_token, read_provider_response_body(response)).await {
+                    Ok(Ok(b)) => b,
+                    Ok(Err(LlmError::Http(error))) => {
+                        last_error = Some(LlmError::Http(error));
+                        attempt += 1;
+                        if attempt >= max_attempts {
+                            return Err(last_error.expect("set above"));
+                        }
+                        apply_retry_delay(
+                            &self.cancel_token,
+                            policy,
+                            attempt - 1,
+                            None,
+                            max_backoff,
+                            last_error.take().expect("set above"),
+                        )
+                        .await?;
+                        continue;
                     }
-                    apply_retry_delay(
-                        &self.cancel_token,
-                        policy,
-                        attempt - 1,
-                        None,
-                        max_backoff,
-                        last_error.take().expect("set above"),
-                    )
-                    .await?;
-                    continue;
-                }
-                Err(_) => {
-                    return Err(LlmError::Provider("interrupted by user".to_string()));
-                }
-            };
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(LlmError::Provider("interrupted by user".to_string()));
+                    }
+                };
+            let response_body = provider_error_body_preview(&response_bytes);
 
             // Auto-detect unsupported response_format: 400 with response_format
             // enabled in Auto mode -> retry once without it. Do NOT count
@@ -1066,6 +1083,45 @@ impl LlmProvider for OpenAiCompatibleProvider {
             supports_usage_tokens: true,
         }
     }
+}
+
+async fn read_provider_response_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BODY_BYTES as u64)
+    {
+        return Err(provider_response_body_too_large());
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .map_or(0, |length| length as usize);
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) = response.chunk().await? {
+        let Some(new_len) = body.len().checked_add(chunk.len()) else {
+            return Err(provider_response_body_too_large());
+        };
+        if new_len > MAX_PROVIDER_RESPONSE_BODY_BYTES {
+            return Err(provider_response_body_too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn provider_response_body_too_large() -> LlmError {
+    LlmError::InvalidResponse(format!(
+        "provider response body exceeded the {MAX_PROVIDER_RESPONSE_BODY_BYTES}-byte limit"
+    ))
+}
+
+fn provider_error_body_preview(body: &[u8]) -> String {
+    let preview_len = body.len().min(MAX_PROVIDER_ERROR_BODY_BYTES);
+    let mut preview = String::from_utf8_lossy(&body[..preview_len]).into_owned();
+    if body.len() > preview_len {
+        preview.push_str("\u{2026} [truncated]");
+    }
+    preview
 }
 
 async fn cancelable<T>(
@@ -1271,6 +1327,87 @@ mod tests {
 
         let result = cancelable_sleep(&token, Duration::from_secs(3600)).await;
         assert!(result.is_err(), "cancelled token must abort sleep");
+    }
+
+    #[test]
+    fn provider_error_body_preview_is_truncated() {
+        let body = vec![b'x'; MAX_PROVIDER_ERROR_BODY_BYTES + 1];
+        let preview = provider_error_body_preview(&body);
+
+        assert!(preview.ends_with("[truncated]"));
+        assert!(!preview.contains(&"x".repeat(MAX_PROVIDER_ERROR_BODY_BYTES + 1)));
+    }
+
+    #[tokio::test]
+    async fn oversized_provider_response_body_is_rejected_while_streaming() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0_u8; 8_192];
+            let _ = stream.read(&mut request).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+
+            let chunk = vec![b'x'; 64 * 1024];
+            let chunk_header = format!("{:X}\r\n", chunk.len());
+            for _ in 0..=(MAX_PROVIDER_RESPONSE_BODY_BYTES / chunk.len()) {
+                if stream.write_all(chunk_header.as_bytes()).await.is_err()
+                    || stream.write_all(&chunk).await.is_err()
+                    || stream.write_all(b"\r\n").await.is_err()
+                {
+                    break;
+                }
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+            let _ = stream.shutdown().await;
+        });
+
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://{addr}"),
+            // Local providers intentionally permit an absent API key.
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            model: "test-model".to_string(),
+            timeout_seconds: 10,
+            provider_max_attempts: 1,
+            thinking_disabled: true,
+            retry_after_policy: RetryAfterPolicy::None,
+            max_backoff_seconds: 1,
+            max_idle_per_host: 1,
+            json_mode: bookforge_core::JsonMode::PromptOnly,
+        })
+        .unwrap();
+        let error = provider
+            .complete(CompletionRequest {
+                system: "translate".to_string(),
+                user: "hello".to_string(),
+                response_format: ResponseFormat::Json,
+                temperature: 0.2,
+                max_output_tokens: Some(256),
+                metadata: RequestMetadata::default(),
+            })
+            .await
+            .expect_err("oversized response must be rejected");
+
+        assert!(
+            error.to_string().contains(&format!(
+                "exceeded the {MAX_PROVIDER_RESPONSE_BODY_BYTES}-byte limit"
+            )),
+            "unexpected error: {error}"
+        );
+        server_handle.abort();
     }
 
     /// Verify that json_mode_auto_fallback retries without response_format

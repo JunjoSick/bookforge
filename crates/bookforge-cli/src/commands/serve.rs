@@ -20,7 +20,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -130,15 +130,11 @@ const OPENROUTER_MODELS: &[&str] = &[
 const OPENAI_COMPATIBLE_MODELS: &[&str] = &["gpt-4o-mini", "gpt-4o"];
 const CSRF_HEADER: &str = "x-bookforge-csrf";
 const CSRF_TOKEN_PLACEHOLDER: &str = "__BOOKFORGE_CSRF_TOKEN__";
+const DASHBOARD_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; connect-src 'self'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; media-src 'self'; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'";
 
 /// Monotonic suffix for estimate temp files, so two uploads landing in the same
 /// millisecond never collide on a path (and delete each other's input mid-parse).
 static ESTIMATE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// `fetch_elevenlabs_subscription` resolves its key through a configured
-/// environment-variable name. Serialize the narrowly-scoped temporary key used
-/// for dashboard-session credentials, which otherwise live only in `AppState`.
-static ELEVENLABS_QUOTA_ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, clap::Args)]
 pub struct ServeArgs {
@@ -438,8 +434,18 @@ async fn shutdown_signal() {
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn index(State(state): State<AppState>) -> Html<String> {
-    Html(DASHBOARD_HTML.replace(CSRF_TOKEN_PLACEHOLDER, &state.csrf_token))
+async fn index(State(state): State<AppState>) -> Response {
+    (
+        [
+            ("content-security-policy", DASHBOARD_CONTENT_SECURITY_POLICY),
+            ("x-frame-options", "DENY"),
+            ("x-content-type-options", "nosniff"),
+            ("referrer-policy", "no-referrer"),
+            ("cache-control", "no-store"),
+        ],
+        Html(DASHBOARD_HTML.replace(CSRF_TOKEN_PLACEHOLDER, &state.csrf_token)),
+    )
+        .into_response()
 }
 
 async fn list_jobs(State(state): State<AppState>) -> Result<Json<Vec<JobListItem>>, AppError> {
@@ -1003,8 +1009,8 @@ async fn launch_translate(
     };
 
     // Resolve the API key: a freshly-supplied one is remembered for the session;
-    // otherwise reuse one already remembered for this provider. A blank key falls
-    // through to the run's normal environment-variable resolution.
+    // otherwise reuse one already remembered for this provider or copy only that
+    // provider's key from the server environment into the scrubbed child.
     let supplied_key = (provider != "mock")
         .then(|| field_value(&fields, "api_key"))
         .flatten();
@@ -1013,8 +1019,13 @@ async fn launch_translate(
         Some(supplied)
     } else {
         lock_keys(&state)?.get(&provider).cloned()
-    };
-    if provider != "mock" && key.is_none() && !provider_env_has_key(&provider) {
+    }
+    .or_else(|| {
+        provider_key_env(&provider)
+            .and_then(|env| std::env::var(env).ok())
+            .filter(|value| !value.is_empty())
+    });
+    if provider != "mock" && key.is_none() {
         return Ok(bad_request("provider API key is required"));
     }
 
@@ -1081,15 +1092,15 @@ async fn launch_translate(
     if let Some(base_url) = openai_base_url {
         command.arg("--base-url").arg(base_url);
     }
-    // Inject the key through the environment (never argv), pointing the run at a
-    // canonical provider env var. The child records that env-var name in its job
-    // snapshot, so `bookforge resume` can use the same env name later.
-    if provider != "mock"
-        && let Some(key) = key
-    {
-        let env = provider_key_env(&provider).expect("provider was validated");
+    let api_key_env = (provider != "mock" && key.is_some())
+        .then(|| provider_key_env(&provider).expect("provider was validated"));
+    configure_dashboard_child_environment(&mut command, api_key_env.zip(key.as_deref()));
+
+    // Point the run at the one canonical provider key copied into its otherwise
+    // scrubbed environment. The child records the env-var name in its job
+    // snapshot, so `bookforge resume` can use the same name later.
+    if let Some(env) = api_key_env {
         command.arg("--api-key-env").arg(env);
-        command.env(env, key);
     }
 
     // Detached: the run outlives this request. The short startup check catches
@@ -1228,7 +1239,7 @@ async fn estimate_audiobook(
 
     if provider == "elevenlabs"
         && let Some(api_key) = resolve_audio_provider_key(&state, "elevenlabs")?
-        && let Some(subscription) = fetch_dashboard_elevenlabs_subscription(&api_key, &model).await
+        && let Some(subscription) = fetch_dashboard_elevenlabs_subscription(&api_key).await
     {
         let remaining = subscription
             .character_limit
@@ -1248,42 +1259,16 @@ async fn estimate_audiobook(
     Ok(Json(payload).into_response())
 }
 
-struct TemporaryEnvKey(String);
-
-impl Drop for TemporaryEnvKey {
-    fn drop(&mut self) {
-        // SAFETY: the name is unique to this request and access to temporary
-        // ElevenLabs quota variables is serialized by `ELEVENLABS_QUOTA_ENV_LOCK`.
-        unsafe { std::env::remove_var(&self.0) };
-    }
-}
-
 async fn fetch_dashboard_elevenlabs_subscription(
     api_key: &str,
-    model: &str,
 ) -> Option<bookforge_audio::ElevenLabsSubscription> {
-    let lock = ELEVENLABS_QUOTA_ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
-    let _guard = lock.lock().await;
-    let sequence = ESTIMATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let env_name = format!(
-        "BOOKFORGE_DASHBOARD_ELEVENLABS_KEY_{}_{}",
-        std::process::id(),
-        sequence
-    );
-    // SAFETY: this request-unique name is never read or written outside the
-    // serialized section guarded above, and the RAII guard removes it on every
-    // return path (including cancellation).
-    unsafe { std::env::set_var(&env_name, api_key) };
-    let _temporary_key = TemporaryEnvKey(env_name.clone());
-    let mut config = bookforge_audio::ElevenLabsTtsConfig::hosted(
-        (!model.is_empty()).then(|| model.to_string()),
-    );
-    config.api_key_env = env_name;
-    config.timeout_seconds = ELEVENLABS_VOICE_TIMEOUT_SECONDS;
-    config.max_attempts = 2;
-    bookforge_audio::fetch_elevenlabs_subscription(&config)
-        .await
-        .ok()
+    bookforge_audio::fetch_elevenlabs_subscription_with_key(
+        ELEVENLABS_BASE_URL,
+        api_key,
+        ELEVENLABS_VOICE_TIMEOUT_SECONDS,
+    )
+    .await
+    .ok()
 }
 
 /// Launch audiobook synthesis directly from an uploaded source or translated
@@ -1513,9 +1498,7 @@ async fn launch_audiobook(
         api_key_env,
         &advanced,
     ));
-    if let (Some(env), Some(key)) = (api_key_env, key) {
-        command.env(env, key);
-    }
+    configure_dashboard_child_environment(&mut command, api_key_env.zip(key.as_deref()));
 
     let mut child = command
         .spawn()
@@ -2290,10 +2273,90 @@ fn provider_key_env(provider: &str) -> Option<&'static str> {
         .find_map(|(known, env)| (*known == provider).then_some(*env))
 }
 
-fn provider_env_has_key(provider: &str) -> bool {
-    provider_key_env(provider)
-        .and_then(|env| std::env::var(env).ok())
-        .is_some_and(|value| !value.is_empty())
+fn configure_dashboard_child_environment(
+    command: &mut tokio::process::Command,
+    provider_key: Option<(&str, &str)>,
+) {
+    configure_dashboard_child_environment_from(command, std::env::vars_os(), provider_key);
+}
+
+fn configure_dashboard_child_environment_from(
+    command: &mut tokio::process::Command,
+    parent_environment: impl IntoIterator<Item = (OsString, OsString)>,
+    provider_key: Option<(&str, &str)>,
+) {
+    command.env_clear();
+    for (name, value) in parent_environment {
+        if dashboard_child_environment_variable_allowed(&name) {
+            command.env(name, value);
+        }
+    }
+
+    if let Some((name, value)) = provider_key {
+        command.env(name, value);
+    }
+}
+
+/// Variables every platform must forward to a spawned job.
+///
+/// Unlike poppler or ffmpeg, this child is BookForge itself doing the actual
+/// provider calls, so withholding network configuration does not harden
+/// anything — it just breaks the run. `reqwest` reads the proxy variables
+/// (in both cases) and some distributions rely on the `SSL_CERT_*` pair to
+/// locate a trust store; drop them and a dashboard-launched job fails to
+/// reach the provider on exactly the machines where the CLI works, which is
+/// a miserable thing to debug. `RUST_LOG` is kept so a job launched from the
+/// dashboard can be traced like any other.
+const DASHBOARD_CHILD_NETWORK_VARIABLES: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "RUST_LOG",
+];
+
+fn dashboard_child_environment_variable_allowed(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+
+    // Proxy variables are conventionally read in either case, so match both.
+    if DASHBOARD_CHILD_NETWORK_VARIABLES
+        .iter()
+        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+    {
+        return true;
+    }
+
+    // Exactly one of the following blocks compiles, so each is written as the
+    // function's trailing expression rather than an early return.
+    #[cfg(windows)]
+    {
+        [
+            "PATH",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ]
+        .iter()
+        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+    }
+
+    #[cfg(unix)]
+    {
+        matches!(
+            name.as_ref(),
+            "PATH" | "HOME" | "LANG" | "LANGUAGE" | "TMPDIR"
+        ) || name.starts_with("LC_")
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        name == "PATH"
+    }
 }
 
 fn lock_keys(state: &AppState) -> Result<MutexGuard<'_, HashMap<String, String>>> {
@@ -3018,6 +3081,42 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_child_environment_omits_unneeded_provider_secrets() {
+        let mut command = tokio::process::Command::new("bookforge");
+        let fake_parent_environment = [
+            (
+                OsString::from("DEEPSEEK_API_KEY"),
+                OsString::from("fake-parent-secret"),
+            ),
+            (OsString::from("PATH"), OsString::from("fake-path")),
+        ];
+        configure_dashboard_child_environment_from(
+            &mut command,
+            fake_parent_environment,
+            Some(("ELEVENLABS_API_KEY", "required-child-key")),
+        );
+
+        let child_environment = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(ToOwned::to_owned)))
+            .collect::<HashMap<_, _>>();
+        assert!(!child_environment.contains_key(std::ffi::OsStr::new("DEEPSEEK_API_KEY")));
+        assert_eq!(
+            child_environment
+                .get(std::ffi::OsStr::new("PATH"))
+                .and_then(|value| value.as_deref()),
+            Some(std::ffi::OsStr::new("fake-path"))
+        );
+        assert_eq!(
+            child_environment
+                .get(std::ffi::OsStr::new("ELEVENLABS_API_KEY"))
+                .and_then(|value| value.as_deref()),
+            Some(std::ffi::OsStr::new("required-child-key"))
+        );
+    }
+
+    #[test]
     fn dashboard_options_include_common_languages_and_models() {
         let options = dashboard_options_payload();
         assert!(options.languages.contains(&"Italian"));
@@ -3163,6 +3262,21 @@ mod tests {
             .expect("route should respond");
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-security-policy"),
+            Some(&HeaderValue::from_static(DASHBOARD_CONTENT_SECURITY_POLICY))
+        );
+        for (name, value) in [
+            ("x-frame-options", "DENY"),
+            ("x-content-type-options", "nosniff"),
+            ("referrer-policy", "no-referrer"),
+            ("cache-control", "no-store"),
+        ] {
+            assert_eq!(
+                response.headers().get(name),
+                Some(&HeaderValue::from_static(value))
+            );
+        }
     }
 
     #[tokio::test]
@@ -3536,20 +3650,22 @@ mod tests {
         ] {
             assert!(DASHBOARD_HTML.contains(marker), "missing {marker}");
         }
+        assert!(!DASHBOARD_HTML.contains("fonts.googleapis.com"));
+        assert!(!DASHBOARD_HTML.contains("fonts.gstatic.com"));
     }
 
     #[test]
     fn dashboard_assets_reassemble_byte_stably() {
         use sha2::{Digest, Sha256};
 
-        assert_eq!(DASHBOARD_HTML.len(), 106_868);
+        assert_eq!(DASHBOARD_HTML.len(), 106_532);
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
         let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
         let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
             digest_hex,
-            "648276dd25726153a19ea34c262f756193a8256addc1d04e62453914285f9690"
+            "3f1e6871c57ebf35c08c6e25d57c0ba4a6379f6105755660f0dddb8d7bae2de8"
         );
 
         let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");

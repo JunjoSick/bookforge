@@ -1,3 +1,5 @@
+mod archive_limits;
+
 pub mod reader;
 pub mod reflow;
 pub mod validate;

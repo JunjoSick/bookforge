@@ -1,16 +1,21 @@
 //! OCR engines used to recover PDF pages whose text reconstruction is weak.
 
-use std::{sync::Once, thread, time::Duration};
+use std::{io::Read, sync::Once, thread, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{
     Url,
-    blocking::{Client, RequestBuilder},
+    blocking::{Client, RequestBuilder, Response},
     header::{HeaderMap, RETRY_AFTER},
 };
 use serde_json::{Value, json};
 
 static UNLIMITED_OCR_NO_PROCESSOR_WARNING: Once = Once::new();
+
+// OCR responses are JSON text, so 8 MiB leaves ample room for dense pages
+// while preventing an untrusted endpoint from streaming unbounded data.
+const MAX_OCR_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OCR_ERROR_DETAIL_CHARS: usize = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OcrDialect {
@@ -189,7 +194,7 @@ fn parse_ocr_response(bytes: &[u8]) -> Result<String, OcrError> {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| error.to_string());
-        return Err(OcrError::Provider(detail));
+        return Err(OcrError::Provider(truncate_error_detail(&detail)));
     }
 
     let content = value
@@ -229,13 +234,12 @@ fn parse_models_response(bytes: &[u8]) -> Result<Vec<String>, OcrError> {
         OcrError::InvalidResponse(format!("models response is not valid JSON: {error}"))
     })?;
     if let Some(error) = value.get("error") {
-        return Err(OcrError::Provider(
+        return Err(OcrError::Provider(truncate_error_detail(
             error
                 .get("message")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown provider error")
-                .to_string(),
-        ));
+                .unwrap_or("unknown provider error"),
+        )));
     }
     let entries = value
         .get("data")
@@ -264,9 +268,9 @@ where
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
-                    let bytes = response.bytes()?;
+                    let bytes = read_response_body(response)?;
                     if !bytes.is_empty() {
-                        return Ok(bytes.to_vec());
+                        return Ok(bytes);
                     }
                     last_error = Some(OcrError::Provider(
                         "provider returned an empty response body".to_string(),
@@ -274,8 +278,8 @@ where
                 } else {
                     let retryable = status.is_server_error() || status.as_u16() == 429;
                     let retry_after = retry_after_delay(response.headers());
-                    let detail = response.text().unwrap_or_default();
-                    let detail = detail.chars().take(300).collect::<String>();
+                    let detail = read_response_body(response)?;
+                    let detail = truncate_error_detail(&String::from_utf8_lossy(&detail));
                     last_error = Some(OcrError::Provider(format!("HTTP {status}: {detail}")));
                     if !retryable {
                         break;
@@ -306,6 +310,44 @@ where
         }
     }
     Err(last_error.unwrap_or_else(|| OcrError::Provider("no attempts were made".to_string())))
+}
+
+fn read_response_body(mut response: Response) -> Result<Vec<u8>, OcrError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_OCR_RESPONSE_BODY_BYTES as u64)
+    {
+        return Err(ocr_response_body_too_large());
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .unwrap_or(0)
+        .min(MAX_OCR_RESPONSE_BODY_BYTES.min(64 * 1024) as u64) as usize;
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let read = response.read(&mut chunk).map_err(|error| {
+            OcrError::Provider(format!("could not read OCR response body: {error}"))
+        })?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        if read > MAX_OCR_RESPONSE_BODY_BYTES.saturating_sub(bytes.len()) {
+            return Err(ocr_response_body_too_large());
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn ocr_response_body_too_large() -> OcrError {
+    OcrError::Provider(format!(
+        "OCR response body exceeds the {MAX_OCR_RESPONSE_BODY_BYTES}-byte limit"
+    ))
+}
+
+fn truncate_error_detail(detail: &str) -> String {
+    detail.chars().take(MAX_OCR_ERROR_DETAIL_CHARS).collect()
 }
 
 fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
@@ -358,6 +400,13 @@ mod tests {
     use super::*;
 
     fn one_request_server(response_body: &str) -> (String, mpsc::Receiver<String>) {
+        one_request_server_with_content_length(response_body, response_body.len() as u64)
+    }
+
+    fn one_request_server_with_content_length(
+        response_body: &str,
+        content_length: u64,
+    ) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock listener");
         let address = listener.local_addr().expect("mock address");
         let response_body = response_body.as_bytes().to_vec();
@@ -390,8 +439,7 @@ mod tests {
                 }
             }
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                response_body.len()
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
             );
             stream.write_all(response.as_bytes()).expect("headers");
             stream.write_all(&response_body).expect("body");
@@ -496,5 +544,40 @@ mod tests {
 
         let request = captured.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(!request.to_ascii_lowercase().contains("authorization:"));
+    }
+
+    #[test]
+    fn ocr_page_rejects_oversized_response_before_buffering_body() {
+        let body = r#"{"choices":[{"message":{"content":"small"}}]}"#;
+        let (base_url, _) =
+            one_request_server_with_content_length(body, MAX_OCR_RESPONSE_BODY_BYTES as u64 + 1);
+        let key_env = "BOOKFORGE_OCR_TEST_OVERSIZED_PAGE_KEY";
+        unsafe { std::env::remove_var(key_env) };
+        let mut config = OcrConfig::new(base_url);
+        config.api_key_env = key_env.to_string();
+        config.max_attempts = 1;
+        let client = HttpOcrClient::new(config).unwrap();
+        let error = client.ocr_page(b"png", 1).unwrap_err();
+
+        assert!(matches!(error, OcrError::Provider(_)));
+        assert!(error.to_string().contains("8388608-byte limit"));
+    }
+
+    #[test]
+    fn health_check_rejects_oversized_response_before_buffering_body() {
+        let (base_url, _) = one_request_server_with_content_length(
+            r#"{"data":[]}"#,
+            MAX_OCR_RESPONSE_BODY_BYTES as u64 + 1,
+        );
+        let key_env = "BOOKFORGE_OCR_TEST_OVERSIZED_HEALTH_KEY";
+        unsafe { std::env::remove_var(key_env) };
+        let mut config = OcrConfig::new(base_url);
+        config.api_key_env = key_env.to_string();
+        config.max_attempts = 1;
+        let client = HttpOcrClient::new(config).unwrap();
+        let error = client.health_check().unwrap_err();
+
+        assert!(matches!(error, OcrError::Provider(_)));
+        assert!(error.to_string().contains("8388608-byte limit"));
     }
 }

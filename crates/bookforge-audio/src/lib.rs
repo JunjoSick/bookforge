@@ -31,7 +31,8 @@ pub use provider::{
     ElevenLabsSubscription, ElevenLabsTtsConfig, ElevenLabsTtsProvider, ElevenLabsVoice,
     GeminiTtsConfig, GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider,
     SpeechRequest, TextNormalization, TtsError, TtsProvider, elevenlabs_model_max_input_chars,
-    fetch_elevenlabs_subscription, list_elevenlabs_voices, resolve_preferred_elevenlabs_model,
+    fetch_elevenlabs_subscription, fetch_elevenlabs_subscription_with_key, list_elevenlabs_voices,
+    resolve_preferred_elevenlabs_model,
 };
 pub use stitch::{StitchOptions, StitchReport, ffmpeg_available, single_file_ffmpeg_args, stitch};
 pub use text::{

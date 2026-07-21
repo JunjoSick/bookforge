@@ -1,5 +1,18 @@
 use super::*;
 
+#[cfg(unix)]
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)
+}
+
 pub fn run_doctor(db_path: Option<PathBuf>) -> Result<StorageDoctor> {
     let path = db_path.unwrap_or_else(|| PathBuf::from(".bookforge/jobs.sqlite"));
     let database_exists = path.exists();
@@ -57,7 +70,7 @@ impl JobStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            create_private_dir_all(parent)?;
         }
         let conn = Connection::open(&path)?;
 
@@ -425,4 +438,33 @@ fn record_migration(conn: &Connection, version: i64, name: &str) -> rusqlite::Re
         params![version, name, timestamp_string()],
     )?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod unix_permissions_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn open_creates_private_bookforge_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "bookforge-store-permissions-{}-{}",
+            std::process::id(),
+            unix_timestamp_nanos()
+        ));
+        fs::create_dir(&root).expect("test root should be created");
+        let bookforge_dir = root.join(".bookforge");
+        let db_path = bookforge_dir.join("jobs.sqlite");
+
+        let store = JobStore::open(&db_path).expect("store should open");
+        let mode = fs::metadata(&bookforge_dir)
+            .expect(".bookforge metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+
+        drop(store);
+        fs::remove_dir_all(&root).expect("test directory should be removed");
+    }
 }

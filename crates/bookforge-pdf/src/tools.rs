@@ -10,9 +10,9 @@ use std::{
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Child, Command, ExitStatus, Output, Stdio},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -22,6 +22,15 @@ const PDF_XML_ZOOM: &str = "1.5";
 const PDF_XML_ZOOM_NUM: i64 = 3;
 const PDF_XML_ZOOM_DEN: i64 = 2;
 const PDF_POINTS_PER_INCH: i64 = 72;
+pub const DEFAULT_POPPLER_TIMEOUT: Duration = Duration::from_secs(120);
+/// XML from large, layout-heavy PDFs can be substantial, so stdout gets a
+/// generous ceiling while still preventing an external tool from exhausting RAM.
+const MAX_POPPLER_STDOUT_BYTES: usize = 256 * 1024 * 1024;
+/// Poppler stderr is only included in diagnostics and should remain compact.
+const MAX_POPPLER_STDERR_BYTES: usize = 64 * 1024;
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const TEMP_DIR_RANDOM_BYTES: usize = 16;
+const TEMP_DIR_CREATE_ATTEMPTS: usize = 128;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -35,6 +44,19 @@ pub enum ToolError {
         tool: &'static str,
         code: Option<i32>,
         stderr: String,
+    },
+
+    #[error("'{tool}' timed out after {timeout:?}")]
+    TimedOut {
+        tool: &'static str,
+        timeout: Duration,
+    },
+
+    #[error("'{tool}' {stream} exceeded the {limit}-byte capture limit")]
+    OutputTooLarge {
+        tool: &'static str,
+        stream: &'static str,
+        limit: usize,
     },
 
     #[error("pdfimages output did not match its -list rows: {0}")]
@@ -111,49 +133,75 @@ impl PopplerTools {
 
     /// `pdftohtml -v` prints its version banner on stderr.
     pub fn version(&self) -> Option<String> {
-        let mut command = Command::new(&self.pdftohtml);
+        self.version_with_timeout(DEFAULT_POPPLER_TIMEOUT)
+    }
+
+    /// Return the Poppler version banner, bounding this invocation by `timeout`.
+    pub fn version_with_timeout(&self, timeout: Duration) -> Option<String> {
+        let mut command = poppler_command(&self.pdftohtml);
         command.arg("-v");
-        let output = command_output(&mut command).ok()?;
+        let output = command_output(&mut command, "pdftohtml", timeout).ok()?;
         let banner = String::from_utf8_lossy(&output.stderr);
         banner.lines().next().map(|line| line.trim().to_string())
     }
 
     /// Run `pdftohtml -xml` and return the XML document.
     pub fn pdf_to_xml(&self, pdf: &Path) -> Result<String, ToolError> {
+        self.pdf_to_xml_with_timeout(pdf, DEFAULT_POPPLER_TIMEOUT)
+    }
+
+    /// Run `pdftohtml -xml` with a caller-selected deadline.
+    pub fn pdf_to_xml_with_timeout(
+        &self,
+        pdf: &Path,
+        timeout: Duration,
+    ) -> Result<String, ToolError> {
         let work_dir = scoped_temp_dir("bookforge-pdftohtml")?;
         let pdf = absolute_path(pdf)?;
-        let mut command = Command::new(&self.pdftohtml);
-        command.current_dir(&work_dir).args([
-            "-xml",
-            "-stdout",
-            "-q",
-            "-enc",
-            "UTF-8",
-            "-fmt",
-            "png",
-            "-zoom",
-            PDF_XML_ZOOM,
-        ]);
-        command.arg(pdf);
-        let output = command_output(&mut command)?;
+        let result = (|| {
+            let mut command = poppler_command(&self.pdftohtml);
+            command.current_dir(&work_dir).args([
+                "-xml",
+                "-stdout",
+                "-q",
+                "-enc",
+                "UTF-8",
+                "-fmt",
+                "png",
+                "-zoom",
+                PDF_XML_ZOOM,
+            ]);
+            command.arg(pdf);
+            let output = command_output(&mut command, "pdftohtml", timeout)?;
+            if !output.status.success() {
+                return Err(ToolError::Failed {
+                    tool: "pdftohtml",
+                    code: output.status.code(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                });
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        })();
         let _ = fs::remove_dir_all(&work_dir);
-        if !output.status.success() {
-            return Err(ToolError::Failed {
-                tool: "pdftohtml",
-                code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        result
     }
 
     /// Raw text via `pdftotext`, used as the coverage baseline: it makes
     /// no layout decisions, so its character count approximates "all the
     /// text poppler can see".
     pub fn pdf_to_text(&self, pdf: &Path) -> Result<String, ToolError> {
-        let mut command = Command::new(&self.pdftotext);
+        self.pdf_to_text_with_timeout(pdf, DEFAULT_POPPLER_TIMEOUT)
+    }
+
+    /// Run `pdftotext` with a caller-selected deadline.
+    pub fn pdf_to_text_with_timeout(
+        &self,
+        pdf: &Path,
+        timeout: Duration,
+    ) -> Result<String, ToolError> {
+        let mut command = poppler_command(&self.pdftotext);
         command.args(["-enc", "UTF-8", "-q"]).arg(pdf).arg("-");
-        let output = command_output(&mut command)?;
+        let output = command_output(&mut command, "pdftotext", timeout)?;
         if !output.status.success() {
             return Err(ToolError::Failed {
                 tool: "pdftotext",
@@ -169,19 +217,29 @@ impl PopplerTools {
         pdf: &Path,
         output_dir: &Path,
     ) -> Result<Vec<ExtractedImage>, ToolError> {
+        self.extract_images_with_timeout(pdf, output_dir, DEFAULT_POPPLER_TIMEOUT)
+    }
+
+    /// Extract embedded images with a caller-selected deadline per Poppler call.
+    pub fn extract_images_with_timeout(
+        &self,
+        pdf: &Path,
+        output_dir: &Path,
+        timeout: Duration,
+    ) -> Result<Vec<ExtractedImage>, ToolError> {
         fs::create_dir_all(output_dir)?;
-        let listed = self.list_images(pdf)?;
+        let listed = self.list_images(pdf, timeout)?;
         if listed.is_empty() {
             return Ok(Vec::new());
         }
 
         let root = output_dir.join("image");
-        let mut command = Command::new(self.pdfimages_path()?);
+        let mut command = poppler_command(self.pdfimages_path()?);
         command
             .args(["-png", "-p", "-print-filenames", "-q"])
             .arg(pdf)
             .arg(&root);
-        let output = command_output(&mut command)?;
+        let output = command_output(&mut command, "pdfimages", timeout)?;
         if !output.status.success() {
             return Err(ToolError::Failed {
                 tool: "pdfimages",
@@ -208,11 +266,22 @@ impl PopplerTools {
         page: u32,
         output_dir: &Path,
     ) -> Result<PathBuf, ToolError> {
+        self.render_page_png_with_timeout(pdf, page, output_dir, DEFAULT_POPPLER_TIMEOUT)
+    }
+
+    /// Render one page with a caller-selected deadline.
+    pub fn render_page_png_with_timeout(
+        &self,
+        pdf: &Path,
+        page: u32,
+        output_dir: &Path,
+        timeout: Duration,
+    ) -> Result<PathBuf, ToolError> {
         fs::create_dir_all(output_dir)?;
         let root = output_dir.join(format!("page-{page:04}"));
         let page_arg = page.to_string();
         let dpi_arg = PDF_RENDER_DPI.to_string();
-        let mut command = Command::new(self.pdftoppm_path()?);
+        let mut command = poppler_command(self.pdftoppm_path()?);
         command
             .args([
                 "-f",
@@ -226,7 +295,7 @@ impl PopplerTools {
             ])
             .arg(pdf)
             .arg(&root);
-        let output = command_output(&mut command)?;
+        let output = command_output(&mut command, "pdftoppm", timeout)?;
         if !output.status.success() {
             return Err(ToolError::Failed {
                 tool: "pdftoppm",
@@ -244,6 +313,18 @@ impl PopplerTools {
         output_dir: &Path,
         name: &str,
     ) -> Result<PathBuf, ToolError> {
+        self.render_page_crop_png_with_timeout(pdf, crop, output_dir, name, DEFAULT_POPPLER_TIMEOUT)
+    }
+
+    /// Render one page crop with a caller-selected deadline.
+    pub fn render_page_crop_png_with_timeout(
+        &self,
+        pdf: &Path,
+        crop: PageCrop,
+        output_dir: &Path,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<PathBuf, ToolError> {
         fs::create_dir_all(output_dir)?;
         let root = output_dir.join(name);
         let crop = crop.to_render_pixels();
@@ -253,7 +334,7 @@ impl PopplerTools {
         let width_arg = crop.width.to_string();
         let height_arg = crop.height.to_string();
         let dpi_arg = PDF_RENDER_DPI.to_string();
-        let mut command = Command::new(self.pdftoppm_path()?);
+        let mut command = poppler_command(self.pdftoppm_path()?);
         command
             .args([
                 "-f",
@@ -275,7 +356,7 @@ impl PopplerTools {
             ])
             .arg(pdf)
             .arg(&root);
-        let output = command_output(&mut command)?;
+        let output = command_output(&mut command, "pdftoppm", timeout)?;
         if !output.status.success() {
             return Err(ToolError::Failed {
                 tool: "pdftoppm",
@@ -286,10 +367,10 @@ impl PopplerTools {
         Ok(root.with_extension("png"))
     }
 
-    fn list_images(&self, pdf: &Path) -> Result<Vec<ListedImage>, ToolError> {
-        let mut command = Command::new(self.pdfimages_path()?);
+    fn list_images(&self, pdf: &Path, timeout: Duration) -> Result<Vec<ListedImage>, ToolError> {
+        let mut command = poppler_command(self.pdfimages_path()?);
         command.args(["-list"]).arg(pdf);
-        let output = command_output(&mut command)?;
+        let output = command_output(&mut command, "pdfimages", timeout)?;
         if !output.status.success() {
             return Err(ToolError::Failed {
                 tool: "pdfimages",
@@ -303,11 +384,117 @@ impl PopplerTools {
     }
 }
 
-fn command_output(command: &mut Command) -> io::Result<Output> {
+fn poppler_command(program: &Path) -> Command {
+    let mut command = Command::new(program);
+    command.env_clear();
+    copy_environment_variable(&mut command, "PATH");
+    #[cfg(windows)]
+    {
+        // Windows needs these for system DLL discovery and temporary-file APIs.
+        copy_environment_variable(&mut command, "SYSTEMROOT");
+        copy_environment_variable(&mut command, "TEMP");
+        copy_environment_variable(&mut command, "TMP");
+    }
+    #[cfg(unix)]
+    {
+        // None of these are secrets, and poppler misbehaves without them:
+        // `LD_LIBRARY_PATH` is how a non-system build (Homebrew, nix, conda,
+        // a local prefix) finds libpoppler; fontconfig — which the rendering
+        // tools use for font matching — reads `HOME`, `XDG_CACHE_HOME` and
+        // `FONTCONFIG_PATH`; and text extraction is locale-sensitive. Clearing
+        // them would trade a key leak for broken conversions on exactly the
+        // platforms this scrub is meant to protect. The point of the allowlist
+        // is to withhold provider credentials, not to blank the environment.
+        for name in [
+            "LD_LIBRARY_PATH",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "XDG_CACHE_HOME",
+            "FONTCONFIG_PATH",
+            "FONTCONFIG_FILE",
+            "TMPDIR",
+        ] {
+            copy_environment_variable(&mut command, name);
+        }
+    }
+    command
+}
+
+fn copy_environment_variable(command: &mut Command, name: &'static str) {
+    if let Some(value) = std::env::var_os(name) {
+        command.env(name, value);
+    }
+}
+
+fn command_output(
+    command: &mut Command,
+    tool: &'static str,
+    timeout: Duration,
+) -> Result<Output, ToolError> {
+    command_output_with_limits(
+        command,
+        tool,
+        timeout,
+        MAX_POPPLER_STDOUT_BYTES,
+        MAX_POPPLER_STDERR_BYTES,
+    )
+}
+
+fn command_output_with_limits(
+    command: &mut Command,
+    tool: &'static str,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<Output, ToolError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = spawn_command(command)?;
+    let mut child = ChildGuard::new(child);
+    let stdout = child
+        .stdout()
+        .ok_or_else(|| io::Error::other("child stdout was not piped"))?;
+    let stderr = child
+        .stderr()
+        .ok_or_else(|| io::Error::other("child stderr was not piped"))?;
+    let stdout_reader = spawn_bounded_reader(stdout, stdout_limit, "stdout")?;
+    let stderr_reader = spawn_bounded_reader(stderr, stderr_limit, "stderr")?;
+
+    let wait_result = wait_with_timeout(&mut child, timeout);
+    if wait_result.is_err() {
+        child.kill_and_reap();
+    }
+    let stdout = join_reader(stdout_reader)?;
+    let stderr = join_reader(stderr_reader)?;
+    let status = match wait_result {
+        Ok(status) => status,
+        Err(WaitError::TimedOut) => {
+            return Err(ToolError::TimedOut { tool, timeout });
+        }
+        Err(WaitError::Io(err)) => return Err(ToolError::Io(err)),
+    };
+
+    if stdout.exceeded {
+        return Err(ToolError::OutputTooLarge {
+            tool,
+            stream: "stdout",
+            limit: stdout_limit,
+        });
+    }
+
+    Ok(Output {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
+}
+
+fn spawn_command(command: &mut Command) -> io::Result<Child> {
     let mut delay = Duration::from_millis(5);
     for attempt in 0..4 {
-        match command.output() {
-            Ok(output) => return Ok(output),
+        match command.spawn() {
+            Ok(child) => return Ok(child),
             Err(err) if err.raw_os_error() == Some(26) && attempt < 3 => {
                 thread::sleep(delay);
                 delay *= 2;
@@ -315,7 +502,122 @@ fn command_output(command: &mut Command) -> io::Result<Output> {
             Err(err) => return Err(err),
         }
     }
-    command.output()
+    command.spawn()
+}
+
+#[derive(Debug)]
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn spawn_bounded_reader<R>(
+    mut reader: R,
+    limit: usize,
+    stream: &'static str,
+) -> io::Result<thread::JoinHandle<io::Result<CapturedOutput>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::Builder::new()
+        .name(format!("poppler-{stream}-reader"))
+        .spawn(move || {
+            let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+            let mut exceeded = false;
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                let remaining = limit.saturating_sub(bytes.len());
+                let retained = count.min(remaining);
+                bytes.extend_from_slice(&buffer[..retained]);
+                exceeded |= retained < count;
+            }
+            Ok(CapturedOutput { bytes, exceeded })
+        })
+}
+
+fn join_reader(
+    reader: thread::JoinHandle<io::Result<CapturedOutput>>,
+) -> io::Result<CapturedOutput> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("poppler output reader thread panicked"))?
+}
+
+enum WaitError {
+    TimedOut,
+    Io(io::Error),
+}
+
+fn wait_with_timeout(child: &mut ChildGuard, timeout: Duration) -> Result<ExitStatus, WaitError> {
+    let started = Instant::now();
+    loop {
+        match child.try_wait().map_err(WaitError::Io)? {
+            Some(status) => return Ok(status),
+            None if started.elapsed() >= timeout => return Err(WaitError::TimedOut),
+            None => {
+                let delay = timeout
+                    .saturating_sub(started.elapsed())
+                    .min(CHILD_POLL_INTERVAL);
+                if delay.is_zero() {
+                    return Err(WaitError::TimedOut);
+                }
+                thread::sleep(delay);
+            }
+        }
+    }
+}
+
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.as_mut()?.stdout.take()
+    }
+
+    fn stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.as_mut()?.stderr.take()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let status = self
+            .child
+            .as_mut()
+            .expect("child guard must remain armed while waiting")
+            .try_wait()?;
+        if status.is_some() {
+            self.child.take();
+        }
+        Ok(status)
+    }
+
+    fn kill_and_reap(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = child.kill();
+            if child.wait().is_err() {
+                return;
+            }
+        }
+        self.child.take();
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
 }
 
 fn scale_xml_to_render_px(value: i32) -> i32 {
@@ -701,13 +1003,84 @@ fn absolute_path(path: &Path) -> Result<PathBuf, ToolError> {
 }
 
 pub(crate) fn scoped_temp_dir(prefix: &str) -> Result<PathBuf, ToolError> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let path = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&path)?;
-    Ok(path)
+    for _ in 0..TEMP_DIR_CREATE_ATTEMPTS {
+        let mut random = [0_u8; TEMP_DIR_RANDOM_BYTES];
+        fill_secure_random(&mut random)?;
+        let suffix = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let path = std::env::temp_dir().join(format!("{prefix}-{suffix}"));
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a unique secure temporary directory",
+    )
+    .into())
+}
+
+#[cfg(unix)]
+fn fill_secure_random(bytes: &mut [u8]) -> io::Result<()> {
+    fs::File::open("/dev/urandom")?.read_exact(bytes)
+}
+
+#[cfg(windows)]
+fn fill_secure_random(bytes: &mut [u8]) -> io::Result<()> {
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(
+            algorithm: *mut std::ffi::c_void,
+            buffer: *mut u8,
+            buffer_len: u32,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let buffer_len = u32::try_from(bytes.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "random buffer is too large"))?;
+    // SAFETY: `bytes` is writable for `buffer_len` bytes, the null algorithm
+    // handle is required with BCRYPT_USE_SYSTEM_PREFERRED_RNG, and BCrypt does
+    // not retain either pointer after returning.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            buffer_len,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status >= 0 {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "BCryptGenRandom failed with NTSTATUS 0x{:08x}",
+            status as u32
+        )))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn fill_secure_random(_bytes: &mut [u8]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure temporary directories are unsupported on this platform",
+    ))
 }
 
 fn find_tool(name: &'static str) -> Result<PathBuf, ToolError> {
@@ -739,6 +1112,154 @@ fn find_tool(name: &'static str) -> Result<PathBuf, ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+
+    fn fake_tool_command(test_name: &str) -> Command {
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut command = poppler_command(&executable);
+        command.args(["--ignored", "--exact", test_name, "--nocapture"]);
+        command
+    }
+
+    #[test]
+    #[ignore = "stand-in executable invoked by timeout coverage"]
+    fn fake_tool_sleeps_then_marks_completion() {
+        thread::sleep(Duration::from_millis(750));
+        fs::write("fake-tool-completed", b"completed").expect("completion marker writes");
+    }
+
+    #[test]
+    #[ignore = "stand-in executable invoked by output-limit coverage"]
+    fn fake_tool_emits_large_stdout() {
+        let bytes = vec![b'x'; 4 * 1024];
+        io::stdout().write_all(&bytes).expect("fake stdout writes");
+        io::stdout().flush().expect("fake stdout flushes");
+    }
+
+    #[test]
+    #[ignore = "stand-in parent process invoked by environment coverage"]
+    fn fake_parent_builds_sanitized_poppler_command() {
+        assert_eq!(
+            std::env::var_os("DEEPSEEK_API_KEY").as_deref(),
+            Some(OsStr::new("fixture-secret"))
+        );
+        let executable = find_tool("pdftohtml").expect("POPPLER_PATH discovery");
+        let command = poppler_command(&executable);
+        let environment = command.get_envs().collect::<Vec<_>>();
+
+        assert!(environment.iter().all(|(name, _)| {
+            !name
+                .to_string_lossy()
+                .eq_ignore_ascii_case("DEEPSEEK_API_KEY")
+        }));
+        assert!(
+            environment
+                .iter()
+                .all(|(name, _)| { !name.to_string_lossy().eq_ignore_ascii_case("POPPLER_PATH") })
+        );
+        if std::env::var_os("PATH").is_some() {
+            assert!(environment.iter().any(|(name, value)| {
+                name.to_string_lossy().eq_ignore_ascii_case("PATH") && value.is_some()
+            }));
+        }
+    }
+
+    #[test]
+    fn timed_out_child_is_killed_and_reaped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut command = fake_tool_command("tools::tests::fake_tool_sleeps_then_marks_completion");
+        command.current_dir(dir.path());
+
+        let started = Instant::now();
+        let error = command_output_with_limits(
+            &mut command,
+            "fake-poppler",
+            Duration::from_millis(150),
+            1024,
+            1024,
+        )
+        .expect_err("the fake tool should time out");
+        let elapsed = started.elapsed();
+
+        assert_eq!(error.to_string(), "'fake-poppler' timed out after 150ms");
+        assert!(matches!(
+            &error,
+            ToolError::TimedOut {
+                tool: "fake-poppler",
+                timeout
+            } if *timeout == Duration::from_millis(150)
+        ));
+        assert!(elapsed < Duration::from_millis(700));
+        thread::sleep(Duration::from_secs(1));
+        assert!(
+            !dir.path().join("fake-tool-completed").exists(),
+            "completion marker proves the timed-out child survived"
+        );
+    }
+
+    #[test]
+    fn oversized_stdout_is_rejected_at_the_configured_limit() {
+        let mut command = fake_tool_command("tools::tests::fake_tool_emits_large_stdout");
+        let error = command_output_with_limits(
+            &mut command,
+            "fake-poppler",
+            Duration::from_secs(5),
+            1024,
+            1024,
+        )
+        .expect_err("the fake tool should exceed stdout's limit");
+
+        assert!(matches!(
+            error,
+            ToolError::OutputTooLarge {
+                tool: "fake-poppler",
+                stream: "stdout",
+                limit: 1024
+            }
+        ));
+    }
+
+    #[test]
+    fn poppler_command_keeps_discovery_working_without_inheriting_secrets() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let executable_name = if cfg!(windows) {
+            "pdftohtml.exe"
+        } else {
+            "pdftohtml"
+        };
+        let executable = dir.path().join(executable_name);
+        fs::write(&executable, b"fixture").expect("fake executable writes");
+        let test_executable = std::env::current_exe().expect("current test executable");
+        let output = Command::new(test_executable)
+            .args([
+                "--ignored",
+                "--exact",
+                "tools::tests::fake_parent_builds_sanitized_poppler_command",
+            ])
+            .env("POPPLER_PATH", dir.path())
+            .env("DEEPSEEK_API_KEY", "fixture-secret")
+            .output()
+            .expect("environment stand-in runs");
+
+        assert!(
+            output.status.success(),
+            "environment stand-in failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn scoped_temp_dirs_are_securely_randomized() {
+        let first = scoped_temp_dir("bookforge-secure-temp").expect("first temp dir");
+        let second = scoped_temp_dir("bookforge-secure-temp").expect("second temp dir");
+
+        assert_ne!(first, second);
+        assert!(first.is_dir());
+        assert!(second.is_dir());
+        fs::remove_dir_all(first).expect("first temp dir removes");
+        fs::remove_dir_all(second).expect("second temp dir removes");
+    }
 
     #[test]
     fn parses_pdfimages_list_rows() {
