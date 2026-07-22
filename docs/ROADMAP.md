@@ -1,14 +1,16 @@
-# BookForge — Technical Roadmap, v1.0.1 through v2.6.0
+# BookForge — Technical Roadmap, v1.0.1 through v2.6.x
 
-**Document version:** 1.4.0
+**Document version:** 1.5.0
 **Last updated:** 2026-07-21
 **Status:** historical roadmap plus active follow-up notes
 **Audience:** project maintainer + Claude Code (or any other coding agent) implementing
 the milestones below.
 
-> **Current status:** v2.5.1 is the latest published release (2026-07-16),
-> and the v2.6.0 audiobook narration quality and UI-parity milestone is in
-> progress.
+> **Current status:** v2.6.0 shipped and was tagged on 2026-07-21. It delivered
+> audiobook narration hierarchy, chaptered `.m4b` output by default,
+> ElevenLabs consistency controls, cost/quota estimates, WebUI parity, and OCR
+> endpoint foundations. v2.6.1 was prepared and merged to `main` on 2026-07-21
+> with security-audit remediation and two ElevenLabs fixes; its tag is pending.
 > This document is kept for architectural invariants, shipped-milestone
 > context, and deferred follow-up work. For current user behavior, start
 > with `README.md`, `CHANGELOG.md`, and `docs/v2-web-dashboard-plan.md`;
@@ -124,7 +126,8 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v1.7 | Bilingual output (§9b) | 5–8 days | passive (release notes only) | **shipped 2026-07-04 as release v2.2.0** |
 | v1.8 | Structural credibility (EPUBCheck + corpus; was the planned v1.5 scope, §8) | 10–14 days | README final rewrite citing corpus | **shipped 2026-06-20** |
 | v2.0 | Monitoring UI (`RunState`, `watch`, `--ui tui`, local `serve`) | shipped scope | release notes | shipped; patch line completed at v2.0.3 (2026-07-02) |
-| v2.6.0 | Audiobook narration quality & UI parity (§16) | 8–12 days | release notes and updated audiobook guide | in progress |
+| v2.6.0 | Audiobook narration quality & UI parity (§16) | 8–12 days | release notes and updated audiobook guide | **shipped 2026-07-21 as release v2.6.0** |
+| v2.6.1 | Security-audit remediation + ElevenLabs fixes | patch release | release notes | **merged 2026-07-21; tag pending** |
 
 Priority note (2026-06): the owner needs PDF translation more than
 bilingual output — scientific papers (figures/tables must survive) and
@@ -2393,19 +2396,15 @@ visible reader-facing defect in the owner's actual library.
 
 ## 10. v2 — open-ended (sketched, not committed)
 
-> **Status note (2026-07-03):** "v2" shipped (releases v2.0.0–v2.1.0)
-> with a scope chosen at the time — the monitoring UI plus web dashboard.
-> The candidates sketched below were written before that decision; read
-> them as an open-ended follow-up idea list, not as the shipped v2's contents.
+> **Status note (2026-07-21):** "v2" shipped with a scope chosen at the time —
+> the monitoring UI plus web dashboard. The four mini-specs in §10.1.1–10.1.4
+> subsequently shipped in v2.3.0 and v2.4.0 and remain below as historical
+> design records. Bullets marked shipped are complete; the unmarked bullets
+> remain open-ended candidates, not commitments.
 
-The v2 list is what's interesting *as of writing*. The real v2
-priorities will be informed by:
-
-- What v1.8's corpus regression surfaces (likely: long-tail EPUB edge cases).
-- Feedback from the v1.4 writeup (likely: feature requests we can't predict).
-- What flags accumulate after using BookForge on 5–10 real books in v1.x.
-
-So this section is a **sketch**, not a commitment. Re-evaluate after v1.8 ships.
+This section now serves as both a historical design record and an open idea
+list. Shipped labels are definitive; every unmarked entry remains a **sketch,
+not a commitment**.
 
 ### 10.1 Sketched candidates
 
@@ -2419,16 +2418,24 @@ So this section is a **sketch**, not a commitment. Re-evaluate after v1.8 ships.
   shim is even later.
 - **Broader engine API surface** — HTTP/JSON-RPC beyond the local dashboard,
   with an auth model suitable for non-local clients.
-- **Native Anthropic and Gemini providers.** Only if quality measurements
-  prove the OpenRouter detour is hurting.
+- **Native Anthropic and Gemini translation providers.** Only if quality
+  measurements prove the OpenRouter detour is hurting.
 - **Streaming translation output** for live token meters during long jobs.
 - **Format-adjacent sibling tools**: `bookforge-docx2epub` and similar.
   Strictly siblings, not engine surface. PDF graduated out of this bullet:
   it is now mainline ingestion, spec'd as v1.6 in §9 (decision 2026-06).
-- **Glossary auto-extraction (v1.2.x)** — already mentioned, file here as
-  a reminder if it didn't ship as a point release.
-- **Proper Pause + Stop for in-flight translations.** Promoted from a
-  sketch to a scheduled mini-spec — see §10.1.1 below.
+- **Shipped in v1.2.x — Glossary auto-extraction.** Retained here as
+  historical context; see §5b.
+- **Shipped in v2.3.0 — Proper Pause + Stop for in-flight translations.**
+  Historical mini-spec: see §10.1.1 below.
+- **Shipped in v2.4.0 — In-dashboard review & correction loop.** Durable
+  corrections, flags, and the editable Review dashboard are retained as the
+  historical mini-spec in §10.1.2.
+- **Shipped in v2.4.0 — On-the-fly settings reconfiguration.** Revisioned,
+  atomic live configuration is retained as the historical mini-spec in §10.1.3.
+- **Shipped in v2.4.0 — Truncation handling + fail-fast alert.**
+  Escalation-first handling and systemic-truncation alerts are retained as the
+  historical mini-spec in §10.1.4.
 - **Unified operation/job envelope (`OperationKind::{Translation, Audiobook}`).**
   Audiobook generation shipped in v2.5.0 with its *own* durable
   `AudiobookManifest` checkpoint — per-chunk progress that survives a restart
@@ -2454,7 +2461,10 @@ So this section is a **sketch**, not a commitment. Re-evaluate after v1.8 ships.
   are normally real `<h*>` elements that never reach this `<p>`-only path — and
   remove it. Low priority; no correctness impact today.
 
-#### 10.1.1 Mini-spec: Pause + Stop (added 2026-07-03, ready to schedule)
+#### 10.1.1 Mini-spec: Pause + Stop (shipped in v2.3.0)
+
+**Shipped in v2.3.0.** The mini-spec below is retained as a historical design
+record.
 
 **Goal.** The Progress surfaces (CLI `--ui`, `watch`, and the `serve`
 dashboard) gain working Pause / Resume / Stop controls. Today they are
@@ -2503,13 +2513,18 @@ across machine reboots beyond what the control file naturally provides.
 **Effort:** 1–2 days engine + 1 day surfaces. **Priority:** after v1.7
 ships; pairs naturally with §9c in a quality-of-life release.
 
-> **Shipped 2026-07-05 in v2.3.0**, alongside §9c reflow (+`--aggressive`).
-> The finalize-stage pause path required a fix pass (threading the shared
+> **Post-ship note.** The controls landed 2026-07-05 alongside §9c reflow
+> (+`--aggressive`). The finalize-stage pause path required a fix pass
+> (threading the shared
 > PauseSignal into QA/double-check, a run-long control-file watcher, and
 > resumable stop) caught by a pre-merge review; see
 > `docs/codex-fix-pause-review.md`.
 
-#### 10.1.2 Mini-spec: In-dashboard review & correction loop (added 2026-07-06, owner-approved)
+#### 10.1.2 Mini-spec: In-dashboard review & correction loop (shipped in v2.4.0)
+
+**Shipped in v2.4.0.** Durable human corrections and flags, the editable
+Review dashboard, and the `correct` CLI path completed this loop. The mini-spec
+below is retained as a historical design record.
 
 **Goal.** Make the `serve` dashboard's Review screen *editable* so a
 non-developer translator can fix a flagged / `needs_review` segment in
@@ -2567,14 +2582,13 @@ fuzzy-TM sketch in §10.1), batch bulk-edit. Keep it one-segment-at-a-time.
 high — completes the review loop the v2 dashboard started and is the top
 blocker for the non-developer audience.
 
-#### 10.1.3 Mini-spec: On-the-fly settings reconfiguration (added 2026-07-06, owner-approved)
+#### 10.1.3 Mini-spec: On-the-fly settings reconfiguration (shipped in v2.4.0)
 
-> **Implemented for v2.4.0 on the project-remediation branch.** Revisioned
+> **Shipped in v2.4.0.** Revisioned
 > overrides now apply in-process at request, unstarted-batch, and finalize-stage
 > boundaries. The CLI and dashboard share validation and persistence; a runtime
 > lease lets dashboard Resume signal a live worker or launch one replacement
-> after stop/crash. Automated acceptance is complete; the selected real-provider
-> run remains part of the final release gate.
+> after stop/crash. This mini-spec is retained as a historical design record.
 
 **Goal.** Adjust *cache-safe* run settings on an existing (initially: paused)
 job and have `resume` apply them — without starting a fresh run and losing
@@ -2625,11 +2639,12 @@ reconfiguring completed jobs.
 **Effort:** ~1 day CLI + snapshot-merge. **Priority:** high — small, and it
 removes a real "lost all my progress to change one number" cliff.
 
-#### 10.1.4 Mini-spec: Truncation handling + fail-fast alert (added 2026-07-06, owner-approved)
+#### 10.1.4 Mini-spec: Truncation handling + fail-fast alert (shipped in v2.4.0)
 
-> **Implemented on main after v2.3.0; scheduled for v2.4.0.** Truncated batches
+> **Shipped in v2.4.0.** Truncated batches
 > escalate their output budget before splitting, and systemic exhaustion emits
-> an additive alert surfaced by CLI, watch, and the browser dashboard.
+> an additive alert surfaced by CLI, watch, and the browser dashboard. This
+> mini-spec is retained as a historical design record.
 
 **Goal.** Handle `max_output_tokens` truncation intelligently, and surface a
 prominent, actionable **alert** when truncation is *systemic* instead of
@@ -3100,6 +3115,324 @@ ElevenLabs checkpoints, and dashboard verification.
   foundations.
 - ffmpeg for assembled book files and ffprobe for exact gaps and chapter-marker
   timing; synthesis remains useful when those external tools are absent.
+
+> **Shipped 2026-07-21 as v2.6.0.** All ten acceptance criteria were met. The
+> un-mockable release gate narrated a real EPUB chapter live with ElevenLabs
+> `eleven_v3` rather than the Flash v2.5 model named in criterion 9; the
+> resulting audiobook artifacts and dashboard flow were inspected end to end.
+
+---
+
+## 17. Proposed post-2.6 / v3 candidate arc (not committed)
+
+> **Proposal only.** The candidate milestones below are a menu for maintainer
+> selection, not a release promise, sequence commitment, or assertion that a
+> semver-major release is required. Their effort ranges are deliberately rough.
+> Selecting one candidate does not commit the others.
+
+### 17.1 Candidate A — Engine extraction, public API, and unified operations
+
+#### Goal
+
+Extract a stable `bookforge-engine` library that can run BookForge operations
+without going through the CLI, then use that boundary to unify translation and
+audiobook lifecycle plumbing and, if there is demonstrated demand, expose a
+broader authenticated engine API.
+
+#### Architectural rationale
+
+The CLI currently owns orchestration that embedders would need to duplicate.
+The library boundary must come first: a remote API should be an adapter over a
+coherent engine, not a second orchestration implementation. The current
+`AudiobookManifest` remains a valid temporary checkpoint; unification should
+replace duplication only after `OperationKind::{Translation, Audiobook}` has a
+clear shared lifecycle.
+
+#### Deliverables
+
+- A documented, semver-governed `bookforge-engine` crate with typed requests,
+  progress subscriptions, cancellation/control, resume, and artifact results.
+- CLI translation and audiobook paths implemented as clients of the same
+  engine API, without changing their user-visible behavior by default.
+- A common operation envelope covering translation and audiobook identity,
+  state, events, checkpoints, and artifacts while retaining migration support
+  for existing translation jobs and audiobook manifests.
+- A broader HTTP or JSON-RPC surface only after its non-local use case and auth
+  model are approved; the local dashboard remains a client, not a parallel
+  engine.
+
+#### Schema changes
+
+- Versioned operation records gain an `OperationKind` discriminator and typed
+  operation-specific payloads.
+- Store, event-log, and manifest migrations preserve readability and resume for
+  existing translation jobs and schema-v3 audiobook manifests.
+- Any public wire format receives an explicit schema version before non-local
+  clients are supported.
+
+#### CLI surface
+
+- Existing commands remain the compatibility surface and delegate to the
+  library.
+- A broader server mode may gain explicit bind, authentication, and transport
+  settings; exact flags are deferred until the API and threat model are chosen.
+
+#### Out of scope
+
+- A C ABI, hosted service, multi-tenant control plane, or general-purpose GUI.
+- Forcing audio chunks into `SegmentTranslation` before a compatible common
+  envelope exists.
+
+#### Acceptance criteria
+
+1. A small external Rust program can submit, observe, pause/resume, and collect
+   artifacts for both a translation and an audiobook through the public crate.
+2. CLI and library runs with equivalent inputs produce equivalent manifests,
+   events, and artifacts.
+3. Pre-extraction translation jobs and audiobook manifests remain readable and
+   resumable after migration.
+4. If a non-local API ships, authentication is mandatory outside loopback and
+   credentials never appear in URLs, logs, events, or browser responses.
+5. **Un-mockable:** run a real translation and a real audiobook through an
+   external program using the published engine API and inspect both outputs.
+
+#### Effort
+
+Roughly 15–25 focused person-days, with the remote API portion omitted unless
+its demand and security model are approved.
+
+#### Dependencies
+
+- The shipped translation scheduler, control plane, event log, local dashboard,
+  and audiobook manifest.
+- The broader engine API and operation unification depend on completing the
+  `bookforge-engine` extraction first.
+
+### 17.2 Candidate B — Translation QA depth and live progress
+
+#### Goal
+
+Improve translation confidence and responsiveness with semantic-equivalence
+soft warnings, fuzzy translation-memory suggestions, and streaming progress
+that can drive live token meters during long provider requests.
+
+#### Architectural rationale
+
+These are complementary feedback layers, not replacements for deterministic
+validation. Semantic scoring can identify meaning drift that structural checks
+cannot see; fuzzy TM can reuse related human-reviewed phrasing without
+pretending it is an exact cache hit; streaming can report useful progress while
+BookForge still waits for a complete validated JSON response before committing
+a translation.
+
+#### Deliverables
+
+- A locally runnable multilingual semantic scorer with versioned model and
+  threshold metadata, surfaced only as QA evidence and soft warnings.
+- A fuzzy TM index with scoped candidates, similarity scores, provenance, and
+  explicit acceptance rules separate from the exact content-addressed cache.
+- Provider streaming support sufficient for additive progress events and live
+  token meters, while buffering the final structured response for ordinary
+  validation and deterministic reassembly.
+- Review, report, CLI, TUI, and dashboard presentation for scores, TM matches,
+  and streaming progress.
+
+#### Schema changes
+
+- QA records gain optional semantic model/version, score, and threshold fields.
+- TM records gain source fingerprint, scope, similarity method/version,
+  provenance, and accepted/rejected state.
+- Events gain additive streaming-progress counters; partial model output is not
+  stored as a completed segment.
+
+#### CLI surface
+
+- Opt-in controls for semantic QA, fuzzy-TM lookup, thresholds, and live token
+  meters; exact names and defaults remain design decisions for the milestone.
+- Status and review commands distinguish exact-cache reuse, fuzzy suggestions,
+  and human-approved TM reuse.
+
+#### Out of scope
+
+- Treating embedding similarity as proof of correctness, silently accepting a
+  fuzzy match, or replacing human review.
+- Multi-agent debate QA or validation/repair of model-produced document markup.
+
+#### Acceptance criteria
+
+1. A pinned multilingual fixture corpus produces reproducible semantic scores
+   and catches seeded meaning reversals without failing structurally valid work.
+2. Fuzzy TM returns scoped, ranked candidates with provenance and never reports
+   them as exact cache hits.
+3. Rejecting or accepting a TM suggestion is durable and auditable.
+4. Streaming updates drive live meters, but truncated or invalid final JSON is
+   rejected under the same validation rules as a non-streaming response.
+5. **Un-mockable:** translate a real chapter through a streaming provider,
+   inspect live progress, semantic warnings, and at least one reviewed fuzzy-TM
+   suggestion, then verify the rebuilt book.
+
+#### Effort
+
+Roughly 12–22 focused person-days, depending on embedding runtime size and
+provider streaming differences.
+
+#### Dependencies
+
+- Existing tiered QA, review/correction workflow, glossary scopes, store, and
+  provider abstraction.
+- Streaming depends on provider support and must preserve the current complete-
+  response JSON validation boundary. Candidate A is useful but not required.
+
+### 17.3 Candidate C — OCR productization
+
+#### Goal
+
+Turn the v2.6.0 `--ocr-endpoint` and openai/unlimited-ocr dialect foundations
+into a complete scanned-book workflow with a supported OCR deployment path,
+resumable batch conversion, and measurable output quality.
+
+#### Architectural rationale
+
+An endpoint abstraction proves integration but does not make OCR a product.
+Scanned books need page discovery, batching, checkpointing, reading-order and
+layout reconstruction, and quality gates before their text can safely enter the
+existing translation IR. OCR remains a deterministic ingestion concern around
+an external or managed recognizer; it must not weaken the rule that translation
+models see validated prose payloads rather than raw document structure.
+
+#### Deliverables
+
+- A maintainer-approved bundled and/or managed OCR deployment path, while
+  retaining the shipped endpoint dialect for independently hosted services.
+- Scan detection, page extraction, bounded concurrent OCR, durable per-page
+  checkpoints, retry/resume, and batch conversion for scanned books.
+- Deterministic reconstruction into BookForge's existing document/EPUB
+  ingestion path, including reading order and retained page/image provenance.
+- OCR quality reporting for coverage, confidence where available, suspicious
+  pages, language mismatch, and pages requiring human review.
+- CLI and dashboard planning, progress, review, and artifact download flows.
+
+#### Schema changes
+
+- A versioned OCR manifest records source identity, backend/dialect, page
+  checkpoints, extracted text provenance, quality results, and output artifacts.
+- Endpoint secrets remain outside manifests and events; migrations preserve the
+  v2.6.0 endpoint configuration path.
+
+#### CLI surface
+
+- A dedicated OCR/conversion workflow, plus an explicit path for feeding its
+  validated output into translation; command names and whether this is one or
+  two steps remain open design choices.
+- Planning flags cover page ranges, backend selection, concurrency, retry, and
+  quality thresholds without exposing credentials.
+
+#### Out of scope
+
+- Claiming OCR quality without a representative scanned-book corpus.
+- Handwriting recognition, model-driven DOM repair, or reproducing arbitrary
+  original PDF geometry as translated PDF output.
+
+#### Acceptance criteria
+
+1. A multi-page scanned-book fixture can be interrupted and resumed without
+   repeating successful page OCR.
+2. Reading order, page/image provenance, and quality flags survive conversion
+   into a valid downstream document artifact.
+3. Zip-bomb/resource limits, timeouts, filesystem permissions, and secret
+   handling match the hardened v2.6.1 security posture.
+4. The dashboard and CLI report the same plan, progress, review pages, and
+   final artifacts.
+5. **Un-mockable:** convert a real scanned book with the supported OCR backend,
+   inspect flagged pages and reading order, then translate a representative
+   chapter and validate the resulting EPUB.
+
+#### Effort
+
+Roughly 15–30 focused person-days; backend packaging and corpus diversity are
+the largest uncertainties.
+
+#### Dependencies
+
+- The v2.6.0 OCR endpoint/dialect foundations, PDF ingestion, EPUB rebuild, and
+  the v2.6.1 resource/security hardening.
+- Candidate A is optional; if selected first, OCR should use its operation and
+  progress APIs rather than introduce another durable job model.
+
+### 17.4 Candidate D — Selective provider and format expansion
+
+#### Goal
+
+Add native Anthropic and Gemini translation providers only if measurements
+justify bypassing OpenRouter, and build `docx2epub` or other format converters
+as sibling tools rather than widening the translation engine's core document
+surface.
+
+#### Architectural rationale
+
+Provider breadth and format conversion solve different edge integrations but
+share one constraint: neither should duplicate engine orchestration or weaken
+the EPUB-centered architecture. Native providers require evidence that the
+OpenRouter route harms quality, capability, latency, or cost. Format tools
+should produce validated inputs for BookForge and remain independently scoped.
+
+#### Deliverables
+
+- Evidence and maintainer approval for each native provider before
+  implementation, followed by request/response, usage, retry, error, pricing,
+  and streaming parity with existing provider contracts.
+- A reusable sibling-tool pattern, with `docx2epub` as the first candidate and
+  additional formats considered separately rather than promised as a bundle.
+- Structural validation and provenance reports for converted EPUBs before they
+  enter translation.
+
+#### Schema changes
+
+- Additive provider identifiers and provider-specific capability metadata;
+  secrets remain in the existing credential paths.
+- Sibling converters own versioned manifests if they need checkpoints; their
+  schemas do not become translation-job fields merely for convenience.
+
+#### CLI surface
+
+- Native providers may become new `--provider` values with capability-aware
+  validation.
+- Format conversion ships as a sibling command or binary such as
+  `bookforge-docx2epub`, with explicit input, output, inspect, and validate
+  surfaces rather than implicit translation-engine ingestion.
+
+#### Out of scope
+
+- Adding native providers without a measured benefit, supporting every office
+  or proprietary ebook format, or treating DOCX as a new core engine IR.
+- Hosted provider brokering or a SaaS conversion service.
+
+#### Acceptance criteria
+
+1. Each native provider has contract, retry, usage, and real-call parity tests
+   and demonstrates the measured benefit that justified it.
+2. Provider selection never changes cache identity or credential handling
+   implicitly.
+3. A real DOCX converts to a structurally valid EPUB with an inspectable
+   provenance report and can then pass through an ordinary BookForge run.
+4. Failure in a sibling converter cannot corrupt an existing BookForge job or
+   mutate its source artifact.
+5. **Un-mockable:** complete one approved native-provider translation and one
+   real DOCX-to-EPUB-to-BookForge flow, inspecting costs and final structure.
+
+#### Effort
+
+Roughly 10–20 focused person-days for two native providers plus the first
+sibling converter, after the evidence gates; each additional format is a new
+estimate.
+
+#### Dependencies
+
+- Existing provider contracts, pricing/usage reporting, credential handling,
+  EPUB inspection, and structural validation.
+- Native streaming parity depends on Candidate B if streaming is selected.
+  Sibling tools benefit from Candidate A's stable public API but must remain
+  outside the engine surface.
 
 ---
 
