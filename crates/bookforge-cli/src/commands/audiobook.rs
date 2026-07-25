@@ -410,6 +410,9 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             .then(|| args.text_normalization.into_audio()),
         heading_break_tag,
         chapter_filter: args.chapters.clone(),
+        gap_chapter_ms: args.gap_chapter_ms,
+        gap_title_ms: args.gap_title_ms,
+        gap_paragraph_ms: args.gap_paragraph_ms,
         pdf_page_grouping,
     };
     validate_options(&options)?;
