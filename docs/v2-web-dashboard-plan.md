@@ -54,7 +54,9 @@ already existed, newly exposed over HTTP:
   preview), then `POST /api/translate`. The launch now also forwards the wizard's
   Advanced fields — `--concurrency`, `--qa`, `--context-window`, `--validate-output`
   — each validated before reaching the child argv.
-- **Progress** ← `GET /api/jobs/{id}` + SSE. Monitor-only (see below).
+- **Progress** ← `GET /api/jobs/{id}` + SSE, with lifecycle controls:
+  `POST /api/jobs/{id}/pause`, `POST /api/jobs/{id}/resume`, and
+  `POST /api/jobs/{id}/stop` (see below).
 - **Review** ← **`GET /api/jobs/{id}/review`** (new; shares
   `review::generate_review_document` with the CLI `review` command): side-by-side
   source/target, soft-warning badges, client-side flags in `localStorage`.
@@ -65,10 +67,18 @@ already existed, newly exposed over HTTP:
   glossary methods): list/add/remove terms by language pair and scope (default
   global).
 
-**Deferred to the roadmap (§10.1):** the Progress screen's **Pause/Stop**. Runs
-are spawned detached and the engine has no cooperative pause primitive, so the
-controls are omitted rather than faked; checkpoints already make a run resumable
-via `bookforge resume`.
+**Status: SUPERSEDED — SHIPPED** (v2.3.0, 2026-07-05). This update originally
+deferred the Progress screen's **Pause/Stop** to roadmap §10.1 because runs were
+spawned detached and the engine had no cooperative pause primitive at the time;
+the controls were omitted rather than faked, while checkpoints already made a
+run resumable via `bookforge resume`. Cooperative pause, resume, and stop later
+shipped across the engine, CLI, terminal watcher, and browser dashboard, with
+completed segments checkpointed before parking and finalize-stage QA and
+double-check requests honoring the controls. The dashboard registers
+`POST /api/jobs/{id}/pause`, `POST /api/jobs/{id}/resume`, and
+`POST /api/jobs/{id}/stop`. v2.4.0 (2026-07-13) then added live, cache-safe
+reconfiguration through both `GET /api/jobs/{id}/reconfigure` and
+`POST /api/jobs/{id}/reconfigure`.
 
 ## Archived Original Plan
 

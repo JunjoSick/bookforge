@@ -46,6 +46,62 @@ or supplied to CLI commands through environment variables. See
 | `benchmark` | Measure provider latency and throughput with synthetic requests. |
 | `audiobook` | Generate resumable audio chunks and optional stitched audio from an EPUB. |
 
+## Local browser dashboard
+
+The local dashboard is the default front door. Running `bookforge` without a
+subcommand starts it on `127.0.0.1:8765` and opens the default browser. The
+explicit command uses the same address and 250 ms server-sent-events refresh
+interval, but opens a browser only when `--open` is present:
+
+```bash
+bookforge
+bookforge serve --open
+```
+
+Use `--bind` to select another loopback address or port. `--refresh-ms` controls
+the live-update interval; values are clamped to the range from 50 through 5,000
+milliseconds.
+
+```bash
+bookforge serve --bind 127.0.0.1:9000 --refresh-ms 500
+```
+
+The dashboard lists jobs and shows their details and live events. It can
+estimate and launch translations, review and validate results, save manual
+translations, flag or retry segments, and manage glossary entries. It also
+routes the reconfigure, pause, resume, and stop controls described below. The
+audiobook flow can estimate and launch a run, report its status, cancel it, and
+download its artifact. The dashboard is therefore a control surface, not only
+a monitor.
+
+Before binding, `serve` checks whether the current working directory can hold
+`.bookforge/`. A writable directory is left unchanged. On Windows, an
+unwritable directory is replaced with `%LOCALAPPDATA%\BookForge`, falling back
+to `%USERPROFILE%\BookForge`. On other platforms it uses
+`$XDG_DATA_HOME/bookforge`, falling back to `$HOME/.local/share/bookforge`.
+Uploads, job state, outputs, and dashboard-launched child processes then use
+that relocated working directory.
+
+The dashboard is deliberately unauthenticated and may hold provider API keys,
+so it is only for the person at that machine. This is enforced at the network
+boundary: `--bind` rejects every non-loopback address and directs remote users
+to an SSH tunnel. Keys pasted into the dashboard remain in server memory only
+for the lifetime of the process. They are never written to disk, logged, or
+placed on a child process's command line; spawned runs receive them through
+their environment.
+
+Mutating requests require the per-server CSRF token in the
+`x-bookforge-csrf` header, and Host-header middleware rejects requests that do
+not name the bound loopback port. Request bodies are capped at 64 MiB. The
+dashboard page carries a content security policy, `X-Frame-Options: DENY`,
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and
+`Cache-Control: no-store`.
+
+`watch` and `serve` are default-on build features (`tui` / `serve`); build with
+`--no-default-features` for a minimal binary without them. Such a build has no
+`serve` subcommand, and running `bookforge` without a command prints help
+instead of starting the dashboard.
+
 ## A complete translation workflow
 
 Inspect the source before spending provider tokens. The coverage report calls
@@ -286,6 +342,45 @@ bookforge translate book.epub \
 
 Use `tail <job-id> --json` for persisted event objects after launch. See
 [events.md](events.md) for the event schema and folding rules.
+
+## Benchmark provider latency and throughput
+
+`benchmark` sends a fixed synthetic translation request to a real provider. It
+makes one provider call for each sample, so the default `--samples 5` makes five
+potentially billable calls. `--tokens` defaults to 1,000 and sets each request's
+maximum output tokens; it is a response-length cap, not a total token budget.
+
+```bash
+bookforge benchmark \
+  --base-url https://openrouter.ai/api/v1 \
+  --api-key-env OPENROUTER_API_KEY \
+  --model openrouter/auto \
+  --samples 5 \
+  --tokens 1000
+```
+
+The command accepts the shared `--provider`, `--model`, `--base-url`,
+`--api-key-env`, and `--timeout-seconds` flags. Its implementation does not,
+however, read the `--provider` name: even though that parsed value defaults to
+`deepseek`, it does not select a preset. Without explicit overrides,
+`benchmark` constructs an OpenAI-compatible client for
+`https://openrouter.ai/api/v1`, reads `OPENROUTER_API_KEY`, uses
+`openrouter/auto`, and applies a 120-second timeout.
+
+Samples currently run one at a time. `--concurrency` defaults to 1, but its
+value appears only in the printed header and does not make requests parallel.
+
+Each sample prints success or failure. Successful lines include latency, token
+counts, and approximate output tokens per second. The results block always
+reports success, failure, HTTP 429, and timeout counts; when requests succeed,
+it also reports p50, p95, and average latency and average output throughput.
+With at least one success, the recommendation classifies a rate-limited or very
+slow result as `free-tier`, a fast result without rate limits as `fastest`, and
+the remainder as `balanced`; it prints the selected profile name with suggested
+concurrency and timeout values.
+
+See [benchmarks.md](benchmarks.md) for the wider set of metrics to retain when
+recording provider and end-to-end benchmarks.
 
 ## Audiobooks
 
