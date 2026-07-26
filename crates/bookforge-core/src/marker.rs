@@ -87,6 +87,52 @@ pub fn marker_inner_texts(text: &str) -> Vec<MarkerInnerText> {
     inner_texts
 }
 
+/// Paired-marker prose must remain free to change during translation. Only a
+/// non-empty, at-most-eight-character token with no letters, at least one
+/// digit or reference symbol, and otherwise only reference punctuation is
+/// protected as non-translatable marker reference text.
+pub fn marker_reference_token(text: &str) -> Option<&str> {
+    let token = text.trim();
+    let length = token.chars().count();
+    if length == 0 || length > 8 || token.chars().any(char::is_alphabetic) {
+        return None;
+    }
+    if !token
+        .chars()
+        .any(|ch| ch.is_ascii_digit() || is_reference_symbol(ch))
+    {
+        return None;
+    }
+    token
+        .chars()
+        .all(|ch| {
+            ch.is_ascii_digit()
+                || ch.is_ascii_whitespace()
+                || is_reference_symbol(ch)
+                || matches!(
+                    ch,
+                    '[' | ']'
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                        | '.'
+                        | ','
+                        | '-'
+                        | '–'
+                        | '—'
+                        | '/'
+                        | ':'
+                        | ';'
+                )
+        })
+        .then_some(token)
+}
+
+fn is_reference_symbol(ch: char) -> bool {
+    matches!(ch, '*' | '†' | '‡' | '§' | '¶' | '#')
+}
+
 /// Return a deterministic error when paired inline markers are unbalanced,
 /// mis-nested, or closed by the wrong marker tag. ID-presence checks alone
 /// cannot detect `<m1>text` with a missing `</m1>`, which is valid prose JSON
@@ -351,6 +397,20 @@ mod tests {
     #[test]
     fn marker_inner_texts_ignore_empty_markers() {
         assert!(marker_inner_texts("A <r3/> B <m4/> C").is_empty());
+    }
+
+    #[test]
+    fn marker_reference_tokens_are_narrowly_classified() {
+        for token in ["1", "*2", "† 3", "[12]", "12–14"] {
+            assert_eq!(marker_reference_token(token), Some(token), "{token}");
+        }
+        for prose_or_data in ["", "beautiful", "E=mc^2", "42%", "123456789"] {
+            assert_eq!(
+                marker_reference_token(prose_or_data),
+                None,
+                "{prose_or_data}"
+            );
+        }
     }
 
     #[test]

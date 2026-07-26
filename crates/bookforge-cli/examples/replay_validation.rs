@@ -123,11 +123,12 @@ struct EmittedPair {
 struct Totals {
     jobs_considered: usize,
     jobs_replayed: usize,
+    settings_resolved: usize,
+    skipped_settings_unreadable: usize,
     skipped_no_snapshot_path: usize,
     skipped_missing_snapshot: usize,
     skipped_epub_unreadable: usize,
     skipped_segmentation_failed: usize,
-    jobs_without_config_snapshot: usize,
 
     stored_block_rows: usize,
     pairs_replayed: usize,
@@ -219,17 +220,26 @@ fn main() -> Result<()> {
         totals.jobs_considered += 1;
 
         let snapshot = match store.load_job_config_snapshot(&job.id) {
-            Ok(snapshot) => snapshot,
+            Ok(Some(snapshot)) => {
+                totals.settings_resolved += 1;
+                snapshot
+            }
+            Ok(None) => {
+                totals.skipped_settings_unreadable += 1;
+                warn(&format!(
+                    "{}: no run configuration snapshot; skipping rather than replaying with defaults",
+                    job.id
+                ));
+                continue;
+            }
             Err(error) => {
+                totals.skipped_settings_unreadable += 1;
                 warn(&format!("{}: config snapshot unreadable: {error}", job.id));
-                None
+                continue;
             }
         };
-        if snapshot.is_none() {
-            totals.jobs_without_config_snapshot += 1;
-        }
 
-        let Some(epub_path) = resolve_snapshot_path(&root, job, snapshot.as_ref()) else {
+        let Some(epub_path) = resolve_snapshot_path(&root, job, &snapshot) else {
             totals.skipped_no_snapshot_path += 1;
             warn(&format!("{}: no input snapshot recorded", job.id));
             continue;
@@ -256,7 +266,7 @@ fn main() -> Result<()> {
             }
         };
 
-        let (segmentation, batch_config, profile) = replay_settings(snapshot.as_ref());
+        let (segmentation, batch_config, profile) = replay_settings(&snapshot);
         let segments = match build_segments(&book, &segmentation) {
             Ok(segments) => segments,
             Err(error) => {
@@ -270,18 +280,11 @@ fn main() -> Result<()> {
         let section_titles = section_titles(&segments);
 
         let source_lang = snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.source_language.clone())
-            .or_else(|| job.source_lang.clone())
+            .source_language
+            .clone()
             .filter(|lang| !lang.trim().is_empty());
-        let target_lang = snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.target_language.clone())
-            .unwrap_or_else(|| job.target_lang.clone());
-        let provider = snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.provider.clone())
-            .unwrap_or_else(|| job.provider.clone());
+        let target_lang = snapshot.target_language.clone();
+        let provider = snapshot.provider.clone();
 
         // Mirrors bookforge_llm::validation::should_validate_source_copy, which
         // is pub(crate) and therefore not reachable from an example.
@@ -541,12 +544,12 @@ fn store_root(db_path: &Path) -> PathBuf {
 fn resolve_snapshot_path(
     root: &Path,
     job: &JobRecord,
-    snapshot: Option<&RunConfigSnapshot>,
+    snapshot: &RunConfigSnapshot,
 ) -> Option<PathBuf> {
     let recorded = job
         .input_snapshot_path
         .clone()
-        .or_else(|| snapshot.and_then(|snapshot| snapshot.input_snapshot_path.clone()));
+        .or_else(|| snapshot.input_snapshot_path.clone());
     if let Some(path) = recorded {
         let resolved = if path.is_absolute() {
             path
@@ -566,22 +569,9 @@ fn resolve_snapshot_path(
 }
 
 fn replay_settings(
-    snapshot: Option<&RunConfigSnapshot>,
+    snapshot: &RunConfigSnapshot,
 ) -> (SegmentationConfig, BatchConfig, TranslationProfile) {
-    let Some(settings) = snapshot.map(|snapshot| snapshot.settings.to_settings()) else {
-        return (
-            SegmentationConfig::default(),
-            BatchConfig {
-                enabled: true,
-                target_tokens: REPLAY_TARGET_TOKENS,
-                max_items: REPLAY_MAX_ITEMS,
-                adaptive_sizing: false,
-                split_on_json_failure: true,
-                repair_invalid_items: true,
-            },
-            TranslationProfile::Balanced,
-        );
-    };
+    let settings = snapshot.settings.to_settings();
     let batch = BatchConfig {
         enabled: true,
         target_tokens: settings.batch.target_tokens.max(REPLAY_TARGET_TOKENS),
@@ -697,6 +687,11 @@ fn print_report(
     println!("\n=== jobs ===");
     println!("considered                 : {}", totals.jobs_considered);
     println!("replayed                   : {}", totals.jobs_replayed);
+    println!("settings resolved          : {}", totals.settings_resolved);
+    println!(
+        "skipped: settings unreadable: {}",
+        totals.skipped_settings_unreadable
+    );
     println!(
         "skipped: no snapshot path  : {}",
         totals.skipped_no_snapshot_path
@@ -713,11 +708,6 @@ fn print_report(
         "skipped: segmentation fail : {}",
         totals.skipped_segmentation_failed
     );
-    println!(
-        "without config snapshot    : {}",
-        totals.jobs_without_config_snapshot
-    );
-
     println!("\n=== pairs ===");
     println!("stored block rows          : {}", totals.stored_block_rows);
     println!("pairs replayed             : {}", totals.pairs_replayed);

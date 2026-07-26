@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use bookforge_core::marker::{marker_inner_texts, strip_marker_tokens};
+use bookforge_core::marker::{marker_inner_texts, marker_reference_token, strip_marker_tokens};
 
 const MIN_SOURCE_CHARS: usize = 120;
 const MIN_OVERLAP_WORDS: usize = 30;
@@ -636,7 +636,7 @@ pub(crate) fn marker_reference_text_error(source: &str, translation: &str) -> Op
         .collect::<HashMap<_, _>>();
 
     for marker in marker_inner_texts(source) {
-        let Some(token) = reference_token(&marker.text) else {
+        let Some(token) = marker_reference_token(&marker.text) else {
             continue;
         };
         let Some(translated_text) = translated_inner_texts.get(&marker.id) else {
@@ -656,52 +656,6 @@ pub(crate) fn marker_reference_text_error(source: &str, translation: &str) -> Op
     }
 
     None
-}
-
-/// Paired-marker prose must remain free to change during translation. Only a
-/// non-empty, at-most-eight-character token with no letters, at least one
-/// digit or reference symbol, and otherwise only reference punctuation is
-/// protected as non-translatable reference text.
-fn reference_token(text: &str) -> Option<&str> {
-    let token = text.trim();
-    let length = token.chars().count();
-    if length == 0 || length > 8 || token.chars().any(char::is_alphabetic) {
-        return None;
-    }
-    if !token
-        .chars()
-        .any(|ch| ch.is_ascii_digit() || is_reference_symbol(ch))
-    {
-        return None;
-    }
-    token
-        .chars()
-        .all(|ch| {
-            ch.is_ascii_digit()
-                || ch.is_ascii_whitespace()
-                || is_reference_symbol(ch)
-                || matches!(
-                    ch,
-                    '[' | ']'
-                        | '('
-                        | ')'
-                        | '{'
-                        | '}'
-                        | '.'
-                        | ','
-                        | '-'
-                        | '–'
-                        | '—'
-                        | '/'
-                        | ':'
-                        | ';'
-                )
-        })
-        .then_some(token)
-}
-
-fn is_reference_symbol(ch: char) -> bool {
-    matches!(ch, '*' | '†' | '‡' | '§' | '¶' | '#')
 }
 
 fn remove_whitespace(value: &str) -> String {

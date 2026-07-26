@@ -307,7 +307,8 @@ fn parses_complex_generated_fixture_shapes() {
         table_row_text
             .protected_spans
             .iter()
-            .any(|span| span.text == "2024")
+            .all(|span| span.text != "2024"),
+        "bare marker reference text is owned by marker validation"
     );
     assert!(
         table_row_text
