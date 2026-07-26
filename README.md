@@ -18,7 +18,7 @@ of translation quality.
 
 ## Status
 
-BookForge v2.5.1 is usable for EPUB translation, PDF-to-EPUB ingestion, and
+BookForge v2.6.1 is usable for EPUB translation, PDF-to-EPUB ingestion, and
 local browser-based translation runs:
 
 - EPUB inspect, parse, segment, and rebuild
@@ -52,6 +52,29 @@ local browser-based translation runs:
 - Cost estimates for known provider/model pairs
 - Externalized, overridable provider pricing
 - Resumable audiobook generation with hosted and local TTS providers
+- Typed audiobook narration chunks for chapter titles, in-section headings,
+  and body prose
+- Default chaptered `audiobook.m4b` assembly with title/artist metadata,
+  chapter markers, `--no-book-file` opt-out, `--single` flat output, and
+  whole-book-only `--loudnorm`
+- ElevenLabs consistency controls with `--seed`, model-aware `--language`,
+  `--text-normalization auto|on|off`, and up to 300 characters of same-chapter
+  context
+- Per-character TTS cost estimates and non-fatal ElevenLabs quota preflight,
+  plus one-based `--chapters` subsets and `--list-voices` discovery
+- ElevenLabs model selection preferring Eleven v3, Flash v2.5, Turbo v2.5,
+  then Multilingual v2, with consistent character limits across all interfaces
+- Browser audiobook voice discovery, pre-launch cost/quota estimates,
+  chapter-grouped progress, `.m4b` playback, and advanced generation controls
+- `bookforge-audio-v2` synthesis caching and manifest schema 3, invalidating
+  earlier chunk caches and supporting `--prune` cleanup
+- Optional low-confidence PDF OCR through OpenAI-compatible `--ocr-endpoint`
+  services, including the `--ocr-dialect unlimited-ocr` SGLang dialect,
+  `action=ocr` reporting, and loopback endpoint diagnostics
+- Bounded EPUB decompression, capped provider/OCR/event-log reads, and
+  time-limited poppler tools with scrubbed environments and private temp dirs
+- Least-privilege provider-key handling for quota checks and dashboard jobs,
+  hardened dashboard headers, and private `.bookforge` data on Unix
 
 ## Documentation
 
@@ -599,6 +622,7 @@ respect.
 ```txt
 crates/bookforge-core   IR, segmentation, shared config
 crates/bookforge-epub   EPUB inspect/read/rebuild
+crates/bookforge-pdf    PDF ingestion: poppler, reconstruction, OCR, EPUB emit
 crates/bookforge-llm    prompts, providers, scheduler, validators
 crates/bookforge-llm/prompts  Versioned prompt templates
 crates/bookforge-audio  Audiobook TTS: chunking, providers, stitch
