@@ -1,7 +1,10 @@
 use super::*;
-use bookforge_core::segment::{
-    SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata, SegmentSource,
-    SegmentTextRun,
+use bookforge_core::{
+    ir::{ProtectedSpan, ProtectedSpanKind},
+    segment::{
+        SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
+        SegmentSource, SegmentTextRun,
+    },
 };
 
 fn make_segment(id: &str, blocks: Vec<SegmentBlock>, markers: Vec<String>) -> Segment {
@@ -61,7 +64,13 @@ fn protected_block(text: &str, spans: Vec<String>) -> SegmentBlock {
             id: "r0".to_string(),
             text: text.to_string(),
         }],
-        protected_spans: spans,
+        protected_spans: spans
+            .into_iter()
+            .map(|text| ProtectedSpan {
+                kind: ProtectedSpanKind::Number,
+                text,
+            })
+            .collect(),
     }
 }
 
@@ -574,7 +583,7 @@ fn parses_valid_batch_response() {
 }
 
 #[test]
-fn missing_protected_span_fails_batch_item_instead_of_appending() {
+fn missing_short_ordinal_succeeds_with_warning_instead_of_appending() {
     let seg = make_segment(
         "seg1",
         vec![protected_block("Chapter 4th", vec!["4th".to_string()])],
@@ -599,17 +608,19 @@ fn missing_protected_span_fails_batch_item_instead_of_appending() {
     })
     .to_string();
 
-    // The dropped span must surface as an item failure feeding the
-    // repair pipeline — never be glued onto the translated text.
+    // A short ordinal is a soft Number violation: keep the model output,
+    // surface the warning, and never glue the source token onto the text.
     let result = parse_batch_response(batch, &response).expect("parse");
-    assert_eq!(result.translations.len(), 0);
-    assert_eq!(result.failures.len(), 1);
+    assert_eq!(result.translations.len(), 1);
+    assert_eq!(result.failures.len(), 0);
+    assert_eq!(result.translations[0].text, "Capitolo");
     assert!(
-        result.failures[0]
-            .error
-            .contains("protected span missing: 4th"),
-        "got: {}",
-        result.failures[0].error
+        result.translations[0]
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("protected span missing: 4th")),
+        "got: {:?}",
+        result.translations[0].warning
     );
 }
 
@@ -1230,7 +1241,10 @@ fn turbo_batches_keep_internal_markers_but_hide_them_from_the_model() {
         kind: "paragraph".to_string(),
         text: "Before <m1>bold</m1> 42".to_string(),
         text_runs: Vec::new(),
-        protected_spans: vec!["42".to_string()],
+        protected_spans: vec![ProtectedSpan {
+            kind: ProtectedSpanKind::Number,
+            text: "42".to_string(),
+        }],
     };
     let segment = make_segment("seg1", vec![block], vec!["m1".to_string()]);
     let batch_config = BatchConfig {
@@ -1250,13 +1264,21 @@ fn turbo_batches_keep_internal_markers_but_hide_them_from_the_model() {
     assert_eq!(batch.mode, BatchMode::TurboTextOnly);
     assert_eq!(batch.items[0].source_text, "Before <m1>bold</m1> 42");
     assert!(batch.items[0].required_markers.is_empty());
-    assert_eq!(batch.items[0].protected_spans, ["42"]);
+    assert_eq!(
+        batch.items[0]
+            .protected_spans
+            .iter()
+            .map(|span| (span.kind, span.text.as_str()))
+            .collect::<Vec<_>>(),
+        [(ProtectedSpanKind::Number, "42")]
+    );
 
     let rendered = render_batch_items(&batch, &test_run_config());
     assert!(!rendered.contains("<m1>"));
     assert!(!rendered.contains("</m1>"));
     assert!(rendered.contains("Before bold 42"));
     assert!(rendered.contains("\"protected\":[\"42\"]"));
+    assert!(!rendered.contains("\"kind\":\"Number\""));
 }
 
 #[test]

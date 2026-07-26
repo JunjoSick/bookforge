@@ -2,6 +2,8 @@ use super::*;
 
 use std::collections::BTreeMap;
 
+pub use bookforge_core::ir::QaFindingSeverity;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum QaFindingKind {
     ProtectedSpanMissing,
@@ -51,26 +53,6 @@ impl QaFindingKind {
     }
 }
 
-/// `error` means the output is structurally unusable or the run could not
-/// produce output at all (protocol, transport, or an unclassified hard
-/// failure). `warning` means the output is intact and renderable but a
-/// heuristic validator judged the content suspect, or the operator stopped
-/// the run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QaFindingSeverity {
-    Error,
-    Warning,
-}
-
-impl QaFindingSeverity {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Error => "error",
-            Self::Warning => "warning",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QaFinding {
     pub kind: QaFindingKind,
@@ -110,11 +92,19 @@ pub fn classify_segment_error(error: &str) -> Vec<QaFinding> {
     }
 
     let mut findings: Vec<QaFinding> = Vec::new();
-    for fragment in error
+    for encoded_fragment in error
         .split("; ")
         .map(str::trim)
         .filter(|part| !part.is_empty())
     {
+        let (explicit_severity, fragment) =
+            if let Some(fragment) = encoded_fragment.strip_prefix("warning: ") {
+                (Some(QaFindingSeverity::Warning), fragment)
+            } else if let Some(fragment) = encoded_fragment.strip_prefix("error: ") {
+                (Some(QaFindingSeverity::Error), fragment)
+            } else {
+                (None, encoded_fragment)
+            };
         let kind = classify_failure(fragment);
         if kind == QaFindingKind::Other
             && let Some(previous) = findings.last_mut()
@@ -128,7 +118,7 @@ pub fn classify_segment_error(error: &str) -> Vec<QaFinding> {
         }
         findings.push(QaFinding {
             kind,
-            severity: kind.severity(),
+            severity: explicit_severity.unwrap_or_else(|| kind.severity()),
             message: fragment.to_string(),
         });
     }
@@ -294,12 +284,14 @@ impl JobStore {
         Ok(())
     }
 
-    /// Drop findings for any segment in the job that no longer carries an error.
+    /// Drop stale error findings for segments that no longer carry an error.
+    /// Warnings may intentionally belong to succeeded segments.
     pub fn prune_stale_findings(&self, job_id: &str) -> Result<usize> {
         let conn = self.conn.borrow();
         Ok(conn.execute(
             "DELETE FROM qa_findings
              WHERE job_id = ?1
+               AND severity = 'error'
                AND segment_id IN (
                  SELECT id FROM segments
                  WHERE job_id = ?1 AND (error IS NULL OR TRIM(error) = '')

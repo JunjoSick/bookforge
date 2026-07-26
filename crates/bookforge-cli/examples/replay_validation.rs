@@ -345,7 +345,7 @@ fn main() -> Result<()> {
             segments_with_pairs.insert(stored.segment_id.clone());
 
             let section_title = section_titles.get(&stored.segment_id).map(String::as_str);
-            let Some(message) = batch_item_validation_error(
+            let Some(validation) = batch_item_validation_error(
                 item,
                 &stored.text,
                 validate_source_copy,
@@ -354,6 +354,7 @@ fn main() -> Result<()> {
             ) else {
                 continue;
             };
+            let message = validation.to_string();
 
             let kinds = classify_kinds(&message);
             totals.flagged_pairs += 1;

@@ -35,6 +35,17 @@ impl JobStore {
     }
 
     pub fn save_translation(&self, request: SaveTranslation<'_>) -> Result<()> {
+        self.save_translation_with_findings(request, None)
+    }
+
+    /// Save a successful translation and optionally replace its durable QA
+    /// findings. The segment remains `succeeded`; warnings live in
+    /// `qa_findings`, not `segments.error`.
+    pub fn save_translation_with_findings(
+        &self,
+        request: SaveTranslation<'_>,
+        findings: Option<&str>,
+    ) -> Result<()> {
         if self.translation_is_human_corrected(request.job_id, request.segment_id)? {
             return Ok(());
         }
@@ -85,7 +96,13 @@ impl JobStore {
         }
         // Findings are instrumentation, so a failed findings write must never
         // fail the surrounding translation checkpoint.
-        let _ = self.clear_segment_findings(request.job_id, request.segment_id);
+        let findings = findings.map(str::trim).filter(|value| !value.is_empty());
+        let _ = if let Some(findings) = findings {
+            self.record_segment_findings(request.job_id, request.segment_id, findings)
+                .map(|_| ())
+        } else {
+            self.clear_segment_findings(request.job_id, request.segment_id)
+        };
         self.consume_dashboard_retry_guidance(request.job_id, request.segment_id)?;
         self.touch_job_unless_status(request.job_id, "running", &["paused", "stopped"])?;
         Ok(())
