@@ -194,19 +194,22 @@ fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
             let joined = translation.joined_text();
             match translation.status {
                 SegmentStatus::Succeeded => {
-                    store.save_translation(SaveTranslation {
-                        job_id: &job_id,
-                        segment_id: &translation.segment_id.0,
-                        translated_text: &joined,
-                        blocks: &translation.blocks,
-                        provider: &provider,
-                        model: &model,
-                        prompt_version: &prompt_version,
-                        input_tokens: translation.input_tokens,
-                        input_cached_tokens: translation.input_cached_tokens,
-                        output_tokens: translation.output_tokens,
-                        tokens_estimated: translation.tokens_estimated,
-                    })?;
+                    store.save_translation_with_findings(
+                        SaveTranslation {
+                            job_id: &job_id,
+                            segment_id: &translation.segment_id.0,
+                            translated_text: &joined,
+                            blocks: &translation.blocks,
+                            provider: &provider,
+                            model: &model,
+                            prompt_version: &prompt_version,
+                            input_tokens: translation.input_tokens,
+                            input_cached_tokens: translation.input_cached_tokens,
+                            output_tokens: translation.output_tokens,
+                            tokens_estimated: translation.tokens_estimated,
+                        },
+                        translation.error.as_deref(),
+                    )?;
                 }
                 SegmentStatus::NeedsReview => {
                     store.save_needs_review(SaveNeedsReview {
@@ -417,6 +420,84 @@ mod tests {
         assert_eq!(summary.needs_review, 1, "one needs review");
         assert_eq!(summary.total_segments, 2);
 
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn succeeded_translation_persists_warning_finding_round_trip() {
+        let db_path = temp_path("warning_round_trip.sqlite");
+        let input_path = temp_path("warning_input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture writable");
+
+        let store = JobStore::open(&db_path).expect("store open for setup");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("warning_output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-model",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job created");
+        store
+            .insert_segments(
+                &job.id,
+                &[test_segment("seg_warning", 0)],
+                "v1",
+                "mock",
+                "mock-model",
+                "test_ns",
+            )
+            .expect("segment inserted");
+
+        let mut translation = test_translation("seg_warning", 0, SegmentStatus::Succeeded);
+        translation.error = Some("warning: protected span missing: E=mc^2 [kind=math]".to_string());
+        apply(
+            &store,
+            CheckpointCommand::SaveTranslation {
+                job_id: job.id.clone(),
+                translation: Box::new(translation),
+                provider: "mock".to_string(),
+                model: "mock-model".to_string(),
+                prompt_version: "v1".to_string(),
+            },
+        )
+        .expect("successful translation with warning should checkpoint");
+        drop(store);
+
+        let store = JobStore::open(&db_path).expect("store re-open");
+        let summary = store
+            .summary(&job.id)
+            .expect("summary query")
+            .expect("summary exists");
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(summary.needs_review, 0);
+        assert_eq!(
+            store
+                .prune_stale_findings(&job.id)
+                .expect("pruning stale errors"),
+            0,
+            "a warning on a succeeded segment is not stale"
+        );
+        let findings = store
+            .segment_qa_findings(&job.id)
+            .expect("warning findings load");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].segment_id, "seg_warning");
+        assert_eq!(findings[0].kind, "protected_span_missing");
+        assert_eq!(findings[0].severity, "warning");
+        assert_eq!(
+            findings[0].message,
+            "protected span missing: E=mc^2 [kind=math]"
+        );
+
+        drop(store);
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(input_path);
     }

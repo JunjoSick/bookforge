@@ -178,7 +178,7 @@ pub fn validate_block_translations(
             }
 
             for span in &block.protected_spans {
-                if block.text.contains(span) && !translated.contains(span) {
+                if block.text.contains(&span.text) && !translated.contains(&span.text) {
                     issues.push(EpubValidationIssue {
                         severity: ValidationSeverity::Warning,
                         kind: "missing_protected_span".to_string(),
@@ -186,7 +186,7 @@ pub fn validate_block_translations(
                         block_id: Some(block.block_id.0.clone()),
                         message: format!(
                             "Protected span '{}' may be missing in block {}",
-                            span, block.block_id.0
+                            span.text, block.block_id.0
                         ),
                     });
                 }
@@ -231,7 +231,7 @@ mod tests {
         block_text: &str,
         protected_spans: Vec<String>,
     ) -> (Segment, bookforge_core::ir::BlockId) {
-        use bookforge_core::ir::{BlockId, SectionId};
+        use bookforge_core::ir::{BlockId, ProtectedSpan, ProtectedSpanKind, SectionId};
         use bookforge_core::segment::{
             SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
             SegmentSource, SegmentTextRun,
@@ -253,7 +253,13 @@ mod tests {
                         id: "r0".to_string(),
                         text: block_text.to_string(),
                     }],
-                    protected_spans,
+                    protected_spans: protected_spans
+                        .into_iter()
+                        .map(|text| ProtectedSpan {
+                            kind: ProtectedSpanKind::Number,
+                            text,
+                        })
+                        .collect(),
                 }],
                 token_estimate: 1,
             },

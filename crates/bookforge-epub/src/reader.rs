@@ -1428,6 +1428,19 @@ fn looks_like_inline_math_token(value: &str) -> bool {
     if chars.len() < 3 {
         return false;
     }
+    // OCR scans commonly substitute operators such as `^` for missing
+    // letters/spaces. Multiple operators without any digit are stronger
+    // evidence of mangled prose than of an inline equation.
+    if !chars.iter().any(|ch| ch.is_ascii_digit())
+        && chars
+            .iter()
+            .filter(|ch| is_inline_math_operator(**ch))
+            .take(2)
+            .count()
+            >= 2
+    {
+        return false;
+    }
     // Sentence punctuation followed by an operator signals a fused endnote marker.
     if chars
         .windows(2)
@@ -2180,6 +2193,27 @@ mod tests {
                 .iter()
                 .any(|span| span.kind == ProtectedSpanKind::Math)
         );
+    }
+
+    #[test]
+    fn inline_math_rejects_operator_heavy_ocr_garbage_without_digits() {
+        for value in ["Thei^is^ood^reason", "^I^sually^o^tbe"] {
+            assert!(
+                !detect_protected_spans(value)
+                    .iter()
+                    .any(|span| span.kind == ProtectedSpanKind::Math),
+                "{value}"
+            );
+        }
+
+        for value in ["E=mc^2", "p<0.05", "x_12", "mc^2", "3.5*2"] {
+            assert!(
+                detect_protected_spans(value)
+                    .iter()
+                    .any(|span| span.kind == ProtectedSpanKind::Math && span.text == value),
+                "{value}"
+            );
+        }
     }
 
     #[test]

@@ -673,6 +673,9 @@ where
                                     tokens_estimated: false,
                                 });
                             add_usage(entry, item);
+                            if let Some(warning) = &item.warning {
+                                append_translation_error(entry, warning);
+                            }
                             if !entry
                                 .blocks
                                 .iter()
@@ -1162,6 +1165,9 @@ where
                     )
                 });
             add_usage(entry, translation);
+            if let Some(warning) = &translation.warning {
+                append_translation_error(entry, warning);
+            }
             if let Some(source_item) = all_items.get(&translation.item_id) {
                 entry.blocks.push(BlockTranslation {
                     block_id: source_item.block_id.clone(),
@@ -1335,11 +1341,16 @@ where
                         .items
                         .iter()
                         .map(|item| {
+                            let protected = item
+                                .protected_spans
+                                .iter()
+                                .map(|span| span.text.as_str())
+                                .collect::<Vec<_>>();
                             serde_json::json!({
                                 "id": item.item_id,
                                 "source_text": item.source_text,
                                 "required_markers": item.required_markers,
-                                "protected": item.protected_spans,
+                                "protected": protected,
                             })
                         })
                         .collect();
@@ -1352,7 +1363,7 @@ where
                                 "id": item.item_id,
                                 "error": repair_errors
                                     .get(&item.item_id)
-                                    .cloned()
+                                    .map(|error| provider_safe_validation_error(error))
                                     .unwrap_or_else(|| "invalid batch item".to_string()),
                             })
                         })
@@ -1535,7 +1546,12 @@ where
                             segment_translations.get_mut(&translation.segment_id.0)
                         {
                             existing.status = SegmentStatus::Succeeded;
-                            existing.error = None;
+                            let retained_warnings =
+                                existing.error.as_deref().and_then(warning_findings_only);
+                            existing.error = retained_warnings;
+                            if let Some(warning) = &translation.warning {
+                                append_translation_error(existing, warning);
+                            }
                             if let Some(block) = existing
                                 .blocks
                                 .iter_mut()
@@ -1909,6 +1925,26 @@ fn append_translation_error(entry: &mut SegmentTranslation, error: &str) {
     }
 }
 
+fn warning_findings_only(error: &str) -> Option<String> {
+    let warnings = error
+        .split("; ")
+        .filter(|fragment| fragment.starts_with("warning: "))
+        .collect::<Vec<_>>()
+        .join("; ");
+    (!warnings.is_empty()).then_some(warnings)
+}
+
+fn provider_safe_validation_error(error: &str) -> String {
+    let mut message = error.to_string();
+    while let Some(start) = message.find(" [kind=") {
+        let Some(relative_end) = message[start..].find(']') else {
+            break;
+        };
+        message.replace_range(start..=start + relative_end, "");
+    }
+    message
+}
+
 fn repairable_batch_failure(failure: &BatchItemFailure) -> bool {
     !matches!(
         failure.error.as_str(),
@@ -2008,5 +2044,22 @@ pub(super) fn request_status_for_controller<T>(result: &Result<T, LlmError>) -> 
         }
         Err(LlmError::InvalidResponse(_)) | Err(LlmError::Json(_)) => RequestStatus::InvalidJson,
         Err(_) => RequestStatus::OtherError,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provider_safe_validation_error;
+
+    #[test]
+    fn provider_validation_errors_omit_protected_span_kinds() {
+        let error = "error: protected span missing: https://example.com [kind=url]; \
+                     warning: protected span missing: E=mc^2 [kind=math]";
+
+        assert_eq!(
+            provider_safe_validation_error(error),
+            "error: protected span missing: https://example.com; \
+             warning: protected span missing: E=mc^2"
+        );
     }
 }
