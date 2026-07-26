@@ -310,7 +310,11 @@ impl JobStore {
              CREATE INDEX IF NOT EXISTS idx_style_lookup
              ON style_sheets(target_language, scope_kind, scope_id);
              CREATE INDEX IF NOT EXISTS idx_entity_lookup
-             ON entities(source_language, target_language, scope_kind, scope_id);",
+             ON entities(source_language, target_language, scope_kind, scope_id);
+             CREATE INDEX IF NOT EXISTS idx_qa_findings_job
+             ON qa_findings(job_id, kind);
+             CREATE INDEX IF NOT EXISTS idx_qa_findings_segment
+             ON qa_findings(job_id, segment_id);",
         )?;
         record_migration(&conn, 1, "initial")?;
         record_migration(&conn, 2, "v1_0_1_input_snapshot")?;
@@ -319,6 +323,12 @@ impl JobStore {
         record_migration(&conn, 5, "v1_2_1_nullable_glossary_candidate_targets")?;
         record_migration(&conn, 6, "v1_3_context_styles_entities")?;
         record_migration(&conn, 7, "v2_4_human_corrections")?;
+        // Unlike the preceding idempotent DDL migrations, version 8 drives a
+        // one-time data backfill and therefore must be gated explicitly.
+        if !migration_applied(&conn, 8)? {
+            backfill_qa_findings(&conn)?;
+            record_migration(&conn, 8, "v2_7_qa_findings")?;
+        }
         Ok(())
     }
 }
@@ -438,6 +448,61 @@ fn record_migration(conn: &Connection, version: i64, name: &str) -> rusqlite::Re
         params![version, name, timestamp_string()],
     )?;
     Ok(())
+}
+
+fn migration_applied(conn: &Connection, version: i64) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM _migrations WHERE version = ?1)",
+        params![version],
+        |row| row.get::<_, bool>(0),
+    )
+}
+
+fn backfill_qa_findings(conn: &Connection) -> rusqlite::Result<usize> {
+    let rows = {
+        let mut stmt = conn.prepare(
+            "SELECT s.job_id, s.id, s.error
+             FROM segments s
+             WHERE s.status IN ('needs_review', 'failed')
+               AND s.error IS NOT NULL
+               AND TRIM(s.error) <> ''
+               AND NOT EXISTS (
+                 SELECT 1 FROM qa_findings f
+                 WHERE f.job_id = s.job_id AND f.segment_id = s.id
+               )
+             ORDER BY s.job_id, s.id",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let mut inserted = 0usize;
+    for (job_id, segment_id, error) in rows {
+        for (index, finding) in classify_segment_error(&error).into_iter().enumerate() {
+            let hash = stable_hash(&format!("{job_id}\u{1f}{segment_id}\u{1f}{index}"));
+            let id = format!("qaf_{}", &hash[..24]);
+            inserted += conn.execute(
+                "INSERT OR REPLACE INTO qa_findings
+                 (id, segment_id, job_id, severity, kind, message)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    segment_id,
+                    job_id,
+                    finding.severity.as_str(),
+                    finding.kind.as_str(),
+                    finding.message,
+                ],
+            )?;
+        }
+    }
+    Ok(inserted)
 }
 
 #[cfg(all(test, unix))]

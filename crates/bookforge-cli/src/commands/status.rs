@@ -3,7 +3,7 @@ use clap::Args;
 use std::path::PathBuf;
 
 use bookforge_core::RunConfigSnapshot;
-use bookforge_store::{JobRecord, JobStore, JobSummary};
+use bookforge_store::{JobRecord, JobStore, JobSummary, QaFindingCount};
 
 use crate::{
     commands::reconfigure,
@@ -61,6 +61,9 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     println!("  needs review: {}", summary.needs_review);
     println!("  failed:      {}", summary.failed);
     println!("  retry pending: {}", summary.retry_pending);
+    for line in format_finding_breakdown(&store.qa_finding_breakdown(&args.job_id)?) {
+        println!("{line}");
+    }
     println!();
     println!("Tokens:");
     println!("  input:  {}", summary.input_tokens);
@@ -114,6 +117,36 @@ fn report_path_for_status(job: &JobRecord, snapshot: Option<&RunConfigSnapshot>)
         .clone()
         .or_else(|| snapshot.and_then(|snapshot| snapshot.report_markdown_path.clone()))
         .unwrap_or(fallback_reports.markdown)
+}
+
+/// Render the per-kind breakdown of a job's stored QA findings.
+///
+/// `segments.error` records *that* a segment was flagged and carries the raw
+/// detail, but only a count per kind makes a systematic problem visible: one
+/// kind sitting at 70% of all flags is a bug in that one validator, not
+/// hundreds of independently bad translations. Returns an empty vector when
+/// the job has no findings so the caller prints nothing at all.
+fn format_finding_breakdown(findings: &[QaFindingCount]) -> Vec<String> {
+    if findings.is_empty() {
+        return Vec::new();
+    }
+
+    let total = findings.iter().map(|finding| finding.count).sum::<usize>();
+    let width = findings
+        .iter()
+        .map(|finding| finding.kind.len())
+        .max()
+        .unwrap_or_default();
+
+    let mut lines = vec![String::new(), format!("Flag breakdown ({total} findings):")];
+    lines.extend(findings.iter().map(|finding| {
+        let kind = &finding.kind;
+        let count = finding.count;
+        let share = finding.share_percent(total);
+        let severity = &finding.severity;
+        format!("  {kind:<width$}  {count:>6}  {share:>5.1}%  {severity}")
+    }));
+    lines
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +327,35 @@ mod tests {
         };
 
         assert_eq!(guidance_for_summary(&summary), Some(StatusGuidance::Resume));
+    }
+
+    fn finding_count(kind: &str, severity: &str, count: usize) -> QaFindingCount {
+        QaFindingCount {
+            kind: kind.to_string(),
+            severity: severity.to_string(),
+            count,
+        }
+    }
+
+    #[test]
+    fn finding_breakdown_is_omitted_when_a_job_has_no_findings() {
+        assert!(format_finding_breakdown(&[]).is_empty());
+    }
+
+    #[test]
+    fn finding_breakdown_reports_each_kind_with_its_share_of_all_flags() {
+        let lines = format_finding_breakdown(&[
+            finding_count("protected_span_missing", "error", 478),
+            finding_count("source_copy_unchanged", "warning", 191),
+        ]);
+
+        assert_eq!(lines[0], "");
+        assert_eq!(lines[1], "Flag breakdown (669 findings):");
+        assert_eq!(lines[2], "  protected_span_missing     478   71.4%  error");
+        assert_eq!(
+            lines[3],
+            "  source_copy_unchanged      191   28.6%  warning"
+        );
     }
 
     #[test]

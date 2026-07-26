@@ -83,6 +83,9 @@ impl JobStore {
                 ],
             )?;
         }
+        // Findings are instrumentation, so a failed findings write must never
+        // fail the surrounding translation checkpoint.
+        let _ = self.clear_segment_findings(request.job_id, request.segment_id);
         self.consume_dashboard_retry_guidance(request.job_id, request.segment_id)?;
         self.touch_job_unless_status(request.job_id, "running", &["paused", "stopped"])?;
         Ok(())
@@ -138,6 +141,9 @@ impl JobStore {
                 ],
             )?;
         }
+        // Findings are instrumentation, so a failed findings write must never
+        // fail the surrounding translation checkpoint.
+        let _ = self.record_segment_findings(request.job_id, request.segment_id, request.error);
         self.consume_dashboard_retry_guidance(request.job_id, request.segment_id)?;
         self.touch_job_unless_status(request.job_id, "needs_review", &["paused", "stopped"])?;
         Ok(())
@@ -179,6 +185,9 @@ impl JobStore {
                 params![translated_hash, request.job_id, request.segment_id],
             )?;
         }
+        // Findings are instrumentation, so a failed findings write must never
+        // fail the surrounding translation checkpoint.
+        let _ = self.clear_segment_findings(request.job_id, request.segment_id);
         self.consume_dashboard_retry_guidance(request.job_id, request.segment_id)?;
         self.touch_job_unless_status(request.job_id, "running", &["paused", "stopped"])?;
         Ok(())

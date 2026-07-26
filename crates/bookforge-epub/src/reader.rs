@@ -1189,7 +1189,7 @@ fn build_block(
     } else {
         text_runs
     };
-    let protected_spans = detect_protected_spans(&visible_text);
+    let protected_spans = detect_protected_spans_in_text_runs(&text_runs);
 
     Block {
         id: BlockId(format!("b_{ordinal:06}")),
@@ -1295,6 +1295,40 @@ fn detect_protected_spans(text: &str) -> Vec<ProtectedSpan> {
     spans
 }
 
+fn marker_aware_prose_segments(text_runs: &[TextRun]) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+
+    for run in text_runs {
+        if is_marker_token(&run.text) {
+            // Marker boundaries separate otherwise adjacent prose tokens.
+            let segment = normalize_space(&current);
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+            current.clear();
+        } else {
+            current.push_str(&run.text);
+        }
+    }
+
+    let segment = normalize_space(&current);
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+    segments
+}
+
+fn detect_protected_spans_in_text_runs(text_runs: &[TextRun]) -> Vec<ProtectedSpan> {
+    let mut spans = marker_aware_prose_segments(text_runs)
+        .into_iter()
+        .flat_map(|segment| detect_protected_spans(&segment))
+        .collect::<Vec<_>>();
+    spans.sort_by(|left, right| left.text.cmp(&right.text));
+    spans.dedup_by(|left, right| left.kind == right.kind && left.text == right.text);
+    spans
+}
+
 fn detect_chapter_numeral_spans(text: &str) -> Vec<String> {
     let tokens = text
         .split_whitespace()
@@ -1374,6 +1408,13 @@ fn detect_math_spans(text: &str) -> Vec<String> {
 fn looks_like_inline_math_token(value: &str) -> bool {
     let chars = value.chars().collect::<Vec<_>>();
     if chars.len() < 3 {
+        return false;
+    }
+    // Sentence punctuation followed by an operator signals a fused endnote marker.
+    if chars
+        .windows(2)
+        .any(|pair| matches!(pair[0], '.' | ',') && is_strong_inline_math_operator(pair[1]))
+    {
         return false;
     }
     let has_operand = chars.iter().any(|ch| ch.is_ascii_alphanumeric());
@@ -1870,6 +1911,101 @@ mod tests {
     }
 
     #[test]
+    fn endnote_markers_never_fuse_prose_into_protected_spans() {
+        let section_id = SectionId("sec_000000".to_string());
+        let xhtml = r##"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body>
+  <p>Doubts about the vaccine.<sup><a epub:type="noteref" href="#n2">*2</a></sup></p>
+  <p>The source was opaque,<sup><a epub:type="noteref" href="#n8">*8</a></sup></p>
+  <p>The plan supported well-being.<sup><a epub:type="noteref" href="#n6">*6</a></sup></p>
+  <p>The answer was B.<sup><a epub:type="noteref" href="#n3">*3</a></sup></p>
+  <p>Other Americans.<sup><a epub:type="noteref" href="#n3">*3</a></sup></p>
+  <p>The citations.<sup><a epub:type="noteref" href="#n12">*12</a></sup></p>
+</body>
+</html>"##;
+        let blocks = extract_blocks(xhtml, "chapter.xhtml", &section_id, 0)
+            .expect("block extraction should succeed");
+        let protected_texts = blocks
+            .iter()
+            .flat_map(|block| block.protected_spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        // Marker boundaries keep endnote text independent from adjacent prose.
+        let fused = [
+            "vaccine.*2",
+            "opaque,*8",
+            "well-being.*6",
+            "B.*3",
+            "Americans.*3",
+            "citations.*12",
+        ];
+        assert!(
+            !protected_texts.iter().any(|text| fused.contains(text)),
+            "fused protected span found: {protected_texts:?}"
+        );
+        assert!(
+            protected_texts
+                .iter()
+                .all(|text| !text.chars().any(|ch| ch.is_ascii_alphabetic())),
+            "prose leaked into protected spans: {protected_texts:?}"
+        );
+    }
+
+    #[test]
+    fn endnote_marker_without_punctuation_still_never_fuses() {
+        let section_id = SectionId("sec_000000".to_string());
+        let xhtml = r##"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body><p>the vaccine<sup><a epub:type="noteref" href="#n2">*2</a></sup> works</p></body>
+</html>"##;
+        let blocks = extract_blocks(xhtml, "chapter.xhtml", &section_id, 0)
+            .expect("block extraction should succeed");
+
+        // The marker-aware split protects cases the punctuation guard cannot detect.
+        assert!(blocks.iter().all(|block| {
+            block
+                .protected_spans
+                .iter()
+                .all(|span| !span.text.contains("vaccine"))
+        }));
+    }
+
+    #[test]
+    fn protected_spans_survive_inside_inline_markers() {
+        let section_id = SectionId("sec_000000".to_string());
+        let xhtml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p>Einstein wrote <em>E = mc^2</em> in 1905, see https://example.com and file.txt.</p>
+<p>Chapter 12-14 covers p&lt;0.05 and #anchor and mail@example.com.</p>
+<p>CAPITOLO I Il buonsenso</p>
+</body></html>"#;
+        let blocks = extract_blocks(xhtml, "chapter.xhtml", &section_id, 0)
+            .expect("block extraction should succeed");
+        let protected_texts = blocks
+            .iter()
+            .flat_map(|block| block.protected_spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        // Each marker-delimited prose segment still runs every existing detector.
+        for expected in [
+            "E = mc^2",
+            "1905",
+            "https://example.com",
+            "file.txt",
+            "12-14",
+            "p<0.05",
+            "#anchor",
+            "mail@example.com",
+            "I",
+        ] {
+            assert!(
+                protected_texts.contains(&expected),
+                "missing {expected}: {protected_texts:?}"
+            );
+        }
+    }
+
+    #[test]
     fn protected_spans_preserve_all_exact_digits() {
         let spans = detect_protected_spans(
             "Chapter 1 cites https://example.com, file.txt, #anchor, and pages 12-14.",
@@ -1978,6 +2114,17 @@ mod tests {
                 .iter()
                 .any(|span| span.kind == ProtectedSpanKind::Math)
         );
+    }
+
+    #[test]
+    fn inline_math_rejects_prose_glued_to_an_endnote_marker() {
+        // Sentence punctuation before a marker operator is not mathematical syntax.
+        for value in ["vaccine.*2", "opaque,*8", "citations.*12"] {
+            assert!(!looks_like_inline_math_token(value), "{value}");
+        }
+        for value in ["mc^2", "p<0.05", "x_12"] {
+            assert!(looks_like_inline_math_token(value), "{value}");
+        }
     }
 
     fn block_text(block: &Block) -> String {

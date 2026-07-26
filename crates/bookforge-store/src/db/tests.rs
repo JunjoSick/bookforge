@@ -2413,3 +2413,360 @@ fn glossary_term(
         source_count: 0,
     }
 }
+
+const MULTI_FINDING_ERROR: &str = "translation is unchanged from the source-language prose; batch translation block mismatch: missing=[\"b_000853\"], extra=[], duplicate=[]";
+
+fn setup_findings_store(
+    name: &str,
+    segment_count: usize,
+) -> (PathBuf, PathBuf, JobStore, JobRecord) {
+    let db_path = temp_path(name);
+    let input_path = temp_path("findings_input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("findings_output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let segments = (0..segment_count)
+        .map(|ordinal| segment(&format!("seg_{ordinal}"), ordinal))
+        .collect::<Vec<_>>();
+    store
+        .insert_segments(
+            &job.id,
+            &segments,
+            "v1",
+            "mock",
+            "mock-prefix",
+            "findings_ns",
+        )
+        .expect("segments should insert");
+    (db_path, input_path, store, job)
+}
+
+fn save_two_findings(store: &JobStore, job_id: &str) {
+    store
+        .save_needs_review(SaveNeedsReview {
+            job_id,
+            segment_id: "seg_0",
+            preserved_text: "Source 0",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "Source 0".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            error: MULTI_FINDING_ERROR,
+            input_tokens: Some(5),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(5),
+            tokens_estimated: false,
+        })
+        .expect("review translation should save");
+}
+
+#[test]
+fn classifies_real_qa_failure_strings_into_every_taxonomy_kind() {
+    let cases = [
+        (
+            "protected span missing from segment 'seg_0007': 4th",
+            QaFindingKind::ProtectedSpanMissing,
+            QaFindingSeverity::Error,
+            "protected_span_missing",
+        ),
+        (
+            "inline marker missing from segment 'seg_0012': m1",
+            QaFindingKind::InlineMarkerMissing,
+            QaFindingSeverity::Error,
+            "inline_marker_missing",
+        ),
+        (
+            "inline marker duplicated: m3",
+            QaFindingKind::InlineMarkerDuplicated,
+            QaFindingSeverity::Error,
+            "inline_marker_duplicated",
+        ),
+        (
+            "unknown inline marker: m9",
+            QaFindingKind::InlineMarkerUnknown,
+            QaFindingSeverity::Error,
+            "inline_marker_unknown",
+        ),
+        (
+            "inline marker <i> is missing closing tag </i>",
+            QaFindingKind::MarkerStructure,
+            QaFindingSeverity::Error,
+            "marker_structure",
+        ),
+        (
+            "segment 'seg_0003' expected 4 block translations, got 3",
+            QaFindingKind::BatchBlockMismatch,
+            QaFindingSeverity::Error,
+            "batch_block_mismatch",
+        ),
+        (
+            "translation is unchanged from the source-language prose",
+            QaFindingKind::SourceCopyUnchanged,
+            QaFindingSeverity::Warning,
+            "source_copy_unchanged",
+        ),
+        (
+            "unapproved lowercase word in strict Toki Pona output: kalama",
+            QaFindingKind::TargetLanguageGate,
+            QaFindingSeverity::Warning,
+            "target_language_gate",
+        ),
+        (
+            "translation checkpoint failure: provider error: HTTP status 503: upstream unavailable",
+            QaFindingKind::ProviderError,
+            QaFindingSeverity::Error,
+            "provider_error",
+        ),
+        (
+            "batch translation checkpoint failure: provider error: interrupted by user",
+            QaFindingKind::Interrupted,
+            QaFindingSeverity::Warning,
+            "interrupted",
+        ),
+        (
+            "something nobody has seen before",
+            QaFindingKind::Other,
+            QaFindingSeverity::Error,
+            "other",
+        ),
+    ];
+
+    for (error, expected_kind, expected_severity, expected_wire_kind) in cases {
+        let findings = classify_segment_error(error);
+        assert_eq!(findings.len(), 1, "{error}");
+        assert_eq!(findings[0].kind, expected_kind, "{error}");
+        assert_eq!(findings[0].severity, expected_severity, "{error}");
+        assert_eq!(findings[0].kind.as_str(), expected_wire_kind, "{error}");
+        assert_eq!(
+            findings[0].severity.as_str(),
+            expected_severity.as_str(),
+            "{error}"
+        );
+        assert_eq!(findings[0].message, error, "{error}");
+    }
+}
+
+#[test]
+fn classifies_concatenated_failures_as_distinct_findings() {
+    let findings = classify_segment_error(MULTI_FINDING_ERROR);
+    assert_eq!(findings.len(), 2);
+    assert_eq!(findings[0].kind, QaFindingKind::SourceCopyUnchanged);
+    assert_eq!(
+        findings[0].message,
+        "translation is unchanged from the source-language prose"
+    );
+    assert_eq!(findings[1].kind, QaFindingKind::BatchBlockMismatch);
+    assert_eq!(
+        findings[1].message,
+        "batch translation block mismatch: missing=[\"b_000853\"], extra=[], duplicate=[]"
+    );
+
+    let breakdown = aggregate_findings(findings);
+    assert_eq!(breakdown.len(), 2);
+    assert_eq!(breakdown[0].share_percent(2), 50.0);
+    assert_eq!(breakdown[0].share_percent(0), 0.0);
+}
+
+#[test]
+fn embedded_separator_in_validator_context_stays_in_one_finding() {
+    let error = "pi must group at least two following words; offending context: jan pi mute";
+    let findings = classify_segment_error(error);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].kind, QaFindingKind::TargetLanguageGate);
+    assert_eq!(findings[0].message, error);
+}
+
+#[test]
+fn empty_segment_errors_produce_no_findings() {
+    assert!(classify_segment_error("").is_empty());
+    assert!(classify_segment_error(" \t\r\n ").is_empty());
+}
+
+#[test]
+fn save_needs_review_records_each_distinct_failure() {
+    let (db_path, input_path, store, job) =
+        setup_findings_store("save_needs_review_findings.sqlite", 1);
+    save_two_findings(&store, &job.id);
+
+    let findings = store
+        .segment_qa_findings(&job.id)
+        .expect("findings should load");
+    assert_eq!(findings.len(), 2);
+    assert!(findings.iter().all(|finding| finding.segment_id == "seg_0"));
+    let breakdown = store
+        .qa_finding_breakdown(&job.id)
+        .expect("breakdown should load");
+    assert_eq!(breakdown.len(), 2);
+    assert_eq!(breakdown[0].kind, "batch_block_mismatch");
+    assert_eq!(breakdown[1].kind, "source_copy_unchanged");
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn repeated_needs_review_save_replaces_findings_without_duplication() {
+    let (db_path, input_path, store, job) =
+        setup_findings_store("replace_needs_review_findings.sqlite", 1);
+    save_two_findings(&store, &job.id);
+    let first_ids = store
+        .segment_qa_findings(&job.id)
+        .expect("first findings should load")
+        .into_iter()
+        .map(|finding| finding.id)
+        .collect::<Vec<_>>();
+
+    save_two_findings(&store, &job.id);
+    let second_ids = store
+        .segment_qa_findings(&job.id)
+        .expect("replacement findings should load")
+        .into_iter()
+        .map(|finding| finding.id)
+        .collect::<Vec<_>>();
+    assert_eq!(second_ids.len(), 2);
+    assert_eq!(second_ids, first_ids);
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn successful_translation_clears_previous_findings() {
+    let (db_path, input_path, store, job) =
+        setup_findings_store("clear_translation_findings.sqlite", 1);
+    save_two_findings(&store, &job.id);
+    assert_eq!(store.segment_qa_findings(&job.id).unwrap().len(), 2);
+
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_0",
+            translated_text: "Tradotto",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "Tradotto".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(4),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(3),
+            tokens_estimated: false,
+        })
+        .expect("successful translation should save");
+    assert!(store.segment_qa_findings(&job.id).unwrap().is_empty());
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn migration_eight_backfills_existing_segment_errors_once() {
+    let (db_path, input_path, store, job) = setup_findings_store("backfill_qa_findings.sqlite", 1);
+    {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "UPDATE segments
+             SET status = 'needs_review', error = ?1
+             WHERE job_id = ?2 AND id = 'seg_0'",
+            params![MULTI_FINDING_ERROR, job.id],
+        )
+        .expect("legacy segment should update");
+        conn.execute("DELETE FROM qa_findings", [])
+            .expect("findings should clear");
+        conn.execute("DELETE FROM _migrations WHERE version = 8", [])
+            .expect("migration marker should clear");
+    }
+    drop(store);
+
+    let reopened = JobStore::open(&db_path).expect("legacy store should reopen");
+    let findings = reopened
+        .segment_qa_findings(&job.id)
+        .expect("backfilled findings should load");
+    assert_eq!(findings.len(), 2);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.kind == "source_copy_unchanged")
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.kind == "batch_block_mismatch")
+    );
+    let migration_count = reopened
+        .conn
+        .borrow()
+        .query_row(
+            "SELECT COUNT(*) FROM _migrations WHERE version = 8",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("migration marker should query");
+    assert_eq!(migration_count, 1);
+
+    drop(reopened);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn qa_finding_breakdown_orders_counts_descending() {
+    let (db_path, input_path, store, job) =
+        setup_findings_store("qa_finding_breakdown_order.sqlite", 6);
+    let errors = [
+        "batch translation block mismatch: missing=[], extra=[], duplicate=[]",
+        "missing block translations: b_1",
+        "segment 'seg_2' expected 2 block translations, got 1",
+        "provider error: upstream unavailable",
+        "HTTP status 503: upstream unavailable",
+        "translation is unchanged from the source-language prose",
+    ];
+    for (ordinal, error) in errors.into_iter().enumerate() {
+        assert_eq!(
+            store
+                .record_segment_findings(&job.id, &format!("seg_{ordinal}"), error)
+                .expect("finding should record"),
+            1
+        );
+    }
+
+    let breakdown = store
+        .qa_finding_breakdown(&job.id)
+        .expect("breakdown should load");
+    assert_eq!(
+        breakdown
+            .iter()
+            .map(|entry| (entry.kind.as_str(), entry.count))
+            .collect::<Vec<_>>(),
+        vec![
+            ("batch_block_mismatch", 3),
+            ("provider_error", 2),
+            ("source_copy_unchanged", 1),
+        ]
+    );
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
