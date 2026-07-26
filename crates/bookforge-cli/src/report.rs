@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Result;
-use bookforge_core::segment::Segment;
+use bookforge_core::segment::{SEGMENT_UNIT_NAME, Segment};
 use bookforge_llm::QaSegmentReview;
 use bookforge_store::{
     JobRecord, JobSummary, SegmentRecord, aggregate_findings, classify_segment_error,
@@ -77,12 +77,14 @@ struct QaReport {
     source_language: Option<String>,
     target_language: String,
     output: String,
+    segment_unit: &'static str,
     total_segments: usize,
     successful_segments: usize,
     cached_segments: usize,
     retried_segments: usize,
     failed_segments: usize,
     needs_review_segments: usize,
+    needs_review_rate_percent: f64,
     retry_pending_segments: usize,
     corrected_segments: usize,
     input_tokens: u64,
@@ -121,12 +123,17 @@ pub(crate) fn write_report(input: ReportInput<'_>) -> Result<ReportFiles> {
         source_language: input.job.source_lang.clone(),
         target_language: input.job.target_lang.clone(),
         output: input.output.display().to_string(),
+        segment_unit: SEGMENT_UNIT_NAME,
         total_segments: input.summary.total_segments,
         successful_segments: input.summary.succeeded,
         cached_segments: input.summary.cached,
         retried_segments: input.summary.retried,
         failed_segments: input.summary.failed,
         needs_review_segments: input.summary.needs_review,
+        needs_review_rate_percent: segment_share_percent(
+            input.summary.needs_review,
+            input.summary.total_segments,
+        ),
         retry_pending_segments: input.summary.retry_pending,
         corrected_segments: input.corrected_segments,
         input_tokens: input.summary.input_tokens,
@@ -623,14 +630,14 @@ fn render_markdown(report: &QaReport) -> String {
 
     output.push_str("## Summary\n\n");
     output.push_str(&format!(
-        "- Translated: {}/{} segments\n",
+        "- Translated: {}/{} scheduler segments\n",
         report.successful_segments, report.total_segments
     ));
     output.push_str(&format!("- Cached: {}\n", report.cached_segments));
     output.push_str(&format!("- Retried: {}\n", report.retried_segments));
     output.push_str(&format!(
-        "- Needs review: {}\n",
-        report.needs_review_segments
+        "- Needs review: {}/{} scheduler segments ({:.1}%)\n",
+        report.needs_review_segments, report.total_segments, report.needs_review_rate_percent
     ));
     output.push_str(&format!("- Failed: {}\n", report.failed_segments));
     output.push_str(&format!(
@@ -719,6 +726,14 @@ fn render_markdown(report: &QaReport) -> String {
     output
 }
 
+fn segment_share_percent(count: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (count as f64 * 1_000.0 / total as f64).round() / 10.0
+    }
+}
+
 fn optional_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
@@ -801,6 +816,13 @@ mod tests {
     #[test]
     fn finding_breakdown_is_empty_without_flagged_segments() {
         assert!(finding_breakdown(&[segment_record("seg_0", "succeeded", None)]).is_empty());
+    }
+
+    #[test]
+    fn needs_review_rate_uses_scheduler_segment_denominator() {
+        assert_eq!(segment_share_percent(8, 32), 25.0);
+        assert_eq!(segment_share_percent(1, 3), 33.3);
+        assert_eq!(segment_share_percent(0, 0), 0.0);
     }
 
     #[test]

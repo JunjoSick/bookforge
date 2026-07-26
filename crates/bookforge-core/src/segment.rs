@@ -11,6 +11,9 @@ use crate::{
 pub const CACHE_KEY_SCHEMA_VERSION: u32 = 2;
 /// Bumped when Segment / SegmentBlock layout changes incompatibly.
 pub const SEGMENT_SCHEMA_VERSION: u32 = 1;
+/// Stable label for the canonical unit checkpointed, retried, resumed, and
+/// persisted in the job store.
+pub const SEGMENT_UNIT_NAME: &str = "scheduler_segment";
 /// Bumped when inline marker extraction (m/keep/ref) changes incompatibly.
 /// v2: depth-anchored block closing, lazily anchored text blocks for
 /// non-whitelist elements, addressable stray text nodes — block ordinals
@@ -215,6 +218,11 @@ pub enum SegmentStatus {
     SkippedCached,
 }
 
+/// Build the scheduler's units of work.
+///
+/// Each returned segment becomes one job-store `segments` row. Provider request
+/// batching may group several of these units, but does not change their identity
+/// or count.
 pub fn build_segments(book: &Book, config: &SegmentationConfig) -> Result<Vec<Segment>> {
     if config.max_segment_tokens == 0 {
         return Err(BookforgeError::InvalidInput(
