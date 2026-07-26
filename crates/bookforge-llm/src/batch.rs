@@ -48,8 +48,7 @@ use planning::{
     repartition_pending_batches, set_batch_output_override, split_batch_with_config,
     take_batch_output_override, token_estimate,
 };
-#[cfg(test)]
-use rendering::batch_item_validation_error;
+pub use rendering::batch_item_validation_error;
 pub use rendering::parse_batch_response;
 use rendering::{parse_batch_response_with_validation, render_batch_items};
 

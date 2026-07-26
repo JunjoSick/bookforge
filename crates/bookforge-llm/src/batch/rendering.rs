@@ -1,7 +1,7 @@
 use super::*;
 use serde::Deserialize;
 
-pub(super) fn batch_item_validation_error(
+pub fn batch_item_validation_error(
     item: &TranslationBatchItem,
     translation: &str,
     validate_source_copy: bool,
@@ -26,6 +26,11 @@ pub(super) fn batch_item_validation_error(
         if !expected.contains(marker) {
             return Some(format!("unknown inline marker: {marker}"));
         }
+    }
+    if let Some(error) =
+        crate::validation::marker_reference_text_error(&item.source_text, translation)
+    {
+        return Some(error);
     }
     for span in &item.protected_spans {
         if !span.trim().is_empty() && !crate::validation::protected_span_present(span, translation)
@@ -554,6 +559,77 @@ fn wrap_text_only_translation_with_source_markers(source: &str, translation: &st
         return translation;
     }
     format!("{prefix}{translation}")
+}
+
+#[cfg(test)]
+mod noteref_marker_validation_tests {
+    use super::*;
+
+    /// `word.<sup><a epub:type="noteref">*2</a></sup>` reaches the model as
+    /// `word.<m0><m1>*2</m1></m0>`. Every marker ID survives when the model
+    /// drops the `*2`, so only the inner-text check can catch it.
+    fn noteref_item() -> TranslationBatchItem {
+        TranslationBatchItem {
+            item_id: "item_noteref".to_string(),
+            segment_id: SegmentId("seg_noteref".to_string()),
+            section_id: bookforge_core::ir::SectionId("section_noteref".to_string()),
+            block_id: bookforge_core::ir::BlockId("block_noteref".to_string()),
+            ordinal: 0,
+            kind: "paragraph".to_string(),
+            source_text: "The word.<m0><m1>*2</m1></m0> It follows.".to_string(),
+            text_runs: Vec::new(),
+            protected_spans: Vec::new(),
+            required_markers: vec!["m0".to_string(), "m1".to_string()],
+            checksum: "checksum_noteref".to_string(),
+        }
+    }
+
+    #[test]
+    fn dropped_noteref_token_fails_batch_item_validation() {
+        let error = batch_item_validation_error(
+            &noteref_item(),
+            "La parola.<m0><m1></m1></m0> Segue.",
+            false,
+            None,
+            None,
+        )
+        .expect("a dropped endnote reference must fail validation");
+
+        assert!(error.contains("lost its reference text"), "got: {error}");
+        assert!(error.contains("*2"), "got: {error}");
+    }
+
+    #[test]
+    fn preserved_noteref_token_passes_batch_item_validation() {
+        assert_eq!(
+            batch_item_validation_error(
+                &noteref_item(),
+                "La parola.<m0><m1>*2</m1></m0> Segue.",
+                false,
+                None,
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn translated_marker_prose_still_passes_batch_item_validation() {
+        let mut item = noteref_item();
+        item.source_text = "A <m0>beautiful</m0> day.".to_string();
+        item.required_markers = vec!["m0".to_string()];
+
+        assert_eq!(
+            batch_item_validation_error(
+                &item,
+                "Una <m0>bellissima</m0> giornata.",
+                false,
+                None,
+                None
+            ),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

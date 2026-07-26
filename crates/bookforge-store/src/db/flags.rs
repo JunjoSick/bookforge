@@ -21,6 +21,9 @@ impl JobStore {
             let conn = self.conn.borrow();
             conn.execute(&sql, params![job_id])?
         };
+        // Findings are instrumentation, so a failed findings write must never
+        // fail the surrounding translation checkpoint.
+        let _ = self.prune_stale_findings(job_id);
         self.touch_job_unless_status(job_id, "retry_pending", &["stopped"])?;
         Ok(count)
     }
@@ -65,6 +68,10 @@ impl JobStore {
         tx.execute(
             "DELETE FROM segment_flags
              WHERE job_id = ?1 AND segment_id = ?2 AND kind = 'dashboard_retry'",
+            params![job_id, segment_id],
+        )?;
+        tx.execute(
+            "DELETE FROM qa_findings WHERE job_id = ?1 AND segment_id = ?2",
             params![job_id, segment_id],
         )?;
         if let Some(guidance) = guidance.filter(|value| !value.trim().is_empty()) {
@@ -201,6 +208,11 @@ impl JobStore {
                 params.push(id);
             }
             updated += conn.execute(&sql, params.as_slice())?;
+        }
+        for segment_id in segment_ids {
+            // Findings are instrumentation, so a failed findings write must
+            // never fail the surrounding translation checkpoint.
+            let _ = self.record_segment_findings(job_id, segment_id, reason);
         }
         if updated > 0 {
             self.mark_job_needs_review(job_id)?;

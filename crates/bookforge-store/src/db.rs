@@ -18,12 +18,17 @@ use rusqlite::{Connection, OptionalExtension, params, types::Type};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 
+mod findings;
 mod flags;
 mod glossary;
 mod jobs;
 mod schema;
 mod translations;
 
+pub use findings::{
+    QaFinding, QaFindingCount, QaFindingKind, QaFindingSeverity, StoredQaFinding,
+    aggregate_findings, classify_segment_error,
+};
 pub use flags::RetryScope;
 pub use schema::run_doctor;
 #[cfg(test)]

@@ -10,7 +10,10 @@ use bookforge_core::{
         Block, BlockId, BlockKind, Book, BookFormat, BookId, DomPath, InlineMark, Metadata,
         ProtectedSpan, ProtectedSpanKind, Resource, Section, SectionId, SpineItem, TextRun,
     },
-    marker::{is_marker_token, strip_marker_tokens},
+    marker::{
+        is_marker_token, marker_reference_token, parse_marker_close, parse_paired_marker_open,
+        strip_marker_tokens,
+    },
 };
 use quick_xml::{
     Reader,
@@ -1189,7 +1192,7 @@ fn build_block(
     } else {
         text_runs
     };
-    let protected_spans = detect_protected_spans(&visible_text);
+    let protected_spans = detect_protected_spans_in_text_runs(&text_runs);
 
     Block {
         id: BlockId(format!("b_{ordinal:06}")),
@@ -1295,6 +1298,55 @@ fn detect_protected_spans(text: &str) -> Vec<ProtectedSpan> {
     spans
 }
 
+fn marker_aware_prose_segments(text_runs: &[TextRun]) -> Vec<(String, bool)> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut marker_depth = 0usize;
+
+    for run in text_runs {
+        if is_marker_token(&run.text) {
+            let segment = normalize_space(&current);
+            if !segment.is_empty() {
+                segments.push((segment, marker_depth > 0));
+            }
+            current.clear();
+            let marker = run.text.trim();
+            if parse_paired_marker_open(marker).is_some() {
+                marker_depth += 1;
+            } else if parse_marker_close(marker).is_some() {
+                marker_depth = marker_depth.saturating_sub(1);
+            }
+        } else {
+            current.push_str(&run.text);
+        }
+    }
+
+    let segment = normalize_space(&current);
+    if !segment.is_empty() {
+        segments.push((segment, marker_depth > 0));
+    }
+    segments
+}
+
+fn detect_protected_spans_in_text_runs(text_runs: &[TextRun]) -> Vec<ProtectedSpan> {
+    let mut spans = marker_aware_prose_segments(text_runs)
+        .into_iter()
+        .flat_map(|(segment, inside_marker)| {
+            // Reference text inside a marker is validated by the marker reference-text check.
+            // Protected spans cover prose outside markers and non-reference data that the
+            // specialized marker check intentionally does not own.
+            if inside_marker && marker_reference_token(&segment).is_some() {
+                Vec::new()
+            } else {
+                detect_protected_spans(&segment)
+            }
+        })
+        .collect::<Vec<_>>();
+    spans.sort_by(|left, right| left.text.cmp(&right.text));
+    spans.dedup_by(|left, right| left.kind == right.kind && left.text == right.text);
+    spans
+}
+
 fn detect_chapter_numeral_spans(text: &str) -> Vec<String> {
     let tokens = text
         .split_whitespace()
@@ -1376,12 +1428,44 @@ fn looks_like_inline_math_token(value: &str) -> bool {
     if chars.len() < 3 {
         return false;
     }
+    // Sentence punctuation followed by an operator signals a fused endnote marker.
+    if chars
+        .windows(2)
+        .any(|pair| matches!(pair[0], '.' | ',') && is_strong_inline_math_operator(pair[1]))
+    {
+        return false;
+    }
+    if is_alphabetic_word_with_only_edge_operators(&chars) {
+        return false;
+    }
     let has_operand = chars.iter().any(|ch| ch.is_ascii_alphanumeric());
     let has_strong_operator = chars.iter().any(|ch| is_strong_inline_math_operator(*ch));
     let has_numeric_subscript = chars.contains(&'_') && chars.iter().any(|ch| ch.is_ascii_digit());
     has_operand
         && (has_strong_operator || has_numeric_subscript)
         && chars.iter().all(|ch| is_math_token_char(*ch))
+}
+
+fn is_alphabetic_word_with_only_edge_operators(chars: &[char]) -> bool {
+    if chars.iter().any(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    let Some(first_alpha) = chars.iter().position(|ch| ch.is_ascii_alphabetic()) else {
+        return false;
+    };
+    let last_alpha = chars
+        .iter()
+        .rposition(|ch| ch.is_ascii_alphabetic())
+        .expect("first alphabetic character exists");
+    let has_edge_operator = first_alpha > 0 || last_alpha + 1 < chars.len();
+    has_edge_operator
+        && chars[first_alpha..=last_alpha]
+            .iter()
+            .all(|ch| ch.is_ascii_alphabetic())
+        && chars[..first_alpha]
+            .iter()
+            .chain(&chars[last_alpha + 1..])
+            .all(|ch| is_inline_math_operator(*ch))
 }
 
 fn looks_like_math_operand(value: &str) -> bool {
@@ -1870,6 +1954,124 @@ mod tests {
     }
 
     #[test]
+    fn endnote_markers_never_fuse_prose_into_protected_spans() {
+        let section_id = SectionId("sec_000000".to_string());
+        let xhtml = r##"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body>
+  <p>Doubts about the vaccine.<sup><a epub:type="noteref" href="#n2">*2</a></sup></p>
+  <p>The source was opaque,<sup><a epub:type="noteref" href="#n8">*8</a></sup></p>
+  <p>The plan supported well-being.<sup><a epub:type="noteref" href="#n6">*6</a></sup></p>
+  <p>The answer was B.<sup><a epub:type="noteref" href="#n3">*3</a></sup></p>
+  <p>Other Americans.<sup><a epub:type="noteref" href="#n3">*3</a></sup></p>
+  <p>The citations.<sup><a epub:type="noteref" href="#n12">*12</a></sup></p>
+</body>
+</html>"##;
+        let blocks = extract_blocks(xhtml, "chapter.xhtml", &section_id, 0)
+            .expect("block extraction should succeed");
+        let protected_texts = blocks
+            .iter()
+            .flat_map(|block| block.protected_spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        // Marker boundaries keep endnote text independent from adjacent prose.
+        let fused = [
+            "vaccine.*2",
+            "opaque,*8",
+            "well-being.*6",
+            "B.*3",
+            "Americans.*3",
+            "citations.*12",
+        ];
+        assert!(
+            !protected_texts.iter().any(|text| fused.contains(text)),
+            "fused protected span found: {protected_texts:?}"
+        );
+        assert!(
+            protected_texts
+                .iter()
+                .all(|text| !text.chars().any(|ch| ch.is_ascii_alphabetic())),
+            "prose leaked into protected spans: {protected_texts:?}"
+        );
+    }
+
+    #[test]
+    fn endnote_marker_without_punctuation_still_never_fuses() {
+        let section_id = SectionId("sec_000000".to_string());
+        let xhtml = r##"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body><p>the vaccine<sup><a epub:type="noteref" href="#n2">*2</a></sup> works</p></body>
+</html>"##;
+        let blocks = extract_blocks(xhtml, "chapter.xhtml", &section_id, 0)
+            .expect("block extraction should succeed");
+
+        // The marker-aware split protects cases the punctuation guard cannot detect.
+        assert!(blocks.iter().all(|block| {
+            block
+                .protected_spans
+                .iter()
+                .all(|span| !span.text.contains("vaccine"))
+        }));
+    }
+
+    #[test]
+    fn protected_spans_delegate_marker_references_and_preserve_other_data() {
+        let section_id = SectionId("sec_000000".to_string());
+        let xhtml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p>Einstein wrote <em>E = mc^2</em> in 1905, see https://example.com and file.txt.</p>
+<p>Chapter 12-14 covers p&lt;0.05 and #anchor and mail@example.com.</p>
+<p>CAPITOLO I Il buonsenso</p>
+</body></html>"#;
+        let blocks = extract_blocks(xhtml, "chapter.xhtml", &section_id, 0)
+            .expect("block extraction should succeed");
+        let protected_texts = blocks
+            .iter()
+            .flat_map(|block| block.protected_spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        // Marker-inner prose and data that is not reference text still runs every detector.
+        for expected in [
+            "E = mc^2",
+            "1905",
+            "https://example.com",
+            "file.txt",
+            "12-14",
+            "p<0.05",
+            "#anchor",
+            "mail@example.com",
+            "I",
+        ] {
+            assert!(
+                protected_texts.contains(&expected),
+                "missing {expected}: {protected_texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn endnote_reference_text_is_not_a_protected_span_but_outer_year_is() {
+        let section_id = SectionId("sec_000000".to_string());
+        let xhtml = r##"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body><p>word.<sup><a epub:type="noteref" href="#n2">*2</a></sup> Ordinary 2020.</p></body>
+</html>"##;
+        let blocks = extract_blocks(xhtml, "chapter.xhtml", &section_id, 0)
+            .expect("block extraction should succeed");
+        let protected_texts = blocks[0]
+            .protected_spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            protected_texts
+                .iter()
+                .all(|text| !text.contains('2') || *text == "2020"),
+            "marker reference leaked into protected spans: {protected_texts:?}"
+        );
+        assert!(protected_texts.contains(&"2020"));
+    }
+
+    #[test]
     fn protected_spans_preserve_all_exact_digits() {
         let spans = detect_protected_spans(
             "Chapter 1 cites https://example.com, file.txt, #anchor, and pages 12-14.",
@@ -1978,6 +2180,22 @@ mod tests {
                 .iter()
                 .any(|span| span.kind == ProtectedSpanKind::Math)
         );
+    }
+
+    #[test]
+    fn inline_math_rejects_prose_glued_to_an_endnote_marker() {
+        // Sentence punctuation before a marker operator is not mathematical syntax.
+        for value in ["vaccine.*2", "opaque,*8", "citations.*12"] {
+            assert!(!looks_like_inline_math_token(value), "{value}");
+        }
+        // An otherwise alphabetic word with an operator only at its edge is prose, not math.
+        for value in ["Revolution*", "and^"] {
+            assert!(!looks_like_inline_math_token(value), "{value}");
+        }
+        // Digits or an operator between operands remain valid mathematical evidence.
+        for value in ["I*16", "mc^2", "p<0.05", "x_12", "E=mc^2"] {
+            assert!(looks_like_inline_math_token(value), "{value}");
+        }
     }
 
     fn block_text(block: &Block) -> String {

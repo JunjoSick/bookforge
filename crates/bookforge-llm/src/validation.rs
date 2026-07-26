@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use bookforge_core::marker::strip_marker_tokens;
+use bookforge_core::marker::{marker_inner_texts, marker_reference_token, strip_marker_tokens};
 
 const MIN_SOURCE_CHARS: usize = 120;
 const MIN_OVERLAP_WORDS: usize = 30;
@@ -624,6 +624,50 @@ fn is_toki_phrase_boundary_char(ch: char) -> bool {
     )
 }
 
+/// Reject translations that kept a marker's ID but silently dropped the
+/// reference text it wrapped. Endnote references arrive as
+/// `word.<sup><a epub:type="noteref">*2</a></sup>`, i.e. `word.<m0><m1>*2</m1></m0>`,
+/// so every marker-ID check can pass while the `*2` is gone from the finished
+/// book. Marker prose stays free to change; only reference tokens are pinned.
+pub(crate) fn marker_reference_text_error(source: &str, translation: &str) -> Option<String> {
+    let translated_inner_texts = marker_inner_texts(translation)
+        .into_iter()
+        .map(|marker| (marker.id, marker.text))
+        .collect::<HashMap<_, _>>();
+
+    for marker in marker_inner_texts(source) {
+        let Some(token) = marker_reference_token(&marker.text) else {
+            continue;
+        };
+        let Some(translated_text) = translated_inner_texts.get(&marker.id) else {
+            continue;
+        };
+        let compact_token = remove_whitespace(token);
+        let compact_translation = remove_whitespace(translated_text);
+        if exact_protected_span_present(&compact_token, &compact_translation)
+            || numeric_tokens_equivalent(&compact_token, &compact_translation)
+        {
+            continue;
+        }
+        return Some(format!(
+            "inline marker {} lost its reference text '{token}'",
+            marker.id
+        ));
+    }
+
+    None
+}
+
+fn remove_whitespace(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn numeric_tokens_equivalent(left: &str, right: &str) -> bool {
+    let left_forms = canonical_number_forms(left);
+    let right_forms = canonical_number_forms(right);
+    !left_forms.is_empty() && left_forms.iter().any(|form| right_forms.contains(form))
+}
+
 pub(crate) fn protected_span_present(span: &str, translation: &str) -> bool {
     dangling_numeric_span(span)
         || exact_protected_span_present(span, translation)
@@ -634,6 +678,7 @@ pub(crate) fn protected_span_present(span: &str, translation: &str) -> bool {
                 .iter()
                 .any(|candidate| canonical_decimal_number(candidate).as_deref() == Some(&expected))
         })
+        || numeric_span_present(span, translation)
 }
 
 fn exact_protected_span_present(span: &str, translation: &str) -> bool {
@@ -657,6 +702,215 @@ fn exact_protected_span_present(span: &str, translation: &str) -> bool {
                 .is_none_or(|ch| !ch.is_alphanumeric());
         left_boundary && right_boundary
     })
+}
+
+/// Every canonical reading of one numeric token. Empty when `token` is not a number.
+///
+/// Separators are classified rather than replaced blindly: repeated identical
+/// separators can be strict three-digit grouping, while a final `.` or `,`
+/// can be decimal after differently styled grouping. A single separator with
+/// a three-digit suffix deliberately yields both readings.
+fn canonical_number_forms(token: &str) -> Vec<String> {
+    let normalized = normalize_number_signs(token);
+    let (sign, unsigned) = if let Some(unsigned) = normalized.strip_prefix('-') {
+        ("-", unsigned)
+    } else if let Some(unsigned) = normalized.strip_prefix('+') {
+        ("+", unsigned)
+    } else {
+        ("", normalized.as_str())
+    };
+    let (numeric, percent) = if let Some(numeric) = unsigned.strip_suffix('%') {
+        (numeric, "%")
+    } else {
+        (unsigned, "")
+    };
+    if numeric.is_empty() {
+        return Vec::new();
+    }
+
+    let mut groups = Vec::new();
+    let mut separators = Vec::new();
+    let mut current = String::new();
+    for ch in numeric.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if is_number_separator(ch) {
+            if current.is_empty() {
+                return Vec::new();
+            }
+            groups.push(std::mem::take(&mut current));
+            separators.push(ch);
+        } else {
+            return Vec::new();
+        }
+    }
+    if current.is_empty() {
+        return Vec::new();
+    }
+    groups.push(current);
+
+    let grouped_integer = groups.concat();
+    let integer_reading = if separators.is_empty() {
+        true
+    } else {
+        let first_separator = separators[0];
+        separators
+            .iter()
+            .all(|separator| *separator == first_separator)
+            && (1..=3).contains(&groups[0].len())
+            && groups[1..].iter().all(|group| group.len() == 3)
+    };
+
+    let decimal_reading = separators.last().is_some_and(|last_separator| {
+        if !matches!(last_separator, '.' | ',') {
+            return false;
+        }
+        if separators.len() == 1 {
+            return true;
+        }
+        let earlier_separators = &separators[..separators.len() - 1];
+        let grouping_separator = earlier_separators[0];
+        grouping_separator != *last_separator
+            && earlier_separators
+                .iter()
+                .all(|separator| *separator == grouping_separator)
+            && (1..=3).contains(&groups[0].len())
+            && groups[1..groups.len() - 1]
+                .iter()
+                .all(|group| group.len() == 3)
+    });
+
+    let mut forms = Vec::new();
+    if integer_reading {
+        forms.push(format!("{sign}{grouped_integer}{percent}"));
+    }
+    if decimal_reading {
+        let integer = groups[..groups.len() - 1].concat();
+        let fractional = &groups[groups.len() - 1];
+        let decimal = format!("{sign}{integer}.{fractional}{percent}");
+        if !forms.contains(&decimal) {
+            forms.push(decimal);
+        }
+    }
+    forms
+}
+
+fn is_number_separator(ch: char) -> bool {
+    matches!(ch, '.' | ',' | ' ' | '\u{00a0}' | '\u{202f}' | '\u{2009}')
+}
+
+fn numeric_candidate_ranges(text: &str) -> Vec<(usize, usize, String)> {
+    let chars = text.char_indices().collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if !chars[index].1.is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+
+        let start_index = if index > 0
+            && matches!(normalize_number_sign(chars[index - 1].1), '-' | '+')
+            && (index == 1 || !chars[index - 2].1.is_alphanumeric())
+        {
+            index - 1
+        } else {
+            index
+        };
+        let mut end_index = index + 1;
+        while end_index < chars.len() {
+            let ch = chars[end_index].1;
+            if ch.is_ascii_digit()
+                || (matches!(ch, '.' | ',')
+                    && chars
+                        .get(end_index + 1)
+                        .is_some_and(|(_, next)| next.is_ascii_digit()))
+                || (is_space_grouping_separator(ch)
+                    && has_strict_three_digit_group(&chars, end_index))
+            {
+                end_index += 1;
+            } else {
+                break;
+            }
+        }
+        if chars
+            .get(end_index)
+            .is_some_and(|(_, trailing)| *trailing == '%')
+        {
+            end_index += 1;
+        }
+
+        let start = chars[start_index].0;
+        let end = chars
+            .get(end_index)
+            .map_or(text.len(), |(offset, _)| *offset);
+        candidates.push((start, end, normalize_number_signs(&text[start..end])));
+        index = end_index;
+    }
+
+    candidates
+}
+
+fn is_space_grouping_separator(ch: char) -> bool {
+    matches!(ch, ' ' | '\u{00a0}' | '\u{202f}' | '\u{2009}')
+}
+
+fn has_strict_three_digit_group(chars: &[(usize, char)], separator_index: usize) -> bool {
+    (1..=3).all(|offset| {
+        chars
+            .get(separator_index + offset)
+            .is_some_and(|(_, ch)| ch.is_ascii_digit())
+    }) && chars
+        .get(separator_index + 4)
+        .is_none_or(|(_, ch)| !ch.is_ascii_digit())
+}
+
+/// Numeric substrings of `text`, including space-grouped forms such as `90 000 000`.
+fn numeric_candidates(text: &str) -> Vec<String> {
+    numeric_candidate_ranges(text)
+        .into_iter()
+        .map(|(_, _, candidate)| candidate)
+        .collect()
+}
+
+/// Locale-insensitive presence check for spans that contain numbers.
+fn numeric_span_present(span: &str, translation: &str) -> bool {
+    let span_numbers = numeric_candidates(span);
+    if span_numbers.is_empty() {
+        return false;
+    }
+
+    let mut translated_number_forms = numeric_candidates(translation)
+        .iter()
+        .map(|candidate| canonical_number_forms(candidate))
+        .collect::<Vec<_>>();
+    for span_number in span_numbers {
+        let required_forms = canonical_number_forms(&span_number);
+        if required_forms.is_empty() {
+            return false;
+        }
+        let Some(match_index) = translated_number_forms.iter().position(|candidate_forms| {
+            required_forms
+                .iter()
+                .any(|required| candidate_forms.contains(required))
+        }) else {
+            return false;
+        };
+        translated_number_forms.remove(match_index);
+    }
+
+    let mut literal_remainder = String::with_capacity(span.len());
+    let mut copied_until = 0;
+    for (start, end, _) in numeric_candidate_ranges(span) {
+        literal_remainder.push_str(&span[copied_until..start]);
+        literal_remainder.push(' ');
+        copied_until = end;
+    }
+    literal_remainder.push_str(&span[copied_until..]);
+    literal_remainder
+        .split_whitespace()
+        .all(|token| exact_protected_span_present(token, translation))
 }
 
 fn normalized_prose(text: &str) -> String {
@@ -947,11 +1201,78 @@ mod tests {
     }
 
     #[test]
+    fn protected_span_presence_accepts_localized_statistical_decimals() {
+        assert!(protected_span_present(
+            "p < 0.05",
+            "Il risultato era p < 0,05."
+        ));
+        assert!(protected_span_present(
+            "F = 3.86",
+            "Il valore osservato era F = 3,86."
+        ));
+    }
+
+    #[test]
+    fn protected_span_presence_accepts_localized_digit_grouping() {
+        assert!(protected_span_present(
+            "90,000,000",
+            "La popolazione raggiunse 90.000.000 di persone."
+        ));
+        assert!(protected_span_present(
+            "90,000,000",
+            "La popolazione raggiunse 90 000 000 di persone."
+        ));
+        assert!(protected_span_present(
+            "1,000,000,000",
+            "Il totale era 1.000.000.000."
+        ));
+    }
+
+    #[test]
+    fn protected_span_presence_rejects_missing_or_wrong_statistical_number() {
+        assert!(!protected_span_present(
+            "p < 0.05",
+            "Il risultato non conteneva alcun valore numerico."
+        ));
+        assert!(!protected_span_present(
+            "p < 0.05",
+            "Il risultato era p < 0,06."
+        ));
+    }
+
+    #[test]
     fn protected_span_presence_still_rejects_absent_numbers() {
         assert!(!protected_span_present(
             "5.16",
             "Si noti che questa forma di rettificazione deriva dai canali aperti."
         ));
+    }
+
+    #[test]
+    fn marker_reference_text_rejects_dropped_token() {
+        let source = "Parola.<m0><m1>*2</m1></m0> Segue.";
+        let translation = "Parola.<m0><m1></m1></m0> Segue.";
+
+        assert_eq!(
+            marker_reference_text_error(source, translation).as_deref(),
+            Some("inline marker m1 lost its reference text '*2'")
+        );
+    }
+
+    #[test]
+    fn marker_reference_text_accepts_preserved_token() {
+        let source = "Parola.<m0><m1>*2</m1></m0> Segue.";
+        let translation = "Parola.<m0><m1>*2</m1></m0> Continua.";
+
+        assert_eq!(marker_reference_text_error(source, translation), None);
+    }
+
+    #[test]
+    fn marker_reference_text_allows_prose_to_change() {
+        let source = "Una <m0>beautiful</m0> giornata";
+        let translation = "Una <m0>bellissima</m0> giornata";
+
+        assert_eq!(marker_reference_text_error(source, translation), None);
     }
 
     #[test]
