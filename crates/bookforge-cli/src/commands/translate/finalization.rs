@@ -3,8 +3,8 @@ use super::*;
 /// Shared post-translation pipeline: QA, fallback, double-check, finish, report.
 /// Both batch and non-batch paths call this after translation completes.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn finish_translation_pipeline(
-    provider: &OpenAiCompatibleProvider,
+pub(super) async fn finish_translation_pipeline<P>(
+    provider: &P,
     cancel_token: &tokio_util::sync::CancellationToken,
     cli_args: &TranslateArgs,
     segments: &[Segment],
@@ -21,7 +21,15 @@ pub(super) async fn finish_translation_pipeline(
     started: std::time::Instant,
     snapshot: &mut RunConfigSnapshot,
     job_runtime_settings: &tokio::sync::watch::Receiver<crate::control::JobRuntimeSettings>,
-) -> Result<()> {
+    telemetry: &TelemetryLog,
+    glossary_rules: &std::collections::HashMap<
+        String,
+        Vec<bookforge_core::glossary::GlossarySelectionRule>,
+    >,
+) -> Result<()>
+where
+    P: LlmProvider + Clone,
+{
     translations.sort_by_key(|t| t.ordinal);
 
     let pause_signal = run_config.pause_signal.clone().unwrap_or_default();
@@ -56,7 +64,7 @@ pub(super) async fn finish_translation_pipeline(
         return Ok(());
     }
     let fallback_config = FallbackPassConfig::from_snapshot(snapshot.fallback.as_ref());
-    let fallback_translations = run_fallback_pass(
+    let fallback_translations = run_fallback_pass_instrumented(
         cancel_token,
         fallback_config.as_ref(),
         segments,
@@ -68,6 +76,8 @@ pub(super) async fn finish_translation_pipeline(
         &controlled_run_config,
         Some(&mut control_poller),
         progress.clone(),
+        telemetry,
+        glossary_rules,
     )
     .await?;
     *translations = fallback_translations;
@@ -171,8 +181,8 @@ pub(super) async fn wait_for_finalize_stage_control(
     ))
 }
 
-struct DoubleCheckPass<'a> {
-    provider: &'a OpenAiCompatibleProvider,
+struct DoubleCheckPass<'a, P> {
+    provider: &'a P,
     cancel_token: &'a tokio_util::sync::CancellationToken,
     cli_args: &'a TranslateArgs,
     segments: &'a [Segment],
@@ -184,7 +194,49 @@ struct DoubleCheckPass<'a> {
     progress: Arc<dyn bookforge_core::ProgressSink>,
 }
 
-async fn run_double_check_pass(pass: DoubleCheckPass<'_>) -> Result<bool> {
+#[derive(Clone)]
+enum DoubleCheckProvider<P> {
+    Primary(P),
+    Mock(MockProvider),
+    OpenAi(OpenAiCompatibleProvider),
+}
+
+impl<P> LlmProvider for DoubleCheckProvider<P>
+where
+    P: LlmProvider,
+{
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> std::result::Result<CompletionResponse, LlmError> {
+        match self {
+            Self::Primary(provider) => provider.complete(request).await,
+            Self::Mock(provider) => provider.complete(request).await,
+            Self::OpenAi(provider) => provider.complete(request).await,
+        }
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        match self {
+            Self::Primary(provider) => provider.capabilities(),
+            Self::Mock(provider) => provider.capabilities(),
+            Self::OpenAi(provider) => provider.capabilities(),
+        }
+    }
+
+    fn is_reasoning(&self) -> bool {
+        match self {
+            Self::Primary(provider) => provider.is_reasoning(),
+            Self::Mock(provider) => provider.is_reasoning(),
+            Self::OpenAi(provider) => provider.is_reasoning(),
+        }
+    }
+}
+
+async fn run_double_check_pass<P>(pass: DoubleCheckPass<'_, P>) -> Result<bool>
+where
+    P: LlmProvider + Clone,
+{
     let DoubleCheckPass {
         provider,
         cancel_token,
@@ -201,37 +253,56 @@ async fn run_double_check_pass(pass: DoubleCheckPass<'_>) -> Result<bool> {
         return Ok(true);
     }
 
-    let (dc_provider, dc_provider_name, dc_model) = if cli_args.double_check_provider.is_some()
-        || cli_args.double_check_model.is_some()
-    {
-        let provider_str = cli_args
-            .double_check_provider
-            .as_deref()
-            .unwrap_or("openrouter");
-        let dc_config = provider_config(
-            provider_str,
-            cli_args.double_check_model.as_deref(),
-            cli_args.double_check_base_url.as_deref(),
-            cli_args.double_check_api_key_env.as_deref(),
-            settings.provider.timeout_seconds,
-            settings.provider.provider_max_attempts,
-            settings.provider.thinking_disabled,
-            settings.provider.retry_after_policy,
-            settings.provider.max_backoff_seconds,
-            settings.provider.max_idle_per_host,
-            settings.provider.json_mode,
-        )?;
-        let provider = OpenAiCompatibleProvider::new_with_cancel(dc_config, cancel_token.clone())
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let model = provider.model().to_string();
-        (provider, provider_str.to_string(), model)
-    } else {
-        (
-            provider.clone(),
-            config.provider.clone(),
-            provider.model().to_string(),
-        )
-    };
+    let (dc_provider, dc_provider_name, dc_model) =
+        if cli_args.double_check_provider.is_some() || cli_args.double_check_model.is_some() {
+            let provider_str = cli_args
+                .double_check_provider
+                .as_deref()
+                .unwrap_or("openrouter");
+            if provider_str == "mock" {
+                let model = cli_args
+                    .double_check_model
+                    .clone()
+                    .unwrap_or_else(|| config.model.clone());
+                (
+                    DoubleCheckProvider::Mock(MockProvider::new(
+                        mock_mode(&model),
+                        &config.target_language,
+                    )),
+                    provider_str.to_string(),
+                    model,
+                )
+            } else {
+                let dc_config = provider_config(
+                    provider_str,
+                    cli_args.double_check_model.as_deref(),
+                    cli_args.double_check_base_url.as_deref(),
+                    cli_args.double_check_api_key_env.as_deref(),
+                    settings.provider.timeout_seconds,
+                    settings.provider.provider_max_attempts,
+                    settings.provider.thinking_disabled,
+                    settings.provider.retry_after_policy,
+                    settings.provider.max_backoff_seconds,
+                    settings.provider.max_idle_per_host,
+                    settings.provider.json_mode,
+                )?;
+                let provider =
+                    OpenAiCompatibleProvider::new_with_cancel(dc_config, cancel_token.clone())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let model = provider.model().to_string();
+                (
+                    DoubleCheckProvider::OpenAi(provider),
+                    provider_str.to_string(),
+                    model,
+                )
+            }
+        } else {
+            (
+                DoubleCheckProvider::Primary(provider.clone()),
+                config.provider.clone(),
+                config.model.clone(),
+            )
+        };
     let mut double_check_config = config.clone();
     double_check_config.provider = dc_provider_name;
     double_check_config.model = dc_model;
