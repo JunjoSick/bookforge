@@ -846,13 +846,34 @@ function setProgressStatus(status) {
   pill.textContent = status;
   pill.className = "badge " + badgeClass(status);
 }
-async function bfJobControl(id, command) {
+function showResumeKeyEntry(id, details, toast) {
+  if (!toast) return;
+  const provider = details.provider || "this provider";
+  const env = details.api_key_env ? ` (${details.api_key_env})` : "";
+  toast.innerHTML = `API key for ${esc(provider)}${esc(env)} is unavailable. <input class="inp" id="resume-key" type="password" autocomplete="off" placeholder="Paste API key" style="display:inline-block;width:min(280px,55vw);margin-left:8px"><button class="btn btn-primary" id="resume-key-submit" type="button" style="margin-left:6px">Supply key &amp; resume</button>`;
+  const input = $("#resume-key"), submit = $("#resume-key-submit");
+  if (submit) submit.onclick = () => bfResumeWithKey(id);
+  if (input) input.focus();
+}
+function bfResumeWithKey(id) {
+  const input = $("#resume-key"), toast = $("#toast");
+  const apiKey = input ? input.value.trim() : "";
+  if (!apiKey) { if (toast) toast.textContent = "Paste the provider API key to resume."; return; }
+  if (input) input.value = "";
+  bfJobControl(id, "resume", apiKey);
+}
+async function bfJobControl(id, command, apiKey) {
   const toast = $("#toast");
   const buttons = ["#pausebtn","#resumebtn","#stopbtn"].map(id => $(id)).filter(Boolean);
   buttons.forEach(b => b.disabled = true);
   if (toast) toast.textContent = command + " requested…";
   try {
-    const r = await fetch("/api/jobs/" + encodeURIComponent(id) + "/" + command, { method: "POST", headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    const request = { method: "POST", headers: { [CSRF_HEADER]: CSRF_TOKEN } };
+    if (command === "resume") {
+      request.headers["content-type"] = "application/json";
+      request.body = JSON.stringify(apiKey ? { api_key: apiKey } : {});
+    }
+    const r = await fetch("/api/jobs/" + encodeURIComponent(id) + "/" + command, request);
     const j = await r.json();
     if (r.ok) {
       if (command === "pause") setProgressStatus("paused");
@@ -864,6 +885,8 @@ async function bfJobControl(id, command) {
       if (command === "resume" && j.mode === "launching") message = "A resume worker is already starting.";
       if (toast) toast.textContent = message;
       setTimeout(refreshRuntimeSettings, 350);
+    } else if (command === "resume" && j.requires_api_key) {
+      showResumeKeyEntry(id, j, toast);
     } else {
       if (toast) toast.textContent = j.error || `${command} failed`;
     }
