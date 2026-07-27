@@ -269,9 +269,40 @@ async fn mock_and_openai_entry_points_share_events_and_artifacts() {
         .into_iter()
         .filter(|kind| kind != "RuntimeConfigResolved")
         .collect::<Vec<_>>();
+
+    // The checkpoint writer is a separate actor so the hot path never blocks on
+    // SQLite, which means `CheckpointQueued` and `CheckpointFlushed` interleave
+    // nondeterministically with the scheduler's own events. Asserting a total
+    // order over them encodes an invariant the system deliberately does not
+    // have, and fails intermittently under different scheduling. Compare the
+    // full multiset — so no event can be silently lost or duplicated — and the
+    // order of everything else.
+    fn kind_counts(kinds: &[String]) -> std::collections::BTreeMap<&str, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for kind in kinds {
+            *counts.entry(kind.as_str()).or_insert(0) += 1;
+        }
+        counts
+    }
     assert_eq!(
-        mock_events, openai_events,
-        "the only intentional event difference is runtime provider resolution"
+        kind_counts(&mock_events),
+        kind_counts(&openai_events),
+        "both entry points must emit the same events; the only intentional \
+         difference is runtime provider resolution"
+    );
+
+    const CHECKPOINT_ACTOR_EVENTS: [&str; 2] = ["CheckpointQueued", "CheckpointFlushed"];
+    let ordered = |kinds: &[String]| {
+        kinds
+            .iter()
+            .filter(|kind| !CHECKPOINT_ACTOR_EVENTS.contains(&kind.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ordered(&mock_events),
+        ordered(&openai_events),
+        "the deterministic event sequence must match between entry points"
     );
 }
 
