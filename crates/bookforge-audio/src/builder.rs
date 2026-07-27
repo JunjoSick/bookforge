@@ -42,6 +42,13 @@ pub struct AudiobookOptions {
     pub text_normalization: Option<TextNormalization>,
     pub heading_break_tag: Option<String>,
     pub chapter_filter: Option<std::collections::BTreeSet<usize>>,
+    /// Inter-chapter, post-heading, and inter-paragraph silence recorded in the
+    /// manifest. The silence itself is inserted at stitch time (see
+    /// `StitchOptions`); these mirror the same run's configuration so the
+    /// manifest is a faithful record of what was requested.
+    pub gap_chapter_ms: u32,
+    pub gap_title_ms: u32,
+    pub gap_paragraph_ms: u32,
     /// Group physical pdftohtml pages around explicit chapter headings.
     /// This must only be enabled from a positive source-format signal.
     pub pdf_page_grouping: bool,
@@ -64,6 +71,9 @@ impl Default for AudiobookOptions {
             text_normalization: None,
             heading_break_tag: None,
             chapter_filter: None,
+            gap_chapter_ms: 1_200,
+            gap_title_ms: 800,
+            gap_paragraph_ms: 0,
             pdf_page_grouping: false,
         }
     }
@@ -393,9 +403,9 @@ where
         language: options.language_code.clone(),
         text_normalization: options.text_normalization,
         gaps: GapSettings {
-            chapter_ms: 1_200,
-            title_ms: 800,
-            paragraph_ms: 0,
+            chapter_ms: options.gap_chapter_ms,
+            title_ms: options.gap_title_ms,
+            paragraph_ms: options.gap_paragraph_ms,
         },
         author: (!book.metadata.creators.is_empty()).then(|| book.metadata.creators.join(", ")),
         chapters,
@@ -1050,6 +1060,43 @@ mod tests {
         .expect("resume should succeed");
         assert_eq!(resumed.chunks_synthesized, 0);
         assert_eq!(resumed.chunks_skipped, resumed.chunks_total);
+    }
+
+    #[tokio::test]
+    async fn manifest_records_the_configured_gaps_not_the_defaults() {
+        use crate::provider::MockTtsProvider;
+        let dir = tempfile::tempdir().unwrap();
+        let book = book_with_sections();
+        let options = AudiobookOptions {
+            out_dir: dir.path().join("out"),
+            max_chars: 40,
+            gap_chapter_ms: 2_000,
+            gap_title_ms: 250,
+            gap_paragraph_ms: 100,
+            ..AudiobookOptions::default()
+        };
+
+        let report = build_audiobook(
+            &book,
+            Arc::new(MockTtsProvider::new()),
+            &options,
+            CancellationToken::new(),
+            |_p| {},
+        )
+        .await
+        .expect("build should succeed");
+
+        let manifest: AudiobookManifest =
+            serde_json::from_slice(&std::fs::read(&report.manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest.gaps,
+            GapSettings {
+                chapter_ms: 2_000,
+                title_ms: 250,
+                paragraph_ms: 100,
+            },
+            "manifest must reflect the requested gaps, not hardcoded defaults"
+        );
     }
 
     #[tokio::test]

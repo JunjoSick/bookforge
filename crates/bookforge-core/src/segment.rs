@@ -4,13 +4,16 @@ use sha2::{Digest, Sha256};
 use crate::{
     BookforgeError, Result,
     config::SegmentationConfig,
-    ir::{Block, BlockId, BlockKind, Book, Section, SectionId},
+    ir::{Block, BlockId, BlockKind, Book, ProtectedSpan, Section, SectionId},
 };
 
 /// Bumped when the cache key derivation changes incompatibly.
 pub const CACHE_KEY_SCHEMA_VERSION: u32 = 2;
 /// Bumped when Segment / SegmentBlock layout changes incompatibly.
 pub const SEGMENT_SCHEMA_VERSION: u32 = 1;
+/// Stable label for the canonical unit checkpointed, retried, resumed, and
+/// persisted in the job store.
+pub const SEGMENT_UNIT_NAME: &str = "scheduler_segment";
 /// Bumped when inline marker extraction (m/keep/ref) changes incompatibly.
 /// v2: depth-anchored block closing, lazily anchored text blocks for
 /// non-whitelist elements, addressable stray text nodes — block ordinals
@@ -158,7 +161,7 @@ pub struct SegmentBlock {
     pub kind: String,
     pub text: String,
     pub text_runs: Vec<SegmentTextRun>,
-    pub protected_spans: Vec<String>,
+    pub protected_spans: Vec<ProtectedSpan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +218,11 @@ pub enum SegmentStatus {
     SkippedCached,
 }
 
+/// Build the scheduler's units of work.
+///
+/// Each returned segment becomes one job-store `segments` row. Provider request
+/// batching may group several of these units, but does not change their identity
+/// or count.
 pub fn build_segments(book: &Book, config: &SegmentationConfig) -> Result<Vec<Segment>> {
     if config.max_segment_tokens == 0 {
         return Err(BookforgeError::InvalidInput(
@@ -309,12 +317,12 @@ fn push_segment(
     let segment_blocks = blocks
         .iter()
         .map(|block| {
-            let mut spans = block
-                .protected_spans
-                .iter()
-                .map(|span| span.text.clone())
-                .collect::<Vec<_>>();
-            spans.sort();
+            let mut spans = block.protected_spans.clone();
+            spans.sort_by(|left, right| {
+                left.text
+                    .cmp(&right.text)
+                    .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
+            });
             spans.dedup();
             SegmentBlock {
                 block_id: block.id.clone(),
@@ -463,7 +471,8 @@ fn tail_words(text: &str, max_words: usize) -> String {
 mod tests {
     use super::*;
     use crate::ir::{
-        BlockKind, BookFormat, BookId, DomPath, Metadata, Resource, Section, SpineItem, TextRun,
+        BlockKind, BookFormat, BookId, DomPath, Metadata, ProtectedSpanKind, Resource, Section,
+        SpineItem, TextRun,
     };
 
     #[test]
@@ -518,6 +527,68 @@ mod tests {
         };
 
         assert!(build_segments(&book, &config).is_err());
+    }
+
+    #[test]
+    fn segment_blocks_carry_protected_span_kinds_directly() {
+        let spans = vec![
+            ProtectedSpan {
+                kind: ProtectedSpanKind::Math,
+                text: "E=mc^2".to_string(),
+            },
+            ProtectedSpan {
+                kind: ProtectedSpanKind::Url,
+                text: "https://example.com".to_string(),
+            },
+            ProtectedSpan {
+                kind: ProtectedSpanKind::Number,
+                text: "42".to_string(),
+            },
+        ];
+        let mut book = book_with_two_sections();
+        book.blocks[0].protected_spans = spans.clone();
+
+        let segments = build_segments(
+            &book,
+            &SegmentationConfig {
+                max_segment_tokens: 100,
+                context_tokens: 0,
+            },
+        )
+        .expect("segments should build");
+
+        let mut expected = spans;
+        expected.sort_by(|left, right| {
+            left.text
+                .cmp(&right.text)
+                .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
+        });
+        assert_eq!(segments[0].source.blocks[0].protected_spans, expected);
+    }
+
+    #[test]
+    fn protected_span_metadata_does_not_change_segment_checksum_or_id() {
+        let config = SegmentationConfig {
+            max_segment_tokens: 100,
+            context_tokens: 0,
+        };
+        let baseline = book_with_two_sections();
+        let baseline_segments =
+            build_segments(&baseline, &config).expect("baseline segments should build");
+
+        let mut with_span = baseline;
+        with_span.blocks[0].protected_spans = vec![ProtectedSpan {
+            kind: ProtectedSpanKind::Number,
+            text: "1".to_string(),
+        }];
+        let segments_with_span =
+            build_segments(&with_span, &config).expect("segments with spans should build");
+
+        assert_eq!(
+            segments_with_span[0].checksum,
+            baseline_segments[0].checksum
+        );
+        assert_eq!(segments_with_span[0].id, baseline_segments[0].id);
     }
 
     #[test]

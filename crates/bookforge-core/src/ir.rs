@@ -115,7 +115,7 @@ pub struct InlineMark {
     pub kind: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectedSpan {
     pub kind: ProtectedSpanKind,
     pub text: String,
@@ -132,4 +132,36 @@ pub enum ProtectedSpanKind {
     InternalAnchor,
     Citation,
     FootnoteReference,
+}
+
+impl ProtectedSpanKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Url => "url",
+            Self::Email => "email",
+            Self::Code => "code",
+            Self::Math => "math",
+            Self::Number => "number",
+            Self::Filename => "filename",
+            Self::InternalAnchor => "internal_anchor",
+            Self::Citation => "citation",
+            Self::FootnoteReference => "footnote_reference",
+        }
+    }
+}
+
+/// Severity shared by deterministic validation and durable QA findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QaFindingSeverity {
+    Error,
+    Warning,
+}
+
+impl QaFindingSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+        }
+    }
 }

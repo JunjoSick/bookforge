@@ -8,8 +8,10 @@ use anyhow::{Context, Result, bail};
 use bookforge_core::{config::SegmentationConfig, segment::build_segments};
 use bookforge_epub::{ValidationSeverity, inspect_epub, read_epub, validate_translated_epub};
 use clap::Args;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+const VALIDATION_REPORT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Args)]
 pub struct ValidateArgs {
@@ -24,7 +26,7 @@ pub struct ValidateArgs {
     pub strict_epubcheck: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ValidationReport {
     schema_version: u32,
     epub_path: String,
@@ -32,7 +34,7 @@ pub(crate) struct ValidationReport {
     bookforge_validators: BookforgeValidatorReport,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EpubCheckReport {
     ran: bool,
     version: Option<String>,
@@ -40,7 +42,7 @@ struct EpubCheckReport {
     messages: Vec<ValidationMessage>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BookforgeValidatorReport {
     status: String,
     xml_valid: bool,
@@ -49,13 +51,20 @@ struct BookforgeValidatorReport {
     xhtml_spine_count: Option<usize>,
     section_count: Option<usize>,
     block_count: Option<usize>,
-    segment_count: Option<usize>,
+    /// Diagnostic re-segmentation of the EPUB being validated. This is not a
+    /// persisted scheduler count from the translation job.
+    #[serde(alias = "segment_count")]
+    default_segmentation_count: Option<usize>,
+    #[serde(default = "schema_2_default_segmentation_max_tokens")]
+    default_segmentation_max_tokens: usize,
+    #[serde(default = "schema_2_default_segmentation_context_tokens")]
+    default_segmentation_context_tokens: usize,
     estimated_token_count: Option<usize>,
     files_checked: usize,
     messages: Vec<ValidationMessage>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ValidationMessage {
     severity: String,
     code: String,
@@ -131,7 +140,7 @@ pub(crate) fn validate_path(input: &Path, strict_epubcheck: bool) -> ValidationO
 
     ValidationOutcome {
         report: ValidationReport {
-            schema_version: 2,
+            schema_version: VALIDATION_REPORT_SCHEMA_VERSION,
             epub_path: input.display().to_string(),
             epubcheck,
             bookforge_validators,
@@ -161,7 +170,8 @@ fn run_bookforge_validators(input: &Path) -> BookforgeValidatorReport {
 
     let inspection = inspect_epub(input);
     let book = read_epub(input);
-    let mut segment_count = None;
+    let segmentation = SegmentationConfig::default();
+    let mut default_segmentation_count = None;
     let mut estimated_token_count = None;
     let mut section_count = None;
     let mut block_count = None;
@@ -178,9 +188,9 @@ fn run_bookforge_validators(input: &Path) -> BookforgeValidatorReport {
     if let Ok(book) = &book {
         section_count = Some(book.sections.len());
         block_count = Some(book.blocks.len());
-        match build_segments(book, &SegmentationConfig::default()) {
+        match build_segments(book, &segmentation) {
             Ok(segments) => {
-                segment_count = Some(segments.len());
+                default_segmentation_count = Some(segments.len());
                 estimated_token_count = Some(
                     segments
                         .iter()
@@ -219,11 +229,21 @@ fn run_bookforge_validators(input: &Path) -> BookforgeValidatorReport {
             .map(|value| value.xhtml_spine_count),
         section_count,
         block_count,
-        segment_count,
+        default_segmentation_count,
+        default_segmentation_max_tokens: segmentation.max_segment_tokens,
+        default_segmentation_context_tokens: segmentation.context_tokens,
         estimated_token_count,
         files_checked: structural.files_checked,
         messages,
     }
+}
+
+fn schema_2_default_segmentation_max_tokens() -> usize {
+    1_200
+}
+
+fn schema_2_default_segmentation_context_tokens() -> usize {
+    160
 }
 
 fn severity_label(severity: ValidationSeverity) -> &'static str {
@@ -564,6 +584,24 @@ fn format_location(location: &Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn validator_report(segment_count: Option<usize>) -> BookforgeValidatorReport {
+        BookforgeValidatorReport {
+            status: "valid".to_string(),
+            xml_valid: true,
+            package_path: Some("content.opf".to_string()),
+            spine_count: Some(1),
+            xhtml_spine_count: Some(1),
+            section_count: Some(1),
+            block_count: Some(2),
+            default_segmentation_count: segment_count,
+            default_segmentation_max_tokens: SegmentationConfig::default().max_segment_tokens,
+            default_segmentation_context_tokens: SegmentationConfig::default().context_tokens,
+            estimated_token_count: Some(10),
+            files_checked: 1,
+            messages: Vec::new(),
+        }
+    }
+
     #[test]
     fn parses_epubcheck_json_messages_and_status() {
         let report = parse_epubcheck_json(
@@ -605,6 +643,57 @@ mod tests {
     fn default_report_does_not_collide_with_translation_report() {
         let path = default_report_path(Path::new("book.it.epub"));
         assert_eq!(path, PathBuf::from("book.it.validation.json"));
+    }
+
+    #[test]
+    fn schema_3_names_validation_resegmentation_explicitly() {
+        let report = ValidationReport {
+            schema_version: VALIDATION_REPORT_SCHEMA_VERSION,
+            epub_path: "book.epub".to_string(),
+            epubcheck: unavailable_epubcheck("not installed".to_string()),
+            bookforge_validators: validator_report(Some(7)),
+        };
+
+        let value = serde_json::to_value(report).expect("report should serialize");
+        let validators = value["bookforge_validators"]
+            .as_object()
+            .expect("validators should be an object");
+
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(validators["default_segmentation_count"], 7);
+        assert!(!validators.contains_key("segment_count"));
+        assert_eq!(
+            validators["default_segmentation_max_tokens"],
+            SegmentationConfig::default().max_segment_tokens
+        );
+    }
+
+    #[test]
+    fn schema_2_segment_count_remains_readable() {
+        let mut value =
+            serde_json::to_value(validator_report(Some(7))).expect("report should serialize");
+        let validators = value
+            .as_object_mut()
+            .expect("validators should be an object");
+        validators.remove("default_segmentation_max_tokens");
+        validators.remove("default_segmentation_context_tokens");
+        let count = validators
+            .remove("default_segmentation_count")
+            .expect("new count should be present");
+        validators.insert("segment_count".to_string(), count);
+
+        let parsed: BookforgeValidatorReport =
+            serde_json::from_value(value).expect("schema 2 validator report should deserialize");
+
+        assert_eq!(parsed.default_segmentation_count, Some(7));
+        assert_eq!(
+            parsed.default_segmentation_max_tokens,
+            SegmentationConfig::default().max_segment_tokens
+        );
+        assert_eq!(
+            parsed.default_segmentation_context_tokens,
+            SegmentationConfig::default().context_tokens
+        );
     }
 
     #[test]

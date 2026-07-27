@@ -147,7 +147,15 @@ where
                 required_markers: block
                     .map(|block| marker_ids_in_text(&block.text))
                     .unwrap_or_default(),
-                protected_spans: block.map(|b| b.protected_spans.clone()).unwrap_or_default(),
+                protected_spans: block
+                    .map(|block| {
+                        block
+                            .protected_spans
+                            .iter()
+                            .map(|span| span.text.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 deterministic_warnings: Vec::new(),
             };
 

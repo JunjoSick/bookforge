@@ -5,9 +5,11 @@ use std::{
 };
 
 use anyhow::Result;
-use bookforge_core::segment::Segment;
+use bookforge_core::segment::{SEGMENT_UNIT_NAME, Segment};
 use bookforge_llm::QaSegmentReview;
-use bookforge_store::{JobRecord, JobSummary, SegmentRecord};
+use bookforge_store::{
+    JobRecord, JobSummary, SegmentRecord, aggregate_findings, classify_segment_error,
+};
 use serde::Serialize;
 
 use crate::cost::estimate_cost_usd_with_cached;
@@ -75,12 +77,14 @@ struct QaReport {
     source_language: Option<String>,
     target_language: String,
     output: String,
+    segment_unit: &'static str,
     total_segments: usize,
     successful_segments: usize,
     cached_segments: usize,
     retried_segments: usize,
     failed_segments: usize,
     needs_review_segments: usize,
+    needs_review_rate_percent: f64,
     retry_pending_segments: usize,
     corrected_segments: usize,
     input_tokens: u64,
@@ -89,7 +93,16 @@ struct QaReport {
     estimated_cost: Option<f64>,
     qa_reviewed_segments: usize,
     qa_warnings: Vec<QaWarning>,
+    finding_breakdown: Vec<QaFindingBreakdownEntry>,
     performance: Option<RunPerformanceSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QaFindingBreakdownEntry {
+    kind: String,
+    severity: String,
+    count: usize,
+    share_percent: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,12 +123,17 @@ pub(crate) fn write_report(input: ReportInput<'_>) -> Result<ReportFiles> {
         source_language: input.job.source_lang.clone(),
         target_language: input.job.target_lang.clone(),
         output: input.output.display().to_string(),
+        segment_unit: SEGMENT_UNIT_NAME,
         total_segments: input.summary.total_segments,
         successful_segments: input.summary.succeeded,
         cached_segments: input.summary.cached,
         retried_segments: input.summary.retried,
         failed_segments: input.summary.failed,
         needs_review_segments: input.summary.needs_review,
+        needs_review_rate_percent: segment_share_percent(
+            input.summary.needs_review,
+            input.summary.total_segments,
+        ),
         retry_pending_segments: input.summary.retry_pending,
         corrected_segments: input.corrected_segments,
         input_tokens: input.summary.input_tokens,
@@ -130,6 +148,7 @@ pub(crate) fn write_report(input: ReportInput<'_>) -> Result<ReportFiles> {
         ),
         qa_reviewed_segments: input.qa_reviews.len(),
         qa_warnings: qa_warnings(&input),
+        finding_breakdown: finding_breakdown(input.segment_records),
         performance: input.performance.clone(),
     };
 
@@ -151,6 +170,37 @@ pub(crate) fn report_paths(output: &Path) -> ReportFiles {
         json: parent.join(format!("{stem}.report.json")),
         markdown: parent.join(format!("{stem}.report.md")),
     }
+}
+
+/// Per-kind classification of every flagged segment in this run.
+///
+/// `qa_warnings` above lists each flag individually, which buries the shape of
+/// the problem once a book produces hundreds of them. This rolls the same
+/// failures up by kind so a single misfiring validator is obvious at the top of
+/// the list.
+///
+/// The report is written as a run finalizes, so it classifies straight from the
+/// segment records rather than reading `qa_findings` back out of the store.
+/// Both paths run [`classify_segment_error`], so the report and
+/// `bookforge status` cannot drift apart.
+fn finding_breakdown(records: &[SegmentRecord]) -> Vec<QaFindingBreakdownEntry> {
+    let counts = aggregate_findings(
+        records
+            .iter()
+            .filter(|record| matches!(record.status.as_str(), "failed" | "needs_review"))
+            .filter_map(|record| record.error.as_deref())
+            .flat_map(classify_segment_error),
+    );
+    let total = counts.iter().map(|count| count.count).sum::<usize>();
+    counts
+        .iter()
+        .map(|count| QaFindingBreakdownEntry {
+            kind: count.kind.clone(),
+            severity: count.severity.clone(),
+            count: count.count,
+            share_percent: count.share_percent(total),
+        })
+        .collect()
 }
 
 fn qa_warnings(input: &ReportInput<'_>) -> Vec<QaWarning> {
@@ -580,14 +630,14 @@ fn render_markdown(report: &QaReport) -> String {
 
     output.push_str("## Summary\n\n");
     output.push_str(&format!(
-        "- Translated: {}/{} segments\n",
+        "- Translated: {}/{} scheduler segments\n",
         report.successful_segments, report.total_segments
     ));
     output.push_str(&format!("- Cached: {}\n", report.cached_segments));
     output.push_str(&format!("- Retried: {}\n", report.retried_segments));
     output.push_str(&format!(
-        "- Needs review: {}\n",
-        report.needs_review_segments
+        "- Needs review: {}/{} scheduler segments ({:.1}%)\n",
+        report.needs_review_segments, report.total_segments, report.needs_review_rate_percent
     ));
     output.push_str(&format!("- Failed: {}\n", report.failed_segments));
     output.push_str(&format!(
@@ -622,6 +672,18 @@ fn render_markdown(report: &QaReport) -> String {
             output.push_str(&format!(
                 "- **{}** `{}` `{}`: {}\n",
                 warning.severity, warning.kind, segment, warning.message
+            ));
+        }
+    }
+
+    output.push_str("\n## Flag Breakdown\n\n");
+    if report.finding_breakdown.is_empty() {
+        output.push_str("No flagged segments.\n");
+    } else {
+        for entry in &report.finding_breakdown {
+            output.push_str(&format!(
+                "- `{}` ({}): {} ({:.1}%)\n",
+                entry.kind, entry.severity, entry.count, entry.share_percent
             ));
         }
     }
@@ -664,6 +726,14 @@ fn render_markdown(report: &QaReport) -> String {
     output
 }
 
+fn segment_share_percent(count: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (count as f64 * 1_000.0 / total as f64).round() / 10.0
+    }
+}
+
 fn optional_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
@@ -673,6 +743,87 @@ fn optional_u64(value: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn segment_record(id: &str, status: &str, error: Option<&str>) -> SegmentRecord {
+        SegmentRecord {
+            id: id.to_string(),
+            status: status.to_string(),
+            attempts: 1,
+            error: error.map(ToString::to_string),
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            tokens_estimated: false,
+        }
+    }
+
+    #[test]
+    fn finding_breakdown_rolls_flagged_segments_up_by_kind() {
+        let records = [
+            segment_record(
+                "seg_0",
+                "needs_review",
+                Some("protected span missing from segment 'seg_0': 4th"),
+            ),
+            segment_record(
+                "seg_1",
+                "needs_review",
+                Some("protected span missing from segment 'seg_1': 5.16"),
+            ),
+            segment_record(
+                "seg_2",
+                "failed",
+                Some("translation checkpoint failure: provider error: HTTP status 503: down"),
+            ),
+            // Succeeded segments never contribute, even if a stale error string
+            // is still attached to the record.
+            segment_record("seg_3", "succeeded", Some("protected span missing: x")),
+        ];
+
+        let breakdown = finding_breakdown(&records);
+
+        assert_eq!(breakdown.len(), 2);
+        assert_eq!(breakdown[0].kind, "protected_span_missing");
+        assert_eq!(breakdown[0].count, 2);
+        assert_eq!(breakdown[0].share_percent, 66.7);
+        assert_eq!(breakdown[1].kind, "provider_error");
+        assert_eq!(breakdown[1].count, 1);
+    }
+
+    #[test]
+    fn finding_breakdown_counts_each_failure_in_a_concatenated_error() {
+        let records = [segment_record(
+            "seg_0",
+            "needs_review",
+            Some(
+                "translation is unchanged from the source-language prose; \
+                 batch translation block mismatch: missing=[\"b_000853\"], extra=[], duplicate=[]",
+            ),
+        )];
+
+        let breakdown = finding_breakdown(&records);
+
+        assert_eq!(
+            breakdown
+                .iter()
+                .map(|entry| entry.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["batch_block_mismatch", "source_copy_unchanged"]
+        );
+        assert!(breakdown.iter().all(|entry| entry.count == 1));
+    }
+
+    #[test]
+    fn finding_breakdown_is_empty_without_flagged_segments() {
+        assert!(finding_breakdown(&[segment_record("seg_0", "succeeded", None)]).is_empty());
+    }
+
+    #[test]
+    fn needs_review_rate_uses_scheduler_segment_denominator() {
+        assert_eq!(segment_share_percent(8, 32), 25.0);
+        assert_eq!(segment_share_percent(1, 3), 33.3);
+        assert_eq!(segment_share_percent(0, 0), 0.0);
+    }
 
     #[test]
     fn missing_number_message_accepts_decimal_comma_localization() {

@@ -19,6 +19,12 @@ pub struct MarkerClose {
     pub len: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerInnerText {
+    pub id: String,
+    pub text: String,
+}
+
 pub fn marker_ids_in_text(text: &str) -> Vec<String> {
     let mut ids = Vec::new();
     let mut rest = text;
@@ -39,6 +45,92 @@ pub fn marker_ids_in_text(text: &str) -> Vec<String> {
     }
 
     ids
+}
+
+/// Inner text of every paired inline marker, with nested marker tags removed.
+pub fn marker_inner_texts(text: &str) -> Vec<MarkerInnerText> {
+    let mut inner_texts = Vec::new();
+    let mut stack = Vec::<(String, String, usize)>::new();
+    let mut offset = 0;
+
+    while offset < text.len() {
+        let rest = &text[offset..];
+        let Some(index) = rest.find('<') else {
+            break;
+        };
+        let tag_start = offset + index;
+        let tag = &text[tag_start..];
+
+        if let Some(open) = parse_paired_marker_open(tag) {
+            offset = tag_start + open.len;
+            stack.push((open.tag_name, open.id, offset));
+        } else if let Some(empty) = parse_empty_marker(tag) {
+            offset = tag_start + empty.len;
+        } else if let Some(close) = parse_marker_close(tag) {
+            offset = tag_start + close.len;
+            if let Some(frame_index) = stack
+                .iter()
+                .rposition(|(tag_name, _, _)| tag_name == &close.tag_name)
+            {
+                for (_, id, content_start) in stack.drain(frame_index..) {
+                    inner_texts.push(MarkerInnerText {
+                        id,
+                        text: strip_marker_tokens(&text[content_start..tag_start]),
+                    });
+                }
+            }
+        } else {
+            offset = tag_start + 1;
+        }
+    }
+
+    inner_texts
+}
+
+/// Paired-marker prose must remain free to change during translation. Only a
+/// non-empty, at-most-eight-character token with no letters, at least one
+/// digit or reference symbol, and otherwise only reference punctuation is
+/// protected as non-translatable marker reference text.
+pub fn marker_reference_token(text: &str) -> Option<&str> {
+    let token = text.trim();
+    let length = token.chars().count();
+    if length == 0 || length > 8 || token.chars().any(char::is_alphabetic) {
+        return None;
+    }
+    if !token
+        .chars()
+        .any(|ch| ch.is_ascii_digit() || is_reference_symbol(ch))
+    {
+        return None;
+    }
+    token
+        .chars()
+        .all(|ch| {
+            ch.is_ascii_digit()
+                || ch.is_ascii_whitespace()
+                || is_reference_symbol(ch)
+                || matches!(
+                    ch,
+                    '[' | ']'
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                        | '.'
+                        | ','
+                        | '-'
+                        | '–'
+                        | '—'
+                        | '/'
+                        | ':'
+                        | ';'
+                )
+        })
+        .then_some(token)
+}
+
+fn is_reference_symbol(ch: char) -> bool {
+    matches!(ch, '*' | '†' | '‡' | '§' | '¶' | '#')
 }
 
 /// Return a deterministic error when paired inline markers are unbalanced,
@@ -272,6 +364,53 @@ mod tests {
             marker_ids_in_text(r#"A <m1>bold <r1/> text</m1> and <m id="m000000_000">old</m>."#);
 
         assert_eq!(ids, vec!["m1", "r1", "m000000_000"]);
+    }
+
+    #[test]
+    fn marker_inner_texts_strip_nested_marker_tags() {
+        assert_eq!(
+            marker_inner_texts("Parola.<m0><m1>*2</m1></m0> Segue."),
+            vec![
+                MarkerInnerText {
+                    id: "m1".to_string(),
+                    text: "*2".to_string(),
+                },
+                MarkerInnerText {
+                    id: "m0".to_string(),
+                    text: "*2".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn marker_inner_texts_support_legacy_markers() {
+        assert_eq!(
+            marker_inner_texts(r#"A <m id="m000000_000">†3</m> B"#),
+            vec![MarkerInnerText {
+                id: "m000000_000".to_string(),
+                text: "†3".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn marker_inner_texts_ignore_empty_markers() {
+        assert!(marker_inner_texts("A <r3/> B <m4/> C").is_empty());
+    }
+
+    #[test]
+    fn marker_reference_tokens_are_narrowly_classified() {
+        for token in ["1", "*2", "† 3", "[12]", "12–14"] {
+            assert_eq!(marker_reference_token(token), Some(token), "{token}");
+        }
+        for prose_or_data in ["", "beautiful", "E=mc^2", "42%", "123456789"] {
+            assert_eq!(
+                marker_reference_token(prose_or_data),
+                None,
+                "{prose_or_data}"
+            );
+        }
     }
 
     #[test]

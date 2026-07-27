@@ -1,7 +1,7 @@
 use bookforge_core::{
     config::{BatchConfig, ProviderRequestMetric, TranslationProfile},
     glossary::GlossaryFormat,
-    ir::BlockId,
+    ir::{BlockId, ProtectedSpan, ProtectedSpanKind, QaFindingSeverity},
     segment::{BlockTranslation, Segment, SegmentId, SegmentStatus, SegmentTextRun},
 };
 use std::collections::{HashMap, VecDeque, hash_map::Entry};
@@ -48,8 +48,7 @@ use planning::{
     repartition_pending_batches, set_batch_output_override, split_batch_with_config,
     take_batch_output_override, token_estimate,
 };
-#[cfg(test)]
-use rendering::batch_item_validation_error;
+pub use rendering::batch_item_validation_error;
 pub use rendering::parse_batch_response;
 use rendering::{parse_batch_response_with_validation, render_batch_items};
 
@@ -93,7 +92,7 @@ pub struct TranslationBatchItem {
     pub kind: String,
     pub source_text: String,
     pub text_runs: Vec<SegmentTextRun>,
-    pub protected_spans: Vec<String>,
+    pub protected_spans: Vec<ProtectedSpan>,
     pub required_markers: Vec<String>,
     pub checksum: String,
 }
@@ -113,10 +112,79 @@ pub struct BatchItemTranslation {
     pub item_id: String,
     pub segment_id: SegmentId,
     pub text: String,
+    /// Severity-prefixed findings carried by a successful item. Only warning
+    /// violations can reach this field.
+    pub warning: Option<String>,
     pub input_tokens: Option<u64>,
     pub input_cached_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub tokens_estimated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchItemValidationViolation {
+    pub severity: QaFindingSeverity,
+    pub protected_span_kind: Option<ProtectedSpanKind>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchItemValidationError {
+    violations: Vec<BatchItemValidationViolation>,
+    message: String,
+}
+
+impl BatchItemValidationError {
+    fn new(violations: Vec<BatchItemValidationViolation>) -> Option<Self> {
+        if violations.is_empty() {
+            return None;
+        }
+        let message = violations
+            .iter()
+            .map(|violation| violation.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(Self {
+            violations,
+            message,
+        })
+    }
+
+    pub fn violations(&self) -> &[BatchItemValidationViolation] {
+        &self.violations
+    }
+
+    pub fn has_errors(&self) -> bool {
+        self.violations
+            .iter()
+            .any(|violation| violation.severity == QaFindingSeverity::Error)
+    }
+
+    fn persistence_message(&self) -> String {
+        self.violations
+            .iter()
+            .map(|violation| format!("{}: {}", violation.severity.as_str(), violation.message))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    pub fn contains(&self, pattern: &str) -> bool {
+        self.message.contains(pattern)
+    }
+}
+
+impl std::fmt::Display for BatchItemValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::ops::Deref for BatchItemValidationError {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -237,6 +237,9 @@ impl JobStore {
                 params![error, job_id, segment_id],
             )?;
         }
+        // Findings are instrumentation, so a failed findings write must never
+        // fail the surrounding translation checkpoint.
+        let _ = self.record_segment_findings(job_id, segment_id, error);
         self.mark_job_failed(job_id)?;
         Ok(())
     }
@@ -247,7 +250,7 @@ impl JobStore {
         segment_id: &str,
         error: &str,
     ) -> Result<()> {
-        {
+        let updated = {
             let conn = self.conn.borrow();
             conn.execute(
                 "UPDATE segments
@@ -256,7 +259,12 @@ impl JobStore {
                    AND id = ?3
                    AND status NOT IN ('succeeded', 'skipped_cached', 'needs_review')",
                 params![error, job_id, segment_id],
-            )?;
+            )?
+        };
+        if updated > 0 {
+            // Findings are instrumentation, so a failed findings write must
+            // never fail the surrounding translation checkpoint.
+            let _ = self.record_segment_findings(job_id, segment_id, error);
         }
         self.mark_job_failed(job_id)?;
         Ok(())
@@ -279,7 +287,14 @@ impl JobStore {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql = format!(
+            let select_sql = format!(
+                "SELECT id FROM segments
+                 WHERE job_id = ?
+                   AND id IN ({placeholders})
+                   AND status NOT IN ('succeeded', 'skipped_cached', 'needs_review')
+                 ORDER BY id"
+            );
+            let update_sql = format!(
                 "UPDATE segments
                  SET status = 'failed', attempts = attempts + 1, error = ?
                  WHERE job_id = ?
@@ -287,14 +302,36 @@ impl JobStore {
                    AND status NOT IN ('succeeded', 'skipped_cached', 'needs_review')"
             );
 
-            let conn = self.conn.borrow();
-            let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(chunk.len() + 2);
-            params.push(&error);
-            params.push(&job_id);
-            for id in chunk {
-                params.push(id);
+            let (chunk_updated, failed_segment_ids) = {
+                let conn = self.conn.borrow();
+                let mut select_params: Vec<&dyn rusqlite::types::ToSql> =
+                    Vec::with_capacity(chunk.len() + 1);
+                select_params.push(&job_id);
+                for id in chunk {
+                    select_params.push(id);
+                }
+                let mut stmt = conn.prepare(&select_sql)?;
+                let failed_segment_ids = stmt
+                    .query_map(select_params.as_slice(), |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+
+                let mut update_params: Vec<&dyn rusqlite::types::ToSql> =
+                    Vec::with_capacity(chunk.len() + 2);
+                update_params.push(&error);
+                update_params.push(&job_id);
+                for id in chunk {
+                    update_params.push(id);
+                }
+                let chunk_updated = conn.execute(&update_sql, update_params.as_slice())?;
+                (chunk_updated, failed_segment_ids)
+            };
+            updated += chunk_updated;
+            for segment_id in failed_segment_ids {
+                // Findings are instrumentation, so a failed findings write
+                // must never fail the surrounding translation checkpoint.
+                let _ = self.record_segment_findings(job_id, &segment_id, error);
             }
-            updated += conn.execute(&sql, params.as_slice())?;
         }
 
         if updated > 0 {

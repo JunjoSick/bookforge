@@ -11,7 +11,7 @@ use bookforge_core::{
     GlossaryTerm, RunConfigSnapshot, segment::build_segments, target_matches, term_matches,
 };
 use bookforge_epub::read_epub;
-use bookforge_store::{JobRecord, JobStore};
+use bookforge_store::{JobRecord, JobStore, QaFindingCount, StoredQaFinding};
 use clap::Args;
 use serde::Serialize;
 
@@ -45,7 +45,26 @@ pub(crate) struct ReviewDocument {
     source_book_author: Option<String>,
     source_input_snapshot: Option<String>,
     totals: ReviewTotals,
+    /// Per-kind classification of every flagged segment, count-descending.
+    /// Mirrors what `bookforge status <job-id>` prints; both read the same
+    /// `qa_findings` rows so the two surfaces can never disagree.
+    finding_breakdown: Vec<ReviewFindingCount>,
     segments: Vec<ReviewSegment>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ReviewFindingCount {
+    kind: String,
+    severity: String,
+    count: usize,
+    share_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ReviewFinding {
+    kind: String,
+    severity: String,
+    message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +88,9 @@ pub(crate) struct ReviewSegment {
     human_corrected: bool,
     corrected_at: Option<String>,
     flagged: bool,
+    /// Structured QA findings persisted for this segment, one per distinct
+    /// failure parsed out of `segments.error`.
+    findings: Vec<ReviewFinding>,
     soft_warnings: Vec<ReviewWarning>,
     tokens: ReviewTokens,
     status: String,
@@ -160,6 +182,8 @@ pub(crate) fn generate_review_document(store: &JobStore, job_id: &str) -> Result
         &flagged_segment_ids,
         &summary,
         &glossary_terms,
+        &store.qa_finding_breakdown(&job.id)?,
+        &store.segment_qa_findings(&job.id)?,
     ))
 }
 
@@ -243,7 +267,21 @@ fn build_review_document(
     flagged_segment_ids: &std::collections::HashSet<String>,
     summary: &bookforge_store::JobSummary,
     glossary_terms: &[GlossaryTerm],
+    finding_counts: &[QaFindingCount],
+    stored_findings: &[StoredQaFinding],
 ) -> ReviewDocument {
+    let mut findings_by_segment: HashMap<&str, Vec<ReviewFinding>> = HashMap::new();
+    for finding in stored_findings {
+        findings_by_segment
+            .entry(finding.segment_id.as_str())
+            .or_default()
+            .push(ReviewFinding {
+                kind: finding.kind.clone(),
+                severity: finding.severity.clone(),
+                message: finding.message.clone(),
+            });
+    }
+
     let records_by_id = records
         .iter()
         .map(|record| (record.id.as_str(), record))
@@ -303,6 +341,10 @@ fn build_review_document(
                 corrected_at: stored_translation
                     .and_then(|translation| translation.corrected_at.clone()),
                 flagged: flagged_segment_ids.contains(&segment.id.0),
+                findings: findings_by_segment
+                    .get(segment.id.0.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
                 soft_warnings: soft_warnings(
                     record,
                     &segment.source.text,
@@ -349,8 +391,24 @@ fn build_review_document(
                 summary.output_tokens,
             ),
         },
+        finding_breakdown: review_finding_counts(finding_counts),
         segments: review_segments,
     }
+}
+
+/// Re-shape the store's breakdown for the review document, precomputing each
+/// kind's share so the HTML never has to derive percentages of its own.
+fn review_finding_counts(counts: &[QaFindingCount]) -> Vec<ReviewFindingCount> {
+    let total = counts.iter().map(|count| count.count).sum::<usize>();
+    counts
+        .iter()
+        .map(|count| ReviewFindingCount {
+            kind: count.kind.clone(),
+            severity: count.severity.clone(),
+            count: count.count,
+            share_percent: count.share_percent(total),
+        })
+        .collect()
 }
 
 fn soft_warnings(
@@ -563,6 +621,12 @@ body {
   background: var(--bg);
   color: var(--text);
   font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  /* Column layout so the flag breakdown strip can be inserted between the
+     header and the panes without the panes' height needing to know how tall
+     the chrome above them happens to be. */
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
 }
 header {
   position: sticky;
@@ -597,13 +661,40 @@ input[type="search"] {
   padding: 7px 9px;
   background: white;
 }
+.breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.breakdown[hidden] { display: none; }
+.breakdown-label { color: var(--muted); font-size: 12px; text-transform: uppercase; }
+.finding-chip {
+  position: relative;
+  overflow: hidden;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 9px 5px;
+  font-size: 12px;
+}
+.finding-chip[aria-pressed="true"] { border-color: var(--accent); background: #e7f5f2; }
+.chip-kind { font-weight: 600; }
+.chip-share { color: var(--muted); }
+.chip-bar { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--warn); }
+.finding-chip.sev-error .chip-bar { background: var(--bad); }
 .review-shell {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  height: calc(100vh - 64px);
+  flex: 1 1 auto;
+  min-height: 0;
 }
 .pane {
   overflow: auto;
+  min-height: 0;
   padding: 12px;
   border-right: 1px solid var(--line);
 }
@@ -647,11 +738,13 @@ input[type="search"] {
   padding: 1px 7px;
   font-size: 11px;
 }
-.badge.status-needs_review, .badge.status-failed, .badge.glossary-mismatch {
+.badge.status-needs_review, .badge.status-failed, .badge.glossary-mismatch,
+.badge.finding.sev-error {
   border-color: #fecaca;
   background: #fef2f2;
   color: var(--bad);
 }
+.badge.finding { border-style: dashed; }
 .flag-panel {
   display: none;
   margin-top: 10px;
@@ -673,7 +766,7 @@ footer { padding: 10px 16px; color: var(--muted); font-size: 12px; border-top: 1
 @media (max-width: 840px) {
   header { grid-template-columns: 1fr; }
   .toolbar { justify-content: flex-start; }
-  .review-shell { grid-template-columns: 1fr; height: auto; }
+  .review-shell { grid-template-columns: 1fr; flex: 0 0 auto; }
   .pane { height: 50vh; border-right: 0; border-bottom: 1px solid var(--line); }
   input[type="search"] { min-width: 0; width: 100%; }
   .suggestions { grid-template-columns: 1fr; }
@@ -708,6 +801,7 @@ const REVIEW_HTML_MIDDLE: &str = r#"
     <button id="export" class="primary">Export flags</button>
   </div>
 </header>
+<section class="breakdown" id="breakdown" hidden></section>
 <main class="review-shell">
   <section class="pane" id="sourcePane"><div class="pane-title">Source</div><div id="sourceList"></div></section>
   <section class="pane" id="targetPane"><div class="pane-title">Translation</div><div id="targetList"></div></section>
@@ -722,6 +816,7 @@ const REVIEW_HTML_SUFFIX: &str = r#"
 let data;
 let flags = {};
 let filter = "all";
+let filterKind = null;
 let syncing = false;
 
 const kinds = ["name", "register", "wrong_translation", "formatting", "tone", "other"];
@@ -756,6 +851,58 @@ function updateMeta() {
   document.getElementById("meta").textContent =
     `${data.provider}/${data.model} | ${totals.segments} segments | ${flagged} flagged | ` +
     `${totals.tokens_input} input, ${totals.tokens_input_cached} cached, ${totals.tokens_output} output tokens`;
+}
+
+function kindLabel(kind) {
+  return kind.replaceAll("_", " ");
+}
+
+// The per-kind strip is the whole point of the findings table: a single kind
+// holding most of the flags means one validator is misfiring, which is
+// invisible when every flag just reads "needs review".
+function renderBreakdown() {
+  const host = document.getElementById("breakdown");
+  host.textContent = "";
+  const rows = data.finding_breakdown || [];
+  host.hidden = rows.length === 0;
+  if (host.hidden) return;
+
+  const total = rows.reduce((sum, row) => sum + row.count, 0);
+  const label = document.createElement("span");
+  label.className = "breakdown-label";
+  label.textContent = `Flags by kind (${total})`;
+  host.appendChild(label);
+
+  for (const row of rows) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = `finding-chip sev-${row.severity}`;
+    chip.title = `${row.count} of ${total} findings (${row.severity})`;
+    chip.setAttribute("aria-pressed", String(filter === "kind" && filterKind === row.kind));
+
+    const name = document.createElement("span");
+    name.className = "chip-kind";
+    name.textContent = kindLabel(row.kind);
+    const share = document.createElement("span");
+    share.className = "chip-share";
+    share.textContent = `${row.count} · ${row.share_percent}%`;
+    const bar = document.createElement("span");
+    bar.className = "chip-bar";
+    bar.style.width = `${Math.max(2, row.share_percent)}%`;
+    chip.append(name, share, bar);
+
+    chip.addEventListener("click", () => {
+      if (filter === "kind" && filterKind === row.kind) {
+        filter = "all";
+        filterKind = null;
+      } else {
+        filter = "kind";
+        filterKind = row.kind;
+      }
+      render();
+    });
+    host.appendChild(chip);
+  }
 }
 
 function warningLabel(w) {
@@ -795,6 +942,13 @@ function renderSegment(segment, side) {
     const b = document.createElement("span");
     b.className = `badge status-${segment.status}`;
     b.textContent = segment.status.replaceAll("_", " ");
+    badges.appendChild(b);
+  }
+  for (const finding of segment.findings || []) {
+    const b = document.createElement("span");
+    b.className = `badge finding sev-${finding.severity}`;
+    b.textContent = kindLabel(finding.kind);
+    b.title = finding.message;
     badges.appendChild(b);
   }
   for (const warning of segment.soft_warnings) {
@@ -891,6 +1045,10 @@ function renderFlagPanel(segment) {
 function render() {
   document.getElementById("title").textContent = data.source_book_title || "BookForge Review";
   updateMeta();
+  renderBreakdown();
+  document.querySelectorAll("[data-filter]").forEach(button => {
+    button.classList.toggle("active", button.dataset.filter === filter);
+  });
   const query = document.getElementById("search").value.trim().toLowerCase();
   const sourceList = document.getElementById("sourceList");
   const targetList = document.getElementById("targetList");
@@ -904,6 +1062,7 @@ function render() {
        (filter === "flagged" && hasFlag) ||
        (filter === "warnings" && segment.soft_warnings.length > 0) ||
        (filter === "needs_review" && segment.status === "needs_review") ||
+       (filter === "kind" && (segment.findings || []).some(finding => finding.kind === filterKind)) ||
        (filter === "completed" && (segment.status === "succeeded" || segment.status === "skipped_cached")));
     if (!visible) continue;
     sourceList.appendChild(renderSegment(segment, "source"));
@@ -952,7 +1111,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.querySelectorAll("[data-filter]").forEach(button => {
     button.addEventListener("click", () => {
       filter = button.dataset.filter;
-      document.querySelectorAll("[data-filter]").forEach(b => b.classList.toggle("active", b === button));
+      filterKind = null;
       render();
     });
   });
@@ -982,6 +1141,30 @@ mod tests {
         let html = render_html(&json!({"schema_version": 1, "x": "<tag>"}).to_string());
         assert!(html.contains("embedded-review-json"));
         assert!(html.contains("\\u003ctag\\u003e"));
+    }
+
+    #[test]
+    fn review_finding_counts_precompute_each_kind_share() {
+        let counts = review_finding_counts(&[
+            QaFindingCount {
+                kind: "protected_span_missing".to_string(),
+                severity: "error".to_string(),
+                count: 478,
+            },
+            QaFindingCount {
+                kind: "source_copy_unchanged".to_string(),
+                severity: "warning".to_string(),
+                count: 191,
+            },
+        ]);
+
+        assert_eq!(counts[0].share_percent, 71.4);
+        assert_eq!(counts[1].share_percent, 28.6);
+    }
+
+    #[test]
+    fn review_finding_counts_are_empty_without_findings() {
+        assert!(review_finding_counts(&[]).is_empty());
     }
 
     #[test]

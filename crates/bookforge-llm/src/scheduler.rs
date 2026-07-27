@@ -5,7 +5,7 @@ use std::time::Duration;
 use bookforge_core::{
     config::{BatchConfig, ContextScope, ResolvedRunSettings, TranslationProfile},
     glossary::{GlossaryFormat, GlossaryPromptTerm},
-    ir::BlockId,
+    ir::{BlockId, ProtectedSpan},
     scheduler::SchedulerConfig,
     segment::{BlockTranslation, Segment, SegmentBlock, SegmentId, SegmentStatus},
 };
@@ -1368,7 +1368,11 @@ fn segment_run_block_to_json(block: &SegmentBlock) -> Value {
                 "text": run.text,
             }))
             .collect::<Vec<_>>(),
-        "protected_spans": block.protected_spans,
+        "protected_spans": block
+            .protected_spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -1387,7 +1391,7 @@ fn parse_and_validate(
                     segment.id.0, parsed.segment_id
                 )));
             }
-            let expected_spans: &[String] = segment
+            let expected_spans: &[ProtectedSpan] = segment
                 .source
                 .blocks
                 .first()
@@ -1652,12 +1656,16 @@ fn validation_retry_appendix(segment: &Segment, mode: TranslationMode, error: &s
     )
 }
 
-fn validate_protected_spans(segment: &Segment, spans: &[String], translation: &str) -> Result<()> {
+fn validate_protected_spans(
+    segment: &Segment,
+    spans: &[ProtectedSpan],
+    translation: &str,
+) -> Result<()> {
     for span in spans {
-        if !crate::validation::protected_span_present(span, translation) {
+        if !crate::validation::protected_span_present(&span.text, translation) {
             return Err(LlmError::InvalidResponse(format!(
                 "protected span missing from segment '{}': {}",
-                segment.id.0, span
+                segment.id.0, span.text
             )));
         }
     }
@@ -1782,7 +1790,7 @@ mod tests {
     use std::time::Duration;
 
     use bookforge_core::{
-        ir::SectionId,
+        ir::{ProtectedSpan, ProtectedSpanKind, SectionId},
         segment::{
             Segment, SegmentBlock, SegmentConstraints, SegmentContext, SegmentMetadata,
             SegmentSource, SegmentTextRun,
@@ -2112,7 +2120,10 @@ mod tests {
         let mut segment = segment("seg_a", 0, vec![("b0", "Visit https://example.com")]);
         segment.source.blocks[0]
             .protected_spans
-            .push("https://example.com".to_string());
+            .push(protected_span(
+                ProtectedSpanKind::Url,
+                "https://example.com",
+            ));
         segment
             .constraints
             .preserve_spans
@@ -2146,7 +2157,7 @@ mod tests {
         let mut segment = segment("seg_a", 0, vec![("b0", "The 4th day")]);
         segment.source.blocks[0]
             .protected_spans
-            .push("4th".to_string());
+            .push(protected_span(ProtectedSpanKind::Number, "4th"));
         segment.constraints.preserve_spans.push("4th".to_string());
 
         let translations = translate_segments(MissingProtectedSpanProvider, &[segment], &config())
@@ -2175,8 +2186,12 @@ mod tests {
     fn localized_decimal_protected_span_passes_validation() {
         let segment = segment("seg_a", 0, vec![("b0", "diameter 0.1 to 1 mm")]);
 
-        validate_protected_spans(&segment, &["0.1".to_string()], "diametro da 0,1 a 1 mm")
-            .expect("decimal comma localization should preserve numeric value");
+        validate_protected_spans(
+            &segment,
+            &[protected_span(ProtectedSpanKind::Number, "0.1")],
+            "diametro da 0,1 a 1 mm",
+        )
+        .expect("decimal comma localization should preserve numeric value");
     }
 
     #[test]
@@ -2185,7 +2200,7 @@ mod tests {
 
         validate_protected_spans(
             &segment,
-            &["-63.5".to_string()],
+            &[protected_span(ProtectedSpanKind::Number, "-63.5")],
             "il potenziale era circa –63,5 mV",
         )
         .expect("localized minus and decimal comma should preserve numeric value");
@@ -2197,7 +2212,7 @@ mod tests {
 
         validate_protected_spans(
             &segment,
-            &["1957,1989".to_string()],
+            &[protected_span(ProtectedSpanKind::Citation, "1957,1989")],
             "Skou (1957, 1989) isolò una ATPasi",
         )
         .expect("citation spacing should not count as a dropped numeric span");
@@ -2207,8 +2222,12 @@ mod tests {
     fn dangling_numeric_protected_span_passes_validation() {
         let segment = segment("seg_a", 0, vec![("b0", "The value was 10-")]);
 
-        validate_protected_spans(&segment, &["10-".to_string()], "7,3 × 10⁻⁷ mol cm⁻²")
-            .expect("dangling numeric extraction artifacts should not force review");
+        validate_protected_spans(
+            &segment,
+            &[protected_span(ProtectedSpanKind::Number, "10-")],
+            "7,3 × 10⁻⁷ mol cm⁻²",
+        )
+        .expect("dangling numeric extraction artifacts should not force review");
     }
 
     #[test]
@@ -2217,7 +2236,7 @@ mod tests {
 
         let error = validate_protected_spans(
             &segment,
-            &["5.16".to_string()],
+            &[protected_span(ProtectedSpanKind::Number, "5.16")],
             "Si noti che questa forma di rettificazione deriva dai canali aperti.",
         )
         .expect_err("absent numeric spans still need review");
@@ -2236,7 +2255,7 @@ mod tests {
         );
         segment.source.blocks[0]
             .protected_spans
-            .push("1".to_string());
+            .push(protected_span(ProtectedSpanKind::Number, "1"));
         segment.constraints.preserve_spans.push("1".to_string());
 
         let translations = translate_segments(
@@ -2482,6 +2501,27 @@ mod tests {
         assert!(rendered.user.contains("\"Aragorn\" -> \"Aragorn\""));
     }
 
+    #[test]
+    fn run_preserving_prompt_projects_protected_spans_to_text() {
+        let mut segment = segment("seg_a", 0, vec![("b0", "Chapter 42")]);
+        segment.source.blocks[0].protected_spans =
+            vec![protected_span(ProtectedSpanKind::Number, "42")];
+        segment.constraints.preserve_spans = vec!["42".to_string()];
+
+        let rendered = render_prompt(
+            &PromptLibrary::global().run_preserving,
+            &segment,
+            &config(),
+            TranslationMode::RunPreserving,
+            &[],
+        )
+        .expect("run-preserving prompt should render");
+
+        assert!(rendered.user.contains("42"));
+        assert!(!rendered.user.contains("\"kind\": \"Number\""));
+        assert!(!rendered.user.contains("\"kind\":\"Number\""));
+    }
+
     fn config() -> TranslationRunConfig {
         TranslationRunConfig {
             source_language: Some("English".to_string()),
@@ -2556,6 +2596,13 @@ mod tests {
                 max_tokens: 100,
             },
             checksum: id.to_string(),
+        }
+    }
+
+    fn protected_span(kind: ProtectedSpanKind, text: &str) -> ProtectedSpan {
+        ProtectedSpan {
+            kind,
+            text: text.to_string(),
         }
     }
 
