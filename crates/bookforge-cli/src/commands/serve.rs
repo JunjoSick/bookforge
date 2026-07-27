@@ -180,7 +180,12 @@ struct AppState {
     runtime_lease_stale_after: Duration,
     #[cfg(test)]
     resume_launches: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    resume_child_environments: Option<Arc<Mutex<Vec<CapturedChildEnvironment>>>>,
 }
+
+#[cfg(test)]
+type CapturedChildEnvironment = HashMap<OsString, Option<OsString>>;
 
 #[derive(Clone)]
 struct ElevenLabsVoiceCache {
@@ -307,6 +312,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         runtime_lease_stale_after: crate::control::RUNTIME_LEASE_STALE_AFTER,
         #[cfg(test)]
         resume_launches: None,
+        #[cfg(test)]
+        resume_child_environments: None,
     };
 
     let app = dashboard_router(state);
@@ -790,37 +797,45 @@ async fn resume_job(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
+    request: Option<Json<ResumeJobRequest>>,
 ) -> Result<Response, AppError> {
     if let Some(response) = reject_mutation(&headers, &state) {
         return Ok(response);
     }
+    let request = request.map(|Json(request)| request).unwrap_or_default();
     let store_path = state.store_path.clone();
     let lease_stale_after = state.runtime_lease_stale_after;
     let lookup = id.clone();
-    let action = tokio::task::spawn_blocking(move || -> Result<Option<(bool, bool, bool)>> {
+    let action = tokio::task::spawn_blocking(move || -> Result<Option<ResumeJobAction>> {
         let store = JobStore::open(&store_path)?;
         let Some(job) = store.get_job(&lookup)? else {
             return Ok(None);
         };
+        let snapshot = store.load_job_config_snapshot(&lookup)?;
         let live = matches!(
             crate::control::runtime_lease_state(&lookup, lease_stale_after),
             crate::control::RuntimeLeaseState::Fresh(_)
         );
         let resumable = !store.resumable_segment_ids(&lookup)?.is_empty()
-            || (job_status_has_unfinished_pipeline_work(&job.status)
-                && store.load_job_config_snapshot(&lookup)?.is_some());
+            || (job_status_has_unfinished_pipeline_work(&job.status) && snapshot.is_some());
         let force = !live && job.status == "paused";
-        Ok(Some((live, resumable, force)))
+        Ok(Some(ResumeJobAction {
+            live,
+            resumable,
+            force,
+            provider: job.provider,
+            api_key_env: snapshot.and_then(|snapshot| snapshot.api_key_env),
+        }))
     })
     .await??;
-    let Some((live, resumable, force)) = action else {
+    let Some(action) = action else {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such job" })),
         )
             .into_response());
     };
-    if live {
+    if action.live {
         let path = crate::control::request_job_control(&id, ControlCommand::Resume)?;
         return Ok(Json(json!({
             "command": "resume",
@@ -829,10 +844,27 @@ async fn resume_job(
         }))
         .into_response());
     }
-    if !resumable {
+    if !action.resumable {
         return Ok(bad_request(
             "the worker is not alive and this job has no resumable work",
         ));
+    }
+
+    let api_key_env = if action.provider == "mock" {
+        None
+    } else {
+        action
+            .api_key_env
+            .or_else(|| provider_key_env(&action.provider).map(str::to_string))
+    };
+    let key = resolve_dashboard_provider_key(
+        &state,
+        &action.provider,
+        request.api_key,
+        api_key_env.as_deref(),
+    )?;
+    if action.provider != "mock" && key.is_none() {
+        return Ok(missing_resume_key(&action.provider, api_key_env.as_deref()));
     }
 
     let Some(mut launch_claim) = crate::control::RuntimeLaunchClaim::acquire(&id)? else {
@@ -842,18 +874,6 @@ async fn resume_job(
         }))
         .into_response());
     };
-    #[cfg(test)]
-    if let Some(launches) = &state.resume_launches {
-        launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        launch_claim.persist_until_worker();
-        return Ok(Json(json!({
-            "command": "resume",
-            "mode": "spawned",
-            "pid": 0,
-            "forced": force,
-        }))
-        .into_response());
-    }
     let executable =
         std::env::current_exe().context("failed to locate the BookForge executable")?;
     let mut command = tokio::process::Command::new(executable);
@@ -865,7 +885,7 @@ async fn resume_job(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    if force {
+    if action.force {
         // A paused job normally expects to signal its original process. A
         // missing/stale lease proves that process is unavailable, so the
         // replacement must use the CLI's explicit dead-worker escape hatch.
@@ -875,6 +895,30 @@ async fn resume_job(
     {
         use std::os::windows::process::CommandExt;
         command.as_std_mut().creation_flags(0x0800_0000);
+    }
+    configure_dashboard_child_environment(&mut command, api_key_env.as_deref().zip(key.as_deref()));
+    #[cfg(test)]
+    if let Some(launches) = &state.resume_launches {
+        launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(environments) = &state.resume_child_environments {
+            let environment = command
+                .as_std()
+                .get_envs()
+                .map(|(name, value)| (name.to_os_string(), value.map(ToOwned::to_owned)))
+                .collect();
+            environments
+                .lock()
+                .map_err(|_| anyhow::anyhow!("resume environment recorder is unavailable"))?
+                .push(environment);
+        }
+        launch_claim.persist_until_worker();
+        return Ok(Json(json!({
+            "command": "resume",
+            "mode": "spawned",
+            "pid": 0,
+            "forced": action.force,
+        }))
+        .into_response());
     }
     let mut child = command.spawn().context("failed to launch resume worker")?;
     let pid = child.id();
@@ -890,9 +934,40 @@ async fn resume_job(
         "command": "resume",
         "mode": "spawned",
         "pid": pid,
-        "forced": force,
+        "forced": action.force,
     }))
     .into_response())
+}
+
+#[derive(Default, Deserialize)]
+struct ResumeJobRequest {
+    api_key: Option<String>,
+}
+
+struct ResumeJobAction {
+    live: bool,
+    resumable: bool,
+    force: bool,
+    provider: String,
+    api_key_env: Option<String>,
+}
+
+fn missing_resume_key(provider: &str, api_key_env: Option<&str>) -> Response {
+    let env_note = api_key_env
+        .map(|env| format!(" ({env})"))
+        .unwrap_or_default();
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": format!(
+                "API key for provider '{provider}'{env_note} is unavailable; supply it to resume this job"
+            ),
+            "requires_api_key": true,
+            "provider": provider,
+            "api_key_env": api_key_env,
+        })),
+    )
+        .into_response()
 }
 
 fn job_status_has_unfinished_pipeline_work(status: &str) -> bool {
@@ -959,11 +1034,11 @@ async fn dashboard_options() -> Json<DashboardOptions> {
 /// Launch a new translation from an uploaded EPUB.
 ///
 /// Runs the translation as a detached `bookforge translate` subprocess. The
-/// child inherits this process's environment and may receive a dashboard-supplied
-/// session key through the provider's normal key env var; key values are never
-/// placed on the command line. The job is matched back to the dashboard by its
-/// unique input path (returned to the client), since the run generates its own
-/// job id.
+/// child receives an allowlisted subset of this process's environment and may
+/// receive a dashboard-supplied session key through the provider's normal key env
+/// var; key values are never placed on the command line. The job is matched back
+/// to the dashboard by its unique input path (returned to the client), since the
+/// run generates its own job id.
 async fn launch_translate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1018,23 +1093,15 @@ async fn launch_translate(
         None
     };
 
-    // Resolve the API key: a freshly-supplied one is remembered for the session;
-    // otherwise reuse one already remembered for this provider or copy only that
-    // provider's key from the server environment into the scrubbed child.
     let supplied_key = (provider != "mock")
         .then(|| field_value(&fields, "api_key"))
         .flatten();
-    let key = if let Some(supplied) = supplied_key {
-        lock_keys(&state)?.insert(provider.clone(), supplied.clone());
-        Some(supplied)
-    } else {
-        lock_keys(&state)?.get(&provider).cloned()
-    }
-    .or_else(|| {
-        provider_key_env(&provider)
-            .and_then(|env| std::env::var(env).ok())
-            .filter(|value| !value.is_empty())
-    });
+    let key = resolve_dashboard_provider_key(
+        &state,
+        &provider,
+        supplied_key,
+        provider_key_env(&provider),
+    )?;
     if provider != "mock" && key.is_none() {
         return Ok(bad_request("provider API key is required"));
     }
@@ -2283,6 +2350,34 @@ fn provider_key_env(provider: &str) -> Option<&'static str> {
         .find_map(|(known, env)| (*known == provider).then_some(*env))
 }
 
+/// Resolve a translation provider key without persisting it.
+///
+/// A key supplied by the browser replaces the session's remembered key for that
+/// provider. Otherwise the session key wins over the one expected in the serve
+/// process's environment. Callers still choose the env-var name injected into
+/// the scrubbed child, which lets resume honor the run snapshot.
+fn resolve_dashboard_provider_key(
+    state: &AppState,
+    provider: &str,
+    supplied_key: Option<String>,
+    expected_env: Option<&str>,
+) -> Result<Option<String>> {
+    let supplied_key = supplied_key.and_then(|key| {
+        let key = key.trim();
+        (!key.is_empty()).then(|| key.to_string())
+    });
+    if let Some(supplied_key) = supplied_key {
+        lock_keys(state)?.insert(provider.to_string(), supplied_key.clone());
+        return Ok(Some(supplied_key));
+    }
+    if let Some(remembered_key) = lock_keys(state)?.get(provider).cloned() {
+        return Ok(Some(remembered_key));
+    }
+    Ok(expected_env
+        .and_then(|env| std::env::var(env).ok())
+        .filter(|value| !value.is_empty()))
+}
+
 fn configure_dashboard_child_environment(
     command: &mut tokio::process::Command,
     provider_key: Option<(&str, &str)>,
@@ -3024,6 +3119,7 @@ mod tests {
             store_path: default_store_path(),
             runtime_lease_stale_after: crate::control::RUNTIME_LEASE_STALE_AFTER,
             resume_launches: None,
+            resume_child_environments: None,
         }
     }
 
@@ -3676,14 +3772,14 @@ mod tests {
     fn dashboard_assets_reassemble_byte_stably() {
         use sha2::{Digest, Sha256};
 
-        assert_eq!(DASHBOARD_HTML.len(), 106_532);
+        assert_eq!(DASHBOARD_HTML.len(), 107_870);
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
         let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
         let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
             digest_hex,
-            "3f1e6871c57ebf35c08c6e25d57c0ba4a6379f6105755660f0dddb8d7bae2de8"
+            "244cdd95024bcbd88009b9c3e5c27dbe689935980f158e9b1472aec75974267b"
         );
 
         let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");
@@ -3706,6 +3802,8 @@ mod tests {
             "function bfReviewRetrySubmit",
             "Stop the job before queuing a retry",
             "function bfReviewStopForRetry",
+            "function showResumeKeyEntry",
+            "function bfResumeWithKey",
         ] {
             assert!(DASHBOARD_HTML.contains(marker), "missing {marker}");
         }
@@ -3821,6 +3919,14 @@ mod tests {
     }
 
     fn build_mutation_fixture() -> MutationFixture {
+        build_mutation_fixture_for_provider("mock", "mock-identity", None)
+    }
+
+    fn build_mutation_fixture_for_provider(
+        provider: &str,
+        model: &str,
+        api_key_env: Option<&str>,
+    ) -> MutationFixture {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let input_path = temp.path().join("input.epub");
         build_fixture_epub(&input_path);
@@ -3834,10 +3940,10 @@ mod tests {
                 output: &output_path,
                 source_lang: Some("English"),
                 target_lang: "Italian",
-                provider: "mock",
-                model: "mock-identity",
+                provider,
+                model,
                 base_url: None,
-                api_key_env: None,
+                api_key_env,
                 book_id: None,
                 series_id: None,
             })
@@ -3864,7 +3970,7 @@ mod tests {
         );
 
         store
-            .insert_segments(&job.id, &segments, "v1", "mock", "mock-identity", "test_ns")
+            .insert_segments(&job.id, &segments, "v1", provider, model, "test_ns")
             .expect("segments should insert");
 
         for segment in &segments {
@@ -3892,8 +3998,8 @@ mod tests {
                     input_cached_tokens: Some(0),
                     output_tokens: Some(12),
                     tokens_estimated: false,
-                    provider: "mock",
-                    model: "mock-identity",
+                    provider,
+                    model,
                     prompt_version: "v1",
                 })
                 .expect("translation should save");
@@ -3913,10 +4019,10 @@ mod tests {
             source_language: Some("English".to_string()),
             target_language: "Italian".to_string(),
             creator: None,
-            provider: "mock".to_string(),
-            model: "mock-identity".to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
             base_url: None,
-            api_key_env: None,
+            api_key_env: api_key_env.map(str::to_string),
             profile: settings.profile,
             provider_preset: None,
             prompt_version: "v1".to_string(),
@@ -4205,6 +4311,155 @@ mod tests {
             .expect("control file should read"),
             bookforge_core::ControlCommand::Resume
         );
+
+        clean_runtime_files(&fixture.job_id);
+    }
+
+    #[tokio::test]
+    async fn dashboard_resume_uses_remembered_key_in_scrubbed_child_environment() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const KEY_ENV: &str = "BOOKFORGE_SERVE_TEST_DEEPSEEK_KEY";
+        const SESSION_KEY: &str = "dashboard-session-key";
+
+        let fixture =
+            build_mutation_fixture_for_provider("deepseek", "deepseek-chat", Some(KEY_ENV));
+        make_stopped_fixture_resumable(&fixture);
+        clean_runtime_files(&fixture.job_id);
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let environments = Arc::new(Mutex::new(Vec::new()));
+        let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+        lock_keys(&state).expect("key store should lock").extend([
+            ("deepseek".to_string(), SESSION_KEY.to_string()),
+            (
+                "openrouter".to_string(),
+                "unrelated-session-key".to_string(),
+            ),
+        ]);
+        state.resume_launches = Some(launches.clone());
+        state.resume_child_environments = Some(environments.clone());
+        let router = dashboard_router(state);
+
+        let response = post_json(
+            &router,
+            &format!("/api/jobs/{}/resume", fixture.job_id),
+            Some(&fixture.csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["mode"], "spawned");
+        assert!(!response.to_string().contains(SESSION_KEY));
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+
+        let environments = environments.lock().expect("environments should lock");
+        let environment = environments
+            .first()
+            .expect("one resume environment should be captured");
+        assert_eq!(
+            environment
+                .get(std::ffi::OsStr::new(KEY_ENV))
+                .and_then(|value| value.as_deref()),
+            Some(std::ffi::OsStr::new(SESSION_KEY))
+        );
+        for (_, unrelated_env) in PROVIDER_KEY_ENVS {
+            assert!(
+                !environment.contains_key(std::ffi::OsStr::new(unrelated_env)),
+                "{unrelated_env} must not leak into the resume child"
+            );
+        }
+
+        clean_runtime_files(&fixture.job_id);
+    }
+
+    #[tokio::test]
+    async fn dashboard_resume_without_required_key_returns_actionable_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const KEY_ENV: &str = "BOOKFORGE_SERVE_TEST_MISSING_OPENROUTER_KEY_9C71";
+        let fixture =
+            build_mutation_fixture_for_provider("openrouter", "openrouter/auto", Some(KEY_ENV));
+        make_stopped_fixture_resumable(&fixture);
+        clean_runtime_files(&fixture.job_id);
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+        state.resume_launches = Some(launches.clone());
+        let router = dashboard_router(state);
+
+        let response = post_json(
+            &router,
+            &format!("/api/jobs/{}/resume", fixture.job_id),
+            Some(&fixture.csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = response_json(response).await;
+        assert_eq!(response["requires_api_key"], true);
+        assert_eq!(response["provider"], "openrouter");
+        assert_eq!(response["api_key_env"], KEY_ENV);
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("supply it to resume")
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+
+        clean_runtime_files(&fixture.job_id);
+    }
+
+    #[tokio::test]
+    async fn dashboard_resume_accepts_and_remembers_replacement_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const KEY_ENV: &str = "BOOKFORGE_SERVE_TEST_RESUPPLIED_OPENROUTER_KEY";
+        const REPLACEMENT_KEY: &str = "replacement-dashboard-key";
+
+        let fixture =
+            build_mutation_fixture_for_provider("openrouter", "openrouter/auto", Some(KEY_ENV));
+        make_stopped_fixture_resumable(&fixture);
+        clean_runtime_files(&fixture.job_id);
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let environments = Arc::new(Mutex::new(Vec::new()));
+        let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+        let keys = state.keys.clone();
+        state.resume_launches = Some(launches.clone());
+        state.resume_child_environments = Some(environments.clone());
+        let router = dashboard_router(state);
+
+        let response = post_json(
+            &router,
+            &format!("/api/jobs/{}/resume", fixture.job_id),
+            Some(&fixture.csrf),
+            json!({ "api_key": REPLACEMENT_KEY }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["mode"], "spawned");
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            keys.lock()
+                .expect("key store should lock")
+                .get("openrouter")
+                .map(String::as_str),
+            Some(REPLACEMENT_KEY)
+        );
+        let environments = environments.lock().expect("environments should lock");
+        let environment = environments
+            .first()
+            .expect("one resume environment should be captured");
+        assert_eq!(
+            environment
+                .get(std::ffi::OsStr::new(KEY_ENV))
+                .and_then(|value| value.as_deref()),
+            Some(std::ffi::OsStr::new(REPLACEMENT_KEY))
+        );
+        assert!(!environment.contains_key(std::ffi::OsStr::new("DEEPSEEK_API_KEY")));
 
         clean_runtime_files(&fixture.job_id);
     }
