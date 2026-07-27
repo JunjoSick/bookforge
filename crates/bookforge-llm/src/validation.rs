@@ -219,6 +219,14 @@ pub(crate) fn source_copy_validation_error(
     None
 }
 
+pub(crate) fn empty_translation_validation_error(
+    source: &str,
+    translation: &str,
+) -> Option<&'static str> {
+    (!source.trim().is_empty() && translation.trim().is_empty())
+        .then_some("empty translation for non-empty source")
+}
+
 /// Conservative hard gates for the built-in Toki Pona style. These checks
 /// deliberately cover failures that can be detected without judging the
 /// translation's politics or semantic choices: source-language leakage,

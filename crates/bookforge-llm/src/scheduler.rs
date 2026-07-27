@@ -1398,6 +1398,12 @@ fn parse_and_validate(
                 .map(|block| block.protected_spans.as_slice())
                 .unwrap_or(&[]);
             let translation = parsed.translation;
+            if let Some(error) = crate::validation::empty_translation_validation_error(
+                &segment.source.text,
+                &translation,
+            ) {
+                return Err(LlmError::InvalidResponse(error.to_string()));
+            }
             validate_protected_spans(segment, expected_spans, &translation)?;
             if validate_source_copy
                 && let Some(error) = crate::validation::source_copy_validation_error(
@@ -1462,6 +1468,15 @@ fn parse_and_validate(
                                 segment.id.0, source_block.block_id.0
                             ))
                         })?;
+                if let Some(error) = crate::validation::empty_translation_validation_error(
+                    &source_block.text,
+                    &translation,
+                ) {
+                    return Err(LlmError::InvalidResponse(format!(
+                        "segment '{}' block '{}': {error}",
+                        segment.id.0, source_block.block_id.0
+                    )));
+                }
                 let expected_markers = marker_ids_in_text(&source_block.text);
                 validate_markers(segment, &expected_markers, &translation)?;
                 validate_protected_spans(segment, &source_block.protected_spans, &translation)?;
@@ -1525,6 +1540,14 @@ fn parse_and_validate(
                         ))
                     })?;
                 let text = validate_and_join_runs(segment, source_block, block.translated_runs)?;
+                if let Some(error) =
+                    crate::validation::empty_translation_validation_error(&source_block.text, &text)
+                {
+                    return Err(LlmError::InvalidResponse(format!(
+                        "segment '{}' block '{}': {error}",
+                        segment.id.0, source_block.block_id.0
+                    )));
+                }
                 let expected_markers = marker_ids_in_text(&source_block.text);
                 validate_markers(segment, &expected_markers, &text)?;
                 validate_protected_spans(segment, &source_block.protected_spans, &text)?;
@@ -1865,6 +1888,89 @@ mod tests {
             .expect_err("long unchanged source prose should fail");
 
         assert!(error.to_string().contains("source-language prose"));
+    }
+
+    #[test]
+    fn non_batch_plain_rejects_whitespace_translation_for_non_empty_source() {
+        let segment = segment("seg_a", 0, vec![("b0", "Visible prose")]);
+        let response = serde_json::json!({
+            "segment_id": "seg_a",
+            "translation": " \n\t",
+        })
+        .to_string();
+
+        let error = parse_and_validate(&response, &segment, TranslationMode::Plain, false)
+            .expect_err("whitespace-only translation must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("empty translation for non-empty source")
+        );
+    }
+
+    #[test]
+    fn non_batch_marker_safe_rejects_empty_translation_for_non_empty_source() {
+        let segment = segment(
+            "seg_a",
+            0,
+            vec![("b0", "First paragraph."), ("b1", "Second paragraph.")],
+        );
+        let response = serde_json::json!({
+            "segment_id": "seg_a",
+            "blocks": [
+                {"block_id": "b0", "translation": "Primo paragrafo."},
+                {"block_id": "b1", "translation": ""},
+            ],
+        })
+        .to_string();
+
+        let error = parse_and_validate(&response, &segment, TranslationMode::MarkerSafe, false)
+            .expect_err("empty non-empty block translation must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("empty translation for non-empty source")
+        );
+    }
+
+    #[test]
+    fn non_batch_marker_safe_allows_genuinely_empty_source_block() {
+        let segment = segment("seg_a", 0, vec![("b0", ""), ("b1", "Second paragraph.")]);
+        let response = serde_json::json!({
+            "segment_id": "seg_a",
+            "blocks": [
+                {"block_id": "b0", "translation": " \n"},
+                {"block_id": "b1", "translation": "Secondo paragrafo."},
+            ],
+        })
+        .to_string();
+
+        let blocks = parse_and_validate(&response, &segment, TranslationMode::MarkerSafe, false)
+            .expect("an empty source block may have an empty translation");
+
+        assert_eq!(blocks[0].text, " \n");
+        assert_eq!(blocks[1].text, "Secondo paragrafo.");
+    }
+
+    #[tokio::test]
+    async fn empty_plain_translation_never_returns_cache_eligible_success() {
+        let segments = vec![segment("seg_a", 0, vec![("b0", "Visible prose")])];
+
+        let translations = translate_segments(WhitespaceTranslationProvider, &segments, &config())
+            .await
+            .expect("validation failure should become NeedsReview");
+
+        assert_eq!(translations.len(), 1);
+        assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
+        assert!(
+            translations[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("empty translation for non-empty source"))
+        );
+        assert_eq!(translations[0].blocks[0].text, "Visible prose");
     }
 
     #[tokio::test]
@@ -2618,6 +2724,34 @@ mod tests {
             ProviderCapabilities {
                 supports_json_response_format: true,
                 supports_usage_tokens: false,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct WhitespaceTranslationProvider;
+
+    impl LlmProvider for WhitespaceTranslationProvider {
+        async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+            Ok(CompletionResponse {
+                content: serde_json::json!({
+                    "segment_id": request.metadata.segment_id.unwrap_or_default(),
+                    "translation": " \n\t",
+                })
+                .to_string(),
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(1),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 0,
+                raw: serde_json::json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
             }
         }
     }
