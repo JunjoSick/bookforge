@@ -458,12 +458,13 @@ function audioProviderOption(id) {
       default_voice:"mock", formats:["wav"], default_format:"wav", requires_key:false,
       requires_voice:false, supports_auto_model:false, supports_instructions:false, supports_speed:true, max_chars:40000 };
 }
+// Per-model ceilings come from /api/options, which sources them from the same
+// Rust function the synthesis path uses. Do not reintroduce a table here: a
+// second copy of a provider's limits will drift from the first.
 function audioProviderMaxChars(provider, model) {
-  if (provider.id === "elevenlabs") {
-    const limits = { eleven_v3:5000, eleven_multilingual_v1:10000, eleven_multilingual_v2:10000,
-      eleven_flash_v2:30000, eleven_turbo_v2:30000, eleven_flash_v2_5:40000, eleven_turbo_v2_5:40000 };
-    return limits[model] || 10000;
-  }
+  const perModel = provider.model_max_chars || {};
+  const limit = Number(perModel[model]);
+  if (Number.isFinite(limit) && limit > 0) return limit;
   return Math.max(1, Number(provider.max_chars) || 4096);
 }
 function bfAudioProvider(id) {
