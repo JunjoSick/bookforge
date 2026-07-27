@@ -35,10 +35,13 @@ local browser dashboard started by `bookforge serve`.
    time, writing `chapter-NNN-part-NNN-<hash>.<ext>` atomically (temp file then
    rename) so an interrupted write is never mistaken for a finished one.
 6. **Manifest**: a schema-3 `manifest.json` records the plan, narration kind,
-   synthesis settings, gap settings, author, and per-chunk metadata.
-7. **Assemble**: when ffmpeg is available, a normal run creates a chaptered
-   `audiobook.m4b` with chapter markers and title/artist metadata (using the
-   EPUB author as the artist). The chunks remain the resumable units on disk.
+   synthesis settings, gap settings, author, and each chunk's success or
+   failure. Provider/content failures do not cancel unrelated paid work; the
+   run finishes the remaining chunks, records every error, and exits as failed.
+7. **Assemble**: only a fully synthesized manifest is assembled. When ffmpeg is
+   available, a normal run creates a chaptered `audiobook.m4b` with chapter
+   markers and title/artist metadata (using the EPUB author as the artist). The
+   chunks remain the resumable units on disk.
 
 ## Narration hierarchy and continuity
 
@@ -154,6 +157,7 @@ aloud instead of treating them as directives.
 | `--list-voices` | off | List ElevenLabs voice IDs and metadata; no input EPUB is required. |
 | `--dry-run` | off | Print the chapter/chunk plan, cost estimate, and available quota, then exit. |
 | `--prune` | off | Delete superseded chunks not used by the current plan (report-only with `--dry-run`). |
+| `--retry-failed` | off | Call the provider only for chunks recorded as failed in the previous matching manifest. |
 | `--ui <auto\|progress\|quiet\|json\|tui>` | `auto` | Select progress output or the full-screen terminal dashboard. |
 
 Chapter numbers are the one-based numbers shown in the plan. Comma-separated
@@ -232,14 +236,43 @@ If ffmpeg is unavailable, BookForge keeps the completed chunks and warns that
 it could not create the automatic book file. An explicitly requested `--m4b`
 fails clearly while preserving those chunks for a later resumed stitch.
 
+ffmpeg writes each chapter, `.m4b`, flat book file, and reusable silence clip
+to a private sibling path first. A successful encode atomically replaces the
+public filename; a failed encode removes the staged file and leaves any older
+good artifact untouched. Failure messages include a bounded tail of ffmpeg's
+stderr. If ffprobe cannot determine every chapter duration, BookForge does not
+publish an unchaptered `.m4b` under the promised chaptered filename.
+
+Explicit whole-book requests are strict: `--m4b` and `--single` make the
+command fail if their requested artifacts are absent. The established
+best-effort contract for `--stitch` and automatic M4B assembly remains
+non-fatal (so completed synthesis is still reusable when ffmpeg is absent or
+fails). JSON adds `"deliverable_status": "partial"` plus itemized
+`deliverable_errors`; post-processing failures use overall `"status":
+"partial"` (or `"failed"` for strict outputs). For backward compatibility, the
+specific `--stitch`-with-no-ffmpeg case retains overall `"status":
+"succeeded"` to mean synthesis succeeded, while its deliverable status and
+warnings still state that no chapter files exist. Dashboard-launched runs copy
+stitch warnings into the additive `warnings` array in `process.json`.
+
 ## Resume and cache cleanup
 
 Re-run the same command and every matching hashed chunk already on disk is
-skipped. The `bookforge-audio-v2` cache key covers the text, narration kind,
+skipped. A normal resume repairs every missing or invalid cache entry. After a
+partial failure, add `--retry-failed` for the stronger paid-run guarantee: only
+records whose prior status is `failed` may call the provider. Previously
+successful records are validated against the manifest's byte count and SHA-256
+hash; if one is missing or changed, failed-only mode reports it rather than
+silently paying to regenerate it.
+
+The `bookforge-audio-v2` cache key covers the text, narration kind,
 provider/model identity, voice, format, speed, instructions, seed, language,
-normalization, and same-chapter neighbor context. An interrupted write is
-never accepted as a finished chunk. The run summary reports how many chunks
-were synthesized and reused.
+normalization, and same-chapter neighbor context. An interrupted chunk write is
+never accepted as finished. Manifest updates are serialized off the async
+synthesis workers, checkpointed in small batches, and always flushed for a
+failure, cancellation, and final outcome. The audio files remain the durable
+resume source if a process stops between a chunk rename and the next batched
+manifest checkpoint.
 
 Superseded chunks stay on disk so prior generations remain auditable. Pass
 `--prune` to remove chunk files the current run does not use and free the
