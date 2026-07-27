@@ -22,9 +22,9 @@ pub mod stitch;
 pub mod text;
 
 pub use builder::{
-    AudiobookManifest, AudiobookOptions, AudiobookReport, AudiobookStatus, BuildError, ChunkRecord,
-    ChunkStatus, GapSettings, Progress, build_audiobook, plan_chunks, plan_chunks_for_prune,
-    validate_options,
+    AudiobookManifest, AudiobookOptions, AudiobookReport, AudiobookStatus, BuildError,
+    ChunkFailure, ChunkRecord, ChunkStatus, GapSettings, Progress, build_audiobook,
+    failed_chunk_files, plan_chunks, plan_chunks_for_prune, validate_options,
 };
 pub use cleanup::{StaleChunk, find_stale_chunks, remove_stale_chunks};
 pub use provider::{
