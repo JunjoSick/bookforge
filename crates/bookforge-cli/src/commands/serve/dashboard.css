@@ -61,6 +61,11 @@ main{min-height:calc(100vh - 60px)}
 .bar-track{height:5px;border-radius:3px;background:var(--chip);overflow:hidden}
 .bar-fill{height:100%;border-radius:3px;background:var(--accent)}
 .book-action{font:500 12.5px var(--sans);color:var(--accent);white-space:nowrap;align-self:flex-start}
+.book-actions{display:flex;flex-direction:column;align-items:flex-end;gap:9px;white-space:nowrap}
+.narrate-action{border:0;background:transparent;padding:0;font:600 11px var(--sans);color:var(--muted);cursor:pointer}
+.narrate-action:hover{color:var(--accent)}
+.library-actions{display:flex;align-items:center;gap:9px}
+.audio-cover{background:linear-gradient(150deg,var(--good),var(--accent))}
 .add-card{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:22px;border:1.5px dashed var(--line);border-radius:14px;cursor:pointer;background:var(--soft);min-height:112px;text-align:center}
 .add-card .plus{font-size:26px;line-height:1;color:var(--accent)}
 .add-card b{font:600 14px var(--sans);color:var(--ink);margin-top:8px}
@@ -71,6 +76,7 @@ main{min-height:calc(100vh - 60px)}
 .badge.paused{color:var(--warn);background:var(--chip)}
 .badge.stopped{color:var(--danger);background:var(--accentsoft)}
 .badge.done,.badge.completed,.badge.succeeded{color:var(--good);background:var(--goodbg)}
+.badge.succeededwithwarnings{color:var(--warn);background:var(--chip)}
 .badge.failed,.badge.error{color:var(--danger);background:var(--accentsoft)}
 
 /* wizard */
@@ -171,6 +177,9 @@ main{min-height:calc(100vh - 60px)}
 .audio-chapter-title{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
 .audio-chapter-count{font:500 11px var(--mono);color:var(--faint)}
 .audio-player{width:min(330px,45vw);height:38px}
+.audio-warnings{margin:0 0 16px;padding:13px 15px;border:1px solid var(--warn);border-radius:10px;background:var(--chip);color:var(--muted);font:500 12px/1.5 var(--sans)}
+.audio-warnings-title{margin-bottom:5px;color:var(--warn);font-weight:700}
+.audio-warning+.audio-warning{margin-top:4px}
 .audio-advanced{margin-top:8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
 .audio-advanced summary{padding:13px 4px;cursor:pointer;font:600 13px var(--sans);color:var(--muted)}
 .audio-advanced-body{padding:4px 2px 16px}

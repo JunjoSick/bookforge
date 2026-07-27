@@ -80,6 +80,31 @@ double-check requests honoring the controls. The dashboard registers
 reconfiguration through both `GET /api/jobs/{id}/reconfigure` and
 `POST /api/jobs/{id}/reconfigure`.
 
+## Update (2026-07-27): audiobook library and workflow parity
+
+Audiobooks are durable Library entries rather than browser-local operations.
+`GET /api/audiobooks` scans `.bookforge/serve-uploads/audiobook-{id}/` for
+`manifest.json` and `process.json`, returning compact newest-first summaries;
+`GET /api/audiobooks/{id}` remains the full progress view. The Library renders
+translation and audiobook cards together, including a defensive
+**Succeeded with warnings** outcome when a newer audiobook child records stitch
+warnings in `process.json`.
+
+Finished translation cards expose **Narrate this book**. The existing multipart
+`POST /api/audiobook/estimate` and `POST /api/audiobook` routes accept a
+`source_job_id` as an alternative to a file upload. The server resolves that
+job's finished output EPUB from `JobStore`; the browser cannot submit a general
+server filesystem path.
+
+Operational gaps closed in the same pass:
+
+- `POST /api/audiobooks/{id}/cancel` falls back to the persisted child PID after
+  a dashboard restart when no in-memory cancellation token remains.
+- `GET /api/audiobooks/{id}/artifact` supports one byte range, returning `206`
+  with `Content-Range` or `416` with `Content-Range: bytes */length`.
+- A later `JobCreated` in an appended resume event log clears the prior
+  `TranslationFinished` terminal fields, so SSE follows the new run epoch.
+
 ## Archived Original Plan
 
 The remainder of this file is the original planning note. It is intentionally

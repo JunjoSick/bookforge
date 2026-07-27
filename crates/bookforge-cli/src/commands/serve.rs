@@ -157,6 +157,10 @@ struct AppState {
     refresh: Duration,
     csrf_token: String,
     host_port: u16,
+    /// Root for browser uploads and audiobook operation directories. Production
+    /// uses [`UPLOAD_DIR`]; tests inject a temp directory so route coverage does
+    /// not race through the process-global working directory.
+    upload_dir: PathBuf,
     /// Provider → API key, supplied via the dashboard. Held only in memory for
     /// the lifetime of the server: never written to disk, never logged, and
     /// only injected into spawned runs through the child's environment.
@@ -182,6 +186,8 @@ struct AppState {
     resume_launches: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     resume_child_environments: Option<Arc<Mutex<Vec<CapturedChildEnvironment>>>>,
+    #[cfg(test)]
+    audio_restart_cancels: Option<Arc<Mutex<Vec<u32>>>>,
 }
 
 #[cfg(test)]
@@ -305,6 +311,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         refresh: Duration::from_millis(args.refresh_ms.clamp(50, 5_000)),
         csrf_token: generate_csrf_token()?,
         host_port: local.port(),
+        upload_dir: PathBuf::from(UPLOAD_DIR),
         keys: Arc::new(Mutex::new(HashMap::new())),
         elevenlabs_voices: Arc::new(Mutex::new(None)),
         audio_cancels: Arc::new(Mutex::new(HashMap::new())),
@@ -314,6 +321,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         resume_launches: None,
         #[cfg(test)]
         resume_child_environments: None,
+        #[cfg(test)]
+        audio_restart_cancels: None,
     };
 
     let app = dashboard_router(state);
@@ -371,6 +380,7 @@ fn dashboard_router(state: AppState) -> Router {
         .route("/api/translate", post(launch_translate))
         .route("/api/audiobook/estimate", post(estimate_audiobook))
         .route("/api/audiobook", post(launch_audiobook))
+        .route("/api/audiobooks", get(list_audiobooks))
         .route("/api/audiobooks/{id}", get(audiobook_status))
         .route("/api/audiobooks/{id}/cancel", post(cancel_audiobook))
         .route("/api/audiobooks/{id}/artifact", get(audiobook_artifact))
@@ -1108,7 +1118,7 @@ async fn launch_translate(
 
     let stem = sanitize_component(strip_epub_suffix(&file_name));
     let tag = format!("{}-{stem}", now_ms());
-    let upload_dir = PathBuf::from(UPLOAD_DIR);
+    let upload_dir = state.upload_dir.clone();
     std::fs::create_dir_all(&upload_dir)?;
     let input_path = upload_dir.join(format!("{tag}.epub"));
     std::fs::write(&input_path, &bytes)?;
@@ -1210,9 +1220,69 @@ async fn launch_translate(
     .into_response())
 }
 
-/// Plan audiobook synthesis from an uploaded EPUB without making provider
-/// requests. Parsing and chunk construction are blocking, so both happen off
-/// the async worker after the upload has been saved to a temporary path.
+struct AudiobookSource {
+    bytes: Vec<u8>,
+    file_name: String,
+}
+
+/// Resolve either a direct browser upload or the output of a finished
+/// translation. The latter is addressed by job id rather than by a
+/// browser-supplied filesystem path, keeping the handoff scoped to records the
+/// server already trusts.
+async fn resolve_audiobook_source(
+    state: &AppState,
+    fields: &HashMap<String, String>,
+    file_bytes: Option<Vec<u8>>,
+    file_name: String,
+) -> Result<AudiobookSource> {
+    if let Some(bytes) = file_bytes.filter(|bytes| !bytes.is_empty()) {
+        return Ok(AudiobookSource { bytes, file_name });
+    }
+
+    let source_job_id = field_value(fields, "source_job_id")
+        .context("upload an EPUB file or choose a finished translation")?;
+    let store_path = state.store_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<AudiobookSource> {
+        let store = JobStore::open(store_path)?;
+        let job = store
+            .get_job(&source_job_id)?
+            .with_context(|| format!("no translation job '{source_job_id}'"))?;
+        if job.status != "succeeded" {
+            anyhow::bail!("translation must be finished before it can be narrated");
+        }
+        let metadata = std::fs::metadata(&job.output_path).with_context(|| {
+            format!(
+                "translated EPUB is not available at {}",
+                job.output_path.display()
+            )
+        })?;
+        if metadata.len() > MAX_UPLOAD_BYTES as u64 {
+            anyhow::bail!("translated EPUB exceeds the dashboard upload limit");
+        }
+        let file_name = job
+            .output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("translated.epub")
+            .to_string();
+        let bytes = std::fs::read(&job.output_path).with_context(|| {
+            format!(
+                "failed to read translated EPUB at {}",
+                job.output_path.display()
+            )
+        })?;
+        if bytes.is_empty() {
+            anyhow::bail!("translated EPUB is empty");
+        }
+        Ok(AudiobookSource { bytes, file_name })
+    })
+    .await?
+}
+
+/// Plan audiobook synthesis from an uploaded EPUB or finished translation
+/// without making provider requests. Parsing and chunk construction are
+/// blocking, so both happen off the async worker after the source has been
+/// saved to a temporary path.
 async fn estimate_audiobook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1223,18 +1293,24 @@ async fn estimate_audiobook(
     }
 
     let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name = "upload.epub".to_string();
     let mut fields = HashMap::<String, String>::new();
     while let Some(field) = multipart.next_field().await? {
         let name = field.name().unwrap_or_default().to_string();
         if name == "file" {
+            if let Some(value) = field.file_name().filter(|value| !value.is_empty()) {
+                file_name = value.to_string();
+            }
             file_bytes = Some(field.bytes().await?.to_vec());
         } else {
             fields.insert(name, field.text().await?);
         }
     }
-    let Some(bytes) = file_bytes.filter(|bytes| !bytes.is_empty()) else {
-        return Ok(bad_request("upload an EPUB file"));
+    let source = match resolve_audiobook_source(&state, &fields, file_bytes, file_name).await {
+        Ok(source) => source,
+        Err(error) => return Ok(bad_request(&error.to_string())),
     };
+    let bytes = source.bytes;
 
     let provider = field_value(&fields, "provider").unwrap_or_else(|| "mock".to_string());
     if !matches!(
@@ -1374,9 +1450,12 @@ async fn launch_audiobook(
             fields.insert(name, field.text().await?);
         }
     }
-    let Some(bytes) = file_bytes.filter(|bytes| !bytes.is_empty()) else {
-        return Ok(bad_request("upload an EPUB file"));
+    let source = match resolve_audiobook_source(&state, &fields, file_bytes, file_name).await {
+        Ok(source) => source,
+        Err(error) => return Ok(bad_request(&error.to_string())),
     };
+    let bytes = source.bytes;
+    let file_name = source.file_name;
 
     let provider = field_value(&fields, "provider").unwrap_or_else(|| "mock".to_string());
     if !matches!(
@@ -1539,7 +1618,7 @@ async fn launch_audiobook(
     let stem = sanitize_component(strip_epub_suffix(&file_name));
     let sequence = ESTIMATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let id = format!("{}-{sequence}-{stem}", now_ms());
-    let upload_dir = PathBuf::from(UPLOAD_DIR);
+    let upload_dir = state.upload_dir.clone();
     std::fs::create_dir_all(&upload_dir)?;
     let input_path = upload_dir.join(format!("audiobook-{id}.epub"));
     let out_dir = upload_dir.join(format!("audiobook-{id}"));
@@ -1754,25 +1833,106 @@ fn resolved_model_from_synthesis_id(synthesis_id: &str) -> Option<&str> {
     (!model.is_empty()).then_some(model)
 }
 
-async fn audiobook_status(AxumPath(id): AxumPath<String>) -> Result<Response, AppError> {
-    if !valid_audiobook_id(&id) {
-        return Ok(bad_request("invalid audiobook operation id"));
+async fn list_audiobooks(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    let upload_dir = state.upload_dir.clone();
+    let items =
+        tokio::task::spawn_blocking(move || list_audiobook_summaries(&upload_dir)).await??;
+    Ok(Json(items))
+}
+
+fn list_audiobook_summaries(upload_dir: &Path) -> Result<Vec<serde_json::Value>> {
+    let entries = match std::fs::read_dir(upload_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut items = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("audiobook-"))
+            .filter(|id| valid_audiobook_id(id))
+        else {
+            continue;
+        };
+        let out_dir = entry.path();
+        if !out_dir.join("manifest.json").is_file() && !out_dir.join("process.json").is_file() {
+            continue;
+        }
+        if let Some(payload) = read_audiobook_payload(upload_dir, id) {
+            let process_updated = payload
+                .get("process")
+                .and_then(|process| process.get("updated_at_ms"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let manifest_updated = payload
+                .get("updated_at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            items.push(json!({
+                "id": payload.get("id"),
+                "title": payload.get("title"),
+                "status": payload.get("status"),
+                "process_status": payload
+                    .get("process")
+                    .and_then(|process| process.get("status")),
+                "input_path": payload.get("input_path"),
+                "out_dir": payload.get("out_dir"),
+                "synthesis_id": payload.get("synthesis_id"),
+                "voice": payload.get("voice"),
+                "chapters": payload.get("chapters"),
+                "completed_chunks": payload.get("completed_chunks"),
+                "total_chunks": payload
+                    .get("chunks")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0),
+                "artifact": payload.get("artifact"),
+                "warnings": payload.get("warnings"),
+                "updated_at_ms": manifest_updated.max(process_updated),
+            }));
+        }
     }
-    let out_dir = PathBuf::from(UPLOAD_DIR).join(format!("audiobook-{id}"));
-    if !out_dir.is_dir() {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "no such audiobook operation"})),
+    items.sort_by_key(|item| {
+        std::cmp::Reverse(
+            item.get("updated_at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
         )
-            .into_response());
+    });
+    Ok(items)
+}
+
+fn audiobook_warnings(process: &serde_json::Value) -> Vec<serde_json::Value> {
+    match process.get("warnings") {
+        Some(serde_json::Value::Array(warnings)) => warnings.clone(),
+        Some(serde_json::Value::String(warning)) if !warning.is_empty() => {
+            vec![json!(warning)]
+        }
+        Some(serde_json::Value::Object(warning)) if !warning.is_empty() => {
+            vec![serde_json::Value::Object(warning.clone())]
+        }
+        _ => Vec::new(),
     }
-    let manifest_path = out_dir.join("manifest.json");
-    let process_path = out_dir.join("process.json");
-    let process: serde_json::Value = std::fs::read(&process_path)
+}
+
+fn read_audiobook_payload(upload_dir: &Path, id: &str) -> Option<serde_json::Value> {
+    let out_dir = upload_dir.join(format!("audiobook-{id}"));
+    if !out_dir.is_dir() {
+        return None;
+    }
+    let process: serde_json::Value = std::fs::read(out_dir.join("process.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_else(|| json!({"status": "starting"}));
-    let mut payload: serde_json::Value = std::fs::read(&manifest_path)
+    let mut payload: serde_json::Value = std::fs::read(out_dir.join("manifest.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_else(|| {
@@ -1787,35 +1947,65 @@ async fn audiobook_status(AxumPath(id): AxumPath<String>) -> Result<Response, Ap
         .and_then(serde_json::Value::as_str)
         .and_then(resolved_model_from_synthesis_id)
         .map(str::to_string);
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("id".to_string(), json!(id));
-        object.insert("out_dir".to_string(), json!(out_dir.display().to_string()));
-        object.insert("process".to_string(), process.clone());
-        object.insert("resolved_model".to_string(), json!(resolved_model));
-        match process.get("status").and_then(serde_json::Value::as_str) {
-            Some("failed") => {
-                object.insert("status".to_string(), json!("failed"));
-                object.insert(
-                    "error".to_string(),
-                    process
-                        .get("error")
-                        .cloned()
-                        .unwrap_or_else(|| json!("audiobook process failed")),
-                );
-            }
-            Some("cancelled") => {
-                object.insert("status".to_string(), json!("cancelled"));
-            }
-            _ => {}
+    let warnings = audiobook_warnings(&process);
+    let object = payload.as_object_mut()?;
+    object.insert("id".to_string(), json!(id));
+    object.insert(
+        "input_path".to_string(),
+        json!(
+            upload_dir
+                .join(format!("audiobook-{id}.epub"))
+                .display()
+                .to_string()
+        ),
+    );
+    object.insert("out_dir".to_string(), json!(out_dir.display().to_string()));
+    object.insert("process".to_string(), process.clone());
+    object.insert("warnings".to_string(), json!(warnings));
+    object.insert("resolved_model".to_string(), json!(resolved_model));
+    match process.get("status").and_then(serde_json::Value::as_str) {
+        Some("succeeded") => {
+            object.insert("status".to_string(), json!("succeeded"));
         }
-        if out_dir.join("audiobook.m4b").is_file() {
+        Some("failed") => {
+            object.insert("status".to_string(), json!("failed"));
             object.insert(
-                "artifact".to_string(),
-                json!(out_dir.join("audiobook.m4b").display().to_string()),
+                "error".to_string(),
+                process
+                    .get("error")
+                    .cloned()
+                    .unwrap_or_else(|| json!("audiobook process failed")),
             );
         }
+        Some("cancelled") => {
+            object.insert("status".to_string(), json!("cancelled"));
+        }
+        _ => {}
     }
-    Ok(Json(payload).into_response())
+    if out_dir.join("audiobook.m4b").is_file() {
+        object.insert(
+            "artifact".to_string(),
+            json!(out_dir.join("audiobook.m4b").display().to_string()),
+        );
+    }
+    Some(payload)
+}
+
+async fn audiobook_status(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, AppError> {
+    if !valid_audiobook_id(&id) {
+        return Ok(bad_request("invalid audiobook operation id"));
+    }
+    match read_audiobook_payload(&state.upload_dir, &id) {
+        Some(payload) => Ok(Json(payload).into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no such audiobook operation"})),
+        )
+            .into_response()),
+    }
 }
 
 async fn cancel_audiobook(
@@ -1835,15 +2025,93 @@ async fn cancel_audiobook(
         .map_err(|_| anyhow::anyhow!("audiobook cancellation registry is unavailable"))?
         .get(&id)
         .cloned();
-    let Some(cancel) = cancel else {
+    if let Some(cancel) = cancel {
+        cancel.cancel();
+        return Ok(Json(json!({"ok": true, "status": "cancelling"})).into_response());
+    }
+
+    let out_dir = state.upload_dir.join(format!("audiobook-{id}"));
+    let process: serde_json::Value = match std::fs::read(out_dir.join("process.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        Some(process) => process,
+        None => {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "audiobook operation has no running process"})),
+            )
+                .into_response());
+        }
+    };
+    if !matches!(
+        process.get("status").and_then(serde_json::Value::as_str),
+        Some("starting" | "running")
+    ) {
         return Ok((
             StatusCode::CONFLICT,
-            Json(json!({"error": "audiobook operation is not running in this server"})),
+            Json(json!({"error": "audiobook operation is not running"})),
+        )
+            .into_response());
+    }
+    let Some(pid) = process
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)
+    else {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "audiobook operation has no running process"})),
         )
             .into_response());
     };
-    cancel.cancel();
-    Ok(Json(json!({"ok": true, "status": "cancelling"})).into_response())
+    if let Err(error) = terminate_restarted_audiobook(&state, pid).await {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({"error": format!("could not cancel audiobook process: {error}")})),
+        )
+            .into_response());
+    }
+    let auto_model = process
+        .get("auto_model")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    write_audio_process_state(&out_dir, "cancelled", Some(pid), None, auto_model)?;
+    Ok(Json(json!({"ok": true, "status": "cancelled"})).into_response())
+}
+
+async fn terminate_restarted_audiobook(state: &AppState, pid: u32) -> Result<()> {
+    #[cfg(test)]
+    if let Some(cancelled) = &state.audio_restart_cancels {
+        cancelled
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test cancellation recorder is unavailable"))?
+            .push(pid);
+        return Ok(());
+    }
+    #[cfg(not(test))]
+    let _ = state;
+
+    #[cfg(windows)]
+    let status = tokio::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()
+        .await
+        .context("failed to run taskkill")?;
+    #[cfg(unix)]
+    let status = tokio::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .await
+        .context("failed to run kill")?;
+    #[cfg(not(any(windows, unix)))]
+    anyhow::bail!("process cancellation is unsupported on this platform");
+
+    if !status.success() {
+        anyhow::bail!("process signalling exited with {status}");
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1851,14 +2119,75 @@ struct ArtifactQuery {
     disposition: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ArtifactByteRange {
+    Full,
+    Partial { start: u64, end: u64 },
+    Unsatisfiable,
+}
+
+fn parse_artifact_range(headers: &HeaderMap, length: u64) -> ArtifactByteRange {
+    let Some(value) = headers.get(axum::http::header::RANGE) else {
+        return ArtifactByteRange::Full;
+    };
+    let Ok(value) = value.to_str() else {
+        return ArtifactByteRange::Unsatisfiable;
+    };
+    let Some(spec) = value.trim().strip_prefix("bytes=") else {
+        return ArtifactByteRange::Unsatisfiable;
+    };
+    if spec.contains(',') {
+        return ArtifactByteRange::Unsatisfiable;
+    }
+    let Some((start, end)) = spec.split_once('-') else {
+        return ArtifactByteRange::Unsatisfiable;
+    };
+    if length == 0 {
+        return ArtifactByteRange::Unsatisfiable;
+    }
+    if start.is_empty() {
+        let Ok(suffix_length) = end.parse::<u64>() else {
+            return ArtifactByteRange::Unsatisfiable;
+        };
+        if suffix_length == 0 {
+            return ArtifactByteRange::Unsatisfiable;
+        }
+        let start = length.saturating_sub(suffix_length.min(length));
+        return ArtifactByteRange::Partial {
+            start,
+            end: length - 1,
+        };
+    }
+    let Ok(start) = start.parse::<u64>() else {
+        return ArtifactByteRange::Unsatisfiable;
+    };
+    if start >= length {
+        return ArtifactByteRange::Unsatisfiable;
+    }
+    let end = if end.is_empty() {
+        length - 1
+    } else {
+        let Ok(end) = end.parse::<u64>() else {
+            return ArtifactByteRange::Unsatisfiable;
+        };
+        end.min(length - 1)
+    };
+    if end < start {
+        return ArtifactByteRange::Unsatisfiable;
+    }
+    ArtifactByteRange::Partial { start, end }
+}
+
 async fn audiobook_artifact(
+    State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ArtifactQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
     if !valid_audiobook_id(&id) {
         return Ok(bad_request("invalid audiobook operation id"));
     }
-    let out_dir = PathBuf::from(UPLOAD_DIR).join(format!("audiobook-{id}"));
+    let out_dir = state.upload_dir.join(format!("audiobook-{id}"));
     let m4b_path = out_dir.join("audiobook.m4b");
     let (path, content_type, download_name) = if m4b_path.is_file() {
         (m4b_path, "audio/mp4", "audiobook.m4b")
@@ -1868,7 +2197,7 @@ async fn audiobook_artifact(
             tokio::task::spawn_blocking(move || ensure_audio_download_zip(&archive_dir)).await??;
         (archive, "application/zip", "audiobook-audio.zip")
     };
-    let Ok(file) = tokio::fs::File::open(&path).await else {
+    let Ok(mut file) = tokio::fs::File::open(&path).await else {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({"error": "audiobook artifact is not available"})),
@@ -1882,14 +2211,51 @@ async fn audiobook_artifact(
         (false, true) => "attachment; filename=\"audiobook.m4b\"",
         (false, false) => "attachment; filename=\"audiobook-audio.zip\"",
     };
-    Ok((
-        [
-            (axum::http::header::CONTENT_TYPE, content_type),
-            (axum::http::header::CONTENT_DISPOSITION, content_disposition),
-        ],
-        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
-    )
-        .into_response())
+    let length = file.metadata().await?.len();
+    let requested = parse_artifact_range(&headers, length);
+    if requested == ArtifactByteRange::Unsatisfiable {
+        return Ok(Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(axum::http::header::ACCEPT_RANGES, "bytes")
+            .header(
+                axum::http::header::CONTENT_RANGE,
+                format!("bytes */{length}"),
+            )
+            .body(axum::body::Body::empty())
+            .context("failed to build range error response")?);
+    }
+
+    let mut builder = Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .header(axum::http::header::CONTENT_DISPOSITION, content_disposition)
+        .header(axum::http::header::ACCEPT_RANGES, "bytes");
+    match requested {
+        ArtifactByteRange::Full => Ok(builder
+            .header(axum::http::header::CONTENT_LENGTH, length)
+            .body(axum::body::Body::from_stream(
+                tokio_util::io::ReaderStream::new(file),
+            ))
+            .context("failed to build artifact response")?),
+        ArtifactByteRange::Partial { start, end } => {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+            file.seek(std::io::SeekFrom::Start(start)).await?;
+            let partial_length = end - start + 1;
+            builder = builder
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(axum::http::header::CONTENT_LENGTH, partial_length)
+                .header(
+                    axum::http::header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{length}"),
+                );
+            Ok(builder
+                .body(axum::body::Body::from_stream(
+                    tokio_util::io::ReaderStream::new(file.take(partial_length)),
+                ))
+                .context("failed to build partial artifact response")?)
+        }
+        ArtifactByteRange::Unsatisfiable => unreachable!("handled above"),
+    }
 }
 
 fn ensure_audio_download_zip(out_dir: &std::path::Path) -> Result<PathBuf> {
@@ -1957,13 +2323,21 @@ fn write_audio_process_state(
 ) -> Result<()> {
     let path = out_dir.join("process.json");
     let temp = out_dir.join("process.part.tmp");
-    let bytes = serde_json::to_vec_pretty(&json!({
+    let warnings = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|process| process.get("warnings").cloned());
+    let mut process = json!({
         "status": status,
         "pid": pid,
         "error": error,
         "auto_model": auto_model,
         "updated_at_ms": now_ms(),
-    }))?;
+    });
+    if let (Some(object), Some(warnings)) = (process.as_object_mut(), warnings) {
+        object.insert("warnings".to_string(), warnings);
+    }
+    let bytes = serde_json::to_vec_pretty(&process)?;
     std::fs::write(&temp, bytes)?;
     if path.exists() {
         let _ = std::fs::remove_file(&path);
@@ -3113,6 +3487,7 @@ mod tests {
             refresh: Duration::from_millis(250),
             csrf_token: token.to_string(),
             host_port: 8765,
+            upload_dir: PathBuf::from(UPLOAD_DIR),
             keys: Arc::new(Mutex::new(HashMap::new())),
             elevenlabs_voices: Arc::new(Mutex::new(None)),
             audio_cancels: Arc::new(Mutex::new(HashMap::new())),
@@ -3120,6 +3495,7 @@ mod tests {
             runtime_lease_stale_after: crate::control::RUNTIME_LEASE_STALE_AFTER,
             resume_launches: None,
             resume_child_environments: None,
+            audio_restart_cancels: None,
         }
     }
 
@@ -3131,6 +3507,13 @@ mod tests {
     fn test_state_with_store(token: &str, store_path: PathBuf) -> AppState {
         AppState {
             store_path,
+            ..test_state(token)
+        }
+    }
+
+    fn test_state_with_upload_dir(token: &str, upload_dir: PathBuf) -> AppState {
+        AppState {
+            upload_dir,
             ..test_state(token)
         }
     }
@@ -3282,6 +3665,9 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("function esc(value)"));
         assert!(DASHBOARD_HTML.contains("${esc(d.id)}"));
         assert!(DASHBOARD_HTML.contains("${esc(body)}"));
+        assert!(DASHBOARD_HTML.contains("${esc(a.id)}"));
+        assert!(DASHBOARD_HTML.contains("${esc(w.sourcePath)}"));
+        assert!(DASHBOARD_HTML.contains("${esc(audioWarningMessage(warning))}"));
     }
 
     #[test]
@@ -3602,6 +3988,200 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    fn write_test_audiobook_operation(
+        upload_dir: &Path,
+        id: &str,
+        manifest: serde_json::Value,
+        process: serde_json::Value,
+    ) -> PathBuf {
+        let out_dir = upload_dir.join(format!("audiobook-{id}"));
+        std::fs::create_dir_all(&out_dir).expect("operation directory should be created");
+        std::fs::write(
+            out_dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).expect("manifest should serialize"),
+        )
+        .expect("manifest should be written");
+        std::fs::write(
+            out_dir.join("process.json"),
+            serde_json::to_vec(&process).expect("process state should serialize"),
+        )
+        .expect("process state should be written");
+        out_dir
+    }
+
+    #[tokio::test]
+    async fn audiobook_index_scans_durable_operations_newest_first() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        write_test_audiobook_operation(
+            temp.path(),
+            "older",
+            json!({
+                "title": "Older Book",
+                "status": "running",
+                "completed_chunks": 1,
+                "chapters": 1,
+                "chunks": [{"status": "synthesized"}],
+                "updated_at_ms": 10,
+            }),
+            json!({"status": "running", "updated_at_ms": 11}),
+        );
+        write_test_audiobook_operation(
+            temp.path(),
+            "newer",
+            json!({
+                "title": "Newer Book",
+                "status": "succeeded",
+                "completed_chunks": 2,
+                "chapters": 1,
+                "chunks": [{"status": "synthesized"}, {"status": "cached"}],
+                "updated_at_ms": 20,
+            }),
+            json!({
+                "status": "succeeded",
+                "warnings": [{"message": "chapter markers were unavailable"}],
+                "updated_at_ms": 21,
+            }),
+        );
+        std::fs::create_dir_all(temp.path().join("not-an-audiobook"))
+            .expect("unrelated directory should be created");
+
+        let router = dashboard_router(test_state_with_upload_dir(
+            "token-123",
+            temp.path().to_path_buf(),
+        ));
+        let response = get_route(&router, "/api/audiobooks").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        let items = payload.as_array().expect("index should be an array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], "newer");
+        assert_eq!(items[0]["title"], "Newer Book");
+        assert_eq!(items[0]["total_chunks"], 2);
+        assert_eq!(
+            items[0]["warnings"][0]["message"],
+            "chapter markers were unavailable"
+        );
+        assert_eq!(items[1]["id"], "older");
+    }
+
+    #[tokio::test]
+    async fn audiobook_cancel_uses_persisted_pid_after_server_restart() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let out_dir = write_test_audiobook_operation(
+            temp.path(),
+            "restartable",
+            json!({"status": "running", "chunks": []}),
+            json!({
+                "status": "running",
+                "pid": 4242,
+                "auto_model": true,
+                "warnings": ["stitch fallback"],
+                "updated_at_ms": 10,
+            }),
+        );
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+        state.audio_restart_cancels = Some(cancelled.clone());
+        assert!(state.audio_cancels.lock().unwrap().is_empty());
+        let router = dashboard_router(state);
+
+        let response = post_json(
+            &router,
+            "/api/audiobooks/restartable/cancel",
+            Some("token-123"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(*cancelled.lock().unwrap(), vec![4242]);
+        let process: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(out_dir.join("process.json")).expect("process state should remain"),
+        )
+        .expect("process state should be JSON");
+        assert_eq!(process["status"], "cancelled");
+        assert_eq!(process["auto_model"], true);
+        assert_eq!(process["warnings"][0], "stitch fallback");
+    }
+
+    #[tokio::test]
+    async fn audiobook_source_resolves_finished_translation_by_job_id() {
+        let fixture = build_mutation_fixture();
+        build_fixture_epub(&fixture.output_path);
+        let state = test_state_with_store("token-123", fixture.store_path.clone());
+        let fields = HashMap::from([("source_job_id".to_string(), fixture.job_id.clone())]);
+
+        let source = resolve_audiobook_source(
+            &state,
+            &fields,
+            None,
+            "ignored-upload-name.epub".to_string(),
+        )
+        .await
+        .expect("finished translation output should resolve");
+
+        assert_eq!(source.file_name, "output.epub");
+        assert!(source.bytes.starts_with(b"PK"));
+    }
+
+    #[tokio::test]
+    async fn audiobook_artifact_supports_ranges_and_rejects_unsatisfiable_ranges() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let out_dir = temp.path().join("audiobook-range-test");
+        std::fs::create_dir_all(&out_dir).expect("operation directory should be created");
+        std::fs::write(out_dir.join("audiobook.m4b"), b"0123456789")
+            .expect("artifact should be written");
+        let router = dashboard_router(test_state_with_upload_dir(
+            "token-123",
+            temp.path().to_path_buf(),
+        ));
+
+        let partial = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/audiobooks/range-test/artifact")
+                    .header("host", TEST_HOST)
+                    .header("range", "bytes=2-5")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            partial.headers().get("content-range"),
+            Some(&HeaderValue::from_static("bytes 2-5/10"))
+        );
+        assert_eq!(
+            partial.headers().get("accept-ranges"),
+            Some(&HeaderValue::from_static("bytes"))
+        );
+        let body = axum::body::to_bytes(partial.into_body(), usize::MAX)
+            .await
+            .expect("partial body should read");
+        assert_eq!(&body[..], b"2345");
+
+        let unsatisfiable = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/audiobooks/range-test/artifact")
+                    .header("host", TEST_HOST)
+                    .header("range", "bytes=20-")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(unsatisfiable.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            unsatisfiable.headers().get("content-range"),
+            Some(&HeaderValue::from_static("bytes */10"))
+        );
+    }
+
     #[test]
     fn audiobook_operation_ids_cannot_escape_the_upload_directory() {
         assert!(valid_audiobook_id("1234-safe_id"));
@@ -3772,14 +4352,14 @@ mod tests {
     fn dashboard_assets_reassemble_byte_stably() {
         use sha2::{Digest, Sha256};
 
-        assert_eq!(DASHBOARD_HTML.len(), 107_870);
+        assert_eq!(DASHBOARD_HTML.len(), 113_200);
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
         let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
         let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
             digest_hex,
-            "244cdd95024bcbd88009b9c3e5c27dbe689935980f158e9b1472aec75974267b"
+            "440a46cbeb6a7630f488d337b5e22ecc077f69c86b7f108e8a895a309362dd3c"
         );
 
         let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");

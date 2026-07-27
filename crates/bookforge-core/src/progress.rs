@@ -351,6 +351,13 @@ impl RunState {
                 self.job_id = Some(job_id.clone());
                 self.input_path = Some(input_path.clone());
                 self.output_path = Some(output_path.clone());
+                // `resume` appends a fresh JobCreated to the existing event log.
+                // A prior TranslationFinished belongs to the previous run epoch
+                // and must not make live replay terminate before the resumed
+                // worker emits its first new progress event.
+                self.finished = false;
+                self.finished_elapsed_ms = None;
+                self.paused = false;
             }
             ProgressEvent::JobPaused { job_id, .. } => {
                 self.job_id = Some(job_id.clone());
@@ -639,6 +646,47 @@ mod tests {
         assert_eq!(state.finished_elapsed_ms, Some(3_000));
         assert_eq!(state.failed_segments, vec!["s4".to_string()]);
         assert_eq!(state.needs_review_segments, vec!["s3".to_string()]);
+    }
+
+    #[test]
+    fn second_job_created_clears_previous_epoch_terminal_state() {
+        let first_created = ProgressEvent::JobCreated {
+            job_id: "job_1".into(),
+            input_path: "in.epub".into(),
+            output_path: "first.epub".into(),
+            timestamp_ms: 1_000,
+        };
+        let finished = ProgressEvent::TranslationFinished {
+            succeeded: 2,
+            cached: 1,
+            needs_review: 0,
+            failed: 0,
+            input_tokens: 123,
+            output_tokens: 456,
+            elapsed_ms: 3_000,
+            timestamp_ms: 4_000,
+        };
+        let resumed_created = ProgressEvent::JobCreated {
+            job_id: "job_1".into(),
+            input_path: "in.epub".into(),
+            output_path: "resumed.epub".into(),
+            timestamp_ms: 5_000,
+        };
+
+        let mut state = RunState::from_events([first_created, finished]);
+        assert!(state.finished);
+        assert_eq!(state.finished_elapsed_ms, Some(3_000));
+        state.paused = true;
+
+        state.fold(&resumed_created);
+
+        assert!(!state.finished);
+        assert_eq!(state.finished_elapsed_ms, None);
+        assert!(!state.paused);
+        assert_eq!(state.output_path.as_deref(), Some("resumed.epub"));
+        assert_eq!(state.done_segments, 3);
+        assert_eq!(state.input_tokens, 123);
+        assert_eq!(state.output_tokens, 456);
     }
 
     #[test]
