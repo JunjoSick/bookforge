@@ -9,7 +9,7 @@ use bookforge_audio::{
     AudioFormat, AudiobookOptions, ElevenLabsTtsConfig, ElevenLabsTtsProvider, GeminiTtsConfig,
     GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider, Progress,
     StitchOptions, TextNormalization, build_audiobook, elevenlabs_model_max_input_chars,
-    fetch_elevenlabs_subscription, list_elevenlabs_voices, plan_chunks,
+    fetch_elevenlabs_subscription, list_elevenlabs_voices, plan_chunks, plan_chunks_for_prune,
     resolve_preferred_elevenlabs_model, stitch, validate_options,
 };
 use bookforge_epub::{ReflowOptions, read_epub, reflow_epub};
@@ -200,10 +200,10 @@ pub struct AudiobookArgs {
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
 
-    /// Remove audio chunk files in the output directory left over from earlier
-    /// runs (a different voice, model, speed, format, or edited source text).
-    /// The current run's chunks are always kept. With `--dry-run` the stale
-    /// files are only reported, never deleted.
+    /// Remove managed audio chunks superseded by the current full-book
+    /// settings (voice, model, speed, format, or source text). With
+    /// `--chapters`, reusable chunks for unselected chapters are kept. With
+    /// `--dry-run`, stale files are only reported, never deleted.
     #[arg(long, default_value_t = false)]
     pub prune: bool,
 
@@ -424,6 +424,8 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             input.display()
         );
     }
+    let full_prune_plan = (args.prune && options.chapter_filter.is_some())
+        .then(|| plan_chunks_for_prune(&book, &options));
     let chapter_count = plan
         .iter()
         .map(|chunk| chunk.chapter_index)
@@ -478,8 +480,11 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
 
     if args.dry_run {
         let stale = if args.prune {
-            bookforge_audio::find_stale_chunks(&out_dir, &plan)
-                .with_context(|| format!("scanning {} for stale chunks", out_dir.display()))?
+            bookforge_audio::find_stale_chunks(
+                &out_dir,
+                full_prune_plan.as_deref().unwrap_or(plan.as_slice()),
+            )
+            .with_context(|| format!("scanning {} for stale chunks", out_dir.display()))?
         } else {
             Vec::new()
         };
@@ -507,7 +512,7 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         } else if human_output {
             println!("Dry run: no audio synthesized.");
             if args.prune {
-                report_stale_chunks(&stale, false);
+                report_stale_chunks(&stale, true);
             }
         }
         return Ok(());
@@ -674,8 +679,14 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     }
 
     if args.prune {
-        let stale = bookforge_audio::find_stale_chunks(&out_dir, &plan)
-            .with_context(|| format!("scanning {} for stale chunks", out_dir.display()))?;
+        let stale = bookforge_audio::find_stale_chunks(
+            &out_dir,
+            full_prune_plan.as_deref().unwrap_or(plan.as_slice()),
+        )
+        .with_context(|| format!("scanning {} for stale chunks", out_dir.display()))?;
+        if (human_output || fallback_tui_output) && !stale.is_empty() {
+            report_stale_chunks(&stale, false);
+        }
         let (removed, freed) = bookforge_audio::remove_stale_chunks(&stale)
             .with_context(|| format!("removing stale chunks in {}", out_dir.display()))?;
         if args.ui == UiMode::Json {
@@ -702,15 +713,15 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     Ok(())
 }
 
-/// Print a human-readable list of stale chunk files. When `deleted` is false
-/// the files were only reported (dry run).
-fn report_stale_chunks(stale: &[bookforge_audio::StaleChunk], deleted: bool) {
+/// Print a human-readable list of stale chunk files. A dry run previews the
+/// deletion; a live run calls this immediately before removing the files.
+fn report_stale_chunks(stale: &[bookforge_audio::StaleChunk], dry_run: bool) {
     if stale.is_empty() {
         println!("Prune: no stale chunks from earlier runs.");
         return;
     }
     let freed: u64 = stale.iter().map(|chunk| chunk.bytes).sum();
-    let verb = if deleted { "Removed" } else { "Would remove" };
+    let verb = if dry_run { "Would remove" } else { "Removing" };
     println!(
         "{verb} {} stale chunk file(s) ({}):",
         stale.len(),

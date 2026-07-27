@@ -252,6 +252,16 @@ pub fn plan_chunks(book: &Book, options: &AudiobookOptions) -> Vec<ChunkRecord> 
         .collect()
 }
 
+/// Build the complete deterministic chunk plan used to identify stale cache
+/// files. Unlike [`plan_chunks`], this deliberately ignores
+/// [`AudiobookOptions::chapter_filter`] so a partial run does not treat chunks
+/// from unselected chapters as stale.
+pub fn plan_chunks_for_prune(book: &Book, options: &AudiobookOptions) -> Vec<ChunkRecord> {
+    let mut full_book_options = options.clone();
+    full_book_options.chapter_filter = None;
+    plan_chunks(book, &full_book_options)
+}
+
 fn build_plan(book: &Book, options: &AudiobookOptions) -> Vec<PlannedChunk> {
     let ext = options.format.extension();
     let mut planned = Vec::new();
@@ -878,6 +888,33 @@ mod tests {
                 ChunkKind::Title
             );
         }
+    }
+
+    #[test]
+    fn prune_plan_ignores_chapter_filter_and_preserves_selected_chunk_names() {
+        let book = book_with_sections();
+        let options = AudiobookOptions {
+            max_chars: 40,
+            chapter_filter: Some([2].into_iter().collect()),
+            ..AudiobookOptions::default()
+        };
+
+        let filtered = plan_chunks(&book, &options);
+        assert!(
+            filtered.iter().all(|chunk| chunk.chapter_index == 1),
+            "the ordinary plan should contain only the selected chapter"
+        );
+
+        let prune_plan = plan_chunks_for_prune(&book, &options);
+        let planned_chapters: std::collections::BTreeSet<_> =
+            prune_plan.iter().map(|chunk| chunk.chapter_index).collect();
+        assert_eq!(planned_chapters, [0, 1].into_iter().collect());
+        assert!(
+            filtered
+                .iter()
+                .all(|selected| prune_plan.iter().any(|chunk| chunk.file == selected.file)),
+            "removing the filter must not change selected chapters' cache names"
+        );
     }
 
     #[test]
