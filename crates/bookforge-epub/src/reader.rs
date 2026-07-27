@@ -1428,16 +1428,13 @@ fn looks_like_inline_math_token(value: &str) -> bool {
     if chars.len() < 3 {
         return false;
     }
-    // OCR scans commonly substitute operators such as `^` for missing
-    // letters/spaces. Multiple operators without any digit are stronger
-    // evidence of mangled prose than of an inline equation.
-    if !chars.iter().any(|ch| ch.is_ascii_digit())
+    // OCR scans commonly substitute operators such as `^` for letters.
+    // A word-sized alphabetic run alongside an operator is stronger evidence
+    // of mangled prose than of a short symbolic operand.
+    if chars.iter().any(|ch| is_inline_math_operator(*ch))
         && chars
-            .iter()
-            .filter(|ch| is_inline_math_operator(**ch))
-            .take(2)
-            .count()
-            >= 2
+            .split(|ch| !ch.is_ascii_alphabetic())
+            .any(|run| run.len() >= 3)
     {
         return false;
     }
@@ -2214,6 +2211,41 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn inline_math_rejects_ocr_damaged_letter_runs() {
+        for value in [
+            "en^erPrises",
+            "the^ight",
+            "conspiracy/1*",
+            "receiv-lnThafUisrifibi^0way",
+        ] {
+            assert!(!looks_like_inline_math_token(value), "{value}");
+        }
+
+        for value in ["E=mc^2", "p<0.05", "x_12", "3.5*2", "mc^2"] {
+            assert!(looks_like_inline_math_token(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn extract_blocks_does_not_protect_ocr_damaged_prose() {
+        let section_id = SectionId("sec_000000".to_string());
+        let xhtml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p>The en^erPrises searched the^ight while conspiracy/1* appeared in receiv-lnThafUisrifibi^0way reports.</p>
+</body></html>"#;
+        let blocks = extract_blocks(xhtml, "chapter.xhtml", &section_id, 0)
+            .expect("block extraction should succeed");
+        let protected_spans = blocks
+            .iter()
+            .flat_map(|block| block.protected_spans.iter())
+            .collect::<Vec<_>>();
+
+        assert!(
+            protected_spans.is_empty(),
+            "OCR-damaged prose became protected spans: {protected_spans:?}"
+        );
     }
 
     #[test]
