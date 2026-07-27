@@ -1,8 +1,11 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
-use bookforge_core::{ResolvedRunSettings, scheduler::SchedulerConfig, segment::Segment};
-use bookforge_llm::{LlmProvider, SegmentTranslation, TranslationRunConfig};
+use bookforge_core::{
+    ResolvedRunSettings, glossary::GlossarySelectionRule, scheduler::SchedulerConfig,
+    segment::Segment,
+};
+use bookforge_llm::{LlmProvider, SegmentTranslation, TelemetryLog, TranslationRunConfig};
 use bookforge_store::JobStore;
 
 use crate::checkpoint::CheckpointWriter;
@@ -62,6 +65,68 @@ pub(crate) async fn run_checkpointed_translation<P>(
 where
     P: LlmProvider,
 {
+    run_checkpointed_translation_inner(
+        provider,
+        pending_segments,
+        run_config,
+        settings,
+        checkpoint,
+        progress,
+        batch_enabled,
+        Arc::new(TelemetryLog::new()),
+        &HashMap::new(),
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_checkpointed_translation_instrumented<P>(
+    provider: P,
+    pending_segments: &[Segment],
+    run_config: &TranslationRunConfig,
+    settings: &ResolvedRunSettings,
+    checkpoint: CheckpointRunContext<'_>,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
+    batch_enabled: bool,
+    telemetry: Arc<TelemetryLog>,
+    glossary_rules: &HashMap<String, Vec<GlossarySelectionRule>>,
+    print_human_output: bool,
+) -> Result<Vec<SegmentTranslation>>
+where
+    P: LlmProvider,
+{
+    run_checkpointed_translation_inner(
+        provider,
+        pending_segments,
+        run_config,
+        settings,
+        checkpoint,
+        progress,
+        batch_enabled,
+        telemetry,
+        glossary_rules,
+        print_human_output,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_checkpointed_translation_inner<P>(
+    provider: P,
+    pending_segments: &[Segment],
+    run_config: &TranslationRunConfig,
+    settings: &ResolvedRunSettings,
+    checkpoint: CheckpointRunContext<'_>,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
+    batch_enabled: bool,
+    telemetry: Arc<TelemetryLog>,
+    glossary_rules: &HashMap<String, Vec<GlossarySelectionRule>>,
+    print_human_output: bool,
+) -> Result<Vec<SegmentTranslation>>
+where
+    P: LlmProvider,
+{
     if pending_segments.is_empty() {
         return Ok(Vec::new());
     }
@@ -94,6 +159,8 @@ where
             checkpoint_context,
             progress,
             Some(&mut control_poller),
+            telemetry.clone(),
+            print_human_output,
         )
         .await
     } else {
@@ -106,5 +173,40 @@ where
         )
         .await
     };
-    finalize_writer(translation_result, sender, writer).await
+    let translations = finalize_writer(translation_result, sender, writer).await?;
+    record_glossary_telemetry(
+        &telemetry,
+        &run_config.glossary,
+        glossary_rules,
+        &translations,
+    );
+    Ok(translations)
+}
+
+pub(crate) fn record_glossary_telemetry(
+    telemetry: &TelemetryLog,
+    glossary: &bookforge_llm::GlossaryRunConfig,
+    rules_by_segment: &HashMap<String, Vec<GlossarySelectionRule>>,
+    translations: &[SegmentTranslation],
+) {
+    for translation in translations {
+        let Some(entries) = glossary.entries_by_segment.get(&translation.segment_id.0) else {
+            continue;
+        };
+        let Some(rules) = rules_by_segment.get(&translation.segment_id.0) else {
+            continue;
+        };
+        debug_assert_eq!(entries.len(), rules.len());
+        let output = translation.joined_text();
+        for (entry, rule) in entries.iter().zip(rules) {
+            let honored = if entry.target.is_empty() {
+                false
+            } else if entry.case_sensitive {
+                output.contains(&entry.target)
+            } else {
+                output.to_lowercase().contains(&entry.target.to_lowercase())
+            };
+            telemetry.record_glossary_entry(*rule, honored);
+        }
+    }
 }
