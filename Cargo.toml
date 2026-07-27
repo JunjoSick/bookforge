@@ -39,7 +39,7 @@ zip = "8.6"
 # the MSRV. Dependabot is told to skip >=0.40 in .github/dependabot.yml.
 rusqlite = { version = "0.39", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip", "brotli"], default-features = false }
-base64 = "0.22"
+base64 = "0.23"
 
 # The profile that 'dist' will build with
 [profile.dist]
