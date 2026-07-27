@@ -38,6 +38,7 @@ const App = {
   screen: "library",
   theme: localStorage.getItem("bf-theme") || "light",
   jobs: [],
+  audiobooks: [],
   selected: null,
   es: null,
   options: { languages: ["English","Italian","Spanish","French","German"], providers: [], audio_providers: [], ffmpeg_available: false },
@@ -63,7 +64,7 @@ function freshWizard() {
 
 function freshAudioWizard() {
   const canM4b = App.options.ffmpeg_available === true;
-  return { file:null, fileName:"", provider:"openai", model:"gpt-4o-mini-tts",
+  return { file:null, fileName:"", sourceJobId:"", sourcePath:"", provider:"openai", model:"gpt-4o-mini-tts",
     voice:"alloy", format:"mp3", speed:1, maxChars:2000, concurrency:4,
     instructions:"", baseUrl:"", apiKey:"", stitch:canM4b, m4b:canM4b,
     advancedOpen:false, chapterGap:1200, single:false, loudnorm:false, seed:"", language:"",
@@ -107,18 +108,25 @@ function render() {
 function jobDone(st) { return st === "succeeded" || st === "done" || st === "completed"; }
 async function renderLibrary(stage) {
   stage.innerHTML = `<div class="wrap">
-    <div class="pagehead"><div><h1>Your library</h1><p>Pick up a translation, review a finished book, or start a new one.</p></div>
-      <button class="btn btn-primary" onclick="bfStartNew()">+ New translation</button></div>
+    <div class="pagehead"><div><h1>Your library</h1><p>Pick up a translation or audiobook, review a finished book, or start a new one.</p></div>
+      <div class="library-actions"><button class="btn btn-ghost" onclick="bfStartAudiobook()">+ New audiobook</button><button class="btn btn-primary" onclick="bfStartNew()">+ New translation</button></div></div>
     <div class="book-grid" id="grid"><div class="empty">Loading…</div></div></div>`;
   loadLibraryJobs();
 }
 async function loadLibraryJobs() {
-  let jobs = [];
-  try { jobs = await (await fetch("/api/jobs")).json(); } catch (e) { jobs = []; }
+  let jobs = [], audiobooks = [];
+  try {
+    const [jobResponse, audiobookResponse] = await Promise.all([fetch("/api/jobs"), fetch("/api/audiobooks")]);
+    if (jobResponse.ok) jobs = await jobResponse.json();
+    if (audiobookResponse.ok) audiobooks = await audiobookResponse.json();
+  } catch (e) {}
+  if (!Array.isArray(jobs)) jobs = [];
+  if (!Array.isArray(audiobooks)) audiobooks = [];
   App.jobs = jobs;
+  App.audiobooks = audiobooks;
   const grid = $("#grid");
   if (!grid || App.screen !== "library") return;
-  const cards = jobs.map(j => {
+  const translationCards = jobs.map(j => {
     const p = pct(j.done, j.total_segments);
     const st = badgeClass(j.status);
     const done = jobDone(st);
@@ -132,14 +140,56 @@ async function loadLibraryJobs() {
         <div class="book-meta"><span class="badge ${st}">${esc(j.status)}</span><span class="mono">${j.done}/${j.total_segments} · ${esc(j.target_lang)}</span></div>
         <div class="bar-track" ${p?"":'style="opacity:0"'}><div class="bar-fill" style="width:${p}%;${done?"background:var(--good)":""}"></div></div>
       </div>
-      <div class="book-action">${action}</div></div>`;
+      <div class="book-actions"><span class="book-action">${esc(action)}</span>${done?`<button class="narrate-action" onclick="event.stopPropagation();bfNarrateJob('${esc(j.id)}')">Narrate this book</button>`:""}</div></div>`;
   }).join("");
-  grid.innerHTML = cards + `<div class="add-card" onclick="bfStartNew()">
+  const audiobookCards = audiobooks.map(a => {
+    const warnings = audioWarnings(a);
+    let status = a.status || a.process_status || "starting";
+    if (status === "succeeded" && a.process_status === "running") status = "stitching";
+    const terminal = audioTerminal(status);
+    const p = pct(a.completed_chunks, a.total_chunks);
+    const label = audioStatusLabel(status, warnings);
+    const st = badgeClass(label);
+    const title = a.title || titleFromPath(a.input_path || a.id);
+    const action = status === "succeeded" ? "Listen →" : terminal ? "Inspect →" : "View progress →";
+    return `<div class="book-card" onclick="bfOpenAudiobook('${esc(a.id)}')">
+      <div class="cover audio-cover">♪</div>
+      <div class="book-main">
+        <div class="book-title">${esc(title)}</div>
+        <div class="book-sub">Audiobook · ${esc(a.synthesis_id||"planning")}</div>
+        <div class="book-meta"><span class="badge ${esc(st)}">${esc(label)}</span><span class="mono">${esc(a.completed_chunks||0)}/${esc(a.total_chunks||"?")} · ${esc(a.chapters||0)} chapters</span></div>
+        <div class="bar-track" ${p?"":'style="opacity:0"'}><div class="bar-fill" style="width:${esc(p)}%;${terminal?"background:var(--good)":""}"></div></div>
+      </div>
+      <div class="book-actions"><span class="book-action">${esc(action)}</span></div></div>`;
+  }).join("");
+  grid.innerHTML = translationCards + audiobookCards + `<div class="add-card" onclick="bfStartNew()">
       <div class="plus">＋</div><b>Translate a new book</b><span>Drop an EPUB to begin</span></div>`;
 }
 function bfOpenJob(id, st) {
   if (jobDone(st)) bfGo("review", { selected: id });
   else bfGo("progress", { selected: id });
+}
+function bfOpenAudiobook(id) {
+  App.audioSelected = id;
+  localStorage.setItem("bf-audiobook-id", id);
+  bfGo("audiobook");
+}
+async function bfNarrateJob(id) {
+  try {
+    const response = await fetch("/api/jobs/" + encodeURIComponent(id));
+    const job = await response.json();
+    if (!response.ok || !job.output_path) throw new Error(job.error || "translated EPUB is unavailable");
+    const w = freshAudioWizard();
+    w.sourceJobId = id;
+    w.sourcePath = job.output_path;
+    w.fileName = titleFromPath(job.output_path) + ".epub";
+    App.audioWizard = w;
+    App.audioSelected = null;
+    localStorage.removeItem("bf-audiobook-id");
+    bfGo("audiobook");
+  } catch (error) {
+    window.alert(error.message || "Could not open this translation for narration.");
+  }
 }
 
 /* ---------------- Wizard ---------------- */
@@ -383,6 +433,25 @@ async function trySelectPending(inputPath, attempt) {
 }
 
 /* ---------------- Audiobooks ---------------- */
+function audioWarnings(data) {
+  const warnings = data && (Array.isArray(data.warnings) ? data.warnings
+    : data.process && Array.isArray(data.process.warnings) ? data.process.warnings : []);
+  return warnings || [];
+}
+function audioWarningMessage(warning) {
+  if (typeof warning === "string") return warning;
+  if (warning && typeof warning === "object") return warning.message || warning.warning || warning.kind || "Audiobook output may be degraded.";
+  return String(warning || "Audiobook output may be degraded.");
+}
+function audioStatusLabel(status, warnings) {
+  return status === "succeeded" && warnings.length ? "Succeeded with warnings" : status;
+}
+function audioTerminal(status) { return ["succeeded","failed","cancelled"].includes(status); }
+function audioHasSource(w) { return !!(w && (w.file || w.sourceJobId)); }
+function appendAudioSource(fd, w) {
+  if (w.sourceJobId) fd.append("source_job_id", w.sourceJobId);
+  else if (w.file) fd.append("file", w.file);
+}
 function audioProviderOption(id) {
   return (App.options.audio_providers || []).find(p => p.id === id)
     || { id:"mock", label:"mock", models:["mock-silence"], default_model:"mock-silence",
@@ -409,12 +478,12 @@ function bfAudioFormat(format) { syncAudioInputs(); App.audioWizard.format = for
 function bfAudioModel() { syncAudioInputs(); const w=App.audioWizard, p=audioProviderOption(w.provider); w.maxChars=Math.min(w.maxChars,audioProviderMaxChars(p,w.model)); w.estimate=null; renderAudiobook($("#stage")); }
 function bfAudioPickFile(input) {
   const file = input.files && input.files[0]; if (!file) return;
-  App.audioWizard.file = file; App.audioWizard.fileName = file.name; App.audioWizard.estimate = null; renderAudiobook($("#stage"));
+  App.audioWizard.file = file; App.audioWizard.fileName = file.name; App.audioWizard.sourceJobId = ""; App.audioWizard.sourcePath = ""; App.audioWizard.estimate = null; renderAudiobook($("#stage"));
 }
 function bfAudioDropFile(e) {
   const f = bfDroppedEpub(e);
   if (!f) { audioToast("drop an EPUB (.epub) file"); return; }
-  App.audioWizard.file = f; App.audioWizard.fileName = f.name; App.audioWizard.estimate = null; renderAudiobook($("#stage"));
+  App.audioWizard.file = f; App.audioWizard.fileName = f.name; App.audioWizard.sourceJobId = ""; App.audioWizard.sourcePath = ""; App.audioWizard.estimate = null; renderAudiobook($("#stage"));
 }
 function syncAudioInputs() {
   const w = App.audioWizard; if (!w) return;
@@ -455,14 +524,14 @@ function audioEstimateHtml(estimate) {
       ? `quota OK (${remaining} left)`
       : `<span class="audio-estimate-bad">quota exceeded (${remaining} left)</span>`);
   }
-  return parts.join(" Â· ");
+  return parts.join(" · ");
 }
 
 async function bfAudioEstimate() {
-  const w = App.audioWizard; if (!w || !w.file || App.screen !== "audiobook" || App.audioSelected) return;
+  const w = App.audioWizard; if (!audioHasSource(w) || App.screen !== "audiobook" || App.audioSelected) return;
   syncAudioInputs();
   const request = ++App.audioEstimateRequest;
-  const fd = new FormData(); fd.append("file", w.file); fd.append("provider", w.provider);
+  const fd = new FormData(); appendAudioSource(fd, w); fd.append("provider", w.provider);
   if (w.model) fd.append("model", w.model);
   fd.append("max_chars", String(w.maxChars));
   try {
@@ -515,9 +584,10 @@ function renderAudiobook(stage) {
       <button class="btn btn-ghost" onclick="bfGo('library')">Back to library</button></div>
     <div class="wizpanel" style="max-width:920px;margin:0 auto">
       <div class="kicker">Source EPUB</div>
-      <div class="drop ${w.file?"has":""}" onclick="$('#audio-file').click()"
+      <div class="drop ${audioHasSource(w)?"has":""}" onclick="$('#audio-file').click()"
           ondragover="bfDragOver(event)" ondragenter="bfDragOver(event)" ondragleave="bfDragLeave(event)" ondrop="bfAudioDropFile(event)">
-        ${w.file ? `<div class="fname">${esc(w.fileName)}</div><div style="color:var(--muted);font-size:12px;margin-top:6px">Click to choose another EPUB</div>` : `<div>Drop an <b>EPUB</b> here or click to browse.</div>`}
+        ${w.sourceJobId ? `<div class="fname">${esc(w.sourcePath)}</div><div style="color:var(--muted);font-size:12px;margin-top:6px">Translated EPUB from the Library · click to choose another EPUB</div>`
+          : w.file ? `<div class="fname">${esc(w.fileName)}</div><div style="color:var(--muted);font-size:12px;margin-top:6px">Click to choose another EPUB</div>` : `<div>Drop an <b>EPUB</b> here or click to browse.</div>`}
       </div><input type="file" id="audio-file" accept=".epub" hidden onchange="bfAudioPickFile(this)">
       <div class="field-label" style="margin-top:20px">Speech provider</div><div class="chips">${providerChips}</div>
       <div class="adv-grid" style="margin-top:18px">
@@ -556,18 +626,18 @@ function renderAudiobook(stage) {
         <button class="btn btn-primary" id="audio-launch" onclick="bfLaunchAudiobook()">Start audiobook</button></div>
     </div></div>`;
   if (w.provider === "elevenlabs" && App.providerKeys["audio:elevenlabs"] === true) loadElevenLabsVoices();
-  if (w.file && !w.estimate) bfAudioEstimateDebounced();
+  if (audioHasSource(w) && !w.estimate) bfAudioEstimateDebounced();
 }
 
 async function bfLaunchAudiobook() {
   syncAudioInputs(); const w = App.audioWizard, p = audioProviderOption(w.provider);
-  if (!w.file) return audioToast("choose an EPUB file");
+  if (!audioHasSource(w)) return audioToast("choose an EPUB file");
   if (!w.model && !p.supports_auto_model) return audioToast("model is required");
   if (p.requires_voice && !w.voice) return audioToast("ElevenLabs voice ID is required");
   if (w.launching) return; w.launching = true;
   const button = $("#audio-launch"); if (button) { button.disabled=true; button.textContent="Starting…"; }
   audioToast("uploading and planning…");
-  const fd = new FormData(); fd.append("file", w.file); fd.append("provider", w.provider);
+  const fd = new FormData(); appendAudioSource(fd, w); fd.append("provider", w.provider);
   if (w.model) fd.append("model", w.model); fd.append("voice", w.voice); fd.append("format", w.format);
   fd.append("speed", String(w.speed)); fd.append("max_chars", String(w.maxChars)); fd.append("concurrency", String(w.concurrency));
   if (w.instructions) fd.append("instructions", w.instructions); if (w.baseUrl) fd.append("base_url", w.baseUrl);
@@ -610,6 +680,10 @@ async function pollAudiobook(id) {
   const processStatus = data.process && data.process.status;
   let status = data.status || processStatus || "starting";
   if (status === "succeeded" && processStatus === "running") status = "stitching";
+  const warnings = audioWarnings(data);
+  const statusLabel = audioStatusLabel(status, warnings);
+  const terminal = audioTerminal(status);
+  const warningList = warnings.map(warning => `<div class="audio-warning">${esc(audioWarningMessage(warning))}</div>`).join("");
   const chapters = audiobookChapterProgress(chunks);
   const chapterList = chapters.map(chapter => {
     const complete = chapter.total > 0 && chapter.done === chapter.total;
@@ -618,20 +692,21 @@ async function pollAudiobook(id) {
   const autoSelected = data.process && data.process.auto_model === true;
   const panel = $("#audio-progress"); if (!panel) return;
   panel.innerHTML = `<div class="facts">
-      <div class="fact"><div class="k">Status</div><div class="v"><span class="badge ${badgeClass(status)}">${esc(status)}</span></div></div>
+      <div class="fact"><div class="k">Status</div><div class="v"><span class="badge ${esc(badgeClass(statusLabel))}">${esc(statusLabel)}</span></div></div>
       <div class="fact"><div class="k">Provider</div><div class="v mono">${esc(data.synthesis_id||"planning")}</div></div>
       <div class="fact"><div class="k">Model</div><div class="v mono">${esc(data.resolved_model||"planning")}${autoSelected&&data.resolved_model?" (auto-selected)":""}</div></div>
       <div class="fact"><div class="k">Voice</div><div class="v">${esc(data.voice||"—")}</div></div>
       <div class="fact"><div class="k">Progress</div><div class="v mono">${done}/${total||"?"}</div></div>
     </div><div class="bar-track" style="margin:22px 0"><div class="bar-fill" style="width:${progress}%"></div></div>
+    ${status==="succeeded"&&warningList?`<div class="audio-warnings"><div class="audio-warnings-title">Succeeded with warnings</div>${warningList}</div>`:""}
     ${chapterList?`<div class="audio-chapters"><div class="audio-chapters-head">Chapters</div><div class="audio-chapter-list">${chapterList}</div></div>`:""}
     <div class="costbox"><div><div class="ck">Output</div><div class="mono" style="margin-top:8px;word-break:break-all">${esc(data.artifact||data.out_dir||"")}</div></div><div class="cm">${progress}% complete<br>${num(chunks.reduce((sum,chunk)=>sum+(chunk.chars||0),0))} characters planned</div></div>
     <div class="wizfoot" style="padding:18px 0 0"><span class="grow"></span>
-      ${!["succeeded","failed","cancelled"].includes(status)?`<button class="btn btn-ghost" onclick="bfCancelAudiobook('${esc(id)}')">Cancel</button>`:""}
+      ${!terminal?`<button class="btn btn-ghost" onclick="bfCancelAudiobook('${esc(id)}')">Cancel</button>`:""}
       ${status==="succeeded"&&data.artifact?`<audio class="audio-player" controls preload="none" src="/api/audiobooks/${encodeURIComponent(id)}/artifact?disposition=inline"></audio>`:""}
       ${status==="succeeded"?`<a class="btn btn-primary" href="/api/audiobooks/${encodeURIComponent(id)}/artifact">Download ${data.artifact?"M4B":"audio ZIP"}</a>`:""}
     </div>${data.error?`<div class="empty" style="color:var(--bad)">${esc(data.error)}</div>`:""}`;
-  if (!["succeeded","failed","cancelled"].includes(status)) setTimeout(()=>pollAudiobook(id), 800);
+  if (!terminal) setTimeout(()=>pollAudiobook(id), 800);
 }
 async function bfCancelAudiobook(id) {
   try {
