@@ -14,7 +14,7 @@
 //! - Binds `127.0.0.1` by default; the book text is private.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     convert::Infallible,
     ffi::OsString,
     net::SocketAddr,
@@ -2897,6 +2897,7 @@ fn dashboard_options_payload() -> DashboardOptions {
                 supports_instructions: false,
                 supports_speed: true,
                 max_chars: 40_000,
+                model_max_chars: BTreeMap::new(),
             },
             AudioProviderOption {
                 id: "openai",
@@ -2912,6 +2913,7 @@ fn dashboard_options_payload() -> DashboardOptions {
                 supports_instructions: true,
                 supports_speed: true,
                 max_chars: 4_096,
+                model_max_chars: BTreeMap::new(),
             },
             AudioProviderOption {
                 id: "gemini",
@@ -2927,6 +2929,7 @@ fn dashboard_options_payload() -> DashboardOptions {
                 supports_instructions: true,
                 supports_speed: false,
                 max_chars: 4_096,
+                model_max_chars: BTreeMap::new(),
             },
             AudioProviderOption {
                 id: "elevenlabs",
@@ -2944,6 +2947,15 @@ fn dashboard_options_payload() -> DashboardOptions {
                 max_chars: bookforge_audio::elevenlabs_model_max_input_chars(
                     "eleven_multilingual_v2",
                 ),
+                model_max_chars: AUDIO_ELEVENLABS_MODELS
+                    .iter()
+                    .map(|model| {
+                        (
+                            *model,
+                            bookforge_audio::elevenlabs_model_max_input_chars(model),
+                        )
+                    })
+                    .collect(),
             },
         ],
         ffmpeg_available: bookforge_audio::ffmpeg_available(),
@@ -3355,6 +3367,9 @@ struct AudioProviderOption {
     supports_instructions: bool,
     supports_speed: bool,
     max_chars: usize,
+    /// Per-model input ceilings, so the browser never keeps its own copy of a
+    /// provider's limits. Empty when every model shares `max_chars`.
+    model_max_chars: BTreeMap<&'static str, usize>,
 }
 
 impl JobDetail {
@@ -3658,6 +3673,43 @@ mod tests {
             audio_provider_max_chars("elevenlabs", "eleven_flash_v2_5"),
             40_000
         );
+    }
+
+    /// The browser used to carry its own table of ElevenLabs per-model limits,
+    /// which is a copy that can drift from the one synthesis actually enforces.
+    /// The options payload now serves them, so guard both halves: the payload
+    /// agrees with the canonical function, and the JS no longer hardcodes them.
+    #[test]
+    fn audio_options_serve_per_model_limits_so_the_browser_keeps_no_copy() {
+        let options = dashboard_options_payload();
+        let elevenlabs = options
+            .audio_providers
+            .iter()
+            .find(|provider| provider.id == "elevenlabs")
+            .expect("elevenlabs provider should be offered");
+
+        assert!(
+            !elevenlabs.model_max_chars.is_empty(),
+            "per-model limits must reach the browser"
+        );
+        for model in elevenlabs.models {
+            assert_eq!(
+                elevenlabs.model_max_chars.get(model).copied(),
+                Some(bookforge_audio::elevenlabs_model_max_input_chars(model)),
+                "served limit for {model} must match the synthesis path"
+            );
+        }
+
+        assert!(
+            DASHBOARD_JS.contains("provider.model_max_chars"),
+            "the browser must read limits from the payload"
+        );
+        for stale in ["eleven_flash_v2_5:40000", "eleven_v3:5000"] {
+            assert!(
+                !DASHBOARD_JS.contains(stale),
+                "dashboard.js must not reintroduce a hardcoded limit table ({stale})"
+            );
+        }
     }
 
     #[test]
@@ -4352,14 +4404,14 @@ mod tests {
     fn dashboard_assets_reassemble_byte_stably() {
         use sha2::{Digest, Sha256};
 
-        assert_eq!(DASHBOARD_HTML.len(), 113_200);
+        assert_eq!(DASHBOARD_HTML.len(), 113_292);
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
         assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
         let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
         let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
             digest_hex,
-            "440a46cbeb6a7630f488d337b5e22ecc077f69c86b7f108e8a895a309362dd3c"
+            "908c441831ab32699345eedd9157909c26c8477d7c1e893d5c176daeb351c486"
         );
 
         let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");

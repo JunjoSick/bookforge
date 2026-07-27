@@ -115,6 +115,76 @@ Batch / scheduler invariants (if the milestone touches `batch.rs`):
 - Repair batches use a sentinel value for any field they don't
   participate in.
 
+### Partial failure reported as success
+
+Three independent subsystem audits on 2026-07-27 converged on one recurring
+defect shape, found at six separate sites. It is the single most productive
+thing to look for in this codebase, so check it explicitly.
+
+The pattern: an operation partly fails, and the failure is converted into a
+success signal somewhere downstream. Real instances, all now fixed:
+
+- A batch response missing requested items returned `Ok`, and the caller — which
+  never inspected the failures it carried — told the adaptive sizer it had
+  succeeded. The sizer then **grew** the batch, so more items were dropped. A
+  compounding loop, not an edge case.
+- An empty translation for a non-empty source was marked `Succeeded`, became
+  cache-eligible, and erased the prose on rebuild.
+- `--chapters N --prune` reported "removed stale chunks" while deleting every
+  unselected chapter's paid audio.
+- ffmpeg failing mid-encode still emitted `"status": "succeeded"` with a null
+  audiobook, having already overwritten a previously good file.
+- The dashboard reported "Resume worker started" after a 150 ms check, before
+  provider construction, so a worker that died for want of an API key looked
+  fine.
+- `.m4b` assembly silently dropped chapter markers when a duration probe failed
+  and still reported the requested deliverable.
+
+Questions worth asking of any PR:
+
+- Does an `Ok`/success value here carry a failure list that nobody reads?
+- Can this report success before the thing it reports on has actually happened?
+- If this partially succeeds, is the partial state distinguishable from the
+  complete one *by a caller*, not just in a log line?
+- Does a "safe to delete" comment state the precondition it actually needs?
+
+Related: a check that cannot fail usefully is the same disease. Before adding a
+validator, ask what it would take for it to be wrong, and see
+`docs/validator-tooling.md` for how to measure that after the fact.
+
+### Test timing and ordering
+
+Four wall-clock races and one ordering race were removed on 2026-07-27. They
+are easy to reintroduce, and each shape needs a **different** fix — applying the
+wrong one makes things worse.
+
+1. **Polling a condition against a deadline.** The deadline *is* the pass/fail
+   criterion, so under load an alive-but-unscheduled process is
+   indistinguishable from a dead one. Raising the timeout is wrong; wait on a
+   real signal instead (an event the production code already emits), while
+   watching for premature exit so genuine failures still fail fast.
+2. **An assertion racing a production time window.** The window is product
+   behaviour and must not move to suit a test. Make the threshold injectable,
+   keep the production default, and let only the specific test opt out.
+3. **Awaiting a real signal with a timeout as deadlock insurance.** Here the
+   `await` is the criterion and the timeout only prevents a hang, so a tight
+   budget buys nothing and converts slow scheduling into a false failure.
+   **Raising it to something generous (30s+) is correct.**
+4. **Asserting order across an actor boundary.** The checkpoint writer runs
+   concurrently with the scheduler by design, so its events interleave
+   nondeterministically. Compare a multiset of event kinds plus the order of
+   everything outside the actor — never a total order.
+
+Some timeouts must stay tight: a test verifying that a 1 ms deadline expires is
+testing elapsed time, and lengthening it destroys the test. Judgement, not a
+blanket rule.
+
+**Verification standard:** these failures are probabilistic under load, and each
+cold run picks a different victim. Two clean runs is not evidence — that is how
+the third and fourth races survived two separate attempts. Reproduce with
+`cargo clean -p bookforge-llm -p bookforge-epub -p bookforge-cli` followed
+immediately by `cargo test --workspace`, at least three times.
+
 ### Security / privacy
 
 - API keys: `--api-key-env` is still the only key intake path. No new
