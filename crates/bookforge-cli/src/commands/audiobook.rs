@@ -207,6 +207,12 @@ pub struct AudiobookArgs {
     #[arg(long, default_value_t = false)]
     pub prune: bool,
 
+    /// Retry only chunks recorded as failed in the previous matching
+    /// manifest. Previously successful chunks are validated but can never
+    /// call the provider in this mode.
+    #[arg(long, default_value_t = false)]
+    pub retry_failed: bool,
+
     /// Progress output mode. `tui` opens an attached full-screen audiobook
     /// dashboard; `json` emits one JSON object per completed chunk.
     #[arg(long, value_enum, default_value_t = UiMode::Auto)]
@@ -414,18 +420,33 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         gap_title_ms: args.gap_title_ms,
         gap_paragraph_ms: args.gap_paragraph_ms,
         pdf_page_grouping,
+        retry_failed: args.retry_failed,
     };
     validate_options(&options)?;
 
-    let plan = plan_chunks(&book, &options);
+    let mut plan = plan_chunks(&book, &options);
     if plan.is_empty() {
         anyhow::bail!(
             "no narratable text found in {} (cover-only or empty book?)",
             input.display()
         );
     }
-    let full_prune_plan = (args.prune && options.chapter_filter.is_some())
-        .then(|| plan_chunks_for_prune(&book, &options));
+    let full_prune_plan = args.prune.then(|| plan_chunks_for_prune(&book, &options));
+    if args.retry_failed {
+        let failed = bookforge_audio::failed_chunk_files(&out_dir.join("manifest.json"))
+            .with_context(|| {
+                format!(
+                    "--retry-failed requires a readable prior manifest at {}",
+                    out_dir.join("manifest.json").display()
+                )
+            })?;
+        plan.retain(|chunk| failed.contains(&chunk.file));
+        if plan.is_empty() {
+            anyhow::bail!(
+                "--retry-failed found no failed chunks matching the current book and synthesis settings"
+            );
+        }
+    }
     let chapter_count = plan
         .iter()
         .map(|chunk| chunk.chapter_index)
@@ -591,11 +612,16 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                 }
             }
         };
-        app.finish(if outcome.is_ok() {
-            "succeeded"
-        } else {
-            "failed"
-        });
+        app.finish(
+            if outcome
+                .as_ref()
+                .is_ok_and(|report| report.chunks_failed == 0)
+            {
+                "succeeded"
+            } else {
+                "failed"
+            },
+        );
         app.draw().ok();
         let restore = app.restore();
         restore?;
@@ -611,6 +637,52 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     };
 
     let fallback_tui_output = args.ui == UiMode::Tui && !use_tui;
+    if report.chunks_failed > 0 {
+        if human_output || fallback_tui_output {
+            eprintln!(
+                "Incomplete: {} of {} chunks failed. Successful audio was preserved.",
+                report.chunks_failed, report.chunks_total
+            );
+            for failure in &report.failures {
+                eprintln!(
+                    "  chapter {}, part {} ({}): {}",
+                    failure.chapter_index + 1,
+                    failure.part,
+                    failure.file,
+                    failure.error
+                );
+            }
+            eprintln!(
+                "Retry: rerun the same command with --retry-failed to call the provider only for these failures."
+            );
+            eprintln!("Manifest: {}", report.manifest_path.display());
+        } else if args.ui == UiMode::Json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "audiobook_finished",
+                    "status": "failed",
+                    "synthesized": report.chunks_synthesized,
+                    "cached": report.chunks_skipped,
+                    "failed": report.chunks_failed,
+                    "chunks": report.chunks_total,
+                    "manifest": report.manifest_path,
+                    "chunk_files": report.files,
+                    "chapter_files": [],
+                    "audiobook": null,
+                    "single_file": null,
+                    "failures": report.failures,
+                    "warnings": [],
+                })
+            );
+        }
+        anyhow::bail!(
+            "{} audiobook chunk(s) failed; successful chunks are resumable from {}",
+            report.chunks_failed,
+            report.manifest_path.display()
+        );
+    }
+
     let stitch_report = if postprocess {
         Some(stitch_output(StitchRequest {
             manifest_path: &report.manifest_path,
@@ -618,7 +690,6 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             book: &book,
             format,
             make_m4b,
-            require_m4b: args.m4b,
             make_single: args.single,
             gap_chapter_ms: args.gap_chapter_ms,
             gap_title_ms: args.gap_title_ms,
@@ -629,10 +700,45 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     } else {
         None
     };
+    if let Some(stitch_report) = &stitch_report {
+        write_stitch_warnings_to_process(&out_dir, &stitch_report.warnings)?;
+    }
+    let deliverable_errors = stitch_report.as_ref().map_or_else(Vec::new, |result| {
+        missing_requested_deliverables(result, report.chapters, args.stitch, make_m4b, args.single)
+    });
+    let strict_deliverable_errors = stitch_report.as_ref().map_or_else(Vec::new, |result| {
+        missing_requested_deliverables(result, report.chapters, false, args.m4b, args.single)
+    });
+    let legacy_missing_ffmpeg_stitch = args.stitch
+        && !make_m4b
+        && !args.single
+        && stitch_report.as_ref().is_some_and(|result| {
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("ffmpeg not found on PATH"))
+        });
+    let final_status = if deliverable_errors.is_empty() || legacy_missing_ffmpeg_stitch {
+        "succeeded"
+    } else if strict_deliverable_errors.is_empty() {
+        "partial"
+    } else {
+        "failed"
+    };
+    let deliverable_status = if deliverable_errors.is_empty() {
+        "complete"
+    } else {
+        "partial"
+    };
 
     if human_output || fallback_tui_output {
+        let summary = if deliverable_errors.is_empty() {
+            "Done"
+        } else {
+            "Incomplete"
+        };
         println!(
-            "Done: {} synthesized, {} reused (resume), {} files total",
+            "{summary}: {} synthesized, {} reused (resume), {} files total",
             report.chunks_synthesized,
             report.chunks_skipped,
             report.files.len()
@@ -653,14 +759,19 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                 .and_then(|result| result.single_file.as_ref())
                 .map_or("none".to_string(), |path| path.display().to_string()),
         );
+        for error in &deliverable_errors {
+            eprintln!("error: {error}");
+        }
     } else if args.ui == UiMode::Json {
         println!(
             "{}",
             serde_json::json!({
                 "event": "audiobook_finished",
-                "status": "succeeded",
+                "status": final_status,
+                "deliverable_status": deliverable_status,
                 "synthesized": report.chunks_synthesized,
                 "cached": report.chunks_skipped,
+                "failed": 0,
                 "chunks": report.chunks_total,
                 "manifest": report.manifest_path,
                 "chunk_files": report.files,
@@ -668,8 +779,13 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                 "audiobook": stitch_report.as_ref().and_then(|result| result.book_file.as_ref()),
                 "single_file": stitch_report.as_ref().and_then(|result| result.single_file.as_ref()),
                 "warnings": stitch_report.as_ref().map(|result| &result.warnings),
+                "deliverable_errors": deliverable_errors,
             })
         );
+    }
+
+    if !strict_deliverable_errors.is_empty() {
+        anyhow::bail!("{}", strict_deliverable_errors.join("; "));
     }
 
     if stitch_report.is_none() && human_output && args.no_book_file {
@@ -1040,6 +1156,8 @@ fn progress_callback(ui: UiMode, total: usize) -> Arc<dyn Fn(Progress) + Send + 
                     "total": event.total,
                     "chapter": event.chapter_title,
                     "cached": event.skipped,
+                    "failed": event.failed,
+                    "error": event.error,
                 })
             );
         });
@@ -1054,7 +1172,9 @@ fn progress_callback(ui: UiMode, total: usize) -> Arc<dyn Fn(Progress) + Send + 
     );
     Arc::new(move |event: Progress| {
         progress.set_position(event.done as u64);
-        let state = if event.skipped {
+        let state = if event.failed {
+            "failed"
+        } else if event.skipped {
             "cached"
         } else {
             "synthesized"
@@ -1155,17 +1275,13 @@ async fn synthesize(
 
 /// Inputs for [`stitch_output`], named at the call site.
 ///
-/// Four of these are bools, and two of them differ only in intent:
-/// `make_m4b` means "assemble an m4b if ffmpeg can", while `require_m4b` means
-/// "the user asked for one, so failing to build it is an error". As positional
-/// arguments they sat next to each other and were easy to transpose.
+/// Named inputs keep the output-policy booleans legible at the call site.
 struct StitchRequest<'a> {
     manifest_path: &'a std::path::Path,
     out_dir: &'a std::path::Path,
     book: &'a bookforge_core::ir::Book,
     format: AudioFormat,
     make_m4b: bool,
-    require_m4b: bool,
     make_single: bool,
     gap_chapter_ms: u32,
     gap_title_ms: u32,
@@ -1181,7 +1297,6 @@ fn stitch_output(request: StitchRequest<'_>) -> Result<bookforge_audio::StitchRe
         book,
         format,
         make_m4b,
-        require_m4b,
         make_single,
         gap_chapter_ms,
         gap_title_ms,
@@ -1219,16 +1334,6 @@ fn stitch_output(request: StitchRequest<'_>) -> Result<bookforge_audio::StitchRe
             println!("Chapter files: {}", result.chapter_files.len());
         }
     }
-    if require_m4b && result.book_file.is_none() {
-        anyhow::bail!(
-            "--m4b was requested, but audiobook.m4b could not be assembled; install ffmpeg and review the stitch warnings above"
-        );
-    }
-    if make_single && result.single_file.is_none() {
-        anyhow::bail!(
-            "--single was requested, but the flat whole-book file could not be assembled; install ffmpeg and review the stitch warnings above"
-        );
-    }
     if human_output && let Some(book_file) = &result.book_file {
         println!("Audiobook: {}", book_file.display());
     }
@@ -1236,6 +1341,71 @@ fn stitch_output(request: StitchRequest<'_>) -> Result<bookforge_audio::StitchRe
         println!("Single file: {}", single_file.display());
     }
     Ok(result)
+}
+
+fn missing_requested_deliverables(
+    report: &bookforge_audio::StitchReport,
+    expected_chapters: usize,
+    require_chapters: bool,
+    require_m4b: bool,
+    require_single: bool,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if require_chapters && report.chapter_files.len() != expected_chapters {
+        errors.push(format!(
+            "--stitch requested {expected_chapters} chapter file(s), but only {} were produced",
+            report.chapter_files.len()
+        ));
+    }
+    if require_m4b && report.book_file.is_none() {
+        errors.push(
+            "the requested chaptered audiobook.m4b was not produced; review the stitch warnings"
+                .to_string(),
+        );
+    }
+    if require_single && report.single_file.is_none() {
+        errors.push(
+            "--single was requested, but the flat whole-book file was not produced; review the stitch warnings"
+                .to_string(),
+        );
+    }
+    errors
+}
+
+fn write_stitch_warnings_to_process(out_dir: &std::path::Path, warnings: &[String]) -> Result<()> {
+    let path = out_dir.join("process.json");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let mut process: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path)
+            .with_context(|| format!("failed to read process state {}", path.display()))?,
+    )
+    .with_context(|| format!("failed to parse process state {}", path.display()))?;
+    let object = process
+        .as_object_mut()
+        .context("audiobook process state must be a JSON object")?;
+    object.insert("warnings".to_string(), serde_json::json!(warnings));
+
+    let staged = out_dir.join("process.warnings.part.tmp");
+    std::fs::write(&staged, serde_json::to_vec_pretty(&process)?)
+        .with_context(|| format!("failed to stage process state {}", staged.display()))?;
+    let backup = out_dir.join("process.warnings.replace.bak");
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(&path, &backup)
+        .with_context(|| format!("failed to preserve process state {}", path.display()))?;
+    match std::fs::rename(&staged, &path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(backup);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::rename(&backup, &path);
+            let _ = std::fs::remove_file(staged);
+            Err(error)
+                .with_context(|| format!("failed to publish process state {}", path.display()))
+        }
+    }
 }
 
 fn default_out_dir(input: &std::path::Path) -> PathBuf {
@@ -1271,9 +1441,9 @@ fn validate_audio_base_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioProviderKind, BreakTagsArg, normalize_language_code, parse_chapter_ranges,
-        resolve_context_chars, resolve_heading_break_tag, resolve_language_code,
-        validate_audio_base_url,
+        AudioProviderKind, BreakTagsArg, missing_requested_deliverables, normalize_language_code,
+        parse_chapter_ranges, resolve_context_chars, resolve_heading_break_tag,
+        resolve_language_code, validate_audio_base_url, write_stitch_warnings_to_process,
     };
 
     #[test]
@@ -1404,5 +1574,43 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn missing_explicit_or_automatic_deliverables_are_failures() {
+        let report = bookforge_audio::StitchReport::default();
+        let errors = missing_requested_deliverables(&report, 3, true, true, true);
+        assert_eq!(errors.len(), 3);
+        assert!(errors[0].contains("--stitch"));
+        assert!(errors[1].contains("chaptered audiobook.m4b"));
+        assert!(errors[2].contains("--single"));
+
+        assert!(
+            missing_requested_deliverables(&report, 3, false, false, false).is_empty(),
+            "per-chunk-only output is successful when no stitched deliverable was requested"
+        );
+    }
+
+    #[test]
+    fn stitch_warnings_are_added_to_existing_process_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("process.json"),
+            br#"{"status":"running","pid":42,"auto_model":true}"#,
+        )
+        .unwrap();
+        let warnings = vec![
+            "ffprobe could not read chapter 2".to_string(),
+            "m4b was not produced".to_string(),
+        ];
+
+        write_stitch_warnings_to_process(dir.path(), &warnings).unwrap();
+
+        let process: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("process.json")).unwrap())
+                .unwrap();
+        assert_eq!(process["status"], "running");
+        assert_eq!(process["pid"], 42);
+        assert_eq!(process["warnings"], serde_json::json!(warnings));
     }
 }

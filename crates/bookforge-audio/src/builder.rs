@@ -5,9 +5,9 @@
 //! already on disk. A `manifest.json` records the plan and outcomes for the
 //! operator and for the optional stitch step.
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bookforge_core::ir::Book;
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,10 @@ pub struct AudiobookOptions {
     /// Group physical pdftohtml pages around explicit chapter headings.
     /// This must only be enabled from a positive source-format signal.
     pub pdf_page_grouping: bool,
+    /// Only previously failed chunks may call the provider. Successful chunks
+    /// are still validated and included in the new manifest, but a missing or
+    /// corrupt successful cache entry is reported instead of being re-paid.
+    pub retry_failed: bool,
 }
 
 impl Default for AudiobookOptions {
@@ -75,6 +79,7 @@ impl Default for AudiobookOptions {
             gap_title_ms: 800,
             gap_paragraph_ms: 0,
             pdf_page_grouping: false,
+            retry_failed: false,
         }
     }
 }
@@ -170,9 +175,21 @@ pub struct AudiobookReport {
     pub chunks_total: usize,
     pub chunks_synthesized: usize,
     pub chunks_skipped: usize,
+    pub chunks_failed: usize,
+    pub failures: Vec<ChunkFailure>,
     pub files: Vec<PathBuf>,
     pub manifest_path: PathBuf,
     pub out_dir: PathBuf,
+}
+
+/// A chunk that remained unresolved after the provider's retries.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChunkFailure {
+    pub chapter_index: usize,
+    pub chapter_title: String,
+    pub part: usize,
+    pub file: String,
+    pub error: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -212,6 +229,8 @@ pub struct Progress {
     pub total: usize,
     pub chapter_title: String,
     pub skipped: bool,
+    pub failed: bool,
+    pub error: Option<String>,
 }
 
 /// Internal per-chunk plan item.
@@ -226,6 +245,18 @@ struct PlannedChunk {
     synthesis_sha256: String,
     path: PathBuf,
 }
+
+struct ChunkTaskOutcome {
+    record_index: usize,
+    chapter_index: usize,
+    chapter_title: String,
+    part: usize,
+    path: PathBuf,
+    report_progress: bool,
+    result: Result<(bool, Vec<u8>)>,
+}
+
+const MANIFEST_CHECKPOINT_INTERVAL: usize = 16;
 
 /// Build the deterministic chunk plan for a book. Public so the CLI can
 /// preview counts (e.g. a cost estimate) without synthesizing.
@@ -344,9 +375,10 @@ fn context_slice(text: &str, chars: usize, from_end: bool) -> Option<String> {
     }
 }
 
-/// Synthesize an audiobook. Existing non-empty files are treated as already
-/// done (resume). `on_progress` is invoked once per chunk, in completion
-/// order.
+/// Synthesize an audiobook. Existing audio is reused only after signature
+/// validation and, when a prior manifest is available, byte-count and hash
+/// verification. `on_progress` is invoked once per attempted chunk in
+/// completion order (failed-only retries omit already successful records).
 pub async fn build_audiobook<P, F>(
     book: &Book,
     provider: Arc<P>,
@@ -370,11 +402,41 @@ where
     })?;
 
     let total = plan.len();
-    let done = Arc::new(AtomicUsize::new(0));
-    let synthesized = Arc::new(AtomicUsize::new(0));
-    let skipped = Arc::new(AtomicUsize::new(0));
     let semaphore = Arc::new(Semaphore::new(options.concurrency.max(1)));
     let on_progress = Arc::new(on_progress);
+    let manifest_path = options.out_dir.join("manifest.json");
+    let previous_manifest = load_previous_manifest(&manifest_path, options.retry_failed)?;
+    let previous_records: HashMap<String, ChunkRecord> = previous_manifest
+        .map(|manifest| {
+            manifest
+                .chunks
+                .into_iter()
+                .map(|record| (record.file.clone(), record))
+                .collect()
+        })
+        .unwrap_or_default();
+    let matching_failures = if options.retry_failed {
+        let matching_failures = plan
+            .iter()
+            .filter(|chunk| {
+                previous_records
+                    .get(&file_name_of(&chunk.path))
+                    .is_some_and(|record| {
+                        record.synthesis_sha256 == chunk.synthesis_sha256
+                            && record.status == ChunkStatus::Failed
+                    })
+            })
+            .count();
+        if matching_failures == 0 {
+            return Err(BuildError::InvalidOptions(
+                "--retry-failed found no failed chunks matching the current book and synthesis settings"
+                    .to_string(),
+            ));
+        }
+        matching_failures
+    } else {
+        total
+    };
 
     // Chunk records for the manifest, in plan order.
     let records: Vec<ChunkRecord> = plan
@@ -399,8 +461,7 @@ where
         .map(|record| record.chapter_index)
         .collect::<std::collections::BTreeSet<_>>()
         .len();
-    let manifest_path = options.out_dir.join("manifest.json");
-    let manifest = Arc::new(Mutex::new(AudiobookManifest {
+    let mut manifest = AudiobookManifest {
         schema_version: 3,
         title: book.metadata.title.clone(),
         synthesis_id: options.synthesis_id.clone(),
@@ -424,8 +485,8 @@ where
         status: AudiobookStatus::Running,
         updated_at_ms: now_ms(),
         error: None,
-    }));
-    write_manifest_checkpoint(&manifest, &manifest_path)?;
+    };
+    write_manifest_checkpoint_async(&manifest, &manifest_path).await?;
 
     let mut set = tokio::task::JoinSet::new();
     for (record_index, chunk) in plan.into_iter().enumerate() {
@@ -439,27 +500,61 @@ where
         let seed = options.seed;
         let language_code = options.language_code.clone();
         let text_normalization = options.text_normalization;
-        let done = Arc::clone(&done);
-        let synthesized = Arc::clone(&synthesized);
-        let skipped = Arc::clone(&skipped);
-        let on_progress = Arc::clone(&on_progress);
-        let manifest = Arc::clone(&manifest);
-        let manifest_path = manifest_path.clone();
+        let previous_record = previous_records.get(&file_name_of(&chunk.path)).cloned();
+        let retry_failed = options.retry_failed;
+        let report_progress = !retry_failed
+            || previous_record.as_ref().is_some_and(|record| {
+                record.synthesis_sha256 == chunk.synthesis_sha256
+                    && record.status == ChunkStatus::Failed
+            });
 
         set.spawn(async move {
             let _permit = semaphore
                 .acquire()
                 .await
                 .expect("semaphore is never closed");
-            if cancel.is_cancelled() {
-                return Err(BuildError::Tts(crate::provider::TtsError::Cancelled));
-            }
-
-            let rendered = async {
-                if let Some(bytes) = read_valid_cached_audio(&chunk.path, format) {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                    return Ok::<_, BuildError>((true, bytes));
+            let result = async {
+                if cancel.is_cancelled() {
+                    return Err(BuildError::Tts(crate::provider::TtsError::Cancelled));
                 }
+                if retry_failed {
+                    match previous_record.as_ref() {
+                        Some(record)
+                            if record.synthesis_sha256 == chunk.synthesis_sha256
+                                && record.status == ChunkStatus::Failed => {}
+                        Some(record)
+                            if record.synthesis_sha256 == chunk.synthesis_sha256
+                                && matches!(
+                                    record.status,
+                                    ChunkStatus::Synthesized | ChunkStatus::Cached
+                                ) =>
+                        {
+                            return read_valid_cached_audio(
+                                &chunk.path,
+                                format,
+                                Some(record),
+                            )
+                            .map(|bytes| (true, bytes))
+                            .ok_or_else(|| {
+                                BuildError::InvalidOptions(format!(
+                                    "--retry-failed refused to re-synthesize previously successful chunk {} because its cache file is missing or invalid; rerun without --retry-failed to repair it",
+                                    file_name_of(&chunk.path)
+                                ))
+                            });
+                        }
+                        _ => {
+                            return Err(BuildError::InvalidOptions(format!(
+                                "--retry-failed refused to synthesize chunk {} because it was not recorded as failed by the previous matching run",
+                                file_name_of(&chunk.path)
+                            )));
+                        }
+                    }
+                } else if let Some(bytes) =
+                    read_valid_cached_audio(&chunk.path, format, previous_record.as_ref())
+                {
+                    return Ok((true, bytes));
+                }
+
                 let clip = provider
                     .synthesize(SpeechRequest {
                         text: chunk.text.clone(),
@@ -482,171 +577,257 @@ where
                 }
                 crate::provider::validate_audio_payload(format, None, &clip.bytes)?;
                 write_atomic(&chunk.path, &clip.bytes)?;
-                synthesized.fetch_add(1, Ordering::Relaxed);
                 Ok((false, clip.bytes))
             }
             .await;
 
-            let (was_skipped, audio_bytes) = match rendered {
-                Ok(rendered) => rendered,
-                Err(error) => {
-                    let _ = update_chunk_checkpoint(
-                        &manifest,
-                        &manifest_path,
-                        record_index,
-                        ChunkStatus::Failed,
-                        None,
-                        None,
-                        Some(error.to_string()),
-                    );
-                    return Err(error);
-                }
-            };
-            update_chunk_checkpoint(
-                &manifest,
-                &manifest_path,
+            ChunkTaskOutcome {
                 record_index,
-                if was_skipped {
-                    ChunkStatus::Cached
-                } else {
-                    ChunkStatus::Synthesized
-                },
-                Some(audio_hash(&audio_bytes)),
-                Some(audio_bytes.len() as u64),
-                None,
-            )?;
-
-            let done_now = done.fetch_add(1, Ordering::Relaxed) + 1;
-            on_progress(Progress {
-                done: done_now,
-                total,
+                chapter_index: chunk.chapter_index,
                 chapter_title: chunk.chapter_title.clone(),
-                skipped: was_skipped,
-            });
-            Ok::<PathBuf, BuildError>(chunk.path)
+                part: chunk.part,
+                path: chunk.path,
+                report_progress,
+                result,
+            }
         });
     }
 
-    // Collect results as tasks finish; on the first error, cancel the run so
-    // in-flight provider calls stop, abort the rest, and propagate.
+    // Provider/content failures are isolated to their chunks. Checkpoint them
+    // immediately and keep collecting the paid work that can still succeed.
+    // Cancellation, panics, and checkpoint failures remain run-fatal because
+    // the builder can no longer promise a trustworthy resume point.
     let mut files = Vec::with_capacity(total);
+    let mut failures = Vec::new();
+    let mut synthesized = 0usize;
+    let mut skipped = 0usize;
+    let mut done = 0usize;
+    let mut successful_since_checkpoint = 0usize;
     while let Some(joined) = set.join_next().await {
         match joined {
-            Ok(Ok(path)) => files.push(path),
-            Ok(Err(error)) => {
-                cancel.cancel();
-                set.abort_all();
-                let status =
-                    if matches!(error, BuildError::Tts(crate::provider::TtsError::Cancelled)) {
-                        AudiobookStatus::Cancelled
+            Ok(outcome) => match outcome.result {
+                Ok((was_skipped, audio_bytes)) => {
+                    update_chunk_record(
+                        &mut manifest,
+                        outcome.record_index,
+                        if was_skipped {
+                            ChunkStatus::Cached
+                        } else {
+                            ChunkStatus::Synthesized
+                        },
+                        Some(audio_hash(&audio_bytes)),
+                        Some(audio_bytes.len() as u64),
+                        None,
+                    )?;
+                    if was_skipped {
+                        skipped += 1;
                     } else {
-                        AudiobookStatus::Failed
-                    };
-                let _ = update_manifest_status(
-                    &manifest,
-                    &manifest_path,
-                    status,
-                    Some(error.to_string()),
-                );
-                return Err(error);
-            }
+                        synthesized += 1;
+                    }
+                    files.push(outcome.path);
+                    done += usize::from(outcome.report_progress);
+                    successful_since_checkpoint += 1;
+                    if outcome.report_progress {
+                        on_progress(Progress {
+                            done,
+                            total: matching_failures,
+                            chapter_title: outcome.chapter_title,
+                            skipped: was_skipped,
+                            failed: false,
+                            error: None,
+                        });
+                    }
+                    if successful_since_checkpoint >= MANIFEST_CHECKPOINT_INTERVAL {
+                        write_manifest_checkpoint_async(&manifest, &manifest_path).await?;
+                        successful_since_checkpoint = 0;
+                    }
+                }
+                Err(error)
+                    if matches!(error, BuildError::Tts(crate::provider::TtsError::Cancelled)) =>
+                {
+                    cancel.cancel();
+                    set.abort_all();
+                    update_manifest_status(
+                        &mut manifest,
+                        AudiobookStatus::Cancelled,
+                        Some(error.to_string()),
+                    );
+                    write_manifest_checkpoint_async(&manifest, &manifest_path).await?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    update_chunk_record(
+                        &mut manifest,
+                        outcome.record_index,
+                        ChunkStatus::Failed,
+                        None,
+                        None,
+                        Some(error.clone()),
+                    )?;
+                    failures.push(ChunkFailure {
+                        chapter_index: outcome.chapter_index,
+                        chapter_title: outcome.chapter_title.clone(),
+                        part: outcome.part,
+                        file: file_name_of(&outcome.path),
+                        error: error.clone(),
+                    });
+                    done += usize::from(outcome.report_progress);
+                    if outcome.report_progress {
+                        on_progress(Progress {
+                            done,
+                            total: matching_failures,
+                            chapter_title: outcome.chapter_title,
+                            skipped: false,
+                            failed: true,
+                            error: Some(error),
+                        });
+                    }
+                    write_manifest_checkpoint_async(&manifest, &manifest_path).await?;
+                    successful_since_checkpoint = 0;
+                }
+            },
             Err(join_error) => {
                 cancel.cancel();
                 set.abort_all();
                 let error = BuildError::Tts(crate::provider::TtsError::Provider(format!(
                     "synthesis task panicked: {join_error}"
                 )));
-                let _ = update_manifest_status(
-                    &manifest,
-                    &manifest_path,
+                update_manifest_status(
+                    &mut manifest,
                     AudiobookStatus::Failed,
                     Some(error.to_string()),
                 );
+                let _ = write_manifest_checkpoint_async(&manifest, &manifest_path).await;
                 return Err(error);
             }
         }
     }
     files.sort();
 
-    update_manifest_status(&manifest, &manifest_path, AudiobookStatus::Succeeded, None)?;
+    if failures.is_empty() {
+        update_manifest_status(&mut manifest, AudiobookStatus::Succeeded, None);
+    } else {
+        update_manifest_status(
+            &mut manifest,
+            AudiobookStatus::Failed,
+            Some(format!(
+                "{} of {total} chunks failed; successful chunks were preserved and will be reused",
+                failures.len()
+            )),
+        );
+    }
+    write_manifest_checkpoint_async(&manifest, &manifest_path).await?;
 
     Ok(AudiobookReport {
         chapters,
         chunks_total: total,
-        chunks_synthesized: synthesized.load(Ordering::Relaxed),
-        chunks_skipped: skipped.load(Ordering::Relaxed),
+        chunks_synthesized: synthesized,
+        chunks_skipped: skipped,
+        chunks_failed: failures.len(),
+        failures,
         files,
         manifest_path,
         out_dir: options.out_dir.clone(),
     })
 }
 
-fn read_valid_cached_audio(path: &Path, format: AudioFormat) -> Option<Vec<u8>> {
+fn read_valid_cached_audio(
+    path: &Path,
+    format: AudioFormat,
+    expected: Option<&ChunkRecord>,
+) -> Option<Vec<u8>> {
     let bytes = std::fs::read(path).ok()?;
-    crate::provider::validate_audio_payload(format, None, &bytes)
-        .ok()
-        .map(|()| bytes)
+    crate::provider::validate_audio_payload(format, None, &bytes).ok()?;
+    if let Some(expected_bytes) = expected.and_then(|record| record.bytes)
+        && expected_bytes != bytes.len() as u64
+    {
+        return None;
+    }
+    if let Some(expected_hash) = expected.and_then(|record| record.audio_sha256.as_deref())
+        && expected_hash != audio_hash(&bytes)
+    {
+        return None;
+    }
+    Some(bytes)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn update_chunk_checkpoint(
-    manifest: &Arc<Mutex<AudiobookManifest>>,
-    path: &Path,
+fn update_chunk_record(
+    manifest: &mut AudiobookManifest,
     index: usize,
     status: ChunkStatus,
     audio_sha256: Option<String>,
     bytes: Option<u64>,
     error: Option<String>,
 ) -> Result<()> {
-    {
-        let mut manifest = manifest.lock().map_err(|_| {
-            BuildError::InvalidOptions("audiobook manifest lock was poisoned".to_string())
-        })?;
-        let record = manifest.chunks.get_mut(index).ok_or_else(|| {
-            BuildError::InvalidOptions("audiobook checkpoint index was invalid".to_string())
-        })?;
-        record.status = status;
-        record.audio_sha256 = audio_sha256;
-        record.bytes = bytes;
-        record.error = error;
-        manifest.completed_chunks = manifest
-            .chunks
-            .iter()
-            .filter(|record| {
-                matches!(
-                    record.status,
-                    ChunkStatus::Synthesized | ChunkStatus::Cached
-                )
-            })
-            .count();
-        manifest.updated_at_ms = now_ms();
+    let record = manifest.chunks.get_mut(index).ok_or_else(|| {
+        BuildError::InvalidOptions("audiobook checkpoint index was invalid".to_string())
+    })?;
+    let was_complete = matches!(
+        record.status,
+        ChunkStatus::Synthesized | ChunkStatus::Cached
+    );
+    let is_complete = matches!(status, ChunkStatus::Synthesized | ChunkStatus::Cached);
+    record.status = status;
+    record.audio_sha256 = audio_sha256;
+    record.bytes = bytes;
+    record.error = error;
+    match (was_complete, is_complete) {
+        (false, true) => manifest.completed_chunks += 1,
+        (true, false) => manifest.completed_chunks = manifest.completed_chunks.saturating_sub(1),
+        _ => {}
     }
-    write_manifest_checkpoint(manifest, path)
+    manifest.updated_at_ms = now_ms();
+    Ok(())
 }
 
 fn update_manifest_status(
-    manifest: &Arc<Mutex<AudiobookManifest>>,
-    path: &Path,
+    manifest: &mut AudiobookManifest,
     status: AudiobookStatus,
     error: Option<String>,
-) -> Result<()> {
-    {
-        let mut manifest = manifest.lock().map_err(|_| {
-            BuildError::InvalidOptions("audiobook manifest lock was poisoned".to_string())
-        })?;
-        manifest.status = status;
-        manifest.error = error;
-        manifest.updated_at_ms = now_ms();
-    }
-    write_manifest_checkpoint(manifest, path)
+) {
+    manifest.status = status;
+    manifest.error = error;
+    manifest.updated_at_ms = now_ms();
 }
 
-fn write_manifest_checkpoint(manifest: &Arc<Mutex<AudiobookManifest>>, path: &Path) -> Result<()> {
-    let manifest = manifest.lock().map_err(|_| {
-        BuildError::InvalidOptions("audiobook manifest lock was poisoned".to_string())
+async fn write_manifest_checkpoint_async(manifest: &AudiobookManifest, path: &Path) -> Result<()> {
+    let json = serde_json::to_vec_pretty(manifest)?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_atomic(&path, &json))
+        .await
+        .map_err(|error| {
+            BuildError::InvalidOptions(format!("audiobook checkpoint task failed: {error}"))
+        })?
+}
+
+fn load_previous_manifest(path: &Path, required: bool) -> Result<Option<AudiobookManifest>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(BuildError::Manifest),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
+        Err(error) => Err(BuildError::Io {
+            path: path.to_path_buf(),
+            source: error,
+        }),
+    }
+}
+
+/// Return the exact cache filenames recorded as failed in a prior manifest.
+/// The CLI uses this to make `--retry-failed` cost estimates honest; the
+/// builder independently enforces the same status before any provider call.
+pub fn failed_chunk_files(manifest_path: &Path) -> Result<BTreeSet<String>> {
+    let manifest = load_previous_manifest(manifest_path, true)?.ok_or_else(|| {
+        BuildError::InvalidOptions("previous audiobook manifest was not found".to_string())
     })?;
-    let json = serde_json::to_vec_pretty(&*manifest)?;
-    write_atomic(path, &json)
+    Ok(manifest
+        .chunks
+        .into_iter()
+        .filter(|record| record.status == ChunkStatus::Failed)
+        .map(|record| record.file)
+        .collect())
 }
 
 fn audio_hash(bytes: &[u8]) -> String {
@@ -796,6 +977,40 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{AudioClip, MockTtsProvider, SpeechRequest, TtsError, TtsProvider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingProvider {
+        fail_on: Option<&'static str>,
+        calls: AtomicUsize,
+    }
+
+    impl RecordingProvider {
+        fn new(fail_on: Option<&'static str>) -> Self {
+            Self {
+                fail_on,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl TtsProvider for RecordingProvider {
+        async fn synthesize(
+            &self,
+            request: SpeechRequest,
+        ) -> std::result::Result<AudioClip, TtsError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self
+                .fail_on
+                .is_some_and(|needle| request.text.contains(needle))
+            {
+                return Err(TtsError::Provider(
+                    "deterministic content rejection".to_string(),
+                ));
+            }
+            MockTtsProvider::new().synthesize(request).await
+        }
+    }
 
     // These tests exercise planning and synthesis against a hand-built Book,
     // so they need no EPUB fixture and no network.
@@ -1057,7 +1272,6 @@ mod tests {
 
     #[tokio::test]
     async fn build_writes_files_and_manifest_then_resumes() {
-        use crate::provider::MockTtsProvider;
         let dir = tempfile::tempdir().unwrap();
         let book = book_with_sections();
         let options = AudiobookOptions {
@@ -1101,7 +1315,6 @@ mod tests {
 
     #[tokio::test]
     async fn manifest_records_the_configured_gaps_not_the_defaults() {
-        use crate::provider::MockTtsProvider;
         let dir = tempfile::tempdir().unwrap();
         let book = book_with_sections();
         let options = AudiobookOptions {
@@ -1138,7 +1351,6 @@ mod tests {
 
     #[tokio::test]
     async fn changing_synthesis_settings_creates_new_chunks() {
-        use crate::provider::MockTtsProvider;
         let dir = tempfile::tempdir().unwrap();
         let book = book_with_sections();
         let mut options = AudiobookOptions {
@@ -1188,7 +1400,6 @@ mod tests {
 
     #[tokio::test]
     async fn partial_run_only_synthesizes_missing_chunks() {
-        use crate::provider::MockTtsProvider;
         let dir = tempfile::tempdir().unwrap();
         let book = book_with_sections();
         let options = AudiobookOptions {
@@ -1220,7 +1431,6 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_cached_audio_is_regenerated_instead_of_reused() {
-        use crate::provider::MockTtsProvider;
         let dir = tempfile::tempdir().unwrap();
         let book = book_with_sections();
         let options = AudiobookOptions {
@@ -1250,6 +1460,163 @@ mod tests {
         assert_eq!(&std::fs::read(corrupt_path).unwrap()[..4], b"RIFF");
     }
 
+    #[tokio::test]
+    async fn deterministic_chunk_failure_does_not_abort_and_failed_only_retry_does_not_repay() {
+        let dir = tempfile::tempdir().unwrap();
+        let book = book_with_sections();
+        let mut options = AudiobookOptions {
+            out_dir: dir.path().join("out"),
+            max_chars: 40,
+            concurrency: 2,
+            ..AudiobookOptions::default()
+        };
+        let failing = Arc::new(RecordingProvider::new(Some("third paragraph")));
+
+        let first = build_audiobook(
+            &book,
+            Arc::clone(&failing),
+            &options,
+            CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .expect("isolated provider failures should return a report");
+
+        assert_eq!(first.chunks_failed, 1);
+        assert_eq!(first.chunks_synthesized, first.chunks_total - 1);
+        assert_eq!(first.files.len(), first.chunks_total - 1);
+        assert!(
+            first
+                .failures
+                .iter()
+                .any(|failure| failure.error.contains("content rejection"))
+        );
+        let manifest: AudiobookManifest =
+            serde_json::from_slice(&std::fs::read(&first.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.status, AudiobookStatus::Failed);
+        assert_eq!(
+            manifest
+                .chunks
+                .iter()
+                .filter(|record| record.status == ChunkStatus::Failed)
+                .count(),
+            1
+        );
+
+        options.retry_failed = true;
+        let retry = Arc::new(RecordingProvider::new(None));
+        let resumed = build_audiobook(
+            &book,
+            Arc::clone(&retry),
+            &options,
+            CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .expect("failed-only retry should finish the manifest");
+
+        assert_eq!(retry.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(resumed.chunks_failed, 0);
+        assert_eq!(resumed.chunks_synthesized, 1);
+        assert_eq!(resumed.chunks_skipped, resumed.chunks_total - 1);
+        let manifest: AudiobookManifest =
+            serde_json::from_slice(&std::fs::read(&resumed.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.status, AudiobookStatus::Succeeded);
+        assert_eq!(manifest.completed_chunks, manifest.chunks.len());
+    }
+
+    #[tokio::test]
+    async fn manifest_hash_detects_validly_prefixed_but_changed_cached_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let book = book_with_sections();
+        let options = AudiobookOptions {
+            out_dir: dir.path().join("out"),
+            max_chars: 40,
+            concurrency: 1,
+            ..AudiobookOptions::default()
+        };
+        let first = build_audiobook(
+            &book,
+            Arc::new(MockTtsProvider::new()),
+            &options,
+            CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let changed_path = &first.files[0];
+        let mut changed = std::fs::read(changed_path).unwrap();
+        let last = changed.last_mut().expect("mock wav is non-empty");
+        *last ^= 1;
+        std::fs::write(changed_path, changed).unwrap();
+
+        let provider = Arc::new(RecordingProvider::new(None));
+        let resumed = build_audiobook(
+            &book,
+            Arc::clone(&provider),
+            &options,
+            CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(resumed.chunks_synthesized, 1);
+        assert_eq!(resumed.chunks_skipped, resumed.chunks_total - 1);
+    }
+
+    #[tokio::test]
+    async fn stale_debounced_checkpoint_still_resumes_from_atomic_chunk_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let book = book_with_sections();
+        let options = AudiobookOptions {
+            out_dir: dir.path().join("out"),
+            max_chars: 40,
+            concurrency: 1,
+            ..AudiobookOptions::default()
+        };
+        let first = build_audiobook(
+            &book,
+            Arc::new(MockTtsProvider::new()),
+            &options,
+            CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let mut stale: AudiobookManifest =
+            serde_json::from_slice(&std::fs::read(&first.manifest_path).unwrap()).unwrap();
+        stale.status = AudiobookStatus::Running;
+        stale.completed_chunks = 0;
+        for chunk in &mut stale.chunks {
+            chunk.status = ChunkStatus::Pending;
+        }
+        write_atomic(
+            &first.manifest_path,
+            &serde_json::to_vec_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+
+        let provider = Arc::new(RecordingProvider::new(None));
+        let resumed = build_audiobook(
+            &book,
+            Arc::clone(&provider),
+            &options,
+            CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(resumed.chunks_skipped, resumed.chunks_total);
+        let manifest: AudiobookManifest =
+            serde_json::from_slice(&std::fs::read(&resumed.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.status, AudiobookStatus::Succeeded);
+        assert_eq!(manifest.completed_chunks, manifest.chunks.len());
+    }
+
     #[test]
     fn page_furniture_is_never_planned_for_narration() {
         let mut book = book_with_sections();
@@ -1263,7 +1630,6 @@ mod tests {
 
     #[tokio::test]
     async fn empty_book_is_an_error() {
-        use crate::provider::MockTtsProvider;
         let dir = tempfile::tempdir().unwrap();
         let mut book = book_with_sections();
         for block in &mut book.blocks {

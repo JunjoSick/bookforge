@@ -1,8 +1,10 @@
 //! Optional ffmpeg-based audiobook post-processing.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::builder::{AudiobookManifest, ChunkRecord};
 use crate::text::ChunkKind;
@@ -54,6 +56,9 @@ struct ConcatGaps {
     paragraph: Option<String>,
 }
 
+const FFMPEG_STDERR_LIMIT: usize = 16 * 1024;
+static STAGED_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 pub fn ffmpeg_available() -> bool {
     tool_available("ffmpeg")
 }
@@ -74,6 +79,22 @@ fn tool_available(tool: &str) -> bool {
 
 pub fn stitch(manifest: &AudiobookManifest, options: &StitchOptions) -> StitchReport {
     let mut report = StitchReport::default();
+    let unresolved = manifest
+        .chunks
+        .iter()
+        .filter(|chunk| {
+            !matches!(
+                chunk.status,
+                crate::builder::ChunkStatus::Synthesized | crate::builder::ChunkStatus::Cached
+            )
+        })
+        .count();
+    if unresolved > 0 {
+        report.warnings.push(format!(
+            "{unresolved} chunk(s) are unresolved; skipped stitching to avoid publishing an incomplete audiobook"
+        ));
+        return report;
+    }
     if !ffmpeg_available() {
         report.warnings.push(
             "ffmpeg not found on PATH; skipped stitching (per-chunk files are intact)".into(),
@@ -240,21 +261,19 @@ fn concat_copy(dir: &Path, inputs: &[String], output: &str) -> std::result::Resu
     let list_path = dir.join(&list_name);
     std::fs::write(&list_path, concat_list_content(inputs))
         .map_err(|error| format!("writing concat list: {error}"))?;
-    let status = Command::new("ffmpeg")
+    let output_path = dir.join(output);
+    let staged = staged_output_path(&output_path);
+    let staged_name = file_name_of(&staged);
+    let mut command = Command::new("ffmpeg");
+    command
         .current_dir(dir)
         .args(["-y", "-f", "concat", "-safe", "0", "-i"])
         .arg(&list_name)
         .args(["-c", "copy"])
-        .arg(output)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|error| format!("launching ffmpeg: {error}"))?;
+        .arg(&staged_name);
+    let result = run_ffmpeg_transactional(&mut command, &staged, &output_path, "ffmpeg concat");
     let _ = std::fs::remove_file(&list_path);
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| format!("ffmpeg concat exited with {status}"))
+    result
 }
 
 fn assemble_m4b(
@@ -266,30 +285,26 @@ fn assemble_m4b(
     if chapter_files.is_empty() {
         return Err("no chapter files were produced; cannot assemble m4b".into());
     }
-    let chapter_names: Vec<String> = chapters
-        .iter()
-        .map(|(index, parts)| {
-            parts
-                .first()
-                .map(|part| part.chapter_title.clone())
-                .unwrap_or_else(|| format!("Chapter {}", index + 1))
-        })
-        .collect();
-    let entries = build_book_concat_entries(chapter_files, gaps.chapter.as_deref());
     let list_name = "book.concat.txt";
-    std::fs::write(
-        options.out_dir.join(list_name),
-        concat_list_content(&entries),
-    )
-    .map_err(|error| format!("writing book concat list: {error}"))?;
-
-    let mut ffmeta_name = None;
-    let durations = chapter_files
-        .iter()
-        .map(|path| ffprobe_duration_ms(path))
-        .collect::<Option<Vec<_>>>();
-    if let Some(durations) = durations {
-        let meta_name = "chapters.ffmeta.txt";
+    let meta_name = "chapters.ffmeta.txt";
+    let result = (|| {
+        let chapter_names: Vec<String> = chapters
+            .iter()
+            .map(|(index, parts)| {
+                parts
+                    .first()
+                    .map(|part| part.chapter_title.clone())
+                    .unwrap_or_else(|| format!("Chapter {}", index + 1))
+            })
+            .collect();
+        let durations = chapter_files
+            .iter()
+            .map(|path| ffprobe_duration_ms(path))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                "chapter metadata was skipped because ffprobe could not determine every chapter duration; skipped m4b assembly rather than publishing an unchaptered book"
+                    .to_string()
+            })?;
         let chapter_gap_ms = gaps.chapter.as_ref().map_or(0, |_| options.gap_chapter_ms);
         let metadata = build_ffmetadata(
             options.title.as_deref(),
@@ -299,55 +314,52 @@ fn assemble_m4b(
         );
         std::fs::write(options.out_dir.join(meta_name), metadata)
             .map_err(|error| format!("writing chapter metadata: {error}"))?;
-        ffmeta_name = Some(meta_name);
-    }
 
-    let mut args = vec![
-        "-y".to_string(),
-        "-f".to_string(),
-        "concat".to_string(),
-        "-safe".to_string(),
-        "0".to_string(),
-        "-i".to_string(),
-        list_name.to_string(),
-    ];
-    if let Some(meta_name) = ffmeta_name {
-        args.extend([
+        let entries = build_book_concat_entries(chapter_files, gaps.chapter.as_deref());
+        std::fs::write(
+            options.out_dir.join(list_name),
+            concat_list_content(&entries),
+        )
+        .map_err(|error| format!("writing book concat list: {error}"))?;
+
+        let mut args = vec![
+            "-y".to_string(),
+            "-f".to_string(),
+            "concat".to_string(),
+            "-safe".to_string(),
+            "0".to_string(),
+            "-i".to_string(),
+            list_name.to_string(),
             "-i".to_string(),
             meta_name.to_string(),
             "-map_metadata".to_string(),
             "1".to_string(),
+        ];
+        if options.loudnorm {
+            args.extend(["-af".to_string(), "loudnorm=I=-18:TP=-2:LRA=11".to_string()]);
+        }
+        args.extend([
+            "-c:a".to_string(),
+            "aac".to_string(),
+            "-b:a".to_string(),
+            "128k".to_string(),
         ]);
-    }
-    if options.loudnorm {
-        args.extend(["-af".to_string(), "loudnorm=I=-18:TP=-2:LRA=11".to_string()]);
-    }
-    args.extend([
-        "-c:a".to_string(),
-        "aac".to_string(),
-        "-b:a".to_string(),
-        "128k".to_string(),
-    ]);
-    append_metadata_args(
-        &mut args,
-        options.title.as_deref(),
-        options.author.as_deref(),
-    );
-    args.push("audiobook.m4b".to_string());
-    let status = Command::new("ffmpeg")
-        .current_dir(&options.out_dir)
-        .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|error| format!("launching ffmpeg for m4b: {error}"))?;
+        append_metadata_args(
+            &mut args,
+            options.title.as_deref(),
+            options.author.as_deref(),
+        );
+        let output_path = options.out_dir.join("audiobook.m4b");
+        let staged = staged_output_path(&output_path);
+        args.push(file_name_of(&staged));
+        let mut command = Command::new("ffmpeg");
+        command.current_dir(&options.out_dir).args(&args);
+        run_ffmpeg_transactional(&mut command, &staged, &output_path, "ffmpeg m4b assembly")
+            .map(|()| output_path)
+    })();
     let _ = std::fs::remove_file(options.out_dir.join(list_name));
-    let _ = std::fs::remove_file(options.out_dir.join("chapters.ffmeta.txt"));
-    if status.success() {
-        Ok(options.out_dir.join("audiobook.m4b"))
-    } else {
-        Err(format!("ffmpeg m4b assembly exited with {status}"))
-    }
+    let _ = std::fs::remove_file(options.out_dir.join(meta_name));
+    result
 }
 
 fn assemble_single_file(
@@ -369,27 +381,26 @@ fn assemble_single_file(
     )
     .map_err(|error| format!("writing single-file concat list: {error}"))?;
     let output = format!("audiobook.{}", options.extension);
+    let output_path = options.out_dir.join(&output);
+    let staged = staged_output_path(&output_path);
     let args = single_file_ffmpeg_args(
         list_name,
         &options.extension,
         options.loudnorm,
         options.title.as_deref(),
         options.author.as_deref(),
-        &output,
+        &file_name_of(&staged),
     );
-    let status = Command::new("ffmpeg")
-        .current_dir(&options.out_dir)
-        .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|error| format!("launching ffmpeg for single file: {error}"))?;
+    let mut command = Command::new("ffmpeg");
+    command.current_dir(&options.out_dir).args(&args);
+    let result = run_ffmpeg_transactional(
+        &mut command,
+        &staged,
+        &output_path,
+        "ffmpeg single-file assembly",
+    );
     let _ = std::fs::remove_file(options.out_dir.join(list_name));
-    if status.success() {
-        Ok(options.out_dir.join(output))
-    } else {
-        Err(format!("ffmpeg single-file assembly exited with {status}"))
-    }
+    result.map(|()| output_path)
 }
 
 pub fn single_file_ffmpeg_args(
@@ -446,6 +457,142 @@ fn encoder_for_extension(extension: &str) -> Option<&'static str> {
     }
 }
 
+fn staged_output_path(final_path: &Path) -> PathBuf {
+    let sequence = STAGED_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = final_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let extension = final_path
+        .extension()
+        .map(|extension| extension.to_string_lossy())
+        .unwrap_or_default();
+    final_path.with_file_name(format!(
+        ".{file_name}.{}-{sequence}.part.{extension}",
+        std::process::id()
+    ))
+}
+
+fn run_ffmpeg_transactional(
+    command: &mut Command,
+    staged: &Path,
+    final_path: &Path,
+    context: &str,
+) -> std::result::Result<(), String> {
+    let result = run_ffmpeg(command, context);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(staged);
+        return Err(error);
+    }
+    if !staged.is_file() {
+        return Err(format!(
+            "{context} exited successfully but did not create {}",
+            staged.display()
+        ));
+    }
+    if let Err(error) = publish_staged_file(staged, final_path) {
+        let _ = std::fs::remove_file(staged);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn run_ffmpeg(command: &mut Command, context: &str) -> std::result::Result<(), String> {
+    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("launching {context}: {error}"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("capturing {context} stderr failed"))?;
+    let stderr_reader = std::thread::spawn(move || bounded_stderr_tail(stderr));
+    let status = child
+        .wait()
+        .map_err(|error| format!("waiting for {context}: {error}"))?;
+    let (stderr, truncated) = stderr_reader
+        .join()
+        .map_err(|_| format!("capturing {context} stderr failed"))?
+        .map_err(|error| format!("reading {context} stderr: {error}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&stderr);
+    let stderr = stderr.trim();
+    let detail = if stderr.is_empty() {
+        String::new()
+    } else if truncated {
+        format!("; stderr (last {FFMPEG_STDERR_LIMIT} bytes): {stderr}")
+    } else {
+        format!("; stderr: {stderr}")
+    };
+    Err(format!("{context} exited with {status}{detail}"))
+}
+
+fn bounded_stderr_tail<R: Read>(mut reader: R) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut tail = Vec::with_capacity(FFMPEG_STDERR_LIMIT);
+    let mut buffer = [0u8; 4 * 1024];
+    let mut total = 0usize;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read);
+        if read >= FFMPEG_STDERR_LIMIT {
+            tail.clear();
+            tail.extend_from_slice(&buffer[read - FFMPEG_STDERR_LIMIT..read]);
+            continue;
+        }
+        let overflow = tail
+            .len()
+            .saturating_add(read)
+            .saturating_sub(FFMPEG_STDERR_LIMIT);
+        if overflow > 0 {
+            tail.drain(..overflow);
+        }
+        tail.extend_from_slice(&buffer[..read]);
+    }
+    Ok((tail, total > FFMPEG_STDERR_LIMIT))
+}
+
+fn publish_staged_file(staged: &Path, final_path: &Path) -> std::result::Result<(), String> {
+    if !final_path.exists() {
+        return std::fs::rename(staged, final_path).map_err(|error| {
+            format!("publishing ffmpeg output {}: {error}", final_path.display())
+        });
+    }
+
+    let sequence = STAGED_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = final_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let backup = final_path.with_file_name(format!(
+        ".{file_name}.{}-{sequence}.replace.bak",
+        std::process::id()
+    ));
+    std::fs::rename(final_path, &backup).map_err(|error| {
+        format!(
+            "staging previous ffmpeg output {}: {error}",
+            final_path.display()
+        )
+    })?;
+    match std::fs::rename(staged, final_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(backup);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::rename(&backup, final_path);
+            Err(format!(
+                "publishing ffmpeg output {}: {error}",
+                final_path.display()
+            ))
+        }
+    }
+}
+
 fn probe_audio_params(path: &Path) -> Option<(u32, u16)> {
     let output = Command::new("ffprobe")
         .args([
@@ -490,34 +637,46 @@ fn ensure_silence_file(
     // would feed mismatched silence into a `-c copy` concat.
     let output_name = format!("silence-{ms}-{rate}-{channels}.{extension}");
     let output_path = out_dir.join(&output_name);
-    if output_path.is_file() {
+    if output_path.is_file() && silence_file_is_valid(&output_path, ms, rate, channels) {
         return Ok(output_path);
     }
     let channel_layout = if channels == 1 { "mono" } else { "stereo" };
     let duration = format!("{:.3}", f64::from(ms) / 1_000.0);
-    let status = Command::new("ffmpeg")
-        .current_dir(out_dir)
-        .args([
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            &format!("anullsrc=r={rate}:cl={channel_layout}"),
-            "-t",
-            &duration,
-            "-c:a",
-            encoder,
-            &output_name,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|error| format!("launching ffmpeg for silence: {error}"))?;
-    if status.success() {
-        Ok(output_path)
-    } else {
-        Err(format!("ffmpeg silence generation exited with {status}"))
+    let staged = staged_output_path(&output_path);
+    let staged_name = file_name_of(&staged);
+    let mut command = Command::new("ffmpeg");
+    command.current_dir(out_dir).args([
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("anullsrc=r={rate}:cl={channel_layout}"),
+        "-t",
+        &duration,
+        "-c:a",
+        encoder,
+        &staged_name,
+    ]);
+    run_ffmpeg_transactional(
+        &mut command,
+        &staged,
+        &output_path,
+        "ffmpeg silence generation",
+    )?;
+    Ok(output_path)
+}
+
+fn silence_file_is_valid(path: &Path, expected_ms: u32, rate: u32, channels: u16) -> bool {
+    if std::fs::metadata(path).map_or(true, |metadata| metadata.len() == 0) {
+        return false;
     }
+    if probe_audio_params(path) != Some((rate, channels)) {
+        return false;
+    }
+    let Some(duration_ms) = ffprobe_duration_ms(path) else {
+        return false;
+    };
+    duration_ms.abs_diff(u64::from(expected_ms)) <= u64::from((expected_ms / 5).max(100))
 }
 
 fn ffprobe_duration_ms(path: &Path) -> Option<u64> {
@@ -540,6 +699,9 @@ fn ffprobe_duration_ms(path: &Path) -> Option<u64> {
         .trim()
         .parse()
         .ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
     Some((seconds * 1_000.0).round() as u64)
 }
 
@@ -764,5 +926,111 @@ mod tests {
         );
         assert_eq!(sanitize_filename("***"), "untitled");
         assert_eq!(sanitize_filename("  spaced  out  "), "spaced-out");
+    }
+
+    #[test]
+    fn failed_ffmpeg_run_removes_stage_and_preserves_prior_public_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("audiobook.m4b");
+        std::fs::write(&final_path, b"previous-good-output").unwrap();
+        let staged = staged_output_path(&final_path);
+        std::fs::write(&staged, b"truncated-new-output").unwrap();
+
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "echo diagnostic-from-ffmpeg 1>&2 & exit /b 7"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "echo diagnostic-from-ffmpeg >&2; exit 7"]);
+            command
+        };
+
+        let error = run_ffmpeg_transactional(&mut command, &staged, &final_path, "test ffmpeg")
+            .unwrap_err();
+        assert!(error.contains("diagnostic-from-ffmpeg"), "{error}");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"previous-good-output");
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn failed_duration_probe_skips_unchaptered_m4b_with_warning_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = StitchOptions {
+            out_dir: dir.path().to_path_buf(),
+            make_m4b: true,
+            gap_chapter_ms: 0,
+            gap_title_ms: 0,
+            gap_paragraph_ms: 0,
+            ..StitchOptions::default()
+        };
+        let chapters = vec![(0, vec![chunk(0, 1, ChunkKind::Title)])];
+        let missing = dir.path().join("missing-chapter.wav");
+
+        let warning =
+            assemble_m4b(&options, &chapters, &[missing], &ConcatGaps::default()).unwrap_err();
+
+        assert!(
+            warning.contains("chapter metadata was skipped"),
+            "{warning}"
+        );
+        assert!(warning.contains("unchaptered"), "{warning}");
+        assert!(!dir.path().join("audiobook.m4b").exists());
+        assert!(!dir.path().join("book.concat.txt").exists());
+        assert!(!dir.path().join("chapters.ffmeta.txt").exists());
+    }
+
+    #[test]
+    fn partial_silence_file_is_rejected_instead_of_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join("silence-800-8000-1.wav");
+        std::fs::write(&partial, b"RIFF\0\0\0\0WAVEaudio").unwrap();
+        assert!(!silence_file_is_valid(&partial, 800, 8_000, 1));
+
+        if !ffmpeg_available() || !ffprobe_available() {
+            return;
+        }
+        let generated = ensure_silence_file(dir.path(), 800, "wav", 8_000, 1).unwrap();
+        assert_eq!(generated, partial);
+        assert!(silence_file_is_valid(&generated, 800, 8_000, 1));
+    }
+
+    #[test]
+    fn unresolved_manifest_never_stitches_partial_book() {
+        let mut manifest = AudiobookManifest {
+            schema_version: 3,
+            title: Some("Book".to_string()),
+            synthesis_id: "mock".to_string(),
+            voice: "voice".to_string(),
+            format: "wav".to_string(),
+            speed: 1.0,
+            max_chars: 2_000,
+            instructions: None,
+            seed: None,
+            language: None,
+            text_normalization: None,
+            gaps: crate::builder::GapSettings::default(),
+            author: None,
+            chapters: 1,
+            chunks: vec![chunk(0, 1, ChunkKind::Title)],
+            completed_chunks: 0,
+            status: crate::builder::AudiobookStatus::Failed,
+            updated_at_ms: 0,
+            error: Some("one failed".to_string()),
+        };
+        manifest.chunks[0].status = ChunkStatus::Failed;
+        let report = stitch(&manifest, &StitchOptions::default());
+
+        assert!(report.chapter_files.is_empty());
+        assert!(report.book_file.is_none());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unresolved"))
+        );
     }
 }
