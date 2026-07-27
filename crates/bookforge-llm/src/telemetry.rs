@@ -1,14 +1,23 @@
 use bookforge_core::config::ProviderRequestMetric;
-use std::sync::Mutex;
+use bookforge_core::glossary::GlossarySelectionRule;
+use std::{collections::HashMap, sync::Mutex};
 
 pub struct TelemetryLog {
     entries: Mutex<Vec<ProviderRequestMetric>>,
+    glossary_rules: Mutex<HashMap<GlossarySelectionRule, GlossaryRuleCounters>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GlossaryRuleCounters {
+    injected: usize,
+    honored: usize,
 }
 
 impl TelemetryLog {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(Vec::new()),
+            glossary_rules: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -28,6 +37,54 @@ impl TelemetryLog {
 
     pub fn snapshot(&self) -> Vec<ProviderRequestMetric> {
         self.entries.lock().map(|e| e.clone()).unwrap_or_default()
+    }
+
+    pub fn record_glossary_entry(&self, rule: GlossarySelectionRule, honored: bool) {
+        if let Ok(mut rules) = self.glossary_rules.lock() {
+            let counters = rules.entry(rule).or_default();
+            counters.injected += 1;
+            counters.honored += usize::from(honored);
+        }
+    }
+
+    pub fn glossary_rule_counts(&self, rule: GlossarySelectionRule) -> (usize, usize) {
+        self.glossary_rules
+            .lock()
+            .ok()
+            .and_then(|rules| rules.get(&rule).copied())
+            .map(|counters| (counters.injected, counters.honored))
+            .unwrap_or_default()
+    }
+
+    pub fn has_glossary_entries(&self) -> bool {
+        self.glossary_rules
+            .lock()
+            .is_ok_and(|rules| rules.values().any(|counters| counters.injected > 0))
+    }
+
+    pub fn glossary_summary(&self) -> String {
+        const RULES: [GlossarySelectionRule; 4] = [
+            GlossarySelectionRule::SegmentMatched,
+            GlossarySelectionRule::AlwaysActive,
+            GlossarySelectionRule::RecentlyActive,
+            GlossarySelectionRule::HighFrequencyAnchor,
+        ];
+
+        let rules = self.glossary_rules.lock().ok();
+        let rendered = RULES.map(|rule| {
+            let counters = rules
+                .as_ref()
+                .and_then(|rules| rules.get(&rule))
+                .copied()
+                .unwrap_or_default();
+            format!(
+                "{} injected={} honored={}",
+                rule.as_str(),
+                counters.injected,
+                counters.honored
+            )
+        });
+        format!("glossary rules | {}", rendered.join(" | "))
     }
 }
 
@@ -69,4 +126,32 @@ fn percentile(sorted: &[u64], pct: f64) -> u64 {
     }
     let idx = ((pct / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
     sorted[idx]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glossary_counters_increment_only_the_recorded_rule() {
+        let rules = [
+            GlossarySelectionRule::SegmentMatched,
+            GlossarySelectionRule::AlwaysActive,
+            GlossarySelectionRule::RecentlyActive,
+            GlossarySelectionRule::HighFrequencyAnchor,
+        ];
+
+        for rule in rules {
+            let telemetry = TelemetryLog::new();
+            telemetry.record_glossary_entry(rule, false);
+            assert_eq!(telemetry.glossary_rule_counts(rule), (1, 0));
+            for other in rules {
+                if other != rule {
+                    assert_eq!(telemetry.glossary_rule_counts(other), (0, 0));
+                }
+            }
+            telemetry.record_glossary_entry(rule, true);
+            assert_eq!(telemetry.glossary_rule_counts(rule), (2, 1));
+        }
+    }
 }

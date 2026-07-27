@@ -270,6 +270,25 @@ pub struct GlossaryPromptTerm {
     pub case_sensitive: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GlossarySelectionRule {
+    SegmentMatched,
+    AlwaysActive,
+    RecentlyActive,
+    HighFrequencyAnchor,
+}
+
+impl GlossarySelectionRule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SegmentMatched => "segment_matched",
+            Self::AlwaysActive => "always_active",
+            Self::RecentlyActive => "recently_active",
+            Self::HighFrequencyAnchor => "high_frequency_anchor",
+        }
+    }
+}
+
 impl GlossaryPromptTerm {
     fn from_term(term: &GlossaryTerm) -> Self {
         Self {
@@ -286,6 +305,11 @@ impl GlossaryPromptTerm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentGlossarySelections {
     pub entries_by_segment: HashMap<String, Vec<GlossaryPromptTerm>>,
+    /// Selection rules aligned by index with `entries_by_segment`.
+    ///
+    /// This metadata is intentionally kept out of `GlossaryPromptTerm` so it
+    /// never changes the serialized prompt or its cache identity.
+    pub rules_by_segment: HashMap<String, Vec<GlossarySelectionRule>>,
     pub truncated_authoritative_entries: usize,
 }
 
@@ -329,20 +353,31 @@ pub fn select_glossary_for_segments(
     let computed_counts = source_counts(segments, &terms);
     let high_frequency = high_frequency_anchors(&terms, &computed_counts, 20);
     let mut entries_by_segment = HashMap::new();
+    let mut rules_by_segment = HashMap::new();
     let mut truncated_authoritative_entries = 0usize;
 
     for (index, segment) in segments.iter().enumerate() {
-        let mut selected = Vec::<&GlossaryTerm>::new();
+        let mut selected = Vec::<(&GlossaryTerm, GlossarySelectionRule)>::new();
         let mut seen = HashSet::<i64>::new();
 
         for term in &terms {
             if term_matches(&segment.source.text, term) {
-                push_term(&mut selected, &mut seen, term);
+                push_term(
+                    &mut selected,
+                    &mut seen,
+                    term,
+                    GlossarySelectionRule::SegmentMatched,
+                );
             }
         }
 
         for term in terms.iter().filter(|term| term.always_active) {
-            push_term(&mut selected, &mut seen, term);
+            push_term(
+                &mut selected,
+                &mut seen,
+                term,
+                GlossarySelectionRule::AlwaysActive,
+            );
         }
 
         let start = index.saturating_sub(5);
@@ -352,28 +387,38 @@ pub fn select_glossary_for_segments(
             }
             for term in &terms {
                 if term_matches(&previous.source.text, term) {
-                    push_term(&mut selected, &mut seen, term);
+                    push_term(
+                        &mut selected,
+                        &mut seen,
+                        term,
+                        GlossarySelectionRule::RecentlyActive,
+                    );
                 }
             }
         }
 
         for term in &high_frequency {
-            push_term(&mut selected, &mut seen, term);
+            push_term(
+                &mut selected,
+                &mut seen,
+                term,
+                GlossarySelectionRule::HighFrequencyAnchor,
+            );
         }
 
         let (bounded, truncated) = enforce_budget(selected, budget_tokens);
         truncated_authoritative_entries += truncated;
-        entries_by_segment.insert(
-            segment.id.0.clone(),
-            bounded
-                .into_iter()
-                .map(GlossaryPromptTerm::from_term)
-                .collect(),
-        );
+        let (entries, rules) = bounded
+            .into_iter()
+            .map(|(term, rule)| (GlossaryPromptTerm::from_term(term), rule))
+            .unzip();
+        entries_by_segment.insert(segment.id.0.clone(), entries);
+        rules_by_segment.insert(segment.id.0.clone(), rules);
     }
 
     SegmentGlossarySelections {
         entries_by_segment,
+        rules_by_segment,
         truncated_authoritative_entries,
     }
 }
@@ -403,25 +448,29 @@ pub fn target_matches(text: &str, term: &GlossaryTerm) -> bool {
 }
 
 fn push_term<'a>(
-    selected: &mut Vec<&'a GlossaryTerm>,
+    selected: &mut Vec<(&'a GlossaryTerm, GlossarySelectionRule)>,
     seen: &mut HashSet<i64>,
     term: &'a GlossaryTerm,
+    rule: GlossarySelectionRule,
 ) {
     let synthetic = term.synthetic_id();
     if seen.insert(synthetic) {
-        selected.push(term);
+        selected.push((term, rule));
     }
 }
 
-fn enforce_budget(terms: Vec<&GlossaryTerm>, budget_tokens: usize) -> (Vec<&GlossaryTerm>, usize) {
+fn enforce_budget(
+    terms: Vec<(&GlossaryTerm, GlossarySelectionRule)>,
+    budget_tokens: usize,
+) -> (Vec<(&GlossaryTerm, GlossarySelectionRule)>, usize) {
     let mut used = 0usize;
     let mut kept = Vec::new();
     let mut truncated = 0usize;
-    for term in terms {
+    for (term, rule) in terms {
         let estimate = estimate_prompt_tokens(term);
         if used + estimate <= budget_tokens || kept.is_empty() {
             used += estimate;
-            kept.push(term);
+            kept.push((term, rule));
         } else if term.status == GlossaryStatus::UserSeeded || term.always_active {
             truncated += 1;
         }
@@ -842,6 +891,43 @@ mod tests {
         let second = &selected.entries_by_segment["seg_2"];
         assert!(second.iter().any(|entry| entry.source == "Ring"));
         assert!(second.iter().any(|entry| entry.source == "you"));
+    }
+
+    #[test]
+    fn selection_rules_are_credited_only_when_they_inject_an_entry() {
+        let mut matched = term("Matched", "Corrisposto", GlossaryScopeKind::Book);
+        matched.category = GlossaryCategory::Phrase;
+        let mut always = term("Always", "Sempre", GlossaryScopeKind::Book);
+        always.category = GlossaryCategory::Style;
+        always.always_active = true;
+        let mut recent = term("Recent", "Recente", GlossaryScopeKind::Book);
+        recent.category = GlossaryCategory::Phrase;
+        let mut anchor = term("Anchor", "Ancora", GlossaryScopeKind::Book);
+        anchor.category = GlossaryCategory::Person;
+        anchor.source_count = 100;
+        let segments = vec![
+            segment("seg_1", 0, "Recent appeared earlier"),
+            segment("seg_2", 1, "Matched appears now"),
+        ];
+
+        let selections =
+            select_glossary_for_segments(&segments, &[matched, always, recent, anchor], 800);
+        let entries = &selections.entries_by_segment["seg_2"];
+        let rules = &selections.rules_by_segment["seg_2"];
+        let credited = entries
+            .iter()
+            .zip(rules)
+            .map(|(entry, rule)| (entry.source.as_str(), *rule))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(credited["Matched"], GlossarySelectionRule::SegmentMatched);
+        assert_eq!(credited["Always"], GlossarySelectionRule::AlwaysActive);
+        assert_eq!(credited["Recent"], GlossarySelectionRule::RecentlyActive);
+        assert_eq!(
+            credited["Anchor"],
+            GlossarySelectionRule::HighFrequencyAnchor
+        );
+        assert_eq!(credited.len(), 4);
     }
 
     #[test]
