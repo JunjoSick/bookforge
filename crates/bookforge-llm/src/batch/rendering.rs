@@ -382,11 +382,14 @@ fn parse_text_batch_response(
             continue;
         };
 
-        if item.translation.is_empty() && !request_item.source_text.is_empty() {
+        if let Some(error) = crate::validation::empty_translation_validation_error(
+            &request_item.source_text,
+            &item.translation,
+        ) {
             failures.push(BatchItemFailure {
                 item_id: item.id.clone(),
                 segment_id: request_item.segment_id.clone(),
-                error: "empty translation for non-empty source".to_string(),
+                error: error.to_string(),
                 input_tokens: None,
                 input_cached_tokens: None,
                 output_tokens: None,
@@ -452,18 +455,14 @@ fn parse_text_batch_response(
         });
     }
 
-    for item in &batch.items {
-        if !seen.contains_key(item.item_id.as_str()) {
-            failures.push(BatchItemFailure {
-                item_id: item.item_id.clone(),
-                segment_id: item.segment_id.clone(),
-                error: "item missing from batch response".to_string(),
-                input_tokens: None,
-                input_cached_tokens: None,
-                output_tokens: None,
-                tokens_estimated: false,
-            });
-        }
+    let missing = batch
+        .items
+        .iter()
+        .filter(|item| !seen.contains_key(item.item_id.as_str()))
+        .map(|item| item.item_id.as_str())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(incomplete_batch_response_error(batch.items.len(), &missing));
     }
 
     Ok(BatchTranslationResult {
@@ -592,6 +591,21 @@ fn parse_run_batch_response(
             .collect();
         let joined_translation = joined.join("");
         let translation = joined_translation;
+        if let Some(error) = crate::validation::empty_translation_validation_error(
+            &request_item.source_text,
+            &translation,
+        ) {
+            failures.push(BatchItemFailure {
+                item_id: item.id.clone(),
+                segment_id: request_item.segment_id.clone(),
+                error: error.to_string(),
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                tokens_estimated: false,
+            });
+            continue;
+        }
         let section_title = section_titles
             .and_then(|titles| titles.get(&request_item.segment_id.0))
             .map(String::as_str);
@@ -632,18 +646,14 @@ fn parse_run_batch_response(
         });
     }
 
-    for item in &batch.items {
-        if !seen.contains_key(item.item_id.as_str()) {
-            failures.push(BatchItemFailure {
-                item_id: item.item_id.clone(),
-                segment_id: item.segment_id.clone(),
-                error: "item missing from batch response".to_string(),
-                input_tokens: None,
-                input_cached_tokens: None,
-                output_tokens: None,
-                tokens_estimated: false,
-            });
-        }
+    let missing = batch
+        .items
+        .iter()
+        .filter(|item| !seen.contains_key(item.item_id.as_str()))
+        .map(|item| item.item_id.as_str())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(incomplete_batch_response_error(batch.items.len(), &missing));
     }
 
     Ok(BatchTranslationResult {
@@ -654,6 +664,32 @@ fn parse_run_batch_response(
         input_cached_tokens: None,
         output_tokens: None,
     })
+}
+
+fn incomplete_batch_response_error(requested: usize, missing: &[&str]) -> String {
+    let returned = requested.saturating_sub(missing.len());
+    format!(
+        "batch response incomplete: requested {requested} items, returned {returned}; missing item IDs: {}",
+        missing.join(", ")
+    )
+}
+
+pub(super) fn batch_response_item_count(batch: &TranslationBatch, content: &str) -> Option<usize> {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let items = parsed.get("items")?.as_array()?;
+    let requested = batch
+        .items
+        .iter()
+        .map(|item| item.item_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    Some(
+        items
+            .iter()
+            .filter_map(|item| item.get("id")?.as_str())
+            .filter(|item_id| requested.contains(item_id))
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+    )
 }
 
 pub(super) fn render_batch_items(

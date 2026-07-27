@@ -50,7 +50,9 @@ use planning::{
 };
 pub use rendering::batch_item_validation_error;
 pub use rendering::parse_batch_response;
-use rendering::{parse_batch_response_with_validation, render_batch_items};
+use rendering::{
+    batch_response_item_count, parse_batch_response_with_validation, render_batch_items,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BatchMode {

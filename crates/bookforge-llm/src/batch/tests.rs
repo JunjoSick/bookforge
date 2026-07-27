@@ -911,10 +911,36 @@ fn detects_missing_items_in_batch_response() {
     })
     .to_string();
 
-    let result = parse_batch_response(batch, &response).expect("parse");
+    let error = parse_batch_response(batch, &response)
+        .expect_err("missing requested items must fail the whole response");
+    assert!(error.contains("batch response incomplete"));
+    assert!(error.contains("requested 2 items, returned 1"));
+}
+
+#[test]
+fn present_empty_batch_item_remains_a_per_item_failure() {
+    let batch = make_two_item_batch();
+    let first_id = batch.items[0].item_id.clone();
+    let second_id = batch.items[1].item_id.clone();
+    let response = serde_json::json!({
+        "items": [
+            {"id": first_id, "translation": "Ciao"},
+            {"id": second_id, "translation": " \n\t"},
+        ]
+    })
+    .to_string();
+
+    let result = parse_batch_response(&batch, &response)
+        .expect("a complete envelope with a bad item stays on the per-item path");
+
     assert_eq!(result.translations.len(), 1);
     assert_eq!(result.failures.len(), 1);
-    assert!(result.failures[0].error.contains("missing"));
+    assert_eq!(result.failures[0].item_id, second_id);
+    assert!(
+        result.failures[0]
+            .error
+            .contains("empty translation for non-empty source")
+    );
 }
 
 #[test]
@@ -1844,6 +1870,65 @@ impl LlmProviderTrait for FirstInvalidThenPromptEchoProvider {
     }
 }
 
+struct FirstPartialThenPromptEchoProvider {
+    calls: Mutex<usize>,
+    requested_item_counts: Arc<Mutex<Vec<usize>>>,
+}
+
+impl FirstPartialThenPromptEchoProvider {
+    fn new(requested_item_counts: Arc<Mutex<Vec<usize>>>) -> Self {
+        Self {
+            calls: Mutex::new(0),
+            requested_item_counts,
+        }
+    }
+}
+
+impl LlmProviderTrait for FirstPartialThenPromptEchoProvider {
+    async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+        let mut calls = self.calls.lock().unwrap();
+        let call = *calls;
+        *calls += 1;
+        drop(calls);
+
+        let item_ids = item_ids_from_batch_prompt(&request.user);
+        self.requested_item_counts
+            .lock()
+            .unwrap()
+            .push(item_ids.len());
+        let returned_ids = if call == 0 {
+            item_ids.into_iter().take(1).collect::<Vec<_>>()
+        } else {
+            item_ids
+        };
+        Ok(CompletionResponse {
+            content: serde_json::json!({
+                "items": returned_ids
+                    .into_iter()
+                    .map(|id| serde_json::json!({
+                        "translation": format!("[it] {id}"),
+                        "id": id,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+            .to_string(),
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            finish_reason: FinishReason::Stop,
+            provider_latency_ms: 0,
+            raw: serde_json::json!({}),
+        })
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_response_format: true,
+            supports_usage_tokens: true,
+        }
+    }
+}
+
 struct AlwaysTransientProvider {
     calls: AtomicUsize,
 }
@@ -1997,21 +2082,8 @@ fn item_ids_from_batch_prompt(user_prompt: &str) -> Vec<String> {
         .collect()
 }
 
-struct RepairOrderingSink(Arc<std::sync::Mutex<Vec<&'static str>>>);
-
-impl bookforge_core::ProgressSink for RepairOrderingSink {
-    fn emit(&self, event: bookforge_core::ProgressEvent) {
-        if matches!(
-            event,
-            bookforge_core::ProgressEvent::BatchRepairFinished { .. }
-        ) {
-            self.0.lock().unwrap().push("repair_finished");
-        }
-    }
-}
-
 #[tokio::test]
-async fn completed_repair_publishes_segment_before_repair_phase_finishes() {
+async fn partial_batch_response_splits_smaller_without_recording_success() {
     let segment = make_segment(
         "seg1",
         vec![plain_block("Hello"), plain_block("World")],
@@ -2027,53 +2099,65 @@ async fn completed_repair_publishes_segment_before_repair_phase_finishes() {
         repair_invalid_items: true,
     };
     let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
-    let first_item_id = batches[0].items[0].item_id.clone();
-    let second_item_id = batches[0].items[1].item_id.clone();
-    let provider = SequenceProvider::new(vec![
-        serde_json::json!({
-            "items": [{"id": first_item_id, "translation": "[it] Hello"}],
-        })
-        .to_string(),
-        serde_json::json!({
-            "items": [{"id": second_item_id, "translation": "[it] World"}],
-        })
-        .to_string(),
-    ]);
-    let ordering = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = Arc::new(RepairOrderingSink(ordering.clone()));
-    let callback_ordering = ordering.clone();
+    let requested_item_counts = Arc::new(Mutex::new(Vec::new()));
+    let provider = FirstPartialThenPromptEchoProvider::new(requested_item_counts.clone());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let telemetry = Arc::new(TelemetryLog::new());
+    let mut sizer = BatchSizer::new(16_000, 128);
 
     let translations = translate_batches_with_callback(
         provider,
         batches,
         &segments,
         &test_run_config(),
-        Arc::new(TelemetryLog::new()),
+        telemetry.clone(),
         None,
+        Some(&mut sizer),
+        Arc::new(RecordingProgress {
+            events: events.clone(),
+        }),
         None,
-        sink,
-        None,
-        move |translation| {
-            assert_eq!(translation.status, SegmentStatus::Succeeded);
-            callback_ordering.lock().unwrap().push("callback");
-            Ok(())
-        },
+        |_| Ok(()),
     )
     .await
-    .expect("repair should complete");
+    .expect("split retries should complete");
 
+    assert_eq!(*requested_item_counts.lock().unwrap(), [2, 1, 1]);
     assert_eq!(translations[0].status, SegmentStatus::Succeeded);
-    assert_eq!(*ordering.lock().unwrap(), ["callback", "repair_finished"]);
+    let observations = &sizer.modes[&BatchMode::Plain].recent;
+    assert!(matches!(
+        observations.front(),
+        Some(BatchSizingObservation::InvalidJson)
+    ));
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|observation| matches!(observation, BatchSizingObservation::Success { .. }))
+            .count(),
+        2,
+        "only the two complete split retries should be recorded as successes"
+    );
+    let metrics = telemetry.snapshot();
+    assert_eq!(metrics[0].status, "incomplete:1/2");
+    assert_eq!(metrics[0].items, 2);
+    assert_eq!(metrics[0].finish_reason.as_deref(), Some("stop"));
+    assert!(events.lock().unwrap().iter().any(|event| {
+        matches!(
+            event,
+            bookforge_core::ProgressEvent::Warning { kind, .. }
+                if kind == "batch_incomplete_response_split"
+        )
+    }));
 }
 
 #[tokio::test]
-async fn partial_batch_failure_without_successful_repair_marks_segment_needs_review() {
-    let seg = make_segment(
+async fn partial_repair_response_is_retried_and_present_bad_item_stays_per_item() {
+    let segment = make_segment(
         "seg1",
         vec![plain_block("Hello"), plain_block("World")],
         vec![],
     );
-    let segments = vec![seg.clone()];
+    let segments = vec![segment];
     let cfg = BatchConfig {
         enabled: true,
         target_tokens: 1000,
@@ -2085,21 +2169,26 @@ async fn partial_batch_failure_without_successful_repair_marks_segment_needs_rev
     let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
     assert_eq!(batches.len(), 1);
     let first_item_id = batches[0].items[0].item_id.clone();
-    let missing_block_id = batches[0].items[1].block_id.0.clone();
-
-    let initial_response = serde_json::json!({
-        "items": [
-            {"id": first_item_id, "translation": "[it] Hello"},
-        ]
-    })
-    .to_string();
-    // Repair returns malformed JSON so parse_batch_response fails
-    // and the missing block stays unrepaired.
-    let repair_response = "{not valid json".to_string();
-
-    let provider = SequenceProvider::new(vec![initial_response, repair_response]);
+    let second_item_id = batches[0].items[1].item_id.clone();
+    let provider = SequenceProvider::new(vec![
+        serde_json::json!({
+            "items": [
+                {"id": first_item_id, "translation": "[it] Hello"},
+                {"id": second_item_id, "translation": " \n"},
+            ]
+        })
+        .to_string(),
+        serde_json::json!({"items": []}).to_string(),
+        serde_json::json!({
+            "items": [
+                {"id": second_item_id, "translation": "[it] World"},
+            ]
+        })
+        .to_string(),
+    ]);
     let telemetry = Arc::new(TelemetryLog::new());
     let config = test_run_config();
+    let events = Arc::new(Mutex::new(Vec::new()));
     let translations = translate_batches_with_callback(
         provider,
         batches,
@@ -2108,7 +2197,9 @@ async fn partial_batch_failure_without_successful_repair_marks_segment_needs_rev
         telemetry,
         None,
         None,
-        Arc::new(bookforge_core::NullProgressSink),
+        Arc::new(RecordingProgress {
+            events: events.clone(),
+        }),
         None,
         |_| Ok(()),
     )
@@ -2116,20 +2207,70 @@ async fn partial_batch_failure_without_successful_repair_marks_segment_needs_rev
     .expect("translate");
 
     assert_eq!(translations.len(), 1);
-    let translation = &translations[0];
-    assert_eq!(
-        translation.status,
-        SegmentStatus::NeedsReview,
-        "segment with missing block translation must not be saved as Succeeded",
-    );
-    let error = translation
-        .error
-        .as_ref()
-        .expect("missing-block segment must carry an error");
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+    assert_eq!(translations[0].joined_text(), "[it] Hello\n\n[it] World");
+    let events = events.lock().unwrap();
     assert!(
-        error.contains(&missing_block_id),
-        "error must name missing block id {missing_block_id}, got: {error}",
+        !events
+            .iter()
+            .any(|event| matches!(event, bookforge_core::ProgressEvent::BatchSplit { .. })),
+        "a present-but-invalid item must not split the complete initial envelope"
     );
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            bookforge_core::ProgressEvent::Warning { kind, .. }
+                if kind == "repair_batch_invalid_response_retry"
+        )
+    }));
+}
+
+#[tokio::test]
+async fn length_finished_repair_response_is_retried() {
+    let segment = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+    let segments = vec![segment];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let item_id = batches[0].items[0].item_id.clone();
+    let max_output_tokens = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingSequenceProvider::new(
+        vec![
+            RecordedResponse::ItemsFromBatch(vec![(item_id.clone(), " \t".to_string())]),
+            RecordedResponse::FinishLength,
+            RecordedResponse::ItemsFromBatch(vec![(item_id, "[it] Hello".to_string())]),
+        ],
+        max_output_tokens.clone(),
+    );
+    let telemetry = Arc::new(TelemetryLog::new());
+
+    let translations = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &test_run_config(),
+        telemetry.clone(),
+        None,
+        None,
+        Arc::new(bookforge_core::NullProgressSink),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("length-finished repair should retry");
+
+    assert_eq!(max_output_tokens.lock().unwrap().len(), 3);
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+    let metrics = telemetry.snapshot();
+    assert_eq!(metrics[1].finish_reason.as_deref(), Some("length"));
+    assert_eq!(metrics[1].status, "truncated");
+    assert_eq!(metrics[2].retry_count, 1);
 }
 
 #[tokio::test]

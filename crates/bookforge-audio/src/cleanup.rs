@@ -19,8 +19,8 @@ use crate::builder::ChunkRecord;
 /// files this crate actually manages.
 const MANAGED_EXTENSIONS: &[&str] = &["mp3", "opus", "aac", "flac", "wav", "pcm"];
 
-/// A managed chunk file in the output directory that the current plan will not
-/// use — safe to delete.
+/// A managed chunk file in the output directory that the complete current
+/// book plan will not use and is therefore safe to delete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaleChunk {
     pub path: PathBuf,
@@ -56,7 +56,13 @@ fn is_managed_chunk_name(name: &str) -> bool {
 }
 
 /// List managed chunk files in `out_dir` that the current `plan` does not
-/// reference. A resume never uses these, so they are safe to remove.
+/// reference.
+///
+/// The caller must provide a complete plan covering every narratable chapter
+/// under the current synthesis settings. A chapter-filtered plan is not
+/// sufficient: existing chunks for omitted chapters may still be reusable.
+/// Given a complete plan, a resume never uses the returned files, so they are
+/// safe to remove.
 ///
 /// Returns an empty list if `out_dir` does not exist. Results are sorted by
 /// path for stable reporting.
@@ -183,6 +189,52 @@ mod tests {
         assert!(out.join(keep).exists());
         assert!(out.join("chapter-001.mp3").exists());
         assert!(out.join("audiobook.m4b").exists());
+    }
+
+    #[test]
+    fn complete_plan_keeps_unselected_chapters_and_finds_superseded_chunk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path();
+        let chapter_one = "chapter-001-part-001-1111111111111111.wav";
+        let chapter_two = "chapter-002-part-001-2222222222222222.wav";
+        let chapter_three = "chapter-003-part-001-3333333333333333.wav";
+        let superseded = "chapter-002-part-001-aaaaaaaaaaaaaaaa.wav";
+        for name in [chapter_one, chapter_two, chapter_three, superseded] {
+            fs::write(out.join(name), b"paid audio").expect("write fixture");
+        }
+
+        // This is the full-book reference plan used even when the synthesis
+        // run itself selects only chapter 2.
+        let plan = vec![
+            record(chapter_one),
+            record(chapter_two),
+            record(chapter_three),
+        ];
+        let found = find_stale_chunks(out, &plan).expect("scan");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, out.join(superseded));
+
+        remove_stale_chunks(&found).expect("remove");
+        assert!(!out.join(superseded).exists());
+        assert!(out.join(chapter_one).exists());
+        assert!(out.join(chapter_two).exists());
+        assert!(out.join(chapter_three).exists());
+    }
+
+    #[test]
+    fn dry_run_listing_does_not_delete_stale_chunks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path();
+        let current = "chapter-001-part-001-0123456789abcdef.mp3";
+        let superseded = "chapter-001-part-001-fedcba9876543210.mp3";
+        fs::write(out.join(current), b"current").expect("write fixture");
+        fs::write(out.join(superseded), b"superseded").expect("write fixture");
+
+        // The CLI's dry-run path stops after this read-only listing.
+        let found = find_stale_chunks(out, &[record(current)]).expect("scan");
+        assert_eq!(found.len(), 1);
+        assert!(out.join(current).exists());
+        assert!(out.join(superseded).exists());
     }
 
     #[test]
