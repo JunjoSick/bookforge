@@ -182,6 +182,15 @@ struct AppState {
     /// Age budget used by dashboard lease reads. Production installs the
     /// three-second worker liveness budget; router tests can inject another.
     runtime_lease_stale_after: Duration,
+    /// Per-job locks serializing manual corrections. Applying one correction is
+    /// a read-modify-write over the whole book: it loads every block
+    /// translation, merges one segment, stages a rebuilt EPUB, saves the
+    /// segment, then renames the staged file over the output. Two browser tabs
+    /// correcting different segments can otherwise both read the same
+    /// pre-correction snapshot, and whichever renames last publishes an EPUB
+    /// missing the other's edit — while SQLite retains both, so the store and
+    /// the book silently disagree.
+    correction_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     #[cfg(test)]
     resume_launches: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
@@ -317,6 +326,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         audio_cancels: Arc::new(Mutex::new(HashMap::new())),
         store_path: default_store_path(),
         runtime_lease_stale_after: crate::control::RUNTIME_LEASE_STALE_AFTER,
+        correction_locks: Arc::new(Mutex::new(HashMap::new())),
         #[cfg(test)]
         resume_launches: None,
         #[cfg(test)]
@@ -661,6 +671,10 @@ async fn save_manual_translation(
     }
 
     let store_path = state.store_path.clone();
+    // Held across the whole read-modify-write so a second tab cannot stage a
+    // rebuilt EPUB from a snapshot taken before this correction lands.
+    let lock = job_correction_lock(&state, &id)?;
+    let _guard = lock.lock().await;
     let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
         let store = JobStore::open(store_path)?;
         super::correct::correct_job_segment(
@@ -2845,6 +2859,20 @@ fn lock_keys(state: &AppState) -> Result<MutexGuard<'_, HashMap<String, String>>
         .map_err(|_| anyhow::anyhow!("dashboard API key store is unavailable"))
 }
 
+/// Lock serializing manual corrections for one job.
+///
+/// Applying a correction is a read-modify-write across the whole book, so two
+/// concurrent requests can both read the same pre-correction snapshot and the
+/// later rename publishes an EPUB missing the earlier edit. The registry is
+/// keyed by job id, so corrections to different books still run in parallel.
+fn job_correction_lock(state: &AppState, job_id: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+    let mut locks = state
+        .correction_locks
+        .lock()
+        .map_err(|_| anyhow::anyhow!("correction lock registry is unavailable"))?;
+    Ok(locks.entry(job_id.to_string()).or_default().clone())
+}
+
 fn dashboard_options_payload() -> DashboardOptions {
     DashboardOptions {
         languages: LANGUAGE_OPTIONS,
@@ -3508,6 +3536,7 @@ mod tests {
             audio_cancels: Arc::new(Mutex::new(HashMap::new())),
             store_path: default_store_path(),
             runtime_lease_stale_after: crate::control::RUNTIME_LEASE_STALE_AFTER,
+            correction_locks: Arc::new(Mutex::new(HashMap::new())),
             resume_launches: None,
             resume_child_environments: None,
             audio_restart_cancels: None,
@@ -5252,6 +5281,55 @@ mod tests {
         assert_eq!(launches.load(Ordering::SeqCst), 0);
 
         clean_runtime_files(&fixture.job_id);
+    }
+
+    #[tokio::test]
+    async fn correction_locks_serialize_one_job_and_not_two() {
+        let state = test_state("token-123");
+
+        let a1 = job_correction_lock(&state, "job-a").expect("lock should resolve");
+        let a2 = job_correction_lock(&state, "job-a").expect("lock should resolve");
+        let b = job_correction_lock(&state, "job-b").expect("lock should resolve");
+        assert!(
+            Arc::ptr_eq(&a1, &a2),
+            "the same job must contend on one lock"
+        );
+        assert!(
+            !Arc::ptr_eq(&a1, &b),
+            "different books must not block each other"
+        );
+
+        // Two corrections to the same job must not overlap. Without the lock
+        // both would read the same pre-correction snapshot and the later
+        // rename would publish an EPUB missing the earlier edit.
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let first = {
+            let lock = a1.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                let _guard = lock.lock().await;
+                order.lock().unwrap().push("first-enter");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                order.lock().unwrap().push("first-exit");
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let second = {
+            let lock = a2.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                let _guard = lock.lock().await;
+                order.lock().unwrap().push("second-enter");
+            })
+        };
+        first.await.expect("first correction should finish");
+        second.await.expect("second correction should finish");
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["first-enter", "first-exit", "second-enter"],
+            "the second correction must wait for the first to finish"
+        );
     }
 
     #[tokio::test]
