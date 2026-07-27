@@ -175,6 +175,9 @@ struct AppState {
     /// resolved once at startup instead of per-request) while letting tests
     /// point a router at an isolated temp-dir store without touching CWD.
     store_path: PathBuf,
+    /// Age budget used by dashboard lease reads. Production installs the
+    /// three-second worker liveness budget; router tests can inject another.
+    runtime_lease_stale_after: Duration,
     #[cfg(test)]
     resume_launches: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -301,6 +304,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         elevenlabs_voices: Arc::new(Mutex::new(None)),
         audio_cancels: Arc::new(Mutex::new(HashMap::new())),
         store_path: default_store_path(),
+        runtime_lease_stale_after: crate::control::RUNTIME_LEASE_STALE_AFTER,
         #[cfg(test)]
         resume_launches: None,
     };
@@ -499,8 +503,11 @@ async fn job_reconfigure(
     State(state): State<AppState>,
 ) -> Result<Response, AppError> {
     let store_path = state.store_path.clone();
-    let outcome =
-        tokio::task::spawn_blocking(move || runtime_settings_view(&store_path, &id)).await?;
+    let lease_stale_after = state.runtime_lease_stale_after;
+    let outcome = tokio::task::spawn_blocking(move || {
+        runtime_settings_view(&store_path, &id, lease_stale_after)
+    })
+    .await?;
     match outcome {
         Ok(Some(view)) => Ok(Json(view).into_response()),
         Ok(None) => Ok((
@@ -525,6 +532,7 @@ async fn update_job_reconfigure(
         return Ok(bad_request("select at least one runtime setting"));
     }
     let store_path = state.store_path.clone();
+    let lease_stale_after = state.runtime_lease_stale_after;
     let outcome = tokio::task::spawn_blocking(move || -> Result<RuntimeSettingsView> {
         let store = JobStore::open(&store_path)?;
         let Some(job) = store.get_job(&id)? else {
@@ -542,7 +550,7 @@ async fn update_job_reconfigure(
         }
         let (_path, written) =
             super::reconfigure::write_merged_overrides_for_job(&id, incoming)?;
-        let mut view = runtime_settings_view(&store_path, &id)?
+        let mut view = runtime_settings_view(&store_path, &id, lease_stale_after)?
             .ok_or_else(|| anyhow::anyhow!("job disappeared after reconfiguration"))?;
         view.revision = written.revision;
         Ok(view)
@@ -787,6 +795,7 @@ async fn resume_job(
         return Ok(response);
     }
     let store_path = state.store_path.clone();
+    let lease_stale_after = state.runtime_lease_stale_after;
     let lookup = id.clone();
     let action = tokio::task::spawn_blocking(move || -> Result<Option<(bool, bool, bool)>> {
         let store = JobStore::open(&store_path)?;
@@ -794,7 +803,7 @@ async fn resume_job(
             return Ok(None);
         };
         let live = matches!(
-            crate::control::runtime_lease_state(&lookup),
+            crate::control::runtime_lease_state(&lookup, lease_stale_after),
             crate::control::RuntimeLeaseState::Fresh(_)
         );
         let resumable = !store.resumable_segment_ids(&lookup)?.is_empty()
@@ -908,13 +917,14 @@ async fn control_job(
         return Ok(response);
     }
     let store_path = state.store_path.clone();
+    let lease_stale_after = state.runtime_lease_stale_after;
     let outcome = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
         let store = JobStore::open(store_path)?;
         if store.get_job(&id)?.is_none() {
             return Ok(None);
         }
         if !matches!(
-            crate::control::runtime_lease_state(&id),
+            crate::control::runtime_lease_state(&id, lease_stale_after),
             crate::control::RuntimeLeaseState::Fresh(_)
         ) {
             anyhow::bail!(
@@ -2718,6 +2728,7 @@ struct RuntimeSettingsView {
 fn runtime_settings_view(
     store_path: &std::path::Path,
     id: &str,
+    lease_stale_after: Duration,
 ) -> Result<Option<RuntimeSettingsView>> {
     let store = JobStore::open(store_path)?;
     let Some(job) = store.get_job(id)? else {
@@ -2740,7 +2751,8 @@ fn runtime_settings_view(
         .unwrap_or(snapshot.validate_output);
     let changed_fields = overrides.changed_fields();
     let next_boundary = overrides.application_boundaries();
-    let (lease, live, applied_revision) = match crate::control::runtime_lease_state(id) {
+    let lease_state = crate::control::runtime_lease_state(id, lease_stale_after);
+    let (lease, live, applied_revision) = match lease_state {
         crate::control::RuntimeLeaseState::Fresh(lease) => (
             RuntimeLeaseView {
                 state: "fresh",
@@ -2999,6 +3011,7 @@ mod tests {
     use axum::http::HeaderValue;
 
     const TEST_HOST: &str = "127.0.0.1:8765";
+    const TEST_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
     fn test_state(token: &str) -> AppState {
         AppState {
@@ -3009,6 +3022,7 @@ mod tests {
             elevenlabs_voices: Arc::new(Mutex::new(None)),
             audio_cancels: Arc::new(Mutex::new(HashMap::new())),
             store_path: default_store_path(),
+            runtime_lease_stale_after: crate::control::RUNTIME_LEASE_STALE_AFTER,
             resume_launches: None,
         }
     }
@@ -3190,11 +3204,15 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()?;
 
-        let status = child_exit_status_after(&mut child, Duration::from_secs(2))
+        let expected = tokio::time::timeout(TEST_DEADLOCK_TIMEOUT, child.wait())
+            .await
+            .expect("help child should exit before the deadlock guard")?;
+        let status = child_exit_status_after(&mut child, Duration::ZERO)
             .await?
-            .expect("help child should exit quickly");
+            .expect("completed help child should have an exit status");
 
-        assert!(status.success());
+        assert_eq!(status, expected);
+        assert!(expected.success());
         Ok(())
     }
 
@@ -4118,10 +4136,9 @@ mod tests {
         let fixture = build_mutation_fixture();
         make_stopped_fixture_resumable(&fixture);
         clean_runtime_files(&fixture.job_id);
-        let router = dashboard_router(test_state_with_store(
-            &fixture.csrf,
-            fixture.store_path.clone(),
-        ));
+        let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+        state.runtime_lease_stale_after = Duration::from_millis(u64::MAX);
+        let router = dashboard_router(state);
 
         for command in ["pause", "stop"] {
             let response = post_json(

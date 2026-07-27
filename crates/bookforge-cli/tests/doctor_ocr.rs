@@ -8,6 +8,8 @@ use std::{
 use assert_cmd::Command;
 use predicates::str::contains;
 
+const TEST_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn bookforge() -> Command {
     Command::cargo_bin("bookforge").expect("bookforge binary should be built")
 }
@@ -20,7 +22,7 @@ fn doctor_lists_models_from_loopback_ocr_endpoint() {
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("mock OCR accept");
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(TEST_DEADLOCK_TIMEOUT))
             .expect("read timeout");
         let mut request = Vec::new();
         let mut scratch = [0u8; 2048];
@@ -54,7 +56,7 @@ fn doctor_lists_models_from_loopback_ocr_endpoint() {
         .stdout(contains("baidu/Unlimited-OCR"));
 
     let request = receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(TEST_DEADLOCK_TIMEOUT)
         .expect("doctor request captured");
     assert!(request.starts_with("GET /v1/models HTTP/1.1"));
 }

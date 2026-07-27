@@ -1233,6 +1233,14 @@ mod tests {
         segments: Vec<Segment>,
     }
 
+    fn assert_future_pending<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            future.as_mut().poll(&mut context).is_pending(),
+            "future should wait for the test transition"
+        );
+    }
+
     #[tokio::test]
     async fn paused_resume_wait_times_out_with_force_hint() {
         let fixture = resume_fixture(TranslationProfile::V1Fast.resolve(), 1);
@@ -1264,26 +1272,21 @@ mod tests {
             .store
             .mark_job_paused(&fixture.job.id)
             .expect("job should mark paused");
-        let store_path = fixture.store.path().to_path_buf();
         let job_id = fixture.job.id.clone();
-        let wake_id = job_id.clone();
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            let store = JobStore::open(store_path).expect("store should reopen");
-            store
-                .mark_job_running(&wake_id)
-                .expect("job should leave paused");
-        });
 
         let resumed = wait_for_paused_job_to_leave_paused(
             &fixture.store,
             &job_id,
             Duration::from_secs(1),
             Duration::from_millis(1),
-        )
-        .await
-        .expect("paused wait should not error");
+        );
+        tokio::pin!(resumed);
+        assert_future_pending(resumed.as_mut());
+        fixture
+            .store
+            .mark_job_running(&job_id)
+            .expect("job should leave paused");
+        let resumed = resumed.await.expect("paused wait should not error");
 
         assert!(resumed, "live paused job should be observed leaving paused");
     }
@@ -1303,19 +1306,21 @@ mod tests {
             },
         );
         let args = resume_args(&fixture.job.id);
-        let store_path = fixture.store.path().to_path_buf();
         let job_id = fixture.job.id.clone();
-        let wake_id = job_id.clone();
 
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            let store = JobStore::open(store_path).expect("store should reopen");
-            store
-                .mark_job_running(&wake_id)
-                .expect("live watcher should leave paused");
-        });
-
-        live_fast_resume_paused_job(&fixture.store, &args)
+        let resume = live_fast_resume_paused_job(&fixture.store, &args);
+        tokio::pin!(resume);
+        assert_future_pending(resume.as_mut());
+        assert_eq!(
+            bookforge_core::read_control_file(&bookforge_core::control_path_for_job(&job_id))
+                .expect("control file should read"),
+            ControlCommand::Resume
+        );
+        fixture
+            .store
+            .mark_job_running(&job_id)
+            .expect("live watcher should leave paused");
+        resume
             .await
             .expect("pending overrides should be applied by the live watcher");
 
