@@ -51,7 +51,15 @@ pub(crate) fn runtime_path_for_job(job_id: &str) -> PathBuf {
     bookforge_core::run_dir_for_job(job_id).join("runtime.json")
 }
 
-pub(crate) fn runtime_lease_state(job_id: &str) -> RuntimeLeaseState {
+pub(crate) fn runtime_lease_state(job_id: &str, stale_after: Duration) -> RuntimeLeaseState {
+    runtime_lease_state_at(job_id, stale_after, now_ms())
+}
+
+fn runtime_lease_state_at(
+    job_id: &str,
+    stale_after: Duration,
+    observed_at_ms: u64,
+) -> RuntimeLeaseState {
     let path = runtime_path_for_job(job_id);
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -70,8 +78,9 @@ pub(crate) fn runtime_lease_state(job_id: &str) -> RuntimeLeaseState {
         }
         Err(error) => return RuntimeLeaseState::Invalid(error.to_string()),
     };
-    let age_ms = now_ms().saturating_sub(lease.heartbeat_at_ms);
-    if age_ms <= RUNTIME_LEASE_STALE_AFTER.as_millis() as u64 {
+    let age_ms = observed_at_ms.saturating_sub(lease.heartbeat_at_ms);
+    let stale_after_ms = u64::try_from(stale_after.as_millis()).unwrap_or(u64::MAX);
+    if age_ms <= stale_after_ms {
         RuntimeLeaseState::Fresh(lease)
     } else {
         RuntimeLeaseState::Stale(lease)
@@ -121,6 +130,10 @@ pub(crate) struct RuntimeLaunchClaim {
 
 impl RuntimeLaunchClaim {
     pub(crate) fn acquire(job_id: &str) -> Result<Option<Self>> {
+        Self::acquire_with_stale_after(job_id, RUNTIME_LAUNCH_CLAIM_STALE_AFTER)
+    }
+
+    fn acquire_with_stale_after(job_id: &str, stale_after: Duration) -> Result<Option<Self>> {
         let path = bookforge_core::run_dir_for_job(job_id).join("resume.launch");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -140,7 +153,7 @@ impl RuntimeLaunchClaim {
                         .and_then(|metadata| metadata.modified())
                         .ok()
                         .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age >= RUNTIME_LAUNCH_CLAIM_STALE_AFTER);
+                        .is_some_and(|age| age >= stale_after);
                     if stale {
                         let _ = fs::remove_file(&path);
                         continue;
@@ -357,6 +370,8 @@ pub(crate) struct ControlFileWatcher {
     job_runtime_settings: watch::Receiver<JobRuntimeSettings>,
     lease_path: PathBuf,
     lease_instance_id: String,
+    #[cfg(test)]
+    heartbeat_updates: watch::Receiver<u64>,
 }
 
 pub(crate) struct ControlBaseline {
@@ -431,6 +446,8 @@ impl ControlFileWatcher {
             validate_output: initial_validate_output,
         });
         let process_started_at_ms = now_ms();
+        #[cfg(test)]
+        let (heartbeat_sender, heartbeat_updates) = watch::channel(process_started_at_ms);
         let lease_path = runtime_path_for_job(&job_id);
         let lease_instance_id = format!(
             "{}-{process_started_at_ms}-{}",
@@ -556,12 +573,18 @@ impl ControlFileWatcher {
                 }
                 if last_heartbeat_write.elapsed() >= RUNTIME_HEARTBEAT_INTERVAL {
                     lease.heartbeat_at_ms = now_ms();
-                    if let Err(error) = write_runtime_lease(&task_lease_path, &lease) {
-                        progress.emit(ProgressEvent::Error {
-                            kind: "runtime_lease".to_string(),
-                            message: format!("failed to refresh runtime lease: {error}"),
-                            timestamp_ms: now_ms(),
-                        });
+                    match write_runtime_lease(&task_lease_path, &lease) {
+                        Ok(()) => {
+                            #[cfg(test)]
+                            heartbeat_sender.send_replace(lease.heartbeat_at_ms);
+                        }
+                        Err(error) => {
+                            progress.emit(ProgressEvent::Error {
+                                kind: "runtime_lease".to_string(),
+                                message: format!("failed to refresh runtime lease: {error}"),
+                                timestamp_ms: now_ms(),
+                            });
+                        }
                     }
                     last_heartbeat_write = Instant::now();
                 }
@@ -579,6 +602,8 @@ impl ControlFileWatcher {
             job_runtime_settings,
             lease_path,
             lease_instance_id,
+            #[cfg(test)]
+            heartbeat_updates,
         }
     }
 
@@ -588,6 +613,11 @@ impl ControlFileWatcher {
 
     pub(crate) fn job_runtime_settings(&self) -> watch::Receiver<JobRuntimeSettings> {
         self.job_runtime_settings.clone()
+    }
+
+    #[cfg(test)]
+    fn heartbeat_updates(&self) -> watch::Receiver<u64> {
+        self.heartbeat_updates.clone()
     }
 
     #[allow(dead_code)]
@@ -608,15 +638,16 @@ impl Drop for ControlFileWatcher {
 mod tests {
     use super::*;
     use bookforge_core::{NullProgressSink, TranslationProfile};
-    use std::sync::Mutex;
+
+    const TEST_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
     struct RecordingSink {
-        events: Arc<Mutex<Vec<ProgressEvent>>>,
+        events: tokio::sync::mpsc::UnboundedSender<ProgressEvent>,
     }
 
     impl ProgressSink for RecordingSink {
         fn emit(&self, event: ProgressEvent) {
-            self.events.lock().expect("events lock").push(event);
+            let _ = self.events.send(event);
         }
     }
 
@@ -735,7 +766,7 @@ mod tests {
         );
         let mut receiver = watcher.runtime_settings();
         if receiver.borrow().revision != 7 {
-            tokio::time::timeout(Duration::from_secs(2), receiver.changed())
+            tokio::time::timeout(TEST_DEADLOCK_TIMEOUT, receiver.changed())
                 .await
                 .expect("watcher should publish the sidecar")
                 .expect("runtime channel should stay open");
@@ -789,12 +820,21 @@ mod tests {
             },
         );
 
-        let first = match runtime_lease_state(&job.id) {
+        let mut heartbeat_updates = watcher.heartbeat_updates();
+        let first = match runtime_lease_state(&job.id, Duration::from_millis(u64::MAX)) {
             RuntimeLeaseState::Fresh(lease) => lease,
             state => panic!("expected a fresh runtime lease, got {state:?}"),
         };
-        tokio::time::sleep(RUNTIME_HEARTBEAT_INTERVAL + Duration::from_millis(250)).await;
-        let refreshed = match runtime_lease_state(&job.id) {
+        loop {
+            if *heartbeat_updates.borrow_and_update() > first.heartbeat_at_ms {
+                break;
+            }
+            heartbeat_updates
+                .changed()
+                .await
+                .expect("watcher should report a newer successful heartbeat write");
+        }
+        let refreshed = match runtime_lease_state(&job.id, Duration::from_millis(u64::MAX)) {
             RuntimeLeaseState::Fresh(lease) => lease,
             state => panic!("expected a refreshed runtime lease, got {state:?}"),
         };
@@ -802,7 +842,10 @@ mod tests {
         assert!(refreshed.heartbeat_at_ms > first.heartbeat_at_ms);
 
         drop(watcher);
-        assert_eq!(runtime_lease_state(&job.id), RuntimeLeaseState::Missing);
+        assert_eq!(
+            runtime_lease_state(&job.id, RUNTIME_LEASE_STALE_AFTER),
+            RuntimeLeaseState::Missing
+        );
         let _ = std::fs::remove_dir_all(run_dir);
     }
 
@@ -843,14 +886,14 @@ mod tests {
         .unwrap();
         request_job_control(&job.id, ControlCommand::Resume).unwrap();
 
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
         let signal = PauseSignal::new();
         signal.pause();
         let watcher = ControlFileWatcher::spawn_with_stop_cancel(
             db,
             job.id.clone(),
             Arc::new(RecordingSink {
-                events: events.clone(),
+                events: event_sender,
             }),
             signal,
             CancellationToken::new(),
@@ -861,29 +904,29 @@ mod tests {
             },
         );
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let events = tokio::time::timeout(TEST_DEADLOCK_TIMEOUT, async {
+            let mut recorded = Vec::new();
+            let mut saw_runtime_config = false;
+            let mut saw_resume = false;
             loop {
-                let saw_both = {
-                    let events = events.lock().expect("events lock");
-                    events.iter().any(|event| {
-                        matches!(
-                            event,
-                            ProgressEvent::RuntimeConfigChanged { revision: 9, .. }
-                        )
-                    }) && events
-                        .iter()
-                        .any(|event| matches!(event, ProgressEvent::JobResumed { .. }))
-                };
-                if saw_both {
-                    break;
+                let event = event_receiver
+                    .recv()
+                    .await
+                    .expect("watcher event channel should stay open");
+                saw_runtime_config |= matches!(
+                    &event,
+                    ProgressEvent::RuntimeConfigChanged { revision: 9, .. }
+                );
+                saw_resume |= matches!(&event, ProgressEvent::JobResumed { .. });
+                recorded.push(event);
+                if saw_runtime_config && saw_resume {
+                    break recorded;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("watcher should publish and resume");
 
-        let events = events.lock().expect("events lock");
         let config_index = events
             .iter()
             .position(|event| {
@@ -901,7 +944,6 @@ mod tests {
             config_index < resume_index,
             "override revision must publish before Resume releases work"
         );
-        drop(events);
         assert_eq!(watcher.runtime_settings().borrow().revision, 9);
 
         drop(watcher);
@@ -914,24 +956,25 @@ mod tests {
         let run_dir = bookforge_core::run_dir_for_job(&job_id);
         let _ = std::fs::remove_dir_all(&run_dir);
 
-        let first = RuntimeLaunchClaim::acquire(&job_id)
+        let acquire = || RuntimeLaunchClaim::acquire_with_stale_after(&job_id, Duration::MAX);
+        let first = acquire()
             .expect("first claim should succeed")
             .expect("first caller should own the claim");
         assert!(
-            RuntimeLaunchClaim::acquire(&job_id)
+            acquire()
                 .expect("second acquire should be readable")
                 .is_none(),
             "a concurrent caller must not launch another worker"
         );
 
         drop(first);
-        let mut persisted = RuntimeLaunchClaim::acquire(&job_id)
+        let mut persisted = acquire()
             .expect("claim should be reusable after an unlaunched owner drops")
             .expect("new caller should own the released claim");
         persisted.persist_until_worker();
         drop(persisted);
         assert!(
-            RuntimeLaunchClaim::acquire(&job_id)
+            acquire()
                 .expect("persisted claim should remain readable")
                 .is_none(),
             "a launched worker's claim must remain until its watcher clears it"
@@ -942,6 +985,7 @@ mod tests {
 
     #[test]
     fn runtime_lease_reader_reports_stale_and_invalid_files() {
+        const OBSERVED_AT_MS: u64 = 10_000;
         let job_id = format!("runtime-lease-state-test-{}", now_ms());
         let run_dir = bookforge_core::run_dir_for_job(&job_id);
         let path = runtime_path_for_job(&job_id);
@@ -953,20 +997,20 @@ mod tests {
             instance_id: "stale-worker".to_string(),
             pid: 123,
             process_started_at_ms: 1,
-            heartbeat_at_ms: now_ms()
+            heartbeat_at_ms: OBSERVED_AT_MS
                 .saturating_sub(RUNTIME_LEASE_STALE_AFTER.as_millis() as u64 + 1),
             last_loaded_revision: 2,
             last_applied_revision: 2,
         };
         std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
         assert!(matches!(
-            runtime_lease_state(&job_id),
+            runtime_lease_state_at(&job_id, RUNTIME_LEASE_STALE_AFTER, OBSERVED_AT_MS),
             RuntimeLeaseState::Stale(lease) if lease.instance_id == "stale-worker"
         ));
 
         std::fs::write(&path, b"not-json").unwrap();
         assert!(matches!(
-            runtime_lease_state(&job_id),
+            runtime_lease_state_at(&job_id, RUNTIME_LEASE_STALE_AFTER, OBSERVED_AT_MS),
             RuntimeLeaseState::Invalid(_)
         ));
 
