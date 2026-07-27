@@ -6,7 +6,18 @@ use bookforge_core::{
         SegmentMetadata, SegmentSource, SegmentTextRun,
     },
 };
-use std::{fs, time::SystemTime};
+use std::{fs, io::Write, sync::Mutex, time::SystemTime};
+
+#[derive(Default)]
+struct RecordingProgressSink {
+    events: Mutex<Vec<bookforge_core::ProgressEvent>>,
+}
+
+impl bookforge_core::ProgressSink for RecordingProgressSink {
+    fn emit(&self, event: bookforge_core::ProgressEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
 
 #[test]
 fn toki_pona_text_only_retry_guidance_downgrades_only_the_targeted_batch() {
@@ -150,6 +161,121 @@ async fn scheduler_guard_preserves_completed_segments_on_run_level_error() {
 }
 
 #[tokio::test]
+async fn mock_and_openai_entry_points_share_events_and_artifacts() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = temp.path().join("input.epub");
+    build_translation_fixture(&input);
+    let mock_output = temp.path().join("mock.epub");
+    let openai_output = temp.path().join("openai.epub");
+    let mock_store_path = temp.path().join("mock.sqlite");
+    let openai_store_path = temp.path().join("openai.sqlite");
+
+    let mut settings = TranslationProfile::V1Fast.resolve();
+    settings.batch.enabled = false;
+    settings.scheduler.concurrency = 1;
+    settings.scheduler.max_attempts = 1;
+    settings.provider.provider_max_attempts = 1;
+    settings.provider.json_mode = bookforge_core::JsonMode::PromptOnly;
+
+    let mut mock_args = translate_args_with_preset(None);
+    mock_args.input = input.clone();
+    mock_args.out = Some(mock_output.clone());
+    mock_args.language.target = "English".to_string();
+    mock_args.provider.provider = "mock".to_string();
+    mock_args.provider.model = Some("mock-prefix-target".to_string());
+    let mock_config = TranslationConfig {
+        source_language: Some("English".to_string()),
+        target_language: "English".to_string(),
+        provider: "mock".to_string(),
+        model: Some("mock-prefix-target".to_string()),
+        concurrency: 1,
+        max_attempts: 1,
+        output: mock_output.clone(),
+    };
+    let mock_progress = Arc::new(RecordingProgressSink::default());
+    orchestration::run_mock_translation_with_store(
+        &input,
+        &mock_config,
+        &mock_args.provider,
+        &mock_args,
+        &settings,
+        &tokio_util::sync::CancellationToken::new(),
+        mock_progress.clone(),
+        Some(JobStore::open(&mock_store_path).unwrap()),
+    )
+    .await
+    .expect("mock entry point should finish");
+
+    let (base_url, server) = spawn_openai_prefix_server().await;
+    let mut openai_args = translate_args_with_preset(None);
+    openai_args.input = input.clone();
+    openai_args.out = Some(openai_output.clone());
+    openai_args.language.target = "English".to_string();
+    openai_args.provider.provider = "openai-compatible".to_string();
+    openai_args.provider.model = Some("test-model".to_string());
+    openai_args.provider.base_url = Some(base_url);
+    openai_args.provider.api_key_env = Some("OLLAMA_API_KEY".to_string());
+    let openai_config = TranslationConfig {
+        source_language: Some("English".to_string()),
+        target_language: "English".to_string(),
+        provider: "openai-compatible".to_string(),
+        model: Some("test-model".to_string()),
+        concurrency: 1,
+        max_attempts: 1,
+        output: openai_output.clone(),
+    };
+    let openai_progress = Arc::new(RecordingProgressSink::default());
+    orchestration::run_openai_compatible_translation_with_store(
+        &input,
+        &openai_config,
+        &openai_args.provider,
+        &openai_args,
+        &settings,
+        &tokio_util::sync::CancellationToken::new(),
+        openai_progress.clone(),
+        Some(JobStore::open(&openai_store_path).unwrap()),
+    )
+    .await
+    .expect("OpenAI-compatible entry point should finish");
+    server.abort();
+
+    let openai_job_id = openai_progress
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|event| match event {
+            bookforge_core::ProgressEvent::JobCreated { job_id, .. } => Some(job_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let openai_records = JobStore::open(&openai_store_path)
+        .unwrap()
+        .segment_records(&openai_job_id)
+        .unwrap();
+    assert!(
+        openai_records.iter().all(|record| record.error.is_none()),
+        "OpenAI-compatible stub should produce valid translations: {openai_records:?}"
+    );
+
+    assert_eq!(
+        fs::read(mock_output).unwrap(),
+        fs::read(openai_output).unwrap(),
+        "provider construction must not change the rebuilt EPUB"
+    );
+
+    let mock_events = progress_event_kinds(&mock_progress.events.lock().unwrap());
+    let openai_events = progress_event_kinds(&openai_progress.events.lock().unwrap())
+        .into_iter()
+        .filter(|kind| kind != "RuntimeConfigResolved")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mock_events, openai_events,
+        "the only intentional event difference is runtime provider resolution"
+    );
+}
+
+#[tokio::test]
 async fn fallback_pass_honors_stop_control_file() {
     let db_path = temp_path("fallback_stop.sqlite");
     let input_path = temp_path("fallback_stop_input.epub");
@@ -237,7 +363,6 @@ async fn fallback_pass_honors_stop_control_file() {
         control_path.clone(),
         Arc::new(NullProgressSink),
     );
-
     let result = run_fallback_pass(
         &tokio_util::sync::CancellationToken::new(),
         Some(&fallback_config),
@@ -649,6 +774,177 @@ fn temp_path(name: &str) -> PathBuf {
         "bookforge-cli-test-{}-{nanos}-{seq}-{name}",
         std::process::id()
     ))
+}
+
+fn build_translation_fixture(path: &std::path::Path) {
+    let file = fs::File::create(path).expect("fixture EPUB should be creatable");
+    let mut zip = zip::ZipWriter::new(file);
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    zip.start_file("mimetype", stored).unwrap();
+    zip.write_all(b"application/epub+zip").unwrap();
+    zip.start_file("META-INF/container.xml", deflated).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#,
+    )
+    .unwrap();
+    zip.start_file("content.opf", deflated).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">orchestration-fixture</dc:identifier>
+    <dc:title></dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="chapter"/></spine>
+</package>"#,
+    )
+    .unwrap();
+    zip.start_file("chapter.xhtml", deflated).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Chapter</title></head>
+<body><p>Hello world.</p></body>
+</html>"#,
+    )
+    .unwrap();
+    zip.finish().unwrap();
+}
+
+async fn spawn_openai_prefix_server() -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test server should bind");
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let header_end = loop {
+                let Ok(read) = stream.read(&mut chunk).await else {
+                    break None;
+                };
+                if read == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break Some(index + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length: ")
+                        .or_else(|| line.strip_prefix("content-length: "))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let Ok(read) = stream.read(&mut chunk).await else {
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+            let user = body["messages"][1]["content"].as_str().unwrap();
+            let user = user.replace("\r\n", "\n");
+            let segment_id = user
+                .rsplit_once(r#""segment_id": ""#)
+                .and_then(|(_, value)| value.split('"').next())
+                .unwrap();
+            let completion =
+                if let Some((_, source_blocks)) = user.split_once("Source blocks:\n\n```json\n") {
+                    let source_blocks = source_blocks.split_once("\n```").unwrap().0;
+                    let blocks = serde_json::from_str::<Vec<serde_json::Value>>(source_blocks)
+                        .unwrap()
+                        .into_iter()
+                        .map(|block| {
+                            serde_json::json!({
+                                "block_id": block["block_id"],
+                                "translation": format!(
+                                    "[English] {}",
+                                    block["text"].as_str().unwrap()
+                                ),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    serde_json::json!({"segment_id": segment_id, "blocks": blocks}).to_string()
+                } else {
+                    let source = user
+                        .split_once("Source segment:\n\n```txt\n")
+                        .and_then(|(_, value)| value.split_once("\n```"))
+                        .map(|(source, _)| source)
+                        .unwrap();
+                    serde_json::json!({
+                        "segment_id": segment_id,
+                        "translation": format!("[English] {source}"),
+                    })
+                    .to_string()
+                };
+            let response_body = serde_json::json!({
+                "choices": [{
+                    "message": {"content": completion},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })
+            .to_string();
+            let response_headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(response_headers.as_bytes()).await.unwrap();
+            stream.write_all(response_body.as_bytes()).await.unwrap();
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    (format!("http://{address}"), server)
+}
+
+fn progress_event_kinds(events: &[bookforge_core::ProgressEvent]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| {
+            serde_json::to_value(event)
+                .unwrap()
+                .as_object()
+                .and_then(|object| object.keys().next())
+                .expect("progress event should serialize as a tagged object")
+                .clone()
+        })
+        .collect()
 }
 
 #[test]

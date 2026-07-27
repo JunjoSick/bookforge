@@ -64,6 +64,7 @@ pub async fn run(
                     &effective_provider,
                     &args,
                     &settings,
+                    &cancel_token,
                     progress_sink,
                 )
                 .await
@@ -122,353 +123,64 @@ async fn run_mock_translation(
     provider_args: &CliProviderArgs,
     cli_args: &TranslateArgs,
     settings: &ResolvedRunSettings,
+    cancel_token: &tokio_util::sync::CancellationToken,
     progress: Arc<dyn bookforge_core::ProgressSink>,
 ) -> Result<()> {
-    let started = std::time::Instant::now();
-    progress.emit(bookforge_core::ProgressEvent::StageStarted {
-        stage: "read_epub".to_string(),
-        timestamp_ms: bookforge_core::progress::now_ms(),
-    });
-    let book = read_epub(input)?;
-    progress.emit(bookforge_core::ProgressEvent::StageFinished {
-        stage: "read_epub".to_string(),
-        timestamp_ms: bookforge_core::progress::now_ms(),
-    });
-    progress.emit(bookforge_core::ProgressEvent::StageStarted {
-        stage: "segmentation".to_string(),
-        timestamp_ms: bookforge_core::progress::now_ms(),
-    });
-    let segments = build_segments(&book, &settings.segmentation)?;
-    progress.emit(bookforge_core::ProgressEvent::SegmentationFinished {
-        segment_count: segments.len(),
-        timestamp_ms: bookforge_core::progress::now_ms(),
-    });
+    run_mock_translation_with_store(
+        input,
+        config,
+        provider_args,
+        cli_args,
+        settings,
+        cancel_token,
+        progress,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_mock_translation_with_store(
+    input: &PathBuf,
+    config: &TranslationConfig,
+    provider_args: &CliProviderArgs,
+    cli_args: &TranslateArgs,
+    settings: &ResolvedRunSettings,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
+    store: Option<JobStore>,
+) -> Result<()> {
     let model = config
         .model
         .clone()
         .unwrap_or_else(|| "mock-prefix-target".to_string());
-    let prompt_version = PromptVersion::V2.as_str();
-    let store = JobStore::open_default()?;
-    let glossary = prepare_glossary_run_config(
-        &store,
-        &cli_args.glossary,
-        config.source_language.as_deref(),
-        &config.target_language,
-        cli_args.book_id.as_deref(),
-        cli_args.series_id.as_deref(),
-        cli_args.glossary_format,
-        cli_args.glossary_budget_tokens,
-        cli_args.prompt_extra.clone(),
-        &segments,
-    )?;
-    let context_run_config = context_run_config_from_args(cli_args);
-    let context_registry: Option<Arc<ContextRegistry>> = if context_run_config.enabled() {
-        Some(Arc::new(ContextRegistry::new(&segments)))
-    } else {
-        None
-    };
-    let style = prepare_style_run_config(
-        &store,
-        &cli_args.style,
-        &config.target_language,
-        cli_args.book_id.as_deref(),
-        cli_args.series_id.as_deref(),
-    )?;
-    let entities = prepare_entities_run_config(
-        &store,
-        &cli_args.entities,
-        config.source_language.as_deref(),
-        &config.target_language,
-        cli_args.book_id.as_deref(),
-        cli_args.series_id.as_deref(),
-    )?;
-    let job = store.create_job(CreateJob {
+    let provider = MockProvider::new(mock_mode(&model), &config.target_language);
+    run_translation_with_store(
         input,
-        output: &config.output,
-        source_lang: config.source_language.as_deref(),
-        target_lang: &config.target_language,
-        provider: "mock",
-        model: &model,
-        base_url: None,
-        api_key_env: None,
-        book_id: cli_args.book_id.as_deref(),
-        series_id: cli_args.series_id.as_deref(),
-    })?;
-    if human_stdout_enabled(cli_args.ui) {
-        println!("Job: {}", job.id);
-    }
-    crate::control::clear_job_control(&job.id)?;
-    progress.emit(bookforge_core::ProgressEvent::JobCreated {
-        job_id: job.id.clone(),
-        input_path: input.display().to_string(),
-        output_path: config.output.display().to_string(),
-        timestamp_ms: bookforge_core::progress::now_ms(),
-    });
-    let cache_namespace = compute_cache_namespace(
-        settings.segmentation.max_segment_tokens,
-        settings.segmentation.context_tokens,
-        settings.profile.namespace_str(),
-        settings.batch.enabled,
-        prompt_version,
-        &glossary.fingerprint,
-        if style.run_config.is_some() {
-            &style.fingerprint
-        } else {
-            ""
-        },
-        if entities.run_config.is_some() {
-            &entities.fingerprint
-        } else {
-            ""
-        },
-    );
-    let mut snapshot = persist_snapshot(
-        &store,
-        &job,
-        input,
-        &config.output,
+        config,
         provider_args,
         cli_args,
         settings,
-        prompt_version,
-        &cache_namespace,
-        &glossary.fingerprint,
-        &glossary.active_terms,
-        &style.fingerprint,
-        &style.rendered_block,
-        &entities.fingerprint,
-        &entities.rendered_block,
-        &model,
-        None,
-        None,
-    )?;
-    let rebuild_options = rebuild_options_from_snapshot(&snapshot);
-    store.insert_segments(
-        &job.id,
-        &segments,
-        prompt_version,
-        "mock",
-        &model,
-        &cache_namespace,
-    )?;
-    let pause_signal = bookforge_llm::PauseSignal::new();
-    let stop_cancel_token = tokio_util::sync::CancellationToken::new();
-    let control_watcher = crate::control::ControlFileWatcher::spawn_with_stop_cancel(
-        store.path().to_path_buf(),
-        job.id.clone(),
-        progress.clone(),
-        pause_signal.clone(),
-        stop_cancel_token.clone(),
-        crate::control::ControlBaseline {
-            settings: settings.clone(),
-            qa: cli_args.qa,
-            validate_output: cli_args.validate_output,
+        ProviderRun {
+            provider,
+            model,
+            prompt_version: if settings.batch.enabled {
+                PromptVersion::BatchV3.as_str()
+            } else {
+                PromptVersion::V2.as_str()
+            },
+            base_url: None,
+            api_key_env: None,
+            model_context_tokens: settings.provider.model_context_tokens,
+            max_output_tokens: settings.provider.max_output_tokens,
+            batch_max_output_tokens: settings.provider.batch_max_output_tokens,
+            compact_prompts: settings.compact_prompts,
+            cancel_token: cancel_token.clone(),
         },
-    );
-    let job_runtime_settings = control_watcher.job_runtime_settings();
-    let run_config = TranslationRunConfig {
-        source_language: config.source_language.clone(),
-        target_language: config.target_language.clone(),
-        provider: "mock".to_string(),
-        model: model.clone(),
-        prompt_version: prompt_version.to_string(),
-        temperature: 0.2,
-        scheduler: settings.scheduler.clone(),
-        profile: settings.profile,
-        model_context_tokens: None,
-        max_output_tokens: None,
-        batch_max_output_tokens: None,
-        compact_prompts: false,
-        glossary: glossary.run_config.clone(),
-        context: context_run_config,
-        context_registry: context_registry.clone(),
-        style: style.run_config.clone(),
-        entities: entities.run_config.clone(),
-        pause_signal: Some(pause_signal.clone()),
-        runtime_settings: Some(control_watcher.runtime_settings()),
-    }; // mock
-    let provider = MockProvider::new(mock_mode(&model), &config.target_language);
-    let mut translations = apply_cached_translations(
-        &segments,
-        CacheContext {
-            store: &store,
-            job_id: &job.id,
-            prompt_version,
-            provider: &config.provider,
-            model: &model,
-            source_lang: config.source_language.as_deref(),
-            target_lang: &config.target_language,
-            cache_namespace: &cache_namespace,
-        },
-    )?;
-    let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
-    prepopulate_context_registry(context_registry.as_ref(), &segments, &translations);
-    progress.emit(bookforge_core::ProgressEvent::CacheScanFinished {
-        hits: translations.len(),
-        misses: pending_segments.len(),
-        timestamp_ms: bookforge_core::progress::now_ms(),
-    });
-    let fresh_translations = run_checkpointed_translation(
-        provider.clone(),
-        &pending_segments,
-        &run_config,
-        settings,
-        CheckpointRunContext {
-            store: &store,
-            job_id: &job.id,
-            provider: "mock",
-            model: &model,
-            prompt_version,
-        },
-        progress.clone(),
-        settings.batch.enabled,
+        progress,
+        store,
     )
-    .await?;
-    if job_was_stopped(&store, &job.id)? {
-        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
-        return Ok(());
-    }
-    translations.extend(fresh_translations);
-    translations.sort_by_key(|translation| translation.ordinal);
-    let mut control_poller = crate::control::ControlFilePoller::new_with_stop_cancel(
-        &store,
-        &job.id,
-        progress.clone(),
-        stop_cancel_token.clone(),
-    );
-    if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
-        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
-        return Ok(());
-    }
-    let qa_runtime = job_runtime_settings.borrow().clone();
-    let qa_run_config = crate::control::freeze_run_config_for_stage(&run_config, &qa_runtime);
-    let qa_reviews = qa_reviews_for_mode(
-        ProgressRequestProvider::new(provider.clone(), progress.clone()),
-        &segments,
-        &translations,
-        &qa_run_config,
-        &qa_runtime.settings.qa,
-        qa_runtime.qa,
-    )
-    .await;
-    if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
-        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
-        return Ok(());
-    }
-    let fallback_config = FallbackPassConfig::from_snapshot(snapshot.fallback.as_ref());
-    let fallback_translations = run_fallback_pass(
-        &stop_cancel_token,
-        fallback_config.as_ref(),
-        &segments,
-        std::mem::take(&mut translations),
-        &store,
-        &job.id,
-        prompt_version,
-        settings,
-        &run_config,
-        Some(&mut control_poller),
-        progress.clone(),
-    )
-    .await?;
-    translations = fallback_translations;
-    if job_was_stopped(&store, &job.id)? {
-        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
-        return Ok(());
-    }
-    if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
-        print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
-        return Ok(());
-    }
-    let double_check_runtime = job_runtime_settings.borrow().clone();
-    let double_check_run_config =
-        crate::control::freeze_run_config_for_stage(&run_config, &double_check_runtime);
-    if double_check_runtime.settings.double_check.mode != DoubleCheckMode::Off
-        && !snapshot.finalize.double_check_complete
-    {
-        println!("Double-check: auditing translations...");
-        let corrections = match run_double_check(
-            ProgressRequestProvider::new(provider.clone(), progress.clone()),
-            &segments,
-            &translations,
-            &double_check_run_config,
-            &double_check_runtime.settings.double_check,
-        )
-        .await
-        {
-            Ok(corrections) => corrections,
-            Err(_)
-                if run_config
-                    .pause_signal
-                    .as_ref()
-                    .is_some_and(bookforge_llm::PauseSignal::is_stopped) =>
-            {
-                print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
-                return Ok(());
-            }
-            Err(e) => return Err(anyhow::anyhow!("double-check failed: {e}")),
-        };
-        let changed_segment_ids = apply_double_check_corrections(&mut translations, &corrections);
-        persist_corrected_translations(
-            &store,
-            &job.id,
-            &double_check_run_config,
-            &translations,
-            &changed_segment_ids,
-        )?;
-        snapshot.finalize.double_check_complete = true;
-        store.update_job_config_snapshot(&job.id, &snapshot)?;
-        if job_was_stopped(&store, &job.id)? {
-            print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
-            return Ok(());
-        }
-    }
-    loop {
-        if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
-            print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
-            return Ok(());
-        }
-        if mark_job_finished(&store, &job.id, &translations)? {
-            break;
-        }
-        if job_was_stopped(&store, &job.id)? {
-            print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
-            return Ok(());
-        }
-    }
-    let validation_runtime = job_runtime_settings.borrow().clone();
-    print_summary_rebuild_and_report(
-        &store,
-        &job,
-        &book,
-        &segments,
-        &translations,
-        &qa_reviews,
-        config,
-        &rebuild_options,
-        validation_runtime.validate_output,
-        cli_args.strict_epubcheck,
-        human_stdout_enabled(cli_args.ui),
-    )?;
-    let summary = store
-        .summary(&job.id)?
-        .ok_or_else(|| anyhow::anyhow!("job '{}' summary unavailable", job.id))?;
-    reconfigure::clear_overrides_for_job(&job.id)?;
-    progress.emit(bookforge_core::ProgressEvent::ArtifactWritten {
-        path: config.output.display().to_string(),
-        timestamp_ms: bookforge_core::progress::now_ms(),
-    });
-    progress.emit(bookforge_core::ProgressEvent::TranslationFinished {
-        succeeded: summary.succeeded,
-        cached: summary.cached,
-        needs_review: summary.needs_review,
-        failed: summary.failed,
-        input_tokens: summary.input_tokens,
-        output_tokens: summary.output_tokens,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-        timestamp_ms: bookforge_core::progress::now_ms(),
-    });
-
-    Ok(())
+    .await
 }
 
 async fn run_openai_compatible_translation(
@@ -480,7 +192,30 @@ async fn run_openai_compatible_translation(
     cancel_token: &tokio_util::sync::CancellationToken,
     progress: Arc<dyn bookforge_core::ProgressSink>,
 ) -> Result<()> {
-    let started = std::time::Instant::now();
+    run_openai_compatible_translation_with_store(
+        input,
+        config,
+        provider_args,
+        cli_args,
+        settings,
+        cancel_token,
+        progress,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_openai_compatible_translation_with_store(
+    input: &PathBuf,
+    config: &TranslationConfig,
+    provider_args: &CliProviderArgs,
+    cli_args: &TranslateArgs,
+    settings: &ResolvedRunSettings,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
+    store: Option<JobStore>,
+) -> Result<()> {
     let mut provider_config = provider_config(
         &config.provider,
         config.model.as_deref(),
@@ -524,6 +259,62 @@ async fn run_openai_compatible_translation(
         timestamp_ms: bookforge_core::progress::now_ms(),
     });
 
+    run_translation_with_store(
+        input,
+        config,
+        provider_args,
+        cli_args,
+        settings,
+        ProviderRun {
+            provider,
+            model,
+            prompt_version: if settings.batch.enabled {
+                PromptVersion::BatchV3.as_str()
+            } else {
+                PromptVersion::V2.as_str()
+            },
+            base_url: Some(provider_config.base_url),
+            api_key_env: Some(provider_config.api_key_env),
+            model_context_tokens: settings.provider.model_context_tokens,
+            max_output_tokens: settings.provider.max_output_tokens,
+            batch_max_output_tokens: settings.provider.batch_max_output_tokens,
+            compact_prompts: settings.compact_prompts,
+            cancel_token: cancel_token.clone(),
+        },
+        progress,
+        store,
+    )
+    .await
+}
+
+struct ProviderRun<P> {
+    provider: P,
+    model: String,
+    prompt_version: &'static str,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
+    model_context_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+    batch_max_output_tokens: Option<u32>,
+    compact_prompts: bool,
+    cancel_token: tokio_util::sync::CancellationToken,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_translation_with_store<P>(
+    input: &PathBuf,
+    config: &TranslationConfig,
+    provider_args: &CliProviderArgs,
+    cli_args: &TranslateArgs,
+    settings: &ResolvedRunSettings,
+    provider_run: ProviderRun<P>,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
+    store: Option<JobStore>,
+) -> Result<()>
+where
+    P: LlmProvider + Clone,
+{
+    let started = std::time::Instant::now();
     progress.emit(bookforge_core::ProgressEvent::StageStarted {
         stage: "read_epub".to_string(),
         timestamp_ms: bookforge_core::progress::now_ms(),
@@ -543,12 +334,10 @@ async fn run_openai_compatible_translation(
         segment_count: segments.len(),
         timestamp_ms: bookforge_core::progress::now_ms(),
     });
-    let run_prompt_version = if settings.batch.enabled {
-        PromptVersion::BatchV3.as_str()
-    } else {
-        PromptVersion::V2.as_str()
+    let store = match store {
+        Some(store) => store,
+        None => JobStore::open_default()?,
     };
-    let store = JobStore::open_default()?;
     let glossary = prepare_glossary_run_config(
         &store,
         &cli_args.glossary,
@@ -561,6 +350,12 @@ async fn run_openai_compatible_translation(
         cli_args.prompt_extra.clone(),
         &segments,
     )?;
+    let glossary_rules = select_glossary_for_segments(
+        &segments,
+        &glossary.active_terms,
+        cli_args.glossary_budget_tokens,
+    )
+    .rules_by_segment;
     let context_run_config = context_run_config_from_args(cli_args);
     let context_registry: Option<Arc<ContextRegistry>> = if context_run_config.enabled() {
         Some(Arc::new(ContextRegistry::new(&segments)))
@@ -588,9 +383,9 @@ async fn run_openai_compatible_translation(
         source_lang: config.source_language.as_deref(),
         target_lang: &config.target_language,
         provider: &config.provider,
-        model: &model,
-        base_url: Some(&provider_config.base_url),
-        api_key_env: Some(&provider_config.api_key_env),
+        model: &provider_run.model,
+        base_url: provider_run.base_url.as_deref(),
+        api_key_env: provider_run.api_key_env.as_deref(),
         book_id: cli_args.book_id.as_deref(),
         series_id: cli_args.series_id.as_deref(),
     })?;
@@ -609,7 +404,7 @@ async fn run_openai_compatible_translation(
         settings.segmentation.context_tokens,
         settings.profile.namespace_str(),
         settings.batch.enabled,
-        run_prompt_version,
+        provider_run.prompt_version,
         &glossary.fingerprint,
         if style.run_config.is_some() {
             &style.fingerprint
@@ -630,7 +425,7 @@ async fn run_openai_compatible_translation(
         provider_args,
         cli_args,
         settings,
-        run_prompt_version,
+        provider_run.prompt_version,
         &cache_namespace,
         &glossary.fingerprint,
         &glossary.active_terms,
@@ -638,17 +433,17 @@ async fn run_openai_compatible_translation(
         &style.rendered_block,
         &entities.fingerprint,
         &entities.rendered_block,
-        &model,
-        Some(provider_config.base_url.clone()),
-        Some(provider_config.api_key_env.clone()),
+        &provider_run.model,
+        provider_run.base_url.clone(),
+        provider_run.api_key_env.clone(),
     )?;
     let rebuild_options = rebuild_options_from_snapshot(&snapshot);
     store.insert_segments(
         &job.id,
         &segments,
-        run_prompt_version,
+        provider_run.prompt_version,
         &config.provider,
-        &model,
+        &provider_run.model,
         &cache_namespace,
     )?;
     let pause_signal = bookforge_llm::PauseSignal::new();
@@ -657,7 +452,7 @@ async fn run_openai_compatible_translation(
         job.id.clone(),
         progress.clone(),
         pause_signal.clone(),
-        cancel_token.clone(),
+        provider_run.cancel_token.clone(),
         crate::control::ControlBaseline {
             settings: settings.clone(),
             qa: cli_args.qa,
@@ -669,15 +464,15 @@ async fn run_openai_compatible_translation(
         source_language: config.source_language.clone(),
         target_language: config.target_language.clone(),
         provider: config.provider.clone(),
-        model: model.clone(),
-        prompt_version: run_prompt_version.to_string(),
+        model: provider_run.model.clone(),
+        prompt_version: provider_run.prompt_version.to_string(),
         temperature: 0.2,
         scheduler: settings.scheduler.clone(),
         profile: settings.profile,
-        model_context_tokens: settings.provider.model_context_tokens,
-        max_output_tokens: settings.provider.max_output_tokens,
-        batch_max_output_tokens: settings.provider.batch_max_output_tokens,
-        compact_prompts: settings.compact_prompts,
+        model_context_tokens: provider_run.model_context_tokens,
+        max_output_tokens: provider_run.max_output_tokens,
+        batch_max_output_tokens: provider_run.batch_max_output_tokens,
+        compact_prompts: provider_run.compact_prompts,
         glossary: glossary.run_config.clone(),
         context: context_run_config,
         context_registry: context_registry.clone(),
@@ -691,25 +486,24 @@ async fn run_openai_compatible_translation(
         CacheContext {
             store: &store,
             job_id: &job.id,
-            prompt_version: run_prompt_version,
+            prompt_version: provider_run.prompt_version,
             provider: &config.provider,
-            model: &model,
+            model: &provider_run.model,
             source_lang: config.source_language.as_deref(),
             target_lang: &config.target_language,
             cache_namespace: &cache_namespace,
         },
     )?;
-    let hits = translations.len();
-    let pending_count = segments.len().saturating_sub(hits);
+    let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
     progress.emit(bookforge_core::ProgressEvent::CacheScanFinished {
-        hits,
-        misses: pending_count,
+        hits: translations.len(),
+        misses: pending_segments.len(),
         timestamp_ms: bookforge_core::progress::now_ms(),
     });
-    let pending_segments = pending_segments_for_job(&store, &job.id, &segments)?;
     prepopulate_context_registry(context_registry.as_ref(), &segments, &translations);
-    let fresh_translations = run_checkpointed_translation(
-        provider.clone(),
+    let telemetry = Arc::new(TelemetryLog::new());
+    let fresh_translations = run_checkpointed_translation_instrumented(
+        provider_run.provider.clone(),
         &pending_segments,
         &run_config,
         settings,
@@ -717,11 +511,14 @@ async fn run_openai_compatible_translation(
             store: &store,
             job_id: &job.id,
             provider: &config.provider,
-            model: &model,
-            prompt_version: run_prompt_version,
+            model: &provider_run.model,
+            prompt_version: provider_run.prompt_version,
         },
         progress.clone(),
         settings.batch.enabled,
+        telemetry.clone(),
+        &glossary_rules,
+        human_stdout_enabled(cli_args.ui),
     )
     .await?;
     if job_was_stopped(&store, &job.id)? {
@@ -731,14 +528,14 @@ async fn run_openai_compatible_translation(
     translations.extend(fresh_translations);
 
     finish_translation_pipeline(
-        &provider,
-        cancel_token,
+        &provider_run.provider,
+        &provider_run.cancel_token,
         cli_args,
         &segments,
         &mut translations,
         &store,
         &job,
-        run_prompt_version,
+        provider_run.prompt_version,
         settings,
         &run_config,
         config,
@@ -748,10 +545,20 @@ async fn run_openai_compatible_translation(
         started,
         &mut snapshot,
         &job_runtime_settings,
+        telemetry.as_ref(),
+        &glossary_rules,
     )
     .await?;
 
-    if cancel_token.is_cancelled() && !job_was_stopped(&store, &job.id)? {
+    if telemetry.has_glossary_entries() {
+        let summary = telemetry.glossary_summary();
+        tracing::info!(target: "bookforge::telemetry", "{summary}");
+        if human_stdout_enabled(cli_args.ui) {
+            eprintln!("{summary}");
+        }
+    }
+
+    if provider_run.cancel_token.is_cancelled() && !job_was_stopped(&store, &job.id)? {
         let _ = store.mark_job_interrupted(&job.id);
         eprintln!();
         eprintln!("Interrupted by user.");

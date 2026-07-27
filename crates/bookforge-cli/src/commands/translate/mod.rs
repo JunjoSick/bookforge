@@ -60,15 +60,14 @@ pub use args::TranslateArgs;
 pub(crate) use cache::{CacheContext, apply_cached_translations, pending_segments_for_job};
 use checkpointing::finalize_writer;
 pub(crate) use engine::{CheckpointRunContext, run_checkpointed_translation};
+use engine::{record_glossary_telemetry, run_checkpointed_translation_instrumented};
 #[cfg(test)]
 use finalization::suspicious_qa_candidates;
 pub(crate) use finalization::{
     apply_double_check_corrections, job_was_stopped, mark_job_finished,
     persist_corrected_translations, print_stopped_resume_hint, qa_reviews_for_mode,
 };
-use finalization::{
-    finish_translation_pipeline, mark_unfinished_segments_failed, wait_for_finalize_stage_control,
-};
+use finalization::{finish_translation_pipeline, mark_unfinished_segments_failed};
 use orchestration::human_stdout_enabled;
 pub use orchestration::run;
 use reporting::print_summary_rebuild_and_report;
@@ -554,6 +553,7 @@ fn provider_config(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn translate_and_checkpoint_batch<P>(
     provider: P,
     segments: &[Segment],
@@ -562,6 +562,8 @@ pub(crate) async fn translate_and_checkpoint_batch<P>(
     checkpoint: CheckpointContext<'_>,
     progress: Arc<dyn bookforge_core::ProgressSink>,
     mut control: Option<&mut crate::control::ControlFilePoller<'_>>,
+    telemetry: Arc<TelemetryLog>,
+    print_human_output: bool,
 ) -> Result<Vec<SegmentTranslation>>
 where
     P: LlmProvider,
@@ -574,10 +576,9 @@ where
         return translate_and_checkpoint(provider, segments, config, checkpoint, control).await;
     }
 
-    eprintln!("Batches: {}", batches.len());
-
-    use std::sync::Arc;
-    let telemetry = Arc::new(TelemetryLog::new());
+    if print_human_output {
+        eprintln!("Batches: {}", batches.len());
+    }
 
     // Keep the adaptive controller alive even while disabled so a live
     // revision can enable it at the next request boundary without rebuilding
@@ -754,6 +755,40 @@ pub(crate) async fn run_fallback_pass(
     cancel_token: &tokio_util::sync::CancellationToken,
     fallback_config: Option<&FallbackPassConfig>,
     segments: &[Segment],
+    translations: Vec<SegmentTranslation>,
+    store: &JobStore,
+    job_id: &str,
+    prompt_version: &str,
+    settings: &ResolvedRunSettings,
+    primary_run_config: &TranslationRunConfig,
+    control: Option<&mut crate::control::ControlFilePoller<'_>>,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
+) -> Result<Vec<SegmentTranslation>> {
+    let telemetry = TelemetryLog::new();
+    let glossary_rules = std::collections::HashMap::new();
+    run_fallback_pass_instrumented(
+        cancel_token,
+        fallback_config,
+        segments,
+        translations,
+        store,
+        job_id,
+        prompt_version,
+        settings,
+        primary_run_config,
+        control,
+        progress,
+        &telemetry,
+        &glossary_rules,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_fallback_pass_instrumented(
+    cancel_token: &tokio_util::sync::CancellationToken,
+    fallback_config: Option<&FallbackPassConfig>,
+    segments: &[Segment],
     mut translations: Vec<SegmentTranslation>,
     store: &JobStore,
     job_id: &str,
@@ -762,6 +797,11 @@ pub(crate) async fn run_fallback_pass(
     primary_run_config: &TranslationRunConfig,
     control: Option<&mut crate::control::ControlFilePoller<'_>>,
     progress: Arc<dyn bookforge_core::ProgressSink>,
+    telemetry: &TelemetryLog,
+    glossary_rules: &std::collections::HashMap<
+        String,
+        Vec<bookforge_core::glossary::GlossarySelectionRule>,
+    >,
 ) -> Result<Vec<SegmentTranslation>> {
     let Some(fallback_config) = fallback_config else {
         return Ok(translations);
@@ -823,6 +863,8 @@ pub(crate) async fn run_fallback_pass(
         provider: provider_str.to_string(),
         model: model_str.to_string(),
         prompt_version: prompt_version.to_string(),
+        // Recovery favors reproducibility and low provider pressure: mirror
+        // the primary pass temperature, but dispatch one segment at a time.
         temperature: 0.2,
         scheduler: SchedulerConfig {
             concurrency: 1,
@@ -894,6 +936,7 @@ pub(crate) async fn run_fallback_pass(
         provider => anyhow::bail!("unsupported fallback provider '{provider}'"),
     };
     let fresh = finalize_writer(translation_result, sender, writer).await?;
+    record_glossary_telemetry(telemetry, &run_config.glossary, glossary_rules, &fresh);
 
     for ft in &fresh {
         if let Some(existing) = translations
