@@ -88,6 +88,7 @@ local browser-based translation runs:
 | Generate audiobooks | [Audiobooks](docs/audiobooks.md) |
 | Understand EPUB parsing and rebuilding | [EPUB pipeline](docs/EPUB_PIPELINE.md) |
 | Understand the system design and crate boundaries | [Architecture](docs/ARCHITECTURE.md) |
+| Measure whether a validator flag is real | [Validator tooling](docs/validator-tooling.md) |
 | Contribute code or documentation | [Contributing](CONTRIBUTING.md) |
 
 ## Install And Setup

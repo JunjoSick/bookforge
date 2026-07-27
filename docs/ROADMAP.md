@@ -10,7 +10,8 @@ the milestones below.
 > audiobook narration hierarchy, chaptered `.m4b` output by default,
 > ElevenLabs consistency controls, cost/quota estimates, WebUI parity, and OCR
 > endpoint foundations. v2.6.1 was prepared and merged to `main` on 2026-07-21
-> with security-audit remediation and two ElevenLabs fixes; its tag is pending.
+> with security-audit remediation and two ElevenLabs fixes, and was tagged and
+> released on 2026-07-22.
 > This document is kept for architectural invariants, shipped-milestone
 > context, and deferred follow-up work. For current user behavior, start
 > with `README.md`, `CHANGELOG.md`, and `docs/v2-web-dashboard-plan.md`;
