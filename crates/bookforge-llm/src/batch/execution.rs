@@ -17,6 +17,8 @@ struct BatchWorkerOutput {
     batch: TranslationBatch,
     result: BatchWorkerResult,
     request_status: RequestStatus,
+    finish_reason: Option<FinishReason>,
+    returned_items: Option<usize>,
     latency_ms: u64,
     max_output_tokens: u32,
     output_escalated: bool,
@@ -27,8 +29,16 @@ struct BatchWorkerOutput {
 struct RepairWorkerOutput {
     batch: TranslationBatch,
     result: Result<BatchTranslationResult, LlmError>,
+    finish_reason: Option<FinishReason>,
+    returned_items: Option<usize>,
     latency_ms: u64,
     max_output_tokens: u32,
+}
+
+struct BatchRequestOutput {
+    result: Result<BatchTranslationResult, LlmError>,
+    finish_reason: Option<FinishReason>,
+    returned_items: Option<usize>,
 }
 
 struct InFlightRequestGuard(Arc<AtomicUsize>);
@@ -355,6 +365,8 @@ where
                             batch,
                             result: BatchWorkerResult::StoppedUnfinished,
                             request_status: RequestStatus::OtherError,
+                            finish_reason: None,
+                            returned_items: None,
                             latency_ms: 0,
                             max_output_tokens: 0,
                             output_escalated,
@@ -376,6 +388,8 @@ where
                                 batch,
                                 result: BatchWorkerResult::StoppedUnfinished,
                                 request_status: RequestStatus::OtherError,
+                                finish_reason: None,
+                                returned_items: None,
                                 latency_ms: 0,
                                 max_output_tokens: 0,
                                 output_escalated,
@@ -395,6 +409,8 @@ where
                                         "batch request semaphore closed".to_string(),
                                     ))),
                                     request_status: RequestStatus::OtherError,
+                                    finish_reason: None,
+                                    returned_items: None,
                                     latency_ms: 0,
                                     max_output_tokens: 0,
                                     output_escalated,
@@ -421,6 +437,8 @@ where
                                         "adaptive concurrency limiter closed".to_string(),
                                     ))),
                                     request_status: RequestStatus::OtherError,
+                                    finish_reason: None,
+                                    returned_items: None,
                                     latency_ms: 0,
                                     max_output_tokens: 0,
                                     output_escalated,
@@ -484,7 +502,7 @@ where
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
 
-                    let result = translate_one_batch(
+                    let attempt = translate_one_batch_with_evidence(
                         provider.clone(),
                         library.clone(),
                         batch.clone(),
@@ -500,13 +518,15 @@ where
                     .await;
                     let latency_ms = started.elapsed().as_millis() as u64;
 
-                    let request_status = request_status_for_controller(&result);
+                    let request_status = request_status_for_controller(&attempt.result);
 
                     drop(permit);
                     BatchWorkerOutput {
                         batch,
-                        result: BatchWorkerResult::Provider(result),
+                        result: BatchWorkerResult::Provider(attempt.result),
                         request_status,
+                        finish_reason: attempt.finish_reason,
+                        returned_items: attempt.returned_items,
                         latency_ms,
                         max_output_tokens,
                         output_escalated,
@@ -551,6 +571,8 @@ where
                 batch,
                 result,
                 request_status,
+                finish_reason,
+                returned_items,
                 latency_ms,
                 max_output_tokens,
                 output_escalated,
@@ -579,18 +601,19 @@ where
                     continue;
                 }
             };
+            let recorded_status =
+                batch_request_metric_status(&result, batch.items.len(), returned_items);
+            let recorded_finish_reason =
+                finish_reason.map(|reason| finish_reason_label(reason).to_string());
 
             progress.emit(bookforge_core::ProgressEvent::RequestFinished {
                 request_id: format!("batch_{}", batch.id),
                 batch_id: Some(batch.id.clone()),
                 segment_id: None,
-                status: result
-                    .as_ref()
-                    .map_or_else(|e| request_status_from_error(e), |_| "ok")
-                    .to_string(),
+                status: recorded_status.clone(),
                 latency_ms,
                 status_code: None,
-                finish_reason: None,
+                finish_reason: recorded_finish_reason.clone(),
                 retry_count: 0,
                 input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
                 output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
@@ -610,12 +633,8 @@ where
                 input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
                 output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
                 latency_ms,
-                finish_reason: None,
-                status: if result.is_ok() {
-                    "ok".into()
-                } else {
-                    "error".into()
-                },
+                finish_reason: recorded_finish_reason,
+                status: recorded_status,
                 status_code: None,
                 retry_count: 0,
                 backoff_ms: 0,
@@ -806,8 +825,12 @@ where
                     );
                     pending_queue.push_back(batch);
                 }
-                Err(LlmError::InvalidResponse(_)) if batch.kind == BatchKind::Repair => {
-                    truncation_alert.observe_resolved();
+                Err(error @ LlmError::InvalidResponse(_)) if batch.kind == BatchKind::Repair => {
+                    if !is_incomplete_response_error(&error)
+                        && request_status != RequestStatus::Truncated
+                    {
+                        truncation_alert.observe_resolved();
+                    }
                     progress.emit(bookforge_core::ProgressEvent::Warning {
                         kind: "repair_batch_invalid_response".to_string(),
                         message: format!(
@@ -890,7 +913,9 @@ where
                     });
                 }
                 Err(error @ LlmError::InvalidResponse(_)) if batch.items.len() == 1 => {
-                    truncation_alert.observe_resolved();
+                    if !is_incomplete_response_error(&error) {
+                        truncation_alert.observe_resolved();
+                    }
                     let attempts =
                         increment_batch_item_attempts(&mut single_invalid_attempts_by_item, &batch);
                     let compact_retry_limit =
@@ -958,7 +983,8 @@ where
                         });
                     }
                 }
-                Err(LlmError::InvalidResponse(_)) if batch.items.len() > 1 => {
+                Err(error @ LlmError::InvalidResponse(_)) if batch.items.len() > 1 => {
+                    let incomplete = is_incomplete_response_error(&error);
                     if let Some(sizer) =
                         adaptive_sizer_mut(&mut runtime_sizer, batch_sizer.as_deref_mut())
                     {
@@ -970,7 +996,7 @@ where
                     }
                     if request_status == RequestStatus::Truncated {
                         truncation_alert.observe_unresolved(&progress);
-                    } else {
+                    } else if !incomplete {
                         truncation_alert.observe_resolved();
                     }
                     let split = split_batch_with_config(&batch, Some(config.as_ref()));
@@ -985,6 +1011,8 @@ where
                     progress.emit(bookforge_core::ProgressEvent::Warning {
                         kind: if request_status == RequestStatus::Truncated {
                             "batch_truncated_split"
+                        } else if incomplete {
+                            "batch_incomplete_response_split"
                         } else {
                             "batch_invalid_response_split"
                         }
@@ -994,6 +1022,8 @@ where
                             batch.id,
                             if request_status == RequestStatus::Truncated {
                                 "truncated output"
+                            } else if incomplete {
+                                "incomplete output"
                             } else {
                                 "invalid response"
                             }
@@ -1270,6 +1300,7 @@ where
             .collect();
 
         let mut repaired_count = 0usize;
+        let mut repair_attempts_by_batch: HashMap<String, usize> = HashMap::new();
         let mut repair_tasks = JoinSet::<RepairWorkerOutput>::new();
 
         while !repair_batches.is_empty() || !repair_tasks.is_empty() {
@@ -1421,6 +1452,8 @@ where
                         &library.batch_repair
                     };
 
+                    let mut finish_reason = None;
+                    let mut returned_items = None;
                     let result = match repair_template.render(&vars) {
                         Ok(rendered) => {
                             match provider
@@ -1449,20 +1482,32 @@ where
                                 .await
                             {
                                 Ok(response) => {
-                                    match parse_batch_response_with_validation(
-                                        &repair_batch,
-                                        &response.content,
-                                        validate_source_copy,
-                                        Some(&section_titles),
-                                        (!config.provider.eq_ignore_ascii_case("mock"))
-                                            .then_some(config.target_language.as_str()),
-                                    ) {
-                                        Ok(mut repaired) => {
-                                            repaired.input_tokens = response.input_tokens;
-                                            repaired.output_tokens = response.output_tokens;
-                                            Ok(repaired)
+                                    finish_reason = Some(response.finish_reason);
+                                    returned_items =
+                                        batch_response_item_count(&repair_batch, &response.content);
+                                    if response.finish_reason == FinishReason::Length {
+                                        Err(LlmError::InvalidResponse(
+                                            "repair batch output was truncated: max_output_tokens limit reached"
+                                                .to_string(),
+                                        ))
+                                    } else {
+                                        match parse_batch_response_with_validation(
+                                            &repair_batch,
+                                            &response.content,
+                                            validate_source_copy,
+                                            Some(&section_titles),
+                                            (!config.provider.eq_ignore_ascii_case("mock"))
+                                                .then_some(config.target_language.as_str()),
+                                        ) {
+                                            Ok(mut repaired) => {
+                                                repaired.input_tokens = response.input_tokens;
+                                                repaired.input_cached_tokens =
+                                                    response.input_cached_tokens;
+                                                repaired.output_tokens = response.output_tokens;
+                                                Ok(repaired)
+                                            }
+                                            Err(error) => Err(LlmError::InvalidResponse(error)),
                                         }
-                                        Err(error) => Err(LlmError::InvalidResponse(error)),
                                     }
                                 }
                                 Err(error) => Err(error),
@@ -1476,6 +1521,8 @@ where
                     RepairWorkerOutput {
                         batch: repair_batch,
                         result,
+                        finish_reason,
+                        returned_items,
                         latency_ms: started.elapsed().as_millis() as u64,
                         max_output_tokens,
                     }
@@ -1488,23 +1535,31 @@ where
             let RepairWorkerOutput {
                 batch,
                 result,
+                finish_reason,
+                returned_items,
                 latency_ms,
                 max_output_tokens,
             } = joined
                 .map_err(|err| LlmError::Provider(format!("repair worker task failed: {err}")))?;
 
+            let recorded_status =
+                batch_request_metric_status(&result, batch.items.len(), returned_items);
+            let recorded_finish_reason =
+                finish_reason.map(|reason| finish_reason_label(reason).to_string());
+            let repair_retry_count = repair_attempts_by_batch
+                .get(&batch.id)
+                .copied()
+                .unwrap_or(0);
+
             progress.emit(bookforge_core::ProgressEvent::RequestFinished {
                 request_id: format!("batch_{}", batch.id),
                 batch_id: Some(batch.id.clone()),
                 segment_id: None,
-                status: result
-                    .as_ref()
-                    .map_or_else(|e| request_status_from_error(e), |_| "ok")
-                    .to_string(),
+                status: recorded_status.clone(),
                 latency_ms,
                 status_code: None,
-                finish_reason: None,
-                retry_count: 0,
+                finish_reason: recorded_finish_reason.clone(),
+                retry_count: repair_retry_count,
                 input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
                 output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
                 error_kind: result.as_ref().err().map(|e| format!("{e:?}")),
@@ -1523,20 +1578,27 @@ where
                 input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
                 output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
                 latency_ms,
-                finish_reason: None,
-                status: if result.is_ok() {
-                    "ok".into()
-                } else {
-                    "error".into()
-                },
+                finish_reason: recorded_finish_reason,
+                status: recorded_status,
                 status_code: None,
-                retry_count: 0,
+                retry_count: repair_retry_count,
                 backoff_ms: 0,
                 error_kind: None,
             });
 
             match result {
                 Ok(repaired) => {
+                    if !repaired.failures.is_empty() {
+                        progress.emit(bookforge_core::ProgressEvent::Warning {
+                            kind: "repair_batch_item_failures".to_string(),
+                            message: format!(
+                                "repair batch {} returned {} present-but-invalid items; keeping them NeedsReview",
+                                batch.id,
+                                repaired.failures.len()
+                            ),
+                            timestamp_ms: bookforge_core::progress::now_ms(),
+                        });
+                    }
                     for translation in repaired.translations {
                         let Some(source_item) = all_items.get(&translation.item_id) else {
                             continue;
@@ -1593,6 +1655,19 @@ where
                                 .insert(completed.segment_id.0.clone());
                         }
                     }
+                }
+                Err(error @ LlmError::InvalidResponse(_)) if repair_retry_count < 1 => {
+                    repair_attempts_by_batch.insert(batch.id.clone(), repair_retry_count + 1);
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "repair_batch_invalid_response_retry".to_string(),
+                        message: format!(
+                            "repair batch {} returned an invalid or incomplete response; retrying once for {} items: {error}",
+                            batch.id,
+                            batch.items.len()
+                        ),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    repair_batches.push_back(batch);
                 }
                 Err(error) => {
                     progress.emit(bookforge_core::ProgressEvent::Warning {
@@ -1685,12 +1760,24 @@ pub(super) struct BatchTranslationRequest<'a> {
     pub compact_retry_attempt: usize,
 }
 
+#[cfg(test)]
 pub(super) async fn translate_one_batch(
     provider: Arc<impl LlmProvider>,
     library: Arc<PromptLibrary>,
     batch: TranslationBatch,
     request: BatchTranslationRequest<'_>,
 ) -> Result<BatchTranslationResult, LlmError> {
+    translate_one_batch_with_evidence(provider, library, batch, request)
+        .await
+        .result
+}
+
+async fn translate_one_batch_with_evidence(
+    provider: Arc<impl LlmProvider>,
+    library: Arc<PromptLibrary>,
+    batch: TranslationBatch,
+    request: BatchTranslationRequest<'_>,
+) -> BatchRequestOutput {
     let BatchTranslationRequest {
         config,
         max_output_tokens_override,
@@ -1747,9 +1834,16 @@ pub(super) async fn translate_one_batch(
     )
     .raw("items_json", items_json);
 
-    let mut rendered = template
-        .render(&vars)
-        .map_err(|e| LlmError::Provider(e.to_string()))?;
+    let mut rendered = match template.render(&vars) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            return BatchRequestOutput {
+                result: Err(LlmError::Provider(error.to_string())),
+                finish_reason: None,
+                returned_items: None,
+            };
+        }
+    };
     if compact_retry_attempt > 0 {
         rendered.user.push_str(&format!(
             "\n\nRECOVERY MODE {compact_retry_attempt}: Return one compact JSON object only. Translate every item exactly once. Do not repeat any word, sentence, item, or explanation. End immediately after the closing brace."
@@ -1788,13 +1882,19 @@ pub(super) async fn translate_one_batch(
 
     match response {
         Ok(resp) => {
+            let finish_reason = Some(resp.finish_reason);
+            let returned_items = batch_response_item_count(&batch, &resp.content);
             if resp.finish_reason == FinishReason::Length {
-                return Err(LlmError::InvalidResponse(
-                    "batch output was truncated: max_output_tokens limit reached".to_string(),
-                ));
+                return BatchRequestOutput {
+                    result: Err(LlmError::InvalidResponse(
+                        "batch output was truncated: max_output_tokens limit reached".to_string(),
+                    )),
+                    finish_reason,
+                    returned_items,
+                };
             }
 
-            let mut result = parse_batch_response_with_validation(
+            let result = parse_batch_response_with_validation(
                 &batch,
                 &resp.content,
                 validate_source_copy,
@@ -1802,14 +1902,25 @@ pub(super) async fn translate_one_batch(
                 (!config.provider.eq_ignore_ascii_case("mock"))
                     .then_some(config.target_language.as_str()),
             )
-            .map_err(LlmError::InvalidResponse)?;
-            result.input_tokens = resp.input_tokens;
-            result.input_cached_tokens = resp.input_cached_tokens;
-            result.output_tokens = resp.output_tokens;
-            apportion_batch_usage(&batch, &mut result);
-            Ok(result)
+            .map_err(LlmError::InvalidResponse)
+            .map(|mut result| {
+                result.input_tokens = resp.input_tokens;
+                result.input_cached_tokens = resp.input_cached_tokens;
+                result.output_tokens = resp.output_tokens;
+                apportion_batch_usage(&batch, &mut result);
+                result
+            });
+            BatchRequestOutput {
+                result,
+                finish_reason,
+                returned_items,
+            }
         }
-        Err(e) => Err(e),
+        Err(error) => BatchRequestOutput {
+            result: Err(error),
+            finish_reason: None,
+            returned_items: None,
+        },
     }
 }
 
@@ -2029,6 +2140,38 @@ fn request_status_from_error(error: &LlmError) -> &'static str {
         LlmError::InvalidResponse(_) => "invalid_response",
         LlmError::Json(_) => "json_error",
         _ => "error",
+    }
+}
+
+fn batch_request_metric_status<T>(
+    result: &Result<T, LlmError>,
+    requested_items: usize,
+    returned_items: Option<usize>,
+) -> String {
+    match result {
+        Ok(_) => "ok".to_string(),
+        Err(error) if is_incomplete_response_error(error) => returned_items.map_or_else(
+            || "incomplete".to_string(),
+            |returned| format!("incomplete:{returned}/{requested_items}"),
+        ),
+        Err(error) => request_status_from_error(error).to_string(),
+    }
+}
+
+fn is_incomplete_response_error(error: &LlmError) -> bool {
+    matches!(
+        error,
+        LlmError::InvalidResponse(message) if message.starts_with("batch response incomplete:")
+    )
+}
+
+fn finish_reason_label(reason: FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
+        FinishReason::ContentFilter => "content_filter",
+        FinishReason::ToolCalls => "tool_calls",
+        FinishReason::Unknown => "unknown",
     }
 }
 
