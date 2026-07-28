@@ -31,8 +31,11 @@ translation. Use these severity levels:
   would fix a minor imprecision; for example, a localized register mismatch
   makes one line noticeably too formal.
 
-Do not nitpick harmless style choices. When there is no actual issue, return a
-`pass` verdict with an empty `issues` array.
+Report only issues that meet the `medium` or `high` definitions. Do not report
+`low` issues; omit them from the `issues` array.
+
+Do not nitpick harmless style choices. When there is no reportable `medium` or
+`high` issue, return a `pass` verdict with an empty `issues` array.
 
 Return JSON only:
 {"reviews":[{"id":"...","verdict":"pass|warn|fail","issues":[{"severity":"low|medium|high","kind":"...","message":"...","source_excerpt":"...","translation_excerpt":"..."}]}]}
