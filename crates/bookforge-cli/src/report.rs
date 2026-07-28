@@ -6,9 +6,9 @@ use std::{
 
 use anyhow::Result;
 use bookforge_core::segment::{SEGMENT_UNIT_NAME, Segment};
-use bookforge_llm::QaSegmentReview;
+use bookforge_llm::{QaIssue, QaSegmentReview};
 use bookforge_store::{
-    JobRecord, JobSummary, SegmentRecord, aggregate_findings, classify_segment_error,
+    JobRecord, JobStore, JobSummary, SegmentRecord, aggregate_findings, classify_segment_error,
 };
 use serde::Serialize;
 
@@ -111,6 +111,56 @@ struct QaWarning {
     kind: &'static str,
     segment_id: Option<String>,
     message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CollapsedQaIssue {
+    pub segment_ids: Vec<String>,
+    pub severity: &'static str,
+    pub kind: String,
+    pub message: String,
+    pub source_excerpt: Option<String>,
+    pub translation_excerpts: Vec<(String, String)>,
+    pub occurrence_count: usize,
+}
+
+impl CollapsedQaIssue {
+    pub(crate) fn representative_segment_id(&self) -> &str {
+        self.segment_ids
+            .first()
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    }
+
+    pub(crate) fn stored_severity(&self) -> &'static str {
+        if self.severity == "high" {
+            "error"
+        } else {
+            "warning"
+        }
+    }
+
+    pub(crate) fn formatted_message(&self) -> String {
+        let mut message = format!("{} [{}]: {}", self.severity, self.kind, self.message);
+        if let Some(source_excerpt) = &self.source_excerpt {
+            message.push_str(&format!(" source={source_excerpt:?}"));
+        }
+        if !self.translation_excerpts.is_empty() {
+            let translations = self
+                .translation_excerpts
+                .iter()
+                .map(|(segment_id, excerpt)| format!("{segment_id}: {excerpt:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            message.push_str(&format!(" translations=[{translations}]"));
+        }
+        message.push_str(&format!(
+            " occurrences={} segments=[{}]",
+            self.occurrence_count,
+            self.segment_ids.join(", ")
+        ));
+        message
+    }
 }
 
 pub(crate) fn write_report(input: ReportInput<'_>) -> Result<ReportFiles> {
@@ -327,8 +377,12 @@ fn qa_warnings(input: &ReportInput<'_>) -> Vec<QaWarning> {
         }
     }
 
-    for review in input.qa_reviews {
-        if review.verdict == "pass" && review.issues.is_empty() {
+    for review in input
+        .qa_reviews
+        .iter()
+        .filter(|review| review.issues.is_empty())
+    {
+        if review.verdict == "pass" {
             continue;
         }
         let severity = if review.verdict == "fail" {
@@ -336,41 +390,173 @@ fn qa_warnings(input: &ReportInput<'_>) -> Vec<QaWarning> {
         } else {
             "warning"
         };
-        if review.issues.is_empty() {
-            warnings.push(QaWarning {
-                severity,
-                kind: "qa_review",
-                segment_id: Some(review.segment_id.0.clone()),
-                message: format!("QA verdict: {}", review.verdict),
+        warnings.push(QaWarning {
+            severity,
+            kind: "qa_review",
+            segment_id: Some(review.segment_id.0.clone()),
+            message: format!("QA verdict: {}", review.verdict),
+        });
+    }
+
+    for issue in collapse_qa_issues(input.qa_reviews) {
+        warnings.push(QaWarning {
+            severity: issue.stored_severity(),
+            kind: "qa_review",
+            segment_id: Some(issue.representative_segment_id().to_string()),
+            message: issue.formatted_message(),
+        });
+    }
+
+    warnings
+}
+
+pub(crate) fn collapse_qa_issues(reviews: &[QaSegmentReview]) -> Vec<CollapsedQaIssue> {
+    let mut collapsed = Vec::<CollapsedQaIssue>::new();
+    let mut merge_targets = std::collections::HashMap::<(String, String), usize>::new();
+
+    for review in reviews {
+        for issue in &review.issues {
+            let kind = normalize_issue_kind(&issue.kind);
+            let normalized_source = issue
+                .source_excerpt
+                .as_deref()
+                .map(normalize_source_excerpt)
+                .filter(|excerpt| !excerpt.is_empty());
+            let merge_target = normalized_source
+                .as_ref()
+                .and_then(|source| merge_targets.get(&(kind.clone(), source.clone())).copied());
+
+            if let Some(index) = merge_target {
+                merge_collapsed_issue(&mut collapsed[index], review, issue);
+                continue;
+            }
+
+            let index = collapsed.len();
+            let source_excerpt = issue
+                .source_excerpt
+                .as_deref()
+                .map(str::trim)
+                .filter(|excerpt| !excerpt.is_empty())
+                .map(ToString::to_string);
+            let mut translation_excerpts = Vec::new();
+            if let Some(excerpt) = nonempty_excerpt(issue.translation_excerpt.as_deref()) {
+                translation_excerpts.push((review.segment_id.0.clone(), excerpt.to_string()));
+            }
+            collapsed.push(CollapsedQaIssue {
+                segment_ids: vec![review.segment_id.0.clone()],
+                severity: normalize_issue_severity(&issue.severity),
+                kind: kind.clone(),
+                message: issue.message.clone(),
+                source_excerpt,
+                translation_excerpts,
+                occurrence_count: 1,
             });
-        } else {
-            for issue in &review.issues {
-                warnings.push(QaWarning {
-                    severity,
-                    kind: "qa_review",
-                    segment_id: Some(review.segment_id.0.clone()),
-                    message: format!(
-                        "{} [{}]: {}{}{}",
-                        issue.severity,
-                        issue.kind,
-                        issue.message,
-                        issue
-                            .source_excerpt
-                            .as_ref()
-                            .map(|text| format!(" source={text:?}"))
-                            .unwrap_or_default(),
-                        issue
-                            .translation_excerpt
-                            .as_ref()
-                            .map(|text| format!(" translation={text:?}"))
-                            .unwrap_or_default()
-                    ),
-                });
+            if let Some(source) = normalized_source {
+                merge_targets.insert((kind, source), index);
             }
         }
     }
 
-    warnings
+    collapsed
+}
+
+pub(crate) fn persist_qa_reviews_best_effort(
+    store: &JobStore,
+    job_id: &str,
+    reviews: &[QaSegmentReview],
+) {
+    let collapsed = collapse_qa_issues(reviews);
+    let messages = collapsed
+        .iter()
+        .map(CollapsedQaIssue::formatted_message)
+        .collect::<Vec<_>>();
+    let findings = collapsed
+        .iter()
+        .zip(&messages)
+        .map(|(issue, message)| {
+            (
+                issue.representative_segment_id(),
+                issue.kind.as_str(),
+                issue.severity,
+                message.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if let Err(error) = store.replace_llm_qa_findings(job_id, &findings) {
+        eprintln!("warning: could not persist LLM QA findings for job '{job_id}': {error}");
+    }
+}
+
+fn merge_collapsed_issue(
+    collapsed: &mut CollapsedQaIssue,
+    review: &QaSegmentReview,
+    issue: &QaIssue,
+) {
+    collapsed.occurrence_count += 1;
+    if !collapsed.segment_ids.contains(&review.segment_id.0) {
+        collapsed.segment_ids.push(review.segment_id.0.clone());
+    }
+    let severity = normalize_issue_severity(&issue.severity);
+    if issue_severity_rank(severity) > issue_severity_rank(collapsed.severity) {
+        collapsed.severity = severity;
+    }
+    if let Some(excerpt) = nonempty_excerpt(issue.translation_excerpt.as_deref()) {
+        let occurrence = (review.segment_id.0.clone(), excerpt.to_string());
+        if !collapsed.translation_excerpts.contains(&occurrence) {
+            collapsed.translation_excerpts.push(occurrence);
+        }
+    }
+}
+
+fn normalize_issue_kind(kind: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_separator = false;
+    for character in kind.trim().chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() {
+            normalized.push(character);
+            last_was_separator = false;
+        } else if !normalized.is_empty() && !last_was_separator {
+            normalized.push('_');
+            last_was_separator = true;
+        }
+    }
+    while normalized.ends_with('_') {
+        normalized.pop();
+    }
+    if normalized.is_empty() {
+        "other".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn normalize_source_excerpt(excerpt: &str) -> String {
+    excerpt
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn normalize_issue_severity(severity: &str) -> &'static str {
+    match severity.trim().to_ascii_lowercase().as_str() {
+        "high" => "high",
+        "low" => "low",
+        _ => "medium",
+    }
+}
+
+fn issue_severity_rank(severity: &str) -> u8 {
+    match severity {
+        "high" => 2,
+        "medium" => 1,
+        _ => 0,
+    }
+}
+
+fn nonempty_excerpt(excerpt: Option<&str>) -> Option<&str> {
+    excerpt.map(str::trim).filter(|excerpt| !excerpt.is_empty())
 }
 
 pub(crate) fn urls(text: &str) -> Vec<String> {
@@ -743,6 +929,28 @@ fn optional_u64(value: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static REPORT_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn qa_review(
+        segment_id: &str,
+        kind: &str,
+        source_excerpt: Option<&str>,
+        translation_excerpt: Option<&str>,
+    ) -> QaSegmentReview {
+        QaSegmentReview {
+            segment_id: bookforge_core::segment::SegmentId(segment_id.to_string()),
+            verdict: "warn".to_string(),
+            issues: vec![QaIssue {
+                severity: "medium".to_string(),
+                kind: kind.to_string(),
+                message: "The title is translated inconsistently".to_string(),
+                source_excerpt: source_excerpt.map(ToString::to_string),
+                translation_excerpt: translation_excerpt.map(ToString::to_string),
+            }],
+        }
+    }
 
     fn segment_record(id: &str, status: &str, error: Option<&str>) -> SegmentRecord {
         SegmentRecord {
@@ -816,6 +1024,145 @@ mod tests {
     #[test]
     fn finding_breakdown_is_empty_without_flagged_segments() {
         assert!(finding_breakdown(&[segment_record("seg_0", "succeeded", None)]).is_empty());
+    }
+
+    #[test]
+    fn qa_findings_collapse_by_kind_and_normalized_source_excerpt() {
+        let mut reviews = (0..9)
+            .map(|index| {
+                qa_review(
+                    &format!("seg_{index}"),
+                    "mistranslation",
+                    Some("  The   Cyberiad "),
+                    Some(if index % 2 == 0 {
+                        "Il Ciberiade"
+                    } else {
+                        "La Ciberiade"
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        reviews.push(qa_review(
+            "seg_other_1",
+            "mistranslation",
+            Some("cyberspace"),
+            Some("il ciberspazio"),
+        ));
+        reviews.push(qa_review(
+            "seg_other_2",
+            "mistranslation",
+            Some("cybernetics"),
+            Some("la cibernetica"),
+        ));
+
+        let collapsed = collapse_qa_issues(&reviews);
+
+        assert_eq!(collapsed.len(), 3);
+        assert_eq!(collapsed[0].occurrence_count, 9);
+        assert_eq!(collapsed[0].segment_ids.len(), 9);
+        assert_eq!(
+            collapsed[0].segment_ids,
+            (0..9)
+                .map(|index| format!("seg_{index}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(collapsed[1].occurrence_count, 1);
+        assert_eq!(collapsed[2].occurrence_count, 1);
+        let message = collapsed[0].formatted_message();
+        assert!(message.contains("occurrences=9"));
+        for index in 0..9 {
+            assert!(message.contains(&format!("seg_{index}")));
+        }
+    }
+
+    #[test]
+    fn qa_findings_without_source_excerpts_do_not_merge() {
+        let reviews = [
+            qa_review("seg_0", "mistranslation", None, Some("uno")),
+            qa_review("seg_1", "mistranslation", None, Some("due")),
+        ];
+
+        let collapsed = collapse_qa_issues(&reviews);
+
+        assert_eq!(collapsed.len(), 2);
+        assert!(collapsed.iter().all(|issue| issue.occurrence_count == 1));
+    }
+
+    #[test]
+    fn report_keeps_reviewed_segment_count_while_collapsing_qa_warnings() {
+        let reviews = (0..9)
+            .map(|index| {
+                qa_review(
+                    &format!("seg_{index}"),
+                    "mistranslation",
+                    Some("The Cyberiad"),
+                    Some("La Ciberiade"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let job = JobRecord {
+            id: "job_report_qa".to_string(),
+            input_path: PathBuf::from("source.epub"),
+            input_snapshot_path: None,
+            input_sha256: None,
+            output_path: PathBuf::from("target.epub"),
+            input_hash: "hash".to_string(),
+            source_lang: Some("English".to_string()),
+            target_lang: "Italian".to_string(),
+            provider: "mock".to_string(),
+            model: "mock".to_string(),
+            base_url: None,
+            api_key_env: None,
+            status: "succeeded".to_string(),
+            events_path: None,
+            report_json_path: None,
+            report_markdown_path: None,
+            book_id: None,
+            series_id: None,
+        };
+        let summary = JobSummary {
+            id: job.id.clone(),
+            status: job.status.clone(),
+            total_segments: 9,
+            succeeded: 9,
+            ..JobSummary::default()
+        };
+        let output = std::env::temp_dir().join(format!(
+            "bookforge-qa-report-{}-{}.epub",
+            std::process::id(),
+            REPORT_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let files = write_report(ReportInput {
+            job: &job,
+            summary: &summary,
+            segments: &[],
+            segment_records: &[],
+            translations: &[],
+            qa_reviews: &reviews,
+            performance: None,
+            output: &output,
+            corrected_segments: 0,
+        })
+        .expect("report writes");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&files.json).expect("JSON report can be read"))
+                .expect("JSON report parses");
+
+        assert_eq!(report["qa_reviewed_segments"], 9);
+        let warnings = report["qa_warnings"]
+            .as_array()
+            .expect("qa_warnings stays an array");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["kind"], "qa_review");
+        assert!(
+            warnings[0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("occurrences=9"))
+        );
+
+        let _ = fs::remove_file(files.json);
+        let _ = fs::remove_file(files.markdown);
     }
 
     #[test]

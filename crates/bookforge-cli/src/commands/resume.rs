@@ -34,7 +34,7 @@ use crate::{
     QaMode,
     commands::{reconfigure, validate},
     performance::performance_summary_from_events,
-    report::{ReportInput, TranslationQaInput, write_report},
+    report::{ReportInput, TranslationQaInput, persist_qa_reviews_best_effort, write_report},
 };
 
 use super::translate::{
@@ -552,6 +552,9 @@ async fn run_inner(
     ) {
         print_stopped_resume_hint(&job.id, print_stdout);
         return Ok(());
+    }
+    if qa_runtime.qa != QaMode::Off {
+        persist_qa_reviews_best_effort(&store, &job.id, &qa_reviews);
     }
     let fallback_config = FallbackPassConfig::from_snapshot(snapshot.fallback.as_ref());
     let fallback_translations = run_fallback_pass(
