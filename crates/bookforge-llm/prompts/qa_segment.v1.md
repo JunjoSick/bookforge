@@ -37,8 +37,11 @@ translation. Use these severity levels:
   would fix a minor imprecision; for example, a localized register mismatch
   makes one line noticeably too formal.
 
-Do not nitpick harmless style choices. When there is no actual issue, return a
-`pass` verdict with an empty `issues` array.
+Report only issues that meet the `medium` or `high` definitions. Do not report
+`low` issues; omit them from the `issues` array.
+
+Do not nitpick harmless style choices. When there is no reportable `medium` or
+`high` issue, return a `pass` verdict with an empty `issues` array.
 
 Return only valid JSON.
 
@@ -50,7 +53,7 @@ The output must match this JSON shape exactly:
   "verdict": "pass",
   "issues": [
     {
-      "severity": "low",
+      "severity": "medium",
       "kind": "...",
       "message": "...",
       "source_excerpt": "...",
@@ -60,7 +63,7 @@ The output must match this JSON shape exactly:
 }
 ```
 
-Use `"warn"` for minor but real problems. Use `"fail"` only for serious problems such as omitted paragraphs, major mistranslation, broken meaning, or visibly corrupted structure.
+Use `"warn"` for reportable `medium` problems. Use `"fail"` only for serious problems such as omitted paragraphs, major mistranslation, broken meaning, or visibly corrupted structure.
 
 ## User
 

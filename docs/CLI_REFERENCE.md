@@ -165,8 +165,11 @@ warning for the segment instead of splitting again.
 
 LLM issues are also persisted in the job's `qa_findings` data. Their kinds use
 the reserved `llm_` prefix so `status` and the review page keep model judgments
-distinct from deterministic validator failures. LLM severity maps as follows:
-`high` becomes a stored `error`; `medium` and `low` become `warning`.
+distinct from deterministic validator failures. The reviewer is instructed to
+report only `medium` and `high` issues and omit anything matching the `low`
+boundary. `low` remains accepted in model responses for compatibility. LLM
+severity maps as follows: `high` becomes a stored `error`; `medium` and `low`
+become `warning`.
 
 Repeated LLM issues are reported and stored once when both their normalized
 kind and normalized source excerpt match. Source-excerpt normalization ignores
