@@ -49,13 +49,14 @@ where
     let qa_runtime = job_runtime_settings.borrow().clone();
     let qa_run_config =
         crate::control::freeze_run_config_for_stage(&controlled_run_config, &qa_runtime);
-    let qa_reviews = qa_reviews_for_mode(
+    let qa_reviews = qa_reviews_for_mode_with_max_output_tokens(
         ProgressRequestProvider::new(provider.clone(), progress.clone()),
         segments,
         translations,
         &qa_run_config,
         &qa_runtime.settings.qa,
         qa_runtime.qa,
+        Some(cli_args.qa_max_output_tokens),
     )
     .await;
 
@@ -440,14 +441,54 @@ pub(crate) async fn qa_reviews_for_mode<P>(
 where
     P: LlmProvider,
 {
+    qa_reviews_for_mode_with_max_output_tokens(
+        provider,
+        segments,
+        translations,
+        config,
+        qa_config,
+        qa_mode,
+        None,
+    )
+    .await
+}
+
+async fn qa_reviews_for_mode_with_max_output_tokens<P>(
+    provider: P,
+    segments: &[Segment],
+    translations: &[SegmentTranslation],
+    config: &TranslationRunConfig,
+    qa_config: &bookforge_core::config::QaRunConfig,
+    qa_mode: QaMode,
+    max_output_tokens: Option<u32>,
+) -> Vec<QaSegmentReview>
+where
+    P: LlmProvider,
+{
     match qa_mode {
         QaMode::Off => Vec::new(),
         QaMode::All => {
-            qa_segments_parallel(provider, segments, translations, config, qa_config).await
+            qa_segments_parallel_with_max_output_tokens(
+                provider,
+                segments,
+                translations,
+                config,
+                qa_config,
+                max_output_tokens,
+            )
+            .await
         }
         QaMode::Suspicious => {
             let candidates = suspicious_qa_candidates(segments, translations);
-            qa_segments_parallel(provider, segments, &candidates, config, qa_config).await
+            qa_segments_parallel_with_max_output_tokens(
+                provider,
+                segments,
+                &candidates,
+                config,
+                qa_config,
+                max_output_tokens,
+            )
+            .await
         }
     }
 }

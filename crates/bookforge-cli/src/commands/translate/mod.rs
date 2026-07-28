@@ -21,8 +21,8 @@ use bookforge_llm::{
     MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, ProviderCapabilities,
     ProviderRateController, QaSegmentReview, RateControllerConfig, SegmentTranslation,
     StyleRunConfig, TelemetryLog, TranslationRunConfig, account_for_batch_prompt_overhead,
-    build_translation_batches, qa_segments_parallel, run_double_check, telemetry_summary,
-    translate_batches_with_callback, translate_batches_with_control,
+    build_translation_batches, qa_segments_parallel_with_max_output_tokens, run_double_check,
+    telemetry_summary, translate_batches_with_callback, translate_batches_with_control,
     translate_segments_with_callback, translate_segments_with_control,
 };
 use bookforge_store::{CreateJob, JobRecord, JobStore, SaveTranslation};

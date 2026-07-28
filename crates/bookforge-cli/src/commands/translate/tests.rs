@@ -1159,6 +1159,7 @@ fn translate_args_with_preset(
         qa: QaMode::Off,
         qa_concurrency: 8,
         qa_batch_target_tokens: None,
+        qa_max_output_tokens: 8_192,
         qa_model: None,
         qa_provider: None,
         qa_base_url: None,

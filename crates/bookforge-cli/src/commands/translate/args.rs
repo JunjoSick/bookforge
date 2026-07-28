@@ -148,6 +148,13 @@ pub struct TranslateArgs {
     #[arg(long)]
     pub qa_batch_target_tokens: Option<usize>,
 
+    #[arg(
+        long,
+        default_value_t = 8_192,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub qa_max_output_tokens: u32,
+
     #[arg(long)]
     pub qa_model: Option<String>,
 

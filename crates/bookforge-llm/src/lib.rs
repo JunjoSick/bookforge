@@ -26,7 +26,7 @@ pub use provider::{
     MockProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, ProviderCapabilities,
     RequestMetadata, ResponseFormat,
 };
-pub use qa_batch::qa_segments_parallel;
+pub use qa_batch::{qa_segments_parallel, qa_segments_parallel_with_max_output_tokens};
 pub use rate_controller::{
     ProviderRateController, RateControllerConfig, RequestObservation, RequestStatus,
 };

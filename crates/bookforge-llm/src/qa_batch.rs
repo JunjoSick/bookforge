@@ -1,5 +1,5 @@
 use crate::{
-    CompletionRequest, LlmError, LlmProvider, PromptLibrary, PromptTemplate, QaIssue,
+    CompletionRequest, FinishReason, LlmError, LlmProvider, PromptLibrary, PromptTemplate, QaIssue,
     QaSegmentReview, RequestMetadata, ResponseFormat, SegmentTranslation, TranslationRunConfig,
     concurrency::PauseState,
 };
@@ -14,6 +14,8 @@ use std::{
 };
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+
+const DEFAULT_QA_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
 #[derive(Debug, Deserialize)]
 struct QaBatchResponse {
@@ -47,6 +49,46 @@ struct QaPromptItem {
     protected_spans: Vec<String>,
 }
 
+#[derive(Debug)]
+struct QaBatchRequestError {
+    error: LlmError,
+    truncated: bool,
+}
+
+impl QaBatchRequestError {
+    fn other(error: LlmError) -> Self {
+        Self {
+            error,
+            truncated: false,
+        }
+    }
+
+    fn truncated(error: LlmError) -> Self {
+        Self {
+            error,
+            truncated: true,
+        }
+    }
+
+    fn from_json(error: serde_json::Error) -> Self {
+        let truncated = error.is_eof();
+        Self {
+            error: LlmError::Json(error),
+            truncated,
+        }
+    }
+
+    fn should_split(&self) -> bool {
+        self.truncated || is_json_shape_error(&self.error)
+    }
+}
+
+impl std::fmt::Display for QaBatchRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
 pub async fn qa_segments_parallel<P>(
     provider: P,
     segments: &[Segment],
@@ -57,9 +99,34 @@ pub async fn qa_segments_parallel<P>(
 where
     P: LlmProvider,
 {
+    qa_segments_parallel_with_max_output_tokens(
+        provider,
+        segments,
+        translations,
+        config,
+        qa_config,
+        None,
+    )
+    .await
+}
+
+pub async fn qa_segments_parallel_with_max_output_tokens<P>(
+    provider: P,
+    segments: &[Segment],
+    translations: &[SegmentTranslation],
+    config: &TranslationRunConfig,
+    qa_config: &QaRunConfig,
+    max_output_tokens: Option<u32>,
+) -> Vec<QaSegmentReview>
+where
+    P: LlmProvider,
+{
     let library = Arc::new(PromptLibrary::global().clone());
     let provider = Arc::new(provider);
     let semaphore = Arc::new(Semaphore::new(qa_config.concurrency.max(1)));
+    let max_output_tokens = max_output_tokens
+        .unwrap_or(DEFAULT_QA_MAX_OUTPUT_TOKENS)
+        .max(1);
     let mut tasks = JoinSet::new();
 
     let by_segment = segments
@@ -106,7 +173,8 @@ where
                     .map(|item| qa_error_review(item, "qa_cancelled", "QA semaphore closed"))
                     .collect::<Vec<_>>();
             };
-            request_qa_batch_resilient(&*provider, &library, &chunk, &config).await
+            request_qa_batch_resilient(&*provider, &library, &chunk, &config, max_output_tokens)
+                .await
         });
     }
 
@@ -151,6 +219,7 @@ async fn request_qa_batch_resilient<P>(
     library: &PromptLibrary,
     items: &[QaWorkItem],
     config: &TranslationRunConfig,
+    max_output_tokens: u32,
 ) -> Vec<QaSegmentReview>
 where
     P: LlmProvider,
@@ -159,9 +228,17 @@ where
     let mut reviews = Vec::new();
 
     while let Some(chunk) = queue.pop_front() {
-        match request_qa_batch(provider, &library.qa_batch, &chunk, config).await {
+        match request_qa_batch(
+            provider,
+            &library.qa_batch,
+            &chunk,
+            config,
+            max_output_tokens,
+        )
+        .await
+        {
             Ok(mut chunk_reviews) => reviews.append(&mut chunk_reviews),
-            Err(error) if is_json_shape_error(&error) && chunk.len() > 1 => {
+            Err(error) if error.should_split() && chunk.len() > 1 => {
                 let mid = chunk.len() / 2;
                 queue.push_front(chunk[mid..].to_vec());
                 queue.push_front(chunk[..mid].to_vec());
@@ -185,11 +262,14 @@ async fn request_qa_batch<P>(
     template: &PromptTemplate,
     items: &[QaWorkItem],
     config: &TranslationRunConfig,
-) -> Result<Vec<QaSegmentReview>, LlmError>
+    max_output_tokens: u32,
+) -> Result<Vec<QaSegmentReview>, QaBatchRequestError>
 where
     P: LlmProvider,
 {
-    wait_for_qa_pause(config).await?;
+    wait_for_qa_pause(config)
+        .await
+        .map_err(QaBatchRequestError::other)?;
 
     use crate::Substitutions;
 
@@ -241,7 +321,7 @@ where
 
     let rendered = template
         .render(&vars)
-        .map_err(|e| LlmError::Provider(e.to_string()))?;
+        .map_err(|e| QaBatchRequestError::other(LlmError::Provider(e.to_string())))?;
     let (runtime_config_revision, provider_max_attempts) = config.request_runtime_metadata();
     let response = provider
         .complete(CompletionRequest {
@@ -249,7 +329,7 @@ where
             user: rendered.user,
             response_format: ResponseFormat::Json,
             temperature: 0.0,
-            max_output_tokens: None,
+            max_output_tokens: Some(max_output_tokens),
             metadata: RequestMetadata {
                 segment_id: None,
                 block_ids: items
@@ -265,9 +345,19 @@ where
                 provider_max_attempts,
             },
         })
-        .await?;
+        .await
+        .map_err(QaBatchRequestError::other)?;
 
-    let parsed: QaBatchResponse = serde_json::from_str(&response.content)?;
+    if response.finish_reason == FinishReason::Length {
+        return Err(QaBatchRequestError::truncated(LlmError::InvalidResponse(
+            format!(
+                "QA output was truncated: max_output_tokens limit ({max_output_tokens}) reached"
+            ),
+        )));
+    }
+
+    let parsed: QaBatchResponse =
+        serde_json::from_str(&response.content).map_err(QaBatchRequestError::from_json)?;
     let by_id = items
         .iter()
         .map(|item| (item.segment.id.0.as_str(), item))
@@ -388,7 +478,7 @@ fn qa_error_review(item: &QaWorkItem, kind: &str, message: impl Into<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CompletionResponse, FinishReason, ProviderCapabilities};
+    use crate::{CompletionResponse, ProviderCapabilities};
     use bookforge_core::{
         config::TranslationProfile,
         ir::{BlockId, SectionId},
@@ -431,6 +521,84 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
+            Ok(CompletionResponse {
+                content: serde_json::to_string(&json!({ "reviews": reviews }))?,
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 0,
+                raw: json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: false,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ForcedTruncation {
+        FinishReasonLength,
+        PrematureEof,
+    }
+
+    struct SplitRetryQaProvider {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+        truncation: ForcedTruncation,
+        recover_single_items: bool,
+    }
+
+    impl LlmProvider for SplitRetryQaProvider {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> crate::provider::Result<CompletionResponse> {
+            let ids = extract_ids_from_qa_prompt(&request.user);
+            let should_truncate = ids.len() > 1 || !self.recover_single_items;
+            self.requests.lock().expect("requests mutex").push(request);
+
+            if should_truncate {
+                return Ok(match self.truncation {
+                    ForcedTruncation::FinishReasonLength => CompletionResponse {
+                        // A syntactically complete body proves the finish reason itself
+                        // triggers recovery rather than relying on JSON parsing to fail.
+                        content: serde_json::to_string(&json!({ "reviews": [] }))?,
+                        input_tokens: None,
+                        input_cached_tokens: None,
+                        output_tokens: None,
+                        finish_reason: FinishReason::Length,
+                        provider_latency_ms: 0,
+                        raw: json!({}),
+                    },
+                    ForcedTruncation::PrematureEof => CompletionResponse {
+                        content: format!(
+                            r#"{{"reviews":[{{"id":"{}","verdict":"pass","issues":["#,
+                            ids.first().map(String::as_str).unwrap_or("unknown")
+                        ),
+                        input_tokens: None,
+                        input_cached_tokens: None,
+                        output_tokens: None,
+                        finish_reason: FinishReason::Stop,
+                        provider_latency_ms: 0,
+                        raw: json!({}),
+                    },
+                });
+            }
+
+            let reviews = ids
+                .into_iter()
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "verdict": "pass",
+                        "issues": [],
+                    })
+                })
+                .collect::<Vec<_>>();
             Ok(CompletionResponse {
                 content: serde_json::to_string(&json!({ "reviews": reviews }))?,
                 input_tokens: None,
@@ -619,6 +787,123 @@ mod tests {
 
         assert_eq!(reviews.len(), 2);
         assert_eq!(requests.lock().expect("requests mutex").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn finish_reason_length_splits_and_retries_qa_batch() {
+        let segments = vec![segment("seg_1", 0, "Hello"), segment("seg_2", 1, "Goodbye")];
+        let translations = segments
+            .iter()
+            .map(|segment| translation(segment, "Ciao"))
+            .collect::<Vec<_>>();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = SplitRetryQaProvider {
+            requests: requests.clone(),
+            truncation: ForcedTruncation::FinishReasonLength,
+            recover_single_items: true,
+        };
+
+        let reviews = qa_segments_parallel(
+            provider,
+            &segments,
+            &translations,
+            &run_config(),
+            &qa_config(10_000),
+        )
+        .await;
+
+        assert_eq!(reviews.len(), 2);
+        assert!(reviews.iter().all(|review| review.verdict == "pass"));
+        let request_item_counts = requests
+            .lock()
+            .expect("requests mutex")
+            .iter()
+            .map(|request| extract_ids_from_qa_prompt(&request.user).len())
+            .collect::<Vec<_>>();
+        assert_eq!(request_item_counts, vec![2, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn premature_eof_splits_and_retries_qa_batch() {
+        let segments = vec![segment("seg_1", 0, "Hello"), segment("seg_2", 1, "Goodbye")];
+        let translations = segments
+            .iter()
+            .map(|segment| translation(segment, "Ciao"))
+            .collect::<Vec<_>>();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = SplitRetryQaProvider {
+            requests: requests.clone(),
+            truncation: ForcedTruncation::PrematureEof,
+            recover_single_items: true,
+        };
+
+        let reviews = qa_segments_parallel(
+            provider,
+            &segments,
+            &translations,
+            &run_config(),
+            &qa_config(10_000),
+        )
+        .await;
+
+        assert_eq!(reviews.len(), 2);
+        assert!(reviews.iter().all(|review| review.verdict == "pass"));
+        assert_eq!(requests.lock().expect("requests mutex").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_truncation_surfaces_qa_request_failed_findings() {
+        let segments = vec![segment("seg_1", 0, "Hello"), segment("seg_2", 1, "Goodbye")];
+        let translations = segments
+            .iter()
+            .map(|segment| translation(segment, "Ciao"))
+            .collect::<Vec<_>>();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = SplitRetryQaProvider {
+            requests: requests.clone(),
+            truncation: ForcedTruncation::FinishReasonLength,
+            recover_single_items: false,
+        };
+
+        let reviews = qa_segments_parallel(
+            provider,
+            &segments,
+            &translations,
+            &run_config(),
+            &qa_config(10_000),
+        )
+        .await;
+
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(requests.lock().expect("requests mutex").len(), 3);
+        for review in reviews {
+            assert_eq!(review.verdict, "warn");
+            assert_eq!(review.issues[0].kind, "qa_request_failed");
+            assert!(review.issues[0].message.contains("QA output was truncated"));
+        }
+    }
+
+    #[tokio::test]
+    async fn configurable_qa_output_cap_reaches_request() {
+        let segments = vec![segment("seg_1", 0, "Hello")];
+        let translations = vec![translation(&segments[0], "Ciao")];
+        let provider = CaptureQaProvider::default();
+        let requests = provider.requests.clone();
+
+        let reviews = qa_segments_parallel_with_max_output_tokens(
+            provider,
+            &segments,
+            &translations,
+            &run_config(),
+            &qa_config(10_000),
+            Some(12_345),
+        )
+        .await;
+
+        assert_eq!(reviews.len(), 1);
+        let requests = requests.lock().expect("requests mutex");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].max_output_tokens, Some(12_345));
     }
 
     #[tokio::test]
