@@ -4,7 +4,7 @@
 > the terminal half of v2. `bookforge serve` implements monitoring, retry, **and
 > launch-from-browser** — the last was pulled into v2.0 rather than deferred to
 > v2.1. This document is kept as the design record — see
-> `crates/bookforge-cli/src/commands/serve.rs` for the implementation and
+> `crates/bookforge-cli/src/commands/serve/` for the implementation modules and
 > `crates/bookforge-cli/src/eventlog.rs` for the shared tailer.
 >
 > What shipped vs. this plan:
@@ -40,7 +40,7 @@
 The single-page monitoring dashboard was replaced by a multi-screen, warm
 "paper"-themed SPA (light/dark, Spectral + IBM Plex) ported from the Claude
 Design project *Book Forge UI Design* (`BookForge App.dc.html`). It is still one
-inline `DASHBOARD_HTML` const in `serve.rs` (no build step) and keeps every
+buildless `DASHBOARD_HTML` assembly in `serve/assets.rs` and keeps every
 security contract: loopback-only bind, per-server CSRF token on all mutations,
 HTML-escaping of dynamic text, and in-memory-only API keys.
 
@@ -217,8 +217,9 @@ browser (`xdg-open`/`open`, or the `webbrowser` crate).
 ## Files to add / modify
 
 - `crates/bookforge-cli/Cargo.toml` — add `axum` (optional) + `serve` feature.
-- `crates/bookforge-cli/src/commands/serve.rs` (new) — server, endpoints, inline
-  HTML/CSS/JS consts.
+- `crates/bookforge-cli/src/commands/serve.rs` and
+  `crates/bookforge-cli/src/commands/serve/` (new) — server, domain endpoint
+  modules, and buildless HTML/CSS/JS assembly.
 - `crates/bookforge-cli/src/eventlog.rs` (new) — shared tailer + path resolution,
   extracted from `watch.rs`.
 - `crates/bookforge-cli/src/{main.rs,commands/mod.rs}` — register `serve` (gated).
