@@ -89,6 +89,7 @@ local browser-based translation runs:
 | Understand EPUB parsing and rebuilding | [EPUB pipeline](docs/EPUB_PIPELINE.md) |
 | Understand the system design and crate boundaries | [Architecture](docs/ARCHITECTURE.md) |
 | Measure whether a validator flag is real | [Validator tooling](docs/validator-tooling.md) |
+| Understand why the review loop produces no corrections | [Feedback loop analysis](docs/design-feedback-loop.md) |
 | Contribute code or documentation | [Contributing](CONTRIBUTING.md) |
 
 ## Install And Setup
