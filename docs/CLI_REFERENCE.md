@@ -157,6 +157,12 @@ text, so use that fraction to size the review pass against an `all` estimate.
 Failed, queued, and retry-pending segments are not sent to the reviewer, and an
 empty translation is never submitted even if its status is otherwise eligible.
 
+`--qa-max-output-tokens <TOKENS>` caps each QA response and defaults to `8192`.
+The value must be at least `1`. If a batched response reaches that limit or ends
+as incomplete JSON, BookForge retries by bisecting the batch. One segment is the
+floor: if that request is still truncated, QA records a `qa_request_failed`
+warning for the segment instead of splitting again.
+
 LLM issues are also persisted in the job's `qa_findings` data. Their kinds use
 the reserved `llm_` prefix so `status` and the review page keep model judgments
 distinct from deterministic validator failures. LLM severity maps as follows:
