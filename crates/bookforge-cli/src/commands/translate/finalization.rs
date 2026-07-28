@@ -63,6 +63,9 @@ where
         print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
         return Ok(());
     }
+    if qa_runtime.qa != QaMode::Off {
+        crate::report::persist_qa_reviews_best_effort(store, &job.id, &qa_reviews);
+    }
     let fallback_config = FallbackPassConfig::from_snapshot(snapshot.fallback.as_ref());
     let fallback_translations = run_fallback_pass_instrumented(
         cancel_token,
@@ -462,8 +465,10 @@ pub(super) fn suspicious_qa_candidates(
         .filter(|translation| {
             matches!(
                 translation.status,
-                SegmentStatus::Succeeded | SegmentStatus::SkippedCached
-            )
+                SegmentStatus::Succeeded
+                    | SegmentStatus::SkippedCached
+                    | SegmentStatus::NeedsReview
+            ) && !translation.joined_text().trim().is_empty()
         })
         .filter(|translation| {
             let Some(segment) = by_segment.get(translation.segment_id.0.as_str()) else {
@@ -472,7 +477,8 @@ pub(super) fn suspicious_qa_candidates(
             let source_len = segment.source.text.chars().count().max(1);
             let translated_len = translation.joined_text().chars().count();
             let ratio = translated_len as f64 / source_len as f64;
-            !(0.5..=2.2).contains(&ratio)
+            translation.status == SegmentStatus::NeedsReview
+                || !(0.75..=1.5).contains(&ratio)
                 || translation.template == "translate_run_preserving"
                 || segment.constraints.preserve_spans.len() >= 4
                 || marker_structure_changed(segment, translation)
@@ -634,5 +640,229 @@ pub(crate) fn print_stopped_resume_hint(job_id: &str, print_stdout: bool) {
     if print_stdout {
         println!("Stopped. Progress has been saved to job: {job_id}");
         println!("Resume with: bookforge resume {job_id}");
+    }
+}
+
+#[cfg(test)]
+mod suspicious_tests {
+    use super::*;
+    use bookforge_core::{
+        config::{QaRunConfig, TranslationProfile},
+        ir::{BlockId, SectionId},
+        segment::{
+            BlockTranslation, SegmentBlock, SegmentConstraints, SegmentContext, SegmentId,
+            SegmentMetadata, SegmentSource, SegmentTextRun,
+        },
+    };
+
+    #[test]
+    fn suspicious_candidates_include_each_targeting_signal() {
+        let needs_review = test_segment("needs_review", 0, "Ordinary source prose.");
+        let odd_ratio = test_segment("odd_ratio", 1, "A source segment with normal prose.");
+        let run_preserving = test_segment("run_preserving", 2, "Ordinary source prose.");
+        let mut preserved_spans = test_segment("preserved_spans", 3, "Ordinary source prose.");
+        preserved_spans.constraints.preserve_spans = vec![
+            "one".to_string(),
+            "two".to_string(),
+            "three".to_string(),
+            "four".to_string(),
+        ];
+        let marker_change = test_segment("marker_change", 4, "<m1>Ordinary source prose.</m1>");
+
+        let translations = vec![
+            test_translation(
+                &needs_review,
+                "Ordinary target prose.",
+                "translate_segment",
+                SegmentStatus::NeedsReview,
+            ),
+            test_translation(
+                &odd_ratio,
+                "Short",
+                "translate_segment",
+                SegmentStatus::Succeeded,
+            ),
+            test_translation(
+                &run_preserving,
+                "Ordinary target prose.",
+                "translate_run_preserving",
+                SegmentStatus::Succeeded,
+            ),
+            test_translation(
+                &preserved_spans,
+                "Ordinary target prose.",
+                "translate_segment",
+                SegmentStatus::Succeeded,
+            ),
+            test_translation(
+                &marker_change,
+                "<m2>Ordinary target prose.</m2>",
+                "translate_segment",
+                SegmentStatus::Succeeded,
+            ),
+        ];
+        let segments = vec![
+            needs_review,
+            odd_ratio,
+            run_preserving,
+            preserved_spans,
+            marker_change,
+        ];
+
+        let candidate_ids = suspicious_qa_candidates(&segments, &translations)
+            .into_iter()
+            .map(|translation| translation.segment_id.0)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            candidate_ids,
+            [
+                "needs_review",
+                "odd_ratio",
+                "run_preserving",
+                "preserved_spans",
+                "marker_change",
+            ]
+        );
+    }
+
+    #[test]
+    fn suspicious_candidates_do_not_select_ordinary_prose() {
+        let segments = (0..12)
+            .map(|ordinal| {
+                test_segment(
+                    &format!("ordinary_{ordinal}"),
+                    ordinal,
+                    &format!("Ordinary prose segment {ordinal} has a routine translation length."),
+                )
+            })
+            .collect::<Vec<_>>();
+        let translations = segments
+            .iter()
+            .map(|segment| {
+                test_translation(
+                    segment,
+                    &segment.source.text,
+                    "translate_segment",
+                    SegmentStatus::Succeeded,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(suspicious_qa_candidates(&segments, &translations).is_empty());
+    }
+
+    #[tokio::test]
+    async fn suspicious_mode_sends_needs_review_segments_to_qa() {
+        let segment = test_segment(
+            "validator_flagged",
+            0,
+            "The deterministic validator flagged this translation.",
+        );
+        let translation = test_translation(
+            &segment,
+            "Il validatore deterministico ha segnalato questa traduzione.",
+            "translate_segment",
+            SegmentStatus::NeedsReview,
+        );
+
+        let reviews = qa_reviews_for_mode(
+            MockProvider::new(MockMode::Identity, "Italian"),
+            std::slice::from_ref(&segment),
+            std::slice::from_ref(&translation),
+            &test_run_config(),
+            &QaRunConfig {
+                concurrency: 1,
+                batch_target_tokens: 10_000,
+                model: None,
+                provider: None,
+                base_url: None,
+                api_key_env: None,
+            },
+            QaMode::Suspicious,
+        )
+        .await;
+
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].segment_id.0, "validator_flagged");
+        assert_eq!(translation.status, SegmentStatus::NeedsReview);
+    }
+
+    fn test_segment(id: &str, ordinal: usize, text: &str) -> Segment {
+        let block_id = BlockId(format!("block_{ordinal}"));
+        Segment {
+            id: SegmentId(id.to_string()),
+            section_id: SectionId("section_0".to_string()),
+            ordinal,
+            block_ids: vec![block_id.clone()],
+            source: SegmentSource {
+                text: text.to_string(),
+                blocks: vec![SegmentBlock {
+                    block_id,
+                    kind: "paragraph".to_string(),
+                    text: text.to_string(),
+                    text_runs: vec![SegmentTextRun {
+                        id: format!("run_{ordinal}"),
+                        text: text.to_string(),
+                    }],
+                    protected_spans: Vec::new(),
+                }],
+                token_estimate: 16,
+            },
+            context: SegmentContext::default(),
+            metadata: SegmentMetadata::default(),
+            constraints: SegmentConstraints::default(),
+            checksum: format!("checksum_{ordinal}"),
+        }
+    }
+
+    fn test_translation(
+        segment: &Segment,
+        text: &str,
+        template: &str,
+        status: SegmentStatus,
+    ) -> SegmentTranslation {
+        SegmentTranslation {
+            segment_id: segment.id.clone(),
+            ordinal: segment.ordinal,
+            block_ids: segment.block_ids.clone(),
+            blocks: vec![BlockTranslation {
+                block_id: segment.block_ids[0].clone(),
+                text: text.to_string(),
+            }],
+            checksum: segment.checksum.clone(),
+            status,
+            template: template.to_string(),
+            error: (status == SegmentStatus::NeedsReview)
+                .then(|| "deterministic validation finding".to_string()),
+            input_tokens: Some(10),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(10),
+            tokens_estimated: false,
+        }
+    }
+
+    fn test_run_config() -> TranslationRunConfig {
+        TranslationRunConfig {
+            source_language: Some("English".to_string()),
+            target_language: "Italian".to_string(),
+            provider: "mock".to_string(),
+            model: "mock-identity".to_string(),
+            prompt_version: "v1".to_string(),
+            temperature: 0.0,
+            scheduler: SchedulerConfig::default(),
+            profile: TranslationProfile::Balanced,
+            model_context_tokens: None,
+            max_output_tokens: None,
+            batch_max_output_tokens: None,
+            compact_prompts: false,
+            glossary: GlossaryRunConfig::default(),
+            context: ContextRunConfig::default(),
+            context_registry: None,
+            style: None,
+            entities: None,
+            pause_signal: None,
+            runtime_settings: None,
+        }
     }
 }

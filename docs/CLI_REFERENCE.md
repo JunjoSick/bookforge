@@ -132,9 +132,41 @@ bookforge translate book.epub \
   --target Italian \
   --provider-preset open-router-paid-fast \
   --concurrency 4 \
+  --qa suspicious \
   --validate-output \
   --out book.it.epub
 ```
+
+`--qa` controls the optional LLM review pass. `off` skips it, `all` reviews
+every non-empty successful, cached, or `needs_review` translation, and
+`suspicious` limits those reviewable translations to segments with at least
+one concrete risk signal:
+
+- the deterministic translation pass left the segment in `needs_review`;
+- the translation/source character ratio is outside `0.75..=1.5`;
+- translation used the run-preserving template;
+- the source carries at least four protected spans; or
+- inline marker IDs, shapes, block placement, or syntax changed.
+
+The signals are additive. Routine successful prose near a 1:1 character ratio,
+using the normal template and without marker changes, is not selected. In one
+32-segment prose book, deterministic validation selected 8 segments (25%);
+the other signals are expected to add few segments on an ordinary book but can
+matter more for markup-heavy material. QA cost scales roughly with the selected
+text, so use that fraction to size the review pass against an `all` estimate.
+Failed, queued, and retry-pending segments are not sent to the reviewer, and an
+empty translation is never submitted even if its status is otherwise eligible.
+
+LLM issues are also persisted in the job's `qa_findings` data. Their kinds use
+the reserved `llm_` prefix so `status` and the review page keep model judgments
+distinct from deterministic validator failures. LLM severity maps as follows:
+`high` becomes a stored `error`; `medium` and `low` become `warning`.
+
+Repeated LLM issues are reported and stored once when both their normalized
+kind and normalized source excerpt match. Source-excerpt normalization ignores
+case and whitespace differences. The collapsed message retains the occurrence
+count, every affected segment ID, and the available source and translation
+excerpts. Issues without a source excerpt are not merged.
 
 The command prints a job ID. Keep it: every lifecycle, monitoring, review, and
 recovery command uses that stable ID.

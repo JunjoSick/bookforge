@@ -71,10 +71,7 @@ where
     let mut review_order = HashMap::new();
 
     for translation in translations.iter().cloned() {
-        if !matches!(
-            translation.status,
-            SegmentStatus::Succeeded | SegmentStatus::SkippedCached
-        ) {
+        if !reviewable_translation(&translation) {
             continue;
         }
         let Some(segment) = by_segment.get(translation.segment_id.0.as_str()).cloned() else {
@@ -140,6 +137,13 @@ where
             .unwrap_or(usize::MAX)
     });
     reviews
+}
+
+fn reviewable_translation(translation: &SegmentTranslation) -> bool {
+    matches!(
+        translation.status,
+        SegmentStatus::Succeeded | SegmentStatus::SkippedCached | SegmentStatus::NeedsReview
+    ) && !translation.joined_text().trim().is_empty()
 }
 
 async fn request_qa_batch_resilient<P>(
@@ -533,7 +537,11 @@ mod tests {
         }
     }
 
-    fn translation(segment: &Segment, text: &str) -> SegmentTranslation {
+    fn translation_with_status(
+        segment: &Segment,
+        text: &str,
+        status: SegmentStatus,
+    ) -> SegmentTranslation {
         SegmentTranslation {
             segment_id: segment.id.clone(),
             ordinal: segment.ordinal,
@@ -543,7 +551,7 @@ mod tests {
                 text: text.to_string(),
             }],
             checksum: segment.checksum.clone(),
-            status: SegmentStatus::Succeeded,
+            status,
             template: "translate_segment".to_string(),
             error: None,
             input_tokens: None,
@@ -551,6 +559,10 @@ mod tests {
             output_tokens: None,
             tokens_estimated: false,
         }
+    }
+
+    fn translation(segment: &Segment, text: &str) -> SegmentTranslation {
+        translation_with_status(segment, text, SegmentStatus::Succeeded)
     }
 
     #[tokio::test]
@@ -637,5 +649,38 @@ mod tests {
             .expect("seg_2 should receive an omitted review warning");
         assert_eq!(omitted.verdict, "warn");
         assert_eq!(omitted.issues[0].kind, "qa_response_omitted");
+    }
+
+    #[tokio::test]
+    async fn qa_reviews_nonempty_needs_review_but_skips_empty_and_failed_translations() {
+        let segments = vec![
+            segment("reviewable", 0, "Source one"),
+            segment("empty", 1, "Source two"),
+            segment("failed", 2, "Source three"),
+        ];
+        let translations = vec![
+            translation_with_status(&segments[0], "Traduzione utile", SegmentStatus::NeedsReview),
+            translation_with_status(&segments[1], " \n ", SegmentStatus::NeedsReview),
+            translation_with_status(&segments[2], "Traduzione parziale", SegmentStatus::Failed),
+        ];
+        let provider = CaptureQaProvider::default();
+        let requests = provider.requests.clone();
+
+        let reviews = qa_segments_parallel(
+            provider,
+            &segments,
+            &translations,
+            &run_config(),
+            &qa_config(10_000),
+        )
+        .await;
+
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].segment_id.0, "reviewable");
+        let requests = requests.lock().expect("requests mutex");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].user.contains("\"id\":\"reviewable\""));
+        assert!(!requests[0].user.contains("\"id\":\"empty\""));
+        assert!(!requests[0].user.contains("\"id\":\"failed\""));
     }
 }

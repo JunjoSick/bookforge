@@ -249,7 +249,8 @@ impl JobStore {
         }
 
         tx.execute(
-            "DELETE FROM qa_findings WHERE job_id = ?1 AND segment_id = ?2",
+            "DELETE FROM qa_findings
+             WHERE job_id = ?1 AND segment_id = ?2 AND kind NOT GLOB 'llm_*'",
             params![job_id, segment_id],
         )?;
         for (index, finding) in findings.iter().enumerate() {
@@ -273,12 +274,63 @@ impl JobStore {
         Ok(findings.len())
     }
 
-    /// Drop every finding recorded against one segment (used when a segment
-    /// reaches a clean terminal state and `segments.error` goes back to NULL).
+    /// Replace the LLM-review findings for a job without disturbing findings
+    /// produced by deterministic validators.
+    ///
+    /// `severity` is the model's `low`/`medium`/`high` value. High-severity
+    /// findings become stored errors; every other value becomes a warning.
+    /// Callers collapse repeated issues before this write and put the complete
+    /// occurrence/segment/excerpt context in `message`.
+    pub fn replace_llm_qa_findings(
+        &self,
+        job_id: &str,
+        findings: &[(&str, &str, &str, &str)],
+    ) -> Result<usize> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM qa_findings WHERE job_id = ?1 AND kind GLOB 'llm_*'",
+            params![job_id],
+        )?;
+
+        let mut inserted = 0usize;
+        for (index, (segment_id, kind, severity, message)) in findings.iter().enumerate() {
+            let exists = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM segments WHERE job_id = ?1 AND id = ?2
+                 )",
+                params![job_id, segment_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                continue;
+            }
+
+            let kind = llm_finding_kind(kind);
+            let severity = llm_finding_severity(severity);
+            let hash = stable_hash(&format!(
+                "{job_id}\u{1f}llm\u{1f}{segment_id}\u{1f}{kind}\u{1f}{index}"
+            ));
+            let id = format!("qaf_{}", &hash[..24]);
+            inserted += tx.execute(
+                "INSERT INTO qa_findings
+                 (id, segment_id, job_id, severity, kind, message)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, segment_id, job_id, severity, kind, message],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Drop deterministic findings recorded against one segment (used when a
+    /// segment reaches a clean terminal state and `segments.error` goes back
+    /// to NULL). LLM-review findings have their own replacement lifecycle.
     pub fn clear_segment_findings(&self, job_id: &str, segment_id: &str) -> Result<()> {
         let conn = self.conn.borrow();
         conn.execute(
-            "DELETE FROM qa_findings WHERE job_id = ?1 AND segment_id = ?2",
+            "DELETE FROM qa_findings
+             WHERE job_id = ?1 AND segment_id = ?2 AND kind NOT GLOB 'llm_*'",
             params![job_id, segment_id],
         )?;
         Ok(())
@@ -292,6 +344,7 @@ impl JobStore {
             "DELETE FROM qa_findings
              WHERE job_id = ?1
                AND severity = 'error'
+               AND kind NOT GLOB 'llm_*'
                AND segment_id IN (
                  SELECT id FROM segments
                  WHERE job_id = ?1 AND (error IS NULL OR TRIM(error) = '')
@@ -342,5 +395,113 @@ impl JobStore {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+}
+
+fn llm_finding_kind(kind: &str) -> String {
+    let kind = kind.trim().trim_start_matches("llm_");
+    if kind.is_empty() {
+        "llm_other".to_string()
+    } else {
+        format!("llm_{kind}")
+    }
+}
+
+fn llm_finding_severity(severity: &str) -> &'static str {
+    if severity.trim().eq_ignore_ascii_case("high") {
+        QaFindingSeverity::Error.as_str()
+    } else {
+        QaFindingSeverity::Warning.as_str()
+    }
+}
+
+#[cfg(test)]
+mod llm_findings_tests {
+    use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn llm_finding_round_trips_namespaced_with_mapped_severity() {
+        let db_path = temp_db_path();
+        let store = JobStore::open(&db_path).expect("store opens");
+        {
+            let conn = store.conn.borrow();
+            conn.execute(
+                "INSERT INTO jobs
+                 (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+                 VALUES ('job_qa', 'hash', 'Italian', 'mock', 'mock', 'running', 'now', 'now')",
+                [],
+            )
+            .expect("job fixture inserts");
+            conn.execute(
+                "INSERT INTO segments
+                 (id, job_id, section_id, ordinal, source_hash, prompt_version,
+                  provider, model, status)
+                 VALUES ('seg_0', 'job_qa', 'sec_0', 0, 'hash', 'v1',
+                         'mock', 'mock', 'needs_review')",
+                [],
+            )
+            .expect("segment fixture inserts");
+        }
+
+        store
+            .record_segment_findings(
+                "job_qa",
+                "seg_0",
+                "protected span missing from segment 'seg_0': The Cyberiad",
+            )
+            .expect("deterministic finding writes");
+        store
+            .replace_llm_qa_findings(
+                "job_qa",
+                &[(
+                    "seg_0",
+                    "mistranslation",
+                    "high",
+                    "high [mistranslation]: title changed occurrences=1 segments=[seg_0]",
+                )],
+            )
+            .expect("LLM finding writes");
+        store
+            .record_segment_findings(
+                "job_qa",
+                "seg_0",
+                "protected span missing from segment 'seg_0': The Cyberiad",
+            )
+            .expect("later deterministic refresh preserves LLM finding");
+
+        let findings = store
+            .segment_qa_findings("job_qa")
+            .expect("findings round trip");
+        assert_eq!(findings.len(), 2);
+        let deterministic = findings
+            .iter()
+            .find(|finding| finding.kind == "protected_span_missing")
+            .expect("deterministic finding remains distinguishable");
+        assert_eq!(deterministic.severity, "error");
+        let llm = findings
+            .iter()
+            .find(|finding| finding.kind == "llm_mistranslation")
+            .expect("LLM finding has reserved namespace");
+        assert_eq!(llm.severity, "error");
+        assert!(llm.message.contains("segments=[seg_0]"));
+
+        drop(store);
+        let _ = fs::remove_file(db_path);
+    }
+
+    fn temp_db_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bookforge-llm-findings-{}-{}-{}.sqlite",
+            std::process::id(),
+            unix_timestamp_nanos(),
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 }
