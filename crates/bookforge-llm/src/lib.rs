@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod concurrency;
 pub mod double_check;
+pub mod glossary_proposal;
 pub mod prompt;
 pub mod provider;
 pub mod qa_batch;
@@ -19,6 +20,11 @@ pub use batch::{
 pub use concurrency::{AdaptiveLimiter, PauseSignal, PauseState};
 pub use double_check::{
     CorrectionItem, CorrectionRecord, CorrectionStatus, DoubleCheckItem, run_double_check,
+};
+pub use glossary_proposal::{
+    GLOSSARY_PROPOSAL_PROMPT_NAME, GLOSSARY_PROPOSAL_PROMPT_VERSION, GlossaryProposal,
+    GlossaryProposalInput, GlossaryProposalPolicy, GlossaryProposalRun,
+    propose_glossary_renderings,
 };
 pub use prompt::{PromptLibrary, PromptTemplate, Rendered, Substitutions};
 pub use provider::{

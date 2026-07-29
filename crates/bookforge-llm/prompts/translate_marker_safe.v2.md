@@ -1,4 +1,4 @@
-﻿# translate_marker_safe.v2.md
+# translate_marker_safe.v2.md
 
 ## System
 

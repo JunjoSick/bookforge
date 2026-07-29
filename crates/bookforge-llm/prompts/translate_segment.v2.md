@@ -1,4 +1,4 @@
-﻿# translate_segment.v2.md
+# translate_segment.v2.md
 
 ## System
 
