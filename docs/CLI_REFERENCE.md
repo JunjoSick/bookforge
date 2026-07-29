@@ -365,6 +365,10 @@ bookforge glossary propose book.epub \
   --qa-provider openrouter \
   --qa-model moonshotai/kimi-k3
 
+# Non-interactive: explicitly accept every usable proposal.
+bookforge glossary accept-candidates cyberiad --language "English->Italian"
+
+# Interactive: inspect, edit, or reject individual rows.
 bookforge glossary review-candidates cyberiad --language "English->Italian"
 ```
 
@@ -430,17 +434,35 @@ rendering; `not_terminology` means it is ordinary language or extraction noise.
 Both are targetless, but they are not interchangeable.
 
 A rendering fills `target_text` but remains `auto_candidate`; it is inactive
-until a human runs `accept N`, edits it with `set N "..."`, or explicitly runs
-`accept-all`. `accept-all` only promotes candidates that have a non-empty
-rendering. A decline writes no target and remains pending for manual treatment.
+until a human explicitly accepts it. For a script or batch experiment, run
+`accept-candidates BOOK_ID`; for row-by-row review, use `accept N`, edit with
+`set N "..."`, or run the REPL's `accept-all`. Both bulk surfaces only promote
+candidates with a non-empty rendering and print stable outcome counts:
+
+```text
+Bulk acceptance: accepted=37 skipped-empty=1 skipped-model-rejected=2.
+```
+
+Model rejections are always skipped by bulk acceptance, even if a malformed or
+future row happens to contain a rendering. A broad opt-in would make it too easy
+to erase the distinction between "the model proposed this rendering" and "the
+model said this is not terminology." Override one deliberately in
+`review-candidates` instead. A decline writes no target and remains pending for
+manual treatment.
+
 A model rejection stays visible in `review-candidates` as an inactive
 `auto_candidate` with a `model rejection (not terminology): ...` note. That note
 both preserves the model's reason and prevents automatic re-proposal. A reviewer
 can override it with `accept N` or `set N "..."`; a human `reject N` instead
 changes the status to `rejected`, so machine and human decisions remain
-distinguishable. The command reports the model-rejection count and prints each
-reason. Existing renderings, model rejections, and `user_seeded`, `accepted`, or
-human-`rejected` decisions are not sent again.
+distinguishable. Existing renderings, model rejections, and `user_seeded`,
+`accepted`, or human-`rejected` decisions are not sent again. Bulk acceptance
+also leaves all three settled statuses untouched.
+
+`accept-candidates` intentionally has no category or `source_count` filters.
+`extract-candidates --min-count/--limit` already controls the batch, while an
+acceptance filter would make partially activated proposal sets easier to mistake
+for complete experiments. Add filters only when a measured workflow needs them.
 
 The command reports the request count plus aggregate estimated and
 provider-reported token counts. As an

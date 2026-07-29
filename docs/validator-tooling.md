@@ -370,6 +370,122 @@ reasoning. That is cents per book, once, against paying for repeated QA after
 terminology has already drifted. The command prints both its prompt estimate and
 provider-reported usage; use the selected model's current rates for budgeting.
 
+### Reproducible accepted-glossary A/B
+
+This experiment asks whether an accepted glossary reduces translation defects,
+not merely whether the glossary machinery runs. **Never run it against the
+owner's real store.** That store contains 30 irreplaceable jobs. BookForge opens
+`.bookforge/jobs.sqlite` relative to the process working directory, so every
+command below runs from one newly created scratch directory and every resulting
+store, run snapshot, output, judge result, and cache stays under that directory.
+
+The final commands require the `judge_translation` example from the quality
+benchmark work. Use a checkout containing both that example and the glossary
+batch-accept command. In PowerShell, edit only `$Repo` and `$Book`, then run the
+commands in order:
+
+```powershell
+$Repo = (Resolve-Path "C:\path\to\bookforge").Path
+$Book = (Resolve-Path "C:\path\to\book.epub").Path
+$Scratch = Join-Path ([IO.Path]::GetTempPath()) ("bookforge-glossary-ab-" + [guid]::NewGuid())
+$Manifest = Join-Path $Repo "Cargo.toml"
+$BookId = "glossary-ab-book"
+$env:Path = "$env:USERPROFILE\.cargo\bin;$env:LOCALAPPDATA\mingw64\bin;$env:Path"
+New-Item -ItemType Directory -Path $Scratch | Out-Null
+Set-Location $Scratch
+
+# Offline preflight: estimate one translation before spending anything.
+cargo run --manifest-path $Manifest --package bookforge-cli --release --bin bookforge -- `
+  estimate $Book --source English --target Italian `
+  --provider deepseek --model deepseek-v4-flash
+
+# Paid run A: no accepted glossary exists in this new store.
+cargo run --manifest-path $Manifest --package bookforge-cli --release --bin bookforge -- `
+  translate $Book --source English --target Italian `
+  --provider deepseek --model deepseek-v4-flash --no-thinking `
+  --book-id $BookId --out (Join-Path $Scratch "baseline.it.epub")
+
+# Copy the value printed after "Job:" before continuing.
+$BaselineJob = "<baseline-job-id>"
+
+# Extraction is offline. Proposal is paid and remains inactive.
+cargo run --manifest-path $Manifest --package bookforge-cli --release --bin bookforge -- `
+  glossary extract-candidates $Book --book-id $BookId `
+  --source-lang English --target-lang Italian
+cargo run --manifest-path $Manifest --package bookforge-cli --release --bin bookforge -- `
+  glossary propose $Book --book-id $BookId --language "English->Italian" `
+  --qa-provider deepseek --qa-model deepseek-v4-pro
+
+# Explicit, non-interactive human decision. Require accepted > 0.
+cargo run --manifest-path $Manifest --package bookforge-cli --release --bin bookforge -- `
+  glossary accept-candidates $BookId --language "English->Italian"
+
+# Paid run B: identical translation settings, now with accepted book terms.
+cargo run --manifest-path $Manifest --package bookforge-cli --release --bin bookforge -- `
+  translate $Book --source English --target Italian `
+  --provider deepseek --model deepseek-v4-flash --no-thinking `
+  --book-id $BookId --out (Join-Path $Scratch "glossary.it.epub")
+
+# Copy the second value printed after "Job:".
+$GlossaryJob = "<glossary-job-id>"
+
+# Offline judge preflights: all passages, identical judge and settings.
+cargo run --manifest-path $Manifest --package bookforge-cli --release `
+  --example judge_translation -- --db (Join-Path $Scratch ".bookforge\jobs.sqlite") `
+  --job $BaselineJob --sample 0 --dry-run `
+  --provider deepseek --model deepseek-v4-pro --max-output-tokens 16000
+cargo run --manifest-path $Manifest --package bookforge-cli --release `
+  --example judge_translation -- --db (Join-Path $Scratch ".bookforge\jobs.sqlite") `
+  --job $GlossaryJob --sample 0 --dry-run `
+  --provider deepseek --model deepseek-v4-pro --max-output-tokens 16000
+
+# Paid judging. The second summary also prints per-category baseline deltas.
+cargo run --manifest-path $Manifest --package bookforge-cli --release `
+  --example judge_translation -- --db (Join-Path $Scratch ".bookforge\jobs.sqlite") `
+  --job $BaselineJob --sample 0 `
+  --provider deepseek --model deepseek-v4-pro --max-output-tokens 16000 `
+  --cache (Join-Path $Scratch ".bookforge\translation-judge-cache") `
+  --out (Join-Path $Scratch "judge-baseline.jsonl") `
+  --summary (Join-Path $Scratch "judge-baseline.summary.json")
+cargo run --manifest-path $Manifest --package bookforge-cli --release `
+  --example judge_translation -- --db (Join-Path $Scratch ".bookforge\jobs.sqlite") `
+  --job $GlossaryJob --sample 0 `
+  --provider deepseek --model deepseek-v4-pro --max-output-tokens 16000 `
+  --cache (Join-Path $Scratch ".bookforge\translation-judge-cache") `
+  --baseline (Join-Path $Scratch "judge-baseline.summary.json") `
+  --out (Join-Path $Scratch "judge-glossary.jsonl") `
+  --summary (Join-Path $Scratch "judge-glossary.summary.json")
+```
+
+Do not continue if batch acceptance prints `accepted=0`; there would be no
+glossary treatment to measure. It always reports all outcomes in one stable
+line, for example:
+
+```text
+Bulk acceptance: accepted=37 skipped-empty=1 skipped-model-rejected=2.
+```
+
+Compare the `hard` group's `per_1k_source_words` in the two summary files.
+Also require equal `passages_judged` and `source_words_judged` before treating
+the rates as a paired comparison. Use the same judge, output cap, passage size,
+and sample/seed for both jobs; `--sample 0` above removes sampling variance.
+
+The second translation gets **no translation-cache hits by design** once at
+least one term is accepted. Active glossary content changes its fingerprint,
+and that fingerprint changes the cache namespace. Run B therefore costs full
+price rather than being a nearly free cache replay.
+
+For a realistic translation budget, start with the offline `estimate` command
+above and double its one-run figure. As a concrete scale, 100,000 estimated
+input tokens and BookForge's 1.15× Italian output assumption produce 115,000
+output tokens. At the bundled and current
+[DeepSeek V4 Flash rates](https://api-docs.deepseek.com/quick_start/pricing/)
+of $0.14/M uncached input and $0.28/M output, that is about **$0.046 per run or
+$0.092 for the two translations**. Prompt/context overhead, retries, and the
+second run's glossary block make **$0.10–$0.15 for the translation pair** a
+more practical one-book budget. Proposal and judge calls are separate; both
+commands report usage or a dry-run maximum before the owner approves payment.
+
 **Bound each request while keeping the per-candidate allowance honest.** A
 reasoning model that runs out mid-thought returns HTTP 200 with *no message
 content at all* — not a truncated answer — so the failure used to surface as
