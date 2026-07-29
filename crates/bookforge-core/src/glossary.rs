@@ -2,7 +2,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ir::Block, marker::parse_paired_marker_open, segment::Segment};
+use crate::{
+    ir::{Block, BlockKind},
+    marker::parse_paired_marker_open,
+    segment::Segment,
+};
 
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -209,6 +213,10 @@ pub struct GlossaryCandidate {
 struct CandidateStats {
     category: GlossaryCategory,
     source_count: usize,
+    /// Occurrences that are capitalised for some reason other than position —
+    /// mid-sentence, outside a heading. A candidate with none of these is a
+    /// common word that only ever opened a sentence.
+    evidence_count: usize,
     forms: BTreeMap<String, usize>,
 }
 
@@ -228,16 +236,27 @@ pub fn extract_glossary_candidates(
             &visible_text,
             stopwords,
             &quoted_italic_sources,
+            matches!(block.kind, BlockKind::Heading(_)),
             &mut candidates,
         );
     }
 
     let min_count = min_count.max(1);
+    let word_evidence = candidates
+        .iter()
+        .filter(|(key, _)| !key.contains(' '))
+        .map(|(key, stats)| (key.clone(), stats.evidence_count))
+        .collect::<HashMap<_, _>>();
     let mut candidates = candidates
-        .into_values()
-        .filter(|stats| {
-            stats.category == GlossaryCategory::Invented || stats.source_count >= min_count
+        .into_iter()
+        .filter(|(key, stats)| {
+            // An author's own italics or quotes are an explicit signal, so
+            // `Invented` bypasses both frequency and positional evidence.
+            stats.category == GlossaryCategory::Invented
+                || (stats.source_count >= min_count
+                    && has_positional_evidence(key, stats, &word_evidence))
         })
+        .map(|(_, stats)| stats)
         .map(|stats| GlossaryCandidate {
             source_text: preferred_form(&stats.forms),
             category: stats.category,
@@ -256,6 +275,86 @@ pub fn extract_glossary_candidates(
         candidates.truncate(limit);
     }
     candidates
+}
+
+/// Return one short source excerpt containing a glossary candidate.
+///
+/// Candidate rows intentionally stay small and source-document agnostic. The
+/// caller can derive this disposable context from the EPUB when it is needed
+/// for a proposal prompt.
+pub fn glossary_candidate_excerpt(
+    blocks: &[Block],
+    source_text: &str,
+    max_chars: usize,
+) -> Option<String> {
+    let source_text = source_text.trim();
+    if source_text.is_empty() {
+        return None;
+    }
+
+    blocks.iter().find_map(|block| {
+        let text = block_visible_text(block);
+        let start = text.find(source_text).or_else(|| {
+            source_text
+                .is_ascii()
+                .then(|| {
+                    text.to_ascii_lowercase()
+                        .find(&source_text.to_ascii_lowercase())
+                })
+                .flatten()
+        })?;
+        let start_char = text[..start].chars().count();
+        let term_chars = source_text.chars().count();
+        Some(sentence_excerpt(
+            &text,
+            start_char,
+            start_char + term_chars,
+            max_chars,
+        ))
+    })
+}
+
+fn sentence_excerpt(text: &str, term_start: usize, term_end: usize, max_chars: usize) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let sentence_start = chars[..term_start]
+        .iter()
+        .rposition(|ch| matches!(ch, '.' | '!' | '?'))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let sentence_end = chars[term_end..]
+        .iter()
+        .position(|ch| matches!(ch, '.' | '!' | '?'))
+        .map(|index| term_end + index + 1)
+        .unwrap_or(chars.len());
+
+    let max_chars = max_chars.max(term_end.saturating_sub(term_start)).max(1);
+    let mut excerpt_start = sentence_start;
+    let mut excerpt_end = sentence_end;
+    if excerpt_end.saturating_sub(excerpt_start) > max_chars {
+        let term_len = term_end.saturating_sub(term_start);
+        let context = max_chars.saturating_sub(term_len);
+        excerpt_start = term_start.saturating_sub(context / 2).max(sentence_start);
+        excerpt_end =
+            (term_end + context.saturating_sub(term_start - excerpt_start)).min(sentence_end);
+        if excerpt_end.saturating_sub(excerpt_start) < max_chars {
+            excerpt_start = excerpt_end.saturating_sub(max_chars).max(sentence_start);
+        }
+    }
+
+    let mut excerpt = chars[excerpt_start..excerpt_end]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string();
+    let mut excerpt_chars = excerpt.chars().count();
+    if excerpt_start > sentence_start && excerpt_chars < max_chars {
+        excerpt.insert(0, '…');
+        excerpt_chars += 1;
+    }
+    if excerpt_end < sentence_end && excerpt_chars < max_chars {
+        excerpt.push('…');
+    }
+    excerpt
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,37 +632,78 @@ fn high_frequency_anchors<'a>(
         .collect()
 }
 
+/// Whether a candidate is capitalised for some reason other than where it sits.
+///
+/// A single word needs at least one mid-sentence, non-heading occurrence:
+/// `Finally` and `Meanwhile` accumulate counts purely from sentence position
+/// and are not terminology.
+///
+/// A multi-word phrase gets a second chance. `Ivan Ilych` may open every
+/// sentence it appears in, but it is still a name if each of its words is
+/// independently attested mid-sentence. That distinguishes it from
+/// `Finally Klapaucius`, where the leading word is attested nowhere. A word
+/// missing from the map was suppressed as an author-marked italic, which is
+/// evidence in its own right.
+fn has_positional_evidence(
+    key: &str,
+    stats: &CandidateStats,
+    word_evidence: &HashMap<String, usize>,
+) -> bool {
+    if stats.evidence_count > 0 {
+        return true;
+    }
+    key.contains(' ')
+        && key
+            .split(' ')
+            .all(|word| word_evidence.get(word).copied().unwrap_or(1) > 0)
+}
+
 fn collect_capitalized_candidates(
     text: &str,
     stopwords: &[&str],
     skip_sources: &HashSet<String>,
+    in_heading: bool,
     candidates: &mut BTreeMap<String, CandidateStats>,
 ) {
     let words = tokenize_words(text);
     let mut index = 0usize;
     while index < words.len() {
         let word = &words[index];
-        if !is_capitalized_candidate_word(word) {
+        if !is_capitalized_candidate_word(&word.text) {
             index += 1;
             continue;
         }
 
-        if !is_common_word(word, stopwords) && !skip_sources.contains(&word.to_lowercase()) {
-            add_candidate(candidates, word, GlossaryCategory::Other);
+        // A heading is title-cased by convention, so nothing in it is
+        // evidence; neither is a word that merely opens a sentence. Such
+        // occurrences still count toward frequency — they just cannot be the
+        // only reason a word became a candidate.
+        let evidential = !in_heading && !word.sentence_initial;
+
+        if !is_common_word(&word.text, stopwords)
+            && !skip_sources.contains(&word.text.to_lowercase())
+        {
+            add_candidate(candidates, &word.text, GlossaryCategory::Other, evidential);
         }
 
         let start = index;
         let mut end = index;
         while end < words.len()
-            && is_capitalized_candidate_word(&words[end])
-            && !is_common_word(&words[end], stopwords)
+            && is_capitalized_candidate_word(&words[end].text)
+            && !is_common_word(&words[end].text, stopwords)
         {
             end += 1;
         }
         if end.saturating_sub(start) >= 2 {
-            let phrase = words[start..end].join(" ");
+            let phrase = words[start..end]
+                .iter()
+                .map(|token| token.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
             if !skip_sources.contains(&phrase.to_lowercase()) {
-                add_candidate(candidates, &phrase, GlossaryCategory::Other);
+                // The phrase inherits its first word's position: every later
+                // word in it is mid-sentence by construction.
+                add_candidate(candidates, &phrase, GlossaryCategory::Other, evidential);
             }
         }
         index += 1;
@@ -612,7 +752,7 @@ fn collect_quoted_italic_candidates(
             let raw_content = &marked[tag_end..close_start];
             if let Some(phrase) = quoted_italic_phrase(&marked, tag_start, close_end, raw_content) {
                 sources.insert(phrase.to_lowercase());
-                add_candidate(candidates, &phrase, GlossaryCategory::Invented);
+                add_candidate(candidates, &phrase, GlossaryCategory::Invented, true);
             }
         }
         offset = close_end;
@@ -648,6 +788,7 @@ fn add_candidate(
     candidates: &mut BTreeMap<String, CandidateStats>,
     source_text: &str,
     category: GlossaryCategory,
+    evidential: bool,
 ) {
     let source_text = normalize_candidate_text(source_text);
     if source_text.chars().filter(|ch| ch.is_alphabetic()).count() < 2 {
@@ -657,12 +798,16 @@ fn add_candidate(
     let entry = candidates.entry(key).or_insert_with(|| CandidateStats {
         category,
         source_count: 0,
+        evidence_count: 0,
         forms: BTreeMap::new(),
     });
     if category == GlossaryCategory::Invented {
         entry.category = GlossaryCategory::Invented;
     }
     entry.source_count += 1;
+    if evidential {
+        entry.evidence_count += 1;
+    }
     *entry.forms.entry(source_text).or_insert(0) += 1;
 }
 
@@ -674,14 +819,42 @@ fn preferred_form(forms: &BTreeMap<String, usize>) -> String {
         .unwrap_or_default()
 }
 
+/// A word plus whether it sits where English capitalises by convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WordToken {
+    text: String,
+    /// True at the start of a block, a sentence, a quotation, or a
+    /// parenthetical. Capitalisation in those positions is grammar, not
+    /// evidence that the word is a name.
+    sentence_initial: bool,
+}
+
+/// Characters after which English capitalises the following word regardless of
+/// what that word is. Sentence terminators and line breaks are the obvious
+/// cases; quotation and parenthesis openers matter just as much, because
+/// `"Good morning," he said` capitalises `Good` for exactly the same reason
+/// `Finally, he left` capitalises `Finally`.
+///
+/// Deliberately excluded: `'` and `’`, which are overwhelmingly apostrophes in
+/// prose; `:`, `;` and dashes, which do not trigger capitalisation in English.
+/// Over-marking costs recall — a term marked sentence-initial everywhere is
+/// dropped — so the set stays narrow.
+fn opens_a_sentence(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | '!' | '?' | '…' | '\n' | '\r' | '"' | '“' | '„' | '«' | '‘' | '‹' | '(' | '['
+    )
+}
+
 // The two `current.push(ch)` branches look identical to clippy but guard
 // semantically distinct cases (alphabetic char vs. internal-word connector
 // with lookahead). Collapsing them with `||` would obscure intent.
 #[allow(clippy::if_same_then_else)]
-fn tokenize_words(text: &str) -> Vec<String> {
+fn tokenize_words(text: &str) -> Vec<WordToken> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut chars = text.chars().peekable();
+    let mut sentence_initial = true;
 
     while let Some(ch) = chars.next() {
         if ch.is_alphabetic() {
@@ -691,13 +864,25 @@ fn tokenize_words(text: &str) -> Vec<String> {
             && chars.peek().is_some_and(|next| next.is_alphabetic())
         {
             current.push(ch);
-        } else if !current.is_empty() {
-            words.push(std::mem::take(&mut current));
+        } else {
+            if !current.is_empty() {
+                words.push(WordToken {
+                    text: std::mem::take(&mut current),
+                    sentence_initial,
+                });
+                sentence_initial = false;
+            }
+            if opens_a_sentence(ch) {
+                sentence_initial = true;
+            }
         }
     }
 
     if !current.is_empty() {
-        words.push(current);
+        words.push(WordToken {
+            text: current,
+            sentence_initial,
+        });
     }
     words
 }
@@ -714,7 +899,15 @@ fn is_capitalized_candidate_word(word: &str) -> bool {
 
 fn is_common_word(word: &str, stopwords: &[&str]) -> bool {
     let key = word.to_lowercase();
-    stopwords.contains(&key.as_str())
+    if stopwords.contains(&key.as_str()) {
+        return true;
+    }
+    // A contraction is as common as the pronoun it is built from. `I'll` and
+    // `It's` sit mid-sentence often enough to pass the positional test, so the
+    // stem is what disqualifies them — while `Trurl's` keeps its stem `trurl`
+    // and stays a candidate.
+    key.split_once(['\'', '’'])
+        .is_some_and(|(stem, _)| stopwords.contains(&stem))
 }
 
 fn is_internal_word_connector(ch: char) -> bool {
@@ -978,6 +1171,155 @@ mod tests {
     }
 
     #[test]
+    fn extraction_ignores_words_capitalized_only_at_sentence_start() {
+        let blocks = vec![block(
+            "Finally the door opened. Finally he spoke. Finally it ended. \
+             Finally they left.",
+        )];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 2, None);
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.source_text == "Finally"),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
+    fn extraction_keeps_words_capitalized_mid_sentence() {
+        let blocks = vec![block(
+            "Finally the door opened. Finally he spoke. Then Finally arrived, \
+             and Finally departed.",
+        )];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 2, None);
+
+        let finally = candidates
+            .iter()
+            .find(|candidate| candidate.source_text == "Finally")
+            .unwrap_or_else(|| panic!("{candidates:?}"));
+        // Every occurrence still counts toward frequency; position only
+        // decides whether the word qualifies at all.
+        assert_eq!(finally.source_count, 4);
+    }
+
+    #[test]
+    fn extraction_treats_a_quotation_opener_as_sentence_start() {
+        let blocks = vec![block(
+            "He said, “Good day.” She said, “Good day.” They said, “Good day.”",
+        )];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 2, None);
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.source_text == "Good"),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
+    fn extraction_ignores_title_case_headings_as_evidence() {
+        let blocks = vec![
+            heading_block("The Third Sally"),
+            heading_block("The Third Sally"),
+            heading_block("The Third Sally"),
+        ];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 2, None);
+
+        // A heading capitalises `Third` by typographic convention, so headings
+        // alone can never promote a word to a candidate.
+        assert!(candidates.is_empty(), "{candidates:?}");
+    }
+
+    #[test]
+    fn extraction_keeps_heading_terms_attested_in_prose() {
+        let blocks = vec![
+            heading_block("The Third Sally"),
+            block("They spoke of the Sally often, and the Sally was long."),
+        ];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 2, None);
+
+        let sally = candidates
+            .iter()
+            .find(|candidate| candidate.source_text == "Sally")
+            .unwrap_or_else(|| panic!("{candidates:?}"));
+        assert_eq!(sally.source_count, 3);
+    }
+
+    #[test]
+    fn extraction_keeps_a_name_phrase_that_always_opens_a_sentence() {
+        // `Ivan Ilych` opens every sentence it appears in, but both of its
+        // words are attested mid-sentence, which is what separates it from
+        // `Finally Klapaucius`.
+        let blocks = vec![block(
+            "Ivan Ilych met Peter Ivanovich. Ivan Ilych greeted Ivan again.",
+        )];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 2, None);
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source_text == "Ivan Ilych"),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
+    fn extraction_drops_a_phrase_led_by_an_unattested_word() {
+        let blocks = vec![block(
+            "Finally Klapaucius arrived. Finally Klapaucius spoke. \
+             Trurl watched Klapaucius closely.",
+        )];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 2, None);
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.source_text == "Finally Klapaucius"),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source_text == "Klapaucius"),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
+    fn extraction_drops_contractions_of_common_words() {
+        let blocks = vec![block(
+            "He said I'll go and I'll stay. She said It's fine and It's over. \
+             Trurl's plan worked, and Trurl's friend agreed.",
+        )];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 2, None);
+
+        for junk in ["I'll", "It's"] {
+            assert!(
+                !candidates
+                    .iter()
+                    .any(|candidate| candidate.source_text == junk),
+                "{junk} survived: {candidates:?}"
+            );
+        }
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source_text == "Trurl's"),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
     fn extraction_discovers_quoted_italic_invented_phrases() {
         let blocks = vec![marked_block(
             vec!["He whispered “", "<m1>Lukh</m1>", "” once."],
@@ -1019,6 +1361,31 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn candidate_excerpt_selects_and_bounds_a_sentence_with_the_term() {
+        let blocks = vec![block(
+            "An unrelated opening. Trurl inspected the phantasmatron before dawn. A final line.",
+        )];
+
+        let excerpt =
+            glossary_candidate_excerpt(&blocks, "phantasmatron", 42).expect("excerpt should exist");
+
+        assert!(excerpt.contains("phantasmatron"), "{excerpt}");
+        assert!(excerpt.chars().count() <= 42, "{excerpt}");
+        assert!(!excerpt.contains("unrelated"), "{excerpt}");
+        assert!(!excerpt.contains("final line"), "{excerpt}");
+    }
+
+    #[test]
+    fn candidate_excerpt_is_case_insensitive_for_ascii_terms() {
+        let blocks = vec![block("The STEELYPIPS arrived at noon.")];
+
+        let excerpt =
+            glossary_candidate_excerpt(&blocks, "Steelypips", 80).expect("excerpt should exist");
+
+        assert_eq!(excerpt, "The STEELYPIPS arrived at noon.");
     }
 
     fn term(source: &str, target: &str, scope_kind: GlossaryScopeKind) -> GlossaryTerm {
@@ -1066,6 +1433,12 @@ mod tests {
 
     fn block(text: &str) -> Block {
         marked_block(vec![text], Vec::new())
+    }
+
+    fn heading_block(text: &str) -> Block {
+        let mut block = marked_block(vec![text], Vec::new());
+        block.kind = BlockKind::Heading(1);
+        block
     }
 
     fn marked_block(text_runs: Vec<&str>, inline_marks: Vec<InlineMark>) -> Block {

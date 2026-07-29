@@ -70,7 +70,9 @@ Operational lessons, all learned the expensive way:
   read on exactly the thing you are measuring.
 - **Raise `--max-output-tokens`.** The 400 default starves reasoning models:
   Kimi K3 returned empty content on **49 of 150** calls at 400, and **4 of 100**
-  at 1200. That is a third of the spend wasted.
+  at 1200. That is a third of the spend wasted. This is the same failure
+  described under "Size the output cap from the candidate count" below, and it
+  has now been hit by three separate call sites.
 - **Verdicts are cached on disk** by content hash, so re-runs of already-judged
   units are free. Keep the cache directory between runs.
 - **Judges disagree, and the stricter one has been right.** On a shared subset,
@@ -173,6 +175,67 @@ unit.
 
 Naive chunking therefore trades a 40% signal for better-behaved noise. Measure
 before believing either direction.
+
+## Prevent terminology drift before translation
+
+The terminology defects above share a cheaper intervention point than QA:
+extract repeated or invented source terms once, have a strong model propose a
+canonical target rendering with a short source excerpt, then require a human
+decision before that rendering becomes active.
+
+```bash
+bookforge glossary extract-candidates book.epub \
+  --book-id cyberiad \
+  --source-lang English \
+  --target-lang Italian
+bookforge glossary propose book.epub \
+  --book-id cyberiad \
+  --language "English->Italian" \
+  --qa-provider openrouter \
+  --qa-model moonshotai/kimi-k3
+bookforge glossary review-candidates cyberiad --language "English->Italian"
+```
+
+The proposal prompt makes invented-word strategy explicit: preserve the source,
+translate it directly, calque its components, recreate a target-language
+neologism, or decline when a genuine term's excerpt is insufficient. It can
+separately reject ordinary language as `not_terminology`. Every answer requires
+a one-sentence rationale.
+
+Renderings and model rejections remain inactive `auto_candidate` rows; the
+reviewer must accept or edit them before they can reach translation. A model
+rejection is stored with a visible `model rejection (not terminology): ...`
+note, is skipped by later proposal passes, and remains in `review-candidates`
+for human override. Human rejection uses the distinct `rejected` status. The
+command reports how many candidates the model rejected and prints each reason.
+Settled and already-proposed terms are not sent again, and a provider or
+response-validation failure occurs before any candidate write.
+
+Candidate extraction itself is English-specific: its positional evidence models
+English capitalization and non-English input gets only a 17-word English
+fallback stoplist. German common nouns are capitalized mid-sentence, so every
+repeated noun can clear that filter. Treat extraction as recall and the strong
+model as precision. The default `--min-count 3` is the recommended compromise:
+it recovers three-occurrence terms without paying the 320-output-token budget
+for the much larger one- and two-occurrence tail.
+
+This pass is deliberately book-sized rather than segment-sized. A measured run —
+The Cyberiad, 40 candidates, Kimi K3 — cost 2,355 provider input tokens and
+**8,277 output tokens**: about 207 output tokens per candidate, most of it
+reasoning. That is cents per book, once, against paying for repeated QA after
+terminology has already drifted. The command prints both its prompt estimate and
+provider-reported usage; use the selected model's current rates for budgeting.
+
+**Size the output cap from the candidate count, not a flat number.** One request
+carries every pending candidate, so the budget has to scale. A reasoning model
+that runs out mid-thought returns HTTP 200 with *no message content at all* —
+not a truncated answer — so the failure used to surface as
+`missing choices[0].message.content`, which says nothing about the cause. This
+happened three separate times in two days: `judge_flags` at its 400-token
+default, the QA pass at the provider default, and this command at a flat 4,096.
+The provider now recognises that shape — `finish_reason: length`, or reasoning
+present with content absent — and names the flag to raise. `glossary propose`
+sizes its own budget at 320 tokens per candidate (floor 8,192, ceiling 65,536).
 
 ## Cost
 
