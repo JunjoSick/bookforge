@@ -5,15 +5,16 @@ string-level check fires. Those checks have no model of meaning, so some
 proportion of what they flag is wrong — and until 2026-07-26 nothing measured
 which proportion.
 
-Three dev-time examples cover validator replay, flag precision, and translation
-quality. None is wired into `translate`, and none should be: a model that gated
-or repaired translations would violate the architectural invariants in
-`ROADMAP.md` §1.1–§1.2.
+Four dev-time examples cover validator replay, flag precision, translation
+quality, and quality-finding precision. None is wired into `translate`, and none
+should be: a model that gated or repaired translations would violate the
+architectural invariants in `ROADMAP.md` §1.1–§1.2.
 
 ```
 cargo run --release --example replay_validation -- --help
 cargo run --release --example judge_flags -- --help
 cargo run --release --example judge_translation -- --help
+cargo run --release --example adjudicate_translation -- --help
 ```
 
 ## `replay_validation` — replay the validator offline, for free
@@ -158,8 +159,20 @@ Important measurement rules:
   and the summary. `--sample 0` explicitly selects everything and warns that
   the spend cap is gone.
 - The judge returns enumerable defects, not a score or severity. Every finding
-  must contain exact non-empty source and translation quotes. Missing quotes
-  and non-verbatim quotes are dropped and counted.
+  must contain exact non-empty source and translation quotes. Missing quotes,
+  non-verbatim quotes, and self-refuting explanations are dropped and counted
+  separately in both passage JSONL and the summary.
+- The self-refutation filter is deterministic because all three measured
+  attempts to suppress non-issues through prompt wording made the QA reviewer
+  noisier. It recognizes explicit English dismissals such as `no error`,
+  `no issue`, `is correct`, and `correctly translated`. A finding is retained
+  if the explanation contains a contrast marker (`but`, `however`, `although`,
+  and similar), a separate defect assertion, or a negated/hypothetical
+  correctness claim. Thus `X is correct, but Y is wrong` remains a finding.
+  This conservative lexical rule can miss paraphrased or non-English
+  self-refutations, and it deliberately keeps some fully dismissive
+  explanations that happen to use a contrast word. Those are false negatives;
+  the rule is biased against silently dropping a genuine mixed complaint.
 - Counts and defects per 1,000 source words are reported for every category.
   The three hard categories and three soft categories are also reported as
   separate groups. There is intentionally no combined headline score.
@@ -220,6 +233,91 @@ v4-pro buys around 40× the coverage per dollar.
 **Kimi K3 starved even at 16,000 output tokens** on 2 of 25 passages, and on 10
 of 25 at 4,096. It can burn more than 16k reasoning tokens on a 1,500-character
 passage. Budget accordingly, and see the empty-content diagnosis note above.
+
+### Self-refuting findings, measured 2026-07-29
+
+The first glossary A/B run exposed a deterministic failure mode in the absolute
+counts. Of 587 findings, 67 dismissed their own complaint:
+
+| arm | raw findings | self-refuting | retained |
+| --- | ---: | ---: | ---: |
+| baseline | 262 | 25 (9%) | 237 |
+| glossary | 325 | 42 (12%) | 283 |
+
+For `target_language_error`, 20 of 43 findings (47%) were self-refuting.
+Leaving those rows in made the glossary arm look 116% worse on soft defects;
+removing them changed that comparison to +24%. This does not make the remaining
+findings true. It only establishes the minimum rule that a finding cannot
+simultaneously say there is no defect.
+
+Cached passage outcomes written before the filter are filtered when read, so a
+cache replay adopts the new rule without another provider call. Old result
+JSONL can also be passed directly to the adjudicator below; it defensively
+applies the same rule and reports `dropped_input_self_refuting`.
+
+## `adjudicate_translation` — measure quality-finding precision
+
+This is a separate example rather than a mode inside `judge_translation`.
+Generation reads a throwaway job-store copy and measures defect incidence;
+adjudication reads only the resulting JSONL and measures whether each claim is
+right. Keeping those phases separate makes it impossible for calibration to
+rewrite a translation or accidentally reopen the owner's store, and lets one
+paid generation be calibrated repeatedly with different adjudicators.
+
+As with `judge_flags`, each request asks one narrow question. The input is one
+finding's claimed category, exact source span, exact translation span, and
+explanation. Start offline:
+
+```
+cargo run --release --example adjudicate_translation -- \
+    --results judge-translation.jsonl \
+    --provider deepseek --model deepseek-v4-pro \
+    --limit 0 --dry-run
+```
+
+`--limit` truncates in input order; it does not sample. Use `--limit 0` only
+after inspecting the dry-run maximum, or externally shuffle with a recorded
+seed if a capped precision sample is required. The paid owner-run command is:
+
+```
+cargo run --release --example adjudicate_translation -- \
+    --results judge-translation.jsonl \
+    --provider deepseek --model deepseek-v4-pro \
+    --max-output-tokens 1024 --limit 0 \
+    --out translation-adjudication.jsonl \
+    --summary translation-adjudication.summary.json
+```
+
+The content-addressed cache key includes
+`adjudicate_translation/v1`, scorer, provider/model, temperature, output cap,
+languages, category, both spans, and the complaint. It never contains the API
+key. `--api-key-env` is an environment-variable **name**, never a key value.
+Parsed and unparseable responses are both cached; an unparseable response is a
+terminal JSONL record and is never repaired or re-prompted.
+
+The frozen adjudication JSONL schema records identity and audit text plus:
+
+```
+schema_version, prompt_version, finding_id, passage_id, finding_index,
+category, source_quote, translation_quote, explanation, status,
+verdict, confidence, rationale, cached, input_tokens, output_tokens, error
+```
+
+`status` is `parsed`, `unparseable`, or `error`; parsed `verdict` is
+`true_positive`, `false_positive`, or `unclear`. The summary emits all six
+categories with `findings`, `adjudicated`, verdict counts, `unparseable`,
+`request_errors`, and `true_positive_rate`. The rate is true positives divided
+by parsed adjudications, including parsed `unclear` verdicts. Unparseable
+responses and request errors are visible but do not become false positives. A
+category with no parsed adjudications has JSON `null` and prints `-`, because
+0/0 is not 0% precision.
+
+The hand review of eight `meaning_changed` findings suggested roughly half were
+genuine, including a negation inversion and `Unwinched Waifs` rendered as
+“unscrewed orphans”; eight is not a precision measurement. No paid adjudication
+was run while adding this tooling. The owner-run summary above is the source of
+truth for the per-category table; do not copy the 4/8 impression into a reported
+rate.
 
 ## What this measured, 2026-07-26/27
 

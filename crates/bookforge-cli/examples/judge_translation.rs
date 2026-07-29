@@ -270,6 +270,8 @@ struct PassageRecord {
     raw_defect_count: usize,
     dropped_missing_quote: usize,
     dropped_non_verbatim_quote: usize,
+    #[serde(default)]
+    dropped_self_refuting: usize,
     cached: bool,
     input_tokens: u64,
     output_tokens: u64,
@@ -324,6 +326,12 @@ struct QualitySummary {
     unparseable_responses: usize,
     request_errors: usize,
     dropped_defects: usize,
+    #[serde(default)]
+    dropped_missing_quote: usize,
+    #[serde(default)]
+    dropped_non_verbatim_quote: usize,
+    #[serde(default)]
+    dropped_self_refuting: usize,
     cache_hits: usize,
     provider_calls: usize,
     input_tokens: u64,
@@ -790,6 +798,8 @@ struct CachedOutcome {
     raw_defect_count: usize,
     dropped_missing_quote: usize,
     dropped_non_verbatim_quote: usize,
+    #[serde(default)]
+    dropped_self_refuting: usize,
     error: Option<String>,
 }
 
@@ -921,6 +931,7 @@ fn interpret_response(
             raw_defect_count: 0,
             dropped_missing_quote: 0,
             dropped_non_verbatim_quote: 0,
+            dropped_self_refuting: 0,
             error: Some(reason.to_string()),
         },
         input_tokens,
@@ -940,6 +951,7 @@ fn interpret_response(
     let mut defects = Vec::new();
     let mut dropped_missing_quote = 0usize;
     let mut dropped_non_verbatim_quote = 0usize;
+    let mut dropped_self_refuting = 0usize;
     for raw in response.defects {
         let Some(source_quote) = nonempty_quote(raw.source_quote) else {
             dropped_missing_quote += 1;
@@ -953,6 +965,10 @@ fn interpret_response(
             || !passage.translated_text.contains(&translation_quote)
         {
             dropped_non_verbatim_quote += 1;
+            continue;
+        }
+        if is_self_refuting_explanation(&raw.explanation) {
+            dropped_self_refuting += 1;
             continue;
         }
         defects.push(Defect {
@@ -970,6 +986,7 @@ fn interpret_response(
             raw_defect_count,
             dropped_missing_quote,
             dropped_non_verbatim_quote,
+            dropped_self_refuting,
             error: None,
         },
         input_tokens,
@@ -981,6 +998,107 @@ fn nonempty_quote(quote: Option<String>) -> Option<String> {
     let quote = quote?;
     let trimmed = quote.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Drop only explanations that unambiguously dismiss their own complaint.
+///
+/// This is intentionally lexical and conservative. Prompt-only attempts at
+/// suppressing non-issues have increased finding volume in prior measurements,
+/// while a deterministic filter is stable and auditable. Any contrast marker
+/// or separate defect assertion keeps the finding, so mixed explanations such
+/// as "X is correct, but Y is wrong" are never discarded.
+fn is_self_refuting_explanation(explanation: &str) -> bool {
+    let words = explanation
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+
+    const DISMISSALS: &[&[&str]] = &[
+        &["no", "error"],
+        &["no", "errors"],
+        &["no", "issue"],
+        &["no", "issues"],
+        &["no", "problem"],
+        &["no", "problems"],
+        &["nothing", "wrong"],
+        &["is", "correct"],
+        &["is", "accurate"],
+        &["correctly", "translated"],
+        &["translated", "correctly"],
+        &["accurately", "translated"],
+        &["translated", "accurately"],
+    ];
+    let has_dismissal = DISMISSALS
+        .iter()
+        .any(|phrase| contains_word_sequence(&words, phrase));
+    if !has_dismissal {
+        return false;
+    }
+
+    // Negated and hypothetical correctness claims are not dismissals. Keeping
+    // the entire explanation on these markers is deliberately conservative.
+    const DISMISSAL_BLOCKERS: &[&str] = &["could", "hardly", "never", "not", "should", "would"];
+    if words
+        .iter()
+        .any(|word| DISMISSAL_BLOCKERS.contains(&word.as_str()))
+    {
+        return false;
+    }
+
+    const CONTRAST_MARKERS: &[&str] = &[
+        "although",
+        "but",
+        "except",
+        "however",
+        "nevertheless",
+        "though",
+        "yet",
+    ];
+    if words
+        .iter()
+        .any(|word| CONTRAST_MARKERS.contains(&word.as_str()))
+    {
+        return false;
+    }
+
+    const DEFECT_ASSERTIONS: &[&str] = &[
+        "added",
+        "adds",
+        "changed",
+        "changes",
+        "dropped",
+        "fails",
+        "incorrect",
+        "inconsistent",
+        "missing",
+        "mistranslated",
+        "omitted",
+        "ungrammatical",
+        "unidiomatic",
+        "wrong",
+    ];
+    if words
+        .iter()
+        .any(|word| DEFECT_ASSERTIONS.contains(&word.as_str()))
+    {
+        return false;
+    }
+
+    !words.iter().enumerate().any(|(index, word)| {
+        matches!(
+            word.as_str(),
+            "error" | "errors" | "issue" | "issues" | "problem" | "problems"
+        ) && index
+            .checked_sub(1)
+            .is_none_or(|previous| words[previous] != "no")
+    })
+}
+
+fn contains_word_sequence(words: &[String], phrase: &[&str]) -> bool {
+    words
+        .windows(phrase.len())
+        .any(|window| window.iter().map(String::as_str).eq(phrase.iter().copied()))
 }
 
 /// Deterministically unwrap a whole-response JSON fence. Contents are not
@@ -1084,7 +1202,18 @@ struct OutcomeCache {
 impl OutcomeCache {
     fn get(&self, key: &str) -> Option<CachedOutcome> {
         let path = self.dir.as_ref()?.join(format!("{key}.json"));
-        serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+        let mut outcome =
+            serde_json::from_str::<CachedOutcome>(&fs::read_to_string(path).ok()?).ok()?;
+        // Cache entries written before this deterministic filter existed still
+        // receive the current filtering semantics without another paid call.
+        let before = outcome.defects.len();
+        outcome
+            .defects
+            .retain(|defect| !is_self_refuting_explanation(&defect.explanation));
+        outcome.dropped_self_refuting = outcome
+            .dropped_self_refuting
+            .saturating_add(before.saturating_sub(outcome.defects.len()));
+        Some(outcome)
     }
 
     fn put(&self, key: &str, outcome: &CachedOutcome) {
@@ -1286,6 +1415,7 @@ async fn run_scoring<S: TranslationScorer>(
                         0,
                         0,
                         0,
+                        0,
                         false,
                         0,
                         0,
@@ -1313,6 +1443,7 @@ async fn run_scoring<S: TranslationScorer>(
             outcome.cached.raw_defect_count,
             outcome.cached.dropped_missing_quote,
             outcome.cached.dropped_non_verbatim_quote,
+            outcome.cached.dropped_self_refuting,
             cached,
             outcome.input_tokens,
             outcome.output_tokens,
@@ -1333,6 +1464,7 @@ fn passage_record(
     raw_defect_count: usize,
     dropped_missing_quote: usize,
     dropped_non_verbatim_quote: usize,
+    dropped_self_refuting: usize,
     cached: bool,
     input_tokens: u64,
     output_tokens: u64,
@@ -1358,6 +1490,7 @@ fn passage_record(
         raw_defect_count,
         dropped_missing_quote,
         dropped_non_verbatim_quote,
+        dropped_self_refuting,
         cached,
         input_tokens,
         output_tokens,
@@ -1419,6 +1552,19 @@ fn build_summary(
         })
         .collect();
 
+    let dropped_missing_quote: usize = parsed
+        .iter()
+        .map(|record| record.dropped_missing_quote)
+        .sum();
+    let dropped_non_verbatim_quote: usize = parsed
+        .iter()
+        .map(|record| record.dropped_non_verbatim_quote)
+        .sum();
+    let dropped_self_refuting: usize = parsed
+        .iter()
+        .map(|record| record.dropped_self_refuting)
+        .sum();
+
     QualitySummary {
         schema_version: SUMMARY_SCHEMA_VERSION,
         prompt_version: PROMPT_VERSION.to_string(),
@@ -1436,14 +1582,12 @@ fn build_summary(
             .filter(|record| record.status == RecordStatus::Unparseable)
             .count(),
         request_errors: run.request_errors,
-        dropped_defects: parsed
-            .iter()
-            .map(|record| {
-                record
-                    .dropped_missing_quote
-                    .saturating_add(record.dropped_non_verbatim_quote)
-            })
-            .sum(),
+        dropped_defects: dropped_missing_quote
+            .saturating_add(dropped_non_verbatim_quote)
+            .saturating_add(dropped_self_refuting),
+        dropped_missing_quote,
+        dropped_non_verbatim_quote,
+        dropped_self_refuting,
         cache_hits: run.cache_hits,
         provider_calls: run.provider_calls,
         input_tokens: run.input_tokens,
@@ -1529,6 +1673,12 @@ fn print_human_report(summary: &QualitySummary, corpus: &CorpusStats, owner_db: 
         summary.unparseable_responses, summary.request_errors
     );
     println!("dropped defects    : {}", summary.dropped_defects);
+    println!("  missing quote    : {}", summary.dropped_missing_quote);
+    println!(
+        "  non-verbatim     : {}",
+        summary.dropped_non_verbatim_quote
+    );
+    println!("  self-refuting    : {}", summary.dropped_self_refuting);
     println!(
         "cache/calls        : {}/{}",
         summary.cache_hits, summary.provider_calls
@@ -1826,6 +1976,7 @@ mod tests {
             raw_defect_count: 0,
             dropped_missing_quote: 0,
             dropped_non_verbatim_quote: 0,
+            dropped_self_refuting: 0,
             cached: false,
             input_tokens: 0,
             output_tokens: 0,
@@ -1918,6 +2069,38 @@ mod tests {
         assert_eq!(outcome.cached.defects.len(), 1);
         assert_eq!(outcome.cached.dropped_missing_quote, 2);
         assert_eq!(outcome.cached.dropped_non_verbatim_quote, 1);
+        assert_eq!(outcome.cached.dropped_self_refuting, 0);
+    }
+
+    #[test]
+    fn self_refuting_findings_are_dropped_but_mixed_findings_are_kept() {
+        let passage = Passage {
+            source_text: "Grand Seneschal and the steward".to_string(),
+            translated_text: "Gran Siniscalco e l'amministratore".to_string(),
+            ..passage(1)
+        };
+        let response = r#"{"defects":[
+            {"category":"target_language_error","source_quote":"Grand Seneschal","translation_quote":"Gran Siniscalco","explanation":"'Grand Seneschal' is correctly translated as 'Gran Siniscalco'. No error."},
+            {"category":"meaning_changed","source_quote":"Grand Seneschal and the steward","translation_quote":"Gran Siniscalco e l'amministratore","explanation":"'Grand Seneschal' is correct, but 'steward' is wrong."}
+        ]}"#;
+        let outcome = interpret_response(response, &passage, 11, 12);
+
+        assert!(outcome.cached.parsed);
+        assert_eq!(outcome.cached.raw_defect_count, 2);
+        assert_eq!(outcome.cached.defects.len(), 1);
+        assert_eq!(
+            outcome.cached.defects[0].category,
+            DefectCategory::MeaningChanged
+        );
+        assert_eq!(outcome.cached.dropped_missing_quote, 0);
+        assert_eq!(outcome.cached.dropped_non_verbatim_quote, 0);
+        assert_eq!(outcome.cached.dropped_self_refuting, 1);
+        assert!(!is_self_refuting_explanation(
+            "The title is not correctly translated."
+        ));
+        assert!(!is_self_refuting_explanation(
+            "The title would be correctly translated as Gran Siniscalco."
+        ));
     }
 
     #[test]
@@ -1987,9 +2170,31 @@ mod tests {
 
         assert_eq!(summary.passages_judged, 2);
         assert_eq!(summary.source_words_judged, 150);
+        assert_eq!(summary.dropped_missing_quote, 0);
+        assert_eq!(summary.dropped_non_verbatim_quote, 0);
+        assert_eq!(summary.dropped_self_refuting, 0);
         assert_eq!(meaning.count, 3);
         assert!((meaning.per_1k_source_words - 20.0).abs() < f64::EPSILON);
         assert!((hard_group.per_1k_source_words - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn summary_reports_each_drop_counter_separately() {
+        let mut record = parsed_record(10, Vec::new());
+        record.dropped_missing_quote = 2;
+        record.dropped_non_verbatim_quote = 3;
+        record.dropped_self_refuting = 5;
+        let run = RunResult {
+            records: vec![record],
+            ..RunResult::default()
+        };
+
+        let summary = build_summary(&test_args(), &test_endpoint(), 1, &run);
+
+        assert_eq!(summary.dropped_missing_quote, 2);
+        assert_eq!(summary.dropped_non_verbatim_quote, 3);
+        assert_eq!(summary.dropped_self_refuting, 5);
+        assert_eq!(summary.dropped_defects, 10);
     }
 
     #[test]
