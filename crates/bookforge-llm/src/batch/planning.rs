@@ -573,34 +573,18 @@ fn item_token_estimate(
         return estimate;
     };
 
-    let entries = config
-        .glossary
-        .entries_by_segment
-        .get(&item.segment_id.0)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    if !entries.is_empty() {
-        estimate += match config.glossary.format {
-            GlossaryFormat::Json => {
-                let rendered = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_string());
-                token_estimate("glossary") + token_estimate(&rendered)
-            }
-            GlossaryFormat::Prose => {
-                let rendered = crate::scheduler::render_glossary_prose(entries);
-                token_estimate("glossary_prose") + token_estimate(&rendered)
-            }
-        };
-    }
     if let Some(guidance) = config.glossary.guidance_by_segment.get(&item.segment_id.0) {
         estimate += token_estimate("retry_guidance") + token_estimate(guidance);
     }
     estimate
 }
 
-fn batch_fixed_token_estimate(config: Option<&TranslationRunConfig>) -> usize {
+fn batch_fixed_token_estimate(
+    items: &[TranslationBatchItem],
+    config: Option<&TranslationRunConfig>,
+) -> usize {
     config
-        .and_then(|config| config.glossary.prompt_extra.as_deref())
-        .map(token_estimate)
+        .map(|config| token_estimate(&super::rendering::render_batch_prompt_extra(items, config)))
         .unwrap_or(0)
 }
 
@@ -608,7 +592,7 @@ fn batch_token_estimate(
     items: &[TranslationBatchItem],
     config: Option<&TranslationRunConfig>,
 ) -> usize {
-    batch_fixed_token_estimate(config)
+    batch_fixed_token_estimate(items, config)
         + items
             .iter()
             .map(|item| item_token_estimate(item, config))
@@ -782,8 +766,7 @@ fn repack_batch_with_config(
     let max_items = max_items.max(1);
     let mut out = Vec::new();
     let mut current_items = Vec::new();
-    let fixed_tokens = batch_fixed_token_estimate(config);
-    let mut current_tokens = fixed_tokens;
+    let mut current_tokens = 0usize;
     let mut part = 0usize;
     let base_id = batch.id;
     let base_ordinal = batch.ordinal;
@@ -792,11 +775,14 @@ fn repack_batch_with_config(
     let section_id = batch.section_id;
 
     for item in batch.items {
-        let item_tokens = item_token_estimate(&item, config).max(1);
         let would_exceed_items = current_items.len() >= max_items;
-        let would_exceed_tokens =
-            !current_items.is_empty() && current_tokens + item_tokens > target_tokens;
+        current_items.push(item);
+        let candidate_tokens = batch_token_estimate(&current_items, config);
+        let would_exceed_tokens = current_items.len() > 1 && candidate_tokens > target_tokens;
         if would_exceed_items || would_exceed_tokens {
+            let item = current_items
+                .pop()
+                .expect("candidate batch contains the item just added");
             out.push(TranslationBatch {
                 id: format!("{base_id}_adaptive_{part}"),
                 ordinal: base_ordinal * 1000 + part,
@@ -806,11 +792,12 @@ fn repack_batch_with_config(
                 token_estimate: current_tokens,
                 section_id: section_id.clone(),
             });
-            current_tokens = fixed_tokens;
+            current_items.push(item);
+            current_tokens = batch_token_estimate(&current_items, config);
             part += 1;
+        } else {
+            current_tokens = candidate_tokens;
         }
-        current_tokens += item_tokens;
-        current_items.push(item);
     }
 
     if !current_items.is_empty() {

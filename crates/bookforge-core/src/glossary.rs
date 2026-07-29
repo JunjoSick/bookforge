@@ -357,7 +357,7 @@ fn sentence_excerpt(text: &str, term_start: usize, term_end: usize, max_chars: u
     excerpt
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GlossaryPromptTerm {
     pub source: String,
     pub target: String,
@@ -567,8 +567,8 @@ fn enforce_budget(
     let mut truncated = 0usize;
     for (term, rule) in terms {
         let estimate = estimate_prompt_tokens(term);
-        if used + estimate <= budget_tokens || kept.is_empty() {
-            used += estimate;
+        if used.saturating_add(estimate) <= budget_tokens {
+            used = used.saturating_add(estimate);
             kept.push((term, rule));
         } else if term.status == GlossaryStatus::UserSeeded || term.always_active {
             truncated += 1;
@@ -578,12 +578,22 @@ fn enforce_budget(
 }
 
 fn estimate_prompt_tokens(term: &GlossaryTerm) -> usize {
-    let note = term.notes.as_deref().unwrap_or("");
-    let chars = term.source_text.len()
-        + term.target_text.len()
-        + term.category.as_str().len()
-        + note.len()
-        + 16;
+    // The budget applies to the serialized prompt entries, not just their
+    // user-authored values. Account for field names, JSON punctuation,
+    // `term_id`, and `case_sensitive`; the old value-only estimate omitted
+    // most of that cost. Three extra characters conservatively cover this
+    // entry's comma plus the surrounding array brackets.
+    let prompt_term = GlossaryPromptTerm::from_term(term);
+    let chars = serde_json::to_string(&prompt_term)
+        .map(|rendered| rendered.chars().count().saturating_add(3))
+        .unwrap_or_else(|_| {
+            term.source_text
+                .chars()
+                .count()
+                .saturating_add(term.target_text.chars().count())
+                .saturating_add(term.notes.as_deref().unwrap_or("").chars().count())
+                .saturating_add(64)
+        });
     chars.div_ceil(3).max(1)
 }
 
@@ -1121,6 +1131,36 @@ mod tests {
             GlossarySelectionRule::HighFrequencyAnchor
         );
         assert_eq!(credited.len(), 4);
+    }
+
+    #[test]
+    fn selection_budget_bounds_the_serialized_glossary_entries() {
+        let terms = (0..80)
+            .map(|index| {
+                term(
+                    &format!("Source{index:02}"),
+                    &format!("Target{index:02}"),
+                    GlossaryScopeKind::Book,
+                )
+            })
+            .collect::<Vec<_>>();
+        let source = terms
+            .iter()
+            .map(|term| term.source_text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let segments = vec![segment("seg_budget", 0, &source)];
+        let budget_tokens = 200;
+
+        let selections = select_glossary_for_segments(&segments, &terms, budget_tokens);
+        let rendered =
+            serde_json::to_string(&selections.entries_by_segment["seg_budget"]).expect("serialize");
+        let conservative_rendered_tokens = rendered.chars().count().div_ceil(3);
+
+        assert!(
+            conservative_rendered_tokens <= budget_tokens,
+            "selected glossary rendered to {conservative_rendered_tokens} estimated tokens for a {budget_tokens}-token budget"
+        );
     }
 
     #[test]
