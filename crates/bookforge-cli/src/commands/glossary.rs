@@ -44,6 +44,8 @@ enum GlossaryCommand {
     ExtractCandidates(ExtractCandidatesArgs),
     /// Ask a review model for target renderings of pending candidates.
     Propose(ProposeArgs),
+    /// Accept every rendered candidate without starting an interactive review.
+    AcceptCandidates(AcceptCandidatesArgs),
     /// Interactively accept, translate, or reject extracted candidates.
     ReviewCandidates(ReviewCandidatesArgs),
 }
@@ -152,6 +154,14 @@ struct ReviewCandidatesArgs {
 }
 
 #[derive(Debug, Args)]
+struct AcceptCandidatesArgs {
+    book_id: String,
+
+    #[arg(long)]
+    language: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct ProposeArgs {
     input: PathBuf,
 
@@ -234,6 +244,7 @@ pub async fn run(args: GlossaryArgs) -> Result<()> {
         GlossaryCommand::Export(args) => export_terms(&store, args),
         GlossaryCommand::ExtractCandidates(args) => extract_candidates(&store, args),
         GlossaryCommand::Propose(args) => propose_candidates(&store, args).await,
+        GlossaryCommand::AcceptCandidates(args) => accept_candidates(&store, args),
         GlossaryCommand::ReviewCandidates(args) => review_candidates(&store, args),
     }
 }
@@ -502,10 +513,14 @@ fn candidate_needs_proposal(candidate: &StoredGlossaryCandidate) -> bool {
         .target_text
         .as_deref()
         .is_none_or(|target| target.trim().is_empty())
-        && !candidate
-            .notes
-            .as_deref()
-            .is_some_and(|notes| notes.starts_with(MODEL_REJECTION_NOTE_PREFIX))
+        && !candidate_is_model_rejected(candidate)
+}
+
+fn candidate_is_model_rejected(candidate: &StoredGlossaryCandidate) -> bool {
+    candidate
+        .notes
+        .as_deref()
+        .is_some_and(|notes| notes.starts_with(MODEL_REJECTION_NOTE_PREFIX))
 }
 
 fn model_rejection_note(reason: &str) -> String {
@@ -650,6 +665,67 @@ fn format_optional_tokens(tokens: Option<u64>) -> String {
         .unwrap_or_else(|| "unreported".to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct BulkAcceptanceCounts {
+    accepted: usize,
+    skipped_empty: usize,
+    skipped_model_rejected: usize,
+}
+
+fn accept_candidates(store: &JobStore, args: AcceptCandidatesArgs) -> Result<()> {
+    let Some((source_language, target_language)) =
+        resolve_candidate_language_pair(store, &args.book_id, args.language.as_deref())?
+    else {
+        println!(
+            "{}",
+            format_bulk_acceptance_summary(BulkAcceptanceCounts::default())
+        );
+        return Ok(());
+    };
+    let candidates =
+        store.list_glossary_candidates(&args.book_id, &source_language, &target_language)?;
+    let counts = bulk_accept_candidates(store, &candidates)?;
+    println!("{}", format_bulk_acceptance_summary(counts));
+    Ok(())
+}
+
+fn bulk_accept_candidates(
+    store: &JobStore,
+    candidates: &[StoredGlossaryCandidate],
+) -> Result<BulkAcceptanceCounts> {
+    let mut counts = BulkAcceptanceCounts::default();
+    for candidate in candidates {
+        if candidate_is_model_rejected(candidate) {
+            counts.skipped_model_rejected += 1;
+            continue;
+        }
+        if candidate
+            .target_text
+            .as_deref()
+            .is_none_or(|target| target.trim().is_empty())
+        {
+            counts.skipped_empty += 1;
+            continue;
+        }
+        if !store.accept_glossary_candidate(candidate.id, None)? {
+            anyhow::bail!(
+                "candidate {} was no longer pending; accepted {} candidates before stopping",
+                candidate.id,
+                counts.accepted
+            );
+        }
+        counts.accepted += 1;
+    }
+    Ok(counts)
+}
+
+fn format_bulk_acceptance_summary(counts: BulkAcceptanceCounts) -> String {
+    format!(
+        "Bulk acceptance: accepted={} skipped-empty={} skipped-model-rejected={}.",
+        counts.accepted, counts.skipped_empty, counts.skipped_model_rejected
+    )
+}
+
 fn review_candidates(store: &JobStore, args: ReviewCandidatesArgs) -> Result<()> {
     let Some((source_language, target_language)) =
         resolve_candidate_language_pair(store, &args.book_id, args.language.as_deref())?
@@ -699,24 +775,8 @@ fn review_candidates(store: &JobStore, args: ReviewCandidatesArgs) -> Result<()>
                 }
             }
             Ok(ReviewCommand::AcceptAll) => {
-                let proposed = candidates
-                    .iter()
-                    .filter(|candidate| {
-                        candidate
-                            .target_text
-                            .as_deref()
-                            .is_some_and(|target| !target.trim().is_empty())
-                    })
-                    .collect::<Vec<_>>();
-                let mut accepted = 0usize;
-                for candidate in proposed {
-                    if store.accept_glossary_candidate(candidate.id, None)? {
-                        accepted += 1;
-                    }
-                }
-                println!(
-                    "Accepted {accepted} proposed renderings; candidates without a rendering remain pending."
-                );
+                let counts = bulk_accept_candidates(store, &candidates)?;
+                println!("{}", format_bulk_acceptance_summary(counts));
             }
             Ok(ReviewCommand::Set(number, target)) => {
                 let candidate = match candidate_by_number(&candidates, number) {
@@ -1337,6 +1397,108 @@ case_sensitive = true
         assert_eq!(
             parse_review_command("quit").expect("quit command"),
             ReviewCommand::Quit
+        );
+    }
+
+    #[test]
+    fn bulk_acceptance_promotes_rendered_candidates_and_preserves_other_decisions() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open(directory.path().join("jobs.sqlite")).expect("store");
+        store
+            .upsert_glossary_terms(&[
+                stored_term("rendered one", "reso uno", GlossaryStatus::AutoCandidate),
+                stored_term("rendered two", "reso due", GlossaryStatus::AutoCandidate),
+                stored_term("empty", "", GlossaryStatus::AutoCandidate),
+                stored_term("whitespace", "   ", GlossaryStatus::AutoCandidate),
+                stored_term("accepted", "preesistente", GlossaryStatus::Accepted),
+                stored_term("seeded", "manuale", GlossaryStatus::UserSeeded),
+                stored_term("human rejected", "", GlossaryStatus::Rejected),
+            ])
+            .expect("terms");
+        let candidates = store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("candidates");
+
+        let counts = bulk_accept_candidates(&store, &candidates).expect("bulk acceptance");
+
+        assert_eq!(
+            counts,
+            BulkAcceptanceCounts {
+                accepted: 2,
+                skipped_empty: 2,
+                skipped_model_rejected: 0,
+            }
+        );
+        let terms = store
+            .list_glossary_terms(GlossaryFilter {
+                scope_kind: Some(GlossaryScopeKind::Book),
+                scope_id: Some("book"),
+                source_language: Some("English"),
+                target_language: Some("Italian"),
+                active_only: false,
+            })
+            .expect("terms");
+        let term = |source: &str| {
+            terms
+                .iter()
+                .find(|term| term.source_text == source)
+                .expect("term")
+        };
+        assert_eq!(term("rendered one").status, GlossaryStatus::Accepted);
+        assert_eq!(term("rendered two").status, GlossaryStatus::Accepted);
+        assert_eq!(term("empty").status, GlossaryStatus::AutoCandidate);
+        assert_eq!(term("whitespace").status, GlossaryStatus::AutoCandidate);
+        assert_eq!(term("accepted").status, GlossaryStatus::Accepted);
+        assert_eq!(term("accepted").target_text, "preesistente");
+        assert_eq!(term("seeded").status, GlossaryStatus::UserSeeded);
+        assert_eq!(term("seeded").target_text, "manuale");
+        assert_eq!(term("human rejected").status, GlossaryStatus::Rejected);
+    }
+
+    #[test]
+    fn bulk_acceptance_skips_model_rejections_even_with_a_rendering() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open(directory.path().join("jobs.sqlite")).expect("store");
+        let mut model_rejected =
+            stored_term("ordinary word", "parola", GlossaryStatus::AutoCandidate);
+        model_rejected.notes = Some(model_rejection_note("It is not terminology."));
+        store
+            .upsert_glossary_terms(&[
+                stored_term("real term", "termine", GlossaryStatus::AutoCandidate),
+                model_rejected,
+            ])
+            .expect("terms");
+        let candidates = store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("candidates");
+
+        let counts = bulk_accept_candidates(&store, &candidates).expect("bulk acceptance");
+
+        assert_eq!(
+            counts,
+            BulkAcceptanceCounts {
+                accepted: 1,
+                skipped_empty: 0,
+                skipped_model_rejected: 1,
+            }
+        );
+        let remaining = store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("remaining candidates");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].source_text, "ordinary word");
+        assert!(candidate_is_model_rejected(&remaining[0]));
+    }
+
+    #[test]
+    fn bulk_acceptance_summary_reports_every_outcome_count() {
+        assert_eq!(
+            format_bulk_acceptance_summary(BulkAcceptanceCounts {
+                accepted: 7,
+                skipped_empty: 3,
+                skipped_model_rejected: 2,
+            }),
+            "Bulk acceptance: accepted=7 skipped-empty=3 skipped-model-rejected=2."
         );
     }
 
