@@ -350,6 +350,71 @@ bookforge style --help
 bookforge entities --help
 ```
 
+For a book-specific glossary, extract source candidates, ask an explicitly
+chosen review model for target renderings, then accept or edit them:
+
+```bash
+bookforge glossary extract-candidates book.epub \
+  --book-id cyberiad \
+  --source-lang English \
+  --target-lang Italian
+
+bookforge glossary propose book.epub \
+  --book-id cyberiad \
+  --language "English->Italian" \
+  --qa-provider openrouter \
+  --qa-model moonshotai/kimi-k3
+
+bookforge glossary review-candidates cyberiad --language "English->Italian"
+```
+
+`extract-candidates` counts a capitalized word only when it is capitalized for
+some reason other than where it sits. English capitalises the first word of
+every sentence, quotation, and parenthetical, and headings are title-cased by
+convention, so a word attested *only* in those positions is grammar rather than
+terminology — `Finally`, `Meanwhile`, `Oh`, `Yes` and `Thus` all reached the
+glossary that way before this rule existed. A multi-word phrase gets a second
+chance: `Ivan Ilych` may open every sentence it appears in, yet both its words
+are attested mid-sentence, which is what distinguishes it from
+`Finally Klapaucius`. Contractions inherit their stem, so `I'll` and `It's` are
+filtered as the pronouns they are built from while `Trurl's` survives. Author
+italics and quoted coinages bypass all of this, since they are an explicit
+signal.
+
+On The Cyberiad at `--limit 60`, the rule dropped eleven non-terms and freed
+those slots for nine genuine coinages the noise had been crowding out
+(`Altruizine`, `Alacritus`, `Atrocitus`, `Gargantius`, `Gozmos`, `Multitudians`,
+`Mygrayn`, `Ramolda`, `Perfect Adviser`). Words the author genuinely capitalises
+mid-sentence — honorifics such as `Highest` and `Most`, or `Nothing` as the name
+of a machine's product — still come through, which is correct.
+
+`propose` is a standalone, opt-in pass; `translate` never runs it implicitly.
+The EPUB is required because each term is sent with one bounded source excerpt
+(up to 320 characters by default, configurable with `--context-chars`).
+`--qa-base-url` and `--qa-api-key-env` provide the same endpoint/key overrides
+as the QA provider options. `--qa-model` is required so an inexpensive
+translation model is not selected silently for this judgment-heavy pass.
+
+One request carries every pending candidate, so `--qa-max-output-tokens` has no
+fixed default: it is sized at 320 tokens per candidate, with a floor of 8192 and
+a ceiling of 65536. A measured 40-candidate run on Kimi K3 spent 8277 output
+tokens, about 207 each including reasoning. Pass the flag to override. If a
+reasoning model still exhausts the budget before answering, the error says so
+and names this flag rather than surfacing a bare parse failure.
+
+The model chooses `preserve`, `translate`, `calque`, `recreate`, or `decline`
+and gives a one-sentence reason. A proposal fills `target_text` but remains
+`auto_candidate`; it is inactive until a human runs `accept N`, edits it with
+`set N "..."`, or explicitly runs `accept-all`. `accept-all` only promotes
+candidates that have a non-empty rendering. A decline writes no target, so the
+candidate remains available for manual review. Existing proposals and
+`user_seeded`, `accepted`, or `rejected` decisions are not sent again.
+
+The command reports estimated and provider-reported token counts. As an
+illustrative typical case, 50 candidates with short excerpts are about 5,000
+input and 1,500 output tokens. At $3/M input and $15/M output that is roughly
+$0.04 for the book; substitute the selected model's current prices.
+
 You can also pass TOML files directly to `translate` with repeatable
 `--glossary`, `--style`, and `--entities` flags. Stored scoped guidance is
 selected with `--book-id` and `--series-id`. Files and stored guidance are

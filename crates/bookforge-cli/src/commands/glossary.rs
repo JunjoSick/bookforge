@@ -1,4 +1,4 @@
-use std::{
+﻿use std::{
     fs,
     io::{self, BufRead, Write},
     path::PathBuf,
@@ -6,7 +6,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use bookforge_core::{
-    GlossaryCategory, GlossaryScopeKind, GlossaryStatus, GlossaryTerm, extract_glossary_candidates,
+    GlossaryCategory, GlossaryScopeKind, GlossaryStatus, GlossaryTerm, JsonMode, RetryAfterPolicy,
+    extract_glossary_candidates, glossary::glossary_candidate_excerpt, ir::Block,
+};
+use bookforge_llm::{
+    GlossaryProposalInput, GlossaryProposalRun, LlmProvider, MockProvider, OpenAiCompatibleConfig,
+    OpenAiCompatibleProvider, propose_glossary_renderings,
 };
 use bookforge_store::{GlossaryFilter, JobStore, NewGlossaryCandidate, StoredGlossaryCandidate};
 use clap::{Args, Subcommand};
@@ -34,6 +39,8 @@ enum GlossaryCommand {
     Export(ExportArgs),
     /// Find repeated names and terms in an EPUB for later review.
     ExtractCandidates(ExtractCandidatesArgs),
+    /// Ask a review model for target renderings of pending candidates.
+    Propose(ProposeArgs),
     /// Interactively accept, translate, or reject extracted candidates.
     ReviewCandidates(ReviewCandidatesArgs),
 }
@@ -141,6 +148,39 @@ struct ReviewCandidatesArgs {
     language: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct ProposeArgs {
+    input: PathBuf,
+
+    #[arg(long)]
+    book_id: String,
+
+    #[arg(long)]
+    language: Option<String>,
+
+    #[arg(long, default_value = "deepseek")]
+    qa_provider: String,
+
+    /// Strong model used for terminology proposals; intentionally has no cheap default.
+    #[arg(long)]
+    qa_model: String,
+
+    #[arg(long)]
+    qa_base_url: Option<String>,
+
+    #[arg(long)]
+    qa_api_key_env: Option<String>,
+
+    /// Output-token budget for the proposal request. Defaults to a budget
+    /// scaled to the number of pending candidates.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    qa_max_output_tokens: Option<u32>,
+
+    /// Maximum characters of source context supplied for each candidate.
+    #[arg(long, default_value_t = 320)]
+    context_chars: usize,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct GlossaryToml {
     meta: GlossaryTomlMeta,
@@ -190,6 +230,7 @@ pub async fn run(args: GlossaryArgs) -> Result<()> {
         GlossaryCommand::Import(args) => import_terms(&store, args),
         GlossaryCommand::Export(args) => export_terms(&store, args),
         GlossaryCommand::ExtractCandidates(args) => extract_candidates(&store, args),
+        GlossaryCommand::Propose(args) => propose_candidates(&store, args).await,
         GlossaryCommand::ReviewCandidates(args) => review_candidates(&store, args),
     }
 }
@@ -263,6 +304,265 @@ fn extract_candidates(store: &JobStore, args: ExtractCandidatesArgs) -> Result<(
     Ok(())
 }
 
+async fn propose_candidates(store: &JobStore, args: ProposeArgs) -> Result<()> {
+    let Some((source_language, target_language)) =
+        resolve_candidate_language_pair(store, &args.book_id, args.language.as_deref())?
+    else {
+        println!("No pending glossary candidates.");
+        return Ok(());
+    };
+    let pending = store
+        .list_glossary_candidates(&args.book_id, &source_language, &target_language)?
+        .into_iter()
+        .filter(|candidate| {
+            candidate
+                .target_text
+                .as_deref()
+                .is_none_or(|target| target.trim().is_empty())
+        })
+        .count();
+    if pending == 0 {
+        println!("No pending glossary candidates without proposals.");
+        return Ok(());
+    }
+
+    let book = bookforge_epub::read_epub(&args.input)
+        .with_context(|| format!("failed to read EPUB {}", args.input.display()))?;
+    println!(
+        "Requesting {pending} glossary proposals for {} {}->{} from {}/{}.",
+        args.book_id, source_language, target_language, args.qa_provider, args.qa_model
+    );
+
+    let run = match args.qa_provider.as_str() {
+        "mock" => {
+            let provider = MockProvider::new(
+                crate::commands::translate::mock_mode(&args.qa_model),
+                &target_language,
+            );
+            propose_candidates_with_provider(
+                store,
+                &book.blocks,
+                &args.book_id,
+                &source_language,
+                &target_language,
+                &args.qa_provider,
+                &args.qa_model,
+                args.context_chars,
+                args.qa_max_output_tokens,
+                &provider,
+            )
+            .await?
+        }
+        "deepseek" | "openrouter" | "openai-compatible" => {
+            let config = glossary_proposal_provider_config(&args)?;
+            let provider = OpenAiCompatibleProvider::new(config)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            propose_candidates_with_provider(
+                store,
+                &book.blocks,
+                &args.book_id,
+                &source_language,
+                &target_language,
+                &args.qa_provider,
+                &args.qa_model,
+                args.context_chars,
+                args.qa_max_output_tokens,
+                &provider,
+            )
+            .await?
+        }
+        provider => anyhow::bail!("unsupported glossary proposal provider '{provider}'"),
+    };
+
+    let rendered = run
+        .proposals
+        .iter()
+        .filter(|proposal| proposal.target_text.is_some())
+        .count();
+    let declined = run.proposals.len().saturating_sub(rendered);
+    println!(
+        "Saved {rendered} proposed renderings and {declined} declines; all remain auto_candidate."
+    );
+    if declined > 0 {
+        let candidates =
+            store.list_glossary_candidates(&args.book_id, &source_language, &target_language)?;
+        for proposal in run
+            .proposals
+            .iter()
+            .filter(|proposal| proposal.target_text.is_none())
+        {
+            let source = candidates
+                .iter()
+                .find(|candidate| candidate.id == proposal.id)
+                .map(|candidate| candidate.source_text.as_str())
+                .unwrap_or("<unknown candidate>");
+            println!("Declined {source}: {}", proposal.reason);
+        }
+    }
+    println!(
+        "Tokens: estimated input {}, provider input {}, provider output {}.",
+        run.estimated_input_tokens,
+        format_optional_tokens(run.input_tokens),
+        format_optional_tokens(run.output_tokens)
+    );
+    println!(
+        "Review explicitly with: bookforge glossary review-candidates {} --language \"{}->{}\"",
+        args.book_id, source_language, target_language
+    );
+    Ok(())
+}
+
+/// Output-token budget for a proposal request covering `candidates` terms.
+///
+/// One request carries every pending candidate, so a flat default is wrong at
+/// both ends. A measured run â€” Kimi K3, 40 candidates â€” used 8,277 output
+/// tokens, about 207 per candidate including reasoning. 320 per candidate
+/// leaves headroom for a more verbose model; the 8,192 floor keeps small books
+/// from being starved by a tight budget, and the 65,536 ceiling stops a
+/// pathological candidate list from requesting an unbounded completion.
+fn proposal_output_budget(candidates: usize) -> u32 {
+    let scaled = candidates.saturating_mul(320).min(u32::MAX as usize) as u32;
+    scaled.clamp(8_192, 65_536)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn propose_candidates_with_provider<P>(
+    store: &JobStore,
+    blocks: &[Block],
+    book_id: &str,
+    source_language: &str,
+    target_language: &str,
+    provider_name: &str,
+    model: &str,
+    context_chars: usize,
+    max_output_tokens: Option<u32>,
+    provider: &P,
+) -> Result<GlossaryProposalRun>
+where
+    P: LlmProvider,
+{
+    let candidates = store.list_glossary_candidates(book_id, source_language, target_language)?;
+    let items = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .target_text
+                .as_deref()
+                .is_none_or(|target| target.trim().is_empty())
+        })
+        .map(|candidate| GlossaryProposalInput {
+            id: candidate.id,
+            source_text: candidate.source_text.clone(),
+            category: candidate.category,
+            source_count: candidate.source_count,
+            source_excerpt: glossary_candidate_excerpt(
+                blocks,
+                &candidate.source_text,
+                context_chars.max(1),
+            ),
+        })
+        .collect::<Vec<_>>();
+    let run = propose_glossary_renderings(
+        provider,
+        source_language,
+        target_language,
+        &items,
+        provider_name,
+        model,
+        max_output_tokens.unwrap_or_else(|| proposal_output_budget(items.len())),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("glossary proposal request failed: {error}"))?;
+    let proposals_by_id = run
+        .proposals
+        .iter()
+        .map(|proposal| (proposal.id, proposal))
+        .collect::<std::collections::HashMap<_, _>>();
+    let still_pending =
+        store.list_glossary_candidates(book_id, source_language, target_language)?;
+    let updates = still_pending
+        .iter()
+        .filter_map(|candidate| {
+            let proposal = proposals_by_id.get(&candidate.id)?;
+            let target_text = proposal.target_text.as_ref()?;
+            if candidate
+                .target_text
+                .as_deref()
+                .is_some_and(|target| !target.trim().is_empty())
+            {
+                return None;
+            }
+            let note = format!(
+                "model proposal ({}): {}",
+                proposal.policy.as_str(),
+                proposal.reason
+            );
+            Some(GlossaryTerm {
+                id: Some(candidate.id),
+                scope_kind: GlossaryScopeKind::Book,
+                scope_id: Some(book_id.to_string()),
+                source_text: candidate.source_text.clone(),
+                target_text: target_text.clone(),
+                category: candidate.category,
+                notes: Some(note),
+                case_sensitive: candidate.case_sensitive,
+                always_active: candidate.always_active,
+                status: GlossaryStatus::AutoCandidate,
+                source_language: source_language.to_string(),
+                target_language: target_language.to_string(),
+                source_count: candidate.source_count,
+            })
+        })
+        .collect::<Vec<_>>();
+    let updated = store.upsert_glossary_terms(&updates)?;
+    if updated != updates.len() {
+        anyhow::bail!(
+            "only {updated} of {} proposal rows were still pending; no settled term was overwritten",
+            updates.len()
+        );
+    }
+    Ok(run)
+}
+
+fn glossary_proposal_provider_config(args: &ProposeArgs) -> Result<OpenAiCompatibleConfig> {
+    let (default_url, default_key_env) = match args.qa_provider.as_str() {
+        "deepseek" => ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
+        "openrouter" => ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
+        "openai-compatible" => (
+            args.qa_base_url.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--qa-base-url is required for --qa-provider openai-compatible")
+            })?,
+            "OPENAI_API_KEY",
+        ),
+        provider => anyhow::bail!("unsupported glossary proposal provider '{provider}'"),
+    };
+
+    Ok(OpenAiCompatibleConfig {
+        base_url: args
+            .qa_base_url
+            .clone()
+            .unwrap_or_else(|| default_url.to_string()),
+        api_key_env: args
+            .qa_api_key_env
+            .clone()
+            .unwrap_or_else(|| default_key_env.to_string()),
+        model: args.qa_model.clone(),
+        timeout_seconds: 180,
+        provider_max_attempts: 2,
+        thinking_disabled: false,
+        retry_after_policy: RetryAfterPolicy::JitteredExponential,
+        max_backoff_seconds: 30,
+        max_idle_per_host: 4,
+        json_mode: JsonMode::Auto,
+    })
+}
+
+fn format_optional_tokens(tokens: Option<u64>) -> String {
+    tokens
+        .map(|tokens| tokens.to_string())
+        .unwrap_or_else(|| "unreported".to_string())
+}
+
 fn review_candidates(store: &JobStore, args: ReviewCandidatesArgs) -> Result<()> {
     let Some((source_language, target_language)) =
         resolve_candidate_language_pair(store, &args.book_id, args.language.as_deref())?
@@ -310,6 +610,26 @@ fn review_candidates(store: &JobStore, args: ReviewCandidatesArgs) -> Result<()>
                 if store.accept_glossary_candidate(candidate.id, None)? {
                     println!("Accepted {}.", candidate.source_text);
                 }
+            }
+            Ok(ReviewCommand::AcceptAll) => {
+                let proposed = candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate
+                            .target_text
+                            .as_deref()
+                            .is_some_and(|target| !target.trim().is_empty())
+                    })
+                    .collect::<Vec<_>>();
+                let mut accepted = 0usize;
+                for candidate in proposed {
+                    if store.accept_glossary_candidate(candidate.id, None)? {
+                        accepted += 1;
+                    }
+                }
+                println!(
+                    "Accepted {accepted} proposed renderings; candidates without a rendering remain pending."
+                );
             }
             Ok(ReviewCommand::Set(number, target)) => {
                 let candidate = match candidate_by_number(&candidates, number) {
@@ -389,6 +709,7 @@ fn resolve_candidate_language_pair(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReviewCommand {
     Accept(usize),
+    AcceptAll,
     Set(usize, String),
     Reject(usize),
     List,
@@ -407,6 +728,12 @@ fn parse_review_command(line: &str) -> Result<ReviewCommand> {
     let rest = parts.next().unwrap_or_default();
     match command {
         "accept" => Ok(ReviewCommand::Accept(parse_candidate_number(rest)?)),
+        "accept-all" => {
+            if !rest.trim().is_empty() {
+                anyhow::bail!("usage: accept-all");
+            }
+            Ok(ReviewCommand::AcceptAll)
+        }
         "reject" => Ok(ReviewCommand::Reject(parse_candidate_number(rest)?)),
         "set" => {
             let rest = rest.trim();
@@ -430,7 +757,7 @@ fn parse_review_command(line: &str) -> Result<ReviewCommand> {
         "help" => Ok(ReviewCommand::Help),
         "quit" | "exit" => Ok(ReviewCommand::Quit),
         other => anyhow::bail!(
-            "unknown command '{other}'; expected accept, set, reject, list, help, or quit"
+            "unknown command '{other}'; expected accept, accept-all, set, reject, list, help, or quit"
         ),
     }
 }
@@ -465,7 +792,7 @@ fn candidate_by_number(
 }
 
 fn print_candidate_help() {
-    println!("Commands: accept N, set N \"translation\", reject N, list, help, quit");
+    println!("Commands: accept N, accept-all, set N \"translation\", reject N, list, help, quit");
 }
 
 fn print_candidates(candidates: &[StoredGlossaryCandidate]) {
@@ -477,8 +804,15 @@ fn print_candidates(candidates: &[StoredGlossaryCandidate]) {
             candidate.category,
             candidate.status.as_str(),
             candidate.source_text,
-            candidate.target_text.as_deref().unwrap_or("-")
+            candidate
+                .target_text
+                .as_deref()
+                .filter(|target| !target.trim().is_empty())
+                .unwrap_or("-")
         );
+        if let Some(note) = candidate.notes.as_deref() {
+            println!("\t{note}");
+        }
     }
 }
 
@@ -679,6 +1013,95 @@ fn default_user_seeded() -> GlossaryStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bookforge_llm::{
+        CompletionRequest, CompletionResponse, FinishReason, LlmError, ProviderCapabilities,
+    };
+
+    #[test]
+    fn proposal_budget_scales_with_candidates_between_a_floor_and_a_ceiling() {
+        assert_eq!(proposal_output_budget(0), 8_192);
+        assert_eq!(proposal_output_budget(20), 8_192);
+        // The measured 40-candidate run needed 8,277 output tokens, which the
+        // old flat 4,096 default could not cover.
+        assert!(proposal_output_budget(40) > 8_277);
+        assert_eq!(proposal_output_budget(100), 32_000);
+        assert_eq!(proposal_output_budget(1_000_000), 65_536);
+    }
+
+    #[derive(Clone)]
+    struct FailingProvider;
+
+    impl LlmProvider for FailingProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse, LlmError> {
+            Err(LlmError::Provider("offline test failure".to_string()))
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct DecliningProvider {
+        id: i64,
+    }
+
+    impl LlmProvider for DecliningProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse, LlmError> {
+            let content = serde_json::json!({
+                "proposals": [{
+                    "id": self.id,
+                    "target_text": null,
+                    "policy": "decline",
+                    "reason": "The excerpt does not expose the wordplay."
+                }]
+            })
+            .to_string();
+            Ok(CompletionResponse {
+                content,
+                input_tokens: Some(10),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(5),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 1,
+                raw: serde_json::Value::Null,
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    fn stored_term(source_text: &str, target_text: &str, status: GlossaryStatus) -> GlossaryTerm {
+        GlossaryTerm {
+            id: None,
+            scope_kind: GlossaryScopeKind::Book,
+            scope_id: Some("book".to_string()),
+            source_text: source_text.to_string(),
+            target_text: target_text.to_string(),
+            category: GlossaryCategory::Invented,
+            notes: None,
+            case_sensitive: true,
+            always_active: false,
+            status,
+            source_language: "English".to_string(),
+            target_language: "Italian".to_string(),
+            source_count: 3,
+        }
+    }
 
     #[test]
     fn parses_glossary_toml() {
@@ -722,6 +1145,10 @@ case_sensitive = true
         assert_eq!(
             parse_review_command("accept 2").expect("accept command"),
             ReviewCommand::Accept(2)
+        );
+        assert_eq!(
+            parse_review_command("accept-all").expect("accept-all command"),
+            ReviewCommand::AcceptAll
         );
         assert_eq!(
             parse_review_command("set 3 \"Monte Fato\"").expect("set command"),
@@ -776,5 +1203,153 @@ case_sensitive = true
         assert_eq!(imported[0].category, terms[0].category);
         assert_eq!(imported[0].notes, terms[0].notes);
         assert_eq!(imported[0].source_count, terms[0].source_count);
+    }
+
+    #[tokio::test]
+    async fn proposal_pass_only_submits_unrendered_auto_candidates() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open(directory.path().join("jobs.sqlite")).expect("store");
+        store
+            .upsert_glossary_terms(&[
+                stored_term("pending", "", GlossaryStatus::AutoCandidate),
+                stored_term(
+                    "already proposed",
+                    "esistente",
+                    GlossaryStatus::AutoCandidate,
+                ),
+                stored_term("seeded", "manuale", GlossaryStatus::UserSeeded),
+                stored_term("accepted", "accettato", GlossaryStatus::Accepted),
+                stored_term("rejected", "", GlossaryStatus::Rejected),
+            ])
+            .expect("terms");
+        let provider =
+            MockProvider::new(bookforge_llm::MockMode::PrefixTarget, "Italian".to_string());
+
+        let run = propose_candidates_with_provider(
+            &store,
+            &[],
+            "book",
+            "English",
+            "Italian",
+            "mock",
+            "mock-prefix-target",
+            320,
+            Some(1_024),
+            &provider,
+        )
+        .await
+        .expect("proposal pass");
+
+        assert_eq!(run.proposals.len(), 1);
+        let terms = store
+            .list_glossary_terms(GlossaryFilter {
+                scope_kind: Some(GlossaryScopeKind::Book),
+                scope_id: Some("book"),
+                source_language: Some("English"),
+                target_language: Some("Italian"),
+                active_only: false,
+            })
+            .expect("terms");
+        let term = |source: &str| {
+            terms
+                .iter()
+                .find(|term| term.source_text == source)
+                .expect("term")
+        };
+        assert_eq!(term("pending").target_text, "[Italian] pending");
+        assert_eq!(term("pending").status, GlossaryStatus::AutoCandidate);
+        assert_eq!(term("already proposed").target_text, "esistente");
+        assert_eq!(term("seeded").target_text, "manuale");
+        assert_eq!(term("accepted").target_text, "accettato");
+        assert_eq!(term("rejected").status, GlossaryStatus::Rejected);
+    }
+
+    #[tokio::test]
+    async fn declined_proposal_leaves_candidate_unrendered_and_pending() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open(directory.path().join("jobs.sqlite")).expect("store");
+        store
+            .upsert_glossary_candidates(
+                "book",
+                "English",
+                "Italian",
+                &[NewGlossaryCandidate {
+                    source_text: "dracotron",
+                    category: GlossaryCategory::Invented,
+                    source_count: 4,
+                }],
+            )
+            .expect("candidate");
+        let before = store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("candidate");
+        let provider = DecliningProvider { id: before[0].id };
+
+        propose_candidates_with_provider(
+            &store,
+            &[],
+            "book",
+            "English",
+            "Italian",
+            "test",
+            "declining",
+            320,
+            Some(1_024),
+            &provider,
+        )
+        .await
+        .expect("decline should be usable");
+
+        let after = store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("candidate");
+        assert_eq!(after, before);
+        assert_eq!(after[0].status, GlossaryStatus::AutoCandidate);
+        assert_eq!(after[0].target_text, None);
+    }
+
+    #[tokio::test]
+    async fn provider_failure_does_not_modify_candidates() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open(directory.path().join("jobs.sqlite")).expect("store");
+        store
+            .upsert_glossary_candidates(
+                "book",
+                "English",
+                "Italian",
+                &[NewGlossaryCandidate {
+                    source_text: "Steelypips",
+                    category: GlossaryCategory::Invented,
+                    source_count: 5,
+                }],
+            )
+            .expect("candidate");
+        let before = store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("candidate");
+
+        let error = propose_candidates_with_provider(
+            &store,
+            &[],
+            "book",
+            "English",
+            "Italian",
+            "test",
+            "failing",
+            320,
+            Some(1_024),
+            &FailingProvider,
+        )
+        .await
+        .expect_err("provider failure should surface");
+
+        assert!(
+            error.to_string().contains("offline test failure"),
+            "{error}"
+        );
+        let after = store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("candidate");
+        assert_eq!(after, before);
     }
 }

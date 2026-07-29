@@ -176,7 +176,29 @@ impl LlmProvider for MockProvider {
 
         let block_ids = &request.metadata.block_ids;
 
-        let content = if template == "qa_batch" {
+        let content = if template == "glossary_propose" {
+            let proposals = extract_json_array_after_label(&request.user, "Candidates:")
+                .into_iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_i64()?;
+                    let source = entry
+                        .get("source_text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    Some(json!({
+                        "id": id,
+                        "target_text": transform_text(
+                            self.mode,
+                            &self.target_language,
+                            source,
+                        ),
+                        "policy": "recreate",
+                        "reason": "Mock proposal for offline testing.",
+                    }))
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string(&json!({ "proposals": proposals }))?
+        } else if template == "qa_batch" {
             let reviews = extract_qa_batch_item_ids(&request.user)
                 .into_iter()
                 .map(|id| {
@@ -1031,20 +1053,16 @@ impl LlmProvider for OpenAiCompatibleProvider {
             })
         })?;
 
-        let content = raw
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                LlmError::InvalidResponse(
-                    "OpenAI-compatible response missing choices[0].message.content".to_string(),
-                )
-            })?
-            .to_string();
         let finish_reason = raw
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
             .map(parse_finish_reason)
             .unwrap_or(FinishReason::Unknown);
+        let content = raw
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| LlmError::InvalidResponse(empty_content_diagnosis(&raw, finish_reason)))?
+            .to_string();
         let input_tokens = raw.pointer("/usage/prompt_tokens").and_then(Value::as_u64);
         let input_cached_tokens = cached_input_tokens(&raw);
         let output_tokens = raw
@@ -1226,6 +1244,43 @@ fn retry_delay(
     }
 }
 
+/// Explain a 200 response that carried no message content.
+///
+/// Almost always this is a reasoning model that spent its entire output budget
+/// thinking and had nothing left to answer with — seen three separate times on
+/// Kimi K3, in the QA pass, the flag judge, and glossary proposal, each time
+/// costing a paid request and surfacing only as a bare parse error. When the
+/// evidence points that way, say so and name the remedy; otherwise stay
+/// generic rather than mislabelling a genuinely different failure.
+fn empty_content_diagnosis(raw: &Value, finish_reason: FinishReason) -> String {
+    let reasoning_only = [
+        "/choices/0/message/reasoning_content",
+        "/choices/0/message/reasoning",
+    ]
+    .iter()
+    .any(|pointer| {
+        raw.pointer(pointer)
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    });
+
+    if finish_reason == FinishReason::Length || reasoning_only {
+        let used = raw
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64)
+            .map(|tokens| format!(" after {tokens} output tokens"))
+            .unwrap_or_default();
+        return format!(
+            "the model produced no content{used}: it exhausted its output budget \
+             before answering. Raise the output-token limit for this request \
+             (--qa-max-output-tokens on `translate` and `glossary propose`, \
+             --max-output-tokens on the `judge_flags` example)."
+        );
+    }
+
+    "OpenAI-compatible response missing choices[0].message.content".to_string()
+}
+
 fn parse_finish_reason(value: &str) -> FinishReason {
     match value {
         "stop" => FinishReason::Stop,
@@ -1257,6 +1312,49 @@ mod tests {
     use super::*;
     use bookforge_core::RetryAfterPolicy;
     use tokio::time::Duration;
+
+    #[test]
+    fn empty_content_from_a_truncated_response_names_the_output_cap() {
+        let raw = serde_json::json!({
+            "choices": [{ "message": {}, "finish_reason": "length" }],
+            "usage": { "completion_tokens": 4096 }
+        });
+
+        let message = empty_content_diagnosis(&raw, FinishReason::Length);
+
+        assert!(message.contains("exhausted its output budget"), "{message}");
+        assert!(message.contains("--qa-max-output-tokens"), "{message}");
+        assert!(message.contains("4096"), "{message}");
+    }
+
+    #[test]
+    fn empty_content_after_reasoning_only_names_the_output_cap() {
+        // Kimi K3 returns `stop` while emitting reasoning and no answer.
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": { "reasoning": "thinking at length" },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let message = empty_content_diagnosis(&raw, FinishReason::Stop);
+
+        assert!(message.contains("--qa-max-output-tokens"), "{message}");
+    }
+
+    #[test]
+    fn empty_content_without_truncation_evidence_stays_generic() {
+        let raw = serde_json::json!({
+            "choices": [{ "message": {}, "finish_reason": "content_filter" }]
+        });
+
+        let message = empty_content_diagnosis(&raw, FinishReason::ContentFilter);
+
+        assert_eq!(
+            message,
+            "OpenAI-compatible response missing choices[0].message.content"
+        );
+    }
 
     #[test]
     fn retry_policy_none_returns_none_delay() {
