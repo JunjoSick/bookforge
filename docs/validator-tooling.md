@@ -5,13 +5,15 @@ string-level check fires. Those checks have no model of meaning, so some
 proportion of what they flag is wrong — and until 2026-07-26 nothing measured
 which proportion.
 
-Two dev-time examples exist to answer that. Neither is wired into `translate`,
-and neither should be: a model that gated or repaired translations would violate
-the architectural invariants in `ROADMAP.md` §1.1–§1.2.
+Three dev-time examples cover validator replay, flag precision, and translation
+quality. None is wired into `translate`, and none should be: a model that gated
+or repaired translations would violate the architectural invariants in
+`ROADMAP.md` §1.1–§1.2.
 
 ```
 cargo run --release --example replay_validation -- --help
 cargo run --release --example judge_flags -- --help
+cargo run --release --example judge_translation -- --help
 ```
 
 ## `replay_validation` — replay the validator offline, for free
@@ -46,6 +48,33 @@ Notes that matter when reading its output:
 
 Use it to answer "did this validator change help?" before spending anything.
 
+## The corpus these tools run against
+
+Measured 2026-07-29 against the owner's store, so the next person does not
+re-derive it: **30 jobs**, all 30 snapshots resolvable, 27 with stored
+translated blocks, **40,303 replayable pairs** across 8 books. Four independent
+translations of *Calling Bullshit* and five of *If We Burn* exist, which is
+free A/B material.
+
+`items with no translation` and `block rows with no item` in the thousands are
+expected rather than a defect: several jobs are `needs_review` or `stopped`
+with a large unfinished tail. A "job" is not a finished book.
+
+### Resolving snapshots: the trap
+
+`input_snapshot_path` is stored **relative to the directory BookForge was
+launched from**, with mixed separators (`.bookforge/runs\job_...\input.epub`).
+`replay_validation` resolves it against a root derived from `--db`, so pointing
+`--db` at a lone copy of `jobs.sqlite` elsewhere resolves nothing:
+
+```
+skipped: snapshot unresolved: 29
+replayed                    : 0
+```
+
+Copy the whole `.bookforge/` directory, or point `--db` at the real store — it
+is copied before opening and the original is never written.
+
 ## `judge_flags` — ask a model whether a flag is real
 
 The question is **not** "is this translation good?" It is "is this specific
@@ -71,8 +100,8 @@ Operational lessons, all learned the expensive way:
 - **Raise `--max-output-tokens`.** The 400 default starves reasoning models:
   Kimi K3 returned empty content on **49 of 150** calls at 400, and **4 of 100**
   at 1200. That is a third of the spend wasted. This is the same failure
-  described under "Size the output cap from the candidate count" below, and it
-  has now been hit by three separate call sites.
+  described under "Bound each request while keeping the per-candidate allowance
+  honest" below, and it has now been hit by **four** separate call sites.
 - **Verdicts are cached on disk** by content hash, so re-runs of already-judged
   units are free. Keep the cache directory between runs.
 - **Judges disagree, and the stricter one has been right.** On a shared subset,
@@ -81,6 +110,116 @@ Operational lessons, all learned the expensive way:
   source `December 8` rendered as `10 dicembre`, which is silent data
   corruption. Treat a single judge's rate as a bound, not a measurement, and
   prefer the stricter model.
+
+## `judge_translation` — measure whether translations are good
+
+Validator volume and precision do not measure translation quality.
+`judge_translation` builds passage-sized units from real stored translations
+and asks a judge to enumerate defects in six fixed categories:
+`meaning_changed`, `content_dropped`, `content_added`,
+`terminology_inconsistent`, `register_shift`, and `target_language_error`.
+
+Start with:
+
+```
+cargo run --release --example judge_translation -- \
+    --db .bookforge/jobs.sqlite --sample 25 --dry-run
+```
+
+The dry run opens only a throwaway store copy, renders every sampled system and
+user prompt, records the fixed sampling seed, estimates input tokens, shows the
+configured output-token cap, and prices the maximum run from the embedded
+catalog. It makes no provider calls and writes no JSONL, summary, or cache
+entries.
+
+A real run writes `judge-translation.jsonl` and
+`judge-translation.summary.json` by default. Use a previous summary for an A/B
+comparison:
+
+```
+cargo run --release --example judge_translation -- \
+    --job <candidate-job-id> \
+    --baseline baseline.summary.json \
+    --out candidate.jsonl
+```
+
+Important measurement rules:
+
+- A passage is a greedy contiguous run of blocks from one EPUB section. The
+  next block starts a new passage when adding it would exceed
+  `--passage-chars` (default 1,500), when a section changes, or when an
+  unavailable stored block creates a gap. Blocks are never split; a single
+  oversized block is one oversized passage. Passages may cross scheduler
+  segment boundaries within the same section.
+- `needs_review` rows are excluded. The store deliberately preserves source
+  text for those rows, so they are not translation observations.
+- `--sample` performs a deterministic Fisher-Yates shuffle before taking N.
+  `--seed` defaults to a fixed value and is present in both every JSONL record
+  and the summary. `--sample 0` explicitly selects everything and warns that
+  the spend cap is gone.
+- The judge returns enumerable defects, not a score or severity. Every finding
+  must contain exact non-empty source and translation quotes. Missing quotes
+  and non-verbatim quotes are dropped and counted.
+- Counts and defects per 1,000 source words are reported for every category.
+  The three hard categories and three soft categories are also reported as
+  separate groups. There is intentionally no combined headline score.
+- Unparseable output is recorded once and excluded from the word/rate
+  denominator. It is never sent to a repair model. Request failures are also
+  recorded rather than converted into zero-defect passages.
+- The default judge output cap is 4,096 tokens. This is intentionally generous:
+  reasoning models that exhaust their cap have returned HTTP 200 with empty
+  content, and valid findings need room for two quotes apiece.
+- Results are cached by a hash of the passage content, provider/model, judge
+  settings, and `judge_translation` prompt version. The API credential remains
+  an environment-variable name supplied by `--api-key-env`; it is never a CLI
+  value or an output field. **`--max-output-tokens` is part of that key**, so
+  re-running at a different cap re-pays for the whole sample. That is correct —
+  a different cap can produce a different answer — but it makes cap tuning cost
+  money, so pick a generous cap first.
+
+### What this measured, 2026-07-29
+
+First real run. Corpus: `If We Burn`, English→Italian, deepseek-v4-flash,
+133/133 segments complete — chosen deliberately over the larger Lenin jobs,
+which are PDF conversions where ~29% of validator false positives were traced
+to OCR damage in the *source*. Judging those measures the scanner.
+
+25 passages, one seed, two judges:
+
+| | judged | source words | hard/1k | soft/1k |
+| --- | --- | --- | --- | --- |
+| Kimi K3, 4k cap | 15/25 | 2,845 | 4.57 | 4.57 |
+| Kimi K3, 16k cap | 23/25 | 4,348 | 5.06 | 3.91 |
+| deepseek-v4-pro, 16k cap | 25/25 | 4,803 | 4.16 | 0.83 |
+
+Restricted to the identical 15 passages both judges completed, Kimi and v4-pro
+report **4.57 vs 4.92** hard defects per 1,000 words and **4.57 vs 0.70** soft.
+
+**The hard-defect rate is judge-stable; the soft-defect rate is not.** Hard
+spans 4.16–5.06 across two judges and two output caps — roughly 20%. Soft spans
+0.83–4.57, a 5.5× swing driven almost entirely by `target_language_error`, the
+most subjective category. This mirrors the earlier finding that structural,
+cross-referenced claims are the productive class and isolated-phrase judgements
+are the noise class.
+
+So: **track the hard-defect rate. Report the soft rate, but do not optimise
+against it, and never compare a soft rate across judges.** This is also why
+there is no combined headline score — one number would blend a stable signal
+with an unstable one and move whenever the judge changed.
+
+A representative catch, from Kimi: source `bring the media into your
+understanding` rendered as `include la media`, which in Italian means *the
+average*. The referent changes completely, and no deterministic check can reach
+it.
+
+**Cost is wildly asymmetric.** deepseek-v4-pro spent 113 output tokens per
+passage; Kimi K3 spent about 2,000. For the same 25 passages that is **$0.013
+against roughly $0.50**. If hard-defect agreement holds on a larger sample,
+v4-pro buys around 40× the coverage per dollar.
+
+**Kimi K3 starved even at 16,000 output tokens** on 2 of 25 passages, and on 10
+of 25 at 4,096. It can burn more than 16k reasoning tokens on a 1,500-character
+passage. Budget accordingly, and see the empty-content diagnosis note above.
 
 ## What this measured, 2026-07-26/27
 
@@ -235,8 +374,10 @@ provider-reported usage; use the selected model's current rates for budgeting.
 reasoning model that runs out mid-thought returns HTTP 200 with *no message
 content at all* — not a truncated answer — so the failure used to surface as
 `missing choices[0].message.content`, which says nothing about the cause. This
-happened three separate times in two days: `judge_flags` at its 400-token
-default, the QA pass at the provider default, and this command at a flat 4,096.
+happened four separate times in two days: `judge_flags` at its 400-token
+default, the QA pass at the provider default, this command at a flat 4,096, and
+`judge_translation` — which starved on 10 of 25 passages at a 4,096 cap and
+still on 2 of 25 at **16,000**.
 The provider now recognises that shape — `finish_reason: length`, or reasoning
 present with content absent — and names the relevant flag. `glossary propose`
 caps each request at 8,192 output tokens by default and sizes chunks at 320
