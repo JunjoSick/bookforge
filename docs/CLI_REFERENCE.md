@@ -389,11 +389,11 @@ English is poor and the proposal model must make the terminology judgment.
 
 `--min-count` defaults to 3. This deliberately recovers terms that recur three
 times while keeping one- and two-off capitalized words out of the single,
-book-sized model request. Each additional candidate reserves 320 output tokens
-by default, so lowering it further is not free. The positional rule remains as
-an inexpensive candidate-budget gate, not a semantic verdict; use
-`--min-count` and `--limit` explicitly when a book or language needs a different
-recall/cost tradeoff.
+book-sized proposal pass. Each additional candidate reserves 320 output tokens
+within bounded requests by default, so lowering it further is not free. The
+positional rule remains as an inexpensive candidate-budget gate, not a semantic
+verdict; use `--min-count` and `--limit` explicitly when a book or language
+needs a different recall/cost tradeoff.
 
 On The Cyberiad at `--limit 60`, the rule dropped eleven non-terms and freed
 those slots for nine genuine coinages the noise had been crowding out
@@ -409,12 +409,19 @@ The EPUB is required because each term is sent with one bounded source excerpt
 as the QA provider options. `--qa-model` is required so an inexpensive
 translation model is not selected silently for this judgment-heavy pass.
 
-One request carries every pending candidate, so `--qa-max-output-tokens` has no
-fixed default: it is sized at 320 tokens per candidate, with a floor of 8192 and
-a ceiling of 65536. A measured 40-candidate run on Kimi K3 spent 8277 output
-tokens, about 207 each including reasoning. Pass the flag to override. If a
-reasoning model still exhausts the budget before answering, the error says so
-and names this flag rather than surfacing a bare parse failure.
+`propose` sends bounded chunks rather than one book-sized request.
+`--qa-max-output-tokens` is the cap for each request and defaults to 8192.
+Chunks reserve 320 output tokens per candidate, so the default carries at most
+25 candidates; a measured 40-candidate run on Kimi K3 spent 8277 output tokens,
+about 207 each including reasoning. Passing the flag changes both the
+per-request cap and the derived chunk size.
+
+If a response reaches the cap, is incomplete JSON, or fails response-shape
+validation, BookForge retries by bisecting that chunk, following the QA batch
+recovery strategy. One candidate is the floor. A terminal failure remains
+pending while completed chunks are persisted. The command prints an
+`INCOMPLETE` summary with completed and failed candidate counts and exits with
+an error, so a partially completed pass cannot be mistaken for success.
 
 The model chooses `preserve`, `translate`, `calque`, `recreate`, `decline`, or
 `not_terminology` and gives a one-sentence reason. `decline` means the item is
@@ -435,7 +442,8 @@ distinguishable. The command reports the model-rejection count and prints each
 reason. Existing renderings, model rejections, and `user_seeded`, `accepted`, or
 human-`rejected` decisions are not sent again.
 
-The command reports estimated and provider-reported token counts. As an
+The command reports the request count plus aggregate estimated and
+provider-reported token counts. As an
 illustrative typical case, 50 candidates with short excerpts are about 5,000
 input and 1,500 output tokens. At $3/M input and $15/M output that is roughly
 $0.04 for the book; substitute the selected model's current prices.

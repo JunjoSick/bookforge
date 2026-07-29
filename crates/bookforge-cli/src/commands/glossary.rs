@@ -18,6 +18,7 @@ use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
 const MODEL_REJECTION_NOTE_PREFIX: &str = "model rejection (not terminology): ";
+const DEFAULT_PROPOSAL_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
 #[derive(Debug, Args)]
 pub struct GlossaryArgs {
@@ -173,8 +174,8 @@ struct ProposeArgs {
     #[arg(long)]
     qa_api_key_env: Option<String>,
 
-    /// Output-token budget for the proposal request. Defaults to a budget
-    /// scaled to the number of pending candidates.
+    /// Output-token budget for each proposal request. Defaults to 8192;
+    /// candidates are chunked to reserve about 320 tokens apiece.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     qa_max_output_tokens: Option<u32>,
 
@@ -396,8 +397,22 @@ async fn propose_candidates(store: &JobStore, args: ProposeArgs) -> Result<()> {
             }
         }
     }
+    for failure in &run.failures {
+        println!(
+            "Proposal request failed for {} candidates (IDs {}): {}",
+            failure.candidate_ids.len(),
+            failure
+                .candidate_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            failure.error
+        );
+    }
     println!(
-        "Tokens: estimated input {}, provider input {}, provider output {}.",
+        "Requests: {}. Tokens: estimated input {}, provider input {}, provider output {}.",
+        run.request_count,
         run.estimated_input_tokens,
         format_optional_tokens(run.input_tokens),
         format_optional_tokens(run.output_tokens)
@@ -406,20 +421,14 @@ async fn propose_candidates(store: &JobStore, args: ProposeArgs) -> Result<()> {
         "Review explicitly with: bookforge glossary review-candidates {} --language \"{}->{}\"",
         args.book_id, source_language, target_language
     );
+    if counts.failed > 0 {
+        anyhow::bail!(
+            "glossary proposal pass incomplete: {} of {} candidates failed; completed results were retained for review and failed candidates remain pending",
+            counts.failed,
+            counts.total()
+        );
+    }
     Ok(())
-}
-
-/// Output-token budget for a proposal request covering `candidates` terms.
-///
-/// One request carries every pending candidate, so a flat default is wrong at
-/// both ends. A measured run â€” Kimi K3, 40 candidates â€” used 8,277 output
-/// tokens, about 207 per candidate including reasoning. 320 per candidate
-/// leaves headroom for a more verbose model; the 8,192 floor keeps small books
-/// from being starved by a tight budget, and the 65,536 ceiling stops a
-/// pathological candidate list from requesting an unbounded completion.
-fn proposal_output_budget(candidates: usize) -> u32 {
-    let scaled = candidates.saturating_mul(320).min(u32::MAX as usize) as u32;
-    scaled.clamp(8_192, 65_536)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -427,6 +436,19 @@ struct ProposalCounts {
     rendered: usize,
     declined: usize,
     model_rejected: usize,
+    failed: usize,
+}
+
+impl ProposalCounts {
+    fn completed(self) -> usize {
+        self.rendered
+            .saturating_add(self.declined)
+            .saturating_add(self.model_rejected)
+    }
+
+    fn total(self) -> usize {
+        self.completed().saturating_add(self.failed)
+    }
 }
 
 fn proposal_counts(run: &GlossaryProposalRun) -> ProposalCounts {
@@ -438,6 +460,11 @@ fn proposal_counts(run: &GlossaryProposalRun) -> ProposalCounts {
             _ => counts.rendered += 1,
         }
     }
+    counts.failed = run
+        .failures
+        .iter()
+        .map(|failure| failure.candidate_ids.len())
+        .sum();
     counts
 }
 
@@ -447,10 +474,27 @@ fn format_proposal_summary(counts: ProposalCounts) -> String {
     } else {
         "candidates"
     };
-    format!(
-        "Saved {} proposed renderings and {} declines; model rejected {} {} as not terminology. All remain reviewable auto_candidate rows.",
-        counts.rendered, counts.declined, counts.model_rejected, rejected_candidate_label
-    )
+    if counts.failed == 0 {
+        format!(
+            "Completed all {} glossary candidates: persisted {} proposed renderings and {} model-rejected {}; the model declined {}. All remain reviewable auto_candidate rows.",
+            counts.total(),
+            counts.rendered,
+            counts.model_rejected,
+            rejected_candidate_label,
+            counts.declined
+        )
+    } else {
+        format!(
+            "INCOMPLETE glossary proposal pass: completed {} of {} candidates, persisting {} proposed renderings and {} model-rejected {}; the model declined {}. {} candidates failed and remain pending.",
+            counts.completed(),
+            counts.total(),
+            counts.rendered,
+            counts.model_rejected,
+            rejected_candidate_label,
+            counts.declined,
+            counts.failed
+        )
+    }
 }
 
 fn candidate_needs_proposal(candidate: &StoredGlossaryCandidate) -> bool {
@@ -507,7 +551,7 @@ where
         &items,
         provider_name,
         model,
-        max_output_tokens.unwrap_or_else(|| proposal_output_budget(items.len())),
+        max_output_tokens.unwrap_or(DEFAULT_PROPOSAL_MAX_OUTPUT_TOKENS),
     )
     .await
     .map_err(|error| anyhow::anyhow!("glossary proposal request failed: {error}"))?;
@@ -1059,16 +1103,14 @@ mod tests {
     use bookforge_llm::{
         CompletionRequest, CompletionResponse, FinishReason, LlmError, ProviderCapabilities,
     };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
-    fn proposal_budget_scales_with_candidates_between_a_floor_and_a_ceiling() {
-        assert_eq!(proposal_output_budget(0), 8_192);
-        assert_eq!(proposal_output_budget(20), 8_192);
-        // The measured 40-candidate run needed 8,277 output tokens, which the
-        // old flat 4,096 default could not cover.
-        assert!(proposal_output_budget(40) > 8_277);
-        assert_eq!(proposal_output_budget(100), 32_000);
-        assert_eq!(proposal_output_budget(1_000_000), 65_536);
+    fn proposal_requests_default_to_the_provider_friendly_qa_cap() {
+        assert_eq!(DEFAULT_PROPOSAL_MAX_OUTPUT_TOKENS, 8_192);
     }
 
     #[derive(Clone)]
@@ -1166,6 +1208,34 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FailOnRequestProvider {
+        inner: MockProvider,
+        calls: Arc<AtomicUsize>,
+        fail_call: usize,
+    }
+
+    impl LlmProvider for FailOnRequestProvider {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse, LlmError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == self.fail_call {
+                Err(LlmError::Provider(format!(
+                    "offline failure on request {}",
+                    call + 1
+                )))
+            } else {
+                self.inner.complete(request).await
+            }
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
     fn stored_term(source_text: &str, target_text: &str, status: GlossaryStatus) -> GlossaryTerm {
         GlossaryTerm {
             id: None,
@@ -1182,6 +1252,23 @@ mod tests {
             target_language: "Italian".to_string(),
             source_count: 3,
         }
+    }
+
+    fn seed_proposal_candidates(store: &JobStore, count: usize) {
+        let source_texts = (0..count)
+            .map(|index| format!("candidate-{index}"))
+            .collect::<Vec<_>>();
+        let candidates = source_texts
+            .iter()
+            .map(|source_text| NewGlossaryCandidate {
+                source_text,
+                category: GlossaryCategory::Invented,
+                source_count: 3,
+            })
+            .collect::<Vec<_>>();
+        store
+            .upsert_glossary_candidates("book", "English", "Italian", candidates.as_slice())
+            .expect("candidates");
     }
 
     #[test]
@@ -1356,6 +1443,145 @@ case_sensitive = true
     }
 
     #[tokio::test]
+    async fn multi_chunk_pass_persists_the_same_results_as_one_chunk() {
+        let chunked_directory = tempfile::tempdir().expect("chunked temporary directory");
+        let chunked_store =
+            JobStore::open(chunked_directory.path().join("jobs.sqlite")).expect("chunked store");
+        seed_proposal_candidates(&chunked_store, 5);
+        let chunked_provider = MockProvider::new(bookforge_llm::MockMode::PrefixTarget, "Italian");
+
+        let chunked_run = propose_candidates_with_provider(
+            &chunked_store,
+            &[],
+            "book",
+            "English",
+            "Italian",
+            "mock",
+            "mock-prefix-target",
+            320,
+            Some(640),
+            &chunked_provider,
+        )
+        .await
+        .expect("chunked proposal pass");
+        assert_eq!(chunked_run.request_count, 3);
+        assert!(chunked_run.failures.is_empty());
+
+        let single_directory = tempfile::tempdir().expect("single temporary directory");
+        let single_store =
+            JobStore::open(single_directory.path().join("jobs.sqlite")).expect("single store");
+        seed_proposal_candidates(&single_store, 5);
+        let single_provider = MockProvider::new(bookforge_llm::MockMode::PrefixTarget, "Italian");
+
+        let single_run = propose_candidates_with_provider(
+            &single_store,
+            &[],
+            "book",
+            "English",
+            "Italian",
+            "mock",
+            "mock-prefix-target",
+            320,
+            Some(3_200),
+            &single_provider,
+        )
+        .await
+        .expect("single-chunk proposal pass");
+        assert_eq!(single_run.request_count, 1);
+        assert!(single_run.failures.is_empty());
+
+        let chunked_candidates = chunked_store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("chunked candidates");
+        let single_candidates = single_store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("single candidates");
+        assert_eq!(chunked_candidates, single_candidates);
+    }
+
+    #[tokio::test]
+    async fn failing_chunk_persists_successes_and_reports_every_unlanded_candidate() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open(directory.path().join("jobs.sqlite")).expect("store");
+        seed_proposal_candidates(&store, 6);
+        let before = store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("candidates");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = FailOnRequestProvider {
+            inner: MockProvider::new(bookforge_llm::MockMode::PrefixTarget, "Italian"),
+            calls: calls.clone(),
+            fail_call: 1,
+        };
+
+        let run = propose_candidates_with_provider(
+            &store,
+            &[],
+            "book",
+            "English",
+            "Italian",
+            "mock",
+            "fail-second-request",
+            320,
+            Some(640),
+            &provider,
+        )
+        .await
+        .expect("partial outcome should be returned for explicit reporting");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(run.request_count, 3);
+        assert_eq!(run.proposals.len(), 4);
+        assert_eq!(run.failures.len(), 1);
+        assert_eq!(run.failures[0].candidate_ids.len(), 2);
+        let accounted_ids = run
+            .proposals
+            .iter()
+            .map(|proposal| proposal.id)
+            .chain(
+                run.failures
+                    .iter()
+                    .flat_map(|failure| failure.candidate_ids.iter().copied()),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            accounted_ids,
+            before
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+
+        let after = store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("candidates");
+        assert_eq!(
+            after
+                .iter()
+                .filter(|candidate| candidate.target_text.is_some())
+                .count(),
+            4
+        );
+        assert_eq!(
+            after
+                .iter()
+                .filter(|candidate| candidate_needs_proposal(candidate))
+                .count(),
+            2
+        );
+        let counts = proposal_counts(&run);
+        assert_eq!(counts.completed(), 4);
+        assert_eq!(counts.failed, 2);
+        let summary = format_proposal_summary(counts);
+        assert!(summary.contains("INCOMPLETE"), "{summary}");
+        assert!(summary.contains("completed 4 of 6"), "{summary}");
+        assert!(
+            summary.contains("2 candidates failed and remain pending"),
+            "{summary}"
+        );
+    }
+
+    #[tokio::test]
     async fn declined_proposal_leaves_candidate_unrendered_and_pending() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = JobStore::open(directory.path().join("jobs.sqlite")).expect("store");
@@ -1463,10 +1689,11 @@ case_sensitive = true
                 rendered: 0,
                 declined: 0,
                 model_rejected: 1,
+                failed: 0,
             }
         );
         assert!(
-            format_proposal_summary(counts).contains("model rejected 1 candidate"),
+            format_proposal_summary(counts).contains("1 model-rejected candidate"),
             "the user-facing summary must report the rejection count"
         );
 
@@ -1543,7 +1770,7 @@ case_sensitive = true
     }
 
     #[tokio::test]
-    async fn provider_failure_does_not_modify_candidates() {
+    async fn provider_failure_is_reported_and_does_not_modify_candidates() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = JobStore::open(directory.path().join("jobs.sqlite")).expect("store");
         store
@@ -1562,7 +1789,7 @@ case_sensitive = true
             .list_glossary_candidates("book", "English", "Italian")
             .expect("candidate");
 
-        let error = propose_candidates_with_provider(
+        let run = propose_candidates_with_provider(
             &store,
             &[],
             "book",
@@ -1575,11 +1802,17 @@ case_sensitive = true
             &FailingProvider,
         )
         .await
-        .expect_err("provider failure should surface");
+        .expect("the partial outcome should retain candidate accounting");
 
+        let counts = proposal_counts(&run);
         assert!(
-            error.to_string().contains("offline test failure"),
-            "{error}"
+            run.failures[0].error.contains("offline test failure"),
+            "{run:?}"
+        );
+        assert_eq!(counts.failed, 1);
+        assert!(
+            format_proposal_summary(counts).contains("INCOMPLETE"),
+            "the user-facing summary must never report a partial pass as success"
         );
         let after = store
             .list_glossary_candidates("book", "English", "Italian")

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bookforge_core::GlossaryCategory;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ use crate::{
 const PROMPT_SOURCE: &str = include_str!("../prompts/glossary_propose.v2.md");
 pub const GLOSSARY_PROPOSAL_PROMPT_NAME: &str = "glossary_propose";
 pub const GLOSSARY_PROPOSAL_PROMPT_VERSION: &str = "v2";
+const OUTPUT_TOKENS_PER_CANDIDATE: u32 = 320;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GlossaryProposalInput {
@@ -57,9 +58,17 @@ pub struct GlossaryProposal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlossaryProposalRun {
     pub proposals: Vec<GlossaryProposal>,
+    pub failures: Vec<GlossaryProposalFailure>,
     pub estimated_input_tokens: usize,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub request_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlossaryProposalFailure {
+    pub candidate_ids: Vec<i64>,
+    pub error: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +82,58 @@ struct RawProposal {
     target_text: Option<String>,
     policy: GlossaryProposalPolicy,
     reason: String,
+}
+
+#[derive(Debug)]
+struct ProposalBatchRequestError {
+    error: LlmError,
+    usage: ProposalUsage,
+}
+
+impl ProposalBatchRequestError {
+    fn should_split(&self) -> bool {
+        matches!(self.error, LlmError::Json(_) | LlmError::InvalidResponse(_))
+    }
+}
+
+impl std::fmt::Display for ProposalBatchRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProposalUsage {
+    estimated_input_tokens: usize,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    request_count: usize,
+}
+
+impl ProposalUsage {
+    fn for_request(estimated_input_tokens: usize) -> Self {
+        Self {
+            estimated_input_tokens,
+            input_tokens: None,
+            output_tokens: None,
+            request_count: 1,
+        }
+    }
+
+    fn with_response(mut self, input_tokens: Option<u64>, output_tokens: Option<u64>) -> Self {
+        self.input_tokens = input_tokens;
+        self.output_tokens = output_tokens;
+        self
+    }
+
+    fn accumulate(&mut self, usage: Self) {
+        self.estimated_input_tokens = self
+            .estimated_input_tokens
+            .saturating_add(usage.estimated_input_tokens);
+        self.input_tokens = sum_optional_tokens(self.input_tokens, usage.input_tokens);
+        self.output_tokens = sum_optional_tokens(self.output_tokens, usage.output_tokens);
+        self.request_count = self.request_count.saturating_add(usage.request_count);
+    }
 }
 
 pub async fn propose_glossary_renderings<P>(
@@ -90,9 +151,11 @@ where
     if items.is_empty() {
         return Ok(GlossaryProposalRun {
             proposals: Vec::new(),
+            failures: Vec::new(),
             estimated_input_tokens: 0,
             input_tokens: Some(0),
             output_tokens: Some(0),
+            request_count: 0,
         });
     }
 
@@ -103,15 +166,91 @@ where
         PROMPT_SOURCE,
     )
     .map_err(|error| LlmError::Provider(error.to_string()))?;
+
+    let chunk_size = proposal_chunk_size(max_output_tokens);
+    let mut queue = items
+        .chunks(chunk_size)
+        .map(<[GlossaryProposalInput]>::to_vec)
+        .collect::<VecDeque<_>>();
+    let mut proposals = Vec::with_capacity(items.len());
+    let mut failures = Vec::new();
+    let mut usage = ProposalUsage {
+        estimated_input_tokens: 0,
+        input_tokens: Some(0),
+        output_tokens: Some(0),
+        request_count: 0,
+    };
+
+    while let Some(chunk) = queue.pop_front() {
+        match request_glossary_proposal_batch(
+            provider,
+            &template,
+            source_language,
+            target_language,
+            &chunk,
+            provider_name,
+            model,
+            max_output_tokens,
+        )
+        .await
+        {
+            Ok((mut chunk_proposals, chunk_usage)) => {
+                usage.accumulate(chunk_usage);
+                proposals.append(&mut chunk_proposals);
+            }
+            Err(error) if error.should_split() && chunk.len() > 1 => {
+                usage.accumulate(error.usage);
+                let mid = chunk.len() / 2;
+                queue.push_front(chunk[mid..].to_vec());
+                queue.push_front(chunk[..mid].to_vec());
+            }
+            Err(error) => {
+                usage.accumulate(error.usage);
+                failures.push(GlossaryProposalFailure {
+                    candidate_ids: chunk.iter().map(|item| item.id).collect(),
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(GlossaryProposalRun {
+        proposals,
+        failures,
+        estimated_input_tokens: usage.estimated_input_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        request_count: usage.request_count,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn request_glossary_proposal_batch<P>(
+    provider: &P,
+    template: &PromptTemplate,
+    source_language: &str,
+    target_language: &str,
+    items: &[GlossaryProposalInput],
+    provider_name: &str,
+    model: &str,
+    max_output_tokens: u32,
+) -> Result<(Vec<GlossaryProposal>, ProposalUsage), ProposalBatchRequestError>
+where
+    P: LlmProvider,
+{
     let mut vars = Substitutions::new();
     vars.string("source_language", source_language)
         .string("target_language", target_language)
         .json_compact("items_json", &items);
     let rendered = template
         .render(&vars)
-        .map_err(|error| LlmError::Provider(error.to_string()))?;
+        .map_err(|error| ProposalBatchRequestError {
+            error: LlmError::Provider(error.to_string()),
+            usage: ProposalUsage::for_request(0),
+        })?;
     let estimated_input_tokens =
         estimate_tokens(&rendered.system).saturating_add(estimate_tokens(&rendered.user));
+    let request_usage = ProposalUsage::for_request(estimated_input_tokens);
 
     let response = provider
         .complete(CompletionRequest {
@@ -121,30 +260,49 @@ where
             temperature: 0.1,
             max_output_tokens: Some(max_output_tokens.max(1)),
             metadata: RequestMetadata {
-                prompt_template: Some(template.name),
-                prompt_version: Some(template.version),
+                prompt_template: Some(template.name.clone()),
+                prompt_version: Some(template.version.clone()),
                 provider: Some(provider_name.to_string()),
                 model: Some(model.to_string()),
                 provider_max_attempts: Some(2),
                 ..RequestMetadata::default()
             },
         })
-        .await?;
+        .await
+        .map_err(|error| ProposalBatchRequestError {
+            error,
+            usage: request_usage,
+        })?;
+    let request_usage = request_usage.with_response(response.input_tokens, response.output_tokens);
 
     if response.finish_reason == FinishReason::Length {
-        return Err(LlmError::InvalidResponse(format!(
-            "glossary proposal output was truncated at {max_output_tokens} tokens"
-        )));
+        return Err(ProposalBatchRequestError {
+            error: LlmError::InvalidResponse(format!(
+                "glossary proposal output was truncated at {max_output_tokens} tokens"
+            )),
+            usage: request_usage,
+        });
     }
 
-    let parsed: ProposalResponse = serde_json::from_str(&response.content)?;
-    let proposals = validate_proposals(items, parsed.proposals)?;
-    Ok(GlossaryProposalRun {
-        proposals,
-        estimated_input_tokens,
-        input_tokens: response.input_tokens,
-        output_tokens: response.output_tokens,
-    })
+    let parsed: ProposalResponse =
+        serde_json::from_str(&response.content).map_err(|error| ProposalBatchRequestError {
+            error: LlmError::Json(error),
+            usage: request_usage,
+        })?;
+    let proposals =
+        validate_proposals(items, parsed.proposals).map_err(|error| ProposalBatchRequestError {
+            error,
+            usage: request_usage,
+        })?;
+    Ok((proposals, request_usage))
+}
+
+fn proposal_chunk_size(max_output_tokens: u32) -> usize {
+    usize::try_from((max_output_tokens / OUTPUT_TOKENS_PER_CANDIDATE).max(1)).unwrap_or(usize::MAX)
+}
+
+fn sum_optional_tokens(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    Some(left?.saturating_add(right?))
 }
 
 fn ensure_unique_input_ids(items: &[GlossaryProposalInput]) -> Result<(), LlmError> {
@@ -286,8 +444,42 @@ mod tests {
             Some("[Italian] phantasmatron")
         );
         assert_eq!(run.proposals[0].policy, GlossaryProposalPolicy::Recreate);
+        assert!(run.failures.is_empty());
+        assert_eq!(run.request_count, 1);
         assert!(run.input_tokens.is_some());
         assert!(run.output_tokens.is_some());
+    }
+
+    #[tokio::test]
+    async fn candidate_set_larger_than_one_chunk_uses_multiple_requests() {
+        assert_eq!(proposal_chunk_size(8_192), 25);
+        let provider = MockProvider::new(MockMode::PrefixTarget, "Italian");
+        let items = (1..=26)
+            .map(|id| input(id, format!("candidate-{id}").as_str()))
+            .collect::<Vec<_>>();
+
+        let run = propose_glossary_renderings(
+            &provider,
+            "English",
+            "Italian",
+            &items,
+            "mock",
+            "mock-prefix-target",
+            8_192,
+        )
+        .await
+        .expect("chunked mock proposal should succeed");
+
+        assert_eq!(run.request_count, 2);
+        assert_eq!(run.proposals.len(), items.len());
+        assert!(run.failures.is_empty());
+        assert_eq!(
+            run.proposals
+                .iter()
+                .map(|proposal| proposal.id)
+                .collect::<Vec<_>>(),
+            items.iter().map(|item| item.id).collect::<Vec<_>>()
+        );
     }
 
     #[derive(Clone)]
@@ -317,6 +509,184 @@ mod tests {
                 supports_usage_tokens: true,
             }
         }
+    }
+
+    #[derive(Clone)]
+    struct SplitRetryProvider;
+
+    impl LlmProvider for SplitRetryProvider {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            let items = extract_prompt_items(&request.user);
+            if items.len() > 1 {
+                return Ok(CompletionResponse {
+                    content: serde_json::json!({ "proposals": [] }).to_string(),
+                    input_tokens: Some(10),
+                    input_cached_tokens: Some(0),
+                    output_tokens: Some(5),
+                    finish_reason: FinishReason::Length,
+                    provider_latency_ms: 1,
+                    raw: serde_json::Value::Null,
+                });
+            }
+
+            let proposals = items
+                .iter()
+                .filter_map(|item| {
+                    let id = item.get("id")?.as_i64()?;
+                    let source_text = item.get("source_text")?.as_str()?;
+                    Some(serde_json::json!({
+                        "id": id,
+                        "target_text": format!("rendered {source_text}"),
+                        "policy": "recreate",
+                        "reason": "The isolated candidate has enough evidence."
+                    }))
+                })
+                .collect::<Vec<_>>();
+            Ok(CompletionResponse {
+                content: serde_json::json!({ "proposals": proposals }).to_string(),
+                input_tokens: Some(10),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(5),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 1,
+                raw: serde_json::Value::Null,
+            })
+        }
+
+        fn capabilities(&self) -> crate::ProviderCapabilities {
+            crate::ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct EmptyForCandidateProvider {
+        empty_id: i64,
+    }
+
+    impl LlmProvider for EmptyForCandidateProvider {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            let items = extract_prompt_items(&request.user);
+            if items.iter().any(|item| {
+                item.get("id").and_then(serde_json::Value::as_i64) == Some(self.empty_id)
+            }) {
+                return Ok(CompletionResponse {
+                    content: String::new(),
+                    input_tokens: Some(10),
+                    input_cached_tokens: Some(0),
+                    output_tokens: Some(5),
+                    finish_reason: FinishReason::Stop,
+                    provider_latency_ms: 1,
+                    raw: serde_json::Value::Null,
+                });
+            }
+
+            let proposals = items
+                .iter()
+                .filter_map(|item| {
+                    let id = item.get("id")?.as_i64()?;
+                    let source_text = item.get("source_text")?.as_str()?;
+                    Some(serde_json::json!({
+                        "id": id,
+                        "target_text": format!("rendered {source_text}"),
+                        "policy": "recreate",
+                        "reason": "The candidate has enough evidence."
+                    }))
+                })
+                .collect::<Vec<_>>();
+            Ok(CompletionResponse {
+                content: serde_json::json!({ "proposals": proposals }).to_string(),
+                input_tokens: Some(10),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(5),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 1,
+                raw: serde_json::Value::Null,
+            })
+        }
+
+        fn capabilities(&self) -> crate::ProviderCapabilities {
+            crate::ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    fn extract_prompt_items(user: &str) -> Vec<serde_json::Value> {
+        user.lines()
+            .find_map(|line| {
+                let line = line.trim();
+                line.starts_with('[')
+                    .then(|| serde_json::from_str(line).ok())
+                    .flatten()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn truncation_bisects_and_retries_until_every_candidate_lands() {
+        let items = (1..=4)
+            .map(|id| input(id, format!("candidate-{id}").as_str()))
+            .collect::<Vec<_>>();
+
+        let run = propose_glossary_renderings(
+            &SplitRetryProvider,
+            "English",
+            "Italian",
+            &items,
+            "test",
+            "split-retry",
+            1_280,
+        )
+        .await
+        .expect("split retries should recover");
+
+        assert_eq!(run.proposals.len(), items.len());
+        assert!(run.failures.is_empty());
+        assert_eq!(
+            run.request_count, 7,
+            "one four-item request, two two-item retries, and four single-item retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_response_is_bisected_and_only_terminal_candidate_fails() {
+        let items = (1..=4)
+            .map(|id| input(id, format!("candidate-{id}").as_str()))
+            .collect::<Vec<_>>();
+
+        let run = propose_glossary_renderings(
+            &EmptyForCandidateProvider { empty_id: 3 },
+            "English",
+            "Italian",
+            &items,
+            "test",
+            "empty-on-three",
+            1_280,
+        )
+        .await
+        .expect("empty output should produce an explicitly partial result");
+
+        assert_eq!(
+            run.proposals
+                .iter()
+                .map(|proposal| proposal.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4]
+        );
+        assert_eq!(run.failures.len(), 1);
+        assert_eq!(run.failures[0].candidate_ids, vec![3]);
+        assert!(run.failures[0].error.contains("EOF"), "{run:?}");
+        assert_eq!(run.request_count, 5);
     }
 
     #[tokio::test]
@@ -384,7 +754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incomplete_response_is_rejected_as_a_whole() {
+    async fn incomplete_response_is_bisected_and_terminal_omission_is_accounted_for() {
         let provider = StaticProvider {
             content: serde_json::json!({
                 "proposals": [{
@@ -397,7 +767,7 @@ mod tests {
             .to_string(),
         };
 
-        let error = propose_glossary_renderings(
+        let run = propose_glossary_renderings(
             &provider,
             "English",
             "Italian",
@@ -407,8 +777,13 @@ mod tests {
             1_024,
         )
         .await
-        .expect_err("omitted IDs must fail the batch");
+        .expect("partial result should retain exact failure accounting");
 
-        assert!(error.to_string().contains("omitted IDs: 2"), "{error}");
+        assert_eq!(run.proposals.len(), 1);
+        assert_eq!(run.proposals[0].id, 1);
+        assert_eq!(run.failures.len(), 1);
+        assert_eq!(run.failures[0].candidate_ids, vec![2]);
+        assert!(run.failures[0].error.contains("unknown ID 1"), "{run:?}");
+        assert_eq!(run.request_count, 3);
     }
 }

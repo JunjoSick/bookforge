@@ -208,8 +208,13 @@ rejection is stored with a visible `model rejection (not terminology): ...`
 note, is skipped by later proposal passes, and remains in `review-candidates`
 for human override. Human rejection uses the distinct `rejected` status. The
 command reports how many candidates the model rejected and prints each reason.
-Settled and already-proposed terms are not sent again, and a provider or
-response-validation failure occurs before any candidate write.
+Settled and already-proposed terms are not sent again. The proposal pass uses
+bounded chunks of at most 25 candidates by default (8192 output tokens,
+budgeted at 320 per candidate). Truncated or structurally invalid responses are
+bisected and retried down to a single candidate. Completed chunks are retained,
+but any terminal chunk failure makes the command print an `INCOMPLETE` summary
+with completed and failed counts and exit with an error; failed candidates
+remain pending.
 
 Candidate extraction itself is English-specific: its positional evidence models
 English capitalization and non-English input gets only a 17-word English
@@ -219,23 +224,24 @@ model as precision. The default `--min-count 3` is the recommended compromise:
 it recovers three-occurrence terms without paying the 320-output-token budget
 for the much larger one- and two-occurrence tail.
 
-This pass is deliberately book-sized rather than segment-sized. A measured run —
-The Cyberiad, 40 candidates, Kimi K3 — cost 2,355 provider input tokens and
+This pass is deliberately book-scoped rather than segment-scoped. A measured
+run — The Cyberiad, 40 candidates, Kimi K3 — cost 2,355 provider input tokens and
 **8,277 output tokens**: about 207 output tokens per candidate, most of it
 reasoning. That is cents per book, once, against paying for repeated QA after
 terminology has already drifted. The command prints both its prompt estimate and
 provider-reported usage; use the selected model's current rates for budgeting.
 
-**Size the output cap from the candidate count, not a flat number.** One request
-carries every pending candidate, so the budget has to scale. A reasoning model
-that runs out mid-thought returns HTTP 200 with *no message content at all* —
-not a truncated answer — so the failure used to surface as
+**Bound each request while keeping the per-candidate allowance honest.** A
+reasoning model that runs out mid-thought returns HTTP 200 with *no message
+content at all* — not a truncated answer — so the failure used to surface as
 `missing choices[0].message.content`, which says nothing about the cause. This
 happened three separate times in two days: `judge_flags` at its 400-token
 default, the QA pass at the provider default, and this command at a flat 4,096.
 The provider now recognises that shape — `finish_reason: length`, or reasoning
-present with content absent — and names the flag to raise. `glossary propose`
-sizes its own budget at 320 tokens per candidate (floor 8,192, ceiling 65,536).
+present with content absent — and names the relevant flag. `glossary propose`
+caps each request at 8,192 output tokens by default and sizes chunks at 320
+tokens per candidate. It also bisects a truncated or invalid chunk rather than
+discarding the entire proposal pass.
 
 ## Cost
 
