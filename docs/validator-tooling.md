@@ -107,11 +107,79 @@ Two things the measurement surfaced that nobody was looking for:
 - `other` and `unknown_inline_marker` came back **100% true positive** in both
   runs (small n). Those checks earn their keep and remain hard failures.
 
+## The LLM QA pass, measured
+
+`--qa` sends translated segments to a model for review. It is worth having: on
+one book it caught the book's own title `The Cyberiad` rendered as
+`Il Ciberspazio` ("cyberspace"), which no deterministic check can find.
+
+Judged by the same method as above — same book, same segments, deepseek-v4-pro
+adjudicating — it runs at roughly **40% true positive against 3.2% for the
+deterministic protected-span check**. It is the more precise of the two signals
+by an order of magnitude, and worth calibrating rather than removing.
+
+### Three prompt variants, all measured
+
+Do not repeat these. Same book, same nine segments, same judge:
+
+| prompt | findings | true positive |
+| --- | --- | --- |
+| "Do not nitpick harmless style choices" | 15 | **40.0%** |
+| plus explicit `high`/`medium`/`low` definitions | 54 | 5.6% |
+| plus "report only `medium` and `high`" | 99 | 17.5% |
+
+**Every attempt to constrain the model increased its output.** Defining `low` as
+"a specific, defensible improvement would fix a minor imprecision" created a
+sanctioned category for the noise it was meant to suppress, and 50 of 54
+findings arrived as `low`. Removing `low` from the request did not reduce
+reporting — the model relabelled all 99 findings `medium`, several of which
+state in their own text "This is correct. No issue."
+
+The conclusion is that **severity instructions do not control this model's
+output volume or precision**. It reports what it notices on a linear pass and
+applies whichever label it is permitted to use. The original wording is in the
+tree because it measured best, not because it is well written.
+
+### Why: review units are the wrong size
+
+Segment sizes on a real book are extreme and bimodal:
+
+```
+segments 32   median 12 chars   max 56,106 chars   ten over 10k
+```
+
+The median review unit is a table-of-contents line; the largest is 56,000
+characters. Segments are sized for *translation* throughput, where large
+batches are efficient, and QA inherited that sizing. Output volume tracks input
+size regardless of what the prompt asks for, which explains all three rows above
+better than any theory about wording.
+
+This also explains a specific miss. In a 15,000-character segment a machine is
+built that produces anything beginning with `n`; the translation has it make
+`aghi` and `inchiodare`, neither of which begins with n in Italian. The rule and
+its violation are in the same paragraph and the model did not notice, while
+catching terminology drift between two nearby mentions in the same pass. The
+review is phrase-by-phrase, not holistic.
+
+### The trap in the obvious fix
+
+Chunking QA into smaller units would focus attention — and would probably
+destroy what currently works. Every true positive was a **cross-reference**
+error: a term translated in one place and left in English later
+(`Steelypips`), one word rendered two ways (`Incursione` / `sortita`), a letter
+dropped from an invented word (`CYPHROEROTICON`), register collapsing between
+two mentions. Those are only visible when both mentions sit in the same review
+unit.
+
+Naive chunking therefore trades a 40% signal for better-behaved noise. Measure
+before believing either direction.
+
 ## Cost
 
 Judging 389 flags cost about $0.07 on deepseek-v4-flash, $0.21 on
 deepseek-v4-pro, and roughly $1.72 on Kimi K3 before cache hits. The entire
-two-day measurement effort cost under $3.
+two-day measurement effort cost under $3. A full QA pass over one book with
+Kimi K3 is about $0.35.
 
 Add new models to `pricing/providers.json` **and** the packaged copy at
 `crates/bookforge-cli/pricing/providers.json` — a test asserts they are
