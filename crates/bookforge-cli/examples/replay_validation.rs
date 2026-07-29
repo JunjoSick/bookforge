@@ -239,20 +239,24 @@ fn main() -> Result<()> {
             }
         };
 
-        let Some(epub_path) = resolve_snapshot_path(&root, job, &snapshot) else {
-            totals.skipped_no_snapshot_path += 1;
-            warn(&format!("{}: no input snapshot recorded", job.id));
-            continue;
+        let epub_path = match resolve_snapshot_path(&root, job, &snapshot) {
+            SnapshotLocation::Found(path) => path,
+            SnapshotLocation::NotRecorded => {
+                totals.skipped_no_snapshot_path += 1;
+                warn(&format!("{}: no input snapshot recorded", job.id));
+                continue;
+            }
+            SnapshotLocation::Unresolvable(recorded) => {
+                totals.skipped_missing_snapshot += 1;
+                warn(&format!(
+                    "{}: input snapshot recorded as {} but not found under {}",
+                    job.id,
+                    recorded.display(),
+                    root.display()
+                ));
+                continue;
+            }
         };
-        if !epub_path.exists() {
-            totals.skipped_missing_snapshot += 1;
-            warn(&format!(
-                "{}: input snapshot missing at {}",
-                job.id,
-                epub_path.display()
-            ));
-            continue;
-        }
 
         let book = match read_epub(&epub_path) {
             Ok(book) => book,
@@ -542,31 +546,56 @@ fn store_root(db_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Why a job's input snapshot could or could not be located.
+///
+/// "Nothing was recorded" and "something was recorded but does not resolve
+/// under this root" are different failures with different fixes, and conflating
+/// them is actively misleading: `input_snapshot_path` is stored **relative to
+/// the directory BookForge was launched from**, so pointing `--db` at a copy of
+/// `jobs.sqlite` elsewhere makes every recorded path unresolvable while the
+/// paths themselves are perfectly intact.
+enum SnapshotLocation {
+    Found(PathBuf),
+    NotRecorded,
+    Unresolvable(PathBuf),
+}
+
 fn resolve_snapshot_path(
     root: &Path,
     job: &JobRecord,
     snapshot: &RunConfigSnapshot,
-) -> Option<PathBuf> {
+) -> SnapshotLocation {
     let recorded = job
         .input_snapshot_path
         .clone()
         .or_else(|| snapshot.input_snapshot_path.clone());
     if let Some(path) = recorded {
         let resolved = if path.is_absolute() {
-            path
+            path.clone()
         } else {
-            root.join(path)
+            root.join(&path)
         };
         if resolved.exists() {
-            return Some(resolved);
+            return SnapshotLocation::Found(resolved);
         }
+        let fallback = run_input_fallback(root, &job.id);
+        if fallback.exists() {
+            return SnapshotLocation::Found(fallback);
+        }
+        return SnapshotLocation::Unresolvable(resolved);
     }
-    let fallback = root
-        .join(".bookforge")
+    let fallback = run_input_fallback(root, &job.id);
+    if fallback.exists() {
+        return SnapshotLocation::Found(fallback);
+    }
+    SnapshotLocation::NotRecorded
+}
+
+fn run_input_fallback(root: &Path, job_id: &str) -> PathBuf {
+    root.join(".bookforge")
         .join("runs")
-        .join(&job.id)
-        .join("input.epub");
-    fallback.exists().then_some(fallback)
+        .join(job_id)
+        .join("input.epub")
 }
 
 fn replay_settings(
@@ -694,11 +723,11 @@ fn print_report(
         totals.skipped_settings_unreadable
     );
     println!(
-        "skipped: no snapshot path  : {}",
+        "skipped: snapshot unrecorded: {}",
         totals.skipped_no_snapshot_path
     );
     println!(
-        "skipped: snapshot missing  : {}",
+        "skipped: snapshot unresolved: {}",
         totals.skipped_missing_snapshot
     );
     println!(
