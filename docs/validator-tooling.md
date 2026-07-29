@@ -198,11 +198,26 @@ bookforge glossary review-candidates cyberiad --language "English->Italian"
 
 The proposal prompt makes invented-word strategy explicit: preserve the source,
 translate it directly, calque its components, recreate a target-language
-neologism, or decline when the excerpt is insufficient. It also requests a
-one-sentence rationale. Proposals remain inactive `auto_candidate` rows; the
-reviewer must accept or edit them. Settled and already-proposed terms are not
-sent again, and a provider or response-validation failure occurs before any
-candidate write.
+neologism, or decline when a genuine term's excerpt is insufficient. It can
+separately reject ordinary language as `not_terminology`. Every answer requires
+a one-sentence rationale.
+
+Renderings and model rejections remain inactive `auto_candidate` rows; the
+reviewer must accept or edit them before they can reach translation. A model
+rejection is stored with a visible `model rejection (not terminology): ...`
+note, is skipped by later proposal passes, and remains in `review-candidates`
+for human override. Human rejection uses the distinct `rejected` status. The
+command reports how many candidates the model rejected and prints each reason.
+Settled and already-proposed terms are not sent again, and a provider or
+response-validation failure occurs before any candidate write.
+
+Candidate extraction itself is English-specific: its positional evidence models
+English capitalization and non-English input gets only a 17-word English
+fallback stoplist. German common nouns are capitalized mid-sentence, so every
+repeated noun can clear that filter. Treat extraction as recall and the strong
+model as precision. The default `--min-count 3` is the recommended compromise:
+it recovers three-occurrence terms without paying the 320-output-token budget
+for the much larger one- and two-occurrence tail.
 
 This pass is deliberately book-sized rather than segment-sized. A measured run —
 The Cyberiad, 40 candidates, Kimi K3 — cost 2,355 provider input tokens and

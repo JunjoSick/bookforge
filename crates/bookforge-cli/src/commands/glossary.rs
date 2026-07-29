@@ -1,4 +1,4 @@
-﻿use std::{
+use std::{
     fs,
     io::{self, BufRead, Write},
     path::PathBuf,
@@ -10,12 +10,14 @@ use bookforge_core::{
     extract_glossary_candidates, glossary::glossary_candidate_excerpt, ir::Block,
 };
 use bookforge_llm::{
-    GlossaryProposalInput, GlossaryProposalRun, LlmProvider, MockProvider, OpenAiCompatibleConfig,
-    OpenAiCompatibleProvider, propose_glossary_renderings,
+    GlossaryProposalInput, GlossaryProposalPolicy, GlossaryProposalRun, LlmProvider, MockProvider,
+    OpenAiCompatibleConfig, OpenAiCompatibleProvider, propose_glossary_renderings,
 };
 use bookforge_store::{GlossaryFilter, JobStore, NewGlossaryCandidate, StoredGlossaryCandidate};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
+
+const MODEL_REJECTION_NOTE_PREFIX: &str = "model rejection (not terminology): ";
 
 #[derive(Debug, Args)]
 pub struct GlossaryArgs {
@@ -133,7 +135,7 @@ struct ExtractCandidatesArgs {
     #[arg(long)]
     target_lang: String,
 
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 3)]
     min_count: usize,
 
     #[arg(long)]
@@ -314,12 +316,7 @@ async fn propose_candidates(store: &JobStore, args: ProposeArgs) -> Result<()> {
     let pending = store
         .list_glossary_candidates(&args.book_id, &source_language, &target_language)?
         .into_iter()
-        .filter(|candidate| {
-            candidate
-                .target_text
-                .as_deref()
-                .is_none_or(|target| target.trim().is_empty())
-        })
+        .filter(candidate_needs_proposal)
         .count();
     if pending == 0 {
         println!("No pending glossary candidates without proposals.");
@@ -374,29 +371,29 @@ async fn propose_candidates(store: &JobStore, args: ProposeArgs) -> Result<()> {
         provider => anyhow::bail!("unsupported glossary proposal provider '{provider}'"),
     };
 
-    let rendered = run
-        .proposals
-        .iter()
-        .filter(|proposal| proposal.target_text.is_some())
-        .count();
-    let declined = run.proposals.len().saturating_sub(rendered);
-    println!(
-        "Saved {rendered} proposed renderings and {declined} declines; all remain auto_candidate."
-    );
-    if declined > 0 {
+    let counts = proposal_counts(&run);
+    println!("{}", format_proposal_summary(counts));
+    if counts.declined > 0 || counts.model_rejected > 0 {
         let candidates =
             store.list_glossary_candidates(&args.book_id, &source_language, &target_language)?;
-        for proposal in run
-            .proposals
-            .iter()
-            .filter(|proposal| proposal.target_text.is_none())
-        {
+        for proposal in &run.proposals {
             let source = candidates
                 .iter()
                 .find(|candidate| candidate.id == proposal.id)
                 .map(|candidate| candidate.source_text.as_str())
                 .unwrap_or("<unknown candidate>");
-            println!("Declined {source}: {}", proposal.reason);
+            match proposal.policy {
+                GlossaryProposalPolicy::Decline => {
+                    println!("Declined {source}: {}", proposal.reason);
+                }
+                GlossaryProposalPolicy::NotTerminology => {
+                    println!(
+                        "Model-rejected {source} as not terminology: {}",
+                        proposal.reason
+                    );
+                }
+                _ => {}
+            }
         }
     }
     println!(
@@ -425,6 +422,52 @@ fn proposal_output_budget(candidates: usize) -> u32 {
     scaled.clamp(8_192, 65_536)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ProposalCounts {
+    rendered: usize,
+    declined: usize,
+    model_rejected: usize,
+}
+
+fn proposal_counts(run: &GlossaryProposalRun) -> ProposalCounts {
+    let mut counts = ProposalCounts::default();
+    for proposal in &run.proposals {
+        match proposal.policy {
+            GlossaryProposalPolicy::Decline => counts.declined += 1,
+            GlossaryProposalPolicy::NotTerminology => counts.model_rejected += 1,
+            _ => counts.rendered += 1,
+        }
+    }
+    counts
+}
+
+fn format_proposal_summary(counts: ProposalCounts) -> String {
+    let rejected_candidate_label = if counts.model_rejected == 1 {
+        "candidate"
+    } else {
+        "candidates"
+    };
+    format!(
+        "Saved {} proposed renderings and {} declines; model rejected {} {} as not terminology. All remain reviewable auto_candidate rows.",
+        counts.rendered, counts.declined, counts.model_rejected, rejected_candidate_label
+    )
+}
+
+fn candidate_needs_proposal(candidate: &StoredGlossaryCandidate) -> bool {
+    candidate
+        .target_text
+        .as_deref()
+        .is_none_or(|target| target.trim().is_empty())
+        && !candidate
+            .notes
+            .as_deref()
+            .is_some_and(|notes| notes.starts_with(MODEL_REJECTION_NOTE_PREFIX))
+}
+
+fn model_rejection_note(reason: &str) -> String {
+    format!("{MODEL_REJECTION_NOTE_PREFIX}{reason}")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn propose_candidates_with_provider<P>(
     store: &JobStore,
@@ -444,12 +487,7 @@ where
     let candidates = store.list_glossary_candidates(book_id, source_language, target_language)?;
     let items = candidates
         .iter()
-        .filter(|candidate| {
-            candidate
-                .target_text
-                .as_deref()
-                .is_none_or(|target| target.trim().is_empty())
-        })
+        .filter(|candidate| candidate_needs_proposal(candidate))
         .map(|candidate| GlossaryProposalInput {
             id: candidate.id,
             source_text: candidate.source_text.clone(),
@@ -484,25 +522,30 @@ where
         .iter()
         .filter_map(|candidate| {
             let proposal = proposals_by_id.get(&candidate.id)?;
-            let target_text = proposal.target_text.as_ref()?;
-            if candidate
-                .target_text
-                .as_deref()
-                .is_some_and(|target| !target.trim().is_empty())
-            {
+            if !candidate_needs_proposal(candidate) {
                 return None;
             }
-            let note = format!(
-                "model proposal ({}): {}",
-                proposal.policy.as_str(),
-                proposal.reason
-            );
+            let (target_text, note) = match proposal.policy {
+                GlossaryProposalPolicy::Decline => return None,
+                GlossaryProposalPolicy::NotTerminology => (
+                    String::new(),
+                    model_rejection_note(proposal.reason.as_str()),
+                ),
+                _ => (
+                    proposal.target_text.clone()?,
+                    format!(
+                        "model proposal ({}): {}",
+                        proposal.policy.as_str(),
+                        proposal.reason
+                    ),
+                ),
+            };
             Some(GlossaryTerm {
                 id: Some(candidate.id),
                 scope_kind: GlossaryScopeKind::Book,
                 scope_id: Some(book_id.to_string()),
                 source_text: candidate.source_text.clone(),
-                target_text: target_text.clone(),
+                target_text,
                 category: candidate.category,
                 notes: Some(note),
                 case_sensitive: candidate.case_sensitive,
@@ -1085,6 +1128,44 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RejectingProvider {
+        id: i64,
+    }
+
+    impl LlmProvider for RejectingProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse, LlmError> {
+            let content = serde_json::json!({
+                "proposals": [{
+                    "id": self.id,
+                    "target_text": null,
+                    "policy": "not_terminology",
+                    "reason": "This is an ordinary interjection, not terminology needing a stable rendering."
+                }]
+            })
+            .to_string();
+            Ok(CompletionResponse {
+                content,
+                input_tokens: Some(10),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(5),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 1,
+                raw: serde_json::Value::Null,
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
     fn stored_term(source_text: &str, target_text: &str, status: GlossaryStatus) -> GlossaryTerm {
         GlossaryTerm {
             id: None,
@@ -1209,6 +1290,8 @@ case_sensitive = true
     async fn proposal_pass_only_submits_unrendered_auto_candidates() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = JobStore::open(directory.path().join("jobs.sqlite")).expect("store");
+        let mut model_rejected = stored_term("model rejected", "", GlossaryStatus::AutoCandidate);
+        model_rejected.notes = Some(model_rejection_note("It is an ordinary adjective."));
         store
             .upsert_glossary_terms(&[
                 stored_term("pending", "", GlossaryStatus::AutoCandidate),
@@ -1220,6 +1303,7 @@ case_sensitive = true
                 stored_term("seeded", "manuale", GlossaryStatus::UserSeeded),
                 stored_term("accepted", "accettato", GlossaryStatus::Accepted),
                 stored_term("rejected", "", GlossaryStatus::Rejected),
+                model_rejected,
             ])
             .expect("terms");
         let provider =
@@ -1262,6 +1346,13 @@ case_sensitive = true
         assert_eq!(term("seeded").target_text, "manuale");
         assert_eq!(term("accepted").target_text, "accettato");
         assert_eq!(term("rejected").status, GlossaryStatus::Rejected);
+        assert_eq!(term("model rejected").status, GlossaryStatus::AutoCandidate);
+        assert!(
+            term("model rejected")
+                .notes
+                .as_deref()
+                .is_some_and(|notes| notes.starts_with(MODEL_REJECTION_NOTE_PREFIX))
+        );
     }
 
     #[tokio::test]
@@ -1306,6 +1397,149 @@ case_sensitive = true
         assert_eq!(after, before);
         assert_eq!(after[0].status, GlossaryStatus::AutoCandidate);
         assert_eq!(after[0].target_text, None);
+    }
+
+    #[tokio::test]
+    async fn model_rejection_is_auditable_inactive_and_human_reversible() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open(directory.path().join("jobs.sqlite")).expect("store");
+        store
+            .upsert_glossary_candidates(
+                "book",
+                "English",
+                "Italian",
+                &[
+                    NewGlossaryCandidate {
+                        source_text: "Oh",
+                        category: GlossaryCategory::Other,
+                        source_count: 4,
+                    },
+                    NewGlossaryCandidate {
+                        source_text: "Meanwhile",
+                        category: GlossaryCategory::Other,
+                        source_count: 4,
+                    },
+                ],
+            )
+            .expect("candidates");
+        let before = store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("candidates");
+        let oh_id = before
+            .iter()
+            .find(|candidate| candidate.source_text == "Oh")
+            .expect("Oh candidate")
+            .id;
+        let meanwhile_id = before
+            .iter()
+            .find(|candidate| candidate.source_text == "Meanwhile")
+            .expect("Meanwhile candidate")
+            .id;
+        assert!(
+            store
+                .reject_glossary_candidate(meanwhile_id)
+                .expect("human rejection")
+        );
+
+        let run = propose_candidates_with_provider(
+            &store,
+            &[],
+            "book",
+            "English",
+            "Italian",
+            "test",
+            "rejecting",
+            320,
+            Some(1_024),
+            &RejectingProvider { id: oh_id },
+        )
+        .await
+        .expect("model rejection should be usable");
+
+        let counts = proposal_counts(&run);
+        assert_eq!(
+            counts,
+            ProposalCounts {
+                rendered: 0,
+                declined: 0,
+                model_rejected: 1,
+            }
+        );
+        assert!(
+            format_proposal_summary(counts).contains("model rejected 1 candidate"),
+            "the user-facing summary must report the rejection count"
+        );
+
+        let reviewable = store
+            .list_glossary_candidates("book", "English", "Italian")
+            .expect("reviewable candidates");
+        assert_eq!(reviewable.len(), 1);
+        assert_eq!(reviewable[0].id, oh_id);
+        assert_eq!(reviewable[0].status, GlossaryStatus::AutoCandidate);
+        assert_eq!(
+            reviewable[0].notes.as_deref(),
+            Some(
+                "model rejection (not terminology): This is an ordinary interjection, not terminology needing a stable rendering."
+            )
+        );
+        assert!(!candidate_needs_proposal(&reviewable[0]));
+
+        let active_before_override = store
+            .load_active_glossary_terms("English", "Italian", Some("book"), None)
+            .expect("active glossary");
+        assert!(
+            active_before_override.is_empty(),
+            "translation only loads active glossary rows, so a model rejection must not reach its prompt"
+        );
+
+        let second_run = propose_candidates_with_provider(
+            &store,
+            &[],
+            "book",
+            "English",
+            "Italian",
+            "test",
+            "failing-if-called",
+            320,
+            Some(1_024),
+            &FailingProvider,
+        )
+        .await
+        .expect("a settled model rejection should not call the provider again");
+        assert!(second_run.proposals.is_empty());
+
+        assert!(
+            store
+                .accept_glossary_candidate(oh_id, Some("Oh"))
+                .expect("human override")
+        );
+        let all = store
+            .list_glossary_terms(GlossaryFilter {
+                scope_kind: Some(GlossaryScopeKind::Book),
+                scope_id: Some("book"),
+                source_language: Some("English"),
+                target_language: Some("Italian"),
+                active_only: false,
+            })
+            .expect("all terms");
+        let overridden = all
+            .iter()
+            .find(|term| term.id == Some(oh_id))
+            .expect("overridden term");
+        let human_rejected = all
+            .iter()
+            .find(|term| term.id == Some(meanwhile_id))
+            .expect("human-rejected term");
+        assert_eq!(overridden.status, GlossaryStatus::Accepted);
+        assert!(
+            overridden
+                .notes
+                .as_deref()
+                .is_some_and(|notes| notes.starts_with(MODEL_REJECTION_NOTE_PREFIX)),
+            "the model reason remains as audit history after a human override"
+        );
+        assert_eq!(human_rejected.status, GlossaryStatus::Rejected);
+        assert_eq!(human_rejected.notes, None);
     }
 
     #[tokio::test]

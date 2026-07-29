@@ -8,9 +8,9 @@ use crate::{
     ResponseFormat, Substitutions,
 };
 
-const PROMPT_SOURCE: &str = include_str!("../prompts/glossary_propose.v1.md");
+const PROMPT_SOURCE: &str = include_str!("../prompts/glossary_propose.v2.md");
 pub const GLOSSARY_PROPOSAL_PROMPT_NAME: &str = "glossary_propose";
-pub const GLOSSARY_PROPOSAL_PROMPT_VERSION: &str = "v1";
+pub const GLOSSARY_PROPOSAL_PROMPT_VERSION: &str = "v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GlossaryProposalInput {
@@ -30,6 +30,7 @@ pub enum GlossaryProposalPolicy {
     Calque,
     Recreate,
     Decline,
+    NotTerminology,
 }
 
 impl GlossaryProposalPolicy {
@@ -40,6 +41,7 @@ impl GlossaryProposalPolicy {
             Self::Calque => "calque",
             Self::Recreate => "recreate",
             Self::Decline => "decline",
+            Self::NotTerminology => "not_terminology",
         }
     }
 }
@@ -188,16 +190,20 @@ fn validate_proposals(
             )));
         }
         match (proposal.policy, target_text.as_ref()) {
-            (GlossaryProposalPolicy::Decline, Some(_)) => {
+            (
+                policy @ (GlossaryProposalPolicy::Decline | GlossaryProposalPolicy::NotTerminology),
+                Some(_),
+            ) => {
                 return Err(LlmError::InvalidResponse(format!(
-                    "declined glossary proposal {} included target_text",
-                    proposal.id
+                    "{} glossary proposal {} included target_text",
+                    policy.as_str(),
+                    proposal.id,
                 )));
             }
-            (GlossaryProposalPolicy::Decline, None) => {}
+            (GlossaryProposalPolicy::Decline | GlossaryProposalPolicy::NotTerminology, None) => {}
             (_, None) => {
                 return Err(LlmError::InvalidResponse(format!(
-                    "glossary proposal {} omitted target_text without declining",
+                    "glossary proposal {} omitted target_text without declining or rejecting it as not terminology",
                     proposal.id
                 )));
             }
@@ -341,6 +347,40 @@ mod tests {
 
         assert_eq!(run.proposals[0].target_text, None);
         assert_eq!(run.proposals[0].policy, GlossaryProposalPolicy::Decline);
+    }
+
+    #[tokio::test]
+    async fn not_terminology_proposal_has_no_fabricated_target() {
+        let provider = StaticProvider {
+            content: serde_json::json!({
+                "proposals": [{
+                    "id": 12,
+                    "target_text": null,
+                    "policy": "not_terminology",
+                    "reason": "This is an ordinary interjection, not a term needing a stable rendering."
+                }]
+            })
+            .to_string(),
+        };
+
+        let run = propose_glossary_renderings(
+            &provider,
+            "English",
+            "Italian",
+            &[input(12, "Oh")],
+            "test",
+            "static",
+            1_024,
+        )
+        .await
+        .expect("not-terminology rejection should be valid");
+
+        assert_eq!(run.proposals[0].target_text, None);
+        assert_eq!(
+            run.proposals[0].policy,
+            GlossaryProposalPolicy::NotTerminology
+        );
+        assert!(run.proposals[0].reason.contains("ordinary interjection"));
     }
 
     #[tokio::test]
