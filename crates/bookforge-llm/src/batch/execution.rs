@@ -1787,54 +1787,14 @@ async fn translate_one_batch_with_evidence(
         compact_retry_attempt,
     } = request;
     let context_block = crate::scheduler::render_context_pairs(&context_pairs);
-    let items_json = render_batch_items(&batch, config);
-    let template = if config.compact_prompts {
-        match batch.mode {
-            BatchMode::Plain | BatchMode::TurboTextOnly => &library.batch_plain_compact,
-            BatchMode::MarkerSafe => &library.batch_marker_safe_compact,
-            BatchMode::RunPreserving => &library.batch_run_preserving_compact,
-        }
-    } else {
-        match batch.mode {
-            BatchMode::Plain | BatchMode::TurboTextOnly => &library.batch_plain,
-            BatchMode::MarkerSafe => &library.batch_marker_safe,
-            BatchMode::RunPreserving => &library.batch_run_preserving,
-        }
-    };
-
-    let mut vars = Substitutions::new();
-    vars.string(
-        "source_language",
-        config
-            .source_language
-            .as_deref()
-            .unwrap_or("the source language"),
-    )
-    .string("target_language", &config.target_language)
-    .raw(
-        "style_guide_block",
-        config
-            .style
-            .as_ref()
-            .map(|s| s.rendered_block.clone())
-            .unwrap_or_default(),
-    )
-    .raw(
-        "entity_agreement_block",
-        config
-            .entities
-            .as_ref()
-            .map(|e| e.rendered_block.clone())
-            .unwrap_or_default(),
-    )
-    .raw("context_translation_pairs", context_block)
-    .raw(
-        "prompt_extra",
-        config.glossary.prompt_extra.clone().unwrap_or_default(),
-    )
-    .raw("items_json", items_json);
-
-    let mut rendered = match template.render(&vars) {
+    let template = batch_prompt_template(&batch, config, &library);
+    let rendered = match render_batch_prompt(
+        &batch,
+        config,
+        &library,
+        &context_block,
+        compact_retry_attempt,
+    ) {
         Ok(rendered) => rendered,
         Err(error) => {
             return BatchRequestOutput {
@@ -1844,11 +1804,6 @@ async fn translate_one_batch_with_evidence(
             };
         }
     };
-    if compact_retry_attempt > 0 {
-        rendered.user.push_str(&format!(
-            "\n\nRECOVERY MODE {compact_retry_attempt}: Return one compact JSON object only. Translate every item exactly once. Do not repeat any word, sentence, item, or explanation. End immediately after the closing brace."
-        ));
-    }
 
     let max_tokens = max_output_tokens_override
         .unwrap_or_else(|| capped_batch_max_output_tokens(&batch, config, provider.is_reasoning()));

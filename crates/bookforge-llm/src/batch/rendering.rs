@@ -1,5 +1,6 @@
 use super::*;
 use serde::Deserialize;
+use std::collections::HashSet;
 
 pub fn batch_item_validation_error(
     item: &TranslationBatchItem,
@@ -692,6 +693,140 @@ pub(super) fn batch_response_item_count(batch: &TranslationBatch, content: &str)
     )
 }
 
+fn batch_glossary_entries<'a>(
+    items: &[TranslationBatchItem],
+    config: &'a TranslationRunConfig,
+) -> Vec<&'a bookforge_core::GlossaryPromptTerm> {
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+    for item in items {
+        let segment_entries = config
+            .glossary
+            .entries_by_segment
+            .get(&item.segment_id.0)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for entry in segment_entries {
+            if seen.insert(entry) {
+                entries.push(entry);
+            }
+        }
+    }
+    entries
+}
+
+pub(super) fn render_batch_glossary(
+    items: &[TranslationBatchItem],
+    config: &TranslationRunConfig,
+) -> String {
+    let entries = batch_glossary_entries(items, config);
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    match config.glossary.format {
+        GlossaryFormat::Json => {
+            let rendered = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+            format!(
+                "Active batch glossary constraints (must be honored throughout this batch wherever applicable):\n{rendered}"
+            )
+        }
+        GlossaryFormat::Prose => {
+            let entries = entries.into_iter().cloned().collect::<Vec<_>>();
+            crate::scheduler::render_glossary_prose(&entries)
+        }
+    }
+}
+
+pub(super) fn render_batch_prompt_extra(
+    items: &[TranslationBatchItem],
+    config: &TranslationRunConfig,
+) -> String {
+    let mut blocks = Vec::new();
+    if let Some(extra) = config
+        .glossary
+        .prompt_extra
+        .as_deref()
+        .filter(|extra| !extra.trim().is_empty())
+    {
+        blocks.push(extra.to_string());
+    }
+    let glossary = render_batch_glossary(items, config);
+    if !glossary.is_empty() {
+        blocks.push(glossary);
+    }
+    blocks.join("\n\n")
+}
+
+pub(super) fn render_batch_prompt(
+    batch: &TranslationBatch,
+    config: &TranslationRunConfig,
+    library: &PromptLibrary,
+    context_block: &str,
+    compact_retry_attempt: usize,
+) -> crate::prompt::Result<crate::prompt::Rendered> {
+    let items_json = render_batch_items(batch, config);
+    let prompt_extra = render_batch_prompt_extra(&batch.items, config);
+    let template = batch_prompt_template(batch, config, library);
+
+    let mut vars = Substitutions::new();
+    vars.string(
+        "source_language",
+        config
+            .source_language
+            .as_deref()
+            .unwrap_or("the source language"),
+    )
+    .string("target_language", &config.target_language)
+    .raw(
+        "style_guide_block",
+        config
+            .style
+            .as_ref()
+            .map(|style| style.rendered_block.clone())
+            .unwrap_or_default(),
+    )
+    .raw(
+        "entity_agreement_block",
+        config
+            .entities
+            .as_ref()
+            .map(|entities| entities.rendered_block.clone())
+            .unwrap_or_default(),
+    )
+    .raw("context_translation_pairs", context_block)
+    .raw("prompt_extra", prompt_extra)
+    .raw("items_json", items_json);
+
+    let mut rendered = template.render(&vars)?;
+    if compact_retry_attempt > 0 {
+        rendered.user.push_str(&format!(
+            "\n\nRECOVERY MODE {compact_retry_attempt}: Return one compact JSON object only. Translate every item exactly once. Do not repeat any word, sentence, item, or explanation. End immediately after the closing brace."
+        ));
+    }
+    Ok(rendered)
+}
+
+pub(super) fn batch_prompt_template<'a>(
+    batch: &TranslationBatch,
+    config: &TranslationRunConfig,
+    library: &'a PromptLibrary,
+) -> &'a crate::prompt::PromptTemplate {
+    if config.compact_prompts {
+        match batch.mode {
+            BatchMode::Plain | BatchMode::TurboTextOnly => &library.batch_plain_compact,
+            BatchMode::MarkerSafe => &library.batch_marker_safe_compact,
+            BatchMode::RunPreserving => &library.batch_run_preserving_compact,
+        }
+    } else {
+        match batch.mode {
+            BatchMode::Plain | BatchMode::TurboTextOnly => &library.batch_plain,
+            BatchMode::MarkerSafe => &library.batch_marker_safe,
+            BatchMode::RunPreserving => &library.batch_run_preserving,
+        }
+    }
+}
+
 pub(super) fn render_batch_items(
     batch: &TranslationBatch,
     config: &TranslationRunConfig,
@@ -722,28 +857,6 @@ pub(super) fn render_batch_items(
             .as_object()
             .cloned()
             .unwrap_or_default();
-
-            let entries = config
-                .glossary
-                .entries_by_segment
-                .get(&item.segment_id.0)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            match config.glossary.format {
-                GlossaryFormat::Json => {
-                    obj.insert(
-                        "glossary".to_string(),
-                        serde_json::to_value(entries)
-                            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
-                    );
-                }
-                GlossaryFormat::Prose => {
-                    obj.insert(
-                        "glossary_prose".to_string(),
-                        serde_json::Value::String(crate::scheduler::render_glossary_prose(entries)),
-                    );
-                }
-            }
 
             if let Some(guidance) = config.glossary.guidance_by_segment.get(&item.segment_id.0) {
                 obj.insert(

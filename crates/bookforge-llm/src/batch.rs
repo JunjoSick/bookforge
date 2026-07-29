@@ -51,8 +51,11 @@ use planning::{
 pub use rendering::batch_item_validation_error;
 pub use rendering::parse_batch_response;
 use rendering::{
-    batch_response_item_count, parse_batch_response_with_validation, render_batch_items,
+    batch_prompt_template, batch_response_item_count, parse_batch_response_with_validation,
+    render_batch_prompt,
 };
+#[cfg(test)]
+use rendering::{render_batch_items, render_batch_prompt_extra};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BatchMode {
