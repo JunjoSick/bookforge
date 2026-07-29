@@ -227,12 +227,50 @@ it.
 
 **Cost is wildly asymmetric.** deepseek-v4-pro spent 113 output tokens per
 passage; Kimi K3 spent about 2,000. For the same 25 passages that is **$0.013
-against roughly $0.50**. If hard-defect agreement holds on a larger sample,
-v4-pro buys around 40× the coverage per dollar.
+against roughly $0.50** — about 40× the coverage per dollar.
+
+> **Superseded later the same day.** Adjudication put v4-pro's own findings at
+> roughly **23% precision** (see the calibration section below), so the cheap
+> coverage buys mostly noise. Do not choose v4-pro as the judge on the strength
+> of this cost comparison alone.
 
 **Kimi K3 starved even at 16,000 output tokens** on 2 of 25 passages, and on 10
 of 25 at 4,096. It can burn more than 16k reasoning tokens on a 1,500-character
 passage. Budget accordingly, and see the empty-content diagnosis note above.
+
+### The accepted-glossary A/B, 2026-07-29 — no measurable effect
+
+The first question this benchmark was built to answer. Protocol below, The
+Cyberiad, EN→IT, deepseek-v4-flash translating, v4-pro judging, fresh scratch
+store, both arms translated on the same build. Rates computed on the **94
+passages whose block sets are identical in both arms** — word counts matched
+exactly at 16,945, so exposure is equal.
+
+| | no glossary | 121 accepted terms | p |
+| --- | --- | --- | --- |
+| hard defects | 170 (10.03/1k) | 188 (11.09/1k) | 0.37 |
+| soft defects | 40 (2.36/1k) | 58 (3.42/1k) | 0.09 |
+| meaning_changed | 155 | 181 | 0.17 |
+| content_dropped | 15 | 6 | 0.08 |
+| terminology_inconsistent | 0 | 3 | 0.25 |
+
+**Nothing reaches significance** (two-sided conditional-binomial test at equal
+exposure). The glossary neither helped nor hurt measurably, and notably did not
+improve terminology consistency — the one thing it exists to do.
+
+**The experiment is underpowered by roughly 10×.** At ~170 findings per arm the
+noise floor is about ±19, so only an effect larger than ~20% would be
+detectable. One book cannot answer this question; a serious attempt needs on the
+order of ten.
+
+**Report a p-value, not a percentage.** An earlier version of this run was read
+as "+20% hard defects from the glossary". That reading was wrong twice over: the
+run was confounded by the per-block glossary duplication fixed in #89, *and* the
+difference was not significant to begin with.
+
+Two things the failed experiment did buy. It surfaced that duplication bug —
+worth a 2.75× cost reduction on every glossary-enabled translation — and it is
+the reason the precision calibration below exists.
 
 ### Self-refuting findings, measured 2026-07-29
 
@@ -312,12 +350,49 @@ responses and request errors are visible but do not become false positives. A
 category with no parsed adjudications has JSON `null` and prints `-`, because
 0/0 is not 0% precision.
 
-The hand review of eight `meaning_changed` findings suggested roughly half were
-genuine, including a negation inversion and `Unwinched Waifs` rendered as
-“unscrewed orphans”; eight is not a precision measurement. No paid adjudication
-was run while adding this tooling. The owner-run summary above is the source of
-truth for the per-category table; do not copy the 4/8 impression into a reported
-rate.
+### Measured precision, 2026-07-29 — and why one number is not enough
+
+The same **210 findings** (The Cyberiad, arm A, judged by deepseek-v4-pro) were
+adjudicated twice:
+
+| category | n | v4-pro adjudicating (**self**) | Kimi K3 adjudicating |
+| --- | --- | --- | --- |
+| meaning_changed | 155 | 66.5% | **23.2%** |
+| target_language_error | 36 | 58.3% | **16.7%** |
+| content_dropped | 15 | 26.7% | **0.0%** |
+| register_shift | 4 | 100% | 75% |
+| overall | 210 | ~63% | **~21%** |
+
+87 of 210 verdicts differ. 75 are v4-pro calling true-positive where Kimi calls
+false-positive.
+
+**Never let a model adjudicate findings it produced.** v4-pro rated its own
+output roughly three times more favourably than an independent model did. Always
+cross-model, and treat a self-adjudicated rate as meaningless rather than
+optimistic.
+
+**On this evidence v4-pro is a weak judge for translation quality.** Five
+disagreements were read by hand and Kimi was right in all five. The clearest:
+`Royal Appropriations Commission` → `Commissione Reale per gli Stanziamenti`,
+where v4-pro's rationale asserts the translation "adds Reale" — while *Royal* is
+in the source. That is the same self-contradiction this document already records
+for v4-pro on validator flags. The others were pedantic rather than wrong:
+objecting that `go dead` → `morire` overreaches when the subject is a living
+beast, or that `the King wouldn't pay` → `non voleva pagare` shifts nuance, when
+that is exactly how Italian expresses volitional refusal.
+
+**Consequence for reading any rate.** Discount a v4-pro-judged run hard. The
+Cyberiad A/B reported ~10–12 hard defects per 1,000 words; at roughly 23%
+precision the genuine rate is nearer 2–3. This does not change that A/B's
+conclusion — no significant difference between arms — it widens the noise floor.
+
+A hand review of eight findings by the person who framed the experiment is not a
+measurement either. That review called roughly half genuine; read against an
+independent adjudicator's counter-arguments it was too generous.
+
+**`--limit` truncates in input order, it does not sample** — the same trap
+recorded above for `judge_flags`, and it defaults to 25. Use `--limit 0`, or
+shuffle with a recorded seed first.
 
 ## What this measured, 2026-07-26/27
 
