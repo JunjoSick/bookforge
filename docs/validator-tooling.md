@@ -100,8 +100,8 @@ Operational lessons, all learned the expensive way:
 - **Raise `--max-output-tokens`.** The 400 default starves reasoning models:
   Kimi K3 returned empty content on **49 of 150** calls at 400, and **4 of 100**
   at 1200. That is a third of the spend wasted. This is the same failure
-  described under "Size the output cap from the candidate count" below, and it
-  has now been hit by three separate call sites.
+  described under "Bound each request while keeping the per-candidate allowance
+  honest" below, and it has now been hit by **four** separate call sites.
 - **Verdicts are cached on disk** by content hash, so re-runs of already-judged
   units are free. Keep the cache directory between runs.
 - **Judges disagree, and the stricter one has been right.** On a shared subset,
@@ -374,8 +374,10 @@ provider-reported usage; use the selected model's current rates for budgeting.
 reasoning model that runs out mid-thought returns HTTP 200 with *no message
 content at all* — not a truncated answer — so the failure used to surface as
 `missing choices[0].message.content`, which says nothing about the cause. This
-happened three separate times in two days: `judge_flags` at its 400-token
-default, the QA pass at the provider default, and this command at a flat 4,096.
+happened four separate times in two days: `judge_flags` at its 400-token
+default, the QA pass at the provider default, this command at a flat 4,096, and
+`judge_translation` — which starved on 10 of 25 passages at a 4,096 cap and
+still on 2 of 25 at **16,000**.
 The provider now recognises that shape — `finish_reason: length`, or reasoning
 present with content absent — and names the relevant flag. `glossary propose`
 caps each request at 8,192 output tokens by default and sizes chunks at 320
