@@ -1,4 +1,4 @@
-﻿# translate_batch_marker_safe_compact.v2.md
+# translate_batch_marker_safe_compact.v2.md
 
 ## System
 

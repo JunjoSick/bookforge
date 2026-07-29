@@ -427,6 +427,34 @@ mod tests {
     }
 
     #[test]
+    fn prompt_sources_do_not_start_with_utf8_bom() {
+        let prompt_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let mut bom_prefixed = Vec::new();
+
+        for entry in std::fs::read_dir(&prompt_dir).expect("prompt directory must be readable") {
+            let entry = entry.expect("prompt directory entry must be readable");
+            if !entry
+                .file_type()
+                .expect("prompt directory entry type must be readable")
+                .is_file()
+            {
+                continue;
+            }
+
+            let bytes = std::fs::read(entry.path()).expect("prompt file must be readable");
+            if bytes.starts_with(b"\xEF\xBB\xBF") {
+                bom_prefixed.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+
+        bom_prefixed.sort();
+        assert!(
+            bom_prefixed.is_empty(),
+            "prompt files must not start with a UTF-8 BOM: {bom_prefixed:?}"
+        );
+    }
+
+    #[test]
     fn batch_prompt_templates_are_versioned_v3_for_retry_guidance() {
         // The six batch translate templates (plain / marker-safe /
         // run-preserving, and their compact variants) gained a per-item
