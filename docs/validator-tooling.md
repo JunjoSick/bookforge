@@ -528,13 +528,23 @@ but any terminal chunk failure makes the command print an `INCOMPLETE` summary
 with completed and failed counts and exit with an error; failed candidates
 remain pending.
 
-Candidate extraction itself is English-specific: its positional evidence models
-English capitalization and non-English input gets only a 17-word English
-fallback stoplist. German common nouns are capitalized mid-sentence, so every
-repeated noun can clear that filter. Treat extraction as recall and the strong
-model as precision. The default `--min-count 3` is the recommended compromise:
-it recovers three-occurrence terms without paying the 320-output-token budget
-for the much larger one- and two-occurrence tail.
+Candidate extraction derives its routing from the scripts in the source text
+rather than a language-name list. Sources whose alphabetic characters are
+predominantly cased — including English, Russian, Italian, and German — use the
+measured positional-capitalization, phrase, and contraction rules. Capitalized
+German nouns are useful terminology candidates. Predominantly caseless Han,
+Kana, Hangul, Thai, Arabic, Hebrew, and Devanagari sources use a
+capitalization-blind recurrence sweep. Counting the dominant character kind
+keeps an occasional Latin word from rerouting a caseless book. Repeated tokens
+are ranked with block-level, in-book TF-IDF and the sweep is capped at the square
+root of the book's word-token count, plus phrases marked with both italics and
+quotes. The final `--limit` applies to the frequency-ordered result. Unknown
+language labels need no default; when the text has no alphabetic evidence or
+the measurement ties, recurrence preserves recall without assuming case. Treat
+extraction as recall and the strong model as precision. The default
+`--min-count 3` is the recommended compromise: it recovers three-occurrence
+terms without paying the 320-output-token budget for the much larger one- and
+two-occurrence tail.
 
 This pass is deliberately book-scoped rather than segment-scoped. A measured
 run — The Cyberiad, 40 candidates, Kimi K3 — cost 2,355 provider input tokens and

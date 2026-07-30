@@ -372,32 +372,45 @@ bookforge glossary accept-candidates cyberiad --language "English->Italian"
 bookforge glossary review-candidates cyberiad --language "English->Italian"
 ```
 
-`extract-candidates` is precision-tuned for English, not language-general. It
-counts a capitalized word only when it is capitalized for some reason other than
-where it sits. English capitalises the first word of every sentence, quotation,
-and parenthetical, and headings are title-cased by convention, so a word
-attested *only* in those positions is grammar rather than terminology —
-`Finally`, `Meanwhile`, `Oh`, `Yes` and `Thus` all reached the glossary that way
-before this rule existed. A multi-word phrase gets a second chance: `Ivan Ilych`
-may open every sentence it appears in, yet both its words are attested
-mid-sentence, which is what distinguishes it from `Finally Klapaucius`.
-Contractions inherit their stem, so `I'll` and `It's` are filtered as the
-pronouns they are built from while `Trurl's` survives. Author italics and quoted
-coinages bypass all of this, since they are an explicit signal.
+`extract-candidates` chooses between two extraction strategies by measuring the
+scripts in the source text itself, not by looking up the language name. If most
+alphabetic characters have Unicode case, the source uses the measured
+capitalization heuristic. This includes German: capitalized nouns are useful
+terminology candidates even though case does not distinguish them from proper
+nouns. The heuristic counts a capitalized word only when it is capitalized for
+some reason other than where it sits. English capitalises the first word of
+every sentence, quotation, and parenthetical, and headings are title-cased by
+convention, so a word attested *only* in those positions is grammar rather than
+terminology — `Finally`, `Meanwhile`, `Oh`, `Yes` and `Thus` all reached the
+glossary that way before this rule existed. A multi-word phrase gets a second
+chance: `Ivan Ilych` may open every sentence it appears in, yet both its words
+are attested mid-sentence, which is what distinguishes it from `Finally
+Klapaucius`. Contractions inherit their stem, so `I'll` and `It's` are filtered
+as the pronouns they are built from while `Trurl's` survives.
 
-For non-English input the stoplist falls back to 17 English function words. In
-German, where common nouns are capitalized mid-sentence, the positional rule
-therefore accepts every repeated noun that clears the frequency threshold. The
-extractor remains useful as a mechanical recall pass, but its precision outside
-English is poor and the proposal model must make the terminology judgment.
+Predominantly caseless sources — Han, Kana, Hangul, Thai, Arabic, Hebrew, and
+Devanagari — use an orthography-neutral recurrence sweep instead. Counting the
+dominant character kind keeps an occasional Latin word from rerouting such a
+book. The sweep considers words without relying on case and uses blocks as the
+documents in an in-book TF-IDF ranking: repetition raises a token's score,
+while vocabulary concentrated in a few blocks outranks function words spread
+throughout the book. No language stoplist or sentence-capitalization rule is
+used. Repeated headings cannot qualify without prose attestation. Unknown
+language labels need no default because routing is script-derived; if the text
+has no alphabetic evidence or the measurement ties, recurrence preserves recall
+without assuming case. Phrases that the author marks with both italics and
+enclosing quotation marks remain an explicit signal in either strategy and
+bypass the frequency floor.
 
-`--min-count` defaults to 3. This deliberately recovers terms that recur three
-times while keeping one- and two-off capitalized words out of the single,
-book-sized proposal pass. Each additional candidate reserves 320 output tokens
-within bounded requests by default, so lowering it further is not free. The
-positional rule remains as an inexpensive candidate-budget gate, not a semantic
-verdict; use `--min-count` and `--limit` explicitly when a book or language
-needs a different recall/cost tradeoff.
+`--min-count` defaults to 3. On the recurrence path it is applied before the
+TF-IDF ranking, and the automatic sweep admits at most the square root of the
+book's word-token count (rounded up), plus explicitly author-marked phrases.
+This keeps the default proposal batch sublinear in book length while making
+lowercase terminology reachable. `--limit` can impose a tighter cap on the
+frequency-ordered result. Each additional candidate reserves 320 output tokens
+within bounded proposal requests by default, so lowering `--min-count` or
+widening `--limit` is not free. The proposal model remains responsible for
+rejecting ordinary language as `not_terminology`.
 
 On The Cyberiad at `--limit 60`, the rule dropped eleven non-terms and freed
 those slots for nine genuine coinages the noise had been crowding out
