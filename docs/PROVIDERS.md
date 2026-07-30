@@ -11,6 +11,47 @@ The initial provider target is OpenAI-compatible chat completions, with DeepSeek
 
 All non-mock providers go through `OpenAiCompatibleProvider`. Provider settings include timeout, provider-level attempts, retry-after handling, max backoff, idle connection pool size, JSON mode, model context tokens, and output-token limits.
 
+## Thinking Suppression
+
+`--no-thinking` is dispatched from the configured base URL (or the known
+OpenRouter/DeepSeek preset credential identity when a proxy overrides that URL)
+because
+OpenAI-compatible chat-completion APIs do not share one reasoning-control
+parameter:
+
+| Endpoint | Request field |
+| --- | --- |
+| OpenRouter (`openrouter.ai`) | `"reasoning": {"enabled": false}` |
+| OpenAI (`api.openai.com`) | `"reasoning_effort": "none"` |
+| DeepSeek (`api.deepseek.com`) | `"thinking": {"type": "disabled"}` |
+
+DeepSeek V4's OpenAI-format API documents the `thinking` toggle directly.
+This is a DeepSeek extension, not an Anthropic Messages API request: BookForge
+still sends `/chat/completions`.
+
+For any other `openai-compatible` base URL, BookForge cannot safely guess a
+vendor-specific parameter. It omits all suppression fields and warns instead
+of sending an unknown field that the server may silently ignore. The local
+Ollama and llama.cpp presets currently take this warning path. A model may
+also require reasoning even when its gateway supports a suppression field;
+the provider's model-specific error remains authoritative.
+
+## Reasoning Token Accounting
+
+OpenAI-format usage reports define
+`completion_tokens_details.reasoning_tokens` as a breakdown of
+`completion_tokens`, not an additional token count. BookForge therefore stores
+the billable completion aggregate in `segments.tokens_output`; adding the
+reasoning detail again would double-count standards-compliant responses.
+
+As a defensive compatibility measure, BookForge compares `completion_tokens`
+with `total_tokens - prompt_tokens` and keeps the larger output aggregate. This
+also handles gateways that report visible completion tokens separately while
+keeping `total_tokens` correct. If only a reasoning-token detail is present,
+that count is used as the output fallback. Cost estimates price the resulting
+`tokens_output` aggregate once. There is no separate reasoning column or
+schema migration.
+
 ## Presets And Profiles
 
 Provider presets can change both endpoint/model defaults and runtime knobs such as concurrency, provider attempts, batch target size, adaptive batch sizing, and retry policy. Explicit CLI flags win over preset values.

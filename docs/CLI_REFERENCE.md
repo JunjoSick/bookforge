@@ -137,6 +137,19 @@ bookforge translate book.epub \
   --out book.it.epub
 ```
 
+`--no-thinking` asks the selected endpoint to suppress reasoning. BookForge
+sends OpenRouter's `reasoning.enabled=false`, OpenAI Chat Completions'
+`reasoning_effort=none`, or DeepSeek's `thinking.type=disabled`, selected from
+the base URL or a known OpenRouter/DeepSeek preset credential identity. Other
+OpenAI-compatible endpoints receive no guessed suppression field and produce a
+warning. This includes the bundled local Ollama and llama.cpp endpoints until
+they expose a compatible, documented control.
+
+Provider-reported `completion_tokens` is the billable output aggregate and
+already includes any `completion_tokens_details.reasoning_tokens` breakdown.
+BookForge stores that aggregate as `tokens_output` and uses it for status and
+cost reporting. It does not add the reasoning breakdown a second time.
+
 `--qa` controls the optional LLM review pass. `off` skips it, `all` reviews
 every non-empty successful, cached, or `needs_review` translation, and
 `suspicious` limits those reviewable translations to segments with at least
