@@ -2139,6 +2139,9 @@ fn cli_finalize_stages_snapshot_runtime_settings_at_stage_boundaries() {
         ])
         .assert()
         .success();
+    wait_for_child_events(&events, &mut child, |events| {
+        event_count(events, "RuntimeConfigChanged") >= 1
+    });
 
     let status = child.wait().expect("translate child should exit");
     assert!(status.success(), "translate child failed: {status}");
@@ -2151,6 +2154,17 @@ fn cli_finalize_stages_snapshot_runtime_settings_at_stage_boundaries() {
                 .is_some_and(|id| id.starts_with("qa_"))
         })
         .expect("QA request should start under the baseline stage snapshot");
+    let qa_request = &final_events[qa_started]["RequestStarted"];
+    assert_eq!(
+        qa_request["runtime_config_revision"].as_u64(),
+        Some(0),
+        "the already-started QA stage must retain the baseline revision"
+    );
+    assert_eq!(
+        qa_request["provider_max_attempts"].as_u64(),
+        Some(1),
+        "the already-started QA stage must retain the v1-fast attempt budget"
+    );
     let changed = final_events
         .iter()
         .position(|event| event.get("RuntimeConfigChanged").is_some())
@@ -2165,9 +2179,17 @@ fn cli_finalize_stages_snapshot_runtime_settings_at_stage_boundaries() {
                 .is_some_and(|id| id.starts_with("qa_"))
         })
         .expect("in-flight QA request should finish");
+    // The override watcher and the in-flight provider request are concurrent
+    // actors. The durable edit follows RequestStarted, but the watcher is not
+    // required to emit RuntimeConfigChanged before RequestFinished. Assert only
+    // the causal order plus the stage snapshots that production guarantees.
     assert!(
-        qa_started < changed && changed < qa_finished,
-        "the runtime edit should land while the frozen QA stage is in flight"
+        qa_started < changed,
+        "the runtime change cannot precede the request that triggered the edit"
+    );
+    assert!(
+        qa_started < qa_finished,
+        "the QA request must finish after it starts"
     );
     assert!(
         request_started_ids(&final_events)
