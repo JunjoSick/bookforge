@@ -217,6 +217,43 @@ mod tests {
     }
 
     #[test]
+    fn billable_output_total_including_reasoning_is_charged_once() {
+        let catalog = parse_pricing(
+            r#"{
+  "schema_version": 1,
+  "updated_at": "2026-07-30",
+  "providers": {
+    "openrouter": {
+      "models": {
+        "reasoning-model": {
+          "input_per_million_usd": 0.0,
+          "output_per_million_usd": 15.0,
+          "input_cache_per_million_usd": null
+        }
+      }
+    }
+  }
+}"#,
+            PricingSource::Bundled,
+        )
+        .expect("test pricing should parse");
+
+        // The provider layer folds any reasoning usage into this billable
+        // output aggregate. The cost layer must price that aggregate once.
+        let cost = estimate_cost_usd_with_pricing(
+            &catalog,
+            "openrouter",
+            "reasoning-model",
+            0,
+            0,
+            182_000,
+        )
+        .expect("test model should be priced");
+
+        assert!((cost - 2.73).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn unsupported_schema_is_rejected() {
         let error = parse_pricing(
             r#"{"schema_version":2,"updated_at":"x","providers":{"x":{"models":{}}}}"#,

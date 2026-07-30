@@ -701,6 +701,41 @@ fn cached_input_tokens(raw: &Value) -> Option<u64> {
         .or(Some(0))
 }
 
+fn reasoning_tokens(raw: &Value) -> Option<u64> {
+    raw.pointer("/usage/completion_tokens_details/reasoning_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            raw.pointer("/usage/output_tokens_details/reasoning_tokens")
+                .and_then(Value::as_u64)
+        })
+}
+
+/// Return the provider's billable output-token aggregate.
+///
+/// OpenAI, OpenRouter, and DeepSeek define reasoning tokens as a subset of
+/// `completion_tokens`, so adding the detailed count would double-count them.
+/// A few OpenAI-compatible gateways have returned visible completion tokens
+/// separately while keeping `total_tokens` correct, however. Taking the larger
+/// of `completion_tokens` and `total_tokens - prompt_tokens` handles both shapes
+/// without double-counting standards-compliant responses. The reasoning detail
+/// is a final fallback for partial usage objects.
+fn billable_output_tokens(raw: &Value) -> Option<u64> {
+    let completion_tokens = raw
+        .pointer("/usage/completion_tokens")
+        .and_then(Value::as_u64);
+    let output_from_total = raw
+        .pointer("/usage/total_tokens")
+        .and_then(Value::as_u64)
+        .zip(raw.pointer("/usage/prompt_tokens").and_then(Value::as_u64))
+        .map(|(total, prompt)| total.saturating_sub(prompt));
+
+    completion_tokens
+        .into_iter()
+        .chain(output_from_total)
+        .max()
+        .or_else(|| reasoning_tokens(raw))
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleConfig {
     pub base_url: String,
@@ -738,6 +773,7 @@ pub struct OpenAiCompatibleProvider {
     client: reqwest::Client,
     reasoning_detected: AtomicBool,
     response_format_supported: AtomicBool,
+    thinking_warning_emitted: AtomicBool,
     pub cancel_token: CancellationToken,
 }
 
@@ -749,6 +785,9 @@ impl Clone for OpenAiCompatibleProvider {
             reasoning_detected: AtomicBool::new(self.reasoning_detected.load(Ordering::Relaxed)),
             response_format_supported: AtomicBool::new(
                 self.response_format_supported.load(Ordering::Relaxed),
+            ),
+            thinking_warning_emitted: AtomicBool::new(
+                self.thinking_warning_emitted.load(Ordering::Relaxed),
             ),
             cancel_token: self.cancel_token.clone(),
         }
@@ -782,6 +821,7 @@ impl OpenAiCompatibleProvider {
             client,
             reasoning_detected: AtomicBool::new(is_reasoning),
             response_format_supported: AtomicBool::new(true),
+            thinking_warning_emitted: AtomicBool::new(false),
             cancel_token,
         })
     }
@@ -789,10 +829,93 @@ impl OpenAiCompatibleProvider {
     pub fn model(&self) -> &str {
         &self.config.model
     }
+
+    fn request_body(&self, request: &CompletionRequest) -> Value {
+        let mut body = json!({
+            "model": self.config.model,
+            "temperature": request.temperature,
+            "messages": [
+                {"role": "system", "content": request.system},
+                {"role": "user", "content": request.user}
+            ]
+        });
+
+        if let Some(max_tokens) = request.max_output_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        }
+
+        if self.config.thinking_disabled {
+            match reasoning_control_for_config(&self.config) {
+                ReasoningControl::OpenRouter => {
+                    body["reasoning"] = json!({"enabled": false});
+                }
+                ReasoningControl::OpenAi => {
+                    body["reasoning_effort"] = json!("none");
+                }
+                ReasoningControl::DeepSeek => {
+                    body["thinking"] = json!({"type": "disabled"});
+                }
+                ReasoningControl::Unsupported => {
+                    if !self.thinking_warning_emitted.swap(true, Ordering::Relaxed) {
+                        warn!(
+                            base_url = %self.config.base_url,
+                            model = %self.config.model,
+                            "provider: thinking suppression was requested, but this \
+                             OpenAI-compatible endpoint has no recognized suppression \
+                             parameter; sending no thinking/reasoning field"
+                        );
+                    }
+                }
+            }
+        }
+
+        let use_response_format = request.response_format == ResponseFormat::Json
+            && match self.config.json_mode {
+                bookforge_core::JsonMode::PromptOnly => false,
+                bookforge_core::JsonMode::ResponseFormat => true,
+                bookforge_core::JsonMode::Auto => {
+                    self.response_format_supported.load(Ordering::Relaxed)
+                }
+            };
+
+        if use_response_format {
+            body["response_format"] = json!({"type": "json_object"});
+        }
+
+        body
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningControl {
+    OpenRouter,
+    OpenAi,
+    DeepSeek,
+    Unsupported,
+}
+
+fn reasoning_control_for_config(config: &OpenAiCompatibleConfig) -> ReasoningControl {
+    let host = reqwest::Url::parse(&config.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+
+    match host.as_deref() {
+        Some(host) if host == "openrouter.ai" || host.ends_with(".openrouter.ai") => {
+            ReasoningControl::OpenRouter
+        }
+        Some("api.openai.com") => ReasoningControl::OpenAi,
+        Some("api.deepseek.com") => ReasoningControl::DeepSeek,
+        _ => match config.api_key_env.as_str() {
+            "OPENROUTER_API_KEY" => ReasoningControl::OpenRouter,
+            "DEEPSEEK_API_KEY" => ReasoningControl::DeepSeek,
+            _ => ReasoningControl::Unsupported,
+        },
+    }
 }
 
 impl LlmProvider for OpenAiCompatibleProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        let mut body = self.request_body(&request);
         let api_key = match std::env::var(&self.config.api_key_env) {
             Ok(value) => Some(value),
             Err(_) if local_api_key_is_optional(&self.config.api_key_env) => None,
@@ -808,22 +931,6 @@ impl LlmProvider for OpenAiCompatibleProvider {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        let mut body = json!({
-            "model": self.config.model,
-            "temperature": request.temperature,
-            "messages": [
-                {"role": "system", "content": request.system},
-                {"role": "user", "content": request.user}
-            ]
-        });
-
-        if let Some(max_tokens) = request.max_output_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        }
-
-        if self.config.thinking_disabled {
-            body["thinking"] = json!({"type": "disabled"});
-        }
 
         let use_response_format = request.response_format == ResponseFormat::Json
             && match self.config.json_mode {
@@ -833,10 +940,6 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     self.response_format_supported.load(Ordering::Relaxed)
                 }
             };
-
-        if use_response_format {
-            body["response_format"] = json!({"type": "json_object"});
-        }
 
         let max_attempts = request
             .metadata
@@ -1065,9 +1168,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .to_string();
         let input_tokens = raw.pointer("/usage/prompt_tokens").and_then(Value::as_u64);
         let input_cached_tokens = cached_input_tokens(&raw);
-        let output_tokens = raw
-            .pointer("/usage/completion_tokens")
-            .and_then(Value::as_u64);
+        let output_tokens = billable_output_tokens(&raw);
 
         // Detect reasoning models from their first response so subsequent
         // requests can use a higher max_output_tokens budget.
@@ -1312,6 +1413,158 @@ mod tests {
     use super::*;
     use bookforge_core::RetryAfterPolicy;
     use tokio::time::Duration;
+
+    fn offline_provider(base_url: &str, model: &str) -> OpenAiCompatibleProvider {
+        offline_provider_with_key(base_url, "BOOKFORGE_OFFLINE_TEST_API_KEY", model)
+    }
+
+    fn offline_provider_with_key(
+        base_url: &str,
+        api_key_env: &str,
+        model: &str,
+    ) -> OpenAiCompatibleProvider {
+        OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: base_url.to_string(),
+            api_key_env: api_key_env.to_string(),
+            model: model.to_string(),
+            timeout_seconds: 10,
+            provider_max_attempts: 1,
+            thinking_disabled: true,
+            retry_after_policy: RetryAfterPolicy::None,
+            max_backoff_seconds: 1,
+            max_idle_per_host: 1,
+            json_mode: bookforge_core::JsonMode::PromptOnly,
+        })
+        .expect("offline provider config should be valid")
+    }
+
+    fn offline_request() -> CompletionRequest {
+        CompletionRequest {
+            system: "translate".to_string(),
+            user: "hello".to_string(),
+            response_format: ResponseFormat::Json,
+            temperature: 0.2,
+            max_output_tokens: Some(256),
+            metadata: RequestMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn openrouter_request_uses_unified_reasoning_suppression() {
+        let provider = offline_provider("https://openrouter.ai/api/v1", "anthropic/claude-opus-5");
+
+        let body = provider.request_body(&offline_request());
+
+        assert_eq!(body["reasoning"], json!({"enabled": false}));
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn openai_request_uses_chat_completions_reasoning_effort() {
+        let provider = offline_provider("https://api.openai.com/v1", "gpt-5.6-terra");
+
+        let body = provider.request_body(&offline_request());
+
+        assert_eq!(body["reasoning_effort"], json!("none"));
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn deepseek_request_uses_documented_thinking_toggle() {
+        let provider = offline_provider("https://api.deepseek.com/v1", "deepseek-v4-flash");
+
+        let body = provider.request_body(&offline_request());
+
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn deepseek_preset_identity_survives_a_base_url_proxy() {
+        let provider = offline_provider_with_key(
+            "https://gateway.example.test/deepseek/v1",
+            "DEEPSEEK_API_KEY",
+            "deepseek-v4-flash",
+        );
+
+        let body = provider.request_body(&offline_request());
+
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn recognized_base_url_wins_over_credential_identity() {
+        let provider = offline_provider_with_key(
+            "https://api.deepseek.com/v1",
+            "OPENROUTER_API_KEY",
+            "deepseek-v4-flash",
+        );
+
+        let body = provider.request_body(&offline_request());
+
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn unknown_compatible_endpoint_omits_suppression_and_marks_warning_emitted() {
+        let provider = offline_provider("https://llm.example.test/v1", "custom-model");
+
+        let body = provider.request_body(&offline_request());
+
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("thinking").is_none());
+        assert!(
+            provider.thinking_warning_emitted.load(Ordering::Relaxed),
+            "the unsupported suppression path must emit its warning"
+        );
+    }
+
+    #[test]
+    fn billable_output_does_not_double_count_reasoning_breakdown() {
+        let raw = json!({
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 100,
+                "completion_tokens_details": {"reasoning_tokens": 70},
+                "total_tokens": 150
+            }
+        });
+
+        assert_eq!(billable_output_tokens(&raw), Some(100));
+    }
+
+    #[test]
+    fn billable_output_uses_total_when_gateway_reports_visible_completion_only() {
+        let raw = json!({
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 30,
+                "completion_tokens_details": {"reasoning_tokens": 70},
+                "total_tokens": 150
+            }
+        });
+
+        assert_eq!(billable_output_tokens(&raw), Some(100));
+    }
+
+    #[test]
+    fn billable_output_falls_back_to_reasoning_for_partial_usage() {
+        let raw = json!({
+            "usage": {
+                "completion_tokens_details": {"reasoning_tokens": 70}
+            }
+        });
+
+        assert_eq!(billable_output_tokens(&raw), Some(70));
+    }
 
     #[test]
     fn empty_content_from_a_truncated_response_names_the_output_cap() {
