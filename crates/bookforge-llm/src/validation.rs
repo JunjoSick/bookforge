@@ -884,10 +884,15 @@ fn numeric_candidates(text: &str) -> Vec<String> {
 
 /// Locale-insensitive presence check for spans that contain numbers.
 fn numeric_span_present(span: &str, translation: &str) -> bool {
-    let span_numbers = numeric_candidates(span);
+    let span_ranges = numeric_candidate_ranges(span);
+    let span_numbers = span_ranges
+        .iter()
+        .map(|(_, _, candidate)| candidate.clone())
+        .collect::<Vec<_>>();
     if span_numbers.is_empty() {
         return false;
     }
+    let starts_with_number = span_ranges.first().is_some_and(|(start, _, _)| *start == 0);
 
     let mut translated_number_forms = numeric_candidates(translation)
         .iter()
@@ -910,7 +915,7 @@ fn numeric_span_present(span: &str, translation: &str) -> bool {
 
     let mut literal_remainder = String::with_capacity(span.len());
     let mut copied_until = 0;
-    for (start, end, _) in numeric_candidate_ranges(span) {
+    for (start, end, _) in span_ranges {
         literal_remainder.push_str(&span[copied_until..start]);
         literal_remainder.push(' ');
         copied_until = end;
@@ -918,6 +923,7 @@ fn numeric_span_present(span: &str, translation: &str) -> bool {
     literal_remainder.push_str(&span[copied_until..]);
     literal_remainder
         .split_whitespace()
+        .filter(|token| !starts_with_number || !token.chars().any(char::is_alphabetic))
         .all(|token| exact_protected_span_present(token, translation))
 }
 
@@ -1206,6 +1212,28 @@ mod tests {
             "Skou (1957, 1989) isolò una ATPasi"
         ));
         assert!(protected_span_present("10-", "7,3 × 10⁻⁷ mol cm⁻²"));
+        assert!(protected_span_present(
+            "1,000.50",
+            "Il totale era 1.000,50."
+        ));
+        assert!(protected_span_present("4th", "il 4º tentativo"));
+        assert!(protected_span_present(
+            "19-August",
+            "dal 19 luglio al 7 agosto"
+        ));
+        assert!(protected_span_present(
+            "1857-1918)—tsarist",
+            "(1857-1918)—generale zarista"
+        ));
+        assert!(!protected_span_present("4th", "il 5º tentativo"));
+        assert!(!protected_span_present(
+            "19-August",
+            "dal 20 luglio al 7 agosto"
+        ));
+        assert!(!protected_span_present(
+            "1857-1918)—tsarist",
+            "(1857-1919)—generale zarista"
+        ));
     }
 
     #[test]
@@ -1246,6 +1274,10 @@ mod tests {
             "p < 0.05",
             "Il risultato era p < 0,06."
         ));
+        assert!(!protected_span_present(
+            "p < 0.05",
+            "Il risultato era 0,05."
+        ));
     }
 
     #[test]
@@ -1273,6 +1305,19 @@ mod tests {
         let translation = "Parola.<m0><m1>*2</m1></m0> Continua.";
 
         assert_eq!(marker_reference_text_error(source, translation), None);
+    }
+
+    #[test]
+    fn marker_reference_text_supports_non_ascii_numbering() {
+        let source = "Parola.<m1>١٢</m1> Segue.";
+        let preserved = "Parola.<m1>١٢</m1> Continua.";
+        let dropped = "Parola.<m1></m1> Continua.";
+
+        assert_eq!(marker_reference_text_error(source, preserved), None);
+        assert!(
+            marker_reference_text_error(source, dropped)
+                .is_some_and(|error| error.contains("lost its reference text"))
+        );
     }
 
     #[test]

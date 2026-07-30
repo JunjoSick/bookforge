@@ -233,43 +233,37 @@ fn number_adjacent_to_month(source: &str, number: &str) -> bool {
             .is_none_or(|ch| !ch.is_ascii_digit());
         left_boundary
             && right_boundary
-            && (adjacent_word_before(source, start).is_some_and(is_month_name)
-                || adjacent_word_after(source, end).is_some_and(is_month_name))
+            && (alphabetic_words(&source[..start])
+                .into_iter()
+                .rev()
+                .take(2)
+                .any(is_month_name)
+                || alphabetic_words(&source[end..])
+                    .into_iter()
+                    .take(2)
+                    .any(is_month_name))
     })
 }
 
-fn adjacent_word_before(source: &str, end: usize) -> Option<&str> {
-    let prefix = &source[..end];
-    let word_end = prefix
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| ch.is_ascii_alphabetic())
-        .map(|(index, ch)| index + ch.len_utf8())?;
-    let word_start = prefix[..word_end]
-        .char_indices()
-        .rev()
-        .take_while(|(_, ch)| ch.is_ascii_alphabetic())
-        .last()
-        .map_or(word_end, |(index, _)| index);
-    Some(&prefix[word_start..word_end])
-}
-
-fn adjacent_word_after(source: &str, start: usize) -> Option<&str> {
-    let suffix = &source[start..];
-    let word_start = suffix
-        .char_indices()
-        .find(|(_, ch)| ch.is_ascii_alphabetic())
-        .map(|(index, _)| index)?;
-    let word_end = suffix[word_start..]
-        .char_indices()
-        .take_while(|(_, ch)| ch.is_ascii_alphabetic())
-        .last()
-        .map(|(index, ch)| word_start + index + ch.len_utf8())?;
-    Some(&suffix[word_start..word_end])
+fn alphabetic_words(text: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (index, ch) in text.char_indices() {
+        if ch.is_alphabetic() {
+            start.get_or_insert(index);
+        } else if let Some(word_start) = start.take() {
+            words.push(&text[word_start..index]);
+        }
+    }
+    if let Some(word_start) = start {
+        words.push(&text[word_start..]);
+    }
+    words
 }
 
 fn is_month_name(word: &str) -> bool {
     const MONTHS: &[&str] = &[
+        // English
         "january",
         "jan",
         "february",
@@ -294,8 +288,84 @@ fn is_month_name(word: &str) -> bool {
         "nov",
         "december",
         "dec",
+        // Italian
+        "gennaio",
+        "gen",
+        "febbraio",
+        "marzo",
+        "aprile",
+        "maggio",
+        "mag",
+        "giugno",
+        "giu",
+        "luglio",
+        "lug",
+        "agosto",
+        "ago",
+        "settembre",
+        "set",
+        "ottobre",
+        "ott",
+        "novembre",
+        "dicembre",
+        "dic",
+        // Spanish
+        "enero",
+        "ene",
+        "febrero",
+        "abril",
+        "abr",
+        "mayo",
+        "junio",
+        "julio",
+        "septiembre",
+        "setiembre",
+        "octubre",
+        "diciembre",
+        // Portuguese
+        "janeiro",
+        "fevereiro",
+        "fev",
+        "março",
+        "maio",
+        "mai",
+        "junho",
+        "julho",
+        "outubro",
+        "out",
+        "dezembro",
+        "dez",
+        // Danish and Norwegian
+        "januar",
+        "februar",
+        "marts",
+        "mars",
+        "maj",
+        "juni",
+        "juli",
+        "oktober",
+        "okt",
+        "desember",
+        "des",
+        // French
+        "janvier",
+        "février",
+        "fevrier",
+        "avril",
+        "juin",
+        "juillet",
+        "août",
+        "aout",
+        "octobre",
+        "décembre",
+        "decembre",
+        // German
+        "jänner",
+        "märz",
+        "dezember",
     ];
-    MONTHS.iter().any(|month| word.eq_ignore_ascii_case(month))
+    let folded = word.to_lowercase();
+    MONTHS.contains(&folded.as_str())
 }
 
 fn source_copy_error(
@@ -1166,6 +1236,11 @@ mod protected_span_severity_tests {
             ("The value is 0.0027", "0.0027"),
             ("It cost $15", "$15"),
             ("The event was December 8", "8"),
+            ("L'evento era l'8 dicembre", "8"),
+            ("El evento fue el 8 de diciembre", "8"),
+            ("O evento foi em 8 de dezembro", "8"),
+            ("Begivenheden var den 8. december", "8"),
+            ("Arrangementet var 8. desember", "8"),
             ("1. First item", "1"),
         ] {
             let substantial = batch_item_validation_error(
@@ -1181,6 +1256,18 @@ mod protected_span_severity_tests {
                 "{number} in {source:?} should be hard: {substantial}"
             );
         }
+
+        assert!(
+            batch_item_validation_error(
+                &item_with_span("The event was December 8", ProtectedSpanKind::Number, "8"),
+                "L'evento era l'8 dicembre",
+                false,
+                None,
+                None,
+            )
+            .is_none(),
+            "a localized date that preserves the day must pass"
+        );
     }
 }
 
