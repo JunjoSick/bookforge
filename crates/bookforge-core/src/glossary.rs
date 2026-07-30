@@ -220,25 +220,40 @@ struct CandidateStats {
     forms: BTreeMap<String, usize>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RecurrentTokenStats {
+    source_count: usize,
+    document_count: usize,
+    prose_count: usize,
+    forms: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateExtractionStrategy {
+    Capitalization,
+    Recurrence,
+}
+
 pub fn extract_glossary_candidates(
     blocks: &[Block],
     source_language: &str,
     min_count: usize,
     limit: Option<usize>,
 ) -> Vec<GlossaryCandidate> {
-    let stopwords = common_words(source_language);
     let mut candidates = BTreeMap::<String, CandidateStats>::new();
+    let strategy = candidate_extraction_strategy(blocks);
 
-    for block in blocks {
-        let quoted_italic_sources = collect_quoted_italic_candidates(block, &mut candidates);
-        let visible_text = block_visible_text(block);
-        collect_capitalized_candidates(
-            &visible_text,
-            stopwords,
-            &quoted_italic_sources,
-            matches!(block.kind, BlockKind::Heading(_)),
-            &mut candidates,
-        );
+    match strategy {
+        CandidateExtractionStrategy::Capitalization => {
+            collect_capitalization_candidates(
+                blocks,
+                common_words(source_language),
+                &mut candidates,
+            );
+        }
+        CandidateExtractionStrategy::Recurrence => {
+            collect_recurrent_candidates(blocks, min_count.max(1), &mut candidates);
+        }
     }
 
     let min_count = min_count.max(1);
@@ -250,11 +265,12 @@ pub fn extract_glossary_candidates(
     let mut candidates = candidates
         .into_iter()
         .filter(|(key, stats)| {
-            // An author's own italics or quotes are an explicit signal, so
+            // An author's own quoted italics are an explicit signal, so
             // `Invented` bypasses both frequency and positional evidence.
             stats.category == GlossaryCategory::Invented
                 || (stats.source_count >= min_count
-                    && has_positional_evidence(key, stats, &word_evidence))
+                    && (strategy == CandidateExtractionStrategy::Recurrence
+                        || has_positional_evidence(key, stats, &word_evidence)))
         })
         .map(|(_, stats)| stats)
         .map(|stats| GlossaryCandidate {
@@ -275,6 +291,164 @@ pub fn extract_glossary_candidates(
         candidates.truncate(limit);
     }
     candidates
+}
+
+/// Choose extraction by whether the dominant script in the source text has
+/// case.
+///
+/// Unicode exposes case directly on characters, so routing can generalize to
+/// languages that BookForge has never enumerated. A source whose alphabetic
+/// characters are predominantly cased uses capitalization; a predominantly
+/// caseless source uses recurrence.
+///
+/// Ties and text without alphabetic evidence default to recurrence. That
+/// preserves recall when the script cannot be inferred, whereas capitalization
+/// cannot emit ordinary candidates from a caseless script. Counting the
+/// dominant kind rather than testing for any cased character prevents an
+/// occasional Latin word from rerouting a Han, Kana, Hangul, Thai, Arabic,
+/// Hebrew, or Devanagari source.
+fn candidate_extraction_strategy(blocks: &[Block]) -> CandidateExtractionStrategy {
+    let (cased, caseless) = blocks.iter().fold((0usize, 0usize), |counts, block| {
+        block_visible_text(block)
+            .chars()
+            .filter(|ch| ch.is_alphabetic())
+            .fold(counts, |(cased, caseless), ch| {
+                if ch.is_lowercase() || ch.is_uppercase() {
+                    (cased + 1, caseless)
+                } else {
+                    (cased, caseless + 1)
+                }
+            })
+    });
+
+    if cased > caseless {
+        CandidateExtractionStrategy::Capitalization
+    } else {
+        CandidateExtractionStrategy::Recurrence
+    }
+}
+
+fn collect_capitalization_candidates(
+    blocks: &[Block],
+    stopwords: &[&str],
+    candidates: &mut BTreeMap<String, CandidateStats>,
+) {
+    for block in blocks {
+        let quoted_italic_sources = collect_quoted_italic_candidates(block, candidates);
+        let visible_text = block_visible_text(block);
+        collect_capitalized_candidates(
+            &visible_text,
+            stopwords,
+            &quoted_italic_sources,
+            matches!(block.kind, BlockKind::Heading(_)),
+            candidates,
+        );
+    }
+}
+
+/// Collect recurrent words without using capitalization, sentence position,
+/// or a language-specific stoplist.
+///
+/// Blocks act as the documents in a small in-document TF-IDF calculation.
+/// Sublinear term frequency rewards repetition without letting ubiquitous
+/// function words dominate, while inverse block frequency rewards vocabulary
+/// concentrated in the parts of the book where a term is discussed. The
+/// square-root sweep size keeps the proposal batch sublinear in book length;
+/// callers can impose a tighter `--limit`.
+fn collect_recurrent_candidates(
+    blocks: &[Block],
+    min_count: usize,
+    candidates: &mut BTreeMap<String, CandidateStats>,
+) {
+    let mut recurrent = BTreeMap::<String, RecurrentTokenStats>::new();
+    let mut document_count = 0usize;
+    let mut token_count = 0usize;
+
+    for block in blocks {
+        let quoted_italic_sources = collect_quoted_italic_candidates(block, candidates);
+        let visible_text = block_visible_text(block);
+        let words = tokenize_words(&visible_text);
+        if words.is_empty() {
+            continue;
+        }
+
+        document_count += 1;
+        token_count += words.len();
+        let in_heading = matches!(block.kind, BlockKind::Heading(_));
+        let mut seen_in_document = HashSet::new();
+        for word in words {
+            if word.text.chars().filter(|ch| ch.is_alphabetic()).count() < 2 {
+                continue;
+            }
+            let key = word.text.to_lowercase();
+            if quoted_italic_sources.contains(&key) {
+                continue;
+            }
+
+            let stats = recurrent.entry(key.clone()).or_default();
+            stats.source_count += 1;
+            if !in_heading {
+                stats.prose_count += 1;
+            }
+            *stats.forms.entry(word.text).or_insert(0) += 1;
+            seen_in_document.insert(key);
+        }
+        for key in seen_in_document {
+            if let Some(stats) = recurrent.get_mut(&key) {
+                stats.document_count += 1;
+            }
+        }
+    }
+
+    let sweep_size = recurrent_sweep_size(token_count);
+    let mut recurrent = recurrent
+        .into_iter()
+        .filter(|(_, stats)| stats.source_count >= min_count && stats.prose_count > 0)
+        .map(|(key, stats)| {
+            let score = in_document_tfidf(stats.source_count, stats.document_count, document_count);
+            (key, stats, score)
+        })
+        .collect::<Vec<_>>();
+    recurrent.sort_by(|left, right| {
+        right
+            .2
+            .total_cmp(&left.2)
+            .then_with(|| right.1.source_count.cmp(&left.1.source_count))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    for (key, stats, _) in recurrent.into_iter().take(sweep_size) {
+        merge_recurrent_candidate(candidates, key, stats);
+    }
+}
+
+fn recurrent_sweep_size(token_count: usize) -> usize {
+    (token_count as f64).sqrt().ceil() as usize
+}
+
+fn in_document_tfidf(source_count: usize, document_count: usize, total_documents: usize) -> f64 {
+    let term_frequency = (source_count as f64).ln_1p();
+    let inverse_document_frequency = ((total_documents.saturating_add(1)) as f64
+        / (document_count.saturating_add(1)) as f64)
+        .ln();
+    term_frequency * inverse_document_frequency
+}
+
+fn merge_recurrent_candidate(
+    candidates: &mut BTreeMap<String, CandidateStats>,
+    key: String,
+    stats: RecurrentTokenStats,
+) {
+    let entry = candidates.entry(key).or_insert_with(|| CandidateStats {
+        category: GlossaryCategory::Other,
+        source_count: 0,
+        evidence_count: 0,
+        forms: BTreeMap::new(),
+    });
+    entry.source_count += stats.source_count;
+    for (form, count) in stats.forms {
+        *entry.forms.entry(form).or_insert(0) += count;
+    }
 }
 
 /// Return one short source excerpt containing a glossary candidate.
@@ -1181,6 +1355,154 @@ mod tests {
             candidates.iter().any(|candidate| {
                 candidate.source_text == "Ivan Ilych" && candidate.source_count == 2
             }),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
+    fn extraction_strategy_is_derived_from_the_dominant_script() {
+        for text in [
+            "German: Zarathustra sprach mit den Menschen.",
+            "Russian: Раскольников встретил Катерину Ивановну.",
+            "Italian: Questo Mondo è al Contrario.",
+        ] {
+            assert_eq!(
+                candidate_extraction_strategy(&[block(text)]),
+                CandidateExtractionStrategy::Capitalization,
+                "{text}"
+            );
+        }
+        for text in [
+            "中国经典名著 西游记",
+            "日本語の仮名と漢字",
+            "한국어 한글 문장",
+            "ภาษาไทยไม่มีตัวพิมพ์ใหญ่",
+            "العربية بلا حالة أحرف",
+            "עברית ללא אותיות גדולות",
+            "देवनागरी में अक्षर",
+        ] {
+            assert_eq!(
+                candidate_extraction_strategy(&[block(text)]),
+                CandidateExtractionStrategy::Recurrence,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn occasional_cased_text_does_not_reroute_a_caseless_book() {
+        assert_eq!(
+            candidate_extraction_strategy(&[block(
+                "中国经典名著西游记。話說天下大勢，分久必合，合久必分。Project Gutenberg",
+            )]),
+            CandidateExtractionStrategy::Recurrence
+        );
+    }
+
+    #[test]
+    fn ambiguous_script_defaults_to_recurrence() {
+        assert_eq!(
+            candidate_extraction_strategy(&[block("1234 — !?")]),
+            CandidateExtractionStrategy::Recurrence
+        );
+        assert_eq!(
+            candidate_extraction_strategy(&[block("Ab 中国")]),
+            CandidateExtractionStrategy::Recurrence
+        );
+    }
+
+    #[test]
+    fn general_extraction_ranks_concentrated_vocabulary_above_ubiquitous_words() {
+        let concentrated = in_document_tfidf(4, 2, 20);
+        let ubiquitous = in_document_tfidf(40, 20, 20);
+
+        assert!(concentrated > ubiquitous);
+    }
+
+    #[test]
+    fn general_extraction_sweep_size_grows_with_the_square_root_of_tokens() {
+        assert_eq!(recurrent_sweep_size(0), 0);
+        assert_eq!(recurrent_sweep_size(1), 1);
+        assert_eq!(recurrent_sweep_size(16), 4);
+        assert_eq!(recurrent_sweep_size(17), 5);
+        assert_eq!(recurrent_sweep_size(10_000), 100);
+    }
+
+    #[test]
+    fn recurrence_extraction_finds_uncased_chinese_terminology() {
+        let blocks = vec![
+            block("光合作用 供养 花园。"),
+            block("我们 研究 光合作用。"),
+            block("光合作用 需要 阳光。"),
+            block("花园 今天 关闭。"),
+        ];
+
+        let candidates = extract_glossary_candidates(&blocks, "Chinese", 3, None);
+
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.source_text == "光合作用" && candidate.source_count == 3
+            }),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
+    fn german_extraction_uses_noun_capitalization() {
+        let blocks = vec![
+            block("Das Quantenfeld verändert sich."),
+            block("Wir messen das Quantenfeld genau."),
+            block("Dieses Quantenfeld bleibt stabil."),
+            block("Die Messung endet heute."),
+        ];
+
+        let candidates = extract_glossary_candidates(&blocks, "German", 3, None);
+
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.source_text == "Quantenfeld" && candidate.source_count == 3
+            }),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
+    fn russian_extraction_retains_capitalized_phrases_and_rejects_lowercase_noise() {
+        let blocks = vec![
+            block("Авдотья Романовна встретила Петра."),
+            block("Вчера Авдотья Романовна говорила."),
+            block("Авдотья ответила Петру."),
+        ];
+
+        let candidates = extract_glossary_candidates(&blocks, "Russian", 2, None);
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source_text == "Авдотья Романовна"),
+            "{candidates:?}"
+        );
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.source_text == "встретила"),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
+    fn english_extraction_remains_capitalization_gated() {
+        let blocks = vec![block(
+            "The photosynthesis changed. We measured photosynthesis twice. \
+             Later photosynthesis stopped.",
+        )];
+
+        let candidates = extract_glossary_candidates(&blocks, "English", 3, None);
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.source_text == "photosynthesis"),
             "{candidates:?}"
         );
     }
