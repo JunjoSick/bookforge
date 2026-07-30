@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairedMarkerOpen {
@@ -23,6 +23,244 @@ pub struct MarkerClose {
 pub struct MarkerInnerText {
     pub id: String,
     pub text: String,
+}
+
+/// A reversible prompt-only view of marker-bearing prose.
+///
+/// The document IR keeps every marker. This projection removes only a directly
+/// nested marker whose opening tag immediately follows its parent's opening
+/// tag and whose closing tag immediately precedes its parent's closing tag.
+/// Such a parent and child cover the same structural range. Responses can be
+/// expanded back to the original marker tree with [`Self::restore`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerPromptProjection {
+    pub text: String,
+    omitted_ids: HashSet<String>,
+    restorations: HashMap<String, MarkerRestoration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkerRestoration {
+    opens: String,
+    closes: String,
+}
+
+impl MarkerPromptProjection {
+    pub fn is_omitted(&self, id: &str) -> bool {
+        self.omitted_ids.contains(id)
+    }
+
+    pub fn collapsed_pair_count(&self) -> usize {
+        self.omitted_ids.len()
+    }
+
+    /// Restore markers omitted from the prompt around their retained parent.
+    ///
+    /// Callers still validate the expanded text against the original marker
+    /// set. This method deliberately preserves every model-supplied byte and
+    /// only injects the source marker tokens recorded by the projection.
+    pub fn restore(&self, text: &str) -> String {
+        if self.restorations.is_empty() {
+            return text.to_string();
+        }
+
+        let mut output = String::with_capacity(
+            text.len()
+                + self
+                    .restorations
+                    .values()
+                    .map(|restoration| restoration.opens.len() + restoration.closes.len())
+                    .sum::<usize>(),
+        );
+        let mut stack = Vec::<(String, Option<&MarkerRestoration>)>::new();
+        let mut rest = text;
+
+        while let Some(index) = rest.find('<') {
+            output.push_str(&rest[..index]);
+            let tag = &rest[index..];
+
+            if let Some(open) = parse_paired_marker_open(tag) {
+                let restoration = self.restorations.get(&open.id);
+                output.push_str(&tag[..open.len]);
+                if let Some(restoration) = restoration {
+                    output.push_str(&restoration.opens);
+                }
+                stack.push((open.tag_name, restoration));
+                rest = &tag[open.len..];
+            } else if let Some(empty) = parse_empty_marker(tag) {
+                output.push_str(&tag[..empty.len]);
+                rest = &tag[empty.len..];
+            } else if let Some(close) = parse_marker_close(tag) {
+                if let Some((open_name, restoration)) = stack.pop()
+                    && open_name == close.tag_name
+                    && let Some(restoration) = restoration
+                {
+                    output.push_str(&restoration.closes);
+                }
+                output.push_str(&tag[..close.len]);
+                rest = &tag[close.len..];
+            } else {
+                output.push('<');
+                rest = &tag[1..];
+            }
+        }
+
+        output.push_str(rest);
+        output
+    }
+}
+
+#[derive(Debug)]
+struct PairedMarkerRange {
+    id: String,
+    open_start: usize,
+    open_end: usize,
+    open_token: String,
+    close_start: usize,
+    close_end: usize,
+    close_token: String,
+    parent: Option<usize>,
+}
+
+/// Collapse directly nested paired markers that cover exactly the same range.
+///
+/// Marker IDs and the IR itself are untouched. The returned text is suitable
+/// for a prompt, while [`MarkerPromptProjection::restore`] recreates the full
+/// source marker nesting before validation, persistence, and EPUB rebuild.
+pub fn collapse_nested_markers_for_prompt(text: &str) -> MarkerPromptProjection {
+    if marker_structure_error(text).is_some() {
+        return identity_projection(text);
+    }
+
+    let mut ranges = Vec::<PairedMarkerRange>::new();
+    let mut stack = Vec::<(String, usize)>::new();
+    let mut offset = 0usize;
+
+    while offset < text.len() {
+        let rest = &text[offset..];
+        let Some(index) = rest.find('<') else {
+            break;
+        };
+        let tag_start = offset + index;
+        let tag = &text[tag_start..];
+
+        if let Some(open) = parse_paired_marker_open(tag) {
+            let range_index = ranges.len();
+            ranges.push(PairedMarkerRange {
+                id: open.id,
+                open_start: tag_start,
+                open_end: tag_start + open.len,
+                open_token: tag[..open.len].to_string(),
+                close_start: 0,
+                close_end: 0,
+                close_token: String::new(),
+                parent: stack.last().map(|(_, index)| *index),
+            });
+            stack.push((open.tag_name, range_index));
+            offset = tag_start + open.len;
+        } else if let Some(empty) = parse_empty_marker(tag) {
+            offset = tag_start + empty.len;
+        } else if let Some(close) = parse_marker_close(tag) {
+            let Some((open_name, range_index)) = stack.pop() else {
+                return identity_projection(text);
+            };
+            if open_name != close.tag_name {
+                return identity_projection(text);
+            }
+            ranges[range_index].close_start = tag_start;
+            ranges[range_index].close_end = tag_start + close.len;
+            ranges[range_index].close_token = tag[..close.len].to_string();
+            offset = tag_start + close.len;
+        } else {
+            offset = tag_start + 1;
+        }
+    }
+
+    if !stack.is_empty() {
+        return identity_projection(text);
+    }
+
+    let mut unique_ids = HashSet::new();
+    if ranges.iter().any(|range| !unique_ids.insert(&range.id)) {
+        return identity_projection(text);
+    }
+
+    let mut identical_child = vec![None; ranges.len()];
+    let mut omitted_ids = HashSet::new();
+    for (child_index, child) in ranges.iter().enumerate() {
+        let Some(parent_index) = child.parent else {
+            continue;
+        };
+        let parent = &ranges[parent_index];
+        if parent.open_end == child.open_start && child.close_end == parent.close_start {
+            identical_child[parent_index] = Some(child_index);
+            omitted_ids.insert(child.id.clone());
+        }
+    }
+
+    if omitted_ids.is_empty() {
+        return identity_projection(text);
+    }
+
+    let mut restorations = HashMap::new();
+    for (root_index, root) in ranges.iter().enumerate() {
+        if omitted_ids.contains(&root.id) {
+            continue;
+        }
+
+        let mut child_index = identical_child[root_index];
+        let mut opens = String::new();
+        let mut closes = Vec::new();
+        while let Some(index) = child_index {
+            let child = &ranges[index];
+            opens.push_str(&child.open_token);
+            closes.push(child.close_token.as_str());
+            child_index = identical_child[index];
+        }
+        if !opens.is_empty() {
+            restorations.insert(
+                root.id.clone(),
+                MarkerRestoration {
+                    opens,
+                    closes: closes.into_iter().rev().collect(),
+                },
+            );
+        }
+    }
+
+    let mut omitted_ranges = ranges
+        .iter()
+        .filter(|range| omitted_ids.contains(&range.id))
+        .flat_map(|range| {
+            [
+                (range.open_start, range.open_end),
+                (range.close_start, range.close_end),
+            ]
+        })
+        .collect::<Vec<_>>();
+    omitted_ranges.sort_unstable();
+
+    let mut collapsed = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end) in omitted_ranges {
+        collapsed.push_str(&text[cursor..start]);
+        cursor = end;
+    }
+    collapsed.push_str(&text[cursor..]);
+
+    MarkerPromptProjection {
+        text: collapsed,
+        omitted_ids,
+        restorations,
+    }
+}
+
+fn identity_projection(text: &str) -> MarkerPromptProjection {
+    MarkerPromptProjection {
+        text: text.to_string(),
+        omitted_ids: HashSet::new(),
+        restorations: HashMap::new(),
+    }
 }
 
 pub fn marker_ids_in_text(text: &str) -> Vec<String> {
@@ -357,6 +595,61 @@ pub fn all_markers_present(text: &str, required: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_projection_collapses_only_identical_nested_ranges() {
+        let source = "<m1><m2>eyes</m2></m1> and text";
+        let projection = collapse_nested_markers_for_prompt(source);
+
+        assert_eq!(projection.text, "<m1>eyes</m1> and text");
+        assert_eq!(projection.collapsed_pair_count(), 1);
+        assert!(projection.is_omitted("m2"));
+        assert_eq!(projection.restore(&projection.text), source);
+        assert_eq!(
+            projection.restore("<m1>occhi</m1> e testo"),
+            "<m1><m2>occhi</m2></m1> e testo"
+        );
+    }
+
+    #[test]
+    fn prompt_projection_preserves_nested_different_ranges() {
+        let source = "<m1>wide <m2>narrow</m2> range</m1>";
+        let projection = collapse_nested_markers_for_prompt(source);
+
+        assert_eq!(projection.text, source);
+        assert_eq!(projection.collapsed_pair_count(), 0);
+        assert_eq!(projection.restore(source), source);
+    }
+
+    #[test]
+    fn prompt_projection_restores_identical_marker_chains() {
+        let projection = collapse_nested_markers_for_prompt("<m1><m2><m3>eyes</m3></m2></m1>");
+
+        assert_eq!(projection.text, "<m1>eyes</m1>");
+        assert_eq!(projection.collapsed_pair_count(), 2);
+        assert_eq!(
+            projection.restore("<m1>occhi</m1>"),
+            "<m1><m2><m3>occhi</m3></m2></m1>"
+        );
+    }
+
+    #[test]
+    fn prompt_projection_restores_legacy_marker_tokens() {
+        let source = r#"<m id="outer"><m id="inner">eyes</m></m>"#;
+        let projection = collapse_nested_markers_for_prompt(source);
+
+        assert_eq!(projection.text, r#"<m id="outer">eyes</m>"#);
+        assert_eq!(projection.restore(&projection.text), source);
+    }
+
+    #[test]
+    fn prompt_projection_does_not_collapse_duplicate_source_ids() {
+        let source = "<m1><m1>eyes</m1></m1>";
+        let projection = collapse_nested_markers_for_prompt(source);
+
+        assert_eq!(projection.text, source);
+        assert_eq!(projection.collapsed_pair_count(), 0);
+    }
 
     #[test]
     fn marker_ids_include_short_and_legacy_markers() {
