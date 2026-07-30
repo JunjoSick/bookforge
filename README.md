@@ -83,6 +83,7 @@ local browser-based translation runs:
 | Install BookForge and run a first browser translation | [Install and setup](#install-and-setup) |
 | Understand every CLI command and a full job workflow | [CLI guide](docs/CLI_REFERENCE.md) |
 | Configure hosted or local translation providers | [Provider guide](docs/PROVIDERS.md) |
+| Pick which model to translate with, and what it will cost | [Model selection](docs/model-selection.md) |
 | Diagnose installation, job, provider, EPUB, PDF, or audio problems | [Troubleshooting](docs/TROUBLESHOOTING.md) |
 | Understand checkpoints, resume, and cache reuse | [Checkpointing](docs/CHECKPOINTING.md) |
 | Generate audiobooks | [Audiobooks](docs/audiobooks.md) |
