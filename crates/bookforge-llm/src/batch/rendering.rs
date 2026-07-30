@@ -116,6 +116,50 @@ fn protected_span_texts(item: &TranslationBatchItem) -> Vec<String> {
         .collect()
 }
 
+fn prompt_projected_item(
+    item: &TranslationBatchItem,
+) -> (
+    TranslationBatchItem,
+    bookforge_core::marker::MarkerPromptProjection,
+) {
+    let projection = bookforge_core::marker::collapse_nested_markers_for_prompt(&item.source_text);
+    let mut projected = item.clone();
+    projected.source_text = projection.text.clone();
+    projected
+        .required_markers
+        .retain(|id| !projection.is_omitted(id));
+    projected.text_runs = project_marker_runs(&item.text_runs, &projection);
+    (projected, projection)
+}
+
+fn project_marker_runs(
+    runs: &[SegmentTextRun],
+    projection: &bookforge_core::marker::MarkerPromptProjection,
+) -> Vec<SegmentTextRun> {
+    let mut stack = Vec::<(String, bool)>::new();
+    runs.iter()
+        .filter_map(|run| {
+            if let Some(open) = bookforge_core::marker::parse_paired_marker_open(&run.text)
+                && open.len == run.text.len()
+            {
+                let omitted = projection.is_omitted(&open.id);
+                stack.push((open.tag_name, omitted));
+                return (!omitted).then(|| run.clone());
+            }
+            if let Some(close) = bookforge_core::marker::parse_marker_close(&run.text)
+                && close.len == run.text.len()
+            {
+                let omitted = stack
+                    .pop()
+                    .filter(|(open_name, _)| open_name == &close.tag_name)
+                    .is_some_and(|(_, omitted)| omitted);
+                return (!omitted).then(|| run.clone());
+            }
+            Some(run.clone())
+        })
+        .collect()
+}
+
 fn protected_span_severity(
     item: &TranslationBatchItem,
     kind: ProtectedSpanKind,
@@ -453,9 +497,16 @@ fn parse_text_batch_response(
             continue;
         };
 
+        let translation = if turbo {
+            item.translation.clone()
+        } else {
+            let (_, projection) = prompt_projected_item(request_item);
+            projection.restore(&item.translation)
+        };
+
         if let Some(error) = crate::validation::empty_translation_validation_error(
             &request_item.source_text,
-            &item.translation,
+            &translation,
         ) {
             failures.push(BatchItemFailure {
                 item_id: item.id.clone(),
@@ -469,7 +520,6 @@ fn parse_text_batch_response(
             continue;
         }
 
-        let translation = item.translation.clone();
         let section_title = section_titles
             .and_then(|titles| titles.get(&request_item.segment_id.0))
             .map(String::as_str);
@@ -584,8 +634,9 @@ fn parse_run_batch_response(
         let Some(request_item) = requested_ids.get(item.id.as_str()) else {
             continue;
         };
+        let (projected_item, projection) = prompt_projected_item(request_item);
 
-        let expected_run_count = request_item.text_runs.len();
+        let expected_run_count = projected_item.text_runs.len();
         if item.runs.len() != expected_run_count {
             failures.push(BatchItemFailure {
                 item_id: item.id.clone(),
@@ -602,7 +653,7 @@ fn parse_run_batch_response(
             continue;
         }
 
-        let expected_ids: HashMap<&str, &SegmentTextRun> = request_item
+        let expected_ids: HashMap<&str, &SegmentTextRun> = projected_item
             .text_runs
             .iter()
             .map(|run| (run.id.as_str(), run))
@@ -623,7 +674,7 @@ fn parse_run_batch_response(
             }
         }
         if run_error.is_none() {
-            for expected in &request_item.text_runs {
+            for expected in &projected_item.text_runs {
                 if !run_by_id.contains_key(expected.id.as_str()) {
                     run_error = Some(format!("missing run ID in response: {}", expected.id));
                     break;
@@ -649,7 +700,7 @@ fn parse_run_batch_response(
             continue;
         }
 
-        let joined: Vec<String> = request_item
+        let joined: Vec<String> = projected_item
             .text_runs
             .iter()
             .map(|run| {
@@ -661,7 +712,7 @@ fn parse_run_batch_response(
             })
             .collect();
         let joined_translation = joined.join("");
-        let translation = joined_translation;
+        let translation = projection.restore(&joined_translation);
         if let Some(error) = crate::validation::empty_translation_validation_error(
             &request_item.source_text,
             &translation,
@@ -906,15 +957,17 @@ pub(super) fn render_batch_items(
         .iter()
         .map(|item| {
             let turbo = batch.mode == BatchMode::TurboTextOnly;
+            let projected = (!turbo).then(|| prompt_projected_item(item).0);
+            let prompt_item = projected.as_ref().unwrap_or(item);
             let source_text = if turbo {
-                bookforge_core::marker::strip_marker_tokens(&item.source_text)
+                bookforge_core::marker::strip_marker_tokens(&prompt_item.source_text)
             } else {
-                item.source_text.clone()
+                prompt_item.source_text.clone()
             };
             let required_markers = if turbo {
                 Vec::new()
             } else {
-                item.required_markers.clone()
+                prompt_item.required_markers.clone()
             };
             let protected_spans = protected_span_texts(item);
             let mut obj = serde_json::json!({
@@ -936,7 +989,7 @@ pub(super) fn render_batch_items(
             }
 
             if batch.mode == BatchMode::RunPreserving {
-                let runs: Vec<serde_json::Value> = item
+                let runs: Vec<serde_json::Value> = prompt_item
                     .text_runs
                     .iter()
                     .map(|r| serde_json::json!({"id": r.id, "text": r.text}))
@@ -973,6 +1026,97 @@ fn wrap_text_only_translation_with_source_markers(source: &str, translation: &st
         return translation;
     }
     format!("{prefix}{translation}")
+}
+
+#[cfg(test)]
+mod nested_marker_projection_tests {
+    use super::*;
+    use bookforge_core::{
+        ir::{BlockId, SectionId},
+        segment::SegmentId,
+    };
+
+    fn item(source: &str, runs: Vec<SegmentTextRun>) -> TranslationBatchItem {
+        TranslationBatchItem {
+            item_id: "item".to_string(),
+            segment_id: SegmentId("segment".to_string()),
+            section_id: SectionId("section".to_string()),
+            block_id: BlockId("block".to_string()),
+            ordinal: 0,
+            kind: "paragraph".to_string(),
+            source_text: source.to_string(),
+            text_runs: runs,
+            protected_spans: Vec::new(),
+            required_markers: bookforge_core::marker::marker_ids_in_text(source),
+            checksum: "checksum".to_string(),
+        }
+    }
+
+    fn batch(mode: BatchMode, item: TranslationBatchItem) -> TranslationBatch {
+        TranslationBatch {
+            id: "batch".to_string(),
+            ordinal: 0,
+            mode,
+            kind: BatchKind::Translation,
+            section_id: item.section_id.clone(),
+            items: vec![item],
+            token_estimate: 1,
+        }
+    }
+
+    #[test]
+    fn marker_safe_response_restores_full_source_nesting() {
+        let source = "<m1><m2>eyes</m2></m1>";
+        let original_item = item(source, Vec::new());
+        let (projected, _) = prompt_projected_item(&original_item);
+
+        assert_eq!(projected.source_text, "<m1>eyes</m1>");
+        assert_eq!(projected.required_markers, ["m1"]);
+        assert_eq!(original_item.source_text, source);
+        assert_eq!(original_item.required_markers, ["m1", "m2"]);
+
+        let result = parse_batch_response(
+            &batch(BatchMode::MarkerSafe, original_item),
+            r#"{"items":[{"id":"item","translation":"<m1>occhi</m1>"}]}"#,
+        )
+        .expect("collapsed response should parse");
+
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "<m1><m2>occhi</m2></m1>");
+    }
+
+    #[test]
+    fn run_preserving_response_can_omit_redundant_marker_runs() {
+        let source = "<m1><m2>eyes</m2></m1>";
+        let runs = ["<m1>", "<m2>", "eyes", "</m2>", "</m1>"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| SegmentTextRun {
+                id: format!("r{index}"),
+                text: text.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let original_item = item(source, runs);
+        let (projected, _) = prompt_projected_item(&original_item);
+
+        assert_eq!(
+            projected
+                .text_runs
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<Vec<_>>(),
+            ["<m1>", "eyes", "</m1>"]
+        );
+
+        let result = parse_batch_response(
+            &batch(BatchMode::RunPreserving, original_item),
+            r#"{"items":[{"id":"item","runs":[{"id":"r0","text":"<m1>"},{"id":"r2","text":"occhi"},{"id":"r4","text":"</m1>"}]}]}"#,
+        )
+        .expect("projected runs should parse");
+
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "<m1><m2>occhi</m2></m1>");
+    }
 }
 
 #[cfg(test)]
