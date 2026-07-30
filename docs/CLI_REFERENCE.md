@@ -137,6 +137,14 @@ bookforge translate book.epub \
   --out book.it.epub
 ```
 
+`--batch-target-tokens` bounds estimated request size. An explicit
+`--batch-max-output-tokens` also bounds the estimated JSON response while
+packing batches, in addition to capping each provider response. The response
+bound is opt-in: leaving the flag unset preserves the profile's normal batch
+packing and avoids paying prompt overhead for extra requests. If a response
+body still fails to decode after a retry, BookForge bisects a multi-item batch;
+a single item remains the recovery floor.
+
 `--qa` controls the optional LLM review pass. `off` skips it, `all` reviews
 every non-empty successful, cached, or `needs_review` translation, and
 `suspicious` limits those reviewable translations to segments with at least
