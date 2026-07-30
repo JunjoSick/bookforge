@@ -1737,6 +1737,28 @@ mod tests {
     }
 
     #[test]
+    fn preserves_nested_identical_span_elements_in_ir() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            r#"<html><body><p><span class="italic"><span class="calibre4">eyes</span></span></p></body></html>"#,
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(block_text(&blocks[0]), "<m1><m2>eyes</m2></m1>");
+        assert_eq!(blocks[0].inline_marks.len(), 2);
+        assert!(
+            blocks[0]
+                .inline_marks
+                .iter()
+                .all(|mark| mark.kind == "span")
+        );
+    }
+
+    #[test]
     fn keeps_inter_inline_whitespace_between_marker_runs() {
         let section_id = SectionId("sec_000000".to_string());
         let blocks = extract_blocks(

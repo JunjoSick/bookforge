@@ -617,6 +617,27 @@ mod tests {
     }
 
     #[test]
+    fn prompt_only_marker_projection_preserves_cache_identity() {
+        let source = "<m1><m2>eyes</m2></m1>";
+        let source_checksum = stable_hash(source);
+        let projection = crate::marker::collapse_nested_markers_for_prompt(source);
+        let namespace =
+            compute_cache_namespace(1200, 160, "Balanced", true, "v1", "glossary:a", "", "");
+
+        assert_ne!(projection.text, source);
+        assert_ne!(stable_hash(&projection.text), source_checksum);
+        assert_eq!(
+            stable_hash(source),
+            source_checksum,
+            "the segment source/checksum remains the unprojected IR text"
+        );
+        assert_eq!(
+            namespace, "e85ab6443d2be31dd5eae7f5e748c69592ac92f9582d129a4fb602d4e4ad7868",
+            "a reversible render projection must not move the existing cache namespace"
+        );
+    }
+
+    #[test]
     fn legacy_cache_namespace_v1_ignores_glossary_fingerprint() {
         let current_without_terms =
             compute_cache_namespace(1200, 160, "Balanced", false, "v1", "", "", "");
