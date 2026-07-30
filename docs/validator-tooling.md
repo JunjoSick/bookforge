@@ -45,17 +45,63 @@ Notes that matter when reading its output:
   source against source and says nothing about the model. In one run that
   artifact was 4,750 of 5,139 raw flags. Always read the
   "excluding preserved-source pairs" figure.
+- Replay currently calls only the exact-equality message
+  `translation_unchanged`. The 92%-overlap message (`translation retains N% of
+  the source-language words`) appears under `other`, although the durable
+  finding classifier correctly stores both as `source_copy_unchanged`. Inspect
+  the `other` messages before concluding that they came from the target-language
+  gate.
 - `--emit-pairs <file.jsonl>` writes the flagged pairs for the judge below.
 
 Use it to answer "did this validator change help?" before spending anything.
 
+### Language assumptions in deterministic validation
+
+Audited 2026-07-30 against the corpus below:
+
+- Inline marker identity, multiplicity, shape, nesting, and marker-aware prose
+  splitting are structural and language-neutral. Reference text inside a marker
+  is a separate data check; decimal reference glyphs from non-Latin scripts are
+  recognized as references.
+- URL, email, filename, internal-anchor, citation, code, and footnote-reference
+  protected spans are exact data-identity checks. Math is also identity-based
+  but is reported as a warning.
+- Number matching accepts localized comma/point decimals, comma/point/space
+  grouping, and reordered numeric date components. A leading numeric value may
+  keep its value while its word suffix changes, for example `4th` to `4º` or
+  `19-August` to `19 luglio`. The value parser still recognizes ASCII digits;
+  changing the digit script itself is not treated as numeric equivalence. On
+  the real Italian-target replay, this removed 93 flagged pairs (99 individual
+  number complaints): all retained the numeric values while translating ordinal
+  suffixes, date words, or prose fused to biographical year ranges.
+- The small-date severity rule recognizes month context in English, Italian,
+  Spanish, Portuguese, Danish, Norwegian, French, and German, including a
+  linking word such as `de`. A missing one- or two-digit number outside known
+  critical contexts remains a warning.
+- Source-copy validation is intentionally cross-language, but its thresholds
+  are language-pair-blind: exact equality always fires, while near-copy requires
+  at least 120 source characters, 30 source words, 30 overlapping words, and 92%
+  multiset overlap. The corpus has no close-pair translation with which to
+  calibrate that threshold. The Italian-to-Italian identity job is not such a
+  probe: source and target language are equal and its provider is `mock`, either
+  of which disables source-copy validation.
+- `target_language_gate` is not a generic language detector. It is the strict
+  closed-vocabulary and grammar gate for the built-in Toki Pona style and
+  returns immediately for every other target language.
+- Source-copy content exceptions are not language-neutral. Reference-section
+  titles, `p.` page-note syntax, and explicit “in English” glosses are recognized
+  with English phrases. Treat results from differently titled reference
+  sections with care.
+
 ## The corpus these tools run against
 
 Measured 2026-07-29 against the owner's store, so the next person does not
-re-derive it: **30 jobs**, all 30 snapshots resolvable, 27 with stored
-translated blocks, **40,303 replayable pairs** across 8 books. Four independent
-translations of *Calling Bullshit* and five of *If We Burn* exist, which is
-free A/B material.
+re-derive it: **30 jobs** (28 English-to-Italian, one Italian-to-Italian mock
+identity run, and one English-to-Toki Pona), all 30 snapshots resolvable, 27 with
+stored translated blocks, **40,576 replayable pairs** across 8 books. The 29
+Italian-target jobs account for 40,303 of those pairs. Four independent
+translations of *Calling Bullshit* and five of *If We Burn* exist, which is free
+A/B material.
 
 `items with no translation` and `block rows with no item` in the thousands are
 expected rather than a defect: several jobs are `needs_review` or `stopped`
@@ -405,6 +451,7 @@ English→Italian jobs, deepseek-v4-flash.
 | after marker-aware span detection (#61) | 371 |
 | after severity demotion (#64) | 348 |
 | after the OCR letter-run guard (#65) | 265 |
+| after localized numeric word-suffix handling | 172 |
 
 False-positive rate over that period stayed roughly flat, **75.3% → 77.5%**.
 That is the important finding: four rounds of heuristic tuning cut *volume*

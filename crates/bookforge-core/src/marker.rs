@@ -99,14 +99,14 @@ pub fn marker_reference_token(text: &str) -> Option<&str> {
     }
     if !token
         .chars()
-        .any(|ch| ch.is_ascii_digit() || is_reference_symbol(ch))
+        .any(|ch| ch.is_numeric() || is_reference_symbol(ch))
     {
         return None;
     }
     token
         .chars()
         .all(|ch| {
-            ch.is_ascii_digit()
+            ch.is_numeric()
                 || ch.is_ascii_whitespace()
                 || is_reference_symbol(ch)
                 || matches!(
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn marker_reference_tokens_are_narrowly_classified() {
-        for token in ["1", "*2", "† 3", "[12]", "12–14"] {
+        for token in ["1", "*2", "† 3", "[12]", "12–14", "١٢", "१२"] {
             assert_eq!(marker_reference_token(token), Some(token), "{token}");
         }
         for prose_or_data in ["", "beautiful", "E=mc^2", "42%", "123456789"] {
