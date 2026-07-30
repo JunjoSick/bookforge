@@ -599,6 +599,42 @@ fn batch_token_estimate(
             .sum::<usize>()
 }
 
+fn expected_batch_output_tokens(mode: BatchMode, items: &[TranslationBatchItem]) -> usize {
+    let translated_text = items
+        .iter()
+        .map(|item| token_estimate(&item.source_text).max(1))
+        .sum::<usize>();
+    let json_envelope = 128usize.saturating_add(items.len().saturating_mul(64));
+    let run_envelope = if mode == BatchMode::RunPreserving {
+        items
+            .iter()
+            .map(|item| item.text_runs.len().saturating_mul(16))
+            .sum::<usize>()
+    } else {
+        0
+    };
+    translated_text
+        .saturating_add(json_envelope)
+        .saturating_add(run_envelope)
+}
+
+fn configured_batch_output_limit(config: Option<&TranslationRunConfig>) -> Option<usize> {
+    config
+        .and_then(|config| config.batch_max_output_tokens.or(config.max_output_tokens))
+        .map(|limit| limit as usize)
+}
+
+fn batch_fits_limits(
+    batch: &TranslationBatch,
+    target_tokens: usize,
+    max_items: usize,
+    config: Option<&TranslationRunConfig>,
+) -> bool {
+    let fits_output = configured_batch_output_limit(config)
+        .is_none_or(|limit| expected_batch_output_tokens(batch.mode, &batch.items) <= limit);
+    batch.token_estimate <= target_tokens && batch.items.len() <= max_items && fits_output
+}
+
 /// Deterministic per-item validation for text-mode batch responses. The
 /// markers that must survive are the ones present in THIS block's source;
 /// protected spans are already block-scoped.
@@ -701,7 +737,7 @@ pub(super) fn normalize_batch_for_current_sizer(
     let target_tokens = sizer.target_tokens_for_mode(batch.mode);
     let max_items = sizer.max_items_for_mode(batch.mode);
     let batch = with_configured_token_estimate(batch, config);
-    if batch.token_estimate <= target_tokens && batch.items.len() <= max_items {
+    if batch_fits_limits(&batch, target_tokens, max_items, config) {
         return vec![batch];
     }
     repack_batch_with_config(batch, target_tokens, max_items, config)
@@ -779,7 +815,10 @@ fn repack_batch_with_config(
         current_items.push(item);
         let candidate_tokens = batch_token_estimate(&current_items, config);
         let would_exceed_tokens = current_items.len() > 1 && candidate_tokens > target_tokens;
-        if would_exceed_items || would_exceed_tokens {
+        let would_exceed_output = current_items.len() > 1
+            && configured_batch_output_limit(config)
+                .is_some_and(|limit| expected_batch_output_tokens(mode, &current_items) > limit);
+        if would_exceed_items || would_exceed_tokens || would_exceed_output {
             let item = current_items
                 .pop()
                 .expect("candidate batch contains the item just added");
