@@ -137,6 +137,14 @@ bookforge translate book.epub \
   --out book.it.epub
 ```
 
+`--batch-target-tokens` bounds estimated request size. An explicit
+`--batch-max-output-tokens` also bounds the estimated JSON response while
+packing batches, in addition to capping each provider response. The response
+bound is opt-in: leaving the flag unset preserves the profile's normal batch
+packing and avoids paying prompt overhead for extra requests. If a response
+body still fails to decode after a retry, BookForge bisects a multi-item batch;
+a single item remains the recovery floor.
+
 `--no-thinking` asks the selected endpoint to suppress reasoning. BookForge
 sends OpenRouter's `reasoning.enabled=false`, OpenAI Chat Completions'
 `reasoning_effort=none`, or DeepSeek's `thinking.type=disabled`, selected from
