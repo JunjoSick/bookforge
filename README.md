@@ -84,6 +84,7 @@ local browser-based translation runs:
 | Understand every CLI command and a full job workflow | [CLI guide](docs/CLI_REFERENCE.md) |
 | Configure hosted or local translation providers | [Provider guide](docs/PROVIDERS.md) |
 | Pick which model to translate with, and what it will cost | [Model selection](docs/model-selection.md) |
+| Understand the planned run-supervision component | [Enabler design](docs/enabler-design.md) |
 | Diagnose installation, job, provider, EPUB, PDF, or audio problems | [Troubleshooting](docs/TROUBLESHOOTING.md) |
 | Understand checkpoints, resume, and cache reuse | [Checkpointing](docs/CHECKPOINTING.md) |
 | Generate audiobooks | [Audiobooks](docs/audiobooks.md) |
