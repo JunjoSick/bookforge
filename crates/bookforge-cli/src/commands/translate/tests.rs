@@ -810,6 +810,20 @@ fn temp_path(name: &str) -> PathBuf {
 }
 
 fn build_translation_fixture(path: &std::path::Path) {
+    build_epub_fixture(path, "en", &["Hello world.".to_string()]);
+}
+
+/// Writes a minimal single-chapter EPUB whose body is `paragraphs`.
+///
+/// The preflight tests need real books rather than in-memory `Book` values,
+/// because the point is to exercise parse -> segmentation -> plan. They must not
+/// reach into `tests/`: that directory is gitignored (it holds the owner's real
+/// books), so anything reading from it passes locally and fails in CI.
+fn build_epub_fixture(path: &std::path::Path, language: &str, paragraphs: &[String]) {
+    let body = paragraphs
+        .iter()
+        .map(|paragraph| format!("<p>{paragraph}</p>"))
+        .collect::<String>();
     let file = fs::File::create(path).expect("fixture EPUB should be creatable");
     let mut zip = zip::ZipWriter::new(file);
     let stored =
@@ -831,27 +845,33 @@ fn build_translation_fixture(path: &std::path::Path) {
     .unwrap();
     zip.start_file("content.opf", deflated).unwrap();
     zip.write_all(
-        br#"<?xml version="1.0" encoding="UTF-8"?>
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
     <dc:identifier id="uid">orchestration-fixture</dc:identifier>
     <dc:title></dc:title>
-    <dc:language>en</dc:language>
+    <dc:language>{language}</dc:language>
   </metadata>
   <manifest>
     <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
   </manifest>
   <spine><itemref idref="chapter"/></spine>
-</package>"#,
+</package>"#
+        )
+        .as_bytes(),
     )
     .unwrap();
     zip.start_file("chapter.xhtml", deflated).unwrap();
     zip.write_all(
-        br#"<?xml version="1.0" encoding="UTF-8"?>
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head><title>Chapter</title></head>
-<body><p>Hello world.</p></body>
-</html>"#,
+<body>{body}</body>
+</html>"#
+        )
+        .as_bytes(),
     )
     .unwrap();
     zip.finish().unwrap();
@@ -1192,27 +1212,51 @@ fn translate_args_with_preset(
     }
 }
 
-fn translation_fixture_path(cyberiad: bool) -> PathBuf {
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("tests");
-    if cyberiad {
-        return fixtures.join("The_Cyberiad.epub");
-    }
-    fs::read_dir(&fixtures)
-        .expect("translation fixtures should be readable")
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .find(|path| {
-            path.extension().and_then(|extension| extension.to_str()) == Some("epub")
-                && path.file_name().and_then(|name| name.to_str()) != Some("The_Cyberiad.epub")
+/// A book-shaped EPUB in one of two scripts, for the preflight tests.
+///
+/// Both scripts get the same paragraph count and the same character count per
+/// paragraph, so the only thing that differs between them is the script itself.
+/// That is the variable the plan routes on, and holding the rest equal is what
+/// makes a difference in the resulting settings attributable to it.
+///
+/// The returned `TempDir` owns the file and must stay alive while it is read.
+fn scripted_book_fixture(caseless: bool) -> (tempfile::TempDir, PathBuf) {
+    // Long enough that the plan sees a distribution rather than a single point,
+    // and that the per-paragraph token estimate lands in the range where the
+    // batch bounds actually move.
+    const PARAGRAPHS: usize = 60;
+    const CHARACTERS_PER_PARAGRAPH: usize = 600;
+
+    let (language, sentence) = if caseless {
+        ("zh", "矛盾的普遍性和特殊性的关系是矛盾问题的精髓。")
+    } else {
+        ("en", "The universal and the particular in contradiction. ")
+    };
+    let paragraphs = (0..PARAGRAPHS)
+        .map(|_| {
+            sentence
+                .chars()
+                .cycle()
+                .take(CHARACTERS_PER_PARAGRAPH)
+                .collect::<String>()
         })
-        .expect("CJK EPUB fixture should exist")
+        .collect::<Vec<_>>();
+
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let path = temp.path().join(if caseless {
+        "caseless.epub"
+    } else {
+        "cased.epub"
+    });
+    build_epub_fixture(&path, language, &paragraphs);
+    (temp, path)
 }
 
 #[test]
 fn explicit_batch_flag_beats_plan_while_unset_fields_are_filled() {
+    let (_fixture, input) = scripted_book_fixture(true);
     let mut args = translate_args_with_preset(None);
-    args.input = translation_fixture_path(false);
+    args.input = input;
     args.plan = true;
     args.provider.provider = "mock".to_string();
     args.provider.model = Some("mock-prefix-target".to_string());
@@ -1270,26 +1314,31 @@ fn translate_without_plan_preserves_resolved_settings_bytes() {
 }
 
 #[test]
-fn real_cjk_and_latin_translate_preflights_apply_different_settings() {
-    let planned_settings = |input: PathBuf| {
+fn caseless_and_cased_translate_preflights_apply_different_settings() {
+    let planned_settings = |input: &std::path::Path| {
         let mut args = translate_args_with_preset(None);
-        args.input = input;
+        args.input = input.to_path_buf();
         args.plan = true;
         args.provider.provider = "mock".to_string();
         args.provider.model = Some("mock-prefix-target".to_string());
         let effective_provider = apply_provider_preset(&args.provider, args.provider_preset);
         let (settings, application) =
             orchestration::resolve_settings_and_plan(&args, &effective_provider)
-                .expect("real EPUB preflight should succeed");
+                .expect("EPUB preflight should succeed");
         assert!(application.is_some());
         settings
     };
 
-    let cjk = planned_settings(translation_fixture_path(false));
-    let latin = planned_settings(translation_fixture_path(true));
+    // `plan.rs` pins the rule itself against in-memory books. This asserts the
+    // same divergence survives the real path: EPUB parse, segmentation, then
+    // settings resolution.
+    let (_caseless_fixture, caseless_input) = scripted_book_fixture(true);
+    let (_cased_fixture, cased_input) = scripted_book_fixture(false);
+    let caseless = planned_settings(&caseless_input);
+    let cased = planned_settings(&cased_input);
 
-    assert!(cjk.batch.target_tokens < latin.batch.target_tokens);
-    assert!(cjk.batch.max_items < latin.batch.max_items);
+    assert!(caseless.batch.target_tokens < cased.batch.target_tokens);
+    assert!(caseless.batch.max_items < cased.batch.max_items);
 }
 
 #[tokio::test]
