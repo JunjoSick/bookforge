@@ -40,8 +40,9 @@ local browser dashboard started by `bookforge serve`.
    run finishes the remaining chunks, records every error, and exits as failed.
 7. **Assemble**: only a fully synthesized manifest is assembled. When ffmpeg is
    available, a normal run creates a chaptered `audiobook.m4b` with chapter
-   markers and title/artist metadata (using the EPUB author as the artist). The
-   chunks remain the resumable units on disk.
+   markers, title/artist metadata (using the EPUB author as the artist), and the
+   EPUB cover when one can be identified and embedded. The chunks remain the
+   resumable units on disk.
 
 ## Narration hierarchy and continuity
 
@@ -222,6 +223,16 @@ opts out. `--single` adds one flat `audiobook.<format>`; with MP3 output this is
 the convenient single-file MP3 for players that do not need chapter markers.
 The two book outputs can be requested together.
 
+Cover selection uses the resource manifest already parsed by the EPUB reader.
+An image carrying the EPUB 3 `cover-image` property has first priority. For
+legacy books whose parsed manifest does not retain OPF `meta` or `guide`
+elements, an image with an exact cover-like id (`cover`, `cover-image`, or
+`coverimage`) is next, followed by the first image whose id or filename contains
+`cover`. BookForge does not guess that an unrelated first image is the cover.
+If there is no candidate, the source image is missing, or ffmpeg cannot read or
+mux its format, assembly is retried without artwork and the valid chaptered M4B
+is kept. A rejected candidate produces a warning; no cover is not an error.
+
 `--stitch` and `--m4b` remain available as explicit overrides. Per-chapter
 stitching and ordinary flat-file assembly use stream copy. Raw PCM is rejected
 for stitching because it has no container-level sample metadata; choose WAV
@@ -279,6 +290,15 @@ Superseded chunks stay on disk so prior generations remain auditable. Pass
 space; combine it with `--dry-run` to list them without deleting anything.
 Stitched per-chapter outputs, assembled book files, and `manifest.json` are
 never pruned.
+
+Stitched chapter filenames are ASCII-only, lowercase slugs with repeated
+separators collapsed. Non-ASCII characters are stripped rather than
+transliterated; when that leaves fewer than three ASCII letters or digits,
+BookForge uses `untitled-<hash8>`, derived deterministically from the original
+title. Changing this display slug does not affect resume or pruning because
+those operate on the separate `chapter-NNN-part-NNN-<hash16>.<ext>` chunk names
+recorded in `manifest.json`. A rerun can leave an older stitched chapter beside
+its newly named replacement; cleanup intentionally manages only hashed chunks.
 
 ## Browser dashboard
 

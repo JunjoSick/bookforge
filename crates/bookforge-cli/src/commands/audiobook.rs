@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 #[cfg(feature = "tui")]
 use std::io::IsTerminal;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1313,6 +1314,19 @@ fn stitch_output(request: StitchRequest<'_>) -> Result<bookforge_audio::StitchRe
     if human_output {
         println!("Stitching with ffmpeg...");
     }
+    let (cover, cover_warning) = if make_m4b {
+        match extract_epub_cover(book) {
+            Ok(cover) => (cover, None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "cover art could not be read from the EPUB; produced the m4b without it ({error:#})"
+                )),
+            ),
+        }
+    } else {
+        (None, None)
+    };
     let stitch_options = StitchOptions {
         out_dir: out_dir.to_path_buf(),
         extension: format.extension().to_string(),
@@ -1324,8 +1338,12 @@ fn stitch_output(request: StitchRequest<'_>) -> Result<bookforge_audio::StitchRe
         loudnorm,
         make_single,
         author: (!book.metadata.creators.is_empty()).then(|| book.metadata.creators.join(", ")),
+        cover_path: cover.as_ref().map(|cover| cover.0.clone()),
     };
-    let result = stitch(&manifest, &stitch_options);
+    let mut result = stitch(&manifest, &stitch_options);
+    if let Some(warning) = cover_warning {
+        result.warnings.push(warning);
+    }
     if human_output {
         for warning in &result.warnings {
             eprintln!("warning: {warning}");
@@ -1341,6 +1359,151 @@ fn stitch_output(request: StitchRequest<'_>) -> Result<bookforge_audio::StitchRe
         println!("Single file: {}", single_file.display());
     }
     Ok(result)
+}
+
+/// Pick the cover information already retained by `bookforge-epub` in the
+/// parsed manifest. EPUB 3's explicit `cover-image` property wins. Older books
+/// often use a cover-like manifest id or image filename; those are the legacy
+/// fallback because the reader IR does not retain OPF meta or guide elements.
+fn cover_image_resource(
+    manifest: &[bookforge_core::ir::Resource],
+) -> Option<&bookforge_core::ir::Resource> {
+    let images = || {
+        manifest
+            .iter()
+            .filter(|resource| resource.media_type.starts_with("image/"))
+    };
+    images()
+        .find(|resource| {
+            resource
+                .properties
+                .iter()
+                .any(|property| property.eq_ignore_ascii_case("cover-image"))
+        })
+        .or_else(|| {
+            images().find(|resource| {
+                matches!(
+                    resource.id.to_ascii_lowercase().as_str(),
+                    "cover" | "cover-image" | "coverimage"
+                )
+            })
+        })
+        .or_else(|| {
+            images().find(|resource| {
+                resource.id.to_ascii_lowercase().contains("cover")
+                    || std::path::Path::new(&resource.href)
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| stem.to_ascii_lowercase().contains("cover"))
+            })
+        })
+}
+
+fn extract_epub_cover(book: &bookforge_core::ir::Book) -> Result<Option<TemporaryCover>> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    const MAX_COVER_BYTES: u64 = 64 * 1024 * 1024;
+
+    let Some(resource) = cover_image_resource(&book.manifest) else {
+        return Ok(None);
+    };
+    let source_path = book
+        .source_path
+        .as_deref()
+        .context("the parsed EPUB has no source path")?;
+    let entry_name = epub_resource_path(&book.id.0, &resource.href)
+        .with_context(|| format!("invalid cover resource path {}", resource.href))?;
+    let source = std::fs::File::open(source_path)
+        .with_context(|| format!("failed to open source EPUB {}", source_path.display()))?;
+    let mut archive = zip::ZipArchive::new(source).context("failed to open source EPUB archive")?;
+    let mut entry = archive
+        .by_name(&entry_name)
+        .with_context(|| format!("cover resource {entry_name} is missing from the EPUB"))?;
+    if entry.size() > MAX_COVER_BYTES {
+        anyhow::bail!(
+            "cover resource {entry_name} is {} bytes (limit: {MAX_COVER_BYTES})",
+            entry.size()
+        );
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
+    entry
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read cover resource {entry_name}"))?;
+
+    let extension = std::path::Path::new(&entry_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 10
+                && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
+        })
+        .unwrap_or("image");
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "bookforge-audio-cover-{}-{}-{sequence}.{extension}",
+        std::process::id(),
+        bookforge_core::now_ms()
+    ));
+    std::fs::write(&path, bytes)
+        .with_context(|| format!("failed to stage cover image {}", path.display()))?;
+    Ok(Some(TemporaryCover(path)))
+}
+
+fn epub_resource_path(package_path: &str, href: &str) -> Option<String> {
+    let href = href.split(['#', '?']).next().unwrap_or(href);
+    let href = percent_decode_epub_path(href)?;
+    let package_dir = package_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let joined = if package_dir.is_empty() {
+        href
+    } else {
+        format!("{package_dir}/{href}")
+    };
+    let mut normalized = Vec::new();
+    for part in joined.replace('\\', "/").split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                normalized.pop()?;
+            }
+            _ => normalized.push(part.to_string()),
+        }
+    }
+    (!normalized.is_empty()).then(|| normalized.join("/"))
+}
+
+fn percent_decode_epub_path(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+struct TemporaryCover(PathBuf);
+
+impl Drop for TemporaryCover {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn missing_requested_deliverables(
@@ -1441,10 +1604,23 @@ fn validate_audio_base_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioProviderKind, BreakTagsArg, missing_requested_deliverables, normalize_language_code,
-        parse_chapter_ranges, resolve_context_chars, resolve_heading_break_tag,
-        resolve_language_code, validate_audio_base_url, write_stitch_warnings_to_process,
+        AudioProviderKind, BreakTagsArg, cover_image_resource, epub_resource_path,
+        missing_requested_deliverables, normalize_language_code, parse_chapter_ranges,
+        resolve_context_chars, resolve_heading_break_tag, resolve_language_code,
+        validate_audio_base_url, write_stitch_warnings_to_process,
     };
+
+    fn image_resource(id: &str, href: &str, properties: &[&str]) -> bookforge_core::ir::Resource {
+        bookforge_core::ir::Resource {
+            id: id.to_string(),
+            href: href.to_string(),
+            media_type: "image/jpeg".to_string(),
+            properties: properties
+                .iter()
+                .map(|property| (*property).to_string())
+                .collect(),
+        }
+    }
 
     #[test]
     fn audio_base_url_allows_https_and_loopback_http_only() {
@@ -1453,6 +1629,46 @@ mod tests {
         assert!(validate_audio_base_url("http://127.0.0.1:8880/v1").is_ok());
         assert!(validate_audio_base_url("http://example.com/v1").is_err());
         assert!(validate_audio_base_url("https://token@example.com/v1").is_err());
+    }
+
+    #[test]
+    fn epub3_cover_property_precedes_legacy_cover_names() {
+        let manifest = vec![
+            image_resource("cover", "Images/legacy.jpg", &[]),
+            image_resource("front", "Images/front.jpg", &["cover-image"]),
+            image_resource("other-cover", "Images/other-cover.jpg", &[]),
+        ];
+        assert_eq!(
+            cover_image_resource(&manifest).map(|resource| resource.id.as_str()),
+            Some("front")
+        );
+    }
+
+    #[test]
+    fn legacy_cover_selection_is_stable_and_does_not_guess_first_image() {
+        let manifest = vec![
+            image_resource("logo", "Images/logo.jpg", &[]),
+            image_resource("front-cover", "Images/art.jpg", &[]),
+            image_resource("cover", "Images/later.jpg", &[]),
+        ];
+        assert_eq!(
+            cover_image_resource(&manifest).map(|resource| resource.id.as_str()),
+            Some("cover")
+        );
+        assert!(cover_image_resource(&[image_resource("logo", "Images/logo.jpg", &[])]).is_none());
+    }
+
+    #[test]
+    fn epub_cover_resource_path_is_decoded_and_normalized() {
+        assert_eq!(
+            epub_resource_path("OPS/package.opf", "Images/Cover%20Art.jpg#front").as_deref(),
+            Some("OPS/Images/Cover Art.jpg")
+        );
+        assert_eq!(
+            epub_resource_path("OPS/package/content.opf", "../Images/cover.jpg").as_deref(),
+            Some("OPS/Images/cover.jpg")
+        );
+        assert!(epub_resource_path("package.opf", "../cover.jpg").is_none());
     }
 
     #[test]
