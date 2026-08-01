@@ -23,6 +23,7 @@ or supplied to CLI commands through environment variables. See
 | --- | --- |
 | `serve` | Run the local browser dashboard. Running `bookforge` with no command does the same thing and opens the browser. |
 | `inspect` | Report EPUB structure, metadata, and translatable text coverage. |
+| `plan` | Inspect an EPUB offline and recommend translation settings with reasons. |
 | `estimate` | Estimate input/output tokens and price before a hosted-provider run. |
 | `translate` | Start a checkpointed EPUB translation. |
 | `watch` | Monitor and control a job in a full-screen terminal UI. |
@@ -104,8 +105,42 @@ instead of starting the dashboard.
 
 ## A complete translation workflow
 
-Inspect the source before spending provider tokens. The coverage report calls
-out visible text that BookForge would not send for translation.
+Inspect the source before spending provider tokens. `plan` is advisory only: it
+reads the EPUB, constructs no provider, makes no network request, creates no
+`.bookforge/` state, and neither starts nor changes a translation.
+
+```bash
+bookforge plan book.epub \
+  --source English \
+  --target Italian \
+  --provider openrouter \
+  --model openai/gpt-5.6-luna
+```
+
+Every recommendation includes its reason and a disposition: set explicitly,
+keep the current `v1-fast` default, or omit an optional setting. The plan reports
+dominant script; median, p90, and maximum block and scheduler-segment sizes; the
+estimated default-batch output tail; provider output and thinking controls; and
+the translate flags that follow from those findings. `--source` is recorded for
+the operator but does not affect sizing: script is measured from the EPUB text.
+
+Use `--json` for schema-versioned, stable output suitable for a future
+`translate` consumer:
+
+```bash
+bookforge plan book.epub --target Italian --provider deepseek --json
+```
+
+The first planning slice deliberately does not reuse prior runs. The current
+job-store open path may migrate or otherwise write the database, which would
+violate `plan`'s read-only contract; the output records that no prior-run
+evidence was applied. Concurrency therefore stays at the `v1-fast` default with
+adaptive concurrency enabled until an actual run supplies latency or 429
+evidence. Glossary injection is off by default because its measured A/B found no
+detectable quality effect.
+
+The coverage report from `inspect` calls out visible text that BookForge would
+not send for translation.
 
 ```bash
 bookforge inspect book.epub

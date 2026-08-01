@@ -4,8 +4,9 @@ A component that prepares and supervises a translation run: it inspects the
 book and the provider, chooses settings, watches the run, and adapts when
 something goes wrong.
 
-**This is a design document, not a specification of shipped behaviour.** Nothing
-here is implemented yet. It exists so the shape is agreed before code is written.
+This document records both the agreed shape and the deliberately narrow first
+slice. `bookforge plan` now implements the read-only planning half; supervision
+and automatic application remain future work.
 
 ## What it is, and deliberately is not
 
@@ -77,6 +78,52 @@ Output is a settings recommendation **with a reason attached to each value**. A
 planner that cannot explain itself is not auditable, and every hard-won number in
 this project came from someone asking "why is it that?".
 
+### First slice: `bookforge plan`
+
+The first slice resolves two earlier open questions conservatively: it is a
+separate command, and it advises without applying settings. It reads an EPUB and
+emits human-readable recommendations or stable, schema-versioned JSON. It never
+constructs a provider, makes a network request, starts translation, changes the
+EPUB, or creates `.bookforge/` state.
+
+Its current rules are:
+
+1. Build scheduler segments with the same default `v1-fast` and built-in target
+   sizing policy used by `translate`. Recompute block sizes with the shared,
+   script-aware estimator rather than trusting language flags or stored values.
+2. Classify the dominant script by counting cased and caseless alphabetic
+   characters in translatable text. A tie is undetermined. The declared
+   `--source` is reported but never used for sizing.
+3. Treat 8,192 output tokens as the response safety boundary: it is the
+   power-of-two boundary immediately below the smallest measured failure at
+   roughly 9,000 tokens. Generic estimated translated output is 1.15 times
+   source tokens, consistent with `estimate`, plus the executor's 128-token
+   batch and 64-token-per-item JSON envelopes (and its run-preserving envelope).
+4. For cased-script books, keep the `v1-fast` input-token and item defaults. If
+   the estimated maximum default batch crosses 8,192, recommend
+   `--batch-max-output-tokens 8192`; the executor uses it during packing, so this
+   splits the tail without globally multiplying prompt overhead.
+5. For caseless-script books, derive a density guard from the inspected text:
+   `ceil(4 * estimated source tokens / source characters)`, clamped to 1 through
+   4. Divide the response budget by that guard; fit as many p90 estimated-output
+   items as remain after the fixed JSON envelope; then set the token target to
+   the minimum of the profile default, the guarded output capacity, and p90
+   source tokens times that item count. Round the result down to a 256-token
+   step. This produced 768 tokens and 3 items on the measured Chinese book; the
+   numbers are consequences of its distribution, not copied from the successful
+   800/4 experiment.
+6. Make the provider output ceiling explicit: the current executor permits
+   32,768 tokens for DeepSeek and model names it recognizes as reasoning, and
+   16,384 otherwise. Suppress thinking only for provider identities with a
+   parameter the current provider code recognizes. Leave glossary injection off
+   because the measured A/B found no detectable quality effect.
+
+The general design calls for prior-run reuse. That part is not in the first
+slice because the current `JobStore::open` path creates/migrates state; calling
+it would contradict the command's read-only boundary. Plans say explicitly that
+no prior evidence was consulted. Reuse needs a genuinely read-only store API or
+an explicit state input before it can be added safely.
+
 ### Supervision, during the run
 
 A failure-signature table, built from signatures already observed:
@@ -130,17 +177,14 @@ and cost**, both of which are measured reliably today:
 If the enabler cannot move those, it is not working, and no amount of plausible
 architecture should persuade us otherwise.
 
-## Open questions
+## Remaining open questions
 
-- **Where does it live?** A pre-flight pass inside `translate`, a separate
-  `bookforge plan` command, or a library the CLI and dashboard both call. A
-  separate command is easiest to test and easiest to ignore; an integrated
-  pre-flight is what actually helps a user who never reads documentation.
-- **Does it act, or only advise?** Emitting recommended flags is safe and
-  auditable. Applying them automatically is more useful and harder to reason
-  about. A middle option — apply, but record every decision and its reason in
-  the run snapshot — is probably right, and matches how `reconfigure` already
-  works.
+- **Should planning become an integrated pre-flight?** The first slice is the
+  separate `bookforge plan` command. An integrated pre-flight may better serve a
+  user who never runs it, but must preserve the same inspectable decisions.
+- **Should a later slice apply recommendations?** The first slice only advises.
+  Applying settings automatically would need to record every decision and its
+  reason in the run snapshot, matching how `reconfigure` already works.
 - **How much does persistence remember?** Per book, per book-and-provider, or a
   global learned profile. Global learning across unrelated books is the kind of
   thing that looks clever and is impossible to debug.
