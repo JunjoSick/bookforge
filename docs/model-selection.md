@@ -12,13 +12,26 @@ that disagreement and is explicit about what does not.
 
 | Need | Model | Why |
 | --- | --- | --- |
-| Default | `openai/gpt-5.6-luna` | Completed everything first try, cheapest of the capable set, no fluency complaints under the judge that could score every arm |
-| Bulk / drafts | `deepseek/deepseek-v4-flash` | **$0.01** against Luna's $0.25 for the same text, and also completed first try. Weaker on omissions |
-| Avoid for translation | `anthropic/claude-opus-5` | The one quality claim that survived both judges: consistently in the worse group, at ~19x Luna's cost, and it never completed the test slice |
+| Default, and now also for bulk | `openai/gpt-5.6-luna` | Completed everything first try in both English and Chinese, no fluency complaints, and since the 2026-07-31 price cut it is **cheaper than deepseek-v4-flash on input** |
+| Cost floor, if you tune it | `deepseek/deepseek-v4-flash` | Still cheapest on output and has an 80% input-cache discount, but needs batch tuning on non-Latin scripts and drops content far more often |
+| Avoid for translation | `anthropic/claude-opus-5` | The one quality claim that survived both judges: consistently in the worse group, at roughly 19x Luna's cost, and it never completed the test slice |
 
 **Price does not predict quality.** Across six models spanning a 600x price
 range, the two most expensive placed first and last under one judge, and swapped
 under the other.
+
+**The Flash price argument has largely evaporated.** On 2026-07-31 Luna moved
+from $0.50/$3.00 to **$0.10/$0.60** per million. An earlier version of this
+document recommended Flash for bulk on a 25x gap; measured on a real Chinese book
+the two now cost **$0.0256 against $0.0225** -- about 12% apart -- because Luna is
+cheaper on input and Flash needed small batches, which multiplied its output
+tokens to 64k against Luna's 36k. Output is exactly where Flash's advantage is
+thinnest (0.28 against 0.60, roughly 2x, against being *more* expensive on
+input).
+
+Flash remains genuinely cheap where **input dominates and caching applies** --
+resumes, retries, re-runs over mostly-cached content, where its cached input
+falls to $0.028/M. Judge that per workload rather than from the headline rate.
 
 ## What was measured
 
@@ -115,6 +128,50 @@ What survives both judges:
 - **Grok 4.5 looks best under both** — but under grok that is a model judging its
   own translation, which is known to inflate. Discount it.
 - **Luna against Terra against Fable 5 is unresolved.**
+
+## Non-Latin scripts need batch tuning, and the benchmark cannot score them yet
+
+Measured on 《矛盾论》 (*On Contradiction*, 27,412 characters, Chinese to Italian).
+
+**Default batching fails badly.** BookForge's token estimators are
+whitespace- and Latin-shaped, so they under-count languages without inter-word
+spaces and the planner packs batches several times larger than it believes:
+
+| model, default batching | segments | blocks recovered |
+| --- | --- | --- |
+| `openai/gpt-5.6-luna` | 12/15 | 208 of 211 |
+| `deepseek/deepseek-v4-flash` | 8/15 | **61 of 211 — 71% of the book lost** |
+
+Luna's failures were output-cap truncation; Flash's were
+`HTTP error: error decoding response body`, the oversized-response cliff.
+`--batch-target-tokens 800 --batch-max-items 4` recovered Flash **completely**
+(211 blocks, zero failures), which is the proof the planner is mis-sizing rather
+than the model being weak.
+
+**Until token counting is script-aware, set batch sizes explicitly for CJK
+sources.** `bookforge estimate` also under-reports these languages badly — it
+predicted 446 input tokens for a book that consumed 37,362.
+
+**Quality on Chinese, on 22 identical passages (18,865 source characters):**
+
+| | hard defects | of which content dropped |
+| --- | --- | --- |
+| Luna | 142 | 9 |
+| Flash | 134 | **49** |
+
+Totals are indistinguishable (p = 0.67), but the failure *shapes* differ:
+**Flash drops content 5.4x more often**, echoing the same weakness on the
+English slice (17 against 5). Silent omission is the worse failure mode — a
+reader never learns something is missing, whereas a changed nuance is visible.
+
+Treat this loosely. The judge is unvalidated on Chinese, and `content_dropped` is
+its weakest category at 13.3% precision — though it is suggestive that the same
+asymmetry appears independently on two books in two languages.
+
+**Rates are not reported for Chinese** because `judge_translation` derives
+"source words" by whitespace splitting, which inflates every per-1,000-word
+figure by roughly 100x on unspaced scripts. Only raw counts on identical
+passages are meaningful here.
 
 ## Limits — read before quoting any of this
 
