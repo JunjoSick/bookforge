@@ -199,6 +199,7 @@ async fn mock_and_openai_entry_points_share_events_and_artifacts() {
         &mock_args.provider,
         &mock_args,
         &settings,
+        None,
         &tokio_util::sync::CancellationToken::new(),
         mock_progress.clone(),
         Some(JobStore::open(&mock_store_path).unwrap()),
@@ -231,6 +232,7 @@ async fn mock_and_openai_entry_points_share_events_and_artifacts() {
         &openai_args.provider,
         &openai_args,
         &settings,
+        None,
         &tokio_util::sync::CancellationToken::new(),
         openai_progress.clone(),
         Some(JobStore::open(&openai_store_path).unwrap()),
@@ -1112,6 +1114,7 @@ fn translate_args_with_preset(
 ) -> TranslateArgs {
     TranslateArgs {
         input: temp_path("input.epub"),
+        plan: false,
         language: LanguageArgs {
             source: Some("English".to_string()),
             target: "Italian".to_string(),
@@ -1187,6 +1190,181 @@ fn translate_args_with_preset(
         progress_jsonl: None,
         provider_preset,
     }
+}
+
+fn translation_fixture_path(cyberiad: bool) -> PathBuf {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("tests");
+    if cyberiad {
+        return fixtures.join("The_Cyberiad.epub");
+    }
+    fs::read_dir(&fixtures)
+        .expect("translation fixtures should be readable")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("epub")
+                && path.file_name().and_then(|name| name.to_str()) != Some("The_Cyberiad.epub")
+        })
+        .expect("CJK EPUB fixture should exist")
+}
+
+#[test]
+fn explicit_batch_flag_beats_plan_while_unset_fields_are_filled() {
+    let mut args = translate_args_with_preset(None);
+    args.input = translation_fixture_path(false);
+    args.plan = true;
+    args.provider.provider = "mock".to_string();
+    args.provider.model = Some("mock-prefix-target".to_string());
+    args.batch_max_items = Some(64);
+
+    let effective_provider = apply_provider_preset(&args.provider, args.provider_preset);
+    let (settings, application) =
+        orchestration::resolve_settings_and_plan(&args, &effective_provider)
+            .expect("planned settings should resolve");
+    let applied = application.expect("--plan should produce an application");
+
+    assert_eq!(settings.batch.max_items, 64, "explicit flag must win");
+    assert!(
+        settings.batch.target_tokens < TranslationProfile::V1Fast.resolve().batch.target_tokens,
+        "the unset CJK token target should be filled by the plan"
+    );
+    assert!(
+        applied
+            .applied_plan
+            .decisions
+            .iter()
+            .any(|decision| decision.setting == "batch_target_tokens")
+    );
+    assert!(
+        applied
+            .applied_plan
+            .decisions
+            .iter()
+            .all(|decision| decision.setting != "batch_max_items"),
+        "an explicit field must not be attributed to the plan"
+    );
+}
+
+#[test]
+fn translate_without_plan_preserves_resolved_settings_bytes() {
+    let args = translate_args_with_preset(None);
+    let expected =
+        bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&resolve_settings(&args));
+    let effective_provider = apply_provider_preset(&args.provider, args.provider_preset);
+    let (actual, application) =
+        orchestration::resolve_settings_and_plan(&args, &effective_provider)
+            .expect("ordinary settings should resolve");
+    let actual = bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&actual);
+
+    assert!(application.is_none());
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_vec(&bookforge_core::FinalizeCheckpointSnapshot::default()).unwrap(),
+        br#"{"double_check_complete":false}"#,
+        "an absent plan must not change legacy snapshot bytes"
+    );
+}
+
+#[test]
+fn real_cjk_and_latin_translate_preflights_apply_different_settings() {
+    let planned_settings = |input: PathBuf| {
+        let mut args = translate_args_with_preset(None);
+        args.input = input;
+        args.plan = true;
+        args.provider.provider = "mock".to_string();
+        args.provider.model = Some("mock-prefix-target".to_string());
+        let effective_provider = apply_provider_preset(&args.provider, args.provider_preset);
+        let (settings, application) =
+            orchestration::resolve_settings_and_plan(&args, &effective_provider)
+                .expect("real EPUB preflight should succeed");
+        assert!(application.is_some());
+        settings
+    };
+
+    let cjk = planned_settings(translation_fixture_path(false));
+    let latin = planned_settings(translation_fixture_path(true));
+
+    assert!(cjk.batch.target_tokens < latin.batch.target_tokens);
+    assert!(cjk.batch.max_items < latin.batch.max_items);
+}
+
+#[tokio::test]
+async fn applied_plan_decisions_and_reasons_are_persisted_in_run_snapshot() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = temp.path().join("input.epub");
+    let output = temp.path().join("output.epub");
+    let store_path = temp.path().join("jobs.sqlite");
+    build_translation_fixture(&input);
+
+    let mut args = translate_args_with_preset(None);
+    args.input = input.clone();
+    args.out = Some(output.clone());
+    args.plan = true;
+    args.provider.provider = "mock".to_string();
+    args.provider.model = Some("mock-prefix-target".to_string());
+    let effective_provider = apply_provider_preset(&args.provider, args.provider_preset);
+    let (settings, application) =
+        orchestration::resolve_settings_and_plan(&args, &effective_provider)
+            .expect("planned settings should resolve");
+    let config = TranslationConfig {
+        source_language: args.language.source.clone(),
+        target_language: args.language.target.clone(),
+        provider: "mock".to_string(),
+        model: Some("mock-prefix-target".to_string()),
+        concurrency: settings.scheduler.concurrency,
+        max_attempts: settings.scheduler.max_attempts,
+        output,
+    };
+    let progress = Arc::new(RecordingProgressSink::default());
+    orchestration::run_mock_translation_with_store(
+        &input,
+        &config,
+        &effective_provider,
+        &args,
+        &settings,
+        application,
+        &tokio_util::sync::CancellationToken::new(),
+        progress.clone(),
+        Some(JobStore::open(&store_path).unwrap()),
+    )
+    .await
+    .expect("mock translation should finish");
+
+    let job_id = progress
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|event| match event {
+            bookforge_core::ProgressEvent::JobCreated { job_id, .. } => Some(job_id.clone()),
+            _ => None,
+        })
+        .expect("job creation should be reported");
+    let snapshot = JobStore::open(&store_path)
+        .unwrap()
+        .load_job_config_snapshot(&job_id)
+        .unwrap()
+        .expect("run snapshot should exist");
+    let applied = snapshot
+        .finalize
+        .applied_plan
+        .expect("run snapshot should record the applied plan");
+
+    assert_eq!(
+        applied.schema_version,
+        crate::commands::plan::PLAN_SCHEMA_VERSION
+    );
+    assert!(!applied.decisions.is_empty());
+    assert!(
+        applied
+            .decisions
+            .iter()
+            .all(|decision| !decision.reason.trim().is_empty())
+    );
 }
 
 #[test]

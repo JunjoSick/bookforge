@@ -15,6 +15,10 @@ use crate::{LanguageArgs, ProviderArgs as CliProviderArgs, QaMode, progress::UiM
 pub struct TranslateArgs {
     pub input: PathBuf,
 
+    /// Inspect the EPUB and fill unset translation settings from the offline plan.
+    #[arg(long, default_value_t = false)]
+    pub plan: bool,
+
     #[command(flatten)]
     pub language: LanguageArgs,
 

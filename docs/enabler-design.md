@@ -5,8 +5,10 @@ book and the provider, chooses settings, watches the run, and adapts when
 something goes wrong.
 
 This document records both the agreed shape and the deliberately narrow first
-slice. `bookforge plan` now implements the read-only planning half; supervision
-and automatic application remain future work.
+slices. `bookforge plan` implements read-only inspection, and `bookforge
+translate --plan` can now apply its actionable recommendations when a job is
+created. Supervision remains future work; plan application is deliberately
+opt-in.
 
 ## What it is, and deliberately is not
 
@@ -124,6 +126,53 @@ it would contradict the command's read-only boundary. Plans say explicitly that
 no prior evidence was consulted. Reuse needs a genuinely read-only store API or
 an explicit state input before it can be added safely.
 
+### Second slice: opt-in application at job creation
+
+`bookforge translate --plan` consumes the same typed `Plan` used by the
+read-only command. The flag fits the existing command surface: it names the
+already-documented operation, remains a simple opt-in, and avoids a second set
+of planner-specific tuning flags.
+
+Precedence is field-specific and unambiguous:
+
+1. direct setting flags (`--batch-max-items`, `--max-output-tokens`, and so on)
+   always win;
+2. actionable plan recommendations fill only fields without a direct flag;
+3. profile, target-style, and provider-preset resolution supplies the baseline.
+
+The current consumer applies batch target tokens, batch max items, an optional
+batch output bound, the provider output budget, and recognized thinking
+suppression. It does not rewrite recommendations whose disposition is merely
+"keep default" or "omit". Every applied value and its original planner reason
+is captured in the run snapshot at `finalize.applied_plan`, including the plan
+schema version.
+
+Planning runs after the EPUB has been parsed but before provider construction
+and the translation's final segmentation. The planner needs the size
+distribution produced by its default scheduler segmentation; it builds that
+inspection from the in-memory `Book`, then the translation builds final
+segments with the applied settings. This repeats a cheap segmentation pass but
+does not parse the EPUB archive twice and does not contort the normal no-plan
+path.
+
+Application is creation-only. `resume` treats the run snapshot as authoritative
+and never reruns rules that may have changed between BookForge revisions. The
+cache namespace hashes segmentation, profile, whether batching is enabled,
+prompt version, and prompt-input fingerprints; it does not hash the applied
+batch target/item bounds, output budgets, or thinking suppression. The current
+plan is therefore cache-namespace-safe, but rerunning it mid-job would still
+make one book use two planner revisions without an operator decision.
+
+`reconfigure` composes on top: its supported cache-safe settings supersede the
+captured baseline for remaining work and are merged durably into the snapshot.
+The initial plan rationale remains present, so a later reader can distinguish
+why the job started with a value from a deliberate runtime change.
+
+The flag should become default-on only after a versioned rule set has been
+validated across substantially more books, scripts, providers, and models, and
+shows repeatable improvement in blocks recovered, failed requests, or cost per
+1,000 source characters without regressions on existing workloads.
+
 ### Supervision, during the run
 
 A failure-signature table, built from signatures already observed:
@@ -179,15 +228,13 @@ architecture should persuade us otherwise.
 
 ## Remaining open questions
 
-- **Should planning become an integrated pre-flight?** The first slice is the
-  separate `bookforge plan` command. An integrated pre-flight may better serve a
-  user who never runs it, but must preserve the same inspectable decisions.
-- **Should a later slice apply recommendations?** The first slice only advises.
-  Applying settings automatically would need to record every decision and its
-  reason in the run snapshot, matching how `reconfigure` already works.
 - **How much does persistence remember?** Per book, per book-and-provider, or a
   global learned profile. Global learning across unrelated books is the kind of
   thing that looks clever and is impossible to debug.
+- **When has opt-in earned default-on?** The minimum evidence is broader,
+  versioned validation across scripts/providers/models with completion and cost
+  gains and no material regressions; three books and one-day-old rules are not
+  enough.
 
 ## Not in scope
 
