@@ -379,6 +379,35 @@ Review the conversion report before translating. It records text coverage,
 layout decisions, preserved media, and low-confidence pages. See
 [EPUB_PIPELINE.md](EPUB_PIPELINE.md) for pipeline details.
 
+PDF conversion keeps the historical single-spine-section output unless an
+explicit chapter prefix is supplied:
+
+```bash
+bookforge convert book.pdf --out book.epub --chapter-prefix "CHAPTER "
+```
+
+`--chapter-prefix <TEXT>` starts a new EPUB chapter before each reconstructed
+text-bearing block whose whitespace-normalized visible text begins with the
+literal prefix, compared case-insensitively. It checks complete block text, not
+raw Poppler lines or a fixed character window, so a chapter label reconstructed
+as a paragraph can still form a boundary. Content before the first match is
+retained as its own front-matter chapter. No matches preserve the legacy
+single-chapter EPUB byte for byte.
+
+To prevent a broad prefix from producing thousands of tiny spine items, the
+split falls back to the legacy single chapter when it finds more than 256
+matches or fewer than two text blocks per match on average. The conversion
+report records a warning when that guard fires.
+
+A literal prefix cannot express headings that vary in their leading text, which
+is a real limit for some languages: Chinese chapter labels such as 第一章 and
+第二章 share only 第, and 第 alone also begins ordinary words, so it over-matches
+into the guard rather than splitting usefully. A regular-expression form would
+cover those cases, but `regex` is currently a dev-dependency only, so making it
+a runtime dependency would add roughly a megabyte to the shipped single binary.
+The prefix is the cheap form that covers Latin-script books; the trade is
+recorded here so it can be revisited deliberately.
+
 `reflow` is an explicit preprocessing command for broken paragraph flow; normal
 EPUB reading does not silently rewrite the source.
 
