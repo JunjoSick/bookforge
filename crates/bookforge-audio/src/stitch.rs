@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::builder::{AudiobookManifest, ChunkRecord};
 use crate::text::ChunkKind;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct StitchOptions {
@@ -22,6 +23,9 @@ pub struct StitchOptions {
     pub loudnorm: bool,
     pub make_single: bool,
     pub author: Option<String>,
+    /// Optional source-cover image to attach to the M4B. Cover failures are
+    /// non-fatal: assembly is retried without artwork.
+    pub cover_path: Option<PathBuf>,
 }
 
 impl Default for StitchOptions {
@@ -37,6 +41,7 @@ impl Default for StitchOptions {
             loudnorm: false,
             make_single: false,
             author: None,
+            cover_path: None,
         }
     }
 }
@@ -157,7 +162,12 @@ pub fn stitch(manifest: &AudiobookManifest, options: &StitchOptions) -> StitchRe
     } else {
         if options.make_m4b {
             match assemble_m4b(options, &chapters, &report.chapter_files, &gaps) {
-                Ok(path) => report.book_file = Some(path),
+                Ok((path, cover_warning)) => {
+                    report.book_file = Some(path);
+                    if let Some(warning) = cover_warning {
+                        report.warnings.push(warning);
+                    }
+                }
                 Err(error) => report.warnings.push(error),
             }
         }
@@ -281,7 +291,7 @@ fn assemble_m4b(
     chapters: &[(usize, Vec<ChunkRecord>)],
     chapter_files: &[PathBuf],
     gaps: &ConcatGaps,
-) -> std::result::Result<PathBuf, String> {
+) -> std::result::Result<(PathBuf, Option<String>), String> {
     if chapter_files.is_empty() {
         return Err("no chapter files were produced; cannot assemble m4b".into());
     }
@@ -332,9 +342,24 @@ fn assemble_m4b(
             list_name.to_string(),
             "-i".to_string(),
             meta_name.to_string(),
+        ];
+        if let Some(cover_path) = &options.cover_path {
+            args.extend(["-i".to_string(), cover_path.to_string_lossy().into_owned()]);
+        }
+        args.extend([
             "-map_metadata".to_string(),
             "1".to_string(),
-        ];
+            "-map_chapters".to_string(),
+            "1".to_string(),
+        ]);
+        if options.cover_path.is_some() {
+            args.extend([
+                "-map".to_string(),
+                "0:a:0".to_string(),
+                "-map".to_string(),
+                "2:v:0".to_string(),
+            ]);
+        }
         if options.loudnorm {
             args.extend(["-af".to_string(), "loudnorm=I=-18:TP=-2:LRA=11".to_string()]);
         }
@@ -344,6 +369,14 @@ fn assemble_m4b(
             "-b:a".to_string(),
             "128k".to_string(),
         ]);
+        if options.cover_path.is_some() {
+            args.extend([
+                "-c:v".to_string(),
+                "copy".to_string(),
+                "-disposition:v:0".to_string(),
+                "attached_pic".to_string(),
+            ]);
+        }
         append_metadata_args(
             &mut args,
             options.title.as_deref(),
@@ -354,8 +387,21 @@ fn assemble_m4b(
         args.push(file_name_of(&staged));
         let mut command = Command::new("ffmpeg");
         command.current_dir(&options.out_dir).args(&args);
-        run_ffmpeg_transactional(&mut command, &staged, &output_path, "ffmpeg m4b assembly")
-            .map(|()| output_path)
+        match run_ffmpeg_transactional(&mut command, &staged, &output_path, "ffmpeg m4b assembly") {
+            Ok(()) => Ok((output_path, None)),
+            Err(cover_error) if options.cover_path.is_some() => {
+                let mut fallback_options = options.clone();
+                fallback_options.cover_path = None;
+                let (path, _) = assemble_m4b(&fallback_options, chapters, chapter_files, gaps)?;
+                Ok((
+                    path,
+                    Some(format!(
+                        "cover art could not be embedded; produced the m4b without it ({cover_error})"
+                    )),
+                ))
+            }
+            Err(error) => Err(error),
+        }
     })();
     let _ = std::fs::remove_file(options.out_dir.join(list_name));
     let _ = std::fs::remove_file(options.out_dir.join(meta_name));
@@ -772,12 +818,28 @@ pub fn sanitize_filename(title: &str) -> String {
         out = out.replace("--", "-");
     }
     let trimmed = out.trim_matches('-').to_string();
-    let trimmed = if trimmed.is_empty() {
-        "untitled".to_string()
+    let trimmed = if trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .count()
+        < 3
+    {
+        ascii_fallback_filename(title)
     } else {
         trimmed
     };
     trimmed.chars().take(40).collect::<String>().to_lowercase()
+}
+
+fn ascii_fallback_filename(title: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(title.as_bytes());
+    let mut fallback = String::from("untitled-");
+    for byte in &digest[..4] {
+        fallback.push(char::from(HEX[usize::from(byte >> 4)]));
+        fallback.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    fallback
 }
 
 #[cfg(test)]
@@ -924,8 +986,183 @@ mod tests {
             sanitize_filename("Chapter 1: The Beginning!"),
             "chapter-1-the-beginning"
         );
-        assert_eq!(sanitize_filename("***"), "untitled");
+        assert!(sanitize_filename("***").starts_with("untitled-"));
         assert_eq!(sanitize_filename("  spaced  out  "), "spaced-out");
+    }
+
+    #[test]
+    fn sanitize_filename_is_ascii_nonempty_and_stable_across_scripts() {
+        for title in [
+            "Perché l'Italia",
+            "Преступление и наказание",
+            "Über Größe",
+            "矛盾论",
+        ] {
+            let first = sanitize_filename(title);
+            let second = sanitize_filename(title);
+            assert_eq!(first, second, "{title}");
+            assert!(first.is_ascii(), "{title}: {first}");
+            assert!(!first.is_empty(), "{title}");
+            assert!(
+                first
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphanumeric())
+                    .count()
+                    >= 3,
+                "{title}: {first}"
+            );
+        }
+    }
+
+    fn completed_manifest() -> AudiobookManifest {
+        AudiobookManifest {
+            schema_version: 3,
+            title: Some("Fixture Book".to_string()),
+            synthesis_id: "mock".to_string(),
+            voice: "voice".to_string(),
+            format: "wav".to_string(),
+            speed: 1.0,
+            max_chars: 2_000,
+            instructions: None,
+            seed: None,
+            language: None,
+            text_normalization: None,
+            gaps: crate::builder::GapSettings::default(),
+            author: Some("Fixture Author".to_string()),
+            chapters: 1,
+            chunks: vec![chunk(0, 1, ChunkKind::Body)],
+            completed_chunks: 1,
+            status: crate::builder::AudiobookStatus::Succeeded,
+            updated_at_ms: 0,
+            error: None,
+        }
+    }
+
+    fn generate_audio_fixture(dir: &Path) {
+        let status = Command::new("ffmpeg")
+            .current_dir(dir)
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.2",
+                "-c:a",
+                "pcm_s16le",
+                "c0-p1.wav",
+            ])
+            .status()
+            .expect("ffmpeg should launch");
+        assert!(status.success());
+    }
+
+    fn stitch_fixture(dir: &Path, cover_path: Option<PathBuf>) -> StitchReport {
+        stitch(
+            &completed_manifest(),
+            &StitchOptions {
+                out_dir: dir.to_path_buf(),
+                extension: "wav".to_string(),
+                make_m4b: true,
+                title: Some("Fixture Book".to_string()),
+                gap_chapter_ms: 0,
+                gap_title_ms: 0,
+                gap_paragraph_ms: 0,
+                author: Some("Fixture Author".to_string()),
+                cover_path,
+                ..StitchOptions::default()
+            },
+        )
+    }
+
+    fn probe_streams(path: &Path) -> serde_json::Value {
+        let output = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=index,codec_name,codec_type:stream_disposition=attached_pic",
+                "-of",
+                "json",
+            ])
+            .arg(path)
+            .output()
+            .expect("ffprobe should launch");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("ffprobe should emit JSON")
+    }
+
+    #[test]
+    fn real_m4b_embeds_cover_as_attached_picture() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        generate_audio_fixture(dir.path());
+        let cover = dir.path().join("cover.png");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=navy:s=64x64",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&cover)
+            .status()
+            .expect("ffmpeg should generate the cover fixture");
+        assert!(status.success());
+
+        let report = stitch_fixture(dir.path(), Some(cover));
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let book = report.book_file.expect("m4b should be produced");
+        let probe = probe_streams(&book);
+        let streams = probe["streams"].as_array().unwrap();
+        assert!(streams.iter().any(|stream| stream["codec_type"] == "audio"));
+        assert!(streams.iter().any(|stream| {
+            stream["codec_type"] == "video" && stream["disposition"]["attached_pic"] == 1
+        }));
+    }
+
+    #[test]
+    fn missing_or_unusable_cover_still_produces_valid_m4b() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            return;
+        }
+        for cover_fixture in [None, Some("missing"), Some("unusable")] {
+            let dir = tempfile::tempdir().unwrap();
+            generate_audio_fixture(dir.path());
+            let cover_path = cover_fixture.map(|fixture| {
+                let path = dir.path().join(format!("{fixture}.image"));
+                if fixture == "unusable" {
+                    std::fs::write(&path, b"this is not an image").unwrap();
+                }
+                path
+            });
+            let expected_warning = cover_path.is_some();
+            let report = stitch_fixture(dir.path(), cover_path);
+            let book = report.book_file.expect("fallback m4b should be produced");
+            let probe = probe_streams(&book);
+            let streams = probe["streams"].as_array().unwrap();
+            assert!(streams.iter().any(|stream| stream["codec_type"] == "audio"));
+            assert!(!streams.iter().any(|stream| stream["codec_type"] == "video"));
+            assert_eq!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("cover art could not be embedded")),
+                expected_warning
+            );
+        }
     }
 
     #[test]
