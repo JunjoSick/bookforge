@@ -219,10 +219,11 @@ Important measurement rules:
   self-refutations, and it deliberately keeps some fully dismissive
   explanations that happen to use a contrast word. Those are false negatives;
   the rule is biased against silently dropping a genuine mixed complaint.
-- Counts and defects per 1,000 source words are reported for every category.
+- Counts and defects per 1,000 Unicode source characters are reported for every category.
   The three hard categories and three soft categories are also reported as
-  separate groups. There is intentionally no combined headline score.
-- Unparseable output is recorded once and excluded from the word/rate
+  separate groups. Character exposure is deterministic for both spaced and
+  caseless scripts; there is intentionally no combined headline score.
+- Unparseable output is recorded once and excluded from the character/rate
   denominator. It is never sent to a repair model. Request failures are also
   recorded rather than converted into zero-defect passages.
 - The default judge output cap is 4,096 tokens. This is intentionally generous:
@@ -238,6 +239,11 @@ Important measurement rules:
 
 ### What this measured, 2026-07-29
 
+> **Legacy unit.** The measurements in this section predate summary schema 2
+> and use whitespace-delimited source words. They are retained as historical
+> context, but their `/1k` rates cannot be compared with current
+> character-normalized output. Re-run the benchmark to establish replacement figures.
+
 First real run. Corpus: `If We Burn`, English→Italian, deepseek-v4-flash,
 133/133 segments complete — chosen deliberately over the larger Lenin jobs,
 which are PDF conversions where ~29% of validator false positives were traced
@@ -245,7 +251,7 @@ to OCR damage in the *source*. Judging those measures the scanner.
 
 25 passages, one seed, two judges:
 
-| | judged | source words | hard/1k | soft/1k |
+| | judged | legacy source words | hard/1k words | soft/1k words |
 | --- | --- | --- | --- | --- |
 | Kimi K3, 4k cap | 15/25 | 2,845 | 4.57 | 4.57 |
 | Kimi K3, 16k cap | 23/25 | 4,348 | 5.06 | 3.91 |
@@ -695,8 +701,8 @@ line, for example:
 Bulk acceptance: accepted=37 skipped-empty=1 skipped-model-rejected=2.
 ```
 
-Compare the `hard` group's `per_1k_source_words` in the two summary files.
-Also require equal `passages_judged` and `source_words_judged` before treating
+Compare the `hard` group's `per_1k_source_chars` in the two summary files.
+Also require equal `passages_judged` and `source_chars_judged` before treating
 the rates as a paired comparison. Use the same judge, output cap, passage size,
 and sample/seed for both jobs; `--sample 0` above removes sampling variance.
 

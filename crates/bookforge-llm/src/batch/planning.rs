@@ -557,11 +557,7 @@ fn mode_target_tokens(base: usize) -> HashMap<BatchMode, usize> {
 }
 
 pub(super) fn token_estimate(text: &str) -> usize {
-    let chars = text.chars().count();
-    if chars == 0 {
-        return 0;
-    }
-    (chars / 4).max(1)
+    bookforge_core::segment::estimate_tokens(text)
 }
 
 fn item_token_estimate(
@@ -859,4 +855,15 @@ fn with_configured_token_estimate(
 ) -> TranslationBatch {
     batch.token_estimate = batch_token_estimate(&batch.items, config);
     batch
+}
+
+#[cfg(test)]
+mod script_estimate_tests {
+    use super::token_estimate;
+
+    #[test]
+    fn caseless_source_text_is_not_divided_by_four() {
+        assert_eq!(token_estimate("矛盾是普遍存在的"), 8);
+        assert_eq!(token_estimate("The quick brown fox."), 5);
+    }
 }
