@@ -87,12 +87,18 @@ Two budgeting traps:
 
 ### Quality — reported, not ranked
 
+> **Legacy unit; rerun required.** These quality results were recorded with
+> `judge_translation` summary schema 1 and normalize by whitespace-delimited
+> source words. Current schema 2 reports defects per 1,000 Unicode source
+> characters so caseless scripts have a valid denominator. The rates below are
+> historical only and are not comparable with new benchmark summaries.
+
 Judged on the passages common to every arm, so exposure is equal. Under
 `deepseek-v4-pro` (38 passages, 4,253 words), ordered by residual hard defects
 after removing wordplay-handling complaints and the judge's own self-refuting
 findings:
 
-| model | residual | hard/1k | soft/1k |
+| model | residual | legacy hard/1k words | legacy soft/1k words |
 | --- | --- | --- | --- |
 | `x-ai/grok-4.5` | 35 | 12.5 | 5.4 |
 | `anthropic/claude-fable-5` | 50 | 13.4 | 1.4 |

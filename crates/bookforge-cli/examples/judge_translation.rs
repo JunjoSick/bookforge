@@ -49,8 +49,8 @@ use sha2::{Digest, Sha256};
 
 /// Prompt changes must invalidate the content-addressed cache.
 const PROMPT_VERSION: &str = "judge_translation/v1";
-const OUTPUT_SCHEMA_VERSION: u32 = 1;
-const SUMMARY_SCHEMA_VERSION: u32 = 1;
+const OUTPUT_SCHEMA_VERSION: u32 = 2;
+const SUMMARY_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_SEED: u64 = 0xB00F_0A6E_2026_0729;
 const MAX_JUDGE_RESPONSE_BYTES: usize = 128 * 1024;
 const EMBEDDED_PRICING: &str = include_str!("../pricing/providers.json");
@@ -74,7 +74,7 @@ const ALL_CATEGORIES: [DefectCategory; 6] = [
     about = "Measure passage-level translation defects (dev-time tooling only)",
     long_about = "Builds contiguous passage-sized units from translated blocks in a throwaway \
                   copy of the BookForge job store, asks a judge to enumerate fixed defect \
-                  categories, and reports defects per 1,000 source words. Start with --dry-run."
+                  categories, and reports defects per 1,000 source characters. Start with --dry-run."
 )]
 struct Args {
     /// Path to the owner's job store. It is copied before JobStore::open.
@@ -264,7 +264,6 @@ struct PassageRecord {
     source_language: String,
     target_language: String,
     source_chars: usize,
-    source_words: usize,
     status: RecordStatus,
     defects: Vec<Defect>,
     raw_defect_count: usize,
@@ -283,7 +282,7 @@ struct PassageRecord {
 struct CategoryMetric {
     category: DefectCategory,
     count: usize,
-    per_1k_source_words: f64,
+    per_1k_source_chars: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -291,7 +290,7 @@ struct CategoryMetric {
 struct GroupMetric {
     group: DefectGroup,
     count: usize,
-    per_1k_source_words: f64,
+    per_1k_source_chars: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -299,7 +298,7 @@ struct GroupMetric {
 struct CategoryDelta {
     category: DefectCategory,
     count_delta: i64,
-    per_1k_source_words_delta: f64,
+    per_1k_source_chars_delta: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -322,7 +321,7 @@ struct QualitySummary {
     passages_available: usize,
     passages_sampled: usize,
     passages_judged: usize,
-    source_words_judged: usize,
+    source_chars_judged: usize,
     unparseable_responses: usize,
     request_errors: usize,
     dropped_defects: usize,
@@ -374,7 +373,6 @@ struct Passage {
     source_text: String,
     translated_text: String,
     source_chars: usize,
-    source_words: usize,
 }
 
 /// Assemble a greedy contiguous run. The next block starts a new passage when
@@ -450,7 +448,6 @@ fn push_passage(passages: &mut Vec<Passage>, blocks: &[EvaluationBlock]) {
             .iter()
             .map(|block| block.source_text.chars().count())
             .sum(),
-        source_words: source_text.split_whitespace().count(),
         source_text,
         translated_text,
     });
@@ -1346,7 +1343,7 @@ fn load_pricing(path: Option<&Path>) -> Result<PricingCatalog> {
 }
 
 fn estimate_tokens(text: &str) -> u64 {
-    text.chars().count().div_ceil(4) as u64
+    bookforge_core::segment::estimate_tokens(text) as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -1484,7 +1481,6 @@ fn passage_record(
         source_language: passage.source_language.clone(),
         target_language: passage.target_language.clone(),
         source_chars: passage.source_chars,
-        source_words: passage.source_words,
         status,
         defects,
         raw_defect_count,
@@ -1515,9 +1511,9 @@ fn build_summary(
         .iter()
         .filter(|record| record.status == RecordStatus::Parsed)
         .collect::<Vec<_>>();
-    let source_words_judged = parsed
+    let source_chars_judged = parsed
         .iter()
-        .map(|record| record.source_words)
+        .map(|record| record.source_chars)
         .sum::<usize>();
     let mut counts = BTreeMap::<DefectCategory, usize>::new();
     for record in &parsed {
@@ -1532,7 +1528,7 @@ fn build_summary(
             CategoryMetric {
                 category: *category,
                 count,
-                per_1k_source_words: rate_per_1k(count, source_words_judged),
+                per_1k_source_chars: rate_per_1k(count, source_chars_judged),
             }
         })
         .collect::<Vec<_>>();
@@ -1547,7 +1543,7 @@ fn build_summary(
             GroupMetric {
                 group: *group,
                 count,
-                per_1k_source_words: rate_per_1k(count, source_words_judged),
+                per_1k_source_chars: rate_per_1k(count, source_chars_judged),
             }
         })
         .collect();
@@ -1575,7 +1571,7 @@ fn build_summary(
         passages_available,
         passages_sampled: run.records.len(),
         passages_judged: parsed.len(),
-        source_words_judged,
+        source_chars_judged,
         unparseable_responses: run
             .records
             .iter()
@@ -1598,11 +1594,11 @@ fn build_summary(
     }
 }
 
-fn rate_per_1k(count: usize, source_words: usize) -> f64 {
-    if source_words == 0 {
+fn rate_per_1k(count: usize, source_chars: usize) -> f64 {
+    if source_chars == 0 {
         0.0
     } else {
-        count as f64 * 1_000.0 / source_words as f64
+        count as f64 * 1_000.0 / source_chars as f64
     }
 }
 
@@ -1621,8 +1617,8 @@ fn compute_baseline_delta(current: &QualitySummary, baseline: &QualitySummary) -
                 category: metric.category,
                 count_delta: metric.count as i64
                     - baseline_metric.map_or(0, |baseline| baseline.count as i64),
-                per_1k_source_words_delta: metric.per_1k_source_words
-                    - baseline_metric.map_or(0.0, |baseline| baseline.per_1k_source_words),
+                per_1k_source_chars_delta: metric.per_1k_source_chars
+                    - baseline_metric.map_or(0.0, |baseline| baseline.per_1k_source_chars),
             }
         })
         .collect();
@@ -1667,7 +1663,7 @@ fn print_human_report(summary: &QualitySummary, corpus: &CorpusStats, owner_db: 
         "passages           : {} available, {} sampled, {} judged",
         summary.passages_available, summary.passages_sampled, summary.passages_judged
     );
-    println!("source words (n)   : {}", summary.source_words_judged);
+    println!("source chars (n)   : {}", summary.source_chars_judged);
     println!(
         "unparseable/errors : {}/{}",
         summary.unparseable_responses, summary.request_errors
@@ -1705,24 +1701,24 @@ fn print_human_report(summary: &QualitySummary, corpus: &CorpusStats, owner_db: 
         corpus.blocks_empty_translation
     );
 
-    println!("\ncategory                    count   defects/1k source words");
+    println!("\ncategory                    count   defects/1k source chars");
     println!("----------------------------------------------------------");
     for metric in &summary.categories {
         println!(
             "{:<27} {:>5} {:>25.3}",
             metric.category.as_str(),
             metric.count,
-            metric.per_1k_source_words
+            metric.per_1k_source_chars
         );
     }
-    println!("\ngroup                       count   defects/1k source words");
+    println!("\ngroup                       count   defects/1k source chars");
     println!("----------------------------------------------------------");
     for metric in &summary.groups {
         println!(
             "{:<27} {:>5} {:>25.3}",
             metric.group.as_str(),
             metric.count,
-            metric.per_1k_source_words
+            metric.per_1k_source_chars
         );
     }
     if let Some(delta) = &summary.baseline_delta {
@@ -1737,7 +1733,7 @@ fn print_human_report(summary: &QualitySummary, corpus: &CorpusStats, owner_db: 
                 "{:<27} {:>+11} {:>+12.3}",
                 row.category.as_str(),
                 row.count_delta,
-                row.per_1k_source_words_delta
+                row.per_1k_source_chars_delta
             );
         }
     }
@@ -1755,11 +1751,11 @@ fn print_dry_run(
         let prompt = render_prompt(passage);
         input_tokens += estimate_tokens(&prompt.system) + estimate_tokens(&prompt.user);
         println!(
-            "----- {} / {} [{} blocks, {} source words] -----",
+            "----- {} / {} [{} blocks, {} source chars] -----",
             passage.job_id,
             passage.passage_id,
             passage.block_ids.len(),
-            passage.source_words
+            passage.source_chars
         );
         println!("--- system prompt ---");
         println!("{}", prompt.system);
@@ -1949,13 +1945,12 @@ mod tests {
             source_language: "English".to_string(),
             target_language: "Italian".to_string(),
             source_chars: source.chars().count(),
-            source_words: source.split_whitespace().count(),
             source_text: source,
             translated_text: format!("traduzione numero {index}"),
         }
     }
 
-    fn parsed_record(words: usize, defects: Vec<Defect>) -> PassageRecord {
+    fn parsed_record(source_chars: usize, defects: Vec<Defect>) -> PassageRecord {
         PassageRecord {
             schema_version: OUTPUT_SCHEMA_VERSION,
             prompt_version: PROMPT_VERSION.to_string(),
@@ -1969,8 +1964,7 @@ mod tests {
             block_ids: Vec::new(),
             source_language: "English".to_string(),
             target_language: "Italian".to_string(),
-            source_chars: 0,
-            source_words: words,
+            source_chars,
             status: RecordStatus::Parsed,
             defects,
             raw_defect_count: 0,
@@ -2119,7 +2113,10 @@ mod tests {
         let mut record = parsed_record(10, Vec::new());
         record.seed = 123_456;
         let json = serde_json::to_value(&record).expect("serialize record");
+        assert_eq!(json["schema_version"], 2);
         assert_eq!(json["seed"], 123_456);
+        assert_eq!(json["source_chars"], 10);
+        assert!(json.get("source_words").is_none());
 
         let mut args = test_args();
         args.seed = 123_456;
@@ -2132,11 +2129,15 @@ mod tests {
                 ..RunResult::default()
             },
         );
+        let json = serde_json::to_value(&summary).expect("serialize summary");
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["source_chars_judged"], 10);
+        assert!(json.get("source_words_judged").is_none());
         assert_eq!(summary.seed, 123_456);
     }
 
     #[test]
-    fn rates_use_source_words_and_report_passage_n() {
+    fn rates_use_source_chars_and_report_passage_n() {
         let hard = Defect {
             category: DefectCategory::MeaningChanged,
             source_quote: "a".to_string(),
@@ -2169,13 +2170,13 @@ mod tests {
             .expect("hard group");
 
         assert_eq!(summary.passages_judged, 2);
-        assert_eq!(summary.source_words_judged, 150);
+        assert_eq!(summary.source_chars_judged, 150);
         assert_eq!(summary.dropped_missing_quote, 0);
         assert_eq!(summary.dropped_non_verbatim_quote, 0);
         assert_eq!(summary.dropped_self_refuting, 0);
         assert_eq!(meaning.count, 3);
-        assert!((meaning.per_1k_source_words - 20.0).abs() < f64::EPSILON);
-        assert!((hard_group.per_1k_source_words - 20.0).abs() < f64::EPSILON);
+        assert!((meaning.per_1k_source_chars - 20.0).abs() < f64::EPSILON);
+        assert!((hard_group.per_1k_source_chars - 20.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2209,7 +2210,7 @@ mod tests {
             .clone_from(&CategoryMetric {
                 category: DefectCategory::ContentDropped,
                 count: 5,
-                per_1k_source_words: 2.5,
+                per_1k_source_chars: 2.5,
             });
         let mut baseline = current.clone();
         baseline.seed = 99;
@@ -2222,7 +2223,7 @@ mod tests {
             .clone_from(&CategoryMetric {
                 category: DefectCategory::ContentDropped,
                 count: 2,
-                per_1k_source_words: 1.25,
+                per_1k_source_chars: 1.25,
             });
 
         let delta = compute_baseline_delta(&current, &baseline);
@@ -2234,7 +2235,7 @@ mod tests {
         assert_eq!(delta.baseline_seed, 99);
         assert_eq!(delta.baseline_passages_judged, 3);
         assert_eq!(dropped.count_delta, 3);
-        assert!((dropped.per_1k_source_words_delta - 1.25).abs() < f64::EPSILON);
+        assert!((dropped.per_1k_source_chars_delta - 1.25).abs() < f64::EPSILON);
     }
 
     #[test]
