@@ -624,5 +624,9 @@ bookforge audiobook book.epub --voice alloy --format mp3 --stitch
 ```
 
 See [audiobooks.md](audiobooks.md) for providers, formats, resume hashing,
-pruning, ffmpeg stitching, and M4B assembly.
+pruning, ffmpeg stitching, and M4B assembly. The M4B embeds the EPUB 3
+`cover-image` resource when ffmpeg accepts it, with conservative legacy
+cover-name fallbacks; missing or unusable artwork is non-fatal. Stitched
+chapter names are stable lowercase ASCII slugs, with a deterministic hashed
+fallback when stripping non-ASCII text would leave no useful name.
 
