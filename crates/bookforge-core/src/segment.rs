@@ -24,6 +24,46 @@ pub const SEGMENT_UNIT_NAME: &str = "scheduler_segment";
 /// between marker tokens instead of moving inside the preceding marker.
 pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 4;
 
+const CASED_SCRIPT_CHAR_UNITS_PER_TOKEN: usize = 9;
+const CASED_SCRIPT_CHAR_UNITS_PER_CHAR: usize = 2;
+
+/// Estimate model tokens from the dominant script in `text`.
+///
+/// Unicode case is used as a script-level signal rather than a language name:
+/// alphabetic characters with case (Latin, Cyrillic, Greek, and similar
+/// scripts) use approximately 4.5 characters per token (including spaces),
+/// while predominantly caseless text (Han, Kana, Hangul, Thai, Arabic,
+/// Hebrew, Devanagari, and scripts BookForge has never enumerated) uses one
+/// character per token. Mixed text follows its dominant alphabetic script.
+/// Text without alphabetic evidence keeps the 4.5-character fallback.
+pub fn estimate_tokens(text: &str) -> usize {
+    let mut chars = 0usize;
+    let mut cased = 0usize;
+    let mut caseless = 0usize;
+
+    for ch in text.chars() {
+        chars += 1;
+        if ch.is_alphabetic() {
+            if ch.is_lowercase() || ch.is_uppercase() {
+                cased += 1;
+            } else {
+                caseless += 1;
+            }
+        }
+    }
+
+    if chars == 0 {
+        return 0;
+    }
+    if caseless > cased {
+        chars
+    } else {
+        chars
+            .saturating_mul(CASED_SCRIPT_CHAR_UNITS_PER_CHAR)
+            .div_ceil(CASED_SCRIPT_CHAR_UNITS_PER_TOKEN)
+    }
+}
+
 /// Compute a cache namespace that scopes lookups to a single set of
 /// schema and segmentation parameters. Cached rows from a different
 /// namespace are not eligible for reuse.
@@ -261,7 +301,7 @@ pub fn build_segments(book: &Book, config: &SegmentationConfig) -> Result<Vec<Se
             if matches!(block.kind, BlockKind::Code | BlockKind::PageFurniture) {
                 continue;
             }
-            let block_tokens = block.token_estimate.max(1);
+            let block_tokens = estimate_tokens(&block_text(block)).max(1);
             let should_flush = !current.is_empty()
                 && current_tokens + block_tokens > config.max_segment_tokens
                 && !should_keep_with_previous(&current, block);
@@ -374,7 +414,7 @@ fn push_segment(
 
     let token_estimate = blocks
         .iter()
-        .map(|block| block.token_estimate.max(1))
+        .map(|block| estimate_tokens(&block_text(block)).max(1))
         .sum::<usize>();
 
     let metadata = SegmentMetadata {
@@ -432,7 +472,8 @@ fn should_keep_with_previous(current: &[&Block], next: &Block) -> bool {
         return false;
     };
 
-    matches!(previous.kind, crate::ir::BlockKind::Heading(_)) && next.token_estimate <= 80
+    matches!(previous.kind, crate::ir::BlockKind::Heading(_))
+        && estimate_tokens(&block_text(next)) <= 80
 }
 
 fn block_text(block: &Block) -> String {
@@ -474,6 +515,44 @@ mod tests {
         BlockKind, BookFormat, BookId, DomPath, Metadata, ProtectedSpanKind, Resource, Section,
         SpineItem, TextRun,
     };
+
+    #[test]
+    fn token_estimate_is_derived_from_the_dominant_script() {
+        assert_eq!(estimate_tokens("abcdefgh"), 2);
+        assert_eq!(estimate_tokens("矛盾是普遍存在的"), 8);
+        assert_eq!(
+            estimate_tokens("Project Gutenberg 矛盾是普遍存在的实践是检验真理的标准"),
+            36
+        );
+        assert_eq!(estimate_tokens("1234"), 1);
+        assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn segmentation_recomputes_stale_block_token_estimates() {
+        let mut book = book_with_two_sections();
+        book.blocks[1].text_runs[0].text = "矛盾是普遍存在的".to_string();
+        book.blocks[1].token_estimate = 1;
+        book.blocks[2].text_runs[0].text = "实践是检验真理的标准".to_string();
+        book.blocks[2].token_estimate = 1;
+
+        let segments = build_segments(
+            &book,
+            &SegmentationConfig {
+                max_segment_tokens: 12,
+                context_tokens: 0,
+            },
+        )
+        .expect("segments should build");
+
+        let section_a = segments
+            .iter()
+            .filter(|segment| segment.section_id.0 == "sec_000000")
+            .collect::<Vec<_>>();
+        assert_eq!(section_a.len(), 2);
+        assert_eq!(section_a[0].source.token_estimate, 9);
+        assert_eq!(section_a[1].source.token_estimate, 10);
+    }
 
     #[test]
     fn builds_stable_segments_without_crossing_sections() {

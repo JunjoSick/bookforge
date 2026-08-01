@@ -680,7 +680,7 @@ fn extract_plain_source(user_prompt: &str) -> Option<String> {
 }
 
 fn estimate_tokens(text: &str) -> u64 {
-    text.split_whitespace().count().max(1) as u64
+    bookforge_core::segment::estimate_tokens(text).max(1) as u64
 }
 
 fn cached_input_tokens(raw: &Value) -> Option<u64> {
@@ -1413,6 +1413,13 @@ mod tests {
     use super::*;
     use bookforge_core::RetryAfterPolicy;
     use tokio::time::Duration;
+
+    #[test]
+    fn offline_usage_estimate_is_script_aware() {
+        assert_eq!(estimate_tokens("矛盾是普遍存在的"), 8);
+        assert_eq!(estimate_tokens("The quick brown fox."), 5);
+        assert_eq!(estimate_tokens(""), 1);
+    }
 
     fn offline_provider(base_url: &str, model: &str) -> OpenAiCompatibleProvider {
         offline_provider_with_key(base_url, "BOOKFORGE_OFFLINE_TEST_API_KEY", model)
