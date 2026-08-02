@@ -12,7 +12,10 @@ use bookforge_core::math::{is_inline_math_operator, is_strong_inline_math_operat
 
 use crate::{
     Result,
-    epub::write_epub,
+    epub::{
+        ChapterSplitOutcome, MAX_CHAPTER_MATCHES, MIN_TEXT_BLOCKS_PER_MATCH,
+        write_epub_with_chapter_prefix,
+    },
     model::{
         ColumnMode, DocBlock, Fragment, ImageAsset, ImageRegion, LowConfidenceMode, Page, Span,
         normalize_text_key, spans_text,
@@ -56,6 +59,9 @@ pub struct ConvertOptions {
     pub language: String,
     /// dc:title; defaults to the input file stem when empty.
     pub title: String,
+    /// Case-insensitive literal prefix that starts a new EPUB chapter after
+    /// whitespace normalization. `None` preserves the legacy single chapter.
+    pub chapter_prefix: Option<String>,
 }
 
 impl Default for ConvertOptions {
@@ -65,6 +71,7 @@ impl Default for ConvertOptions {
             low_confidence: LowConfidenceMode::Linearize,
             language: "en".to_string(),
             title: String::new(),
+            chapter_prefix: None,
         }
     }
 }
@@ -72,6 +79,8 @@ impl Default for ConvertOptions {
 pub struct ConvertOutcome {
     pub output: PathBuf,
     pub report: ConversionReport,
+    pub chapters: usize,
+    pub blocks_per_chapter: Vec<usize>,
 }
 
 pub fn convert_pdf(
@@ -194,7 +203,26 @@ fn convert_pdf_with_tools(
     } else {
         options.title.clone()
     };
-    write_epub(&output_blocks, &title, &options.language, output)?;
+    let chapter_outcome = write_epub_with_chapter_prefix(
+        &output_blocks,
+        &title,
+        &options.language,
+        output,
+        options.chapter_prefix.as_deref(),
+    )?;
+    let blocks_per_chapter = match chapter_outcome {
+        ChapterSplitOutcome::SingleChapter => vec![output_blocks.len()],
+        ChapterSplitOutcome::Split { blocks_per_chapter } => blocks_per_chapter,
+        ChapterSplitOutcome::Guarded {
+            matches,
+            text_blocks,
+        } => {
+            layout_warnings.push(format!(
+                "chapter prefix matched {matches} of {text_blocks} text blocks; kept the legacy single chapter because the split guard allows at most {MAX_CHAPTER_MATCHES} matches and requires at least {MIN_TEXT_BLOCKS_PER_MATCH} text blocks per match"
+            ));
+            vec![output_blocks.len()]
+        }
+    };
 
     let report = ConversionReport::build(
         &input.to_string_lossy(),
@@ -216,6 +244,8 @@ fn convert_pdf_with_tools(
     Ok(ConvertOutcome {
         output: output.to_path_buf(),
         report,
+        chapters: blocks_per_chapter.len(),
+        blocks_per_chapter,
     })
 }
 
