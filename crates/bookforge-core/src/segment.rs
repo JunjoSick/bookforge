@@ -37,25 +37,18 @@ const CASED_SCRIPT_CHAR_UNITS_PER_CHAR: usize = 2;
 /// character per token. Mixed text follows its dominant alphabetic script.
 /// Text without alphabetic evidence keeps the 4.5-character fallback.
 pub fn estimate_tokens(text: &str) -> usize {
-    let mut chars = 0usize;
-    let mut cased = 0usize;
-    let mut caseless = 0usize;
-
-    for ch in text.chars() {
-        chars += 1;
-        if ch.is_alphabetic() {
-            if ch.is_lowercase() || ch.is_uppercase() {
-                cased += 1;
-            } else {
-                caseless += 1;
-            }
-        }
-    }
-
+    let chars = text.chars().count();
     if chars == 0 {
         return 0;
     }
-    if caseless > cased {
+
+    // Only a dominantly caseless text counts one token per character. A tie,
+    // or text with no alphabetic evidence, takes the cased ratio -- which is
+    // the choice this function has always made. Note that a genuinely mixed
+    // book is therefore estimated low, since half of it is being costed at
+    // roughly 4.5 characters per token; no measurement has yet said whether
+    // that matters in practice.
+    if crate::script::script_class(text) == crate::script::ScriptClass::Caseless {
         chars
     } else {
         chars

@@ -4,6 +4,7 @@ use anyhow::Result;
 use bookforge_core::{
     config::TranslationProfile,
     ir::{Block, BlockKind, Book},
+    script::{ScriptClass, classify, script_counts},
     segment::{build_segments, estimate_tokens},
     style::built_in_sizing_policy_for_target,
 };
@@ -70,24 +71,6 @@ pub struct SourceInspection {
     pub alphabetic_caseless_characters: usize,
     pub sizing_uses_declared_language: bool,
     pub reason: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScriptClass {
-    Cased,
-    Caseless,
-    Undetermined,
-}
-
-impl ScriptClass {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Cased => "cased",
-            Self::Caseless => "caseless",
-            Self::Undetermined => "undetermined",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -248,11 +231,7 @@ pub(crate) fn plan_book(
         .join("\n");
     let source_characters = source_text.chars().count();
     let (cased, caseless) = script_counts(&source_text);
-    let detected_script = match cased.cmp(&caseless) {
-        std::cmp::Ordering::Greater => ScriptClass::Cased,
-        std::cmp::Ordering::Less => ScriptClass::Caseless,
-        std::cmp::Ordering::Equal => ScriptClass::Undetermined,
-    };
+    let detected_script = classify((cased, caseless));
 
     let block_tokens = translatable_blocks
         .iter()
@@ -636,18 +615,6 @@ fn block_text(block: &Block) -> String {
         .map(|run| run.text.as_str())
         .collect::<Vec<_>>()
         .join("")
-}
-
-fn script_counts(text: &str) -> (usize, usize) {
-    text.chars()
-        .filter(|ch| ch.is_alphabetic())
-        .fold((0, 0), |(cased, caseless), ch| {
-            if ch.is_lowercase() || ch.is_uppercase() {
-                (cased + 1, caseless)
-            } else {
-                (cased, caseless + 1)
-            }
-        })
 }
 
 fn source_density_guard(source_characters: usize, source_tokens: usize) -> usize {
