@@ -124,8 +124,7 @@ estimated default-batch output tail; provider output and thinking controls; and
 the translate flags that follow from those findings. `--source` is recorded for
 the operator but does not affect sizing: script is measured from the EPUB text.
 
-Use `--json` for schema-versioned, stable output suitable for a future
-`translate` consumer:
+Use `--json` for schema-versioned, stable output suitable for tooling:
 
 ```bash
 bookforge plan book.epub --target Italian --provider deepseek --json
@@ -138,6 +137,45 @@ evidence was applied. Concurrency therefore stays at the `v1-fast` default with
 adaptive concurrency enabled until an actual run supplies latency or 429
 evidence. Glossary injection is off by default because its measured A/B found no
 detectable quality effect.
+
+Planning remains opt-in for translation. Add `--plan` to inspect the EPUB
+offline, apply the actionable recommendations, and then start the job:
+
+```bash
+bookforge translate book.epub \
+  --plan \
+  --source Chinese \
+  --target Italian \
+  --provider deepseek
+```
+
+The precedence is direct setting flag, then plan, then the resolved profile,
+target-policy, and provider-preset defaults. For example, an explicit
+`--batch-max-items 64` is never replaced; the plan may still fill an unset
+`--batch-target-tokens`. The current application surface covers batch target
+tokens, batch max items, the optional batch output bound, the provider output
+budget, and supported thinking suppression. Recommendations that merely keep a
+default, such as offline concurrency, are not rewritten.
+
+The EPUB archive is parsed once. Planning inspects that in-memory book and
+constructs the default scheduler segments needed for its size distribution;
+translation then constructs its final segments from the applied settings. Each
+applied setting, typed value, and planner reason is stored in the run snapshot
+under `finalize.applied_plan`. Without `--plan`, no planning inspection runs and
+the existing resolved settings and translation path are unchanged.
+
+`resume` does not accept or rerun the plan. It uses the settings captured when
+the job was created, so a planner rule change after a software update cannot
+silently change only the unfinished part of a book. The current cache namespace
+does not include batch target/items, output budgets, or thinking suppression,
+so those knobs are cache-safe; `reconfigure` may supersede its supported batch
+and scheduler settings for remaining work, and its durable merged settings
+compose with (without erasing) the original plan rationale.
+
+Making planning default-on requires broader evidence: a versioned rule set
+validated across substantially more books, scripts, providers, and models, with
+repeatable gains in blocks recovered, failed requests, or cost per 1,000 source
+characters and no material regression on existing runs.
 
 The coverage report from `inspect` calls out visible text that BookForge would
 not send for translation.

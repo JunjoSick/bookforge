@@ -136,6 +136,24 @@ pub struct FallbackRunConfigSnapshot {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct FinalizeCheckpointSnapshot {
     pub double_check_complete: bool,
+    /// The offline plan applied when this job was created. This stays beside
+    /// the other durable run-evolution metadata so later reconfiguration can
+    /// replace resolved settings without erasing the original rationale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_plan: Option<AppliedPlanSnapshot>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AppliedPlanSnapshot {
+    pub schema_version: u32,
+    pub decisions: Vec<AppliedPlanDecisionSnapshot>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AppliedPlanDecisionSnapshot {
+    pub setting: String,
+    pub value: serde_json::Value,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

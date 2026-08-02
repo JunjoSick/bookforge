@@ -12,7 +12,7 @@ use bookforge_llm::{BatchMode, TranslationBatch, build_translation_batches};
 use clap::Args;
 use serde::Serialize;
 
-const PLAN_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PLAN_SCHEMA_VERSION: u32 = 1;
 // The smallest measured oversized-response failures needed about 9,000 output
 // tokens. Use the power-of-two boundary immediately below that observed cliff.
 const SAFE_RESPONSE_TOKENS: u32 = 8_192;
@@ -212,7 +212,10 @@ fn create_plan(
     )?)
 }
 
-fn plan_book(
+/// Build the same deterministic, offline plan used by the `plan` command from
+/// an EPUB that has already been parsed. Integrated callers can therefore
+/// reuse the in-memory book instead of parsing the archive a second time.
+pub(crate) fn plan_book(
     book: &Book,
     input: &Path,
     declared_source: Option<&str>,

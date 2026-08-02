@@ -1,8 +1,12 @@
-use bookforge_core::config::{DoubleCheckMode, ResolvedRunSettings, TranslationProfile};
+use bookforge_core::{
+    config::{DoubleCheckMode, ResolvedRunSettings, TranslationProfile},
+    run_snapshot::{AppliedPlanDecisionSnapshot, AppliedPlanSnapshot},
+};
 
 use crate::ProviderArgs as CliProviderArgs;
 
 use super::TranslateArgs;
+use crate::commands::plan::{Disposition, Plan};
 
 pub fn apply_provider_preset(
     explicit: &CliProviderArgs,
@@ -131,6 +135,96 @@ pub fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
     }
 
     settings
+}
+
+/// Apply the actionable parts of an offline plan after profile, target-policy,
+/// and provider-preset defaults have resolved. Direct setting flags are tested
+/// field by field and always retain precedence.
+pub fn apply_plan_recommendations(
+    args: &TranslateArgs,
+    settings: &mut ResolvedRunSettings,
+    plan: &Plan,
+) -> AppliedPlanSnapshot {
+    let recommendations = &plan.recommendations;
+    let mut decisions = Vec::new();
+
+    if args.batch_target_tokens.is_none()
+        && recommendations.batch_target_tokens.disposition == Disposition::Set
+        && settings.batch.target_tokens != recommendations.batch_target_tokens.value
+    {
+        settings.batch.target_tokens = recommendations.batch_target_tokens.value;
+        push_plan_decision(
+            &mut decisions,
+            "batch_target_tokens",
+            recommendations.batch_target_tokens.value,
+            &recommendations.batch_target_tokens.reason,
+        );
+    }
+    if args.batch_max_items.is_none()
+        && recommendations.batch_max_items.disposition == Disposition::Set
+        && settings.batch.max_items != recommendations.batch_max_items.value
+    {
+        settings.batch.max_items = recommendations.batch_max_items.value;
+        push_plan_decision(
+            &mut decisions,
+            "batch_max_items",
+            recommendations.batch_max_items.value,
+            &recommendations.batch_max_items.reason,
+        );
+    }
+    if args.batch_max_output_tokens.is_none()
+        && let Some(value) = recommendations.batch_max_output_tokens.value
+        && settings.provider.batch_max_output_tokens != Some(value)
+    {
+        settings.provider.batch_max_output_tokens = Some(value);
+        push_plan_decision(
+            &mut decisions,
+            "batch_max_output_tokens",
+            value,
+            &recommendations.batch_max_output_tokens.reason,
+        );
+    }
+    if args.max_output_tokens.is_none()
+        && settings.provider.max_output_tokens != Some(recommendations.max_output_tokens.value)
+    {
+        settings.provider.max_output_tokens = Some(recommendations.max_output_tokens.value);
+        push_plan_decision(
+            &mut decisions,
+            "max_output_tokens",
+            recommendations.max_output_tokens.value,
+            &recommendations.max_output_tokens.reason,
+        );
+    }
+    if !args.no_thinking
+        && recommendations.no_thinking.value
+        && !settings.provider.thinking_disabled
+    {
+        settings.provider.thinking_disabled = true;
+        push_plan_decision(
+            &mut decisions,
+            "thinking_disabled",
+            true,
+            &recommendations.no_thinking.reason,
+        );
+    }
+
+    AppliedPlanSnapshot {
+        schema_version: plan.schema_version,
+        decisions,
+    }
+}
+
+fn push_plan_decision<T: serde::Serialize>(
+    decisions: &mut Vec<AppliedPlanDecisionSnapshot>,
+    setting: &str,
+    value: T,
+    reason: &str,
+) {
+    decisions.push(AppliedPlanDecisionSnapshot {
+        setting: setting.to_string(),
+        value: serde_json::to_value(value).expect("plan setting values always serialize"),
+        reason: reason.to_string(),
+    });
 }
 
 pub fn retry_amplification_warning(settings: &ResolvedRunSettings) -> Option<String> {
