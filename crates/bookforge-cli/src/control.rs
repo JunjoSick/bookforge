@@ -639,7 +639,11 @@ mod tests {
     use super::*;
     use bookforge_core::{NullProgressSink, TranslationProfile};
 
-    const TEST_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(30);
+    // These waits span synchronous SQLite opens and fsync-heavy lease writes
+    // on a current-thread runtime, which starve badly when the whole suite
+    // runs on a saturated box. The guard exists to catch deadlocks, not load
+    // spikes, so the deadline stays far above any legitimate scheduling delay.
+    const TEST_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(120);
 
     struct RecordingSink {
         events: tokio::sync::mpsc::UnboundedSender<ProgressEvent>,
@@ -825,15 +829,23 @@ mod tests {
             RuntimeLeaseState::Fresh(lease) => lease,
             state => panic!("expected a fresh runtime lease, got {state:?}"),
         };
-        loop {
-            if *heartbeat_updates.borrow_and_update() > first.heartbeat_at_ms {
-                break;
+        // The watcher only refreshes the lease after RUNTIME_HEARTBEAT_INTERVAL
+        // and swallows transient write failures (it retries on the next tick),
+        // so wait for the first observed heartbeat inside the deadlock guard
+        // instead of hanging forever if writes keep failing.
+        tokio::time::timeout(TEST_DEADLOCK_TIMEOUT, async {
+            loop {
+                if *heartbeat_updates.borrow_and_update() > first.heartbeat_at_ms {
+                    break;
+                }
+                heartbeat_updates
+                    .changed()
+                    .await
+                    .expect("watcher should report a newer successful heartbeat write");
             }
-            heartbeat_updates
-                .changed()
-                .await
-                .expect("watcher should report a newer successful heartbeat write");
-        }
+        })
+        .await
+        .expect("watcher should publish a heartbeat within the deadlock guard");
         let refreshed = match runtime_lease_state(&job.id, Duration::from_millis(u64::MAX)) {
             RuntimeLeaseState::Fresh(lease) => lease,
             state => panic!("expected a refreshed runtime lease, got {state:?}"),
@@ -842,10 +854,25 @@ mod tests {
         assert!(refreshed.heartbeat_at_ms > first.heartbeat_at_ms);
 
         drop(watcher);
-        assert_eq!(
-            runtime_lease_state(&job.id, RUNTIME_LEASE_STALE_AFTER),
-            RuntimeLeaseState::Missing
-        );
+        // Drop cancels and aborts the task, but abort cannot interrupt a
+        // synchronous iteration already in progress: under load the task can
+        // still be inside a lease write and perform one final write after
+        // Drop's own removal, before its exit path removes the file again.
+        // Removal-on-drop therefore converges rather than being instantaneous,
+        // so poll briefly instead of asserting immediately.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    runtime_lease_state(&job.id, RUNTIME_LEASE_STALE_AFTER),
+                    RuntimeLeaseState::Missing
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("runtime lease should be removed when the watcher drops");
         let _ = std::fs::remove_dir_all(run_dir);
     }
 

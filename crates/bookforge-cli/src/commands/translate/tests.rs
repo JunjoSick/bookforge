@@ -6,7 +6,12 @@ use bookforge_core::{
         SegmentMetadata, SegmentSource, SegmentTextRun,
     },
 };
-use std::{fs, io::Write, sync::Mutex, time::SystemTime};
+use std::{
+    fs,
+    io::Write,
+    sync::Mutex,
+    time::{Duration, SystemTime},
+};
 
 #[derive(Default)]
 struct RecordingProgressSink {
@@ -17,6 +22,24 @@ impl bookforge_core::ProgressSink for RecordingProgressSink {
     fn emit(&self, event: bookforge_core::ProgressEvent) {
         self.events.lock().unwrap().push(event);
     }
+}
+
+const OPENAI_SCENARIO_ATTEMPTS: usize = 5;
+const OPENAI_SCENARIO_SETTLE_DELAY: Duration = Duration::from_millis(150);
+
+/// Windows loopback connections are intermittently reset under heavy thread
+/// churn (observed ~10% of fresh connections on a 12-core box under CPU
+/// saturation, independent of harness behavior). These resets are
+/// environmental, so transport-level failures get whole-scenario retries
+/// before the test treats them as a real regression.
+fn is_transient_transport_error(error: &anyhow::Error) -> bool {
+    let detail = format!("{error:#}").to_ascii_lowercase();
+    detail.contains("connection reset")
+        || detail.contains("forcibly closed")
+        || detail.contains("10054")
+        || detail.contains("broken pipe")
+        || detail.contains("10038")
+        || detail.contains("error decoding response body")
 }
 
 #[test]
@@ -166,9 +189,7 @@ async fn mock_and_openai_entry_points_share_events_and_artifacts() {
     let input = temp.path().join("input.epub");
     build_translation_fixture(&input);
     let mock_output = temp.path().join("mock.epub");
-    let openai_output = temp.path().join("openai.epub");
     let mock_store_path = temp.path().join("mock.sqlite");
-    let openai_store_path = temp.path().join("openai.sqlite");
 
     let mut settings = TranslationProfile::V1Fast.resolve();
     settings.batch.enabled = false;
@@ -206,38 +227,66 @@ async fn mock_and_openai_entry_points_share_events_and_artifacts() {
     .await
     .expect("mock entry point should finish");
 
-    let (base_url, server) = spawn_openai_prefix_server().await;
-    let mut openai_args = translate_args_with_preset(None);
-    openai_args.input = input.clone();
-    openai_args.out = Some(openai_output.clone());
-    openai_args.language.target = "English".to_string();
-    openai_args.provider.provider = "openai-compatible".to_string();
-    openai_args.provider.model = Some("test-model".to_string());
-    openai_args.provider.base_url = Some(base_url);
-    openai_args.provider.api_key_env = Some("OLLAMA_API_KEY".to_string());
-    let openai_config = TranslationConfig {
-        source_language: Some("English".to_string()),
-        target_language: "English".to_string(),
-        provider: "openai-compatible".to_string(),
-        model: Some("test-model".to_string()),
-        concurrency: 1,
-        max_attempts: 1,
-        output: openai_output.clone(),
+    // Every attempt owns a fresh server port, store, output EPUB, and event
+    // sink so a retried scenario cannot leak artifacts from a failed attempt
+    // into the assertions below.
+    let mut last_failure = String::from("no OpenAI-compatible scenario output was produced");
+    let mut attempt_outcome = None;
+    for attempt_index in 0..OPENAI_SCENARIO_ATTEMPTS {
+        if attempt_index > 0 {
+            tokio::time::sleep(OPENAI_SCENARIO_SETTLE_DELAY).await;
+        }
+        let openai_store_path = temp.path().join(format!("openai-{attempt_index}.sqlite"));
+        let openai_output = temp.path().join(format!("openai-{attempt_index}.epub"));
+        let openai_progress = Arc::new(RecordingProgressSink::default());
+        let (base_url, server) = spawn_openai_prefix_server().await;
+        let mut openai_args = translate_args_with_preset(None);
+        openai_args.input = input.clone();
+        openai_args.out = Some(openai_output.clone());
+        openai_args.language.target = "English".to_string();
+        openai_args.provider.provider = "openai-compatible".to_string();
+        openai_args.provider.model = Some("test-model".to_string());
+        openai_args.provider.base_url = Some(base_url);
+        openai_args.provider.api_key_env = Some("OLLAMA_API_KEY".to_string());
+        let openai_config = TranslationConfig {
+            source_language: Some("English".to_string()),
+            target_language: "English".to_string(),
+            provider: "openai-compatible".to_string(),
+            model: Some("test-model".to_string()),
+            concurrency: 1,
+            max_attempts: 1,
+            output: openai_output.clone(),
+        };
+        let result = orchestration::run_openai_compatible_translation_with_store(
+            &input,
+            &openai_config,
+            &openai_args.provider,
+            &openai_args,
+            &settings,
+            &tokio_util::sync::CancellationToken::new(),
+            openai_progress.clone(),
+            Some(JobStore::open(&openai_store_path).unwrap()),
+        )
+        .await;
+        server.abort();
+
+        match result {
+            Ok(()) => {
+                attempt_outcome = Some((openai_progress, openai_store_path, openai_output));
+                break;
+            }
+            Err(error) if is_transient_transport_error(&error) => {
+                last_failure =
+                    format!("transient loopback failure on attempt {attempt_index}: {error:#}");
+            }
+            Err(error) => panic!("OpenAI-compatible entry point should finish: {error:#}"),
+        }
+    }
+    let Some((openai_progress, openai_store_path, openai_output)) = attempt_outcome else {
+        panic!(
+            "OpenAI-compatible scenario kept failing on transient transport errors: {last_failure}"
+        );
     };
-    let openai_progress = Arc::new(RecordingProgressSink::default());
-    orchestration::run_openai_compatible_translation_with_store(
-        &input,
-        &openai_config,
-        &openai_args.provider,
-        &openai_args,
-        &settings,
-        &tokio_util::sync::CancellationToken::new(),
-        openai_progress.clone(),
-        Some(JobStore::open(&openai_store_path).unwrap()),
-    )
-    .await
-    .expect("OpenAI-compatible entry point should finish");
-    server.abort();
 
     let openai_job_id = openai_progress
         .events

@@ -484,12 +484,62 @@ pub(crate) fn validate_audio_payload(
 pub(super) mod test_support {
     use std::{
         io::{Read, Write},
-        net::TcpListener,
+        net::{Shutdown, TcpListener},
         sync::mpsc,
         time::Duration,
     };
 
-    pub fn one_request_server(
+    use super::TtsError;
+
+    pub(super) const TRANSPORT_ATTEMPTS: usize = 5;
+    pub(super) const CAPTURE_WINDOW: Duration = Duration::from_secs(30);
+    const RETRY_SETTLE_DELAY: Duration = Duration::from_millis(100);
+
+    pub(super) fn transport_error_detail(error: &TtsError) -> String {
+        let mut detail = error.to_string();
+        let mut source = std::error::Error::source(error);
+        while let Some(error) = source {
+            detail.push_str("; ");
+            detail.push_str(&error.to_string());
+            source = error.source();
+        }
+        detail
+    }
+
+    /// Windows loopback connections are intermittently reset under heavy
+    /// thread churn (observed ~10% of fresh connections on a 12-core box under
+    /// CPU saturation, independent of harness behavior). These resets are
+    /// environmental, so transport-level failures get a few whole-scenario
+    /// retries before the test treats them as a real regression.
+    pub(super) fn is_transient_transport_error(error: &TtsError) -> bool {
+        let detail = transport_error_detail(error).to_ascii_lowercase();
+        detail.contains("connection reset")
+            || detail.contains("forcibly closed")
+            || detail.contains("10054")
+            || detail.contains("broken pipe")
+            || detail.contains("10038")
+    }
+
+    pub(super) async fn retry_transient_transport<T, F, Fut>(mut attempt: F) -> Result<T, TtsError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, TtsError>>,
+    {
+        let mut last = None;
+        for index in 0..TRANSPORT_ATTEMPTS {
+            if index > 0 {
+                tokio::time::sleep(RETRY_SETTLE_DELAY).await;
+            }
+            match attempt().await {
+                Ok(value) => return Ok(value),
+                Err(error) if is_transient_transport_error(&error) => last = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last.expect("a retried transport error must be recorded"))
+    }
+
+    pub(super) fn one_request_server(
         response_body: Vec<u8>,
         content_type: &str,
     ) -> (String, mpsc::Receiver<String>) {
@@ -497,7 +547,7 @@ pub(super) mod test_support {
         one_request_server_with_content_length(response_body, content_type, content_length)
     }
 
-    pub fn one_request_server_with_content_length(
+    pub(super) fn one_request_server_with_content_length(
         response_body: Vec<u8>,
         content_type: &str,
         content_length: u64,
@@ -507,42 +557,48 @@ pub(super) mod test_support {
         let content_type = content_type.to_string();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("mock accept");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("read timeout");
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
             let mut request = Vec::new();
             let mut scratch = [0u8; 4096];
             loop {
-                let read = stream.read(&mut scratch).expect("read request");
-                if read == 0 {
-                    break;
+                match stream.read(&mut scratch) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&scratch[..read]),
                 }
-                request.extend_from_slice(&scratch[..read]);
                 let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
                 else {
                     continue;
                 };
                 let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
-                let content_length = headers
+                let declared = headers
                     .lines()
                     .find_map(|line| line.strip_prefix("content-length:"))
                     .and_then(|value| value.trim().parse::<usize>().ok())
                     .unwrap_or(0);
-                if request.len() >= header_end + 4 + content_length {
+                if request.len() >= header_end + 4 + declared {
                     break;
                 }
             }
+            // Queue the capture before responding so `recv` can never race
+            // the server thread.
+            let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
             );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write headers");
-            stream.write_all(&response_body).expect("write response");
-            sender
-                .send(String::from_utf8_lossy(&request).into_owned())
-                .expect("send captured request");
+            if stream.write_all(response.as_bytes()).is_err()
+                || stream.write_all(&response_body).is_err()
+            {
+                return;
+            }
+            // Close write-side first and drain until the peer finishes so the
+            // socket never closes with unread inbound data (Windows answers
+            // that with RST instead of FIN, which surfaces to clients).
+            let _ = stream.shutdown(Shutdown::Write);
+            let mut drain = [0u8; 4096];
+            while matches!(stream.read(&mut drain), Ok(read) if read > 0) {}
         });
         (format!("http://{address}/v1"), receiver)
     }
@@ -724,8 +780,16 @@ mod tests {
         );
         let client = build_http_client(5).unwrap();
         let cancel_token = CancellationToken::new();
-        let error = match send_with_retry(&cancel_token, 1, MAX_AUDIO_RESPONSE_BODY_BYTES, || {
-            client.get(&base_url)
+        let error = match test_support::retry_transient_transport(|| {
+            let client = client.clone();
+            let cancel_token = cancel_token.clone();
+            let base_url = base_url.clone();
+            async move {
+                send_with_retry(&cancel_token, 1, MAX_AUDIO_RESPONSE_BODY_BYTES, || {
+                    client.get(&base_url)
+                })
+                .await
+            }
         })
         .await
         {

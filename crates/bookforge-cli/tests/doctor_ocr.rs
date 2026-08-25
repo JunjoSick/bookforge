@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::TcpListener,
+    net::{Shutdown, TcpListener},
     sync::mpsc,
     time::Duration,
 };
@@ -20,32 +20,38 @@ fn doctor_lists_models_from_loopback_ocr_endpoint() {
     let address = listener.local_addr().expect("mock OCR address");
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("mock OCR accept");
-        stream
-            .set_read_timeout(Some(TEST_DEADLOCK_TIMEOUT))
-            .expect("read timeout");
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(TEST_DEADLOCK_TIMEOUT));
         let mut request = Vec::new();
         let mut scratch = [0u8; 2048];
         loop {
-            let read = stream.read(&mut scratch).expect("read request");
-            if read == 0 {
-                break;
+            match stream.read(&mut scratch) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => request.extend_from_slice(&scratch[..read]),
             }
-            request.extend_from_slice(&scratch[..read]);
             if request.windows(4).any(|part| part == b"\r\n\r\n") {
                 break;
             }
         }
+        // Queue the capture before responding so `recv` can never race the
+        // server thread.
+        let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
         let body = br#"{"data":[{"id":"baidu/Unlimited-OCR"}]}"#;
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
-        stream.write_all(headers.as_bytes()).expect("write headers");
-        stream.write_all(body).expect("write body");
-        sender
-            .send(String::from_utf8_lossy(&request).into_owned())
-            .expect("send request");
+        if stream.write_all(headers.as_bytes()).is_err() || stream.write_all(body).is_err() {
+            return;
+        }
+        // Close write-side first and drain until the peer finishes so the
+        // socket never closes with unread inbound data (Windows answers that
+        // with RST instead of FIN, which surfaces to clients).
+        let _ = stream.shutdown(Shutdown::Write);
+        let mut drain = [0u8; 2048];
+        while matches!(stream.read(&mut drain), Ok(read) if read > 0) {}
     });
 
     bookforge()
