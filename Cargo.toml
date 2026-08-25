@@ -32,7 +32,11 @@ indicatif = "0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 quick-xml = { version = "0.41", features = ["escape-html"] }
-zip = "8.6"
+# Trimmed to deflate only: EPUBs need Deflated + Stored (built-in), so avoid
+# pulling every codec (bzip2/zstd/lzma/aes-crypto chains incl. zstd-sys's C
+# build) and zip's optional `time`. The zlib-rs backend keeps flate2 pure-Rust
+# (no C toolchain) and matches the backend the old default features already used.
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # Held below 0.40 deliberately: 0.40 pulls a libsqlite3-sys that uses the
 # `cfg_select!` macro, which does not exist in our MSRV (see docs/msrv-audit.md
 # for why the floor is 1.88 and what it buys). Raising past 0.39 means raising

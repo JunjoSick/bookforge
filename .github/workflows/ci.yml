@@ -8,6 +8,11 @@ on:
     - cron: "23 3 * * *"
   workflow_dispatch:
 
+# Least privilege: every job here only reads the repo; none needs elevated
+# tokens (checkouts run with persist-credentials: false).
+permissions:
+  contents: read
+
 # Cancel in-flight runs on the same ref when a new commit lands.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -22,10 +27,10 @@ jobs:
     name: fmt
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt
       - run: cargo fmt --all --check
@@ -34,13 +39,13 @@ jobs:
     name: clippy
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Pre-existing too_many_arguments warnings are tolerated; everything else fails the job.
       - run: cargo clippy --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
 
@@ -48,11 +53,11 @@ jobs:
     name: test
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Lifecycle tests create synthetic EPUB fixtures and run in clean clones.
       - run: cargo test --workspace --locked
 
@@ -60,11 +65,11 @@ jobs:
     name: test (windows-msvc)
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: windows-msvc
       - run: cargo test --workspace --locked
@@ -73,13 +78,13 @@ jobs:
     name: msrv (1.88.0)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: msrv-1.88
       # Verifies the rust-version pin in Cargo.toml. If this job fails, either
@@ -92,24 +97,26 @@ jobs:
     if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: "17"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install EPUBCheck 5.3.0
         run: |
           mkdir -p .tools
           curl --fail --location --retry 3 \
             --output .tools/epubcheck.zip \
             https://github.com/w3c/epubcheck/releases/download/v5.3.0/epubcheck-5.3.0.zip
+          # Pinned release; sha256 verified (computed from the official w3c/epubcheck v5.3.0 asset).
+          echo "6c07e68584b2e2ce2f89fe06e1246dfead3eb36b46b340e7d93524f29dcff6c5  .tools/epubcheck.zip" | sha256sum --check --strict -
           unzip -q .tools/epubcheck.zip -d .tools
           echo "BOOKFORGE_EPUBCHECK=$GITHUB_WORKSPACE/.tools/epubcheck-5.3.0/epubcheck.jar" >> "$GITHUB_ENV"
       - run: bash scripts/corpus-fetch.sh small
@@ -120,24 +127,26 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: "17"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install EPUBCheck 5.3.0
         run: |
           mkdir -p .tools
           curl --fail --location --retry 3 \
             --output .tools/epubcheck.zip \
             https://github.com/w3c/epubcheck/releases/download/v5.3.0/epubcheck-5.3.0.zip
+          # Pinned release; sha256 verified (computed from the official w3c/epubcheck v5.3.0 asset).
+          echo "6c07e68584b2e2ce2f89fe06e1246dfead3eb36b46b340e7d93524f29dcff6c5  .tools/epubcheck.zip" | sha256sum --check --strict -
           unzip -q .tools/epubcheck.zip -d .tools
           echo "BOOKFORGE_EPUBCHECK=$GITHUB_WORKSPACE/.tools/epubcheck-5.3.0/epubcheck.jar" >> "$GITHUB_ENV"
       - run: bash scripts/corpus-fetch.sh large

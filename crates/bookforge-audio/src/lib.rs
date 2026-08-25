@@ -12,7 +12,7 @@
 //!   mock.
 //! - [`builder`] orchestrates book -> chunks -> audio files with bounded
 //!   concurrency, atomic writes, file-based resume, and a JSON manifest.
-//! - [`stitch`] optionally joins the files per chapter and into an `.m4b`
+//! - `stitch` optionally joins the files per chapter and into an `.m4b`
 //!   via `ffmpeg`, degrading gracefully when it is absent.
 
 pub mod builder;
