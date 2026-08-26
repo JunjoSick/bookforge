@@ -15,7 +15,21 @@ Push it if absent: `git fetch origin && git checkout remediation/audit-2026-08`.
 3. **Serve auth (H-5):** token auth DEFAULT-ON (auto-generated session token, printed URL bootstraps browser, all API routes require it) with a `--no-auth` opt-out escape hatch.
 4. **Semver:** minor-breaking changes acceptable → final version bump likely **v3.0.0** (status enums replace magic strings, unified estimator changes cache keys, JSON envelope versioning).
 
-## 2. Current state — Wave 0 COMPLETE ✅
+## 2. Current state — Wave 0 COMPLETE ✅ · Wave 1 COMPLETE ✅ (2026-08-26)
+
+Wave 1 landed on this branch as individual commits (all gates green post-integration: fmt/clippy 0 warnings/test 1043 passed):
+
+- `test:` lifecycle fixture made EPUBCheck-valid (nav doc + dcterms:modified) — was failing output validation on any machine with EPUBCheck installed.
+- **P1-store** (`fix(store)`): H-1/STORE-1 atomic correction freeze (IMMEDIATE txn + guarded upsert, SQL-enforced), STORE-3 single-txn checkpoints, STORE-4 transactional glossary rebuild/rename cascade, STORE-13 partial unique indexes for global rows (+dedupe migration 0009), STORE-16 created_at index, STORE-11 resume re-insert refreshes provider/model/source_hash, STORE-14/15/18 (txn upsert_entities, RETURNING add_glossary_term, StoreError::NotFound), H-7 store half (record_migration gated → zero migration writes on reopen).
+- **P1-llm-hotfix** (`fix(llm)`): H-3 llm half (unknown-segment failures re-attributed/unattributable dropped at aggregation), LLM-7 mojibake fixed in 7 templates + guard test extended, DRIFT-1 repair templates renamed .v2→.v3 + stale headings fixed, LLM-6 conservative fence/prose-stripping JSON decode.
+- **P1-epub** (`fix(epub)`): H-2 ArchiveReadBudget wired through reflow + validate (+case-insensitive ext), EPUB-3 script/style/svg/math suppression as verbatim paired markers, EPUB-10 depth cap + de-quadratic close scan, EPUB-4 folio-range numeric-heading cleanup, EPUB-11 canonical util.rs replacing 16 divergent helpers (platform-neutral path normalization), EPUB-5/6/7/9/12/13/14/15/16/17, EPUB-8 assessed-only (cell granularity = core redesign). Follow-up `fix(epub)`: writer scanner marker ids restored to single shared ordinal stream (adjacency regression caught by roundtrip suite, now pinned by new tests).
+- **P1-cli-lifecycle** (`fix(cli)`): H-3 cli half (checkpoint writer log-and-continue + dropped tally), H-4 resume truthfulness (DB-status-driven completion; blockless terminal rows emitted), H-7 cli half (watcher owns one long-lived connection), CLI-3 Ctrl+C in resume, CLI-4 late-control cannot rewrite terminal outcomes, CLI-5 hard errors mark job failed, CLI-7 rename-based stale claim reclaim, CLI-8 lease acquisition for plain resume, CLI-10 O(n) fallback scan, CLI-16 resume flag parity, CLI-12–18 (honest warning, benchmark provider_config, job-id validation for pause/stop, bounded tail read, doctor non-zero exit w/ --no-fail, release builds drop test-only hook).
+- **P1-serve-security** (`fix(serve)`): H-5 token auth default-on (--no-auth opt-out; bootstrap URL flow; header on every route incl. SSE/audio re-wiring), H-6 private dirs/files at serve entry points, SERVE-3 fail-closed PID liveness gate, SERVE-4 strict job-id allowlist, SERVE-5 PrivateTempDir estimate uploads, SERVE-6 launch slot cap, SERVE-7 panic boundary (child isolation deferred: needs audiobook plan-mode plumbing — documented), SERVE-8/9/10 + quality items (spawn_blocking large writes, monotonic launch tags, orphan cleanup, lock eviction).
+- Merged external **PR #108** into the campaign branch (script-aware source-copy detection + shared core ScriptClass; groundwork for P3-estimator).
+
+Outstanding sub-items carried forward: STORE-5 sql-file drift reconciliation (wave 3), SERVE-7 child isolation needs plan-mode flags (note for future audio/ui waves), tempfile promotion decision (dev-dep only), CSP unsafe-inline removal (needs nonce plumbing).
+
+## 2.a Historical — Wave 0 COMPLETE ✅
 
 Commits on this branch:
 - `636b3a89` docs: add 2026-08 deep audit report (remediation tracking base)

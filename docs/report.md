@@ -1,6 +1,6 @@
 # BookForge Deep Audit Report
 
-> **Remediation in progress.** Progress tracking: `docs/HANDOFF-2026-08.md` on branch `remediation/audit-2026-08`. Wave 0 complete (2026-08-25): test deflake (all 5 flake clusters), INFRA-3/4/5, gitignore intent rules incl. `/tests/*KEY*`, zip codec trim, rustdoc fix. All remaining findings pending waves 1–5.
+> **Remediation in progress.** Progress tracking: `docs/HANDOFF-2026-08.md` on branch `remediation/audit-2026-08`. Wave 0 complete (2026-08-25): test deflake (all 5 flake clusters), INFRA-3/4/5, gitignore intent rules incl. `/tests/*KEY*`, zip codec trim, rustdoc fix. Wave 1 complete (2026-08-26): all P1-store/P1-llm-hotfix/P1-epub/P1-cli-lifecycle/P1-serve-security scopes + PR #108 merged. Remaining findings pending waves 2–5.
 
 **Date:** 2026-08-25 · **Version audited:** v2.6.1 (workspace @ `JunjoSick/bookforge`, 427 commits)
 **Method:** 14 specialized audit agents dispatched in sequential waves over the full repo (~80k LOC Rust, 7 crates + CI/docs/scripts/artifacts). Later waves received earlier findings to verify or refute. Builds and tests were actually executed. ~250 raw findings were deduplicated into the consolidated items below.
