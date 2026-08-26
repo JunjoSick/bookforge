@@ -177,14 +177,21 @@ async fn estimate_audiobook(
         let temp = PrivateTempDir::create().context("failed to create a private temp directory")?;
         let plan_path = temp.path.join("book.epub");
         write_private_file(&plan_path, &bytes)?;
+        let scratch_dir = temp.path.clone();
         contain_epub_parser_panics(move || {
-            let book = bookforge_epub::read_epub(&plan_path)?;
+            // AUDIO-7 parity: estimates preprocess through the exact launcher
+            // pipeline (PDF-cleanup reflow -> read -> PDF page grouping), so
+            // PDF-derived books stop quoting different chapter/chunk counts
+            // than the launches they precede. Also lets the panic guard clean
+            // up any staged EPUB the shared pipeline leaves behind.
+            let narration = bookforge_audio::read_narration_source(&plan_path, &scratch_dir)?;
             let options = bookforge_audio::AudiobookOptions {
                 max_chars,
                 chapter_filter,
+                pdf_page_grouping: narration.pdf_page_grouping,
                 ..bookforge_audio::AudiobookOptions::default()
             };
-            let plan = bookforge_audio::plan_chunks(&book, &options);
+            let plan = bookforge_audio::plan_chunks(&narration.book, &options);
             let chapters = plan
                 .iter()
                 .map(|chunk| chunk.chapter_index)
@@ -215,7 +222,17 @@ async fn estimate_audiobook(
 
     if provider == "elevenlabs"
         && let Some(api_key) = resolve_audio_provider_key(&state, "elevenlabs")?
-        && let Some(subscription) = fetch_dashboard_elevenlabs_subscription(&api_key).await
+        // AUDIO-17: metadata preflights ride the cancellation-safe library
+        // twins. These transient routes have no job id yet (and their handler
+        // futures are aborted when the browser disconnects), so the request
+        // passes its own token through — job-owned tokens slot into the same
+        // seam.
+        && let Some(subscription) =
+            fetch_dashboard_elevenlabs_subscription(
+                &api_key,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
     {
         let remaining = subscription
             .character_limit
@@ -237,11 +254,13 @@ async fn estimate_audiobook(
 
 async fn fetch_dashboard_elevenlabs_subscription(
     api_key: &str,
+    cancel_token: tokio_util::sync::CancellationToken,
 ) -> Option<bookforge_audio::ElevenLabsSubscription> {
-    bookforge_audio::fetch_elevenlabs_subscription_with_key(
+    bookforge_audio::fetch_elevenlabs_subscription_with_key_and_cancel(
         ELEVENLABS_BASE_URL,
         api_key,
         ELEVENLABS_VOICE_TIMEOUT_SECONDS,
+        cancel_token,
     )
     .await
     .ok()
@@ -380,6 +399,18 @@ async fn launch_audiobook(
         },
         None => None,
     };
+    // ASYM-1 / AUDIO-6: the launched CLI hard-fails on combinations the
+    // provider capability matrix marks unsupported (seed anywhere but
+    // ElevenLabs). Reject them here so a doomed child is never spawned, and
+    // no upload or operation directory lingers behind the failure. The rest
+    // of the matrix gaps are warn-and-drop inside the CLI child.
+    if seed.is_some()
+        && bookforge_audio::feature_set_for_id(&provider).is_some_and(|features| !features.seed)
+    {
+        return Ok(bad_request(
+            "--seed is supported only with --provider elevenlabs",
+        ));
+    }
     let language = match fields.get("language") {
         Some(value) => {
             let value = value.trim();
@@ -1315,10 +1346,14 @@ async fn audio_voices(
         return Ok(Json(json!({ "voices": voices })).into_response());
     }
 
-    let voices = match bookforge_audio::list_elevenlabs_voices(
+    // AUDIO-17: cancellation-safe voice listing. The handler's future is
+    // dropped when the client disconnects; passing an explicit token keeps
+    // this on the same cancellation seam as the other metadata calls.
+    let voices = match bookforge_audio::list_elevenlabs_voices_with_cancel(
         ELEVENLABS_BASE_URL,
         &api_key,
         ELEVENLABS_VOICE_TIMEOUT_SECONDS,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     {

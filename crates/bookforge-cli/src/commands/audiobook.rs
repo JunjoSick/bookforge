@@ -9,11 +9,11 @@ use anyhow::{Context, Result};
 use bookforge_audio::{
     AudioFormat, AudiobookOptions, ElevenLabsTtsConfig, ElevenLabsTtsProvider, GeminiTtsConfig,
     GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider, Progress,
-    StitchOptions, TextNormalization, build_audiobook, elevenlabs_model_max_input_chars,
-    fetch_elevenlabs_subscription, list_elevenlabs_voices, plan_chunks, plan_chunks_for_prune,
-    resolve_preferred_elevenlabs_model, stitch, validate_options,
+    StitchOptions, TextNormalization, TtsProviderKind, build_audiobook,
+    elevenlabs_model_max_input_chars, feature_set, fetch_elevenlabs_subscription,
+    list_elevenlabs_voices, plan_chunks, plan_chunks_for_prune,
+    resolve_preferred_elevenlabs_model_reported_with_cancel, stitch, validate_options,
 };
-use bookforge_epub::{ReflowOptions, read_epub, reflow_epub};
 use clap::{Args, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio_util::sync::CancellationToken;
@@ -87,7 +87,7 @@ impl TextNormalizationArg {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Environment:\n  BOOKFORGE_AUDIO_PRICING_PATH  Override the bundled audio pricing table with a TOML file."
+    after_help = "Environment:\n  BOOKFORGE_AUDIO_PRICING_PATH  Override the bundled audio pricing table with a JSON file."
 )]
 pub struct AudiobookArgs {
     /// Source EPUB to narrate.
@@ -260,7 +260,13 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         UiMode::Auto | UiMode::Progress => println!("Planning audio chunks..."),
     }
 
-    let (book, pdf_page_grouping) = read_epub_for_audio(input)?;
+    // Launch-parity preprocessing (AUDIO-7): staging, PDF-cleanup reflow, and
+    // page-group detection live in bookforge-audio so estimation, planning,
+    // and real builds share one pipeline and cannot drift apart.
+    let narration_source = bookforge_audio::read_narration_source(input, &std::env::temp_dir())
+        .with_context(|| format!("failed to prepare EPUB narration from {}", input.display()))?;
+    let book = narration_source.book;
+    let pdf_page_grouping = narration_source.pdf_page_grouping;
 
     let out_dir = args.out.clone().unwrap_or_else(|| default_out_dir(input));
     let format = args
@@ -317,6 +323,10 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
 
     let elevenlabs_dry_run_default =
         args.provider == AudioProviderKind::Elevenlabs && args.model.is_none() && args.dry_run;
+    // Why the chosen ElevenLabs model is a degraded substitute, when it is
+    // (AUDIO-3 follow-up): surfaced in plan/report output so an invisible
+    // cost downgrade becomes visible.
+    let mut degraded_model_reason: Option<String> = None;
     let (model, synthesis_id) = match args.provider {
         AudioProviderKind::Mock => {
             let model = args
@@ -375,14 +385,18 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                     config.api_key_env = api_key_env;
                 }
                 config.timeout_seconds = args.timeout_seconds.min(15);
-                match resolve_preferred_elevenlabs_model(
+                match resolve_preferred_elevenlabs_model_reported_with_cancel(
                     &config,
                     args.max_chars,
                     (args.speed - 1.0).abs() > f32::EPSILON,
+                    cancel.clone(),
                 )
                 .await
                 {
-                    Ok(model) => model,
+                    Ok(resolution) => {
+                        degraded_model_reason = resolution.reason;
+                        resolution.model
+                    }
                     Err(error) => {
                         eprintln!(
                             "warning: ElevenLabs model preflight failed ({error}); using default eleven_multilingual_v2"
@@ -413,6 +427,8 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             "eleven_v3 has no speed control on the ElevenLabs TTS endpoint; use --speed 1.0 or pick another model"
         );
     }
+    warn_unsupported_provider_options(&args);
+
     let language_code = resolve_language_code(
         args.provider,
         &model,
@@ -528,6 +544,11 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         } else {
             println!("Model: {model}");
         }
+        // AUDIO-3 follow-up: an auto-selected model can be a degraded
+        // fallback when the models endpoint was unreachable; say so and why.
+        if let Some(reason) = &degraded_model_reason {
+            println!("Degraded model choice: {reason}");
+        }
         println!(
             "Plan: {chapter_count} chapters, {} chunks, {total_chars} characters",
             plan.len()
@@ -575,6 +596,7 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                     "dry_run": true,
                     "stale_chunks": stale.len(),
                     "stale_bytes": stale.iter().map(|chunk| chunk.bytes).sum::<u64>(),
+                    "model_degraded_reason": &degraded_model_reason,
                 })
             );
         } else if human_output {
@@ -603,6 +625,7 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                 "book_file": make_m4b,
                 "single_file": args.single,
                 "dry_run": false,
+                "model_degraded_reason": &degraded_model_reason,
             })
         );
     }
@@ -629,7 +652,12 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             provider: provider_name.to_string(),
             model: model.clone(),
             voice: voice.clone(),
-            cost_line: Some(cost_line.clone()),
+            // Keep the degraded-model note next to the cost estimate where a
+            // driver has a hope of noticing an invisible downgrade.
+            cost_line: Some(match &degraded_model_reason {
+                Some(reason) => format!("{cost_line} | degraded: {reason}"),
+                None => cost_line.clone(),
+            }),
             chapters_total: chapter_count,
             total: plan.len(),
         })?;
@@ -957,6 +985,10 @@ fn resolve_language_code(
     {
         return language;
     }
+    // Model-level nuance (which ElevenLabs models reject language_code at
+    // all) stays here because the provider-kind capability matrix cannot see
+    // it. Provider-level drops (--language on other backends) are surfaced by
+    // `warn_unsupported_provider_options` instead.
     if provider == AudioProviderKind::Elevenlabs && language.is_some() {
         eprintln!(
             "warning: ElevenLabs model {model} rejects language_code; ignoring {} language",
@@ -965,11 +997,6 @@ fn resolve_language_code(
             } else {
                 "the EPUB"
             }
-        );
-    } else if explicit.is_some() {
-        eprintln!(
-            "warning: --language is only applied to ElevenLabs flash/turbo v2.5 models; ignoring it for {}",
-            audio_provider_name(provider)
         );
     }
     None
@@ -1008,6 +1035,56 @@ fn audio_provider_name(provider: AudioProviderKind) -> &'static str {
         AudioProviderKind::Openai => "openai",
         AudioProviderKind::Gemini => "gemini",
         AudioProviderKind::Elevenlabs => "elevenlabs",
+    }
+}
+
+/// The bookforge-audio backend a CLI provider flag selects, so capability
+/// checks (AUDIO-6 / ASYM-1) share one table with synthesis itself.
+fn tts_provider_kind(provider: AudioProviderKind) -> TtsProviderKind {
+    match provider {
+        AudioProviderKind::Mock => TtsProviderKind::Mock,
+        AudioProviderKind::Openai => TtsProviderKind::OpenAi,
+        AudioProviderKind::Gemini => TtsProviderKind::Gemini,
+        AudioProviderKind::Elevenlabs => TtsProviderKind::ElevenLabs,
+    }
+}
+
+/// Warn-and-drop pass over launch-shaping options the selected backend cannot
+/// consume (CLI AUDIO-6 surface). Everything that reaches this point survived
+/// the explicit hard errors above (seed off ElevenLabs, Gemini playback speed,
+/// ElevenLabs instructions), so whatever remains unsupported here is exactly
+/// what synthesis would silently ignore — surface it once, uniformly, before
+/// any spend. The matrix in `bookforge_audio::capabilities` is the single
+/// source of truth; message names come from `unsupported_names()` so they
+/// cannot drift from what the request builders actually send.
+fn warn_unsupported_provider_options(args: &AudiobookArgs) {
+    let features = feature_set(tts_provider_kind(args.provider));
+    // A non-default text-normalization arg is the only way to distinguish an
+    // explicit request from clap's Auto default.
+    let requested = [
+        ("--seed", args.seed.is_some()),
+        ("--language", args.language.is_some()),
+        (
+            "--text-normalization",
+            !matches!(args.text_normalization, TextNormalizationArg::Auto),
+        ),
+        ("--instructions", args.instructions.is_some()),
+        ("--speed", (args.speed - 1.0).abs() > f32::EPSILON),
+    ];
+    let unsupported = features.unsupported_names();
+    let dropped: Vec<&str> = requested
+        .into_iter()
+        .filter(|(_, wanted)| *wanted)
+        .map(|(flag, _)| flag)
+        .filter(|flag| unsupported.contains(flag))
+        .collect();
+    if !dropped.is_empty() {
+        eprintln!(
+            "warning: {} TTS does not support {}; dropping {} before synthesis",
+            audio_provider_name(args.provider),
+            dropped.join(", "),
+            if dropped.len() == 1 { "it" } else { "them" }
+        );
     }
 }
 
@@ -1151,41 +1228,6 @@ fn format_bytes(bytes: u64) -> String {
         format!("{bytes} {}", UNITS[unit])
     } else {
         format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-fn read_epub_for_audio(input: &std::path::Path) -> Result<(bookforge_core::ir::Book, bool)> {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let staged = std::env::temp_dir().join(format!(
-        "bookforge-audio-clean-{}-{}-{sequence}.epub",
-        std::process::id(),
-        bookforge_core::now_ms()
-    ));
-    let cleanup = TemporaryEpub(staged.clone());
-    let reflow = reflow_epub(
-        input,
-        &staged,
-        &ReflowOptions {
-            dry_run: false,
-            aggressive: false,
-            pdf_cleanup: true,
-        },
-    )
-    .with_context(|| format!("failed to prepare EPUB narration from {}", input.display()))?;
-    let mut book =
-        read_epub(&staged).with_context(|| format!("failed to read EPUB {}", input.display()))?;
-    book.source_path = Some(input.to_path_buf());
-    let pdf_page_grouping = reflow.report.totals.pdf_documents_detected > 0;
-    drop(cleanup);
-    Ok((book, pdf_page_grouping))
-}
-
-struct TemporaryEpub(PathBuf);
-
-impl Drop for TemporaryEpub {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
     }
 }
 
