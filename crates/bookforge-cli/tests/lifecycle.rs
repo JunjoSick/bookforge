@@ -47,6 +47,8 @@ fn build_lifecycle_epub(path: &Path) {
     zip.write_all(LIFECYCLE_CONTAINER_XML.as_bytes()).unwrap();
     zip.start_file("content.opf", deflated).unwrap();
     zip.write_all(LIFECYCLE_OPF.as_bytes()).unwrap();
+    zip.start_file("nav.xhtml", deflated).unwrap();
+    zip.write_all(LIFECYCLE_NAV.as_bytes()).unwrap();
     zip.start_file("chapter1.xhtml", deflated).unwrap();
     zip.write_all(LIFECYCLE_CHAPTER_ONE.as_bytes()).unwrap();
     zip.start_file("chapter2.xhtml", deflated).unwrap();
@@ -67,8 +69,10 @@ const LIFECYCLE_OPF: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <dc:identifier id="uid">lifecycle-fixture</dc:identifier>
     <dc:title>Lifecycle Fixture</dc:title>
     <dc:language>en</dc:language>
+    <meta property="dcterms:modified">2026-01-01T00:00:00Z</meta>
   </metadata>
   <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
     <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
     <item id="ch2" href="chapter2.xhtml" media-type="application/xhtml+xml"/>
   </manifest>
@@ -77,6 +81,20 @@ const LIFECYCLE_OPF: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <itemref idref="ch2"/>
   </spine>
 </package>"#;
+
+const LIFECYCLE_NAV: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Lifecycle Fixture Navigation</title></head>
+<body>
+<nav epub:type="toc" id="toc">
+<h1>Table of contents</h1>
+<ol>
+<li><a href="chapter1.xhtml">Lifecycle Chapter One</a></li>
+<li><a href="chapter2.xhtml">Lifecycle Chapter Two</a></li>
+</ol>
+</nav>
+</body>
+</html>"#;
 
 const LIFECYCLE_CHAPTER_ONE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">
