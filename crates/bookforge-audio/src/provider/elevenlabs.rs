@@ -39,6 +39,18 @@ pub const ELEVENLABS_PREFERRED_MODELS: &[&str] = &[
     "eleven_multilingual_v2",
 ];
 
+/// Degradation order used when the preflight cannot reach the models
+/// endpoint (AUDIO-3 / DOC-15): cheapest suitable tier first, so a transient
+/// network failure fails open to Flash rather than to the most expensive
+/// tier. `eleven_v3` is deliberately absent — as the priciest option it must
+/// never be chosen by a *degraded* path, and it is additionally excluded by
+/// request whenever speed control is needed.
+pub const ELEVENLABS_DEGRADED_FALLBACK_ORDER: &[&str] = &[
+    "eleven_flash_v2_5",
+    "eleven_turbo_v2_5",
+    "eleven_multilingual_v2",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ElevenLabsVoice {
     pub voice_id: String,
@@ -58,6 +70,15 @@ pub struct ElevenLabsSubscription {
 pub async fn fetch_elevenlabs_subscription(
     config: &ElevenLabsTtsConfig,
 ) -> Result<ElevenLabsSubscription> {
+    fetch_elevenlabs_subscription_with_cancel(config, CancellationToken::new()).await
+}
+
+/// AUDIO-17: cancellation-safe variant; a cancelled token aborts an
+/// in-flight metadata request instead of waiting out the timeout.
+pub async fn fetch_elevenlabs_subscription_with_cancel(
+    config: &ElevenLabsTtsConfig,
+    cancel_token: CancellationToken,
+) -> Result<ElevenLabsSubscription> {
     let api_key = if base_url_is_loopback(&config.base_url) {
         std::env::var(&config.api_key_env)
             .ok()
@@ -71,6 +92,7 @@ pub async fn fetch_elevenlabs_subscription(
         api_key.as_ref(),
         config.timeout_seconds,
         config.max_attempts,
+        &cancel_token,
     )
     .await
 }
@@ -83,12 +105,30 @@ pub async fn fetch_elevenlabs_subscription_with_key(
     api_key: &str,
     timeout_seconds: u64,
 ) -> Result<ElevenLabsSubscription> {
-    let api_key = ApiKey::new(api_key);
     fetch_elevenlabs_subscription_request(
         base_url,
-        Some(&api_key),
+        Some(&ApiKey::new(api_key)),
         timeout_seconds,
         ELEVENLABS_METADATA_MAX_ATTEMPTS,
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+/// Cancellation-safe explicit-key twin of
+/// [`fetch_elevenlabs_subscription_with_key`].
+pub async fn fetch_elevenlabs_subscription_with_key_and_cancel(
+    base_url: &str,
+    api_key: &str,
+    timeout_seconds: u64,
+    cancel_token: CancellationToken,
+) -> Result<ElevenLabsSubscription> {
+    fetch_elevenlabs_subscription_request(
+        base_url,
+        Some(&ApiKey::new(api_key)),
+        timeout_seconds,
+        ELEVENLABS_METADATA_MAX_ATTEMPTS,
+        &cancel_token,
     )
     .await
 }
@@ -98,12 +138,12 @@ async fn fetch_elevenlabs_subscription_request(
     api_key: Option<&ApiKey>,
     timeout_seconds: u64,
     max_attempts: usize,
+    cancel_token: &CancellationToken,
 ) -> Result<ElevenLabsSubscription> {
     let endpoint = format!("{}/user/subscription", base_url.trim_end_matches('/'));
     let client = build_http_client(timeout_seconds)?;
-    let cancel_token = CancellationToken::new();
     let payload = send_with_retry(
-        &cancel_token,
+        cancel_token,
         max_attempts,
         MAX_JSON_RESPONSE_BODY_BYTES,
         || {
@@ -127,6 +167,17 @@ pub async fn list_elevenlabs_voices(
     api_key: &str,
     timeout_seconds: u64,
 ) -> Result<Vec<ElevenLabsVoice>> {
+    list_elevenlabs_voices_with_cancel(base_url, api_key, timeout_seconds, CancellationToken::new())
+        .await
+}
+
+/// AUDIO-17: cancellation-safe voices listing.
+pub async fn list_elevenlabs_voices_with_cancel(
+    base_url: &str,
+    api_key: &str,
+    timeout_seconds: u64,
+    cancel_token: CancellationToken,
+) -> Result<Vec<ElevenLabsVoice>> {
     #[derive(serde::Deserialize)]
     struct VoicesResponse {
         voices: Vec<ElevenLabsVoice>,
@@ -135,7 +186,6 @@ pub async fn list_elevenlabs_voices(
     let api_key = ApiKey::new(api_key);
     let endpoint = format!("{}/voices", base_url.trim_end_matches('/'));
     let client = build_http_client(timeout_seconds)?;
-    let cancel_token = CancellationToken::new();
     let payload = send_with_retry(
         &cancel_token,
         ELEVENLABS_METADATA_MAX_ATTEMPTS,
@@ -167,11 +217,126 @@ pub fn elevenlabs_model_max_input_chars(model: &str) -> usize {
     }
 }
 
+/// Deterministic cheapest-suitable model for a degraded (cannot-reach-
+/// preflight) run. A pure function of the same inputs as the full resolver,
+/// so resume attempts after a transient outage hash identically to the
+/// original run: the model string is what feeds `synthesis_id`, and a stable
+/// fallback means a resumed build reuses the previous run's paid chunks.
+///
+/// Fail-open target per DOC-15: the CHEAPEST tier that can still satisfy the
+/// request, never `eleven_v3` or any premium tier.
+pub fn degraded_elevenlabs_model(
+    max_chars: usize,
+    needs_speed_control: bool,
+) -> Option<&'static str> {
+    // Speed control rides on voice_settings, which every non-v3 preferred
+    // model accepts; only v3's absence would change anything and it is not
+    // in the degradation order anyway.
+    let _ = needs_speed_control;
+    ELEVENLABS_DEGRADED_FALLBACK_ORDER
+        .iter()
+        .copied()
+        .find(|model| elevenlabs_model_max_input_chars(model) >= max_chars)
+}
+
+/// Which model was chosen for synthesis and how. The CLI/dashboard surface
+/// this in plan/report output; the boolean plus reason make an otherwise
+/// invisible cost downgrade visible to operators.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ElevenLabsModelResolution {
+    pub model: String,
+    /// True when the models endpoint was unreachable and the cheapest
+    /// suitable tier was substituted.
+    pub degraded: bool,
+    pub reason: Option<String>,
+}
+
 /// Select the best available ElevenLabs model for the requested contract.
 pub async fn resolve_preferred_elevenlabs_model(
     config: &ElevenLabsTtsConfig,
     max_chars: usize,
     needs_speed_control: bool,
+) -> Result<String> {
+    resolve_preferred_elevenlabs_model_reported(config, max_chars, needs_speed_control)
+        .await
+        .map(|resolution| resolution.model)
+}
+
+/// Cancellation-safe, fully-reporting resolver. Callers that own a run-level
+/// token must use this so a cancel during model preflight aborts instead of
+/// silently waiting for retries.
+pub async fn resolve_preferred_elevenlabs_model_reported_with_cancel(
+    config: &ElevenLabsTtsConfig,
+    max_chars: usize,
+    needs_speed_control: bool,
+    cancel_token: CancellationToken,
+) -> Result<ElevenLabsModelResolution> {
+    match resolve_preferred_elevenlabs_model_inner(
+        config,
+        max_chars,
+        needs_speed_control,
+        &cancel_token,
+    )
+    .await
+    {
+        Ok(model) => Ok(ElevenLabsModelResolution {
+            model,
+            degraded: false,
+            reason: None,
+        }),
+        Err(error @ TtsError::Http(_)) if error.is_transient_transport() => {
+            let detail = error.to_string();
+            let fallback =
+                degraded_elevenlabs_model(max_chars, needs_speed_control).ok_or(error)?;
+            Ok(ElevenLabsModelResolution {
+                model: fallback.to_string(),
+                degraded: true,
+                reason: Some(format!(
+                    "ElevenLabs model preflight failed transiently ({detail}); degraded to the \
+                     cheapest suitable tier {fallback} so cost stays bounded and the choice is \
+                     deterministic across resume attempts"
+                )),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Full-resolution variant of [`resolve_preferred_elevenlabs_model`]:
+/// identical selection when reachable, but on a transient transport failure
+/// (timeout / connection refused) it fails OPEN to the cheapest suitable
+/// tier instead of erroring out or defaulting to the most expensive one.
+/// Parse failures and HTTP errors keep failing hard — those mean the
+/// account/endpoint state is wrong, not merely flaky, and guessing could
+/// bill against a model the caller did not expect.
+pub async fn resolve_preferred_elevenlabs_model_reported(
+    config: &ElevenLabsTtsConfig,
+    max_chars: usize,
+    needs_speed_control: bool,
+) -> Result<ElevenLabsModelResolution> {
+    resolve_preferred_elevenlabs_model_reported_with_cancel(
+        config,
+        max_chars,
+        needs_speed_control,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+impl TtsError {
+    /// Transport-level transience mirror of the retry policy used by
+    /// [`super::send_with_retry`]: timeouts and connect failures are the
+    /// exactly-the-network class eligible for open degradation.
+    pub fn is_transient_transport(&self) -> bool {
+        matches!(self, TtsError::Http(inner) if inner.is_timeout() || inner.is_connect())
+    }
+}
+
+async fn resolve_preferred_elevenlabs_model_inner(
+    config: &ElevenLabsTtsConfig,
+    max_chars: usize,
+    needs_speed_control: bool,
+    cancel_token: &CancellationToken,
 ) -> Result<String> {
     let endpoint = format!("{}/models", config.base_url.trim_end_matches('/'));
     let api_key = if base_url_is_loopback(&config.base_url) {
@@ -183,9 +348,8 @@ pub async fn resolve_preferred_elevenlabs_model(
     }
     .map(ApiKey::new);
     let client = build_http_client(config.timeout_seconds)?;
-    let cancel_token = CancellationToken::new();
     let payload = send_with_retry(
-        &cancel_token,
+        cancel_token,
         config.max_attempts.min(ELEVENLABS_METADATA_MAX_ATTEMPTS),
         MAX_JSON_RESPONSE_BODY_BYTES,
         || {
@@ -708,6 +872,106 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, TtsError::Provider(_)));
         assert!(error.to_string().contains("empty response body"));
+    }
+
+    /// Bind + drop a listener to obtain a port that reliably refuses
+    /// connections — an offline, deterministic stand-in for a network outage.
+    fn closed_loopback_url() -> String {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("listener for port reservation");
+        let address = listener.local_addr().expect("reserved address");
+        drop(listener);
+        format!("http://{address}/v1")
+    }
+
+    #[tokio::test]
+    async fn unreachable_preflight_fails_open_to_the_cheapest_suitable_tier() {
+        let config = resolver_config(closed_loopback_url(), "RESOLVER_DEGRADE_UNUSED_KEY");
+        let resolution = resolve_preferred_elevenlabs_model_reported(&config, 5_000, false)
+            .await
+            .expect("transient outage must degrade, not fail the run");
+
+        assert!(resolution.degraded);
+        assert_eq!(resolution.model, "eleven_flash_v2_5");
+        assert!(
+            resolution
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cheapest suitable tier"),
+            "{:?}",
+            resolution.reason
+        );
+        // The string-returning wrapper stays contract-compatible.
+        assert_eq!(
+            resolve_preferred_elevenlabs_model(&config, 5_000, false)
+                .await
+                .unwrap(),
+            "eleven_flash_v2_5"
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_choice_is_deterministic_across_resume_attempts() {
+        let config = resolver_config(closed_loopback_url(), "RESOLVER_DEGRADE_STABLE_KEY");
+        let first = resolve_preferred_elevenlabs_model_reported(&config, 12_000, false)
+            .await
+            .unwrap();
+        let second = resolve_preferred_elevenlabs_model_reported(&config, 12_000, false)
+            .await
+            .unwrap();
+        assert_eq!(first, second, "identical inputs must resolve identically");
+        // Flash carries the 40k ceiling too, so 12k chars still fit the
+        // cheapest tier; turbo would only appear for models that out-live
+        // flash's ceiling, which none do today.
+        assert_eq!(first.model, "eleven_flash_v2_5");
+        assert!(first.degraded && second.degraded);
+
+        // Pure-function parity: same answer without any request at all.
+        assert_eq!(
+            degraded_elevenlabs_model(12_000, false),
+            Some("eleven_flash_v2_5")
+        );
+    }
+
+    #[test]
+    fn degraded_order_never_selects_premium_tiers() {
+        for max_chars in [1usize, 5_000, 40_000] {
+            if let Some(model) = degraded_elevenlabs_model(max_chars, false) {
+                assert_ne!(model, "eleven_v3");
+                assert_ne!(model, "eleven_multilingual_v2", "chars={max_chars}");
+            }
+        }
+        assert_eq!(degraded_elevenlabs_model(40_001, false), None);
+    }
+
+    #[tokio::test]
+    async fn preflight_metadata_honours_cancellation_instead_of_waiting() {
+        // AUDIO-17: a cancelled token aborts the request path immediately
+        // (before any network work), regardless of endpoint reachability.
+        let config = resolver_config(closed_loopback_url(), "RESOLVER_CANCEL_UNUSED_KEY");
+        let token = CancellationToken::new();
+        token.cancel();
+        let started = std::time::Instant::now();
+        let outcome =
+            resolve_preferred_elevenlabs_model_reported_with_cancel(&config, 5_000, false, token)
+                .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        match outcome {
+            Err(TtsError::Cancelled) => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+
+        let key_token = CancellationToken::new();
+        key_token.cancel();
+        let cancelled = fetch_elevenlabs_subscription_with_key_and_cancel(
+            &closed_loopback_url(),
+            "sub-key",
+            5,
+            key_token,
+        )
+        .await;
+        assert!(matches!(cancelled, Err(TtsError::Cancelled)));
     }
 
     #[tokio::test]

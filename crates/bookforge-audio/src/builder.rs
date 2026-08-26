@@ -8,6 +8,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bookforge_core::ir::Book;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::lock::{OutDirLock, acquire_out_dir_lock};
 use crate::provider::{AudioFormat, SpeechRequest, TextNormalization, TtsProvider};
 use crate::text::{ChunkKind, chapters_from_book_with_options, chunk_blocks};
 
@@ -207,6 +209,9 @@ pub enum BuildError {
     #[error("invalid audiobook options: {0}")]
     InvalidOptions(String),
 
+    #[error("output directory is locked by another BookForge audiobook run: {0}")]
+    OutputLocked(String),
+
     #[error("provider returned {actual} audio for a {requested} request")]
     FormatMismatch {
         requested: &'static str,
@@ -221,6 +226,15 @@ pub enum BuildError {
 }
 
 type Result<T> = std::result::Result<T, BuildError>;
+
+impl From<crate::lock::LockError> for BuildError {
+    fn from(error: crate::lock::LockError) -> Self {
+        match error {
+            crate::lock::LockError::Held { detail } => BuildError::OutputLocked(detail.to_string()),
+            crate::lock::LockError::Io { path, source } => BuildError::Io { path, source },
+        }
+    }
+}
 
 /// Progress notification emitted after each chunk is resolved.
 #[derive(Debug, Clone)]
@@ -401,6 +415,29 @@ where
         source,
     })?;
 
+    // AUDIO-2: one exclusive cross-process owner per out_dir for the whole
+    // build. Concurrent runs would otherwise interleave manifest checkpoints
+    // and let --prune delete the other run's freshly paid chunks. The lock is
+    // advisory-by-convention; --prune sweeps recognize it and never delete a
+    // live build's lock file. Held via RAII so cancellation, errors, and
+    // panics all release it.
+    let lock = acquire_out_dir_lock(&options.out_dir)?;
+    build_audiobook_locked(book, provider, options, cancel, on_progress, plan, lock).await
+}
+
+async fn build_audiobook_locked<P, F>(
+    book: &Book,
+    provider: Arc<P>,
+    options: &AudiobookOptions,
+    cancel: CancellationToken,
+    on_progress: F,
+    plan: Vec<PlannedChunk>,
+    _lock: OutDirLock,
+) -> Result<AudiobookReport>
+where
+    P: TtsProvider + 'static,
+    F: Fn(Progress) + Send + Sync + 'static,
+{
     let total = plan.len();
     let semaphore = Arc::new(Semaphore::new(options.concurrency.max(1)));
     let on_progress = Arc::new(on_progress);
@@ -490,6 +527,9 @@ where
 
     let mut set = tokio::task::JoinSet::new();
     for (record_index, chunk) in plan.into_iter().enumerate() {
+        // AUDIO-15: share one Arc per planned chunk across the queued future
+        // instead of moving a fresh copy of the whole-book text into each.
+        let chunk = Arc::new(chunk);
         let provider = Arc::clone(&provider);
         let semaphore = Arc::clone(&semaphore);
         let cancel = cancel.clone();
@@ -586,7 +626,7 @@ where
                 chapter_index: chunk.chapter_index,
                 chapter_title: chunk.chapter_title.clone(),
                 part: chunk.part,
-                path: chunk.path,
+                path: chunk.path.clone(),
                 report_progress,
                 result,
             }
@@ -732,11 +772,27 @@ where
     })
 }
 
+/// Load cached audio for a planned chunk if it is still trustworthy.
+///
+/// Verification order (AUDIO-16): the manifest-recorded byte size rejects a
+/// replaced or truncated file without reading its contents; only files that
+/// pass the size gate are read fully, magic-byte validated, and then hashed
+/// against `audio_sha256`. The hash remains the authority — size+mtime style
+/// fast paths alone cannot detect same-size corruption — so the fast path is
+/// documented here as *rejection* filtering, never as proof of validity.
+/// Files with no prior record (or an older manifest without sizes/hashes)
+/// always take the full-read path.
 fn read_valid_cached_audio(
     path: &Path,
     format: AudioFormat,
     expected: Option<&ChunkRecord>,
 ) -> Option<Vec<u8>> {
+    if let Some(expected_bytes) = expected.and_then(|record| record.bytes) {
+        let recorded_len = std::fs::metadata(path).ok()?.len();
+        if recorded_len != expected_bytes {
+            return None;
+        }
+    }
     let bytes = std::fs::read(path).ok()?;
     crate::provider::validate_audio_payload(format, None, &bytes).ok()?;
     if let Some(expected_bytes) = expected.and_then(|record| record.bytes)
@@ -936,36 +992,46 @@ fn synthesis_hash_with_version(
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Write bytes by writing a temp sibling then renaming, so an interrupted
-/// write never leaves a half-file that a resume would mistake for done.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("part.tmp");
-    std::fs::write(&tmp, bytes).map_err(|source| BuildError::Io {
-        path: tmp.clone(),
-        source,
-    })?;
-    if !path.exists() {
-        return std::fs::rename(&tmp, path).map_err(|source| BuildError::Io {
-            path: path.to_path_buf(),
-            source,
-        });
-    }
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    // Windows rename does not replace an existing file. Keep the previous
-    // complete file as a backup until the replacement is safely in place.
-    let backup = path.with_extension("replace.bak");
-    let _ = std::fs::remove_file(&backup);
-    std::fs::rename(path, &backup).map_err(|source| BuildError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+/// Per-process random component for temp names, so two writers that somehow
+/// share a pid namespace (containers) still do not collide.
+fn temp_random_component() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(std::process::id() as u64);
+    hasher.finish()
+}
+
+/// Write bytes by writing a uniquely named temp sibling then renaming it
+/// into place, so an interrupted write never leaves a half-file that a
+/// resume would mistake for done and never clobbers another writer's temp.
+///
+/// `fs::rename` replaces the destination on every platform BookForge ships,
+/// Windows included (the historical backup/rename dance guarded against a
+/// false premise while widening the crash window it claimed to close), so a
+/// single rename into place is the whole protocol. The unique suffix
+/// (`pid` + process-lifetime counter + per-process random) makes concurrent
+/// writers to one directory impossible only because the out_dir lock
+/// serializes them — the suffix is defense in depth for stale debris from
+/// any pre-lock era or foreign writer, and `--prune` sweeps recognize the
+/// `.part.tmp` shape as debris.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let random = temp_random_component();
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = file_name_of(path);
+    let tmp = path.with_file_name(format!(
+        "{file_name}.{}-{sequence}-{random:016x}.part.tmp",
+        std::process::id()
+    ));
+    if let Err(source) = std::fs::write(&tmp, bytes) {
+        return Err(BuildError::Io { path: tmp, source });
+    }
     match std::fs::rename(&tmp, path) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(backup);
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(source) => {
-            let _ = std::fs::rename(&backup, path);
+            let _ = std::fs::remove_file(&tmp);
             Err(BuildError::Io {
                 path: path.to_path_buf(),
                 source,
@@ -1396,6 +1462,144 @@ mod tests {
             validate_options(&options),
             Err(BuildError::InvalidOptions(_))
         ));
+    }
+
+    /// Provider that parks the first synthesis until released, so the test
+    /// can hold a mid-run build open deterministically.
+    struct GatedProvider {
+        started: Arc<tokio::sync::Notify>,
+        gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl TtsProvider for GatedProvider {
+        async fn synthesize(
+            &self,
+            request: SpeechRequest,
+        ) -> std::result::Result<AudioClip, TtsError> {
+            self.started.notify_one();
+            while !self.gate.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            MockTtsProvider::new().synthesize(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_build_of_same_out_dir_is_refused_naming_the_holder() {
+        use crate::lock::{LOCK_FILE_NAME, LockError, acquire_out_dir_lock};
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+        let options = AudiobookOptions {
+            out_dir: out_dir.clone(),
+            max_chars: 40,
+            concurrency: 1,
+            ..AudiobookOptions::default()
+        };
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let book = book_with_sections();
+            let options = options.clone();
+            let gate = Arc::clone(&gate);
+            let started = Arc::clone(&started);
+            tokio::spawn(async move {
+                build_audiobook(
+                    &book,
+                    Arc::new(GatedProvider { started, gate }),
+                    &options,
+                    CancellationToken::new(),
+                    |_| {},
+                )
+                .await
+            })
+        };
+        // Wait until the run has acquired the lock and begun synthesizing.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if out_dir.join(LOCK_FILE_NAME).exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first run should create the lock promptly");
+
+        let contention = match acquire_out_dir_lock(&out_dir) {
+            Err(LockError::Held { detail }) => detail.to_string(),
+            _ => panic!("contended acquisition must report the holder"),
+        };
+        assert!(contention.contains("pid"), "{contention}");
+        assert!(contention.contains("another audiobook run"), "{contention}");
+
+        gate.store(true, Ordering::SeqCst);
+        task.await
+            .expect("build task")
+            .expect("first build succeeds");
+
+        // Release must restore availability for the next run.
+        let reacquired = acquire_out_dir_lock(&out_dir).expect("lock re-acquirable");
+        drop(reacquired);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provably_dead_owner_is_reclaimed_and_guard_removes_own_record() {
+        use crate::lock::{LOCK_FILE_NAME, acquire_out_dir_lock};
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        std::fs::create_dir_all(out_dir).unwrap();
+        let stolen_pid_file = out_dir.join(LOCK_FILE_NAME);
+        std::fs::write(&stolen_pid_file, "pid=4194304\nstarted_at_ms=1\n").unwrap();
+
+        let guard = acquire_out_dir_lock(out_dir).expect("dead owner reclaimed");
+        assert_eq!(guard.pid, std::process::id());
+        drop(guard);
+        assert!(
+            !stolen_pid_file.exists(),
+            "own record must be removed on drop"
+        );
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_content_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("chunk.wav");
+        std::fs::write(&target, b"previous-audio").unwrap();
+
+        write_atomic(&target, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            leftovers.len(),
+            1,
+            "no temp siblings may survive: {leftovers:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("chunk.wav")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn failed_rename_cleans_up_its_temp_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        // Renaming onto an occupied *directory* path fails on every platform
+        // and exercises the cleanup branch deterministically without stubs.
+        let target = dir.path().join("occupied-as-directory");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(write_atomic(&target, b"bytes").is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
     }
 
     #[tokio::test]

@@ -13,10 +13,14 @@ mod elevenlabs;
 mod gemini;
 
 pub use elevenlabs::{
-    ELEVENLABS_MAX_INPUT_CHARS, ELEVENLABS_PREFERRED_MODELS, ElevenLabsSubscription,
-    ElevenLabsTtsConfig, ElevenLabsTtsProvider, ElevenLabsVoice, elevenlabs_model_max_input_chars,
-    fetch_elevenlabs_subscription, fetch_elevenlabs_subscription_with_key, list_elevenlabs_voices,
-    resolve_preferred_elevenlabs_model,
+    ELEVENLABS_DEGRADED_FALLBACK_ORDER, ELEVENLABS_MAX_INPUT_CHARS, ELEVENLABS_PREFERRED_MODELS,
+    ElevenLabsModelResolution, ElevenLabsSubscription, ElevenLabsTtsConfig, ElevenLabsTtsProvider,
+    ElevenLabsVoice, degraded_elevenlabs_model, elevenlabs_model_max_input_chars,
+    fetch_elevenlabs_subscription, fetch_elevenlabs_subscription_with_cancel,
+    fetch_elevenlabs_subscription_with_key, fetch_elevenlabs_subscription_with_key_and_cancel,
+    list_elevenlabs_voices, list_elevenlabs_voices_with_cancel, resolve_preferred_elevenlabs_model,
+    resolve_preferred_elevenlabs_model_reported,
+    resolve_preferred_elevenlabs_model_reported_with_cancel,
 };
 pub use gemini::{GeminiTtsConfig, GeminiTtsProvider};
 
@@ -39,6 +43,50 @@ pub enum AudioFormat {
     #[default]
     Wav,
     Pcm,
+}
+
+/// The TTS backends BookForge launches, keyed by the same ids the CLI and
+/// dashboard use on their command lines/forms. Pure identification lives
+/// here so capability checks ([`crate::capabilities`]) cannot disagree with
+/// what the launch layer accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtsProviderKind {
+    Mock,
+    OpenAi,
+    Gemini,
+    ElevenLabs,
+}
+
+impl TtsProviderKind {
+    pub fn parse(id: &str) -> Option<Self> {
+        match id.trim().to_ascii_lowercase().as_str() {
+            "mock" => Some(Self::Mock),
+            "openai" | "kokoro" | "localai" => Some(Self::OpenAi),
+            "gemini" => Some(Self::Gemini),
+            "elevenlabs" => Some(Self::ElevenLabs),
+            _ => None,
+        }
+    }
+
+    pub fn as_id(self) -> &'static str {
+        match self {
+            Self::Mock => "mock",
+            Self::OpenAi => "openai",
+            Self::Gemini => "gemini",
+            Self::ElevenLabs => "elevenlabs",
+        }
+    }
+
+    /// Default request model per backend, matching CLI/serve defaults so a
+    /// pure-function caller never needs live defaults of its own.
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::Mock => "mock-silence",
+            Self::OpenAi => "gpt-4o-mini-tts",
+            Self::Gemini => "gemini-3.1-flash-tts-preview",
+            Self::ElevenLabs => "",
+        }
+    }
 }
 
 impl AudioFormat {

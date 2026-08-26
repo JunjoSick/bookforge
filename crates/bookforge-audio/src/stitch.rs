@@ -1,10 +1,30 @@
 //! Optional ffmpeg-based audiobook post-processing.
+//!
+//! Subprocess discipline (AUDIO-5): every `ffmpeg` invocation is started
+//! with `-nostdin` and a null stdin so it can never block awaiting terminal
+//! input (including when spawned from the dashboard), and every `ffmpeg` /
+//! `ffprobe` call runs under a hard deadline — on expiry the child is killed
+//! and reaped exactly like the PDF crate's poppler handling, and the failure
+//! surfaces as a normal stitch warning instead of hanging the run forever.
+//!
+//! Loudness normalization and chapter markers (AUDIO-12/AUDIO-13): the
+//! historical single pass concatenated everything, applied `loudnorm` once,
+//! and computed chapter starts from *pre-normalization* chapter durations;
+//! single-pass loudnorm resamples internally, so later chapters drifted out
+//! of alignment with their markers. When `loudnorm` is active for M4B
+//! assembly each chapter is now normalized into an intermediate first, its
+//! duration is probed post-normalization, and those measurements drive the
+//! chapter metadata. Success guarantees are unchanged: if any intermediate
+//! or probe fails, the book assembly is refused with a warning rather than
+//! published unchaptered or mis-chaptered. Single-file output carries no
+//! markers, so it keeps the cheaper single pass.
 
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::builder::{AudiobookManifest, ChunkRecord};
 use crate::text::ChunkKind;
@@ -64,6 +84,16 @@ struct ConcatGaps {
 const FFMPEG_STDERR_LIMIT: usize = 16 * 1024;
 static STAGED_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Hard deadline for one ffmpeg execution. Long audiobook encodes legitimately
+/// run for many minutes, so the budget is generous but finite: a wedged child
+/// (blocked on tty input, deadlocked filter graph) is killed and reaped rather
+/// than hanging the build — or the dashboard child that spawned it — forever.
+const FFMPEG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// ffprobe calls parse small local files; a minute is already pathological.
+const FFPROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// `-version` availability probes answer instantly.
+const TOOL_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub fn ffmpeg_available() -> bool {
     tool_available("ffmpeg")
 }
@@ -72,18 +102,190 @@ pub fn ffprobe_available() -> bool {
     tool_available("ffprobe")
 }
 
+/// Probe-tool constructor. Unlike ffmpeg, ffprobe has no `-nostdin` flag
+/// (it errors with "Option not found" on builds of 6.x+), so tty safety here
+/// comes from the null stdin every runner sets rather than from a CLI flag.
+fn ffprobe_command() -> Command {
+    Command::new("ffprobe")
+}
+
 fn tool_available(tool: &str) -> bool {
-    Command::new(tool)
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let mut command = Command::new(tool);
+    if tool == "ffmpeg" {
+        // ffmpeg honours (and audio flows require) -nostdin; see
+        // [`run_ffmpeg_with_timeout`] for the request-path equivalent.
+        command.arg("-nostdin");
+    }
+    command.arg("-version");
+    matches!(
+        run_tool_with_deadline(command, TOOL_PROBE_TIMEOUT),
+        Some(output) if output.status.success()
+    )
+}
+
+struct ToolOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
+enum WaitOutcome {
+    Finished(Result<ExitStatus, std::io::Error>),
+    TimedOut,
+}
+
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.as_mut()?.stdout.take()
+    }
+
+    fn stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.as_mut()?.stderr.take()
+    }
+
+    fn wait_with_deadline(&mut self, timeout: Duration) -> WaitOutcome {
+        let started = Instant::now();
+        loop {
+            match self.child() {
+                Ok(None) => {}
+                Ok(Some(status)) => return WaitOutcome::Finished(Ok(status)),
+                Err(error) => return WaitOutcome::Finished(Err(error)),
+            }
+            if started.elapsed() >= timeout {
+                // AUDIO-5: kill + reap on expiry so no zombie and no hang.
+                self.kill_and_reap();
+                return WaitOutcome::TimedOut;
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            std::thread::sleep(remaining.min(Duration::from_millis(25)));
+        }
+    }
+
+    fn child(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let status = child.try_wait()?;
+        if status.is_some() {
+            self.child = None;
+        }
+        Ok(status)
+    }
+
+    fn kill_and_reap(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            // Group kill first (unix): a wrapper's grandchildren hold our
+            // pipes open, so they must die with the child for reap+drain to
+            // terminate promptly.
+            let pid = child.id();
+            #[cfg(unix)]
+            if pid > 0 && !process_signals::kill_process_group(pid) {
+                let _ = child.kill();
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = pid;
+                let _ = child.kill();
+            }
+            if child.wait().is_err() {
+                return;
+            }
+        }
+        self.child = None;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
+
+/// Spawn with piped stdio (plus null stdin), capture bounded stdout/stderr,
+/// and enforce `timeout` via kill+reap. Returns `None` for spawn failures and
+/// timeouts alike; callers decide how a silent loss degrades.
+fn run_tool_with_deadline(mut command: Command, timeout: Duration) -> Option<ToolOutput> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    isolate_process_group(&mut command);
+    let mut guard = ChildGuard::new(command.spawn().ok()?);
+    let stderr = guard.stderr()?;
+    // Drain stderr concurrently: a chatty child must never block on a full
+    // pipe while we are polling its exit status.
+    let stderr_reader = std::thread::spawn(move || {
+        let mut sink = [0u8; 8 * 1024];
+        let mut drain = std::io::BufReader::new(stderr);
+        loop {
+            match drain.read(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    let stdout_pipe = guard.stdout()?;
+    let outcome = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut reader = stdout_pipe;
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if bytes.len() > 4 * 1024 * 1024 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        bytes
+    });
+    let wait = guard.wait_with_deadline(timeout);
+    let _ = stderr_reader.join();
+    match wait {
+        WaitOutcome::TimedOut => None,
+        WaitOutcome::Finished(result) => result.ok().map(|status| ToolOutput {
+            status,
+            stdout: outcome.join().unwrap_or_default(),
+        }),
+    }
 }
 
 pub fn stitch(manifest: &AudiobookManifest, options: &StitchOptions) -> StitchReport {
     let mut report = StitchReport::default();
+    // AUDIO-12: loudnorm only ever applies inside M4B / single-file assembly;
+    // surfacing the no-op here keeps per-chapter-only stitches honest even
+    // when ffmpeg is missing and stitching would be skipped outright.
+    if options.loudnorm && !options.make_m4b && !options.make_single {
+        report.warnings.push(
+            "--loudnorm was requested but neither M4B assembly nor single-file output is enabled; \
+             normalization applies only to those outputs, so it was ignored for this stitch"
+                .to_string(),
+        );
+    }
+    // AUDIO-14: name the codec that cannot take silence instead of folding
+    // the limitation into a generic silence-generation failure.
+    if (options.gap_chapter_ms > 0 || options.gap_title_ms > 0 || options.gap_paragraph_ms > 0)
+        && !gaps_supported(&options.extension)
+    {
+        report.warnings.push(format!(
+            "gap settings were ignored because ffmpeg cannot encode silence for the .{} codec; stitched without inter-chunk gaps",
+            options.extension
+        ));
+    }
     let unresolved = manifest
         .chunks
         .iter()
@@ -112,7 +314,7 @@ pub fn stitch(manifest: &AudiobookManifest, options: &StitchOptions) -> StitchRe
         options.gap_chapter_ms > 0 || options.gap_title_ms > 0 || options.gap_paragraph_ms > 0;
     let mut gaps = ConcatGaps::default();
     let mut silence_files = Vec::new();
-    if requested_gaps {
+    if requested_gaps && gaps_supported(&options.extension) {
         let first_chunk = chapters
             .iter()
             .flat_map(|(_, parts)| parts)
@@ -274,7 +476,7 @@ fn concat_copy(dir: &Path, inputs: &[String], output: &str) -> std::result::Resu
     let output_path = dir.join(output);
     let staged = staged_output_path(&output_path);
     let staged_name = file_name_of(&staged);
-    let mut command = Command::new("ffmpeg");
+    let mut command = ffmpeg_command();
     command
         .current_dir(dir)
         .args(["-y", "-f", "concat", "-safe", "0", "-i"])
@@ -297,7 +499,33 @@ fn assemble_m4b(
     }
     let list_name = "book.concat.txt";
     let meta_name = "chapters.ffmeta.txt";
+    let mut intermediates: Vec<PathBuf> = Vec::new();
     let result = (|| {
+        // AUDIO-13 marker pipeline: when loudnorm is active every chapter is
+        // first normalized into an out_dir intermediate; durations probed
+        // from those intermediates drive the chapter table, so markers match
+        // the published audio even though single-pass loudnorm resamples.
+        let (concat_sources, durations) = if options.loudnorm {
+            match normalize_chapters_for_timings(options, chapter_files, &mut intermediates) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return Err(format!(
+                        "chapter metadata was skipped because per-chapter loudness normalization could not complete ({error}); skipped m4b assembly rather than publishing drifted chapter markers"
+                    ));
+                }
+            }
+        } else {
+            let durations = chapter_files
+                .iter()
+                .map(|path| ffprobe_duration_ms(path))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    "chapter metadata was skipped because ffprobe could not determine every chapter duration; skipped m4b assembly rather than publishing an unchaptered book"
+                        .to_string()
+                })?;
+            (chapter_files.to_vec(), durations)
+        };
+
         let chapter_names: Vec<String> = chapters
             .iter()
             .map(|(index, parts)| {
@@ -307,14 +535,6 @@ fn assemble_m4b(
                     .unwrap_or_else(|| format!("Chapter {}", index + 1))
             })
             .collect();
-        let durations = chapter_files
-            .iter()
-            .map(|path| ffprobe_duration_ms(path))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                "chapter metadata was skipped because ffprobe could not determine every chapter duration; skipped m4b assembly rather than publishing an unchaptered book"
-                    .to_string()
-            })?;
         let chapter_gap_ms = gaps.chapter.as_ref().map_or(0, |_| options.gap_chapter_ms);
         let metadata = build_ffmetadata(
             options.title.as_deref(),
@@ -325,7 +545,7 @@ fn assemble_m4b(
         std::fs::write(options.out_dir.join(meta_name), metadata)
             .map_err(|error| format!("writing chapter metadata: {error}"))?;
 
-        let entries = build_book_concat_entries(chapter_files, gaps.chapter.as_deref());
+        let entries = build_book_concat_entries(&concat_sources, gaps.chapter.as_deref());
         std::fs::write(
             options.out_dir.join(list_name),
             concat_list_content(&entries),
@@ -360,9 +580,10 @@ fn assemble_m4b(
                 "2:v:0".to_string(),
             ]);
         }
-        if options.loudnorm {
-            args.extend(["-af".to_string(), "loudnorm=I=-18:TP=-2:LRA=11".to_string()]);
-        }
+        // Loudness handling is fully decided before this command: either
+        // inputs are per-chapter normalized intermediates (loudnorm) or the
+        // run asked for no normalization. Never re-apply a filter here or
+        // normalization compounds and durations drift again.
         args.extend([
             "-c:a".to_string(),
             "aac".to_string(),
@@ -385,7 +606,7 @@ fn assemble_m4b(
         let output_path = options.out_dir.join("audiobook.m4b");
         let staged = staged_output_path(&output_path);
         args.push(file_name_of(&staged));
-        let mut command = Command::new("ffmpeg");
+        let mut command = ffmpeg_command();
         command.current_dir(&options.out_dir).args(&args);
         match run_ffmpeg_transactional(&mut command, &staged, &output_path, "ffmpeg m4b assembly") {
             Ok(()) => Ok((output_path, None)),
@@ -405,7 +626,64 @@ fn assemble_m4b(
     })();
     let _ = std::fs::remove_file(options.out_dir.join(list_name));
     let _ = std::fs::remove_file(options.out_dir.join(meta_name));
+    for intermediate in &intermediates {
+        let _ = std::fs::remove_file(intermediate);
+    }
     result
+}
+
+/// Normalize each chapter file into a hidden `.normalized-chapter-NNN.wav`
+/// intermediate inside out_dir, probe its duration, and hand back the source
+/// names plus the measured timings. Intermediate rate/channels are pinned to
+/// the probed input parameters so loudnorm's internal 192 kHz upsample is
+/// flattened deterministically before encoding. Every produced file is
+/// recorded in `sink`; the caller removes them regardless of outcome.
+///
+/// Failure here is fatal for M4B assembly by design ("skip rather than
+/// publish wrong markers"), matching the pre-existing duration-probe refusal.
+fn normalize_chapters_for_timings(
+    options: &StitchOptions,
+    chapter_files: &[PathBuf],
+    sink: &mut Vec<PathBuf>,
+) -> std::result::Result<(Vec<PathBuf>, Vec<u64>), String> {
+    for (index, path) in chapter_files.iter().enumerate() {
+        let (rate, channels) = probe_audio_params(path)
+            .ok_or_else(|| format!("ffprobe could not read {} parameters", file_name_of(path)))?;
+        let intermediate_path = options.out_dir.join(format!(
+            ".normalized-chapter-{index:03}-{rate}-{channels}.wav"
+        ));
+        let staged = staged_output_path(&intermediate_path);
+        let mut command = ffmpeg_command();
+        command
+            .current_dir(&options.out_dir)
+            .args(["-y", "-i"])
+            .arg(file_name_of(path))
+            .args(["-af", "loudnorm=I=-18:TP=-2:LRA=11"])
+            .args([
+                "-ar".to_string(),
+                rate.to_string(),
+                "-ac".to_string(),
+                channels.to_string(),
+                "-c:a".to_string(),
+                "pcm_s16le".to_string(),
+            ])
+            .arg(file_name_of(&staged));
+        run_ffmpeg_transactional(
+            &mut command,
+            &staged,
+            &intermediate_path,
+            "ffmpeg per-chapter loudness normalization",
+        )?;
+        sink.push(intermediate_path);
+    }
+    let durations = sink
+        .iter()
+        .map(|path| ffprobe_duration_ms(path))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            "ffprobe could not determine post-normalization chapter durations".to_string()
+        })?;
+    Ok((sink.clone(), durations))
 }
 
 fn assemble_single_file(
@@ -437,7 +715,7 @@ fn assemble_single_file(
         options.author.as_deref(),
         &file_name_of(&staged),
     );
-    let mut command = Command::new("ffmpeg");
+    let mut command = ffmpeg_command();
     command.current_dir(&options.out_dir).args(&args);
     let result = run_ffmpeg_transactional(
         &mut command,
@@ -525,7 +803,17 @@ fn run_ffmpeg_transactional(
     final_path: &Path,
     context: &str,
 ) -> std::result::Result<(), String> {
-    let result = run_ffmpeg(command, context);
+    run_ffmpeg_transactional_with_timeout(command, staged, final_path, context, FFMPEG_TIMEOUT)
+}
+
+fn run_ffmpeg_transactional_with_timeout(
+    command: &mut Command,
+    staged: &Path,
+    final_path: &Path,
+    context: &str,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    let result = run_ffmpeg_with_timeout(command, context, timeout);
     if let Err(error) = result {
         let _ = std::fs::remove_file(staged);
         return Err(error);
@@ -543,8 +831,65 @@ fn run_ffmpeg_transactional(
     Ok(())
 }
 
-fn run_ffmpeg(command: &mut Command, context: &str) -> std::result::Result<(), String> {
+/// Every production ffmpeg invocation starts here so the process-level
+/// hardening is unconditional and local to one constructor.
+fn ffmpeg_command() -> Command {
+    // AUDIO-5: refuse stdin input by flag as well as by descriptor; some
+    // builds read interactive prompts even with stdin closed.
+    let mut command = Command::new("ffmpeg");
+    command.arg("-nostdin");
+    command
+}
+
+/// Unix-only: run the child in its own process group so a timeout kill takes
+/// down any grandchildren too (`sh -c`-style wrappers, filter subprocesses).
+/// Without this, a killed wrapper leaves orphans holding our pipes open and
+/// the reap can block indefinitely behind them.
+#[cfg(unix)]
+fn isolate_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let _ = command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+mod process_signals {
+    unsafe extern "C" {
+        pub fn kill(pid: i32, sig: i32) -> i32;
+    }
+    pub const SIGKILL: i32 = 9;
+
+    /// Kill a whole process group by negated pid. Best effort: failure falls
+    /// back to the caller's direct-child kill.
+    pub fn kill_process_group(pid: u32) -> bool {
+        unsafe { kill(pid.negated_i32(), SIGKILL) == 0 }
+    }
+
+    trait NegateI32 {
+        fn negated_i32(self) -> i32;
+    }
+    impl NegateI32 for u32 {
+        fn negated_i32(self) -> i32 {
+            (self.min(i32::MAX as u32)) as i32
+        }
+    }
+}
+
+fn run_ffmpeg_with_timeout(
+    command: &mut Command,
+    context: &str,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    // AUDIO-5: a null stdin plus the hard deadline turn a wedged encode
+    // into a bounded, reported failure instead of an eternal hang.
+    command.stdin(Stdio::null());
     command.stdout(Stdio::null()).stderr(Stdio::piped());
+    // Applied here — the single choke point for execution, not just in
+    // ffmpeg_command — so wrapper-style test/production commands get group
+    // isolation too and grandchild orphans can never outlive their kill.
+    isolate_process_group(command);
     let mut child = command
         .spawn()
         .map_err(|error| format!("launching {context}: {error}"))?;
@@ -553,26 +898,36 @@ fn run_ffmpeg(command: &mut Command, context: &str) -> std::result::Result<(), S
         .take()
         .ok_or_else(|| format!("capturing {context} stderr failed"))?;
     let stderr_reader = std::thread::spawn(move || bounded_stderr_tail(stderr));
-    let status = child
-        .wait()
-        .map_err(|error| format!("waiting for {context}: {error}"))?;
-    let (stderr, truncated) = stderr_reader
-        .join()
-        .map_err(|_| format!("capturing {context} stderr failed"))?
-        .map_err(|error| format!("reading {context} stderr: {error}"))?;
-    if status.success() {
-        return Ok(());
+    let mut guard = ChildGuard::new(child);
+    match guard.wait_with_deadline(timeout) {
+        WaitOutcome::TimedOut => {
+            let _ = stderr_reader.join();
+            Err(format!(
+                "{context} did not finish within {} seconds and was terminated",
+                timeout.as_secs()
+            ))
+        }
+        WaitOutcome::Finished(result) => {
+            let status = result.map_err(|error| format!("waiting for {context}: {error}"))?;
+            let (stderr, truncated) = stderr_reader
+                .join()
+                .map_err(|_| format!("capturing {context} stderr failed"))?
+                .map_err(|error| format!("reading {context} stderr: {error}"))?;
+            if status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&stderr);
+            let stderr = stderr.trim();
+            let detail = if stderr.is_empty() {
+                String::new()
+            } else if truncated {
+                format!("; stderr (last {FFMPEG_STDERR_LIMIT} bytes): {stderr}")
+            } else {
+                format!("; stderr: {stderr}")
+            };
+            Err(format!("{context} exited with {status}{detail}"))
+        }
     }
-    let stderr = String::from_utf8_lossy(&stderr);
-    let stderr = stderr.trim();
-    let detail = if stderr.is_empty() {
-        String::new()
-    } else if truncated {
-        format!("; stderr (last {FFMPEG_STDERR_LIMIT} bytes): {stderr}")
-    } else {
-        format!("; stderr: {stderr}")
-    };
-    Err(format!("{context} exited with {status}{detail}"))
 }
 
 fn bounded_stderr_tail<R: Read>(mut reader: R) -> std::io::Result<(Vec<u8>, bool)> {
@@ -602,58 +957,32 @@ fn bounded_stderr_tail<R: Read>(mut reader: R) -> std::io::Result<(Vec<u8>, bool
     Ok((tail, total > FFMPEG_STDERR_LIMIT))
 }
 
+/// Publish a staged output by renaming over any previous file.
+///
+/// `fs::rename` replaces existing destinations on every supported platform
+/// (Windows included), so — matching the AUDIO-1 simplification in the
+/// builder — the legacy backup/rename choreography and its
+/// pid-colliding `.replace.bak` names are gone; `--prune` sweeps still clean
+/// up those legacy remnants when found.
 fn publish_staged_file(staged: &Path, final_path: &Path) -> std::result::Result<(), String> {
-    if !final_path.exists() {
-        return std::fs::rename(staged, final_path).map_err(|error| {
-            format!("publishing ffmpeg output {}: {error}", final_path.display())
-        });
-    }
-
-    let sequence = STAGED_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let file_name = final_path
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_default();
-    let backup = final_path.with_file_name(format!(
-        ".{file_name}.{}-{sequence}.replace.bak",
-        std::process::id()
-    ));
-    std::fs::rename(final_path, &backup).map_err(|error| {
-        format!(
-            "staging previous ffmpeg output {}: {error}",
-            final_path.display()
-        )
-    })?;
-    match std::fs::rename(staged, final_path) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(backup);
-            Ok(())
-        }
-        Err(error) => {
-            let _ = std::fs::rename(&backup, final_path);
-            Err(format!(
-                "publishing ffmpeg output {}: {error}",
-                final_path.display()
-            ))
-        }
-    }
+    std::fs::rename(staged, final_path)
+        .map_err(|error| format!("publishing ffmpeg output {}: {error}", final_path.display()))
 }
 
 fn probe_audio_params(path: &Path) -> Option<(u32, u16)> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=sample_rate,channels",
-            "-of",
-            "json",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
+    let mut command = ffprobe_command();
+    command.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=sample_rate,channels",
+        "-of",
+        "json",
+    ]);
+    command.arg(path);
+    let output = run_tool_with_deadline(command, FFPROBE_TIMEOUT)?;
     if !output.status.success() {
         return None;
     }
@@ -662,6 +991,16 @@ fn probe_audio_params(path: &Path) -> Option<(u32, u16)> {
     let rate = stream.get("sample_rate")?.as_str()?.parse().ok()?;
     let channels = u16::try_from(stream.get("channels")?.as_u64()?).ok()?;
     Some((rate, channels))
+}
+
+/// Container/codec families where ffmpeg can render silence for concat
+/// gaps. AUDIO-14: anything else degrades with an explicit warning naming
+/// the codec instead of a silent fallback.
+fn gaps_supported(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "mp3" | "wav" | "opus"
+    )
 }
 
 fn ensure_silence_file(
@@ -690,7 +1029,7 @@ fn ensure_silence_file(
     let duration = format!("{:.3}", f64::from(ms) / 1_000.0);
     let staged = staged_output_path(&output_path);
     let staged_name = file_name_of(&staged);
-    let mut command = Command::new("ffmpeg");
+    let mut command = ffmpeg_command();
     command.current_dir(out_dir).args([
         "-y",
         "-f",
@@ -726,18 +1065,17 @@ fn silence_file_is_valid(path: &Path, expected_ms: u32, rate: u32, channels: u16
 }
 
 fn ffprobe_duration_ms(path: &Path) -> Option<u64> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=nokey=1:noprint_wrappers=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
+    let mut command = ffprobe_command();
+    command.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=nokey=1:noprint_wrappers=1",
+    ]);
+    command.arg(path);
+    let output = run_tool_with_deadline(command, FFPROBE_TIMEOUT)?;
     if !output.status.success() {
         return None;
     }
@@ -1058,20 +1396,26 @@ mod tests {
         assert!(status.success());
     }
 
+    fn stitch_fixture_options(dir: &Path) -> StitchOptions {
+        StitchOptions {
+            out_dir: dir.to_path_buf(),
+            extension: "wav".to_string(),
+            make_m4b: true,
+            title: Some("Fixture Book".to_string()),
+            gap_chapter_ms: 0,
+            gap_title_ms: 0,
+            gap_paragraph_ms: 0,
+            author: Some("Fixture Author".to_string()),
+            ..StitchOptions::default()
+        }
+    }
+
     fn stitch_fixture(dir: &Path, cover_path: Option<PathBuf>) -> StitchReport {
         stitch(
             &completed_manifest(),
             &StitchOptions {
-                out_dir: dir.to_path_buf(),
-                extension: "wav".to_string(),
-                make_m4b: true,
-                title: Some("Fixture Book".to_string()),
-                gap_chapter_ms: 0,
-                gap_title_ms: 0,
-                gap_paragraph_ms: 0,
-                author: Some("Fixture Author".to_string()),
                 cover_path,
-                ..StitchOptions::default()
+                ..stitch_fixture_options(dir)
             },
         )
     }
@@ -1095,6 +1439,76 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         serde_json::from_slice(&output.stdout).expect("ffprobe should emit JSON")
+    }
+
+    #[test]
+    fn loudnorm_m4b_chapter_markers_track_post_normalization_durations() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for part in ["c0-p1", "c1-p1"] {
+            let status = Command::new("ffmpeg")
+                .current_dir(dir.path())
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:duration=0.2")
+                .args(["-ar", "44100", "-ac", "1", "-c:a", "pcm_s16le"])
+                .arg(format!("{part}.wav"))
+                .status()
+                .expect("ffmpeg should launch");
+            assert!(status.success());
+        }
+        let mut manifest = completed_manifest();
+        manifest.chunks = vec![chunk(0, 1, ChunkKind::Body), chunk(1, 1, ChunkKind::Body)];
+        manifest.chapters = 2;
+        let mut options = stitch_fixture_options(dir.path());
+        options.loudnorm = true;
+
+        let report = stitch(&manifest, &options);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let book = report.book_file.expect("m4b should be produced");
+        // No normalized intermediates may survive assembly.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".normalized-chapter-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        let output = Command::new("ffprobe")
+            .args(["-v", "error", "-show_chapters", "-of", "json"])
+            .arg(&book)
+            .output()
+            .expect("ffprobe should launch");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let chapters = value["chapters"].as_array().expect("chapter table").clone();
+        assert_eq!(chapters.len(), 2);
+        // Each marker covers its actual (post-normalization) chapter audio
+        // rather than a stale pre-normalization estimate.
+        for chapter in &chapters {
+            let start: f64 = chapter["start_time"].as_str().unwrap().parse().unwrap();
+            let end: f64 = chapter["end_time"].as_str().unwrap().parse().unwrap();
+            assert!(end > start + 0.1, "implausible duration {start}-{end}");
+            assert!(end < start + 0.6, "duration drifted too far: {start}-{end}");
+        }
+    }
+
+    #[test]
+    fn real_m4b_with_default_gaps_publishes_and_reports_no_warnings() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        generate_audio_fixture(dir.path());
+        let mut options = stitch_fixture_options(dir.path());
+        // CLI defaults mirror these gaps.
+        options.gap_chapter_ms = 1_200;
+        options.gap_title_ms = 800;
+
+        let report = stitch(&completed_manifest(), &options);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(report.book_file.is_some());
+        assert!(report.book_file.unwrap().exists());
     }
 
     #[test]
@@ -1269,5 +1683,124 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("unresolved"))
         );
+    }
+
+    #[test]
+    fn loudnorm_without_any_assembly_target_is_reported_not_silent() {
+        // No ffmpeg needed: the no-op report must fire before the tool gate.
+        let report = stitch(
+            &completed_manifest(),
+            &StitchOptions {
+                loudnorm: true,
+                ..StitchOptions::default()
+            },
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("--loudnorm") && warning.contains("ignored")),
+            "{:?}",
+            report.warnings
+        );
+
+        // With a target the flag is honored and stays quiet.
+        if !ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        generate_audio_fixture(dir.path());
+        let mut options = stitch_fixture_options(dir.path());
+        options.loudnorm = true;
+        options.make_single = true;
+        let report = stitch(&completed_manifest(), &options);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("--loudnorm")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn unsupported_gap_codec_is_named_in_a_warning() {
+        let report = stitch(
+            &completed_manifest(),
+            &StitchOptions {
+                gap_chapter_ms: 900,
+                extension: "aac".to_string(),
+                ..StitchOptions::default()
+            },
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(".aac")),
+            "{:?}",
+            report.warnings
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("stitched without inter-chunk gaps"))
+        );
+    }
+
+    #[test]
+    fn unsupported_loudnorm_chain_survives_silence_probe_helpers_offline() {
+        // The helpers behind gaps degrade to None without ffmpeg rather than
+        // blocking: probe and duration calls stay bounded even when the tool
+        // is absent (they also cover the timeout path by construction).
+        let missing = Path::new("definitely-missing-file.wav");
+        if !ffprobe_available() {
+            assert_eq!(probe_audio_params(missing), None);
+            assert_eq!(ffprobe_duration_ms(missing), None);
+        }
+        assert!(!gaps_supported("flac"));
+        assert!(gaps_supported("wav"));
+    }
+
+    #[test]
+    fn timed_out_ffmpeg_child_is_killed_within_deadline() {
+        // The sleeping child is spawned directly (no shell wrapper): the
+        // guarantee under test is this crate's deadline + kill + reap against
+        // a child that never finishes on its own, offline and portably.
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("out.wav");
+        std::fs::write(&final_path, b"prior-output").unwrap();
+        let staged = staged_output_path(&final_path);
+
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("ping");
+            command.args(["-n", "120", "127.0.0.1"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sleep");
+            command.arg("120");
+            command
+        };
+
+        let started = Instant::now();
+        // Far below the 120s child runtime; exercises deadline enforcement
+        // deterministically.
+        let outcome = run_ffmpeg_transactional_with_timeout(
+            &mut command,
+            &staged,
+            &final_path,
+            "test timeout ffmpeg",
+            Duration::from_millis(250),
+        );
+        let elapsed = started.elapsed();
+        assert!(outcome.is_err(), "sleeping child must fail");
+        assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"prior-output");
+        assert!(!staged.exists(), "staged output must be removed");
     }
 }
