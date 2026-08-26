@@ -16,6 +16,41 @@ pub(super) struct AudiobookSource {
     pub(super) file_name: String,
 }
 
+/// SERVE-7 containment boundary for parsing untrusted EPUBs inside the
+/// key-holding serve process.
+///
+/// Why a child process like the translation path uses was *not* implemented:
+/// true isolation would mean planning chunks via the `audiobook` CLI, but that
+/// subcommand exists only in full-synthesis form (it demands provider/voice/
+/// format flags and would synthesize audio), and threading a plan-only mode
+/// through `audiobook.rs` belongs to another crate's workstream. What is done
+/// instead, cheaply and locally:
+/// - the parse runs on a blocking worker thread rather than an async task;
+/// - a panic is caught at this boundary and becomes a 4xx-style refusal, so
+///   hostile input can unwind the parse but never abort the server or leak
+///   beyond the request; the private temp dir (SERVE-5) still cleans up
+///   because it drops during the same unwind;
+/// - memory stays bounded by construction: the EPUB reader's archive budgets
+///   (H-2 fix upstream in bookforge-epub) cap decompression and entity sizes,
+///   so the parser cannot balloon RSS unboundedly before this guard runs.
+fn contain_epub_parser_panics<T>(
+    parse: impl FnOnce() -> Result<T> + std::panic::UnwindSafe,
+) -> Result<T> {
+    match std::panic::catch_unwind(parse) {
+        Ok(result) => result,
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "parser panicked".to_string());
+            Err(anyhow::anyhow!(
+                "this EPUB could not be read safely ({detail}); re-save or re-download the file"
+            ))
+        }
+    }
+}
+
 /// Resolve either a direct browser upload or the output of a finished
 /// translation. The latter is addressed by job id rather than by a
 /// browser-supplied filesystem path, keeping the handoff scoped to records the
@@ -72,8 +107,9 @@ pub(super) async fn resolve_audiobook_source(
 
 /// Plan audiobook synthesis from an uploaded EPUB or finished translation
 /// without making provider requests. Parsing and chunk construction are
-/// blocking, so both happen off the async worker after the source has been
-/// saved to a temporary path.
+/// blocking, so both happen off the async worker inside a per-request private
+/// temp directory (SERVE-5) that is deleted on drop regardless of outcome,
+/// panics included.
 async fn estimate_audiobook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -137,32 +173,28 @@ async fn estimate_audiobook(
         None => None,
     };
 
-    let sequence = ESTIMATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let temp_path = std::env::temp_dir().join(format!(
-        "bookforge-audio-estimate-{}-{}-{sequence}.epub",
-        std::process::id(),
-        now_ms(),
-    ));
-    std::fs::write(&temp_path, bytes)?;
-    let plan_path = temp_path.clone();
     let plan_result = tokio::task::spawn_blocking(move || -> Result<(usize, usize, usize)> {
-        let book = bookforge_epub::read_epub(&plan_path)?;
-        let options = bookforge_audio::AudiobookOptions {
-            max_chars,
-            chapter_filter,
-            ..bookforge_audio::AudiobookOptions::default()
-        };
-        let plan = bookforge_audio::plan_chunks(&book, &options);
-        let chapters = plan
-            .iter()
-            .map(|chunk| chunk.chapter_index)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        let characters = plan.iter().map(|chunk| chunk.chars).sum();
-        Ok((chapters, plan.len(), characters))
+        let temp = PrivateTempDir::create().context("failed to create a private temp directory")?;
+        let plan_path = temp.path.join("book.epub");
+        write_private_file(&plan_path, &bytes)?;
+        contain_epub_parser_panics(move || {
+            let book = bookforge_epub::read_epub(&plan_path)?;
+            let options = bookforge_audio::AudiobookOptions {
+                max_chars,
+                chapter_filter,
+                ..bookforge_audio::AudiobookOptions::default()
+            };
+            let plan = bookforge_audio::plan_chunks(&book, &options);
+            let chapters = plan
+                .iter()
+                .map(|chunk| chunk.chapter_index)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let characters = plan.iter().map(|chunk| chunk.chars).sum();
+            Ok((chapters, plan.len(), characters))
+        })
     })
     .await;
-    let _ = std::fs::remove_file(&temp_path);
     let result = match plan_result? {
         Ok(result) => result,
         Err(error) => {
@@ -406,22 +438,48 @@ async fn launch_audiobook(
         return Ok(bad_request("TTS provider API key is required"));
     }
 
+    // SERVE-6: bound simultaneous launches sharing remembered provider keys.
+    let slot = match try_acquire_launch_slot(&state)? {
+        LaunchSlot::Acquired(slot) => slot,
+        LaunchSlot::Exhausted => return Ok(launch_slot_exhausted()),
+    };
+
     let stem = sanitize_component(strip_epub_suffix(&file_name));
-    let sequence = ESTIMATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let sequence = next_launch_seq();
     let id = format!("{}-{sequence}-{stem}", now_ms());
     let upload_dir = state.upload_dir.clone();
-    std::fs::create_dir_all(&upload_dir)?;
     let input_path = upload_dir.join(format!("audiobook-{id}.epub"));
     let out_dir = upload_dir.join(format!("audiobook-{id}"));
-    std::fs::write(&input_path, bytes)?;
+    // Directory creation plus the (up to 64 MB) input write happen off the
+    // async runtime; everything created is private to the owner (H-6).
+    let inspect_out_dir = out_dir.clone();
+    let write_input_path = input_path.clone();
     let inspect_path = input_path.clone();
-    if let Err(error) =
-        tokio::task::spawn_blocking(move || bookforge_epub::inspect_epub(&inspect_path)).await?
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        ensure_private_dir_under(Path::new(".bookforge"), &upload_dir)?;
+        write_private_file(&write_input_path, &bytes)?;
+        std::fs::create_dir_all(&inspect_out_dir)?;
+        tighten_private_under(&upload_dir, &inspect_out_dir);
+        Ok(())
+    })
+    .await??;
+    // The panic boundary and the ordinary parse failure share one anyhow
+    // error channel here; both mean "refuse this upload".
+    let inspected = match tokio::task::spawn_blocking(move || {
+        contain_epub_parser_panics(move || {
+            bookforge_epub::inspect_epub(&inspect_path).map_err(|error| anyhow::anyhow!("{error}"))
+        })
+    })
+    .await
     {
+        Ok(Ok(inspection)) => Ok(inspection),
+        Ok(Err(error)) => Err(error),
+        Err(join_error) => Err(anyhow::Error::from(join_error)),
+    };
+    if let Err(error) = inspected {
         let _ = std::fs::remove_file(&input_path);
         return Ok(bad_request(&format!("could not read EPUB: {error}")));
     }
-    std::fs::create_dir_all(&out_dir)?;
     write_audio_process_state(&out_dir, "starting", None, None, auto_model)?;
 
     let exe = std::env::current_exe()?;
@@ -447,9 +505,18 @@ async fn launch_audiobook(
     ));
     configure_dashboard_child_environment(&mut command, api_key_env.zip(key.as_deref()));
 
-    let mut child = command
-        .spawn()
-        .context("failed to spawn audiobook process")?;
+    // On spawn failure the freshly written upload (and empty operation dir)
+    // must not linger as orphans; remove them before surfacing the error.
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&input_path);
+            let _ = std::fs::remove_dir_all(&out_dir);
+            return Err(anyhow::Error::from(error)
+                .context("failed to spawn audiobook process")
+                .into());
+        }
+    };
     let pid = child.id();
     write_audio_process_state(&out_dir, "running", pid, None, auto_model)?;
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -485,6 +552,8 @@ async fn launch_audiobook(
             registry.remove(&monitor_id);
         }
     });
+    // The child now owns the operation's lifetime; the launch slot is free.
+    drop(slot);
 
     Ok(Json(json!({
         "ok": true,
@@ -857,6 +926,18 @@ async fn cancel_audiobook(
         )
             .into_response());
     };
+    // SERVE-3: this PID came from disk and may belong to a different process
+    // than when it was written — a server restart plus PID reuse would turn a
+    // blind kill into killing someone else's process tree (the same reason
+    // translation resumes gate on fresh runtime leases). Verify the PID is
+    // alive *and* plausibly one of ours before signalling anything.
+    if !live_process_is_bookforge(pid) {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "could not verify the recorded audiobook process; nothing was signalled"})),
+        )
+            .into_response());
+    }
     if let Err(error) = terminate_restarted_audiobook(&state, pid).await {
         return Ok((
             StatusCode::CONFLICT,
@@ -870,6 +951,69 @@ async fn cancel_audiobook(
         .unwrap_or(false);
     write_audio_process_state(&out_dir, "cancelled", Some(pid), None, auto_model)?;
     Ok(Json(json!({"ok": true, "status": "cancelled"})).into_response())
+}
+
+/// True when `pid` names a live process whose executable plausibly belongs to
+/// BookForge (SERVE-3). Verification is best-effort but *fail-closed*: any
+/// platform where identity cannot be established refuses to signal.
+///
+/// - Linux: resolve `/proc/<pid>/exe` and compare with our own executable.
+/// - Other Unix: `ps -p <pid> -o comm=` must report our executable name.
+/// - Windows: `tasklist` image name must match our executable file name.
+pub(super) fn live_process_is_bookforge(pid: u32) -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(_) => return false,
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        let ours = std::fs::canonicalize(&exe);
+        let theirs = std::fs::read_link(format!("/proc/{pid}/exe")).and_then(std::fs::canonicalize);
+        matches!((ours, theirs), (Ok(ours), Ok(theirs)) if ours == theirs)
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let Some(expected) = exe.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let Ok(output) = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+        else {
+            return false;
+        };
+        let actual = String::from_utf8_lossy(&output.stdout);
+        let actual = actual.trim();
+        // `comm=` may carry a full path; only the final component is stable.
+        let name = actual.rsplit('/').next().unwrap_or(actual);
+        !name.is_empty() && name == expected
+    }
+
+    #[cfg(windows)]
+    {
+        let Some(expected) = exe
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        else {
+            return false;
+        };
+        let Ok(output) = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return false;
+        };
+        let line = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        line.contains(&expected)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = exe;
+        false
+    }
 }
 
 async fn terminate_restarted_audiobook(state: &AppState, pid: u32) -> Result<()> {

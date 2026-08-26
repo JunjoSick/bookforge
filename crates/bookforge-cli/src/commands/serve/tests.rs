@@ -9,6 +9,7 @@ fn test_state(token: &str) -> AppState {
     AppState {
         refresh: Duration::from_millis(250),
         csrf_token: token.to_string(),
+        auth_enabled: true,
         host_port: 8765,
         upload_dir: PathBuf::from(UPLOAD_DIR),
         keys: Arc::new(Mutex::new(HashMap::new())),
@@ -17,6 +18,7 @@ fn test_state(token: &str) -> AppState {
         store_path: default_store_path(),
         runtime_lease_stale_after: crate::control::RUNTIME_LEASE_STALE_AFTER,
         correction_locks: Arc::new(Mutex::new(HashMap::new())),
+        launch_slots: Arc::new(Mutex::new(0)),
         resume_launches: None,
         resume_child_environments: None,
         audio_restart_cancels: None,
@@ -357,7 +359,7 @@ async fn retry_endpoint_rejects_missing_dashboard_token() {
         .await
         .expect("route should respond");
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -379,7 +381,7 @@ async fn audiobook_endpoint_rejects_missing_dashboard_token() {
         .await
         .expect("route should respond");
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -401,26 +403,26 @@ async fn audiobook_estimate_endpoint_rejects_missing_dashboard_token() {
         .await
         .expect("route should respond");
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn elevenlabs_voices_without_key_returns_conflict() {
-    use axum::{body::Body, http::Request};
-    use tower::ServiceExt;
-
-    let response = dashboard_router(test_state("token-123"))
-        .oneshot(
-            Request::builder()
-                .uri("/api/audio/voices?provider=elevenlabs")
-                .header("host", TEST_HOST)
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("route should respond");
-
+    let response = get_route(
+        &dashboard_router(test_state("token-123")),
+        "/api/audio/voices?provider=elevenlabs",
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    // And without the session token it never reaches the handler at all.
+    let rejected = get_route_with_token(
+        &dashboard_router(test_state("token-123")),
+        "/api/audio/voices?provider=elevenlabs",
+        None,
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[test]
@@ -542,7 +544,7 @@ async fn audiobook_cancel_rejects_missing_dashboard_token() {
         .await
         .expect("route should respond");
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 fn write_test_audiobook_operation(
@@ -630,7 +632,9 @@ async fn audiobook_cancel_uses_persisted_pid_after_server_restart() {
         json!({"status": "running", "chunks": []}),
         json!({
             "status": "running",
-            "pid": 4242,
+            // The recorded process must be verifiably ours before cancel will
+            // signal it; the test binary itself is a real BookForge executable.
+            "pid": std::process::id(),
             "auto_model": true,
             "warnings": ["stitch fallback"],
             "updated_at_ms": 10,
@@ -650,7 +654,7 @@ async fn audiobook_cancel_uses_persisted_pid_after_server_restart() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(*cancelled.lock().unwrap(), vec![4242]);
+    assert_eq!(*cancelled.lock().unwrap(), vec![std::process::id()]);
     let process: serde_json::Value = serde_json::from_slice(
         &std::fs::read(out_dir.join("process.json")).expect("process state should remain"),
     )
@@ -701,6 +705,7 @@ async fn audiobook_artifact_supports_ranges_and_rejects_unsatisfiable_ranges() {
             Request::builder()
                 .uri("/api/audiobooks/range-test/artifact")
                 .header("host", TEST_HOST)
+                .header(CSRF_HEADER, "token-123")
                 .header("range", "bytes=2-5")
                 .body(Body::empty())
                 .expect("request should build"),
@@ -726,6 +731,7 @@ async fn audiobook_artifact_supports_ranges_and_rejects_unsatisfiable_ranges() {
             Request::builder()
                 .uri("/api/audiobooks/range-test/artifact")
                 .header("host", TEST_HOST)
+                .header(CSRF_HEADER, "token-123")
                 .header("range", "bytes=20-")
                 .body(Body::empty())
                 .expect("request should build"),
@@ -767,7 +773,7 @@ async fn control_endpoints_reject_missing_dashboard_token() {
             .await
             .expect("route should respond");
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{command}");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{command}");
     }
 }
 
@@ -792,7 +798,7 @@ async fn estimate_endpoint_rejects_missing_dashboard_token() {
         .await
         .expect("route should respond");
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -814,7 +820,7 @@ async fn glossary_mutations_reject_missing_dashboard_token() {
             )
             .await
             .expect("route should respond");
-    assert_eq!(add.status(), StatusCode::FORBIDDEN);
+    assert_eq!(add.status(), StatusCode::UNAUTHORIZED);
 
     let remove = dashboard_router(test_state("token-123"))
         .oneshot(
@@ -827,7 +833,7 @@ async fn glossary_mutations_reject_missing_dashboard_token() {
         )
         .await
         .expect("route should respond");
-    assert_eq!(remove.status(), StatusCode::FORBIDDEN);
+    assert_eq!(remove.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -908,14 +914,14 @@ fn dashboard_ships_all_screen_renderers() {
 fn dashboard_assets_reassemble_byte_stably() {
     use sha2::{Digest, Sha256};
 
-    assert_eq!(DASHBOARD_HTML.len(), 113_292);
+    assert_eq!(DASHBOARD_HTML.len(), 118_849);
     assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
     assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
     let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
     let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
         digest_hex,
-        "908c441831ab32699345eedd9157909c26c8477d7c1e893d5c176daeb351c486"
+        "dfe1806d8d93a812893a330200fad6458dfe696977be5b8062ff53fa4cade73b"
     );
 
     let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");
@@ -1232,19 +1238,23 @@ async fn post_json(
         .expect("route should respond")
 }
 
+/// GET with the default test session token; pass a deliberately different
+/// token to assert authentication behavior.
 async fn get_route(router: &Router, uri: &str) -> Response {
+    get_route_with_token(router, uri, Some("token-123")).await
+}
+
+async fn get_route_with_token(router: &Router, uri: &str, token: Option<&str>) -> Response {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
+    let mut builder = Request::builder().uri(uri).header("host", TEST_HOST);
+    if let Some(token) = token {
+        builder = builder.header(CSRF_HEADER, token);
+    }
     router
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(uri)
-                .header("host", TEST_HOST)
-                .body(Body::empty())
-                .expect("request should build"),
-        )
+        .oneshot(builder.body(Body::empty()).expect("request should build"))
         .await
         .expect("route should respond")
 }
@@ -1281,7 +1291,7 @@ async fn dashboard_reconfigure_is_typed_revisioned_and_csrf_protected() {
     ));
     let uri = format!("/api/jobs/{}/reconfigure", fixture.job_id);
 
-    let initial = get_route(&router, &uri).await;
+    let initial = get_route_with_token(&router, &uri, Some(&fixture.csrf)).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let initial = response_json(initial).await;
     assert_eq!(initial["revision"], 0);
@@ -1293,10 +1303,12 @@ async fn dashboard_reconfigure_is_typed_revisioned_and_csrf_protected() {
     assert_eq!(initial["editable"], true);
 
     let body = json!({ "concurrency": 2 });
+    // H-5 folds the old CSRF gate into the global session-token check, so
+    // both a missing and a wrong token are bare 401 rejections.
     let missing = post_json(&router, &uri, None, body.clone()).await;
-    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
     let wrong = post_json(&router, &uri, Some("wrong-token"), body).await;
-    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
     assert!(
         !crate::commands::reconfigure::overrides_path_for_job(&fixture.job_id).exists(),
         "rejected mutations must not create a sidecar"
@@ -1366,7 +1378,8 @@ async fn dashboard_reconfigure_is_typed_revisioned_and_csrf_protected() {
     assert_eq!(second["effective"]["concurrency"], 3);
     assert_eq!(second["effective"]["batch_max_items"], 2);
 
-    let replayed = response_json(get_route(&router, &uri).await).await;
+    let replayed =
+        response_json(get_route_with_token(&router, &uri, Some(&fixture.csrf)).await).await;
     assert_eq!(replayed["revision"], 2);
     assert_eq!(replayed["effective"]["concurrency"], 3);
 
@@ -1419,9 +1432,10 @@ async fn dashboard_controls_require_a_fresh_lease_and_signal_one_when_present() 
     .expect("lease should write");
 
     let view = response_json(
-        get_route(
+        get_route_with_token(
             &router,
             &format!("/api/jobs/{}/reconfigure", fixture.job_id),
+            Some(&fixture.csrf),
         )
         .await,
     )
@@ -1657,9 +1671,10 @@ async fn dashboard_resume_recognizes_finalize_only_work() {
     let router = dashboard_router(state);
 
     let view = response_json(
-        get_route(
+        get_route_with_token(
             &router,
             &format!("/api/jobs/{}/reconfigure", fixture.job_id),
+            Some(&fixture.csrf),
         )
         .await,
     )
@@ -1726,9 +1741,10 @@ async fn dashboard_resume_rejects_a_completed_job_without_work() {
     let router = dashboard_router(state);
 
     let view = response_json(
-        get_route(
+        get_route_with_token(
             &router,
             &format!("/api/jobs/{}/reconfigure", fixture.job_id),
+            Some(&fixture.csrf),
         )
         .await,
     )
@@ -1818,10 +1834,10 @@ async fn save_manual_translation_rejects_missing_or_wrong_csrf_without_mutating_
     let body = json!({ "blocks": [{ "block_id": "whatever", "text": "corrupted" }] });
 
     let missing = post_json(&router, &uri, None, body.clone()).await;
-    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
     let wrong = post_json(&router, &uri, Some("wrong-token"), body).await;
-    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
 
     let store = JobStore::open(&fixture.store_path).expect("store should reopen");
     assert!(
@@ -1846,10 +1862,10 @@ async fn set_segment_flag_rejects_missing_or_wrong_csrf_without_mutating_store()
     let body = json!({ "flagged": true });
 
     let missing = post_json(&router, &uri, None, body.clone()).await;
-    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
     let wrong = post_json(&router, &uri, Some("wrong-token"), body).await;
-    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
 
     let store = JobStore::open(&fixture.store_path).expect("store should reopen");
     let flagged = store
@@ -1875,10 +1891,10 @@ async fn retry_segment_rejects_missing_or_wrong_csrf_without_mutating_store() {
     let body = json!({ "guidance": "please redo" });
 
     let missing = post_json(&router, &uri, None, body.clone()).await;
-    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
     let wrong = post_json(&router, &uri, Some("wrong-token"), body).await;
-    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
 
     let store = JobStore::open(&fixture.store_path).expect("store should reopen");
     let guidance = store
@@ -1920,6 +1936,7 @@ async fn dashboard_review_and_mutation_endpoints_end_to_end() {
             Request::builder()
                 .uri(&review_uri)
                 .header("host", TEST_HOST)
+                .header(CSRF_HEADER, &fixture.csrf)
                 .body(Body::empty())
                 .expect("request should build"),
         )
@@ -2074,4 +2091,475 @@ async fn dashboard_review_and_mutation_endpoints_end_to_end() {
             .expect("lookup should succeed"),
         "the rejected retry must not un-freeze the human correction"
     );
+}
+
+// -----------------------------------------------------------------------
+// H-5 / SERVE-1: session-token authentication on every route
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn auth_on_requires_session_tokens_on_representative_api_routes() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let router = dashboard_router(test_state("sekrit-token"));
+
+    // Missing tokens: 401 on reads AND mutations, including the two heavy
+    // protectees (review documents, job listing) and options metadata.
+    for uri in [
+        "/api/jobs",
+        "/api/jobs/some-job/review",
+        "/api/jobs/some-job",
+        "/api/options",
+        "/api/providers",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("host", TEST_HOST)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{uri} must reject an anonymous request"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body should read");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("401 should be JSON");
+        assert!(
+            !payload.to_string().contains("sekrit-token"),
+            "the 401 must not echo any credential material"
+        );
+    }
+
+    // Wrong tokens are also bare 401s with no detail about which half failed.
+    let wrong = get_route_with_token(&router, "/api/jobs", Some("not-the-token")).await;
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    // The right token passes through to the handler (options needs no store).
+    let good = get_route_with_token(&router, "/api/options", Some("sekrit-token")).await;
+    assert_eq!(good.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn root_exchange_bootstraps_browsers_without_leaking_the_token() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let secret = "feedface-feedface-feedface";
+    let router = dashboard_router(test_state(secret));
+
+    // Anonymous GET / gets guidance only.
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("host", TEST_HOST)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(anonymous.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(anonymous.into_body(), usize::MAX)
+        .await
+        .expect("login body should read");
+    let login_page = String::from_utf8(body.to_vec()).expect("page is utf-8");
+    assert!(
+        login_page.contains("bookforge serve"),
+        "points at the console link"
+    );
+    assert!(!login_page.contains(secret));
+    assert!(!login_page.contains(CSRF_TOKEN_PLACEHOLDER));
+
+    // Wrong ?token= is rejected without echoing the expected value.
+    let rejected = get_route_with_token(&router, "/?token=deadbeef", None).await;
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+    // Right ?token= gets the bootstrap page that seeds sessionStorage under
+    // the same header name every API fetch sends, mirroring the old CSRF
+    // wiring, then redirects to the clean root.
+    let bootstrapped = get_route_with_token(&router, &format!("/?token={secret}"), None).await;
+    assert_eq!(bootstrapped.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(bootstrapped.into_body(), usize::MAX)
+        .await
+        .expect("bootstrap body should read");
+    let bootstrap = String::from_utf8(body.to_vec()).expect("page is utf-8");
+    assert!(bootstrap.contains(CSRF_HEADER));
+    assert!(bootstrap.contains(&format!(
+        "sessionStorage.setItem(\"{CSRF_HEADER}\", \"{secret}\")"
+    )));
+    assert!(bootstrap.contains("location.replace(\"/\")"));
+    assert!(!bootstrap.is_empty(), "bootstrap page served");
+
+    // A caller already holding the header may load the dashboard directly.
+    let direct = get_route_with_token(&router, "/", Some(secret)).await;
+    assert_eq!(direct.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(direct.into_body(), usize::MAX)
+        .await
+        .expect("dashboard body should read");
+    let page = String::from_utf8(body.to_vec()).expect("dashboard is utf-8");
+    assert!(page.contains(&format!(
+        "const CSRF_TOKEN = sessionStorage.getItem(CSRF_HEADER) || \"{secret}\""
+    )));
+}
+
+#[tokio::test]
+async fn hardened_headers_stamp_every_response_not_just_the_index() {
+    for status_response in [
+        get_route_with_token(
+            &dashboard_router(test_state("token-123")),
+            "/api/options",
+            Some("token-123"),
+        )
+        .await,
+        get_route_with_token(
+            &dashboard_router(test_state("token-123")),
+            "/api/jobs",
+            None,
+        )
+        .await,
+    ] {
+        for (name, value) in [
+            ("content-security-policy", DASHBOARD_CONTENT_SECURITY_POLICY),
+            ("x-content-type-options", "nosniff"),
+            ("referrer-policy", "no-referrer"),
+            ("cache-control", "no-store"),
+            ("x-frame-options", "DENY"),
+        ] {
+            assert_eq!(
+                status_response.headers().get(name),
+                Some(&HeaderValue::from_static(value)),
+                "{name} missing on a {} response",
+                status_response.status()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_auth_restores_the_previous_unauthenticated_behavior() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let mut state = test_state_with_store("quiet-token", temp.path().join("jobs.sqlite"));
+    state.auth_enabled = false;
+    let router = dashboard_router(state);
+
+    // Reads reach handlers without any session credential...
+    let jobs = get_route_with_token(&router, "/api/jobs", None).await;
+    assert_eq!(jobs.status(), StatusCode::OK);
+    // ...and / once again serves the full dashboard with its embedded CSRF
+    // token (still CSRF-guarded per mutation by the legacy checks).
+    let index = get_route_with_token(&router, "/", None).await;
+    assert_eq!(index.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(index.into_body(), usize::MAX)
+        .await
+        .expect("index body should read");
+    let page = String::from_utf8(body.to_vec()).expect("page is utf-8");
+    assert!(
+        page.contains("quiet-token"),
+        "--no-auth embeds the CSRF token again"
+    );
+    // Mutations keep the legacy cross-site/CSRF rejection shape (403).
+    let retry = post_json(&router, "/api/jobs/not-real/retry", None, json!({})).await;
+    assert_eq!(retry.status(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn valid_job_id_mirrors_audiobook_id_strictness() {
+    for valid in ["job_1750000000000000000_deadbeef1234", "a", "x-9_Z"] {
+        assert!(valid_job_id(valid), "rejected {valid:?}");
+    }
+    for invalid in [
+        "",
+        "../escape",
+        "..",
+        "with/slash",
+        "with\\backslash",
+        "with.dot",
+        "with space",
+        "%2e%2e",
+        &"x".repeat(161),
+    ] {
+        assert!(!valid_job_id(invalid), "accepted {invalid:?}");
+    }
+}
+
+#[tokio::test]
+async fn traversal_job_ids_are_refused_before_touching_the_filesystem() {
+    let fixture = build_mutation_fixture();
+    let router = dashboard_router(test_state_with_store(
+        &fixture.csrf,
+        fixture.store_path.clone(),
+    ));
+
+    // Axum percent-decodes path params, so these land in the handler as
+    // traversal payloads ("../..", "with/slash"); both must die at the
+    // validation boundary with a client error — never a store/fs read that
+    // could fold unrelated JSONL into the response.
+    for encoded in ["..%2F..", "a%2Fhidden-run", "%2E%2E%2Fescapes"] {
+        let response = get_route_with_token(
+            &router,
+            &format!("/api/jobs/{encoded}/review"),
+            Some(&fixture.csrf),
+        )
+        .await;
+        assert!(
+            response.status().is_client_error(),
+            "traversal id {encoded} returned {}",
+            response.status()
+        );
+        assert_ne!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "traversal id {encoded} must be a deliberate rejection"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
+// SERVE-3: cancel verifies PID liveness + BookForge ownership before kill
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn audiobook_cancel_refuses_pid_that_cannot_be_verified_as_bookforge() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let pid_slot = u32::MAX - 11; // effectively never a live BookForge process
+    let out_dir = write_test_audiobook_operation(
+        temp.path(),
+        "unverifiable",
+        json!({"status": "running", "chunks": []}),
+        json!({
+            "status": "running",
+            "pid": pid_slot,
+            "updated_at_ms": 10,
+        }),
+    );
+    let cancelled = Arc::new(Mutex::new(Vec::new()));
+    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    state.audio_restart_cancels = Some(cancelled.clone());
+    let router = dashboard_router(state);
+
+    let response = post_json(
+        &router,
+        "/api/audiobooks/unverifiable/cancel",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let payload = response_json(response).await;
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nothing was signalled"),
+        "refusal explains itself: {payload}"
+    );
+    assert!(cancelled.lock().unwrap().is_empty(), "no signal may fire");
+    let process: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(out_dir.join("process.json")).expect("process state remains"),
+    )
+    .expect("process state is JSON");
+    assert_eq!(process["status"], "running", "state stays untouched");
+}
+
+#[test]
+fn liveness_identity_check_accepts_our_own_live_process() {
+    // The test binary IS the current bookforge executable, so the recorded
+    // self-pid is exactly what a genuine restart scenario would produce.
+    assert!(live_process_is_bookforge(std::process::id()));
+}
+
+// -----------------------------------------------------------------------
+// SERVE-6: launch slot cap in AppState
+// -----------------------------------------------------------------------
+
+#[test]
+fn launch_slots_block_at_the_cap_and_release_on_drop() {
+    let state = test_state("token-123");
+    let mut guards = Vec::new();
+    for _ in 0..MAX_CONCURRENT_DASHBOARD_LAUNCHES {
+        match try_acquire_launch_slot(&state).expect("registry locks") {
+            LaunchSlot::Acquired(guard) => guards.push(guard),
+            LaunchSlot::Exhausted => panic!("cap reached too early"),
+        }
+    }
+    assert!(
+        matches!(
+            try_acquire_launch_slot(&state).expect("registry locks"),
+            LaunchSlot::Exhausted
+        ),
+        "fifth concurrent launch must be refused"
+    );
+
+    drop(guards.pop());
+    assert!(
+        matches!(
+            try_acquire_launch_slot(&state).expect("registry locks"),
+            LaunchSlot::Acquired(_)
+        ),
+        "a released slot becomes acquirable"
+    );
+    drop(guards);
+    let held = *state.launch_slots.lock().unwrap();
+    assert_eq!(held, 0, "dropping every guard empties the registry");
+}
+
+// -----------------------------------------------------------------------
+// Quality: idle correction-lock entries are evicted
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn correction_lock_registry_evicts_idle_entries_only() {
+    let state = test_state("token-123");
+
+    // Acquiring creates the entry; eviction while uncontended removes it.
+    let first = job_correction_lock(&state, "job-idle").expect("lock resolves");
+    drop(first);
+    evict_idle_correction_lock(&state, "job-idle");
+    assert!(state.correction_locks.lock().unwrap().is_empty());
+
+    // A contended lock is never evicted (another correction is mid-flight),
+    // but once the holder finishes it becomes evictable again.
+    let held = job_correction_lock(&state, "job-busy").expect("lock resolves");
+    let guard_task = tokio::spawn({
+        let held = held.clone();
+        async move {
+            let _guard = held.lock().await;
+            // Keep the mutex locked long enough for the evict attempt below.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    evict_idle_correction_lock(&state, "job-busy");
+    assert_eq!(
+        state.correction_locks.lock().unwrap().len(),
+        1,
+        "busy locks stay registered"
+    );
+    guard_task.await.expect("holder task joins");
+    evict_idle_correction_lock(&state, "job-busy");
+    assert!(state.correction_locks.lock().unwrap().is_empty());
+}
+
+// -----------------------------------------------------------------------
+// H-6 / SERVE-2: private directories and files at the serve entry points
+// -----------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn private_dirs_are_created_and_loose_ancestors_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("temp dir should be created");
+    let base = root.path().join(".bookforge");
+    let target = base.join("serve-uploads");
+
+    // Pre-existing, previously-loose components get tightened in place
+    // (the exact H-6 regression: an older release's world-readable root).
+    std::fs::create_dir_all(&base).expect("base should exist");
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
+        .expect("permissions should apply");
+    ensure_private_dir_under(root.path(), &target).expect("dir should be created");
+
+    for dir in [base.clone(), target] {
+        let mode = std::fs::metadata(&dir)
+            .expect("metadata should read")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "{} must be 0700", dir.display());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn write_private_file_yields_owner_only_permissions_even_over_stale_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("temp dir should be created");
+    let path = root.path().join("upload.epub");
+    // Stale file from an older release with everyone-readable bits.
+    std::fs::write(&path, b"old").expect("stale file should be written");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("permissions should apply");
+
+    write_private_file(&path, b"private book contents").expect("write should succeed");
+
+    assert_eq!(
+        std::fs::read(&path).expect("read back"),
+        b"private book contents"
+    );
+    let mode = std::fs::metadata(&path)
+        .expect("metadata should read")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[tokio::test]
+async fn estimate_endpoint_parses_upload_from_a_private_temp_dir_end_to_end() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    // A real EPUB through a real multipart upload and parser: exercises the
+    // per-request temp-dir path that replaced shared predictable names, with
+    // no provider network access (mock).
+    let upload_dir = tempfile::tempdir().expect("temp dir should be created");
+    let epub = tempfile::tempdir().expect("fixture dir should be created");
+    let epub_path = epub.path().join("fixture.epub");
+    build_fixture_epub(&epub_path);
+    let bytes = std::fs::read(&epub_path).expect("fixture EPUB should read");
+
+    let boundary = "B";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fixture.epub\"\r\nContent-Type: application/epub+zip\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"provider\"\r\n\r\nmock\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"target\"\r\n\r\nItalian\r\n--{boundary}--\r\n")
+            .as_bytes(),
+    );
+
+    let response = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        upload_dir.path().to_path_buf(),
+    ))
+    .oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/estimate")
+            .header("host", TEST_HOST)
+            .header(CSRF_HEADER, "token-123")
+            .header("content-type", "multipart/form-data; boundary=B")
+            .body(Body::from(body))
+            .expect("request should build"),
+    )
+    .await
+    .expect("route should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = response_json(response).await;
+    // Three segments (two chapters + OPF title) parsed from the upload that
+    // only ever lived inside the per-request private temp directory.
+    assert_eq!(payload["segments"], json!(3), "payload: {payload}");
+    assert_eq!(payload["model"], json!("mock-prefix-target"));
+    assert_eq!(payload["input_tokens"], json!(33));
 }

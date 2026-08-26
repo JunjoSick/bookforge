@@ -1,5 +1,18 @@
 const CSRF_HEADER = "x-bookforge-csrf";
-const CSRF_TOKEN = "__BOOKFORGE_CSRF_TOKEN__";
+// The server only substitutes this placeholder for callers that already hold
+// the session credential; regular browsers get it from sessionStorage, seeded
+// by the ?token= bootstrap link printed by `bookforge serve`.
+const CSRF_TOKEN = sessionStorage.getItem(CSRF_HEADER) || "__BOOKFORGE_CSRF_TOKEN__";
+function bfSessionSeeded() { return !!sessionStorage.getItem(CSRF_HEADER); }
+function bfSignedOut() {
+  try { sessionStorage.removeItem(CSRF_HEADER); } catch (e) {}
+  const old = $("#auth-notice"); if (old) return;
+  const banner = document.createElement("div");
+  banner.id = "auth-notice";
+  banner.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:9999;padding:12px 18px;background:#7a1f1f;color:#fff;font:500 13px system-ui,sans-serif;text-align:center";
+  banner.textContent = "Dashboard session expired or missing — reopen the http://127.0.0.1:?token=… link printed by bookforge serve in its terminal.";
+  document.body.appendChild(banner);
+}
 const $ = (sel, el) => (el || document).querySelector(sel);
 const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 function esc(value) { return String(value == null ? "" : value).replace(/[&<>"']/g, ch => ESC[ch]); }
@@ -704,10 +717,59 @@ async function pollAudiobook(id) {
     <div class="costbox"><div><div class="ck">Output</div><div class="mono" style="margin-top:8px;word-break:break-all">${esc(data.artifact||data.out_dir||"")}</div></div><div class="cm">${progress}% complete<br>${num(chunks.reduce((sum,chunk)=>sum+(chunk.chars||0),0))} characters planned</div></div>
     <div class="wizfoot" style="padding:18px 0 0"><span class="grow"></span>
       ${!terminal?`<button class="btn btn-ghost" onclick="bfCancelAudiobook('${esc(id)}')">Cancel</button>`:""}
-      ${status==="succeeded"&&data.artifact?`<audio class="audio-player" controls preload="none" src="/api/audiobooks/${encodeURIComponent(id)}/artifact?disposition=inline"></audio>`:""}
-      ${status==="succeeded"?`<a class="btn btn-primary" href="/api/audiobooks/${encodeURIComponent(id)}/artifact">Download ${data.artifact?"M4B":"audio ZIP"}</a>`:""}
+      ${status==="succeeded"?`<audio class="audio-player" id="audio-player" controls preload="none"></audio>
+      <button class="btn btn-primary" id="artifact-download">Download ${data.artifact?"M4B":"audio ZIP"}</button>`:""}
     </div>${data.error?`<div class="empty" style="color:var(--bad)">${esc(data.error)}</div>`:""}`;
+  hydrateArtifact(id, status === "succeeded");
   if (!terminal) setTimeout(()=>pollAudiobook(id), 800);
+}
+
+// Artifact playback/download need the session-token header, which plain
+// audio `src=` / anchor `href=` navigation cannot send. Fetch the bytes with
+// the header and hand the DOM a one-off blob: URL instead.
+const artifactUrls = new Map();
+function cachedArtifactUrl(key) { const url = artifactUrls.get(key); return url ? url.url : null; }
+async function hydrateArtifact(id, succeeded) {
+  const player = $("#audio-player"), download = $("#artifact-download");
+  if (!succeeded || (!player && !download)) return;
+  const inlineKey = id + "|inline", downloadKey = id + "|download";
+  try {
+    if (player) {
+      let url = cachedArtifactUrl(inlineKey);
+      if (!url) {
+        const response = await fetch(`/api/audiobooks/${encodeURIComponent(id)}/artifact?disposition=inline`, { headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+        if (response.status === 401) { bfSignedOut(); return; }
+        if (!response.ok) throw new Error("artifact unavailable");
+        url = URL.createObjectURL(await response.blob());
+        artifactUrls.set(inlineKey, { url });
+      }
+      player.src = url;
+    }
+    if (download) {
+      download.onclick = async () => {
+        try {
+          let entry = artifactUrls.get(downloadKey);
+          if (!entry || !entry.name) {
+            const response = await fetch(`/api/audiobooks/${encodeURIComponent(id)}/artifact`, { headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+            if (response.status === 401) { bfSignedOut(); return; }
+            if (!response.ok) throw new Error("artifact unavailable");
+            const disposition = response.headers.get("content-disposition") || "";
+            const match = disposition.match(/filename="([^"]+)"/);
+            entry = { url: URL.createObjectURL(await response.blob()), name: match ? match[1] : "audiobook.zip" };
+            artifactUrls.set(downloadKey, entry);
+          }
+          const anchor = document.createElement("a");
+          anchor.href = entry.url;
+          anchor.download = entry.name;
+          document.body.appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+        } catch (e) {}
+      };
+    }
+  } catch (e) {
+    if (player) player.outerHTML = `<div class="empty">Audio playback is unavailable for this book.</div>`;
+  }
 }
 async function bfCancelAudiobook(id) {
   try {
@@ -899,13 +961,77 @@ function fmtEvent(ev) {
 }
 function openStream(id) {
   closeStream();
-  App.es = new EventSource("/api/jobs/" + encodeURIComponent(id) + "/events");
+  // Auth requires the session token as a header on every API call, and
+  // EventSource cannot set headers — so consume the SSE stream with fetch
+  // and parse the same wire format (event:/data: frames, blank-line
+  // separated, `:`-prefixed keepalive comments ignored).
+  const controller = new AbortController();
+  App.es = controller;
+  const streamState = { id };
   setLive(true, "live");
-  App.es.addEventListener("state", (e) => { if (App.selected === id && App.screen === "progress") { try { updateState(JSON.parse(e.data)); } catch (_) {} } });
-  App.es.addEventListener("done", () => { setLive(false, "finished"); closeStream(); });
-  App.es.onerror = () => setLive(false, "reconnecting…");
+  consumeEventStream(streamState, controller);
 }
-function closeStream() { if (App.es) { App.es.close(); App.es = null; } }
+async function consumeEventStream(state, controller) {
+  try {
+    const response = await fetch("/api/jobs/" + encodeURIComponent(state.id) + "/events", {
+      headers: { [CSRF_HEADER]: CSRF_TOKEN },
+      signal: controller.signal,
+    });
+    if (response.status === 401) { bfSignedOut(); setLive(false, "signed out"); return; }
+    if (!response.ok || !response.body) throw new Error("stream unavailable");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary;
+      while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        handleSseFrame(state, frame);
+      }
+    }
+    // Stream ended server-side (crash/restart): retry like EventSource did.
+    scheduleEventStreamRetry(state);
+  } catch (e) {
+    if (!controller.signal.aborted) scheduleEventStreamRetry(state);
+  }
+}
+function scheduleEventStreamRetry(state) {
+  if (App.es !== null && !(App.es instanceof AbortController)) return;
+  if (App.screen !== "progress" || App.selected !== state.id) return;
+  setLive(false, "reconnecting…");
+  setTimeout(() => {
+    if (App.screen === "progress" && App.selected === state.id && !state.finished) openStream(state.id);
+  }, 1500);
+}
+function handleSseFrame(state, frame) {
+  let event = "message";
+  const data = [];
+  for (const line of frame.split("\n")) {
+    if (line.startsWith(":")) continue;
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+  }
+  const payload = data.join("\n");
+  if (event === "state" && App.selected === state.id && App.screen === "progress") {
+    state.live = true;
+    try { updateState(JSON.parse(payload)); } catch (_) {}
+  } else if (event === "done") {
+    state.live = false;
+    setLive(false, "finished");
+    if (App.es instanceof AbortController) App.es.abort();
+    App.es = null;
+  }
+}
+function closeStream() {
+  if (App.es) {
+    if (App.es instanceof AbortController) App.es.abort();
+    App.es = null;
+  }
+}
 async function bfRetry(id) {
   const btn = $("#retrybtn"), toast = $("#toast");
   if (btn) btn.disabled = true; if (toast) toast.textContent = "submitting…";
@@ -1234,10 +1360,17 @@ async function bfGlossaryRemove(id) {
 
 /* ---------------- boot ---------------- */
 async function loadOptions() {
-  try { const r = await fetch("/api/options"); if (r.ok) App.options = await r.json(); } catch (e) {}
+  try { const r = await fetch("/api/options", { headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    if (r.ok) App.options = await r.json();
+    else if (r.status === 401) bfSignedOut();
+  } catch (e) {}
 }
 async function loadProviderStatus() {
-  try { App.providerKeys = await (await fetch("/api/providers")).json(); } catch (e) { App.providerKeys = {}; }
+  try {
+    const r = await fetch("/api/providers", { headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    if (r.ok) App.providerKeys = await r.json();
+    else if (r.status === 401) bfSignedOut();
+  } catch (e) { App.providerKeys = {}; }
 }
 async function boot() {
   applyTheme();

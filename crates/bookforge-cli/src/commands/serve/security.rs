@@ -11,6 +11,34 @@ pub(super) async fn validate_dashboard_host(
     forbidden("dashboard host header rejected")
 }
 
+/// Bare 401 for failed session-token checks (H-5): no detail about which half
+/// of the credential was wrong, so a probing local process learns nothing.
+pub(super) fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "dashboard authentication required; open the URL printed by `bookforge serve`" })),
+    )
+        .into_response()
+}
+
+/// Stamp the hardened response headers onto every response (SERVE-9). The
+/// index used to carry them alone; API bodies, error JSON, SSE frames, and
+/// artifact streams deserve the same baseline defense.
+pub(super) fn apply_security_headers(response: &mut Response) {
+    let headers = response.headers_mut();
+    for (name, value) in [
+        ("content-security-policy", DASHBOARD_CONTENT_SECURITY_POLICY),
+        ("x-frame-options", "DENY"),
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+        ("cache-control", "no-store"),
+    ] {
+        if let Ok(value) = value.parse::<axum::http::HeaderValue>() {
+            headers.insert(name, value);
+        }
+    }
+}
+
 fn dashboard_host_allowed(headers: &HeaderMap, port: u16) -> bool {
     headers
         .get(HOST)

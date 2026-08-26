@@ -178,6 +178,7 @@ async fn run_default() -> Result<()> {
     serve::run(serve::ServeArgs {
         bind: "127.0.0.1:8765".to_string(),
         open: true,
+        no_auth: false,
         refresh_ms: 250,
     })
     .await

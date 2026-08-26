@@ -1,5 +1,13 @@
 use super::*;
 
+/// Shared SERVE-4 guard: reject job ids that cannot legitimately name a store
+/// record or run directory before anything derives a filesystem path from
+/// them. Axum percent-decodes path segments, so `..%2f..` arrives here as a
+/// traversal attempt and must die at this boundary.
+fn reject_invalid_job_id(id: &str) -> Option<Response> {
+    (!valid_job_id(id)).then(invalid_job_id_response)
+}
+
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/jobs", get(list_jobs))
@@ -47,6 +55,9 @@ async fn job_detail(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Response, AppError> {
+    if let Some(response) = reject_invalid_job_id(&id) {
+        return Ok(response);
+    }
     let lookup = id.clone();
     let store_path = state.store_path.clone();
     let detail = tokio::task::spawn_blocking(move || -> Result<Option<JobDetail>> {
@@ -79,6 +90,9 @@ async fn job_reconfigure(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Response, AppError> {
+    if let Some(response) = reject_invalid_job_id(&id) {
+        return Ok(response);
+    }
     let store_path = state.store_path.clone();
     let lease_stale_after = state.runtime_lease_stale_after;
     let outcome = tokio::task::spawn_blocking(move || {
@@ -103,6 +117,9 @@ async fn update_job_reconfigure(
     Json(incoming): Json<super::reconfigure::RunConfigOverrides>,
 ) -> Result<Response, AppError> {
     if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_invalid_job_id(&id) {
         return Ok(response);
     }
     if incoming.is_empty() {
@@ -144,10 +161,17 @@ async fn job_events(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
+    // Guarded here because the fallback below joins the id into an events
+    // path; `resolve_events_path` stays safe regardless.
+    let valid_id = valid_job_id(&id);
     let refresh = state.refresh;
     let path = resolve_events_path(id, state.store_path.clone()).await;
 
     let stream = async_stream::stream! {
+        if !valid_id {
+            yield Ok(Event::default().event("done").data("done"));
+            return;
+        }
         let mut tailer = EventLogTailer::new(path);
         let mut run = RunState::default();
         let mut ticker = tokio::time::interval(refresh);
@@ -185,6 +209,9 @@ async fn job_review(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Response, AppError> {
+    if let Some(response) = reject_invalid_job_id(&id) {
+        return Ok(response);
+    }
     let store_path = state.store_path.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let store = JobStore::open(store_path)?;
@@ -213,6 +240,12 @@ async fn save_manual_translation(
     headers: HeaderMap,
     Json(request): Json<ManualCorrectionRequest>,
 ) -> Result<Response, AppError> {
+    if let Some(response) = reject_invalid_job_id(&id) {
+        return Ok(response);
+    }
+    if !valid_segment_id(&segment_id) {
+        return Ok(bad_request("invalid segment id"));
+    }
     if let Some(response) = reject_mutation(&headers, &state) {
         return Ok(response);
     }
@@ -224,17 +257,26 @@ async fn save_manual_translation(
     // Held across the whole read-modify-write so a second tab cannot stage a
     // rebuilt EPUB from a snapshot taken before this correction lands.
     let lock = job_correction_lock(&state, &id)?;
-    let _guard = lock.lock().await;
-    let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
-        let store = JobStore::open(store_path)?;
-        super::correct::correct_job_segment(
-            &store,
-            &id,
-            &segment_id,
-            super::correct::CorrectionPayload::Blocks(request.blocks),
-        )
-    })
-    .await?;
+    let evict_job_id = id.clone();
+    let outcome = {
+        let _guard = lock.lock().await;
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let store = JobStore::open(store_path)?;
+            super::correct::correct_job_segment(
+                &store,
+                &id,
+                &segment_id,
+                super::correct::CorrectionPayload::Blocks(request.blocks),
+            )
+        })
+        .await?
+    };
+    // Quality fix: release the registry entry once the job's corrections are
+    // done contending, so long-lived servers don't accumulate one entry per
+    // book ever edited. Contended or still-held locks are never evicted.
+    if outcome.is_ok() {
+        evict_idle_correction_lock(&state, &evict_job_id);
+    }
 
     match outcome {
         Ok(outcome) => Ok(Json(outcome).into_response()),
@@ -253,6 +295,12 @@ async fn set_segment_flag(
     headers: HeaderMap,
     Json(request): Json<SegmentFlagRequest>,
 ) -> Result<Response, AppError> {
+    if let Some(response) = reject_invalid_job_id(&id) {
+        return Ok(response);
+    }
+    if !valid_segment_id(&segment_id) {
+        return Ok(bad_request("invalid segment id"));
+    }
     if let Some(response) = reject_mutation(&headers, &state) {
         return Ok(response);
     }
@@ -281,6 +329,12 @@ async fn retry_segment_with_guidance(
     headers: HeaderMap,
     Json(request): Json<SegmentRetryRequest>,
 ) -> Result<Response, AppError> {
+    if let Some(response) = reject_invalid_job_id(&id) {
+        return Ok(response);
+    }
+    if !valid_segment_id(&segment_id) {
+        return Ok(bad_request("invalid segment id"));
+    }
     if let Some(response) = reject_mutation(&headers, &state) {
         return Ok(response);
     }
@@ -308,6 +362,9 @@ async fn job_validate(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_invalid_job_id(&id) {
         return Ok(response);
     }
 
@@ -348,6 +405,9 @@ async fn retry_job(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_invalid_job_id(&id) {
         return Ok(response);
     }
     let store_path = state.store_path.clone();
@@ -441,6 +501,11 @@ async fn resume_job(
         return Ok(missing_resume_key(&action.provider, api_key_env.as_deref()));
     }
 
+    // SERVE-6: launching a replacement worker is a dashboard launch too.
+    let slot = match try_acquire_launch_slot(&state)? {
+        LaunchSlot::Acquired(slot) => slot,
+        LaunchSlot::Exhausted => return Ok(launch_slot_exhausted()),
+    };
     let Some(mut launch_claim) = crate::control::RuntimeLaunchClaim::acquire(&id)? else {
         return Ok(Json(json!({
             "command": "resume",
@@ -504,6 +569,7 @@ async fn resume_job(
         )));
     }
     launch_claim.persist_until_worker();
+    drop(slot);
     Ok(Json(json!({
         "command": "resume",
         "mode": "spawned",
@@ -565,6 +631,9 @@ async fn control_job(
     if let Some(response) = reject_mutation(&headers, &state) {
         return Ok(response);
     }
+    if let Some(response) = reject_invalid_job_id(&id) {
+        return Ok(response);
+    }
     let store_path = state.store_path.clone();
     let lease_stale_after = state.runtime_lease_stale_after;
     let outcome = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
@@ -618,9 +687,30 @@ pub(super) fn job_correction_lock(
     Ok(locks.entry(job_id.to_string()).or_default().clone())
 }
 
+/// Remove a job's correction lock from the registry when it is genuinely
+/// idle: nobody holds a clone mid-`lock()` and the mutex is not locked.
+/// Synchronous and lock-order-safe (the registry guard is the only one held).
+pub(super) fn evict_idle_correction_lock(state: &AppState, job_id: &str) {
+    let Ok(mut locks) = state.correction_locks.lock() else {
+        return;
+    };
+    if locks
+        .get(job_id)
+        .is_some_and(|lock| lock.try_lock().is_ok())
+    {
+        locks.remove(job_id);
+    }
+}
+
 /// Resolve a job's event-log path off the async runtime (sqlite is blocking).
 async fn resolve_events_path(id: String, store_path: PathBuf) -> PathBuf {
-    let fallback = PathBuf::from(format!(".bookforge/runs/{id}/events.jsonl"));
+    // Defense in depth for SERVE-4: job_events validates first; this keeps
+    // the fallback join safe even if a future caller forgets.
+    let fallback = if valid_job_id(&id) {
+        PathBuf::from(format!(".bookforge/runs/{id}/events.jsonl"))
+    } else {
+        PathBuf::from(".bookforge/runs/invalid-job-id/events.jsonl")
+    };
     let lookup = id.clone();
     tokio::task::spawn_blocking(move || {
         let job = JobStore::open(store_path)

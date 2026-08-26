@@ -73,13 +73,29 @@ async fn launch_translate(
         return Ok(bad_request("provider API key is required"));
     }
 
+    // SERVE-6: bound simultaneous launches so a stray tab or looping script
+    // cannot start unbounded billable runs against remembered keys.
+    let slot = match try_acquire_launch_slot(&state)? {
+        LaunchSlot::Acquired(slot) => slot,
+        LaunchSlot::Exhausted => return Ok(launch_slot_exhausted()),
+    };
+
+    // The monotonic sequence disambiguates two uploads of the same file name
+    // landing within one millisecond (launch-filename-collision quality fix);
+    // the run directory itself stays job-id keyed once the child registers.
     let stem = sanitize_component(strip_epub_suffix(&file_name));
-    let tag = format!("{}-{stem}", now_ms());
+    let tag = format!("{}-{}-{stem}", now_ms(), next_launch_seq());
     let upload_dir = state.upload_dir.clone();
-    std::fs::create_dir_all(&upload_dir)?;
     let input_path = upload_dir.join(format!("{tag}.epub"));
-    std::fs::write(&input_path, &bytes)?;
     let out_path = upload_dir.join(format!("{tag}.{}.epub", sanitize_component(&target)));
+    let write_input_path = input_path.clone();
+    // A 64 MB EPUB must not be memcpy'd to disk on an async worker thread.
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        ensure_private_dir_under(Path::new(".bookforge"), &upload_dir)?;
+        write_private_file(&write_input_path, &bytes)?;
+        Ok(())
+    })
+    .await??;
 
     let exe = std::env::current_exe()?;
     let mut command = tokio::process::Command::new(exe);
@@ -149,14 +165,25 @@ async fn launch_translate(
 
     // Detached: the run outlives this request. The short startup check catches
     // immediate argv/binary failures before the dashboard reports success.
-    let mut child = command
-        .spawn()
-        .context("failed to spawn translation process")?;
+    // Either failure mode below cleans up the freshly written upload so a
+    // dead launch does not leave an orphaned book on disk.
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&input_path);
+            let _ = std::fs::remove_file(&out_path);
+            return Err(anyhow::Error::from(error)
+                .context("failed to spawn translation process")
+                .into());
+        }
+    };
     let pid = child.id();
     let completed_immediately = if let Some(status) =
         child_exit_status_after(&mut child, CHILD_STARTUP_CHECK).await?
     {
         if !status.success() {
+            let _ = std::fs::remove_file(&input_path);
+            let _ = std::fs::remove_file(&out_path);
             return Err(anyhow::anyhow!(
                     "translation process exited immediately with {status}; check the serve console for details"
                 )
@@ -166,6 +193,7 @@ async fn launch_translate(
     } else {
         false
     };
+    drop(slot);
 
     Ok(Json(json!({
         "ok": true,
@@ -179,8 +207,9 @@ async fn launch_translate(
 
 /// Estimate tokens and cost for an uploaded EPUB before the user commits to a
 /// run. Shares [`estimate_epub`](super::estimate::estimate_epub) with the CLI
-/// `estimate` command. The upload is written to a temp file (EPUB parsing reads
-/// from disk) and removed immediately after.
+/// `estimate` command. The upload lives only inside a per-request private
+/// temp directory (SERVE-5): 0700 on Unix, unpredictable name, deleted on
+/// drop whether parsing succeeds, fails, or panics.
 async fn estimate_translate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -212,18 +241,10 @@ async fn estimate_translate(
     let target = field_value(&fields, "target").unwrap_or_else(|| "Italian".to_string());
 
     let result = tokio::task::spawn_blocking(move || {
-        let seq = ESTIMATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "bookforge-estimate-{}-{}-{}.epub",
-            std::process::id(),
-            now_ms(),
-            seq
-        ));
-        std::fs::write(&path, &bytes)?;
-        let outcome =
-            super::estimate::estimate_epub(&path, &target, &provider, model.as_deref(), None);
-        let _ = std::fs::remove_file(&path);
-        outcome
+        let temp = PrivateTempDir::create().context("failed to create a private temp directory")?;
+        let path = temp.path.join("book.epub");
+        write_private_file(&path, &bytes)?;
+        super::estimate::estimate_epub(&path, &target, &provider, model.as_deref(), None)
     })
     .await?;
 
