@@ -8,10 +8,14 @@ impl JobStore {
         let input_path = request.input.to_path_buf();
         let output_path = request.output.to_path_buf();
         let conn = self.conn.borrow();
-        conn.execute(
+        let sql = format!(
             "INSERT INTO jobs
              (id, input_path, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, book_id, series_id, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'running', ?13, ?13)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, '{}', ?13, ?13)",
+            JobStatus::Running.as_db_text()
+        );
+        conn.execute(
+            &sql,
             params![
                 id,
                 input_path.to_string_lossy(),
@@ -42,7 +46,7 @@ impl JobStore {
             model: request.model.to_string(),
             base_url: request.base_url.map(ToOwned::to_owned),
             api_key_env: request.api_key_env.map(ToOwned::to_owned),
-            status: "running".to_string(),
+            status: JobStatus::Running.label().to_string(),
             events_path: None,
             report_json_path: None,
             report_markdown_path: None,
@@ -177,40 +181,42 @@ impl JobStore {
     }
 
     pub fn recompute_job_status(&self, job_id: &str) -> Result<()> {
+        let resolved = SegmentStatus::sql_set(SegmentStatus::resolved());
         let conn = self.conn.borrow();
-        let (total, unresolved) = conn.query_row(
+        let sql = format!(
             "SELECT COUNT(*),
-                    COALESCE(SUM(CASE WHEN status IN ('succeeded', 'skipped_cached') THEN 0 ELSE 1 END), 0)
-             FROM segments WHERE job_id = ?1",
-            params![job_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )?;
+                    COALESCE(SUM(CASE WHEN status IN ({resolved}) THEN 0 ELSE 1 END), 0)
+             FROM segments WHERE job_id = ?1"
+        );
+        let (total, unresolved) = conn.query_row(&sql, params![job_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
         drop(conn);
         if total > 0 && unresolved == 0 {
-            self.touch_job(job_id, "succeeded")
+            self.touch_job(job_id, JobStatus::Succeeded)
         } else {
-            self.touch_job(job_id, "needs_review")
+            self.touch_job(job_id, JobStatus::NeedsReview)
         }
     }
 
     pub fn mark_job_complete(&self, job_id: &str) -> Result<()> {
-        self.touch_job_unless_status(job_id, "succeeded", &["stopped"])
+        self.touch_job_unless_status(job_id, JobStatus::Succeeded, &[JobStatus::Stopped])
     }
 
     pub fn mark_job_running(&self, job_id: &str) -> Result<()> {
-        self.touch_job_unless_status(job_id, "running", &["stopped"])
+        self.touch_job_unless_status(job_id, JobStatus::Running, &[JobStatus::Stopped])
     }
 
     pub fn mark_job_running_for_resume(&self, job_id: &str) -> Result<()> {
-        self.touch_job(job_id, "running")
+        self.touch_job(job_id, JobStatus::Running)
     }
 
     pub fn mark_job_paused(&self, job_id: &str) -> Result<()> {
-        self.touch_job_unless_status(job_id, "paused", &["stopped"])
+        self.touch_job_unless_status(job_id, JobStatus::Paused, &[JobStatus::Stopped])
     }
 
     pub fn mark_job_stopped(&self, job_id: &str) -> Result<()> {
-        self.touch_job(job_id, "stopped")
+        self.touch_job(job_id, JobStatus::Stopped)
     }
 
     pub fn mark_job_succeeded(&self, job_id: &str) -> Result<()> {
@@ -218,24 +224,26 @@ impl JobStore {
     }
 
     pub fn mark_job_needs_review(&self, job_id: &str) -> Result<()> {
-        self.touch_job_unless_status(job_id, "needs_review", &["stopped"])
+        self.touch_job_unless_status(job_id, JobStatus::NeedsReview, &[JobStatus::Stopped])
     }
 
     pub fn mark_job_interrupted(&self, job_id: &str) -> Result<()> {
-        self.touch_job_unless_status(job_id, "interrupted", &["stopped"])
+        self.touch_job_unless_status(job_id, JobStatus::Interrupted, &[JobStatus::Stopped])
     }
 
     pub fn mark_job_failed(&self, job_id: &str) -> Result<()> {
-        self.touch_job_unless_status(job_id, "failed", &["stopped"])
+        self.touch_job_unless_status(job_id, JobStatus::Failed, &[JobStatus::Stopped])
     }
 
     pub fn mark_segment_failed(&self, job_id: &str, segment_id: &str, error: &str) -> Result<()> {
         {
             let conn = self.conn.borrow();
-            conn.execute(
-                "UPDATE segments SET status = 'failed', attempts = attempts + 1, error = ?1 WHERE job_id = ?2 AND id = ?3",
-                params![error, job_id, segment_id],
-            )?;
+            let sql = format!(
+                "UPDATE segments SET status = '{}', attempts = attempts + 1, error = ?1
+                 WHERE job_id = ?2 AND id = ?3",
+                SegmentStatus::Failed.as_db_text()
+            );
+            conn.execute(&sql, params![error, job_id, segment_id])?;
         }
         // Findings are instrumentation, so a failed findings write must never
         // fail the surrounding translation checkpoint.
@@ -252,14 +260,16 @@ impl JobStore {
     ) -> Result<()> {
         let updated = {
             let conn = self.conn.borrow();
-            conn.execute(
+            let sql = format!(
                 "UPDATE segments
-                 SET status = 'failed', attempts = attempts + 1, error = ?1
+                 SET status = '{}', attempts = attempts + 1, error = ?1
                  WHERE job_id = ?2
                    AND id = ?3
-                   AND status NOT IN ('succeeded', 'skipped_cached', 'needs_review')",
-                params![error, job_id, segment_id],
-            )?
+                   AND status NOT IN ({})",
+                SegmentStatus::Failed.as_db_text(),
+                SegmentStatus::sql_set(SegmentStatus::terminal_with_translation())
+            );
+            conn.execute(&sql, params![error, job_id, segment_id])?
         };
         if updated > 0 {
             // Findings are instrumentation, so a failed findings write must
@@ -278,6 +288,8 @@ impl JobStore {
     ) -> Result<usize> {
         const SQLITE_IN_CHUNK_SIZE: usize = 900;
         let mut updated = 0;
+        let failed_status = SegmentStatus::Failed.as_db_text();
+        let untouched = SegmentStatus::sql_set(SegmentStatus::terminal_with_translation());
 
         for chunk in candidate_segment_ids.chunks(SQLITE_IN_CHUNK_SIZE) {
             if chunk.is_empty() {
@@ -291,15 +303,15 @@ impl JobStore {
                 "SELECT id FROM segments
                  WHERE job_id = ?
                    AND id IN ({placeholders})
-                   AND status NOT IN ('succeeded', 'skipped_cached', 'needs_review')
+                   AND status NOT IN ({untouched})
                  ORDER BY id"
             );
             let update_sql = format!(
                 "UPDATE segments
-                 SET status = 'failed', attempts = attempts + 1, error = ?
+                 SET status = '{failed_status}', attempts = attempts + 1, error = ?
                  WHERE job_id = ?
                    AND id IN ({placeholders})
-                   AND status NOT IN ('succeeded', 'skipped_cached', 'needs_review')"
+                   AND status NOT IN ({untouched})"
             );
 
             let (chunk_updated, failed_segment_ids) = {
@@ -415,13 +427,15 @@ impl JobStore {
             summary.input_tokens += input_tokens as u64;
             summary.input_cached_tokens += input_cached_tokens as u64;
             summary.output_tokens += output_tokens as u64;
-            match status.as_str() {
-                "succeeded" => summary.succeeded += count,
-                "failed" => summary.failed += count,
-                "needs_review" => summary.needs_review += count,
-                "retry_pending" => summary.retry_pending += count,
-                "skipped_cached" => summary.cached += count,
-                _ => {}
+            match SegmentStatus::from_db_text(&status) {
+                SegmentStatus::Succeeded => summary.succeeded += count,
+                SegmentStatus::Failed => summary.failed += count,
+                SegmentStatus::NeedsReview => summary.needs_review += count,
+                SegmentStatus::RetryPending => summary.retry_pending += count,
+                SegmentStatus::SkippedCached => summary.cached += count,
+                // Unknown legacy values still count toward the totals above;
+                // they just cannot be bucketed into a lifecycle column.
+                SegmentStatus::Unknown(_) | SegmentStatus::Queued => {}
             }
         }
 
@@ -491,13 +505,15 @@ impl JobStore {
             summary.input_tokens += input_tokens as u64;
             summary.input_cached_tokens += input_cached_tokens as u64;
             summary.output_tokens += output_tokens as u64;
-            match status.as_str() {
-                "succeeded" => summary.succeeded += count,
-                "failed" => summary.failed += count,
-                "needs_review" => summary.needs_review += count,
-                "retry_pending" => summary.retry_pending += count,
-                "skipped_cached" => summary.cached += count,
-                _ => {}
+            match SegmentStatus::from_db_text(&status) {
+                SegmentStatus::Succeeded => summary.succeeded += count,
+                SegmentStatus::Failed => summary.failed += count,
+                SegmentStatus::NeedsReview => summary.needs_review += count,
+                SegmentStatus::RetryPending => summary.retry_pending += count,
+                SegmentStatus::SkippedCached => summary.cached += count,
+                // Unknown legacy values still count toward the totals above;
+                // they just cannot be bucketed into a lifecycle column.
+                SegmentStatus::Unknown(_) | SegmentStatus::Queued => {}
             }
         }
 
@@ -523,11 +539,11 @@ impl JobStore {
             .collect())
     }
 
-    pub(super) fn touch_job(&self, job_id: &str, status: &str) -> Result<()> {
+    pub(super) fn touch_job(&self, job_id: &str, status: JobStatus) -> Result<()> {
         let conn = self.conn.borrow();
         conn.execute(
             "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
-            params![status, timestamp_string(), job_id],
+            params![status.as_db_text(), timestamp_string(), job_id],
         )?;
         Ok(())
     }
@@ -535,8 +551,8 @@ impl JobStore {
     pub(super) fn touch_job_unless_status(
         &self,
         job_id: &str,
-        status: &str,
-        protected_statuses: &[&str],
+        status: JobStatus,
+        protected_statuses: &[JobStatus],
     ) -> Result<()> {
         let conn = self.conn.borrow();
         touch_job_unless_status_on(&conn, job_id, status, protected_statuses)
@@ -548,14 +564,14 @@ impl JobStore {
 pub(super) fn touch_job_unless_status_on(
     conn: &Connection,
     job_id: &str,
-    status: &str,
-    protected_statuses: &[&str],
+    status: JobStatus,
+    protected_statuses: &[JobStatus],
 ) -> Result<()> {
     let now = timestamp_string();
     if protected_statuses.is_empty() {
         conn.execute(
             "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
-            params![status, now, job_id],
+            params![status.as_db_text(), now, job_id],
         )?;
         return Ok(());
     }
@@ -568,12 +584,19 @@ pub(super) fn touch_job_unless_status_on(
          SET status = ?, updated_at = ?
          WHERE id = ? AND status NOT IN ({placeholders})"
     );
+    // Owned copies keep the referenced values alive until execute; the texts
+    // themselves are constant identifiers, never user input.
+    let status_text = status.as_db_text().to_string();
+    let protected_texts: Vec<String> = protected_statuses
+        .iter()
+        .map(|protected| protected.as_db_text().to_string())
+        .collect();
     let mut params: Vec<&dyn rusqlite::types::ToSql> =
-        Vec::with_capacity(3 + protected_statuses.len());
-    params.push(&status);
+        Vec::with_capacity(3 + protected_texts.len());
+    params.push(&status_text);
     params.push(&now);
     params.push(&job_id);
-    for protected in protected_statuses {
+    for protected in &protected_texts {
         params.push(protected);
     }
     conn.execute(&sql, params.as_slice())?;

@@ -2,7 +2,9 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,8 +24,13 @@ mod findings;
 mod flags;
 mod glossary;
 mod jobs;
+mod prune;
 mod schema;
+mod status;
 mod translations;
+
+#[cfg(test)]
+mod migrations_docs;
 
 // Internal cross-module helpers shared by the transactional checkpoint paths.
 use jobs::touch_job_unless_status_on;
@@ -34,9 +41,11 @@ pub use findings::{
     aggregate_findings, classify_segment_error,
 };
 pub use flags::RetryScope;
+pub use prune::{PruneJobDeletion, PruneJobsOptions, PruneJobsReport};
 pub use schema::run_doctor;
 #[cfg(test)]
 use schema::table_column_is_not_null;
+pub use status::{JobStatus, SegmentStatus};
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -64,6 +73,36 @@ pub enum StoreError {
 pub struct JobStore {
     conn: RefCell<Connection>,
     path: PathBuf,
+    /// Non-fatal conditions noticed while opening or migrating (for example
+    /// status values outside the canonical sets on legacy databases). Empty in
+    /// the common case; `take_diagnostics` drains them for surfacing.
+    diagnostics: Mutex<Vec<String>>,
+}
+
+impl JobStore {
+    pub(crate) fn new(conn: Connection, path: PathBuf) -> Self {
+        Self {
+            conn: RefCell::new(conn),
+            path,
+            diagnostics: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Drain non-fatal open/migration diagnostics (warn-once per call). The
+    /// common case is an empty vec: every field is only populated when the
+    /// underlying database carries state BookForge never wrote.
+    pub fn take_diagnostics(&self) -> Vec<String> {
+        self.diagnostics
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn push_diagnostic(&self, message: String) {
+        if let Ok(mut guard) = self.diagnostics.lock() {
+            guard.push(message);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +127,14 @@ pub struct JobRecord {
     pub series_id: Option<String>,
 }
 
+impl JobRecord {
+    /// Typed decode of [`Self::status`]. Unknown legacy values decode to
+    /// [`JobStatus::Unknown`] instead of panicking.
+    pub fn job_status(&self) -> JobStatus {
+        JobStatus::from_db_text(&self.status)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct JobSummary {
     pub id: String,
@@ -102,6 +149,13 @@ pub struct JobSummary {
     pub input_tokens: u64,
     pub input_cached_tokens: u64,
     pub output_tokens: u64,
+}
+
+impl JobSummary {
+    /// Typed decode of [`Self::status`]. See [`JobRecord::job_status`].
+    pub fn job_status(&self) -> JobStatus {
+        JobStatus::from_db_text(&self.status)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -130,6 +184,14 @@ pub struct SegmentRecord {
     pub tokens_estimated: bool,
 }
 
+impl SegmentRecord {
+    /// Typed decode of [`Self::status`]. Unknown legacy values decode to
+    /// [`SegmentStatus::Unknown`] instead of panicking.
+    pub fn segment_status(&self) -> SegmentStatus {
+        SegmentStatus::from_db_text(&self.status)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredBlockTranslation {
     pub segment_id: String,
@@ -149,6 +211,13 @@ pub struct StoredSegmentTranslation {
     pub model: String,
     pub human_corrected: bool,
     pub corrected_at: Option<String>,
+}
+
+impl StoredSegmentTranslation {
+    /// Typed decode of [`Self::status`]. See [`SegmentRecord::segment_status`].
+    pub fn segment_status(&self) -> SegmentStatus {
+        SegmentStatus::from_db_text(&self.status)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,9 +393,25 @@ pub struct StorageDoctor {
     pub note: String,
 }
 
+/// SHA-256 of a file read in bounded chunks (STORE-17 part B). EPUB inputs run
+/// into the hundreds of megabytes; hashing streamed 64 KiB at a time keeps the
+/// store's peak memory flat instead of loading the whole file into RAM like the
+/// former `fs::read` + one-shot digest did.
+const FILE_HASH_CHUNK_BYTES: usize = 64 * 1024;
+
 fn file_hash(path: &Path) -> CoreResult<String> {
-    let bytes = fs::read(path)?;
-    Ok(stable_hash_bytes(&bytes))
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; FILE_HASH_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn stable_hash(text: &str) -> String {

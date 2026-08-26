@@ -1,3 +1,4 @@
+use super::status::job_sql_set;
 use super::*;
 
 #[cfg(unix)]
@@ -79,10 +80,7 @@ impl JobStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        let store = Self {
-            conn: RefCell::new(conn),
-            path,
-        };
+        let store = JobStore::new(conn, path);
         store.migrate()?;
         Ok(store)
     }
@@ -361,7 +359,86 @@ impl JobStore {
             backfill_qa_findings(&conn)?;
             record_migration(&conn, 8, "v2_7_qa_findings")?;
         }
+        // Version 10 (STORE-12) hardens `jobs.status` / `segments.status` with
+        // CHECK constraints and doubles as the unknown-status warn-on-open
+        // pass. Gated like 0009 because it is a one-time table rebuild.
+        self.apply_status_check_constraints(&mut conn);
+
         Ok(())
+    }
+    /// STORE-12: enforce the canonical status vocabularies at the storage
+    /// layer via CHECK constraints, tolerating pre-existing rows:
+    ///
+    /// - Fresh or already-conforming databases get the rebuild once; it is
+    ///   recorded as migration 10 (`v2_8_status_check_constraints`) so later
+    ///   opens skip both the scan and the warning pass entirely — from then on
+    ///   the CHECKs guarantee no foreign status can be written again.
+    /// - Legacy databases whose rows contain values outside the canonical
+    ///   sets are left untouched (the original tables stay plain TEXT): the
+    ///   open succeeds, a diagnostic warns about every unknown value until the
+    ///   data is cleaned up, and reads decode such values defensively to the
+    ///   explicit `Unknown(..)` variant. Old names/rows are never rewritten in
+    ///   place silently.
+    fn apply_status_check_constraints(&self, conn: &mut Connection) {
+        let already_applied = match migration_applied(conn, 10) {
+            Ok(applied) => applied,
+            Err(error) => {
+                self.push_diagnostic(format!(
+                    "status check hardening skipped: could not read the migration ledger: {error}"
+                ));
+                return;
+            }
+        };
+        if already_applied {
+            return;
+        }
+
+        let offending_jobs =
+            distinct_status_values_outside(conn, "jobs", JobStatus::KNOWN_DB_TEXTS);
+        let offending_segments =
+            distinct_status_values_outside(conn, "segments", SegmentStatus::KNOWN_DB_TEXTS);
+
+        let (jobs_offenders, segments_offenders) = match (&offending_jobs, &offending_segments) {
+            (Ok(jobs), Ok(segments)) => (jobs.clone(), segments.clone()),
+            (Err(error), _) | (_, Err(error)) => {
+                self.push_diagnostic(format!(
+                    "status check hardening skipped: could not scan legacy status values: {error}"
+                ));
+                return;
+            }
+        };
+
+        for (table, offenders) in [("jobs", &jobs_offenders), ("segments", &segments_offenders)] {
+            for value in offenders {
+                self.push_diagnostic(format!(
+                    "warning: `{table}` contains non-canonical status {value:?}; \
+                     treated as Unknown on read and excluded from storage-level enforcement"
+                ));
+            }
+        }
+
+        if !jobs_offenders.is_empty() || !segments_offenders.is_empty() {
+            // Tolerate pre-existing rows: keep them exactly as they are rather
+            // than failing the open or rewriting history. The migration stays
+            // unapplied so a future open (after the data is corrected) can
+            // still add the constraints.
+            self.push_diagnostic(
+                "status check constraints not applied: resolve the non-canonical \
+                 statuses above to enable storage-level enforcement"
+                    .to_string(),
+            );
+            return;
+        }
+
+        if let Err(error) = harden_status_tables_with_check_constraints(conn) {
+            self.push_diagnostic(format!("status check hardening failed: {error}"));
+            return;
+        }
+        if let Err(error) = record_migration(conn, 10, "v2_8_status_check_constraints") {
+            self.push_diagnostic(format!(
+                "status check hardening succeeded but could not record migration 10: {error}"
+            ));
+        }
     }
 }
 
@@ -502,6 +579,262 @@ fn migration_applied(conn: &Connection, version: i64) -> rusqlite::Result<bool> 
     )
 }
 
+/// Distinct `status` values currently stored in `table` that are NOT part of
+/// the canonical set enforced by the CHECK constraints. Defensive against
+/// hand-edited legacy databases.
+fn distinct_status_values_outside(
+    conn: &Connection,
+    table: &str,
+    known: &[&str],
+) -> rusqlite::Result<Vec<String>> {
+    if !table_exists(conn, table)? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!("SELECT DISTINCT status FROM {table}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Option<String>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Column is NOT NULL, but tolerate a hand-edited NULL as an offender too:
+    // it is exactly what the rebuild must refuse to bless silently.
+    Ok(rows
+        .into_iter()
+        .flatten()
+        .filter(|value| !known.contains(&value.as_str()))
+        .collect())
+}
+
+/// Column lists shared by the hardened CREATE TABLE and its data-copy SELECT,
+/// so the rebuild can never silently drop or reorder what it preserves.
+const JOB_COLUMNS_ALL: &[&str] = &[
+    "id",
+    "input_path",
+    "input_snapshot_path",
+    "input_sha256",
+    "output_path",
+    "input_hash",
+    "source_lang",
+    "target_lang",
+    "provider",
+    "model",
+    "base_url",
+    "api_key_env",
+    "status",
+    "config_json",
+    "events_path",
+    "report_json_path",
+    "report_markdown_path",
+    "book_id",
+    "series_id",
+    "created_at",
+    "updated_at",
+];
+
+const SEGMENT_COLUMNS_ALL: &[&str] = &[
+    "id",
+    "job_id",
+    "section_id",
+    "ordinal",
+    "source_hash",
+    "prompt_version",
+    "provider",
+    "model",
+    "status",
+    "attempts",
+    "input_tokens",
+    "output_tokens",
+    "tokens_input",
+    "tokens_input_cached",
+    "tokens_output",
+    "tokens_estimated",
+    "cost_estimate",
+    "error",
+    "translated_hash",
+    "cache_namespace",
+];
+
+fn job_status_column_definition() -> String {
+    format!(
+        "status TEXT NOT NULL CHECK(status IN ({}))",
+        job_sql_set(JobStatus::all_known())
+    )
+}
+
+/// STORE-12 storage enforcement: one `IMMEDIATE` transaction rebuilds `jobs`
+/// and `segments` with CHECK-constrained `status` columns, copying every row
+/// verbatim, then recreates the indexes that lived on the dropped tables.
+///
+/// Follows the SQLite ALTER TABLE recipe: foreign_keys are disabled only
+/// around the transaction (pragmas cannot change inside one), both parent
+/// tables drop and rename inside the same transaction so a crash either keeps
+/// the original tables untouched or leaves the fully-swapped, constrained
+/// schema behind. `PRAGMA foreign_key_check` runs afterwards as a belt-and-
+/// braces guard for anything the swap could have unlinked.
+fn harden_status_tables_with_check_constraints(conn: &mut Connection) -> Result<()> {
+    let jobs_status = job_status_column_definition();
+    let segments_status = SegmentStatus::sql_set(SegmentStatus::all_known());
+    let jobs_table_name = format!("jobs_hardened_{}", unix_timestamp_nanos());
+    let segments_table_name = format!("segments_hardened_{}", unix_timestamp_nanos());
+
+    let create_jobs = format!(
+        "CREATE TABLE {jobs_table_name} (
+          id TEXT PRIMARY KEY,
+          input_path TEXT NOT NULL DEFAULT '',
+          input_snapshot_path TEXT,
+          input_sha256 TEXT,
+          output_path TEXT NOT NULL DEFAULT '',
+          input_hash TEXT NOT NULL,
+          source_lang TEXT,
+          target_lang TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          base_url TEXT,
+          api_key_env TEXT,
+          {jobs_status},
+          config_json TEXT,
+          events_path TEXT,
+          report_json_path TEXT,
+          report_markdown_path TEXT,
+          book_id TEXT,
+          series_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );"
+    );
+    let create_segments = format!(
+        "CREATE TABLE {segments_table_name} (
+          id TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          section_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          source_hash TEXT NOT NULL,
+          prompt_version TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ({segments_status})),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          input_tokens INTEGER,
+          output_tokens INTEGER,
+          tokens_input INTEGER,
+          tokens_input_cached INTEGER,
+          tokens_output INTEGER,
+          tokens_estimated INTEGER NOT NULL DEFAULT 0,
+          cost_estimate REAL,
+          error TEXT,
+          translated_hash TEXT,
+          cache_namespace TEXT NOT NULL DEFAULT '',
+          PRIMARY KEY (job_id, id),
+          FOREIGN KEY(job_id) REFERENCES jobs(id)
+        );"
+    );
+
+    conn.pragma_update(None, "foreign_keys", false)?;
+    harden_status_tables_inner(
+        conn,
+        &create_jobs,
+        &create_segments,
+        &jobs_table_name,
+        &segments_table_name,
+    )?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+
+    // Data was only ever copied (not mutated), so by construction the swapped
+    // schema has no dangling references. Still verify: any violation here
+    // would mean the rebuild itself broke referential integrity.
+    if let Some(offending) = first_foreign_key_violation(conn)? {
+        return Err(StoreError::Serialization(format!(
+            "status check hardening produced a foreign key violation involving table '{offending}'"
+        )));
+    }
+    Ok(())
+}
+
+fn harden_status_tables_inner(
+    conn: &mut Connection,
+    create_jobs: &str,
+    create_segments: &str,
+    jobs_tmp: &str,
+    segments_tmp: &str,
+) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch(create_jobs)?;
+    tx.execute_batch(create_segments)?;
+
+    // Copy only the columns that exist in BOTH the hardened table and the
+    // live source so partially-upgraded or very old databases never abort the
+    // rebuild on a missing column (their hardened targets supply DEFAULTs).
+    let jobs_source_columns = existing_columns(&tx, "jobs");
+    let segments_source_columns = existing_columns(&tx, "segments");
+    let jobs_source_columns = jobs_source_columns?;
+    let segments_source_columns = segments_source_columns?;
+    let jobs_copy_columns = JOB_COLUMNS_ALL
+        .iter()
+        .filter(|column| jobs_source_columns.contains::<str>(column))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let segments_copy_columns = SEGMENT_COLUMNS_ALL
+        .iter()
+        .filter(|column| segments_source_columns.contains::<str>(column))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    tx.execute(
+        &format!(
+            "INSERT INTO {jobs_tmp} ({jobs_copy_columns})
+             SELECT {jobs_copy_columns} FROM jobs"
+        ),
+        [],
+    )?;
+    tx.execute(
+        &format!(
+            "INSERT INTO {segments_tmp} ({segments_copy_columns})
+             SELECT {segments_copy_columns} FROM segments"
+        ),
+        [],
+    )?;
+
+    // Child tables keep pointing at the same names; dropping the parents is
+    // only legal while foreign_keys is off, which is exactly why it is toggled
+    // around this transaction.
+    tx.execute_batch(&format!(
+        "DROP TABLE segments;
+         DROP TABLE jobs;
+         ALTER TABLE {segments_tmp} RENAME TO segments;
+         ALTER TABLE {jobs_tmp} RENAME TO jobs;"
+    ))?;
+    // Indexes living on the dropped tables die with them; recreate exactly
+    // the set the procedural migrator maintains on jobs/segments (IF NOT
+    // EXISTS keeps this idempotent across retry attempts).
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_segments_cache_lookup
+         ON segments(source_hash, cache_namespace, prompt_version, provider, model, status);
+         CREATE INDEX IF NOT EXISTS idx_jobs_created_at
+         ON jobs(created_at);",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn first_foreign_key_violation(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
+fn existing_columns(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+) -> rusqlite::Result<std::collections::HashSet<String>> {
+    let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.into_iter().collect())
+}
+
 /// Remove duplicate global-scope rows that the NULL-tolerant table UNIQUE
 /// constraints allowed to accumulate, keeping the most recently updated row
 /// per identity (ties broken by higher id = later insert). Runs before the
@@ -551,19 +884,22 @@ fn deduplicate_global_scope_rows(conn: &Connection) -> Result<()> {
 }
 
 fn backfill_qa_findings(conn: &Connection) -> rusqlite::Result<usize> {
+    let flagged_statuses =
+        SegmentStatus::sql_set(&[SegmentStatus::NeedsReview, SegmentStatus::Failed]);
     let rows = {
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT s.job_id, s.id, s.error
              FROM segments s
-             WHERE s.status IN ('needs_review', 'failed')
+             WHERE s.status IN ({flagged_statuses})
                AND s.error IS NOT NULL
                AND TRIM(s.error) <> ''
                AND NOT EXISTS (
                  SELECT 1 FROM qa_findings f
                  WHERE f.job_id = s.job_id AND f.segment_id = s.id
                )
-             ORDER BY s.job_id, s.id",
-        )?;
+             ORDER BY s.job_id, s.id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,

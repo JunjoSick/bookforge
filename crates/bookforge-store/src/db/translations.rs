@@ -31,6 +31,7 @@ impl JobStore {
     ) -> Result<()> {
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
+        let queued_status = SegmentStatus::Queued.as_db_text();
         for segment in segments {
             // Resume re-runs this against rows that already exist. The
             // conflict arm refreshes the cache-attribution identity columns
@@ -38,15 +39,17 @@ impl JobStore {
             // change cannot leave stale values that future cache lookups
             // would misattribute; status/attempts/tokens stay untouched.
             tx.execute(
-                "INSERT INTO segments
-                 (id, job_id, section_id, ordinal, source_hash, prompt_version, provider, model, status, attempts, cache_namespace)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 0, ?9)
-                 ON CONFLICT(job_id, id) DO UPDATE SET
-                   source_hash = excluded.source_hash,
-                   prompt_version = excluded.prompt_version,
-                   provider = excluded.provider,
-                   model = excluded.model,
-                   cache_namespace = excluded.cache_namespace",
+                &format!(
+                    "INSERT INTO segments
+                     (id, job_id, section_id, ordinal, source_hash, prompt_version, provider, model, status, attempts, cache_namespace)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{queued_status}', 0, ?9)
+                     ON CONFLICT(job_id, id) DO UPDATE SET
+                       source_hash = excluded.source_hash,
+                       prompt_version = excluded.prompt_version,
+                       provider = excluded.provider,
+                       model = excluded.model,
+                       cache_namespace = excluded.cache_namespace"
+                ),
                 params![
                     segment.id.0,
                     job_id,
@@ -104,16 +107,19 @@ impl JobStore {
         )?;
         replace_block_translations(&tx, request.job_id, request.segment_id, request.blocks)?;
         tx.execute(
-            "UPDATE segments
-             SET status = 'succeeded',
-                 attempts = attempts + 1,
-                 tokens_input = ?1,
-                 tokens_input_cached = ?2,
-                 tokens_output = ?3,
-                 tokens_estimated = ?4,
-                 translated_hash = ?5,
-                 error = NULL
-             WHERE job_id = ?6 AND id = ?7",
+            &format!(
+                "UPDATE segments
+                 SET status = '{}',
+                     attempts = attempts + 1,
+                     tokens_input = ?1,
+                     tokens_input_cached = ?2,
+                     tokens_output = ?3,
+                     tokens_estimated = ?4,
+                     translated_hash = ?5,
+                     error = NULL
+                 WHERE job_id = ?6 AND id = ?7",
+                SegmentStatus::Succeeded.as_db_text()
+            ),
             params![
                 request.input_tokens.map(|value| value as i64),
                 request.input_cached_tokens.map(|value| value as i64),
@@ -139,7 +145,12 @@ impl JobStore {
             None => clear_segment_findings_on(&tx, request.job_id, request.segment_id),
         };
         consume_dashboard_retry_guidance_on(&tx, request.job_id, request.segment_id)?;
-        touch_job_unless_status_on(&tx, request.job_id, "running", &["paused", "stopped"])?;
+        touch_job_unless_status_on(
+            &tx,
+            request.job_id,
+            JobStatus::Running,
+            &[JobStatus::Paused, JobStatus::Stopped],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -170,16 +181,19 @@ impl JobStore {
         )?;
         replace_block_translations(&tx, request.job_id, request.segment_id, request.blocks)?;
         tx.execute(
-            "UPDATE segments
-             SET status = 'needs_review',
-                 attempts = attempts + 1,
-                 tokens_input = ?1,
-                 tokens_input_cached = ?2,
-                 tokens_output = ?3,
-                 tokens_estimated = ?4,
-                 translated_hash = ?5,
-                 error = ?6
-             WHERE job_id = ?7 AND id = ?8",
+            &format!(
+                "UPDATE segments
+                 SET status = '{}',
+                     attempts = attempts + 1,
+                     tokens_input = ?1,
+                     tokens_input_cached = ?2,
+                     tokens_output = ?3,
+                     tokens_estimated = ?4,
+                     translated_hash = ?5,
+                     error = ?6
+                 WHERE job_id = ?7 AND id = ?8",
+                SegmentStatus::NeedsReview.as_db_text()
+            ),
             params![
                 request.input_tokens.map(|value| value as i64),
                 request.input_cached_tokens.map(|value| value as i64),
@@ -199,7 +213,12 @@ impl JobStore {
         // fail the surrounding translation checkpoint.
         let _ = record_segment_findings_on(&tx, request.job_id, request.segment_id, request.error);
         consume_dashboard_retry_guidance_on(&tx, request.job_id, request.segment_id)?;
-        touch_job_unless_status_on(&tx, request.job_id, "needs_review", &["paused", "stopped"])?;
+        touch_job_unless_status_on(
+            &tx,
+            request.job_id,
+            JobStatus::NeedsReview,
+            &[JobStatus::Paused, JobStatus::Stopped],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -228,22 +247,30 @@ impl JobStore {
         )?;
         replace_block_translations(&tx, request.job_id, request.segment_id, request.blocks)?;
         tx.execute(
-            "UPDATE segments
-             SET status = 'skipped_cached',
-                 tokens_input = NULL,
-                 tokens_input_cached = NULL,
-                 tokens_output = NULL,
-                 tokens_estimated = 0,
-                 translated_hash = ?1,
-                 error = NULL
-             WHERE job_id = ?2 AND id = ?3",
+            &format!(
+                "UPDATE segments
+                 SET status = '{}',
+                     tokens_input = NULL,
+                     tokens_input_cached = NULL,
+                     tokens_output = NULL,
+                     tokens_estimated = 0,
+                     translated_hash = ?1,
+                     error = NULL
+                 WHERE job_id = ?2 AND id = ?3",
+                SegmentStatus::SkippedCached.as_db_text()
+            ),
             params![translated_hash, request.job_id, request.segment_id],
         )?;
         // Findings are instrumentation, so a failed findings write must never
         // fail the surrounding translation checkpoint.
         let _ = clear_segment_findings_on(&tx, request.job_id, request.segment_id);
         consume_dashboard_retry_guidance_on(&tx, request.job_id, request.segment_id)?;
-        touch_job_unless_status_on(&tx, request.job_id, "running", &["paused", "stopped"])?;
+        touch_job_unless_status_on(
+            &tx,
+            request.job_id,
+            JobStatus::Running,
+            &[JobStatus::Paused, JobStatus::Stopped],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -284,11 +311,14 @@ impl JobStore {
                 request.job_id
             )));
         };
-        if matches!(job_status.as_str(), "running" | "paused") {
-            return Err(StoreError::InvalidCorrection(format!(
-                "job '{}' is {}; stop it before applying a manual correction",
-                request.job_id, job_status
-            )));
+        match JobStatus::from_db_text(&job_status) {
+            JobStatus::Running | JobStatus::Paused => {
+                return Err(StoreError::InvalidCorrection(format!(
+                    "job '{}' is {job_status}; stop it before applying a manual correction",
+                    request.job_id
+                )));
+            }
+            _ => {}
         }
 
         let prompt_version = tx
@@ -329,9 +359,12 @@ impl JobStore {
         )?;
         replace_block_translations(&tx, request.job_id, request.segment_id, request.blocks)?;
         tx.execute(
-            "UPDATE segments
-             SET status = 'succeeded', translated_hash = ?1, error = NULL
-             WHERE job_id = ?2 AND id = ?3",
+            &format!(
+                "UPDATE segments
+                 SET status = '{}', translated_hash = ?1, error = NULL
+                 WHERE job_id = ?2 AND id = ?3",
+                SegmentStatus::Succeeded.as_db_text()
+            ),
             params![translated_hash, request.job_id, request.segment_id],
         )?;
         tx.execute(
@@ -356,11 +389,13 @@ impl JobStore {
 
     pub fn pending_segment_ids(&self, job_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.borrow();
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT id FROM segments
-             WHERE job_id = ?1 AND status IN ('queued', 'retry_pending')
+             WHERE job_id = ?1 AND status IN ({})
              ORDER BY ordinal",
-        )?;
+            SegmentStatus::sql_set(&[SegmentStatus::Queued, SegmentStatus::RetryPending])
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![job_id], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StoreError::from)
@@ -417,14 +452,16 @@ impl JobStore {
         job_id: &str,
     ) -> Result<Vec<StoredSegmentTranslation>> {
         let conn = self.conn.borrow();
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT s.id, s.ordinal, s.status, s.error, t.translated_text,
                     t.provider, t.model, t.human_corrected, t.corrected_at
              FROM segments s
              JOIN translations t ON t.job_id = s.job_id AND t.segment_id = s.id
-             WHERE s.job_id = ?1 AND s.status IN ('succeeded', 'skipped_cached', 'needs_review')
+             WHERE s.job_id = ?1 AND s.status IN ({})
              ORDER BY s.ordinal",
-        )?;
+            SegmentStatus::sql_set(SegmentStatus::terminal_with_translation())
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![job_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -485,11 +522,13 @@ impl JobStore {
 
     pub fn resumable_segment_ids(&self, job_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.borrow();
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT id FROM segments
-             WHERE job_id = ?1 AND status IN ('queued', 'retry_pending', 'failed')
+             WHERE job_id = ?1 AND status IN ({})
              ORDER BY ordinal",
-        )?;
+            SegmentStatus::sql_set(SegmentStatus::resumable())
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![job_id], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StoreError::from)
@@ -507,25 +546,30 @@ impl JobStore {
         cache_namespace: &str,
     ) -> Result<Option<CachedTranslation>> {
         let conn = self.conn.borrow();
+        let sql = format!(
+            "SELECT t.job_id, t.segment_id, t.translated_text
+             FROM translations t
+             JOIN segments s ON s.job_id = t.job_id AND s.id = t.segment_id
+             JOIN jobs j ON j.id = t.job_id
+             WHERE s.source_hash = ?1
+               AND s.prompt_version = ?2
+               AND s.provider = ?3
+               AND s.model = ?4
+               AND ((?5 IS NULL AND j.source_lang IS NULL) OR j.source_lang = ?5)
+               AND j.target_lang = ?6
+               AND s.cache_namespace = ?7
+               AND s.status IN ({})
+               AND t.human_corrected = 0
+             ORDER BY CASE s.status WHEN '{}' THEN 0 ELSE 1 END,
+                      CAST(t.created_at AS INTEGER) DESC,
+                      t.rowid DESC
+             LIMIT 1",
+            SegmentStatus::sql_set(SegmentStatus::resolved()),
+            SegmentStatus::Succeeded.as_db_text()
+        );
         let cached = conn
             .query_row(
-                "SELECT t.job_id, t.segment_id, t.translated_text
-                 FROM translations t
-                 JOIN segments s ON s.job_id = t.job_id AND s.id = t.segment_id
-                 JOIN jobs j ON j.id = t.job_id
-                 WHERE s.source_hash = ?1
-                   AND s.prompt_version = ?2
-                   AND s.provider = ?3
-                   AND s.model = ?4
-                   AND ((?5 IS NULL AND j.source_lang IS NULL) OR j.source_lang = ?5)
-                   AND j.target_lang = ?6
-                   AND s.cache_namespace = ?7
-                   AND s.status IN ('succeeded', 'skipped_cached')
-                   AND t.human_corrected = 0
-                 ORDER BY CASE s.status WHEN 'succeeded' THEN 0 ELSE 1 END,
-                          CAST(t.created_at AS INTEGER) DESC,
-                          t.rowid DESC
-                 LIMIT 1",
+                &sql,
                 params![
                     segment.checksum,
                     prompt_version,
@@ -615,9 +659,9 @@ impl JobStore {
                    AND ((?{} IS NULL AND j.source_lang IS NULL) OR j.source_lang = ?{})
                    AND j.target_lang = ?{}
                    AND s.cache_namespace = ?{}
-                   AND s.status IN ('succeeded', 'skipped_cached')
+                   AND s.status IN ({})
                    AND t.human_corrected = 0
-                 ORDER BY CASE s.status WHEN 'succeeded' THEN 0 ELSE 1 END,
+                 ORDER BY CASE s.status WHEN '{}' THEN 0 ELSE 1 END,
                           CAST(t.created_at AS INTEGER) DESC,
                           t.rowid DESC",
                 hashes.len() + 1,
@@ -627,6 +671,8 @@ impl JobStore {
                 hashes.len() + 5,
                 hashes.len() + 6,
                 hashes.len() + 7,
+                SegmentStatus::sql_set(SegmentStatus::resolved()),
+                SegmentStatus::Succeeded.as_db_text()
             );
 
             let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();

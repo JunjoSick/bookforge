@@ -3561,3 +3561,543 @@ fn migrate_legacy_rename_cascade_completes_and_preserves_data() {
 
     let _ = fs::remove_file(db_path);
 }
+
+// ---------------------------------------------------------------------------
+// STORE-12: typed statuses + storage-level CHECK enforcement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_check_constraints_reject_non_canonical_writes() {
+    let db_path = temp_path("status_checks.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+    assert!(
+        store.take_diagnostics().is_empty(),
+        "fresh stores carry no diagnostics"
+    );
+
+    {
+        let conn = store.conn.borrow();
+        for text in JobStatus::KNOWN_DB_TEXTS {
+            let result = conn.execute(
+                "INSERT INTO jobs
+                 (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+                 VALUES (?1, 'h', 'Italian', 'mock', 'mock', ?2, 't', 't')",
+                params![format!("job_ok_{text}"), text],
+            );
+            assert!(result.is_ok(), "canonical job status '{text}' must insert");
+        }
+        for text in SegmentStatus::KNOWN_DB_TEXTS {
+            let result = conn.execute(
+                "INSERT INTO segments
+                 (id, job_id, section_id, ordinal, source_hash, prompt_version,
+                  provider, model, status)
+                 VALUES (?1, 'job_ok_running', 'sec', 0, 'sh', 'v', 'mock', 'mock', ?2)",
+                params![format!("seg_ok_{text}"), text],
+            );
+            assert!(
+                result.is_ok(),
+                "canonical segment status '{text}' must insert"
+            );
+        }
+
+        // CHECK constraints make every foreign vocabulary write fail at the
+        // SQL boundary instead of silently poisoning downstream matches.
+        let bad_job = conn.execute(
+            "INSERT INTO jobs
+             (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+             VALUES ('job_bad', 'h', 'Italian', 'mock', 'mock', 'mysteriously_broken', 't', 't')",
+            [],
+        );
+        assert!(
+            bad_job.is_err(),
+            "non-canonical job status must be rejected"
+        );
+        let bad_segment = conn.execute(
+            "INSERT INTO segments
+             (id, job_id, section_id, ordinal, source_hash, prompt_version,
+              provider, model, status)
+             VALUES ('seg_bad', 'job_ok_running', 'sec', 1, 'sh', 'v',
+                     'mock', 'mock', 'vendor_patched_state')",
+            [],
+        );
+        assert!(
+            bad_segment.is_err(),
+            "non-canonical segment status must be rejected"
+        );
+    }
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn legacy_unknown_status_degrades_to_warn_on_open_without_data_loss() {
+    let db_path = temp_path("legacy_unknown_status.sqlite");
+    // Hand-edited style database: a status value BookForge never wrote sits in
+    // a pre-CHECK table built straight from the v1 baseline.
+    {
+        let conn = Connection::open(&db_path).expect("legacy db opens");
+        conn.execute_batch(include_str!("../../migrations/0001_initial.sql"))
+            .expect("v1 baseline applies");
+        conn.execute_batch(
+            "
+            INSERT INTO _migrations (version, name, applied_at) VALUES
+              (1, 'initial', 'legacy'), (2, 'v1_0_1_input_snapshot', 'legacy'),
+              (3, 'v1_1_segment_flags', 'legacy'), (4, 'v1_2_glossary_terms', 'legacy'),
+              (5, 'v1_2_1_nullable_glossary_candidate_targets', 'legacy'),
+              (6, 'v1_3_context_styles_entities', 'legacy'),
+              (7, 'v2_4_human_corrections', 'legacy'), (8, 'v2_7_qa_findings', 'legacy');
+            INSERT INTO jobs
+              (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+            VALUES
+              ('legacy_job', 'hash', 'Italian', 'mock', 'mock',
+               'out_of_band', '1000', '1000');
+            ",
+        )
+        .expect("legacy fixture initializes");
+    }
+
+    let store = JobStore::open(&db_path).expect("open must tolerate unknown rows");
+    let diagnostics = store.take_diagnostics();
+    assert!(
+        diagnostics.iter().any(|note| note.contains("out_of_band")),
+        "unknown value must warn on open: {diagnostics:?}"
+    );
+
+    // Serialized format is unchanged externally; only the decoder differs.
+    let record = store
+        .get_job("legacy_job")
+        .expect("job reads")
+        .expect("row exists");
+    assert_eq!(
+        record.status, "out_of_band",
+        "raw text is preserved verbatim"
+    );
+    assert_eq!(
+        record.job_status(),
+        JobStatus::Unknown("out_of_band".to_string()),
+        "unknown decodes defensively instead of panicking"
+    );
+
+    drop(store);
+
+    // Repairing the data lets the next open finally apply the constraints.
+    {
+        let conn = Connection::open(&db_path).expect("repair reopens");
+        conn.execute(
+            "UPDATE jobs SET status = 'failed' WHERE id = 'legacy_job'",
+            [],
+        )
+        .expect("repair applies");
+    }
+    let hardened = JobStore::open(&db_path).expect("repaired store opens");
+    assert!(
+        hardened.take_diagnostics().is_empty(),
+        "canonical data no longer warns"
+    );
+    {
+        let conn = hardened.conn.borrow();
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _migrations WHERE version = 10",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration ledger readable");
+        assert_eq!(applied, 1, "hardening recorded once data conforms");
+        let bogus = conn.execute(
+            "INSERT INTO jobs
+             (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+             VALUES ('x', 'h', 'l', 'p', 'm', 'still_bogus', 't', 't')",
+            [],
+        );
+        assert!(bogus.is_err(), "constraints active after repair");
+    }
+
+    drop(hardened);
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn unknown_segment_status_counts_toward_totals_but_no_bucket() {
+    let db_path = temp_path("legacy_unknown_segment_status.sqlite");
+    {
+        let conn = Connection::open(&db_path).expect("legacy db opens");
+        conn.execute_batch(include_str!("../../migrations/0001_initial.sql"))
+            .expect("v1 baseline applies");
+        conn.execute_batch(
+            "
+            INSERT INTO _migrations (version, name, applied_at) VALUES
+              (1, 'initial', 'legacy'), (2, 'v1_0_1_input_snapshot', 'legacy'),
+              (3, 'v1_1_segment_flags', 'legacy'), (4, 'v1_2_glossary_terms', 'legacy'),
+              (5, 'v1_2_1_nullable_glossary_candidate_targets', 'legacy'),
+              (6, 'v1_3_context_styles_entities', 'legacy'),
+              (7, 'v2_4_human_corrections', 'legacy'), (8, 'v2_7_qa_findings', 'legacy');
+            INSERT INTO jobs
+              (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+            VALUES
+              ('j', 'h', 'Italian', 'mock', 'mock', 'stopped', '1', '2');
+            INSERT INTO segments
+              (id, job_id, section_id, ordinal,
+               source_hash, prompt_version, provider, model, status)
+            VALUES
+              ('s1', 'j', 'sec', 0, 'c1', 'v', 'mock', 'mock', 'succeeded'),
+              ('s2', 'j', 'sec', 1, 'c2', 'v', 'mock', 'mock', 'fancy_custom');
+            ",
+        )
+        .expect("legacy fixture initializes");
+    }
+
+    let store = JobStore::open(&db_path).expect("store opens with warning");
+    assert!(!store.take_diagnostics().is_empty());
+
+    let summary = store.summary("j").expect("summary").expect("job exists");
+    assert_eq!(summary.total_segments, 2, "unknown still counts");
+    assert_eq!(summary.succeeded, 1);
+    assert_eq!(summary.failed, 0, "unbucketed values stay unbucketed");
+
+    let records = store.segment_records("j").expect("records");
+    assert_eq!(
+        records[1].segment_status(),
+        SegmentStatus::Unknown("fancy_custom".to_string())
+    );
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+}
+
+// ---------------------------------------------------------------------------
+// STORE-17 part A: prune_jobs retention path
+// ---------------------------------------------------------------------------
+
+fn prune_fixture_job(store: &JobStore, label: &str) -> JobRecord {
+    let input_path = temp_path(&format!("{label}-input.epub"));
+    fs::write(&input_path, format!("{label} epub bytes")).expect("fixture input writes");
+    store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path(&format!("{label}-output.epub")),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("fixture job creates")
+}
+
+fn populate_full_job_tree(store: &JobStore, job: &JobRecord, artifacts_dir: &Path) {
+    fs::create_dir_all(artifacts_dir).expect("artifacts dir exists");
+    let events_path = artifacts_dir.join(format!("{}-events.jsonl", job.id));
+    let report_json_path = artifacts_dir.join(format!("{}-report.json", job.id));
+    let report_markdown_path = artifacts_dir.join(format!("{}-report.md", job.id));
+    fs::write(&events_path, b"event").expect("events artifact writes");
+    fs::write(&report_json_path, b"{}").expect("json report artifact writes");
+    fs::write(&report_markdown_path, b"# Report").expect("md report artifact writes");
+
+    store
+        .update_job_event_path(&job.id, &events_path)
+        .expect("events path set");
+    store
+        .update_job_report_paths(&job.id, &report_json_path, &report_markdown_path)
+        .expect("report paths set");
+
+    let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
+    store
+        .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "ns")
+        .expect("segments inserted");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            translated_text: "Tradotto",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "Tradotto".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            tokens_estimated: false,
+        })
+        .expect("translation saved");
+    store
+        .save_needs_review(SaveNeedsReview {
+            job_id: &job.id,
+            segment_id: "seg_b",
+            preserved_text: "Da rivedere",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000001".to_string()),
+                text: "Da rivedere".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            error: "needs eyes on it",
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            tokens_estimated: false,
+        })
+        .expect("needs review saved");
+    store
+        .set_dashboard_segment_flag(&job.id, "seg_b", true)
+        .expect("dashboard flag set");
+    store
+        .insert_segment_flags(&[NewSegmentFlag {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            kind: "dashboard_retry",
+            note: Some("please retry"),
+            suggested_source: None,
+            suggested_target: None,
+            consumed: true,
+        }])
+        .expect("flags inserted");
+}
+
+fn count_rows(store: &JobStore, table: &str, job_id: &str) -> i64 {
+    store
+        .conn
+        .borrow()
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE job_id = ?1"),
+            params![job_id],
+            |row| row.get(0),
+        )
+        .expect("count query")
+}
+
+#[test]
+fn prune_jobs_deletes_whole_tree_atomically_and_protects_running() {
+    let db_path = temp_path("prune_tree.sqlite");
+    let artifacts_dir = temp_path("prune-artifacts-root");
+    let store = JobStore::open(&db_path).expect("store opens");
+
+    let finished = prune_fixture_job(&store, "finished");
+    populate_full_job_tree(&store, &finished, &artifacts_dir);
+    store.mark_job_stopped(&finished.id).expect("job stopped");
+
+    // This one stays `running` from creation and is never touched.
+    let running = prune_fixture_job(&store, "running");
+    store
+        .insert_segments(
+            &running.id,
+            &[segment("seg_live", 0)],
+            "v1",
+            "mock",
+            "mock-prefix",
+            "ns",
+        )
+        .expect("running segments inserted");
+
+    let events_file_artifact = artifacts_dir.join(format!("{}-events.jsonl", finished.id));
+    let report_json_artifact = artifacts_dir.join(format!("{}-report.json", finished.id));
+
+    let report = store
+        .prune_jobs(PruneJobsOptions::default())
+        .expect("prunes");
+    assert_eq!(
+        report.protected_running_jobs, 1,
+        "the running job is guarded"
+    );
+    assert_eq!(report.candidate_count, 1);
+    assert_eq!(report.pruned_job_count(), 1);
+    let deletion = &report.deletions[0];
+    assert_eq!(deletion.job_id, finished.id);
+    assert_eq!(deletion.segments, 2);
+    assert!(deletion.translations >= 1);
+    assert!(deletion.translation_blocks >= 2);
+    assert!(
+        deletion.qa_findings >= 1,
+        "needs-review classification kept"
+    );
+    assert!(deletion.segment_flags >= 1);
+    assert!(deletion.artifacts_removed.contains(&events_file_artifact));
+    assert!(deletion.artifacts_removed.contains(&report_json_artifact));
+    assert!(!events_file_artifact.exists(), "artifact file removed");
+    assert!(!report_json_artifact.exists(), "artifact file removed");
+
+    // FK-cascade correctness across ALL child tables: zero orphans remain.
+    assert_eq!(count_rows(&store, "translations", &finished.id), 0);
+    assert_eq!(count_rows(&store, "translation_blocks", &finished.id), 0);
+    assert_eq!(count_rows(&store, "qa_findings", &finished.id), 0);
+    assert_eq!(count_rows(&store, "segment_flags", &finished.id), 0);
+    assert_eq!(count_rows(&store, "segments", &finished.id), 0);
+    assert!(store.get_job(&finished.id).expect("lookup").is_none());
+    assert!(
+        store.get_job(&running.id).expect("lookup").is_some(),
+        "running survives"
+    );
+    assert_eq!(count_rows(&store, "segments", &running.id), 1);
+
+    // Second pass finds nothing more to do.
+    let second = store
+        .prune_jobs(PruneJobsOptions::default())
+        .expect("idempotent");
+    assert_eq!(second.candidate_count, 0);
+    assert_eq!(second.pruned_job_count(), 0);
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(artifacts_dir);
+}
+
+#[test]
+fn prune_jobs_dry_run_reports_without_modifying_anything() {
+    let db_path = temp_path("prune_dry_run.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+    let job = prune_fixture_job(&store, "dry");
+    let artifacts_dir = temp_path("prune-dry-artifacts");
+    populate_full_job_tree(&store, &job, &artifacts_dir);
+    store.mark_job_stopped(&job.id).expect("stopped");
+    let events_artifact = artifacts_dir.join(format!("{}-events.jsonl", job.id));
+
+    let report = store
+        .prune_jobs(PruneJobsOptions {
+            dry_run: true,
+            ..PruneJobsOptions::default()
+        })
+        .expect("dry run");
+    assert!(report.dry_run);
+    assert_eq!(report.candidate_count, 1);
+    let deletion = &report.deletions[0];
+    assert_eq!(deletion.segments, 2);
+    assert!(deletion.segment_flags >= 1);
+
+    // Nothing actually changed.
+    assert!(store.get_job(&job.id).expect("lookup").is_some());
+    assert_eq!(count_rows(&store, "segments", &job.id), 2);
+    assert!(events_artifact.exists(), "dry run never touches artifacts");
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(artifacts_dir);
+}
+
+#[test]
+fn prune_jobs_respects_older_than_and_keep_last_n() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let db_path = temp_path("prune_filters.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+
+    let old_job = prune_fixture_job(&store, "old");
+    let mid_job = prune_fixture_job(&store, "mid");
+    let new_job = prune_fixture_job(&store, "new");
+    for (id, stamp) in [
+        (&old_job.id, "900"),
+        (&mid_job.id, "1500"),
+        (&new_job.id, "2000"),
+    ] {
+        {
+            let conn = store.conn.borrow();
+            conn.execute(
+                "UPDATE jobs SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+                params![stamp, id],
+            )
+            .expect("stamp set");
+        }
+        store.mark_job_stopped(id).expect("stopped");
+    }
+
+    // dry-ish age filter that excludes everything future.
+    let none_match = store
+        .prune_jobs(PruneJobsOptions {
+            older_than: Some(SystemTime::UNIX_EPOCH),
+            ..PruneJobsOptions::default()
+        })
+        .expect("future-only cutoff");
+    assert_eq!(none_match.candidate_count, 0);
+
+    // Age cutoff keeps only `mid`/`new` eligible; keep_last_n=1 then spares
+    // the newest survivor (`new`) — deleting exactly `mid`.
+    let cutoff_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        + 10;
+    let cutoff = UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(cutoff_secs))
+        .expect("cutoff");
+    let report = store
+        .prune_jobs(PruneJobsOptions {
+            older_than: Some(cutoff),
+            keep_last_n: Some(1),
+            ..PruneJobsOptions::default()
+        })
+        .expect("prunes");
+    assert_eq!(report.candidate_count, 3, "age floor is in the far future");
+    assert_eq!(report.retained_by_keep_last_n, 1);
+    assert_eq!(report.pruned_job_count(), 2, "mid+old deleted, newest kept");
+    let deleted_ids: Vec<&str> = report.deletions.iter().map(|d| d.job_id.as_str()).collect();
+    assert!(deleted_ids.contains(&old_job.id.as_str()));
+    assert!(deleted_ids.contains(&mid_job.id.as_str()));
+    assert!(store.get_job(&new_job.id).expect("lookup").is_some());
+    assert!(store.get_job(&old_job.id).expect("lookup").is_none());
+
+    // keep_last_n alone: rebuild order sensitivity by keeping 0 → all go.
+    let everything = store
+        .prune_jobs(PruneJobsOptions {
+            older_than: Some(cutoff),
+            keep_last_n: Some(0),
+            ..PruneJobsOptions::default()
+        })
+        .expect("prunes rest");
+    assert_eq!(everything.pruned_job_count(), 1, "only the newest remains");
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+}
+
+// ---------------------------------------------------------------------------
+// STORE-17 part B: bounded/streaming input hashing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn file_hash_streams_chunks_matching_the_single_shot_digest() {
+    use sha2::{Digest, Sha256};
+
+    let db_path = temp_path("streaming_hash.sqlite");
+    let big_input = temp_path("big-input.epub");
+    // > 2x FILE_HASH_CHUNK_BYTES so at least three streaming chunks are read,
+    // with an awkward remainder size to exercise partial-buffer handling.
+    let total_bytes = 64 * 1024 * 2 + 7;
+    let payload: Vec<u8> = (0..total_bytes).map(|i| (i % 251) as u8).collect();
+    fs::write(&big_input, &payload).expect("large fixture writes");
+
+    let store = JobStore::open(&db_path).expect("store opens");
+    let job = store
+        .create_job(CreateJob {
+            input: &big_input,
+            output: &temp_path("big-output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job creates");
+
+    let mut expected_hasher = Sha256::new();
+    expected_hasher.update(&payload);
+    let expected: String = expected_hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(job.input_hash, expected);
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(big_input);
+}

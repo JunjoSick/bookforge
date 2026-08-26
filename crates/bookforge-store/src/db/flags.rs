@@ -10,13 +10,15 @@ pub enum RetryScope {
 
 impl JobStore {
     pub fn retry_segments(&self, job_id: &str, scope: RetryScope) -> Result<usize> {
-        let where_status = match scope {
-            RetryScope::Failed => "status = 'failed'",
-            RetryScope::NeedsReview => "status = 'needs_review'",
-            RetryScope::All => "status IN ('failed', 'needs_review')",
+        let wanted: &[SegmentStatus] = match scope {
+            RetryScope::Failed => &[SegmentStatus::Failed],
+            RetryScope::NeedsReview => &[SegmentStatus::NeedsReview],
+            RetryScope::All => &[SegmentStatus::Failed, SegmentStatus::NeedsReview],
         };
+        let where_status = format!("status IN ({})", SegmentStatus::sql_set(wanted));
         let sql = format!(
-            "UPDATE segments SET status = 'retry_pending', error = NULL WHERE job_id = ?1 AND {where_status}"
+            "UPDATE segments SET status = '{}', error = NULL WHERE job_id = ?1 AND {where_status}",
+            SegmentStatus::RetryPending.as_db_text()
         );
         let count = {
             let conn = self.conn.borrow();
@@ -25,7 +27,7 @@ impl JobStore {
         // Findings are instrumentation, so a failed findings write must never
         // fail the surrounding translation checkpoint.
         let _ = self.prune_stale_findings(job_id);
-        self.touch_job_unless_status(job_id, "retry_pending", &["stopped"])?;
+        self.touch_job_unless_status(job_id, JobStatus::RetryPending, &[JobStatus::Stopped])?;
         Ok(count)
     }
 
@@ -52,15 +54,21 @@ impl JobStore {
             )
             .optional()?;
         if let Some(job_status) = &job_status
-            && matches!(job_status.as_str(), "running" | "paused")
+            && matches!(
+                JobStatus::from_db_text(job_status),
+                JobStatus::Running | JobStatus::Paused
+            )
         {
             return Err(StoreError::InvalidCorrection(format!(
                 "job '{job_id}' is {job_status}; stop it before requesting a retry"
             )));
         }
         let updated = tx.execute(
-            "UPDATE segments SET status = 'retry_pending', error = NULL
-             WHERE job_id = ?1 AND id = ?2",
+            &format!(
+                "UPDATE segments SET status = '{}', error = NULL
+                 WHERE job_id = ?1 AND id = ?2",
+                SegmentStatus::RetryPending.as_db_text()
+            ),
             params![job_id, segment_id],
         )?;
         if updated == 0 {
@@ -87,7 +95,7 @@ impl JobStore {
         }
         tx.commit()?;
         drop(conn);
-        self.touch_job_unless_status(job_id, "retry_pending", &["stopped"])?;
+        self.touch_job_unless_status(job_id, JobStatus::RetryPending, &[JobStatus::Stopped])?;
         Ok(())
     }
 
@@ -198,10 +206,11 @@ impl JobStore {
                 .join(", ");
             let sql = format!(
                 "UPDATE segments
-                 SET status = 'needs_review',
+                 SET status = '{}',
                      error = ?
                  WHERE job_id = ?
-                   AND id IN ({placeholders})"
+                   AND id IN ({placeholders})",
+                SegmentStatus::NeedsReview.as_db_text()
             );
             let conn = self.conn.borrow();
             let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(chunk.len() + 2);
