@@ -1946,12 +1946,17 @@ fn marked_translation_rendered(
 }
 
 /// Single pass assigning template ids exactly like the reader does:
-/// every Start/Empty inside an active block consumes one ordinal except
-/// elements nested inside a suppressed subtree, which consume none on
-/// either side of the protocol. That symmetry keeps reader- and
-/// writer-side marker ids aligned for patching (audit EPUB-3), while
-/// script/style/svg/math subtrees are captured verbatim instead of
-/// becoming translatable templates.
+/// every Start/Empty inside an active block consumes one SHARED ordinal,
+/// prefixed `m` or `r` respectively except elements nested inside a
+/// suppressed subtree, which consume none on either side of the protocol.
+/// The reader draws paired and empty marker ids from one counter
+/// (`BlockBuilder::next_marker`), so splitting into two independent
+/// sequences here desynchronizes any block mixing paired children with
+/// self-closing siblings: a valid marked translation would reference an
+/// unknown id and silently degrade to untranslated source bytes.
+/// That symmetry keeps reader- and writer-side marker ids aligned for
+/// patching (audit EPUB-3), while script/style/svg/math subtrees are
+/// captured verbatim instead of becoming translatable templates.
 fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
     const STACK_UNDERFLOW: &str = "inline template stack underflow while scanning block contents";
 
@@ -1960,8 +1965,7 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
     // paired template (None for raw-subtree roots, whose bytes live in
     // `raw_events` rather than a template).
     let mut stack = Vec::<(String, Option<Event<'static>>)>::new();
-    let mut m_next = 0usize;
-    let mut r_next = 0usize;
+    let mut marker_ordinal = 0usize;
     let mut pending_left = None::<String>;
     let mut saw_whitespace = false;
     let mut raw_capture: Option<RawCapture> = None;
@@ -1997,8 +2001,8 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
         match event {
             Event::Start(element) => {
                 let name = local_name(element.name().as_ref()).to_vec();
-                let id = marker_id("m", m_next);
-                m_next += 1;
+                let id = marker_id("m", marker_ordinal);
+                marker_ordinal += 1;
                 insert_pending_boundary(
                     &mut scan.boundaries,
                     pending_left.take(),
@@ -2019,8 +2023,8 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
                 }
             }
             Event::Empty(element) => {
-                let id = marker_id("r", r_next);
-                r_next += 1;
+                let id = marker_id("r", marker_ordinal);
+                marker_ordinal += 1;
                 insert_pending_boundary(
                     &mut scan.boundaries,
                     pending_left.take(),
@@ -2972,6 +2976,30 @@ mod tests {
             outcome.xhtml,
         );
         validate_xml(&outcome.xhtml).expect("marked output should re-parse");
+    }
+
+    /// The reader hands out paired (`mN`) and empty (`rN`) marker ids from
+    /// ONE shared counter; the writer scanner must consume ordinals from a
+    /// single stream too, or any block mixing a child element with a
+    /// self-closing sibling (reader ids `m1`/`r2`, writer rescan `m1`/`r1`)
+    /// would reject its legitimate translation as an unknown marker and
+    /// ship untranslated. Regression for the empty-element adjacency bug.
+    #[test]
+    fn scan_block_events_draws_paired_and_empty_ids_from_one_ordinal_stream() {
+        let events = vec![
+            Event::Start(quick_xml::events::BytesStart::new("td").into_owned()),
+            Event::End(BytesEnd::new("td")),
+            Event::Empty(quick_xml::events::BytesStart::new("td").into_owned()),
+        ];
+
+        let scan = scan_block_events(&events).expect("scan should succeed");
+
+        let template_ids = scan.templates.keys().cloned().collect::<Vec<_>>();
+        assert!(
+            scan.templates.contains_key("m1") && template_ids.contains(&"r2".to_string()),
+            "writer rescan must reproduce reader ids m1/r2 for paired+empty content, got: {template_ids:?}"
+        );
+        assert!(!template_ids.contains(&"r1".to_string()));
     }
 
     #[test]
