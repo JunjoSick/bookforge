@@ -1,10 +1,11 @@
-use std::io::Read;
 use std::path::Path;
 
 use bookforge_core::{
     marker::marker_ids_in_text,
     segment::{BlockTranslation, Segment},
 };
+
+use crate::archive_limits::{DEFAULT_ARCHIVE_LIMITS, validate_archive_metadata};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpubValidationReport {
@@ -54,10 +55,55 @@ pub fn validate_translated_epub(
 
     match zip::ZipArchive::new(file) {
         Ok(mut archive) => {
+            // Both the archive's declared metadata and every entry read pass
+            // through the shared decompression budget: `bookforge validate`
+            // sees the same lying-small-entry defense as reflow/reader.
             let mut file_names = Vec::new();
-            for i in 0..archive.len() {
-                if let Ok(entry) = archive.by_index(i) {
-                    file_names.push(entry.name().to_string());
+            match validate_archive_metadata(&mut archive, DEFAULT_ARCHIVE_LIMITS) {
+                Ok(mut read_budget) => {
+                    // One indexed pass names every entry and validates the
+                    // translatable ones; no per-name second scan and no
+                    // decompression of entries whose contents we ignore.
+                    for index in 0..archive.len() {
+                        let Ok(mut entry) = archive.by_index(index) else {
+                            continue;
+                        };
+                        let name = entry.name().to_string();
+                        if !is_validatable_resource_name(&name) {
+                            file_names.push(name);
+                            continue;
+                        }
+
+                        let compressed_size = entry.compressed_size();
+                        match read_budget.read_entry(&mut entry, &name, compressed_size) {
+                            Ok(bytes) => {
+                                if let Ok(content) = String::from_utf8(bytes) {
+                                    validate_xhtml_content(&mut report, &name, &content);
+                                }
+                            }
+                            Err(error) => {
+                                report.xml_valid = false;
+                                report.issues.push(EpubValidationIssue {
+                                    severity: ValidationSeverity::Error,
+                                    kind: "decompression_limit".to_string(),
+                                    href: Some(name.clone()),
+                                    block_id: None,
+                                    message: error.to_string(),
+                                });
+                            }
+                        }
+                        file_names.push(name);
+                    }
+                }
+                Err(error) => {
+                    report.xml_valid = false;
+                    report.issues.push(EpubValidationIssue {
+                        severity: ValidationSeverity::Error,
+                        kind: "decompression_limit".to_string(),
+                        href: None,
+                        block_id: None,
+                        message: error.to_string(),
+                    });
                 }
             }
             report.files_checked = file_names.len();
@@ -82,17 +128,6 @@ pub fn validate_translated_epub(
                     message: "EPUB missing META-INF/container.xml".to_string(),
                 });
                 report.xml_valid = false;
-            }
-
-            for name in &file_names {
-                if (name.ends_with(".xhtml") || name.ends_with(".html") || name.ends_with(".opf"))
-                    && let Ok(mut entry) = archive.by_name(name)
-                {
-                    let mut content = String::new();
-                    if entry.read_to_string(&mut content).is_ok() {
-                        validate_xhtml_content(&mut report, name, &content);
-                    }
-                }
             }
         }
         Err(e) => {
@@ -125,6 +160,19 @@ fn validate_xhtml_content(report: &mut EpubValidationReport, href: &str, content
         });
         report.xml_valid = false;
     }
+}
+
+/// Entries whose well-formedness matters: document resources and the
+/// package manifest. Extension matching is case-insensitive — untrusted
+/// archives routinely ship `CHAPTER.XHTML` — but no second archive scan is
+/// performed for the check.
+fn is_validatable_resource_name(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, extension)| {
+        matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "xhtml" | "html" | "opf"
+        )
+    })
 }
 
 fn has_broken_xml(content: &str) -> bool {
@@ -226,6 +274,141 @@ pub fn validate_block_translations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validatable_resource_names_match_case_insensitively() {
+        assert!(is_validatable_resource_name("chapter.xhtml"));
+        assert!(is_validatable_resource_name("TEXT/CHAPTER.XHTML"));
+        assert!(is_validatable_resource_name("index.Html"));
+        assert!(is_validatable_resource_name("OEBPS/content.OPF"));
+        assert!(!is_validatable_resource_name("toc.ncx"));
+        assert!(!is_validatable_resource_name("images/cover.png"));
+        assert!(!is_validatable_resource_name("META-INF/container.xml"));
+    }
+
+    #[test]
+    fn validates_uppercase_extension_resources_and_reports_href() {
+        use std::io::Write as _;
+        use zip::{CompressionMethod, write::SimpleFileOptions};
+
+        let fixture = temp_zip("bookforge-validate-uppercase", |mut writer| {
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            let deflated =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            writer
+                .start_file("mimetype", stored)
+                .expect("mimetype should start");
+            writer
+                .write_all(b"application/epub+zip")
+                .expect("mimetype should write");
+            writer
+                .start_file("META-INF/container.xml", deflated)
+                .expect("container should start");
+            writer.write_all(CONTAINER_XML.as_bytes()).expect("write");
+            writer
+                .start_file("content.opf", deflated)
+                .expect("opf should start");
+            writer
+                .write_all(OPF_XML.as_bytes())
+                .expect("opf should write");
+            writer
+                .start_file("CHAPTER.XHTML", deflated)
+                .expect("chapter should start");
+            writer
+                .write_all(b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p><b>broken</p></b></body></html>")
+                .expect("chapter should write");
+            writer.finish().expect("fixture should finish");
+        });
+        let report = validate_translated_epub(&fixture, &[], &[]);
+        let _ = std::fs::remove_file(&fixture);
+
+        let malformed = report
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == "malformed_xhtml")
+            .collect::<Vec<_>>();
+        assert_eq!(malformed.len(), 1, "all issues: {:?}", report.issues);
+        assert_eq!(malformed[0].href.as_deref(), Some("CHAPTER.XHTML"));
+        assert!(!report.xml_valid);
+        assert_eq!(report.files_checked, 4);
+    }
+
+    #[test]
+    fn rejects_archives_over_the_entry_count_limit_as_decompression_limit() {
+        use std::io::Write as _;
+        use zip::{CompressionMethod, write::SimpleFileOptions};
+
+        let fixture = temp_zip("bookforge-validate-entry-bomb", |mut writer| {
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            writer
+                .start_file("mimetype", stored)
+                .expect("mimetype should start");
+            writer
+                .write_all(b"application/epub+zip")
+                .expect("mimetype should write");
+            for index in 0..10_001 {
+                writer
+                    .start_file(format!("blob{index}"), stored)
+                    .expect("blob should start");
+                writer.write_all(b"x").expect("blob should write");
+            }
+            writer.finish().expect("fixture should finish");
+        });
+        let report = validate_translated_epub(&fixture, &[], &[]);
+        let _ = std::fs::remove_file(&fixture);
+
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == "decompression_limit"
+                    && issue.message.contains("entry count limit exceeded")),
+            "all issues: {:?}",
+            report.issues
+        );
+        assert!(!report.xml_valid);
+    }
+
+    /// Minimal EPUB with one chapter whose body is injected verbatim, so
+    /// XML-level problems are detectable by name.
+    fn temp_zip<F>(label: &str, build: F) -> std::path::PathBuf
+    where
+        F: FnOnce(zip::ZipWriter<std::fs::File>),
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("{label}-{}-{nonce}.epub", std::process::id()));
+        let file = std::fs::File::create(&path).expect("fixture should create");
+        build(zip::ZipWriter::new(file));
+        path
+    }
+
+    const CONTAINER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+
+    const OPF_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="bookid" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">validate-fixture</dc:identifier>
+    <dc:title>Validate Fixture</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="chapter"/>
+  </spine>
+</package>"#;
 
     fn segment_with_block(
         block_text: &str,

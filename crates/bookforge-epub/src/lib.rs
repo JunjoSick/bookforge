@@ -1,7 +1,7 @@
 mod archive_limits;
-
 pub mod reader;
 pub mod reflow;
+pub(crate) mod util;
 pub mod validate;
 pub mod writer;
 

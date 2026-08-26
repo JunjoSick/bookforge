@@ -112,7 +112,6 @@ pub(crate) fn validate_archive_metadata<R: Read + Seek>(
             limits.max_entries
         )));
     }
-
     let mut total_uncompressed = 0u64;
     let mut total_compressed = 0u64;
     for index in 0..archive.len() {
@@ -163,6 +162,22 @@ pub(crate) fn validate_archive_metadata<R: Read + Seek>(
 
 fn exceeds_ratio(uncompressed: u64, compressed: u64, maximum_ratio: u64) -> bool {
     uncompressed > compressed.saturating_mul(maximum_ratio)
+}
+
+/// Read one text entry through the caller's budget and decode UTF-8.
+/// Every untrusted-archive read in the crate funnels here so the
+/// bounded-decompression guarantee has no exceptions.
+pub(crate) fn read_archive_text<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    read_budget: &mut ArchiveReadBudget,
+    name: &str,
+) -> Result<String> {
+    let mut file = archive.by_name(name)?;
+    let compressed_size = file.compressed_size();
+    let bytes = read_budget.read_entry(&mut file, name, compressed_size)?;
+    String::from_utf8(bytes).map_err(|error| {
+        BookforgeError::InvalidInput(format!("EPUB text entry '{name}' is not UTF-8: {error}"))
+    })
 }
 
 fn limit_error(message: String) -> BookforgeError {

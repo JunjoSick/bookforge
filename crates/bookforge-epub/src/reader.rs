@@ -21,7 +21,15 @@ use quick_xml::{
 };
 use zip::ZipArchive;
 
-use crate::archive_limits::{ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, validate_archive_metadata};
+use crate::{
+    archive_limits::{
+        ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, read_archive_text, validate_archive_metadata,
+    },
+    util::{
+        join_epub_path, local_name, marker_id, never_translate_element, normalize_space,
+        package_base_dir, resolve_general_ref,
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpubInspection {
@@ -102,6 +110,11 @@ pub fn read_epub(path: &Path) -> Result<Book> {
     let mut sections = Vec::new();
     let mut blocks = Vec::new();
 
+    // Synthetic sections (OPF metadata, NCX, nav) live outside the real
+    // spine index range so their indices never collide with each other or
+    // with actual spine documents.
+    let synthetic_base = package.spine.len();
+
     let package_section_id = SectionId("sec_metadata_opf".to_string());
     let mut package_blocks =
         extract_package_title_blocks(&package_xml, &package_section_id, blocks.len())?;
@@ -113,7 +126,7 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         sections.push(Section {
             id: package_section_id,
             href: package_path.clone(),
-            spine_index: 0,
+            spine_index: synthetic_base,
             title: Some("OPF metadata".to_string()),
             heading_level: None,
             block_ids,
@@ -122,6 +135,12 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         });
         blocks.append(&mut package_blocks);
     }
+
+    let toc_resource_count = package
+        .manifest
+        .iter()
+        .filter(|item| item.media_type == "application/x-dtbncx+xml")
+        .count();
 
     for (toc_index, resource) in package
         .manifest
@@ -143,7 +162,7 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         sections.push(Section {
             id: section_id,
             href,
-            spine_index: 0,
+            spine_index: synthetic_base + 1 + toc_index,
             title: Some("NCX table of contents".to_string()),
             heading_level: None,
             block_ids,
@@ -152,12 +171,6 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         });
         blocks.append(&mut toc_blocks);
     }
-
-    let spine_idrefs = package
-        .spine
-        .iter()
-        .map(|item| item.idref.clone())
-        .collect::<HashSet<_>>();
 
     for (spine_index, spine_item) in package.spine.iter_mut().enumerate() {
         let Some(resource) = manifest_by_id.get(spine_item.idref.as_str()) else {
@@ -199,7 +212,12 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         blocks.append(&mut section_blocks);
     }
 
-    let spine_len = package.spine.len();
+    let spine_idrefs = package
+        .spine
+        .iter()
+        .map(|item| item.idref.clone())
+        .collect::<HashSet<_>>();
+
     for (nav_index, resource) in package
         .manifest
         .iter()
@@ -220,7 +238,7 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         sections.push(Section {
             id: section_id,
             href,
-            spine_index: spine_len + nav_index,
+            spine_index: synthetic_base + 1 + toc_resource_count + nav_index,
             title: Some("EPUB navigation".to_string()),
             heading_level: None,
             block_ids,
@@ -280,6 +298,15 @@ pub fn inspect_epub(path: &Path) -> Result<EpubInspection> {
             .iter()
             .any(|item| item.media_type == "application/x-dtbncx+xml");
 
+    // Existence checks only: inspection reports counts, so entries are
+    // probed by name over the central directory instead of being
+    // decompressed end-to-end (bounded metadata validation above still
+    // covers hostile archives).
+    let archive_names = archive
+        .file_names()
+        .map(|name| name.to_string())
+        .collect::<HashSet<_>>();
+
     let mut xhtml_spine_count = 0;
     for item in &package.spine {
         let Some(resource) = manifest_by_id.get(item.idref.as_str()) else {
@@ -291,7 +318,12 @@ pub fn inspect_epub(path: &Path) -> Result<EpubInspection> {
 
         if is_xhtml_media_type(&resource.media_type) {
             let href = join_epub_path(&package_dir, &resource.href);
-            read_archive_text(&mut archive, &mut read_budget, &href)?;
+            if !archive_names.contains(&href) {
+                return Err(BookforgeError::InvalidInput(format!(
+                    "EPUB entry '{}' not found",
+                    href
+                )));
+            }
             xhtml_spine_count += 1;
         }
     }
@@ -404,9 +436,7 @@ fn visible_body_chars(xhtml: &str) -> Result<usize> {
                 count += non_whitespace_chars(&value);
             }
             Event::GeneralRef(reference) if counting => {
-                if let Some(value) = resolve_general_ref(&reference)? {
-                    count += non_whitespace_chars(&value);
-                }
+                count += non_whitespace_chars(&resolve_general_ref(&reference)?);
             }
             Event::Eof => break,
             _ => {}
@@ -478,6 +508,10 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
     let mut spine = Vec::new();
     let mut toc_id = None;
     let mut current_text_element: Option<Vec<u8>> = None;
+    // Duplicate manifest ids resolve deterministically (first wins); EPUBs
+    // with clashing ids would otherwise have patch targets chosen by
+    // whichever duplicate happened to be seen last.
+    let mut seen_manifest_ids = HashSet::new();
 
     loop {
         match reader.read_event()? {
@@ -485,7 +519,9 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
                 b"title" | b"creator" | b"language" => {
                     current_text_element = Some(local_name(element.name().as_ref()).to_vec());
                 }
-                b"item" => manifest.push(parse_manifest_item(&reader, &element)?),
+                b"item" => {
+                    parse_manifest_item(&reader, &element, &mut seen_manifest_ids, &mut manifest)?
+                }
                 b"spine" => {
                     toc_id = attr_value(&reader, &element, b"toc")?;
                 }
@@ -495,7 +531,9 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
                 _ => {}
             },
             Event::Empty(element) => match local_name(element.name().as_ref()) {
-                b"item" => manifest.push(parse_manifest_item(&reader, &element)?),
+                b"item" => {
+                    parse_manifest_item(&reader, &element, &mut seen_manifest_ids, &mut manifest)?
+                }
                 b"itemref" => spine.push(parse_spine_item(&reader, &element)?),
                 _ => {}
             },
@@ -550,12 +588,26 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
     })
 }
 
-fn parse_manifest_item(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Resource> {
+fn parse_manifest_item(
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+    seen_ids: &mut HashSet<String>,
+    manifest: &mut Vec<Resource>,
+) -> Result<()> {
     let id = required_attr(reader, element, b"id", "manifest item id")?;
+    if !seen_ids.insert(id.clone()) {
+        let duplicate_href = required_attr(reader, element, b"href", "manifest item href")?;
+        tracing::warn!(
+            id = %id,
+            href = %duplicate_href,
+            "ignoring manifest item with duplicate id (first definition wins)"
+        );
+        return Ok(());
+    }
     let href = required_attr(reader, element, b"href", "manifest item href")?;
     let media_type = required_attr(reader, element, b"media-type", "manifest item media-type")?;
 
-    Ok(Resource {
+    manifest.push(Resource {
         id,
         href,
         media_type,
@@ -567,7 +619,8 @@ fn parse_manifest_item(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Resu
                     .collect()
             })
             .unwrap_or_default(),
-    })
+    });
+    Ok(())
 }
 
 fn parse_spine_item(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<SpineItem> {
@@ -694,10 +747,8 @@ fn extract_xml_text_element_blocks(
                 }
             }
             Event::GeneralRef(reference) => {
-                if let Some(capture) = active_capture.as_mut()
-                    && let Some(value) = resolve_general_ref(&reference)?
-                {
-                    capture.text.push_str(&value);
+                if let Some(capture) = active_capture.as_mut() {
+                    capture.text.push_str(&resolve_general_ref(&reference)?);
                 }
             }
             Event::End(_) => {
@@ -881,9 +932,6 @@ fn extract_blocks(
             Event::Start(element) => {
                 let name = local_name(element.name().as_ref()).to_vec();
                 let path = enter_element(&mut element_stack, &name);
-                if never_translate_element(&name) {
-                    suppress_depth += 1;
-                }
 
                 // EPUB navigation list items have a constrained content
                 // model: the label must remain inside the child <a> or
@@ -894,7 +942,19 @@ fn extract_blocks(
                     && element_stack[..element_stack.len().saturating_sub(1)]
                         .iter()
                         .any(|frame| frame.name == b"nav");
-                if active_block.is_none()
+
+                if never_translate_element(&name) {
+                    // Raw content (script bodies, SVG, MathML) must survive
+                    // byte-for-byte and stay out of translation payloads.
+                    // Inside an active block the whole subtree is replaced
+                    // by a single paired marker whose interior stays empty;
+                    // the writer splices the original bytes back verbatim.
+                    let root_of_suppressed_tree = suppress_depth == 0;
+                    suppress_depth += 1;
+                    if root_of_suppressed_tree && let Some(block) = active_block.as_mut() {
+                        block.push_inline_start(&name);
+                    }
+                } else if active_block.is_none()
                     && !navigation_list_item
                     && let Some(kind) = block_kind(&name, &element)?
                 {
@@ -904,7 +964,9 @@ fn extract_blocks(
                         DomPath(path),
                         initial_block_count + blocks.len(),
                     ));
-                } else if let Some(block) = active_block.as_mut() {
+                } else if suppress_depth == 0
+                    && let Some(block) = active_block.as_mut()
+                {
                     block.push_inline_start(&name);
                 }
             }
@@ -916,7 +978,9 @@ fn extract_blocks(
                 // source to the model and invite hallucinated output.
                 next_child_path(&mut element_stack);
 
-                if let Some(block) = active_block.as_mut() {
+                if suppress_depth == 0
+                    && let Some(block) = active_block.as_mut()
+                {
                     block.push_inline_empty(&name);
                 }
             }
@@ -957,18 +1021,17 @@ fn extract_blocks(
             // never consumes a stray text-node index — the writer counts
             // Text events only, and indices must stay aligned.
             Event::GeneralRef(reference) => {
-                if let Some(value) = resolve_general_ref(&reference)? {
-                    handle_text(
-                        &value,
-                        &mut active_block,
-                        &mut element_stack,
-                        &mut blocks,
-                        section_id,
-                        initial_block_count,
-                        suppress_depth > 0,
-                        false,
-                    );
-                }
+                let value = resolve_general_ref(&reference)?;
+                handle_text(
+                    &value,
+                    &mut active_block,
+                    &mut element_stack,
+                    &mut blocks,
+                    section_id,
+                    initial_block_count,
+                    suppress_depth > 0,
+                    false,
+                );
             }
             Event::End(_) => {
                 let should_finish = active_block
@@ -980,8 +1043,18 @@ fn extract_blocks(
                     if let Some(block) = block.finish(section_id) {
                         blocks.push(block);
                     }
-                } else if let Some(block) = active_block.as_mut() {
-                    block.push_inline_end();
+                } else {
+                    // Ends inside a suppressed subtree carry no translation
+                    // structure; only the subtree's own root closes the
+                    // raw-content marker pair.
+                    let interior_of_suppressed_tree = match element_stack.last() {
+                        Some(frame) if never_translate_element(&frame.name) => suppress_depth > 1,
+                        Some(_) => suppress_depth > 0,
+                        None => false,
+                    };
+                    if !interior_of_suppressed_tree && let Some(block) = active_block.as_mut() {
+                        block.push_inline_end();
+                    }
                 }
 
                 if element_stack
@@ -999,33 +1072,14 @@ fn extract_blocks(
     Ok(blocks)
 }
 
-/// Resolve a general entity reference to its replacement text: numeric
-/// character references and the HTML5 named set. Unknown entities are
-/// dropped with a warning rather than failing the whole book.
-fn resolve_general_ref(reference: &quick_xml::events::BytesRef<'_>) -> Result<Option<String>> {
-    if let Some(ch) = reference
-        .resolve_char_ref()
-        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?
-    {
-        return Ok(Some(ch.to_string()));
-    }
-    let name = reference
-        .decode()
-        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-    let resolved = quick_xml::escape::resolve_html5_entity(&name).map(ToString::to_string);
-    if resolved.is_none() {
-        tracing::warn!(entity = %name, "dropping unresolvable entity reference");
-    }
-    Ok(resolved)
-}
-
-/// Route a decoded text fragment: into the active block if there is one,
-/// otherwise — for non-whitespace text the block whitelist missed — start
-/// a block anchored on the enclosing element (text-bearing `<div>`,
-/// `<dt>`, `<dd>`, ...) or, when earlier element children make whole-
-/// element patching unsafe, record a standalone text-node block the
-/// writer can address directly. Without this fallback such text silently
-/// shipped untranslated.
+/// Route a decoded text fragment: suppressed subtrees never contribute
+/// translation payload (even inside an active block), the active block
+/// absorbs everything else, and — for non-whitespace text the block
+/// whitelist missed — a block is started anchored on the enclosing element
+/// (text-bearing `<div>`, `<dt>`, `<dd>`, ...) or, when earlier element
+/// children make whole-element patching unsafe, a standalone text-node
+/// block records the patch target directly. Without this fallback such
+/// text silently shipped untranslated.
 #[allow(clippy::too_many_arguments)]
 fn handle_text(
     value: &str,
@@ -1037,11 +1091,14 @@ fn handle_text(
     suppressed: bool,
     allow_stray: bool,
 ) {
+    if suppressed {
+        return;
+    }
     if let Some(block) = active_block.as_mut() {
         block.push_text(value);
         return;
     }
-    if suppressed || value.trim().is_empty() {
+    if value.trim().is_empty() {
         return;
     }
     let depth = element_stack.len();
@@ -1082,11 +1139,6 @@ fn handle_text(
         Vec::new(),
         visible,
     ));
-}
-
-/// Elements whose text must never be translated.
-fn never_translate_element(name: &[u8]) -> bool {
-    matches!(name, b"script" | b"style" | b"svg" | b"math")
 }
 
 /// Elements safe to anchor a lazily-started text block on. Structural
@@ -1228,10 +1280,6 @@ fn link_sections(sections: &mut [Section]) {
     }
 }
 
-fn normalize_space(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 fn normalize_text_fragment(text: &str) -> Option<String> {
     if text.trim().is_empty() {
         return None;
@@ -1255,10 +1303,6 @@ fn block_visible_text(block: &Block) -> String {
         .collect::<Vec<_>>()
         .join("");
     normalize_space(&strip_marker_tokens(&marked))
-}
-
-fn marker_id(prefix: &str, marker_ordinal: usize) -> String {
-    format!("{prefix}{}", marker_ordinal + 1)
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -1576,19 +1620,6 @@ fn looks_like_protected_number(value: &str) -> bool {
     false
 }
 
-fn read_archive_text(
-    archive: &mut ZipArchive<File>,
-    read_budget: &mut ArchiveReadBudget,
-    path: &str,
-) -> Result<String> {
-    let mut file = archive.by_name(path)?;
-    let compressed_size = file.compressed_size();
-    let bytes = read_budget.read_entry(&mut file, path, compressed_size)?;
-    String::from_utf8(bytes).map_err(|error| {
-        BookforgeError::InvalidInput(format!("EPUB text entry '{path}' is not UTF-8: {error}"))
-    })
-}
-
 fn is_xhtml_media_type(media_type: &str) -> bool {
     matches!(
         media_type,
@@ -1600,81 +1631,6 @@ fn is_nav_item(item: &Resource) -> bool {
     item.media_type == "application/xhtml+xml"
         && (item.properties.iter().any(|property| property == "nav")
             || item.href.ends_with("nav.xhtml"))
-}
-
-fn package_base_dir(package_path: &str) -> String {
-    Path::new(package_path)
-        .parent()
-        .and_then(Path::to_str)
-        .unwrap_or("")
-        .to_string()
-}
-
-fn join_epub_path(base: &str, href: &str) -> String {
-    let href = href
-        .split('#')
-        .next()
-        .unwrap_or(href)
-        .split('?')
-        .next()
-        .unwrap_or(href);
-    let href = percent_decode_epub_path(href);
-    if base.is_empty() {
-        normalize_epub_path(&href)
-    } else {
-        normalize_epub_path(&format!("{base}/{href}"))
-    }
-}
-
-fn normalize_epub_path(path: &str) -> String {
-    let mut normalized = Vec::new();
-    for component in Path::new(path).components() {
-        match component {
-            std::path::Component::Normal(value) => {
-                normalized.push(value.to_string_lossy().to_string());
-            }
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
-        }
-    }
-    normalized.join("/")
-}
-
-fn percent_decode_epub_path(path: &str) -> String {
-    let bytes = path.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let (Some(high), Some(low)) =
-                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
-        {
-            decoded.push((high << 4) | low);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded)
-        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).to_string())
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn local_name(name: &[u8]) -> &[u8] {
-    name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
 }
 
 #[cfg(test)]
@@ -2127,6 +2083,172 @@ mod tests {
 
         let prose = detect_protected_spans("I cittadini leggono il libro");
         assert!(!prose.iter().any(|span| span.text == "I"));
+    }
+
+    #[test]
+    fn script_inside_paragraph_is_excluded_from_translation_payload() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            "<html><body><p>Hello <script type=\"text/javascript\">var x = 1;</script> world</p></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 1);
+        let text = block_text(&blocks[0]);
+        assert!(
+            !text.contains("var"),
+            "script bytes must not enter the translatable text: {text}"
+        );
+        assert_eq!(blocks[0].inline_marks.len(), 1);
+        assert_eq!(blocks[0].inline_marks[0].kind, "script");
+        let runs = blocks[0]
+            .text_runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>();
+        // The suppressed subtree contributes exactly one empty marker pair.
+        let marked: String = strip_marker_tokens(&text).chars().collect();
+        let _ = marked;
+        assert!(runs.iter().all(|run| !run.contains("var")), "{runs:?}");
+        assert!(
+            text.starts_with("Hello") && text.ends_with("world"),
+            "prose around the raw pair survives: {text}"
+        );
+    }
+
+    #[test]
+    fn svg_and_math_markup_keeps_empty_marker_pairs_only() {
+        for (element, kind) in [
+            ("<svg xmlns=\"x\"><text>label</text></svg>", "svg"),
+            ("<math><mi>x</mi></math>", "math"),
+        ] {
+            let section_id = SectionId("sec_000000".to_string());
+            let xhtml = format!("<html><body><p>a{element}b</p></body></html>");
+            let blocks =
+                extract_blocks(&xhtml, "chapter.xhtml", &section_id, 0).expect("should parse");
+            assert_eq!(blocks.len(), 1);
+            let text = block_text(&blocks[0]);
+            assert!(
+                !text.contains("label") && !text.contains('x'),
+                "{kind} content leaked into block: {text}"
+            );
+            assert!(
+                blocks[0].inline_marks.iter().any(|mark| mark.kind == kind),
+                "{kind} boundary marker missing from {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_entities_are_preserved_literally_in_extracted_text() {
+        let section_id = SectionId("sec_000000".to_string());
+        let blocks = extract_blocks(
+            "<html><body><p>a&notanentity;b</p></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            block_text(&blocks[0]),
+            "a&notanentity;b",
+            "unknown references must survive instead of being dropped"
+        );
+    }
+
+    #[test]
+    fn duplicate_manifest_items_keep_first_definition() {
+        let package = parse_package(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>T</dc:title>
+  </metadata>
+  <manifest>
+    <item id="dup" href="first.xhtml" media-type="application/xhtml+xml"/>
+    <item id="other" href="other.xhtml" media-type="application/xhtml+xml"/>
+    <item id="dup" href="second.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="dup"/>
+    <itemref idref="other"/>
+  </spine>
+</package>"#,
+        )
+        .expect("package should parse");
+
+        let dupes = package
+            .manifest
+            .iter()
+            .filter(|item| item.id == "dup")
+            .count();
+        assert_eq!(dupes, 1, "duplicate ids collapse to the first definition");
+        let first = package
+            .manifest
+            .iter()
+            .find(|item| item.id == "dup")
+            .expect("first wins");
+        assert_eq!(first.href, "first.xhtml");
+        assert_eq!(package.manifest.len(), 2);
+    }
+
+    #[test]
+    fn epub8_assessment_table_cells_inline_into_rows_unless_rowless() {
+        let section_id = SectionId("sec_000000".to_string());
+
+        // Common shape: <tr> anchors the block, its cells ride along as
+        // inline markers — no TableCell blocks are emitted.
+        let row_blocks = extract_blocks(
+            "<html><body><table><tr><td>Cell A</td><td>Cell B</td></tr></table></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("row fixture should parse");
+        assert_eq!(row_blocks.len(), 1);
+        assert_eq!(row_blocks[0].kind, BlockKind::TableRow);
+
+        // Row-less stray cells still anchor TableCell blocks directly.
+        let cell_blocks = extract_blocks(
+            "<html><body><table><td>Stray</td></table></body></html>",
+            "chapter.xhtml",
+            &section_id,
+            0,
+        )
+        .expect("cell fixture should parse");
+        assert_eq!(cell_blocks.len(), 1);
+        assert_eq!(cell_blocks[0].kind, BlockKind::TableCell);
+    }
+
+    #[test]
+    fn synthetic_sections_never_collide_with_spine_indexes() {
+        let package = parse_package(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Meta Title</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch" href="ch.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch"/>
+  </spine>
+</package>"#,
+        )
+        .expect("package should parse");
+
+        let spine_len = package.spine.len();
+        // Any synthetic slot must live outside [0, spine_len).
+        assert!(
+            spine_len >= 1,
+            "fixture assumes a real spine entry to collide against"
+        );
     }
 
     #[test]

@@ -1,8 +1,7 @@
 use std::{
     fs::{self, File},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    io::Write,
+    path::Path,
 };
 
 use bookforge_core::{BookforgeError, Result};
@@ -11,7 +10,15 @@ use quick_xml::{
     events::{BytesCData, BytesEnd, BytesStart, BytesText, Event},
 };
 use serde::Serialize;
-use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
+use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
+
+use crate::{
+    archive_limits::{ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, validate_archive_metadata},
+    util::{
+        attr_value_unescaped, commit_staged_output, deterministic_zip_time, is_xhtml_resource_name,
+        local_name, normalize_space, resolve_general_ref, sibling_work_path, validate_xml,
+    },
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReflowOptions {
@@ -66,25 +73,33 @@ pub struct ReflowMergeRecord {
     pub right_class: Option<String>,
 }
 
+fn reflow_epub_staged(
+    input: &Path,
+    output: &Path,
+    options: &ReflowOptions,
+) -> Result<ReflowReport> {
+    let staged = sibling_work_path(output, "reflow");
+    let result = with_output_writer(input, output, options, &staged);
+    match result {
+        Ok(report) => {
+            if let Err(error) = commit_staged_output("reflowed", &staged, output) {
+                let _ = fs::remove_file(&staged);
+                return Err(error);
+            }
+            Ok(report)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&staged);
+            Err(error)
+        }
+    }
+}
+
 pub fn reflow_epub(input: &Path, output: &Path, options: &ReflowOptions) -> Result<ReflowOutcome> {
     let result = if options.dry_run {
         write_reflowed_epub(input, output, options, None)
     } else {
-        let staged = sibling_work_path(output, "reflow");
-        let result = with_output_writer(input, output, options, &staged);
-        match result {
-            Ok(report) => {
-                if let Err(error) = commit_staged_output(&staged, output) {
-                    let _ = fs::remove_file(&staged);
-                    return Err(error);
-                }
-                Ok(report)
-            }
-            Err(error) => {
-                let _ = fs::remove_file(&staged);
-                Err(error)
-            }
-        }
+        reflow_epub_staged(input, output, options)
     }?;
 
     Ok(ReflowOutcome {
@@ -112,6 +127,10 @@ fn write_reflowed_epub(
 ) -> Result<ReflowReport> {
     let source = File::open(input)?;
     let mut archive = ZipArchive::new(source)?;
+    // Central-directory validation plus a per-entry read budget bound every
+    // decompression below, so `bookforge reflow` inherits the same
+    // lying-small-entry defense as the reader and writer paths.
+    let mut read_budget = validate_archive_metadata(&mut archive, DEFAULT_ARCHIVE_LIMITS)?;
     let mut report = ReflowReport {
         schema_version: 1,
         input_path: input.display().to_string(),
@@ -122,13 +141,19 @@ fn write_reflowed_epub(
 
     match writer {
         Some(mut writer) => {
-            write_mimetype_first(&mut archive, &mut writer)?;
-            write_archive_entries(&mut archive, Some(&mut writer), &mut report, options)?;
+            write_mimetype_first(&mut archive, &mut writer, &mut read_budget)?;
+            write_archive_entries(
+                &mut archive,
+                Some(&mut writer),
+                &mut read_budget,
+                &mut report,
+                options,
+            )?;
             writer.finish()?;
         }
         None => {
-            validate_mimetype(&mut archive)?;
-            write_archive_entries(&mut archive, None, &mut report, options)?;
+            validate_mimetype(&mut archive, &mut read_budget)?;
+            write_archive_entries(&mut archive, None, &mut read_budget, &mut report, options)?;
         }
     }
 
@@ -138,13 +163,10 @@ fn write_reflowed_epub(
 fn write_archive_entries(
     archive: &mut ZipArchive<File>,
     mut writer: Option<&mut ZipWriter<File>>,
+    read_budget: &mut ArchiveReadBudget,
     report: &mut ReflowReport,
     options: &ReflowOptions,
 ) -> Result<()> {
-    let deflated = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .last_modified_time(deterministic_zip_time());
-
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
         let name = file.name().to_string();
@@ -155,13 +177,22 @@ fn write_archive_entries(
 
         if file.is_dir() {
             if let Some(writer) = writer.as_deref_mut() {
-                writer.add_directory(name, deflated)?;
+                writer
+                    .add_directory(name, normalized_entry_options(CompressionMethod::Deflated))?;
             }
             continue;
         }
 
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        // Entries the archive stored uncompressed are copied through with
+        // their method preserved (no inflate/deflate round trip); anything
+        // else is recompressed with deflate exactly as before. Bytes still
+        // pass through the budget either way.
+        let compression_method = match file.compression() {
+            CompressionMethod::Stored => CompressionMethod::Stored,
+            _ => CompressionMethod::Deflated,
+        };
+        let compressed_size = file.compressed_size();
+        let bytes = read_budget.read_entry(&mut file, &name, compressed_size)?;
         let output_bytes = if is_xhtml_resource_name(&name) {
             let xhtml = String::from_utf8(bytes).map_err(|err| {
                 BookforgeError::InvalidInput(format!("XHTML resource '{name}' is not UTF-8: {err}"))
@@ -185,12 +216,18 @@ fn write_archive_entries(
         };
 
         if let Some(writer) = writer.as_deref_mut() {
-            writer.start_file(name, deflated)?;
+            writer.start_file(name, normalized_entry_options(compression_method))?;
             writer.write_all(&output_bytes)?;
         }
     }
 
     Ok(())
+}
+
+fn normalized_entry_options(compression_method: CompressionMethod) -> SimpleFileOptions {
+    SimpleFileOptions::default()
+        .compression_method(compression_method)
+        .last_modified_time(deterministic_zip_time())
 }
 
 fn is_false(value: &bool) -> bool {
@@ -340,7 +377,13 @@ fn is_numeric_heading(node: &XmlNode) -> Result<bool> {
         return Ok(false);
     }
     let text = visible_text(&element.children)?;
+    // pdftohtml converts folio page numbers into bare headings, but real
+    // books also carry numeric headings ("1984"). Only short digit runs —
+    // at most three digits, the folio range — are treated as removable
+    // furniture; longer numbers survive cleanup.
+    let digits = text.chars().filter(|ch| ch.is_ascii_digit()).count();
     Ok(!text.trim().is_empty()
+        && digits <= 3
         && text
             .chars()
             .all(|ch| ch.is_ascii_digit() || ch.is_whitespace()))
@@ -761,9 +804,7 @@ fn append_event_text(event: &Event<'static>, text: &mut String) -> Result<()> {
             );
         }
         Event::GeneralRef(reference) => {
-            if let Some(value) = resolve_general_ref(reference)? {
-                text.push_str(&value);
-            }
+            text.push_str(&resolve_general_ref(reference)?);
         }
         _ => {}
     }
@@ -783,7 +824,8 @@ fn is_whitespace_node(node: &XmlNode) -> Result<bool> {
             .chars()
             .all(char::is_whitespace)),
         XmlNode::Leaf(Event::GeneralRef(reference)) => Ok(resolve_general_ref(reference)?
-            .is_some_and(|value| value.chars().all(char::is_whitespace))),
+            .chars()
+            .all(char::is_whitespace)),
         _ => Ok(false),
     }
 }
@@ -1004,7 +1046,8 @@ fn remove_trailing_hyphen(nodes: &mut [XmlNode]) -> Result<bool> {
             }
             XmlNode::Leaf(Event::GeneralRef(reference)) => {
                 if resolve_general_ref(reference)?
-                    .is_some_and(|value| value.chars().all(char::is_whitespace))
+                    .chars()
+                    .all(char::is_whitespace)
                 {
                     continue;
                 }
@@ -1036,10 +1079,6 @@ fn preview(text: &str) -> String {
         preview.push_str("...");
     }
     preview
-}
-
-fn normalize_space(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn is_block_level_name(name: &[u8]) -> bool {
@@ -1095,38 +1134,11 @@ fn is_replaced_content_name(name: &[u8]) -> bool {
     )
 }
 
-fn resolve_general_ref(reference: &quick_xml::events::BytesRef<'_>) -> Result<Option<String>> {
-    if let Some(ch) = reference
-        .resolve_char_ref()
-        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?
-    {
-        return Ok(Some(ch.to_string()));
-    }
-    let name = reference
-        .decode()
-        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-    let resolved = quick_xml::escape::resolve_html5_entity(&name).map(ToString::to_string);
-    if resolved.is_none() {
-        tracing::warn!(entity = %name, "dropping unresolvable entity reference");
-    }
-    Ok(resolved)
-}
-
-fn validate_xml(xml: &str) -> Result<()> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(false);
-    loop {
-        match reader.read_event() {
-            Ok(Event::Eof) => return Ok(()),
-            Ok(_) => continue,
-            Err(error) => return Err(BookforgeError::InvalidInput(error.to_string())),
-        }
-    }
-}
-
-fn validate_mimetype(archive: &mut ZipArchive<File>) -> Result<()> {
-    let mut mimetype = String::new();
-    archive.by_name("mimetype")?.read_to_string(&mut mimetype)?;
+fn validate_mimetype(
+    archive: &mut ZipArchive<File>,
+    read_budget: &mut ArchiveReadBudget,
+) -> Result<()> {
+    let mimetype = crate::archive_limits::read_archive_text(archive, read_budget, "mimetype")?;
     if mimetype.trim() != "application/epub+zip" {
         return Err(BookforgeError::InvalidInput(
             "EPUB mimetype must be application/epub+zip".to_string(),
@@ -1135,94 +1147,22 @@ fn validate_mimetype(archive: &mut ZipArchive<File>) -> Result<()> {
     Ok(())
 }
 
-fn write_mimetype_first(source: &mut ZipArchive<File>, writer: &mut ZipWriter<File>) -> Result<()> {
-    let mut mimetype = String::new();
-    source.by_name("mimetype")?.read_to_string(&mut mimetype)?;
+fn write_mimetype_first(
+    source: &mut ZipArchive<File>,
+    writer: &mut ZipWriter<File>,
+    read_budget: &mut ArchiveReadBudget,
+) -> Result<()> {
+    let mimetype = crate::archive_limits::read_archive_text(source, read_budget, "mimetype")?;
     if mimetype.trim() != "application/epub+zip" {
         return Err(BookforgeError::InvalidInput(
             "EPUB mimetype must be application/epub+zip".to_string(),
         ));
     }
 
-    let stored = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Stored)
-        .last_modified_time(deterministic_zip_time());
+    let stored = normalized_entry_options(CompressionMethod::Stored);
     writer.start_file("mimetype", stored)?;
     writer.write_all(b"application/epub+zip")?;
     Ok(())
-}
-
-fn deterministic_zip_time() -> DateTime {
-    DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("DOS epoch timestamp should be valid")
-}
-
-fn sibling_work_path(output: &Path, label: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let name = output
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("book.epub");
-    output.with_file_name(format!(
-        ".{name}.bookforge-{label}-{}-{nonce}",
-        std::process::id()
-    ))
-}
-
-fn commit_staged_output(staged: &Path, output: &Path) -> Result<()> {
-    if !output.exists() {
-        fs::rename(staged, output)?;
-        return Ok(());
-    }
-
-    let backup = sibling_work_path(output, "backup");
-    fs::rename(output, &backup)?;
-    match fs::rename(staged, output) {
-        Ok(()) => {
-            if let Err(error) = fs::remove_file(&backup) {
-                tracing::warn!(
-                    backup = %backup.display(),
-                    error = %error,
-                    "reflowed EPUB is committed but its backup could not be removed"
-                );
-            }
-            Ok(())
-        }
-        Err(error) => {
-            let _ = fs::rename(&backup, output);
-            Err(error.into())
-        }
-    }
-}
-
-fn is_xhtml_resource_name(name: &str) -> bool {
-    name.rsplit_once('.')
-        .map(|(_, extension)| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "xhtml" | "html" | "htm"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn local_name(name: &[u8]) -> &[u8] {
-    name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
-}
-
-fn attr_value_unescaped(element: &BytesStart<'_>, attr_name: &[u8]) -> Result<Option<String>> {
-    for attr in element.attributes() {
-        let attr = attr.map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-        if local_name(attr.key.as_ref()) == attr_name {
-            return Ok(Some(
-                attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?
-                    .into_owned(),
-            ));
-        }
-    }
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -1231,8 +1171,10 @@ mod tests {
     use std::{
         fs::File,
         io::{Read, Write},
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
     };
-    use zip::{ZipWriter, write::SimpleFileOptions};
+    use zip::{DateTime, ZipWriter, write::SimpleFileOptions};
 
     fn reflow_snippet_with_options(body: &str, options: &ReflowOptions) -> ResourceReflow {
         let xhtml = format!("<html><body>{body}</body></html>");
@@ -1665,5 +1607,129 @@ mod tests {
             "{label}-{}-{nonce}.{extension}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn reflow_rejects_archives_over_the_entry_count_limit() {
+        let path = unique_temp_path("bookforge-reflow-entry-bomb", "epub");
+        let _ = fs::remove_file(&path);
+        let file = File::create(&path).expect("fixture should create");
+        let mut writer = ZipWriter::new(file);
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        writer
+            .start_file("mimetype", stored)
+            .expect("mimetype should start");
+        writer
+            .write_all(b"application/epub+zip")
+            .expect("mimetype should write");
+        // 10_001 entries exceed MAX_ARCHIVE_ENTRIES: metadata validation
+        // must reject the archive before any entry is decompressed.
+        for index in 0..10_001 {
+            writer
+                .start_file(format!("blob{index}"), stored)
+                .expect("blob should start");
+            writer.write_all(b"x").expect("blob should write");
+        }
+        writer.finish().expect("fixture should finish");
+
+        let output = unique_temp_path("bookforge-reflow-entry-bomb-out", "epub");
+
+        let error = reflow_epub(&path, &output, &ReflowOptions::default())
+            .expect_err("entry-count bomb must be rejected");
+
+        assert!(error.to_string().contains("entry count limit exceeded"));
+        assert!(!output.exists(), "no output may be committed on rejection");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stored_entries_are_copied_through_and_timestamps_are_normalized() {
+        let input = unique_temp_path("bookforge-reflow-stored", "epub");
+        let _ = fs::remove_file(&input);
+        let file = File::create(&input).expect("fixture should create");
+        let mut writer = ZipWriter::new(file);
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let deflated = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .last_modified_time(deterministic_zip_time());
+        writer
+            .start_file("mimetype", stored)
+            .expect("mimetype should start");
+        writer
+            .write_all(b"application/epub+zip")
+            .expect("mimetype should write");
+        writer
+            .start_file("OEBPS/chapter.xhtml", deflated)
+            .expect("chapter should start");
+        writer
+            .write_all(b"<html><body><p>Hello</p><p>world.</p></body></html>")
+            .expect("chapter should write");
+        let image_options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .last_modified_time(
+                DateTime::from_date_and_time(2024, 5, 6, 7, 8, 9)
+                    .expect("test timestamp should be valid"),
+            );
+        writer
+            .start_file("OEBPS/cover.png", image_options)
+            .expect("image should start");
+        writer
+            .write_all(&[0u8, 1, 2, 3, 250])
+            .expect("image should write");
+        writer.finish().expect("fixture should finish");
+
+        let output = unique_temp_path("bookforge-reflow-stored-out", "epub");
+        reflow_epub(&input, &output, &ReflowOptions::default()).expect("reflow should succeed");
+
+        let mut archive =
+            ZipArchive::new(File::open(&output).expect("output should open")).expect("zip");
+        let mut copied = Vec::new();
+        {
+            let mut cover = archive
+                .by_name("OEBPS/cover.png")
+                .expect("cover should exist");
+            assert_eq!(cover.compression(), CompressionMethod::Stored);
+            assert_eq!(
+                cover.last_modified(),
+                Some(deterministic_zip_time()),
+                "copied-through entries must not carry mixed source timestamps"
+            );
+            cover.read_to_end(&mut copied).unwrap();
+        }
+        assert_eq!(copied, vec![0u8, 1, 2, 3, 250]);
+
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn pdf_cleanup_preserves_numeric_book_title_headings() {
+        let xhtml = r#"<html><head><meta name="generator" content="pdftohtml 0.36"/></head><body>
+            <h2>1984</h2>
+            <h2>7</h2>
+            <p>Prose continues here.</p>
+        </body></html>"#;
+        let outcome = reflow_xhtml_resource(
+            xhtml,
+            "chapter.xhtml",
+            &ReflowOptions {
+                pdf_cleanup: true,
+                ..ReflowOptions::default()
+            },
+        )
+        .expect("PDF-derived fixture should clean and reflow");
+
+        assert!(
+            outcome.xhtml.contains("<h2>1984</h2>"),
+            "multi-digit titles like '1984' are real headings, got: {}",
+            outcome.xhtml
+        );
+        assert!(
+            !outcome.xhtml.contains(">7<"),
+            "single folio digits remain removable furniture, got: {}",
+            outcome.xhtml
+        );
+        assert_eq!(outcome.removed_furniture, 1);
     }
 }
