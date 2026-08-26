@@ -33,6 +33,10 @@ struct RepairWorkerOutput {
     returned_items: Option<usize>,
     latency_ms: u64,
     max_output_tokens: u32,
+    /// Set when the repair round never reached the provider because the run
+    /// was stopped or a control gate closed; the batch keeps its NeedsReview
+    /// state instead of counting as an attempted-and-failed repair.
+    skipped: bool,
 }
 
 struct BatchRequestOutput {
@@ -58,11 +62,121 @@ impl Drop for InFlightRequestGuard {
 
 fn is_transient(err: &LlmError) -> bool {
     match err {
-        LlmError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
+        // 408 and 425 are timing-condition statuses: a later attempt can
+        // genuinely succeed, unlike their permanent 4xx neighbours
+        // (audit LLM-4).
+        LlmError::HttpStatus { status, .. } => {
+            *status == 429 || *status == 408 || *status == 425 || *status >= 500
+        }
         LlmError::Http(e) => e.is_timeout() || e.is_connect() || e.is_decode() || e.is_body(),
         LlmError::InvalidResponse(message) => is_empty_content_error(message),
         _ => false,
     }
+}
+
+/// Upper bound for one batch-level inter-round backoff.
+///
+/// Batch-level retries sit one layer *above* the provider's own attempt loop:
+/// by the time a whole round fails here, the provider has usually already
+/// spent its configured attempts honoring its `RetryAfterPolicy` and any
+/// `Retry-After` headers internally (headers never surface past
+/// `complete`). What this layer can add honestly is spacing between its own
+/// rounds on the same cadence — jittered exponential, bounded so a long run
+/// still makes progress when an endpoint recovers quickly.
+pub(super) const MAX_BATCH_RETRY_BACKOFF_MS: u64 = 8_000;
+
+/// Jittered exponential delay before re-dispatching a failed transient
+/// round. Deterministic inputs go in; per-attempt-randomized values come
+/// out, so concurrent workers desynchronize instead of retrying in lockstep.
+fn transient_retry_delay(attempt_index: usize) -> Duration {
+    crate::provider::apply_jitter(
+        crate::provider::exponential_delay(attempt_index)
+            .min(Duration::from_millis(MAX_BATCH_RETRY_BACKOFF_MS)),
+        attempt_index,
+    )
+}
+
+/// HTTP status carried by an error, if any. Telemetry used to hardcode
+/// `status_code = None` at this layer, which made the printed `429s=` counter
+/// permanently dead (audit ⚪ group).
+pub(super) fn http_status_of_error(error: &LlmError) -> Option<u16> {
+    match error {
+        LlmError::HttpStatus { status, .. } => Some(*status),
+        _ => None,
+    }
+}
+
+/// Coarse error class for telemetry metrics.
+fn provider_error_kind(error: &LlmError) -> bookforge_core::config::ProviderErrorKind {
+    use bookforge_core::config::ProviderErrorKind;
+    match error {
+        LlmError::HttpStatus { status: 429, .. } => ProviderErrorKind::RateLimit,
+        LlmError::HttpStatus { status, .. } if *status >= 500 => ProviderErrorKind::Server,
+        LlmError::HttpStatus { .. } => ProviderErrorKind::Client,
+        LlmError::Http(e) if e.is_timeout() => ProviderErrorKind::Timeout,
+        LlmError::Http(_) => ProviderErrorKind::Client,
+        LlmError::InvalidResponse(_) | LlmError::Json(_) => ProviderErrorKind::InvalidResponse,
+        LlmError::Provider(_) => ProviderErrorKind::Client,
+    }
+}
+
+/// Per-batch-id bookkeeping so telemetry records real retry counts and the
+/// backoff time actually waited, instead of constant zeros.
+#[derive(Default)]
+pub(super) struct BatchRetryLedger {
+    retries_by_batch: HashMap<String, usize>,
+    backoff_ms_by_batch: HashMap<String, u64>,
+}
+
+impl BatchRetryLedger {
+    /// Mark a requeued batch as entering another retry round.
+    pub(super) fn record_round(&mut self, batch_id: &str, waited_ms: u64) {
+        *self
+            .retries_by_batch
+            .entry(batch_id.to_string())
+            .or_default() += 1;
+        *self
+            .backoff_ms_by_batch
+            .entry(batch_id.to_string())
+            .or_default() += waited_ms;
+    }
+
+    /// Split children inherit the parent's history; they are continuations
+    /// of it, not fresh requests that appeared from nowhere.
+    pub(super) fn inherit_history(&mut self, parent_id: &str, child_ids: &[String]) {
+        let (retries, backoff) = (
+            self.retries_by_batch.get(parent_id).copied().unwrap_or(0),
+            self.backoff_ms_by_batch
+                .get(parent_id)
+                .copied()
+                .unwrap_or(0),
+        );
+        for child in child_ids {
+            self.retries_by_batch.insert(child.clone(), retries);
+            self.backoff_ms_by_batch.insert(child.clone(), backoff);
+        }
+    }
+
+    pub(super) fn retry_count(&self, batch_id: &str) -> usize {
+        self.retries_by_batch.get(batch_id).copied().unwrap_or(0)
+    }
+
+    pub(super) fn backoff_ms(&self, batch_id: &str) -> u64 {
+        self.backoff_ms_by_batch.get(batch_id).copied().unwrap_or(0)
+    }
+}
+
+/// Batch failures replicate their error string into every item's persisted
+/// segment record; cap the payload body once per batch instead of storing up
+/// to an 8 KiB provider dump N times (audit ⚪ group).
+pub(super) fn summarize_error_for_items(error: &LlmError) -> String {
+    const MAX_PERSISTED_ERROR_CHARS: usize = 400;
+    let text = error.to_string();
+    if text.chars().count() <= MAX_PERSISTED_ERROR_CHARS {
+        return text;
+    }
+    let truncated: String = text.chars().take(MAX_PERSISTED_ERROR_CHARS).collect();
+    format!("{truncated}\u{2026} [error text truncated]")
 }
 
 fn is_response_transport_error(err: &LlmError) -> bool {
@@ -118,17 +232,16 @@ pub fn collect_repair_items(result: &BatchTranslationResult) -> Vec<TranslationB
 /// don't deadlock waiting on a segment that will never succeed.
 fn unblock_fence_for_batch_failure(
     registry: Option<&crate::scheduler::ContextRegistry>,
-    segments_by_id: &HashMap<String, Segment>,
+    segments_by_id: &HashMap<&str, &Segment>,
     items: &[TranslationBatchItem],
 ) {
     let Some(registry) = registry else { return };
     let mut seen = std::collections::HashSet::<String>::new();
     for item in items {
-        let key = item.segment_id.0.clone();
-        if !seen.insert(key.clone()) {
+        if !seen.insert(item.segment_id.0.clone()) {
             continue;
         }
-        if let Some(segment) = segments_by_id.get(&key) {
+        if let Some(segment) = segments_by_id.get(item.segment_id.0.as_str()) {
             registry.pre_populate_text(segment, String::new(), SegmentStatus::Failed);
         }
     }
@@ -228,10 +341,12 @@ where
     // per-segment blocks until the count matches the expected block count,
     // then push the joined text into the context registry so later batches
     // can read it as prior context.
-    let segments_by_id: HashMap<String, Segment> = segments
-        .iter()
-        .map(|s| (s.id.0.clone(), s.clone()))
-        .collect();
+    // Borrowed, not cloned: every `Segment` here used to be deep-copied with
+    // its full source payload just to key a lookup map (audit LLM-18). The
+    // input slice outlives this whole function body and is never moved, so
+    // references are enough.
+    let segments_by_id: HashMap<&str, &Segment> =
+        segments.iter().map(|s| (s.id.0.as_str(), s)).collect();
     let segment_block_expected: HashMap<String, usize> = segments
         .iter()
         .map(|s| (s.id.0.clone(), s.block_ids.len()))
@@ -240,27 +355,27 @@ where
     let mut incrementally_finalized_segment_ids = std::collections::HashSet::<String>::new();
 
     let mut all_results: Vec<BatchTranslationResult> = Vec::new();
-    let mut pending: Vec<TranslationBatch> = batches;
-    let max_rounds = 3usize;
     let mut single_invalid_attempts_by_item: HashMap<String, usize> = HashMap::new();
     let mut transient_attempts_by_item: HashMap<String, usize> = HashMap::new();
     let mut escalated_output_tokens_by_item: HashMap<String, u32> = HashMap::new();
     let mut compact_retry_attempts_by_item: HashMap<String, usize> = HashMap::new();
     let mut truncation_alert = TruncationAlertState::default();
+    let mut retry_ledger = BatchRetryLedger::default();
     let mut stop_dispatch = false;
     let mut runtime_sizer: Option<(u64, bool, BatchSizer)> = None;
     let mut repartitioned_revision: Option<u64> = None;
 
-    for _round in 0..max_rounds {
-        if pending.is_empty() || stop_dispatch {
-            break;
-        }
-
+    // The old `for _round in 0..max_rounds` wrapper here was vestigial
+    // (audit LLM-17 / dead-code rollup): the dispatch/join loop below always
+    // drained `pending_queue` — including everything it requeued mid-round —
+    // before exiting, so a second outer round could never see work and the
+    // loop ran at most once by construction.
+    {
         // Spawn one task per queued batch, but gate provider calls below with
         // request_semaphore. Context waiters must not consume provider
         // concurrency, otherwise a split prerequisite batch can be stranded
         // behind later batches that are waiting for its context.
-        let mut pending_queue: VecDeque<TranslationBatch> = pending.drain(..).collect();
+        let mut pending_queue: VecDeque<TranslationBatch> = batches.into_iter().collect();
         let mut tasks = JoinSet::<BatchWorkerOutput>::new();
 
         while (!pending_queue.is_empty() && !stop_dispatch) || !tasks.is_empty() {
@@ -630,6 +745,10 @@ where
                 batch_request_metric_status(&result, batch.items.len(), returned_items);
             let recorded_finish_reason =
                 finish_reason.map(|reason| finish_reason_label(reason).to_string());
+            let recorded_status_code = result.as_ref().err().and_then(http_status_of_error);
+            let recorded_retry_count = retry_ledger.retry_count(&batch.id);
+            let recorded_backoff_ms = retry_ledger.backoff_ms(&batch.id);
+            let recorded_error_kind = result.as_ref().err().map(provider_error_kind);
 
             progress.emit(bookforge_core::ProgressEvent::RequestFinished {
                 request_id: format!("batch_{}", batch.id),
@@ -637,9 +756,9 @@ where
                 segment_id: None,
                 status: recorded_status.clone(),
                 latency_ms,
-                status_code: None,
+                status_code: recorded_status_code,
                 finish_reason: recorded_finish_reason.clone(),
-                retry_count: 0,
+                retry_count: recorded_retry_count,
                 input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
                 output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
                 error_kind: result.as_ref().err().map(|e| format!("{e:?}")),
@@ -660,10 +779,10 @@ where
                 latency_ms,
                 finish_reason: recorded_finish_reason,
                 status: recorded_status,
-                status_code: None,
-                retry_count: 0,
-                backoff_ms: 0,
-                error_kind: None,
+                status_code: recorded_status_code,
+                retry_count: recorded_retry_count,
+                backoff_ms: recorded_backoff_ms,
+                error_kind: recorded_error_kind,
             });
 
             let adaptive_concurrency = config
@@ -694,10 +813,10 @@ where
                     if batch.kind == BatchKind::Translation {
                         for item in &batch_result.translations {
                             let key = item.segment_id.0.clone();
-                            let Some(source_item) = all_items.get(&item.item_id) else {
+                            let Some(source_item) = all_items.get(item.item_id.as_str()) else {
                                 continue;
                             };
-                            let Some(segment) = segments_by_id.get(&key) else {
+                            let Some(segment) = segments_by_id.get(key.as_str()) else {
                                 continue;
                             };
                             let entry = pending_segment_translations
@@ -774,7 +893,9 @@ where
                         // will never publish a Succeeded entry.
                         if let Some(registry) = config.context_registry.as_deref() {
                             for failure in &batch_result.failures {
-                                if let Some(segment) = segments_by_id.get(&failure.segment_id.0) {
+                                if let Some(segment) =
+                                    segments_by_id.get(failure.segment_id.0.as_str())
+                                {
                                     registry.pre_populate_text(
                                         segment,
                                         String::new(),
@@ -793,11 +914,16 @@ where
                     let attempt_limit =
                         transient_batch_attempt_limit(config.scheduler.max_attempts, error);
                     if attempts < attempt_limit {
+                        // Space rounds out instead of hammering an already
+                        // unhappy endpoint back-to-back (audit LLM-4).
+                        let waited = transient_retry_delay(attempts - 1);
+                        tokio::time::sleep(waited).await;
+                        retry_ledger.record_round(&batch.id, waited.as_millis() as u64);
                         progress.emit(bookforge_core::ProgressEvent::Warning {
                             kind: "batch_transient_retry".to_string(),
                             message: format!(
-                                "batch {} transient error on attempt {}; retrying: {error}",
-                                batch.id, attempts
+                                "batch {} transient error on attempt {}; retrying in {:?}: {error}",
+                                batch.id, attempts, waited
                             ),
                             timestamp_ms: bookforge_core::progress::now_ms(),
                         });
@@ -811,7 +937,15 @@ where
                         for item in &batch.items {
                             transient_attempts_by_item.remove(&item.item_id);
                         }
+                        // Bisection also fires fresh requests at the same
+                        // struggling endpoint; give it the same breathing
+                        // room as a plain retry round.
+                        let waited = transient_retry_delay(attempts - 1);
+                        tokio::time::sleep(waited).await;
                         let split = split_batch_with_config(&batch, Some(config.as_ref()));
+                        let child_ids: Vec<String> =
+                            split.iter().map(|part| part.id.clone()).collect();
+                        retry_ledger.inherit_history(&batch.id, &child_ids);
                         if split.len() == 2 {
                             progress.emit(bookforge_core::ProgressEvent::BatchSplit {
                                 batch_id: batch.id.clone(),
@@ -823,8 +957,8 @@ where
                         progress.emit(bookforge_core::ProgressEvent::Warning {
                             kind: "batch_transient_split".to_string(),
                             message: format!(
-                                "batch {} still failed after {} transient attempts; splitting: {error}",
-                                batch.id, attempts
+                                "batch {} still failed after {} transient attempts; splitting (waited {:?}): {error}",
+                                batch.id, attempts, waited
                             ),
                             timestamp_ms: bookforge_core::progress::now_ms(),
                         });
@@ -843,6 +977,9 @@ where
                             &segments_by_id,
                             &batch.items,
                         );
+                        // One compact summary per failure, reused for every
+                        // item — not an 8 KiB provider dump per segment row.
+                        let persisted_error = summarize_error_for_items(error);
                         all_results.push(BatchTranslationResult {
                             batch_id: batch.id.clone(),
                             translations: Vec::new(),
@@ -852,7 +989,7 @@ where
                                 .map(|item| BatchItemFailure {
                                     item_id: item.item_id.clone(),
                                     segment_id: item.segment_id.clone(),
-                                    error: format!("{error}"),
+                                    error: persisted_error.clone(),
                                     input_tokens: None,
                                     input_cached_tokens: None,
                                     output_tokens: None,
@@ -1148,6 +1285,7 @@ where
                         &segments_by_id,
                         &batch.items,
                     );
+                    let persisted_error = summarize_error_for_items(&error);
                     all_results.push(BatchTranslationResult {
                         batch_id: batch.id.clone(),
                         translations: Vec::new(),
@@ -1157,7 +1295,7 @@ where
                             .map(|item| BatchItemFailure {
                                 item_id: item.item_id.clone(),
                                 segment_id: item.segment_id.clone(),
-                                error: format!("{error}"),
+                                error: persisted_error.clone(),
                                 input_tokens: None,
                                 input_cached_tokens: None,
                                 output_tokens: None,
@@ -1171,10 +1309,9 @@ where
                 }
             }
         }
-        if stop_dispatch {
-            break;
-        }
-        pending = pending_queue.into();
+        // Requeued batches were drained inside the same dispatch/join loop
+        // above, so `pending_queue` is empty here by construction; nothing
+        // survives to a hypothetical second round.
     }
 
     progress.emit(bookforge_core::ProgressEvent::Warning {
@@ -1188,8 +1325,7 @@ where
 
     let mut segment_translations: HashMap<String, SegmentTranslation> = HashMap::new();
 
-    let segments_by_id: HashMap<&str, &Segment> =
-        segments.iter().map(|s| (s.id.0.as_str(), s)).collect();
+    // (Reuses the borrowed `segments_by_id` map built at the top of the run.)
 
     let make_entry = |seg_id: &str,
                       status: SegmentStatus,
@@ -1404,8 +1540,33 @@ where
         let mut repaired_count = 0usize;
         let mut repair_attempts_by_batch: HashMap<String, usize> = HashMap::new();
         let mut repair_tasks = JoinSet::<RepairWorkerOutput>::new();
+        let mut repair_stopped = false;
 
         while !repair_batches.is_empty() || !repair_tasks.is_empty() {
+            // Audit LLM-3: the repair phase used to barrel straight through
+            // pause/stop transitions, ignore the request limiter and the
+            // adaptive rate controller — unlike every other stage that
+            // issues provider calls. It now observes the exact same control
+            // boundaries.
+            if let Some(signal) = pause_signal.as_ref() {
+                on_control_boundary(signal)?;
+                match signal.state() {
+                    PauseState::Running => {}
+                    PauseState::Stopped => {
+                        repair_stopped = true;
+                        break;
+                    }
+                    PauseState::Paused if repair_tasks.is_empty() => {
+                        if wait_for_batch_resume_or_stop(signal, &mut on_control_boundary).await?
+                            == PauseState::Stopped
+                        {
+                            repair_stopped = true;
+                            break;
+                        }
+                    }
+                    PauseState::Paused => break,
+                }
+            }
             loop {
                 let runtime_snapshot = config
                     .runtime_settings
@@ -1441,8 +1602,75 @@ where
                 let progress = progress.clone();
                 let section_titles = section_titles.clone();
                 let active_requests = active_requests.clone();
+                let request_limiter = request_limiter.clone();
+                let rate_controller = rate_controller.clone();
+                let pause_signal = pause_signal.clone();
 
                 repair_tasks.spawn(async move {
+                    // Never start new provider traffic for a stopped run.
+                    if let Some(signal) = pause_signal.as_ref()
+                        && signal.wait_until_running_or_stopped().await == PauseState::Stopped
+                    {
+                        return RepairWorkerOutput {
+                            batch: repair_batch,
+                            result: Err(LlmError::Provider("repair stopped".to_string())),
+                            finish_reason: None,
+                            returned_items: None,
+                            latency_ms: 0,
+                            max_output_tokens: 0,
+                            skipped: true,
+                        };
+                    }
+                    // Share the run-wide request limiter with translation
+                    // workers instead of bypassing it.
+                    let request_permit = loop {
+                        match request_limiter.try_acquire() {
+                            Ok(permit) => break permit,
+                            Err(TryAcquireError::NoPermits) => {
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                            }
+                            Err(TryAcquireError::Closed) => {
+                                return RepairWorkerOutput {
+                                    batch: repair_batch,
+                                    result: Err(LlmError::Provider(
+                                        "batch request semaphore closed".to_string(),
+                                    )),
+                                    finish_reason: None,
+                                    returned_items: None,
+                                    latency_ms: 0,
+                                    max_output_tokens: 0,
+                                    skipped: true,
+                                };
+                            }
+                        }
+                    };
+                    // And honor the adaptive controller's gate.
+                    let adaptive_concurrency = config
+                        .runtime_settings
+                        .as_ref()
+                        .map(|receiver| receiver.borrow().adaptive_concurrency)
+                        .unwrap_or_else(|| rate_controller.is_some());
+                    let controller_permit =
+                        match rate_controller.as_ref().filter(|_| adaptive_concurrency) {
+                            Some(controller) => match controller.acquire().await {
+                                Ok(permit) => Some(permit),
+                                Err(_) => {
+                                    return RepairWorkerOutput {
+                                        batch: repair_batch,
+                                        result: Err(LlmError::Provider(
+                                            "adaptive concurrency limiter closed".to_string(),
+                                        )),
+                                        finish_reason: None,
+                                        returned_items: None,
+                                        latency_ms: 0,
+                                        max_output_tokens: 0,
+                                        skipped: true,
+                                    };
+                                }
+                            },
+                            None => None,
+                        };
+
                     let started = std::time::Instant::now();
                     let is_reasoning = provider.is_reasoning();
                     let max_output_tokens =
@@ -1620,6 +1848,8 @@ where
                         ))),
                     };
 
+                    drop(controller_permit);
+                    drop(request_permit);
                     RepairWorkerOutput {
                         batch: repair_batch,
                         result,
@@ -1627,11 +1857,26 @@ where
                         returned_items,
                         latency_ms: started.elapsed().as_millis() as u64,
                         max_output_tokens,
+                        skipped: false,
                     }
                 });
             }
 
-            let Some(joined) = repair_tasks.join_next().await else {
+            let joined = match pause_signal.as_ref() {
+                Some(signal) if signal.state() == PauseState::Paused => {
+                    tokio::select! {
+                        joined = repair_tasks.join_next() => joined,
+                        state = wait_for_batch_resume_or_stop(signal, &mut on_control_boundary) => {
+                            if state? == PauseState::Stopped {
+                                repair_stopped = true;
+                            }
+                            repair_tasks.join_next().await
+                        }
+                    }
+                }
+                _ => repair_tasks.join_next().await,
+            };
+            let Some(joined) = joined else {
                 continue;
             };
             let RepairWorkerOutput {
@@ -1641,8 +1886,24 @@ where
                 returned_items,
                 latency_ms,
                 max_output_tokens,
+                skipped,
             } = joined
                 .map_err(|err| LlmError::Provider(format!("repair worker task failed: {err}")))?;
+
+            if skipped {
+                // The run was stopped (or a control gate closed): no provider
+                // request happened, so there is nothing to observe or record.
+                progress.emit(bookforge_core::ProgressEvent::Warning {
+                    kind: "batch_repair_cancelled".to_string(),
+                    message: format!(
+                        "repair batch {} was not attempted: the run stopped or a control gate closed; {} items stay NeedsReview",
+                        batch.id,
+                        batch.items.len()
+                    ),
+                    timestamp_ms: bookforge_core::progress::now_ms(),
+                });
+                continue;
+            }
 
             let recorded_status =
                 batch_request_metric_status(&result, batch.items.len(), returned_items);
@@ -1652,6 +1913,8 @@ where
                 .get(&batch.id)
                 .copied()
                 .unwrap_or(0);
+            let repair_status_code = result.as_ref().err().and_then(http_status_of_error);
+            let repair_error_kind = result.as_ref().err().map(provider_error_kind);
 
             progress.emit(bookforge_core::ProgressEvent::RequestFinished {
                 request_id: format!("batch_{}", batch.id),
@@ -1659,7 +1922,7 @@ where
                 segment_id: None,
                 status: recorded_status.clone(),
                 latency_ms,
-                status_code: None,
+                status_code: repair_status_code,
                 finish_reason: recorded_finish_reason.clone(),
                 retry_count: repair_retry_count,
                 input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
@@ -1682,11 +1945,20 @@ where
                 latency_ms,
                 finish_reason: recorded_finish_reason,
                 status: recorded_status,
-                status_code: None,
+                status_code: repair_status_code,
                 retry_count: repair_retry_count,
                 backoff_ms: 0,
-                error_kind: None,
+                error_kind: repair_error_kind,
             });
+
+            let adaptive_concurrency = config
+                .runtime_settings
+                .as_ref()
+                .map(|receiver| receiver.borrow().adaptive_concurrency)
+                .unwrap_or_else(|| rate_controller.is_some());
+            if let Some(controller) = rate_controller.as_ref().filter(|_| adaptive_concurrency) {
+                controller.observe(request_status_for_controller(&result), latency_ms);
+            }
 
             match result {
                 Ok(repaired) => {
@@ -1783,6 +2055,17 @@ where
                     });
                 }
             }
+        }
+
+        if repair_stopped {
+            let pending_items: usize = repair_batches.iter().map(|batch| batch.items.len()).sum();
+            progress.emit(bookforge_core::ProgressEvent::Warning {
+                kind: "batch_repair_stopped".to_string(),
+                message: format!(
+                    "repair phase stopped by control signal with {pending_items} items left un-repaired; they stay NeedsReview"
+                ),
+                timestamp_ms: bookforge_core::progress::now_ms(),
+            });
         }
 
         progress.emit(bookforge_core::ProgressEvent::BatchRepairFinished {
@@ -2190,6 +2473,10 @@ fn apportion(total: Option<u64>, weights: &[u64]) -> Vec<Option<u64>> {
 fn request_status_from_error(error: &LlmError) -> &'static str {
     match error {
         LlmError::HttpStatus { status: 429, .. } => "rate_limited",
+        // Both are transient timing conditions; surface them as such so the
+        // timeout counter tells the truth instead of hiding in `error`.
+        LlmError::HttpStatus { status: 408, .. } => "timeout",
+        LlmError::HttpStatus { status: 425, .. } => "too_early",
         LlmError::HttpStatus { status, .. } if *status >= 500 => "server_error",
         LlmError::Http(e) if e.is_timeout() => "timeout",
         LlmError::Http(e) if e.is_connect() => "connect_error",
@@ -2236,6 +2523,8 @@ pub(super) fn request_status_for_controller<T>(result: &Result<T, LlmError>) -> 
     match result {
         Ok(_) => RequestStatus::Ok,
         Err(LlmError::HttpStatus { status: 429, .. }) => RequestStatus::RateLimited,
+        Err(LlmError::HttpStatus { status: 408, .. }) => RequestStatus::Timeout,
+        Err(LlmError::HttpStatus { status: 425, .. }) => RequestStatus::ServerError,
         Err(LlmError::HttpStatus { status, .. }) if *status >= 500 => RequestStatus::ServerError,
         Err(LlmError::Http(error)) if error.is_timeout() => RequestStatus::Timeout,
         Err(LlmError::Http(error)) if error.is_connect() => RequestStatus::ConnectError,

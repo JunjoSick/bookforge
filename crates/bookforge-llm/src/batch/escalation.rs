@@ -85,7 +85,7 @@ pub(super) fn capped_batch_max_output_tokens(
         target_min_output_tokens,
     );
     let user_cap = config.batch_max_output_tokens.or(config.max_output_tokens);
-    bookforge_core::config::cap_output_tokens(
+    crate::scheduler::clamped_output_budget(
         computed,
         batch.token_estimate,
         config.model_context_tokens,
@@ -118,7 +118,7 @@ fn batch_output_token_ceiling(
     } else {
         16_384
     };
-    bookforge_core::config::cap_output_tokens(
+    crate::scheduler::clamped_output_budget(
         ceiling,
         batch.token_estimate,
         config.model_context_tokens,

@@ -271,6 +271,26 @@ pub(crate) fn empty_translation_validation_error(
         .then_some("empty translation for non-empty source")
 }
 
+const KNOWN_QA_VERDICTS: [&str; 3] = ["pass", "warn", "fail"];
+
+/// Validate a model-supplied QA verdict against the documented set
+/// (`pass | warn | fail`). Anything else is unvalidated freeform today;
+/// instead of letting it flow verbatim into reports and gates, degrade it
+/// to `warn` (the conservative default that keeps human eyes on the
+/// segment) and attach an explanatory finding.
+pub(crate) fn normalize_qa_verdict(raw: &str) -> (&'static str, Option<String>) {
+    let folded = raw.trim().to_ascii_lowercase();
+    if let Some(known) = KNOWN_QA_VERDICTS.iter().find(|known| **known == folded) {
+        return (known, None);
+    }
+    (
+        "warn",
+        Some(format!(
+            "QA provider returned an unrecognized verdict {raw:?}; treated as warn"
+        )),
+    )
+}
+
 /// Conservative hard gates for the built-in Toki Pona style. These checks
 /// deliberately cover failures that can be detected without judging the
 /// translation's politics or semantic choices: source-language leakage,

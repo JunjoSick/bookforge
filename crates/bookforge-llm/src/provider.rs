@@ -18,6 +18,15 @@ const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// in errors and logs.
 const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 8 * 1024;
 
+/// Upper bound on a `Retry-After` hint we are willing to honor, whether the
+/// server sent delay-seconds or an HTTP-date. A hostile or buggy endpoint can
+/// otherwise stall one request (and with it a whole worker) for hours. Five
+/// minutes is generous enough for every documented rate-limit window we have
+/// seen in practice while staying far below the old 60s cap's loss of intent:
+/// hints beyond the cap are clamped rather than discarded, so the spirit of
+/// the header survives.
+const MAX_HONORED_RETRY_AFTER_SECS: u64 = 300;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
     #[error("provider error: {0}")]
@@ -803,8 +812,14 @@ impl OpenAiCompatibleProvider {
         config: OpenAiCompatibleConfig,
         cancel_token: CancellationToken,
     ) -> Result<Self> {
-        let is_reasoning = model_name_is_reasoning(&config.model);
-        let effective_timeout = if is_reasoning {
+        // Names alone are not the whole story (see `model_ships_with_thinking`):
+        // a request that explicitly disables thinking never spends its output
+        // budget on hidden chain-of-thought, so it needs neither the x3
+        // multiplier nor the ≥300s timeout floor. Runtime detection on
+        // `reasoning_content` still flips this back on if an endpoint thinks
+        // anyway.
+        let bootstrapped_reasoning = bootstrapped_reasoning(&config);
+        let effective_timeout = if bootstrapped_reasoning {
             config.timeout_seconds.max(300)
         } else {
             config.timeout_seconds
@@ -819,7 +834,7 @@ impl OpenAiCompatibleProvider {
         Ok(Self {
             config,
             client,
-            reasoning_detected: AtomicBool::new(is_reasoning),
+            reasoning_detected: AtomicBool::new(bootstrapped_reasoning),
             response_format_supported: AtomicBool::new(true),
             thinking_warning_emitted: AtomicBool::new(false),
             cancel_token,
@@ -1279,14 +1294,113 @@ async fn apply_retry_delay(
 }
 
 fn is_retryable_status(status: u16) -> bool {
-    status == 429 || (500..=599).contains(&status)
+    // 408 (Request Timeout) and 425 (Too Early) are transient by
+    // specification: both describe timing conditions that a later retry can
+    // resolve, unlike the permanent 4xx family around them.
+    status == 429 || status == 408 || status == 425 || (500..=599).contains(&status)
 }
 
+/// Parse a `Retry-After` header value, honoring both defined forms.
+///
+/// RFC 7231 allows either `delay-seconds` or an HTTP-date. The seconds form
+/// was already handled; the date form was silently dropped before, which made
+/// polite servers look like they had sent nothing. A date in the past means
+/// "retry now" and yields a zero delay. Both forms are clamped to
+/// [`MAX_HONORED_RETRY_AFTER_SECS`]; the clamp is a durability guard against
+/// hostile values, not a policy judgment about small hints.
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
-    let secs: u64 = raw.trim().parse().ok()?;
-    // Cap at 60s so a buggy or hostile server can't stall a request for hours.
-    Some(Duration::from_secs(secs.min(60)))
+    let raw = raw.trim();
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(secs.min(MAX_HONORED_RETRY_AFTER_SECS)));
+    }
+    let target_unix = parse_http_date_unix(raw)?;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(Duration::from_secs(
+        target_unix
+            .saturating_sub(now_unix)
+            .min(MAX_HONORED_RETRY_AFTER_SECS),
+    ))
+}
+
+/// Parse an HTTP-date into Unix seconds. Supports IMF-fixdate
+/// (`Sun, 06 Nov 1994 08:49:37 GMT`) and the obsolete RFC 850 form
+/// (`Sunday, 06-Nov-94 08:49:37 GMT`); asctime is rare enough on the wire
+/// that falling back to the exponential backoff for it is acceptable.
+fn parse_http_date_unix(input: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+
+    let body = input.split(',').nth(1)?.trim_start();
+    let tokens: Vec<&str> = body.split_whitespace().collect();
+
+    // IMF-fixdate carries five tokens ("06 Nov 1994 08:49:37 GMT"); RFC 850
+    // folds the date into one hyphenated token ("06-Nov-94 08:49:37 GMT").
+    let (day_token, month_token, year_token, time_token) = match tokens.as_slice() {
+        [date_token, time_token, zone] if zone.eq_ignore_ascii_case("GMT") => {
+            let (day, rest) = date_token.split_once('-')?;
+            let (month, year) = rest.split_once('-')?;
+            (day, month, year.to_string(), *time_token)
+        }
+        [day_token, month_token, year_token, time_token, zone]
+            if zone.eq_ignore_ascii_case("GMT") =>
+        {
+            (
+                *day_token,
+                *month_token,
+                (*year_token).to_string(),
+                *time_token,
+            )
+        }
+        _ => return None,
+    };
+
+    let day: u32 = day_token.parse().ok()?;
+    let month_index = MONTHS
+        .iter()
+        .position(|name| month_token.eq_ignore_ascii_case(name))? as u32
+        + 1;
+    let year: i64 = match year_token.parse::<i64>() {
+        // Two-digit years only appear in the RFC 850 form; the pivot follows
+        // the common two-digit-year convention (00–68 => 20xx).
+        Ok(short @ 0..=99) if year_token.len() == 2 => {
+            if short < 70 {
+                2000 + short
+            } else {
+                1900 + short
+            }
+        }
+        Ok(full) => full,
+        Err(_) => return None,
+    };
+    let mut clock = time_token.split(':');
+    let hour: u32 = clock.next()?.parse().ok()?;
+    let minute: u32 = clock.next()?.parse().ok()?;
+    let second: u32 = clock.next()?.parse().ok()?;
+    if clock.next().is_some() || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    {
+        return None;
+    }
+
+    // Days-from-civil (Howard Hinnant's algorithm); Gregorian, leap-safe.
+    let shifted_year = year - i64::from(month_index <= 2);
+    let era = shifted_year.div_euclid(400);
+    let year_of_era = shifted_year - era * 400;
+    let month_of_season = if month_index > 2 {
+        month_index - 3
+    } else {
+        month_index + 9
+    };
+    let day_of_season = (153 * month_of_season + 2) / 5 + day - 1;
+    let day_of_era =
+        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + i64::from(day_of_season);
+    let days = era * 146_097 + day_of_era - 719_468;
+
+    Some((days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64) as u64)
 }
 
 fn is_retryable_http_error(error: &reqwest::Error) -> bool {
@@ -1305,21 +1419,36 @@ fn attempt_limit_for_http_error(error: &reqwest::Error, max_attempts: usize) -> 
     }
 }
 
-fn exponential_delay(attempt: usize) -> Duration {
+pub(crate) fn exponential_delay(attempt: usize) -> Duration {
     let millis: u64 = 500u64.saturating_mul(2u64.saturating_pow(attempt as u32));
     Duration::from_millis(millis.min(60_000))
 }
 
-fn apply_jitter(base: Duration, attempt: usize) -> Duration {
+/// Widen `base` into a ±20% window around it and pick a point inside.
+///
+/// The offset is mixed from wall-clock nanoseconds and the process id on
+/// every call instead of derived only from the attempt index. A purely
+/// attempt-derived sequence made every concurrent worker compute the *same*
+/// delay for the same retry round — a thundering herd re-synchronized onto
+/// the exact moment the rate limiter was least able to absorb them
+/// (audit LLM-10).
+pub(crate) fn apply_jitter(base: Duration, attempt: usize) -> Duration {
     let millis = base.as_millis() as u64;
     if millis < 2 {
         return base;
     }
     let spread = millis / 5;
-    let offset = (attempt as u64)
-        .wrapping_mul(1103515245)
-        .wrapping_add(12345)
-        % spread.max(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|now| now.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let seed = nanos
+        ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (attempt as u64).wrapping_mul(1103515245);
+    let offset = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let offset = (offset >> 33) % spread.max(1);
     Duration::from_millis(millis.saturating_sub(spread / 2).saturating_add(offset))
 }
 
@@ -1338,9 +1467,14 @@ fn retry_delay(
 
         RetryAfterPolicy::Fixed => Some(Duration::from_millis(750).min(max_backoff)),
 
+        // A server-provided hint outranks our own curve even under the
+        // jittered policy; when absent the exponential estimate applies.
+        // The hint is still honored through its clamp in `parse_retry_after`.
         RetryAfterPolicy::JitteredExponential => {
-            let base = exponential_delay(attempt).min(max_backoff);
-            Some(apply_jitter(base, attempt))
+            let base = retry_after.unwrap_or_else(|| exponential_delay(attempt).min(max_backoff));
+            // Re-clamp after jittering so the ±20% window can never push a
+            // delay past the operator's ceiling.
+            Some(apply_jitter(base, attempt).min(max_backoff))
         }
     }
 }
@@ -1392,16 +1526,41 @@ fn parse_finish_reason(value: &str) -> FinishReason {
     }
 }
 
-/// Heuristic to detect reasoning / chain-of-thought models by name.
-/// These models consume part of the `max_tokens` budget for internal reasoning
-/// and thus need a higher output token allowance.
-fn model_name_is_reasoning(model: &str) -> bool {
+/// Heuristic: which model names imply chain-of-thought output budget?
+///
+/// Two distinct families live here deliberately:
+///
+/// * Dedicated reasoners (`deepseek-reasoner`-style IDs, the OpenAI
+///   o-series) always consume output tokens for hidden reasoning, toggle or
+///   no toggle, and keep their unconditional treatment.
+/// * DeepSeek V4 chat tiers (`v4-flash`, `v4-pro`) merely **default** to
+///   thinking per DeepSeek's published docs (api-docs.deepseek.com,
+///   "Models & Pricing" / "Thinking Mode", checked 2026-08-26), toggled via
+///   `{"thinking": {"type": ...}}`. For those the caller must confirm
+///   thinking wasn't disabled before treating the model as reasoning — see
+///   `new_with_cancel` and the BookForge presets that ship
+///   `thinking_disabled: true`.
+fn model_ships_with_thinking(model: &str) -> bool {
     let lower = model.to_lowercase();
     lower.contains("reasoner")
         || lower.contains("v4-flash")
+        || lower.contains("v4-pro")
         || lower.starts_with("o1")
         || lower.starts_with("o3")
         || lower.starts_with("o4")
+}
+
+/// Whether the initial classification treats this config as a reasoning
+/// deployment. Dedicated reasoners ignore the disable toggle (their budget
+/// is spent regardless of whether the suppression parameter lands);
+/// default-thinking chat tiers honor it.
+fn bootstrapped_reasoning(config: &OpenAiCompatibleConfig) -> bool {
+    let lower = config.model.to_lowercase();
+    let dedicated = lower.contains("reasoner")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4");
+    dedicated || (model_ships_with_thinking(&config.model) && !config.thinking_disabled)
 }
 
 fn local_api_key_is_optional(name: &str) -> bool {
@@ -1659,6 +1818,77 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_delay_seconds_is_honored_and_capped() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("45"),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(45)));
+
+        let mut hostile = reqwest::header::HeaderMap::new();
+        hostile.insert(
+            reqwest::header::RETRY_AFTER,
+            // 100 hours.
+            reqwest::header::HeaderValue::from_static("360000"),
+        );
+        assert_eq!(
+            parse_retry_after(&hostile),
+            Some(Duration::from_secs(MAX_HONORED_RETRY_AFTER_SECS)),
+            "the clamp must bound hostile hints"
+        );
+    }
+
+    #[test]
+    fn retry_after_http_date_is_parsed_not_dropped() {
+        // The canonical RFC 7231 example (RFC 2616 §3.3.1 test vector).
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        let parsed = parse_retry_after(&headers).expect("HTTP-date must yield a delay");
+        assert!(
+            parsed <= Duration::from_secs(MAX_HONORED_RETRY_AFTER_SECS),
+            "a past date must degrade to an immediate retry, got {parsed:?}"
+        );
+
+        let unix =
+            parse_http_date_unix("Sun, 06 Nov 1994 08:49:37 GMT").expect("IMF-fixdate must parse");
+        assert_eq!(unix, 784_111_777);
+
+        let rfc850 =
+            parse_http_date_unix("Sunday, 06-Nov-94 08:49:37 GMT").expect("RFC 850 must parse");
+        assert_eq!(rfc850, 784_111_777);
+
+        assert_eq!(
+            parse_http_date_unix("Sat, 01 Jan 2000 00:00:00 GMT"),
+            Some(946_684_800)
+        );
+        assert_eq!(parse_http_date_unix("not a date"), None);
+    }
+
+    #[test]
+    fn jittered_exponential_prefers_a_server_hint() {
+        let hint = Some(Duration::from_secs(3));
+        for attempt in 0..5 {
+            let delay = retry_delay(
+                RetryAfterPolicy::JitteredExponential,
+                attempt,
+                hint,
+                Duration::from_secs(30),
+            )
+            .expect("policy yields a delay");
+            // Jitter widens to ±20%, so a honored 3s hint stays near it
+            // rather than collapsing onto our own curve.
+            assert!(
+                delay >= Duration::from_millis(2_000) && delay <= Duration::from_millis(4_000),
+                "hint should dominate the schedule, got {delay:?}"
+            );
+        }
+    }
+
+    #[test]
     fn local_provider_keys_are_optional_only_for_known_presets() {
         assert!(local_api_key_is_optional("OLLAMA_API_KEY"));
         assert!(local_api_key_is_optional("LLAMACPP_API_KEY"));
@@ -1727,6 +1957,55 @@ mod tests {
 
         assert!(preview.ends_with("[truncated]"));
         assert!(!preview.contains(&"x".repeat(MAX_PROVIDER_ERROR_BODY_BYTES + 1)));
+    }
+
+    /// Regression for audit LLM-13. DeepSeek's published docs state that
+    /// `deepseek-v4-flash` (and `-pro`) support both modes with thinking
+    /// enabled *by default* — but every BookForge preset ships
+    /// `thinking_disabled: true`, and a disabled request never burns its
+    /// output budget on hidden chain-of-thought, so it must not receive the
+    /// reasoning ×3 budget or the ≥300s timeout floor.
+    #[test]
+    fn thinking_disabled_names_do_not_bootstrap_reasoning_budgets() {
+        let disabled = offline_provider("https://api.deepseek.com/v1", "deepseek-v4-flash");
+        assert!(
+            !disabled.is_reasoning(),
+            "thinking_disabled flash must not pre-classify as reasoning"
+        );
+        let disabled_pro = offline_provider("https://api.deepseek.com/v1", "deepseek-v4-pro");
+        assert!(!disabled_pro.is_reasoning());
+
+        // With thinking allowed, the documented default applies.
+        let mut enabled_config =
+            OpenAiCompatibleConfig::deepseek(Some("deepseek-v4-flash".to_string()));
+        enabled_config.thinking_disabled = false;
+        enabled_config.base_url = "https://api.deepseek.test/v1".to_string();
+        enabled_config.timeout_seconds = 10;
+        enabled_config.api_key_env = "BOOKFORGE_OFFLINE_TEST_API_KEY".to_string();
+        let enabled = OpenAiCompatibleProvider::new(enabled_config).expect("provider");
+        assert!(
+            enabled.is_reasoning(),
+            "a thinking-enabled V4 chat model defaults to thinking per provider docs"
+        );
+    }
+
+    #[test]
+    fn dedicated_reasoner_ids_stay_classified_as_reasoning() {
+        let reasoner = offline_provider("https://api.deepseek.com/v1", "deepseek-reasoner");
+        assert!(
+            reasoner.is_reasoning(),
+            "deepseek-reasoner-style IDs remain reasoning regardless of the toggle"
+        );
+    }
+
+    #[test]
+    fn transient_timing_statuses_are_retryable() {
+        assert!(is_retryable_status(408));
+        assert!(is_retryable_status(425));
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(503));
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(404));
     }
 
     /// Windows loopback connections intermittently reset or truncate under

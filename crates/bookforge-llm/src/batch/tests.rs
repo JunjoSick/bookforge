@@ -2761,13 +2761,13 @@ async fn transient_batch_errors_stop_after_max_attempts() {
     config.scheduler.max_attempts = 2;
 
     let translations = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(5),
         translate_batches_with_callback(
             provider.clone(),
             batches,
             &segments,
             &config,
-            telemetry,
+            telemetry.clone(),
             None,
             None,
             Arc::new(bookforge_core::NullProgressSink),
@@ -2782,6 +2782,8 @@ async fn transient_batch_errors_stop_after_max_attempts() {
     assert_eq!(provider.calls(), 2);
     assert_eq!(translations.len(), 1);
     assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
+    // Persisted per-item errors are compact summaries now, not repeated
+    // multi-KB dumps; the meaningful head survives truncation unharmed here.
     assert!(
         translations[0]
             .error
@@ -2789,6 +2791,78 @@ async fn transient_batch_errors_stop_after_max_attempts() {
             .is_some_and(|error| error.contains("HTTP status 503")),
         "got: {:?}",
         translations[0].error
+    );
+
+    // Audit ⚪ group / LLM-4: telemetry carries real values — actual status
+    // code, a nonzero retry count after the requeue, and the bounded
+    // inter-round backoff that actually elapsed (0.5s base ±20%).
+    let metrics = telemetry.snapshot();
+    assert_eq!(metrics.len(), 2);
+    assert_eq!(metrics[0].retry_count, 0);
+    assert_eq!(metrics[1].retry_count, 1);
+    assert_eq!(
+        metrics[1].status_code,
+        Some(503),
+        "the recorded status code must be the real one"
+    );
+    assert!(
+        metrics[1].backoff_ms >= 300
+            && metrics[1].backoff_ms <= super::execution::MAX_BATCH_RETRY_BACKOFF_MS,
+        "backoff should be the bounded exponential+jitter wait, got {}ms",
+        metrics[1].backoff_ms
+    );
+    assert!(
+        matches!(
+            metrics[1].error_kind,
+            Some(bookforge_core::config::ProviderErrorKind::Server)
+        ),
+        "got: {:?}",
+        metrics[1].error_kind
+    );
+}
+
+#[test]
+fn retry_ledger_tracks_requeues_and_inherited_split_history() {
+    use super::execution::BatchRetryLedger;
+
+    let mut ledger = BatchRetryLedger::default();
+    assert_eq!(ledger.retry_count("b"), 0);
+
+    ledger.record_round("b", 400);
+    ledger.record_round("b", 600);
+    assert_eq!(ledger.retry_count("b"), 2);
+    assert_eq!(ledger.backoff_ms("b"), 1000);
+
+    // Split children are continuations, not fresh zero-history requests.
+    ledger.inherit_history("b", &[String::from("b_l"), String::from("b_r")]);
+    assert_eq!(ledger.retry_count("b_l"), 2);
+    assert_eq!(ledger.backoff_ms("b_r"), 1000);
+}
+
+#[test]
+fn oversized_provider_errors_are_summarized_once_for_persistence() {
+    let dump = LlmError::HttpStatus {
+        status: 500,
+        body: "x".repeat(8 * 1024),
+    };
+    let summarized = super::execution::summarize_error_for_items(&dump);
+
+    assert!(
+        summarized.chars().count() < 500,
+        "persisted summary must be compact, got {} chars",
+        summarized.chars().count()
+    );
+    assert!(summarized.contains("[error text truncated]"));
+    assert!(summarized.contains("HTTP status 500"));
+
+    let small = LlmError::HttpStatus {
+        status: 408,
+        body: "slow".to_string(),
+    };
+    assert_eq!(
+        super::execution::summarize_error_for_items(&small),
+        small.to_string(),
+        "short errors pass through untouched"
     );
 }
 
