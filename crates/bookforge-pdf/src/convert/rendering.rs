@@ -11,6 +11,7 @@ pub(super) fn ocr_low_confidence_pages(
     render: &mut dyn FnMut(u32) -> Result<Vec<u8>>,
     blocks: &mut Vec<AnchoredBlock>,
     low_confidence_pages: &[u32],
+    max_request_bytes: usize,
 ) -> OcrPagesOutcome {
     let mut outcome = OcrPagesOutcome::default();
     for page_number in low_confidence_pages {
@@ -23,6 +24,13 @@ pub(super) fn ocr_low_confidence_pages(
                 continue;
             }
         };
+        if image.len() > max_request_bytes {
+            outcome.warnings.push(format!(
+                "page {page_number}: OCR skipped because the rendered PNG ({} bytes) exceeds the {max_request_bytes}-byte request limit",
+                image.len()
+            ));
+            continue;
+        }
         match engine.ocr_page(&image, *page_number) {
             Ok(text) => {
                 replace_page_with_ocr_text(blocks, *page_number, &text);
@@ -38,20 +46,26 @@ pub(super) fn ocr_low_confidence_pages(
 
 fn replace_page_with_ocr_text(blocks: &mut Vec<AnchoredBlock>, page_number: u32, text: &str) {
     let old_blocks = std::mem::take(blocks);
+    let mut kept = Vec::with_capacity(old_blocks.len());
     let mut insert_at = None;
 
     for anchored in old_blocks {
-        if anchored.anchor.page == page_number {
-            insert_at.get_or_insert(blocks.len());
+        // OCR replaces the garbage *text* of the page only. Figure/media
+        // blocks stay anchored exactly where they were (PDF-5): their
+        // raster crops and captions remain valid regardless of the text
+        // layer's quality.
+        if anchored.anchor.page == page_number && !matches!(anchored.block, DocBlock::Figure { .. })
+        {
+            insert_at.get_or_insert(kept.len());
             continue;
         }
-        if anchored.anchor.page > page_number {
-            insert_at.get_or_insert(blocks.len());
+        if insert_at.is_none() && anchored.anchor.page > page_number {
+            insert_at.get_or_insert(kept.len());
         }
-        blocks.push(anchored);
+        kept.push(anchored);
     }
 
-    let insert_at = insert_at.unwrap_or(blocks.len());
+    let insert_at = insert_at.unwrap_or(kept.len());
     let mut paragraphs = Vec::new();
     let mut lines = Vec::new();
     for line in text.lines() {
@@ -68,10 +82,12 @@ fn replace_page_with_ocr_text(blocks: &mut Vec<AnchoredBlock>, page_number: u32,
         paragraphs.push(lines.join("\n"));
     }
 
-    for (offset, paragraph) in paragraphs.into_iter().enumerate() {
-        blocks.insert(
-            insert_at + offset,
-            AnchoredBlock {
+    kept.splice(
+        insert_at..insert_at,
+        paragraphs
+            .into_iter()
+            .enumerate()
+            .map(|(offset, paragraph)| AnchoredBlock {
                 block: DocBlock::Paragraph {
                     spans: vec![Span {
                         text: paragraph,
@@ -85,9 +101,9 @@ fn replace_page_with_ocr_text(blocks: &mut Vec<AnchoredBlock>, page_number: u32,
                     left: 0,
                     width: 1,
                 },
-            },
-        );
-    }
+            }),
+    );
+    *blocks = kept;
 }
 
 pub(super) fn preserve_low_confidence_pages(
@@ -101,11 +117,11 @@ pub(super) fn preserve_low_confidence_pages(
         return Ok(Vec::new());
     }
 
-    let page_dir = scoped_temp_dir("bookforge-pdf-pages")?;
+    let page_dir = ScopedTempDir::new("bookforge-pdf-pages")?;
     let mut warnings = Vec::new();
     let result = (|| {
         for page_number in low_confidence_pages {
-            let rendered = match tools.render_page_png(input, *page_number, &page_dir) {
+            let rendered = match tools.render_page_png(input, *page_number, page_dir.path()) {
                 Ok(rendered) => rendered,
                 Err(err) => {
                     warnings.push(format!(
@@ -120,7 +136,7 @@ pub(super) fn preserve_low_confidence_pages(
         }
         Ok(warnings)
     })();
-    let _ = fs::remove_dir_all(&page_dir);
+    drop(page_dir);
     result
 }
 
@@ -282,19 +298,15 @@ pub(super) fn image_asset(
     region: Option<&ImageRegion>,
 ) -> Result<ImageAsset> {
     let bytes = fs::read(&image.path)?;
-    let extension = match image.extension.as_str() {
-        "jpg" | "jpeg" => "jpg",
-        _ => "png",
-    };
-    let media_type = match extension {
-        "jpg" => "image/jpeg",
-        _ => "image/png",
-    };
+    // extract_images always invokes `pdfimages -png`, so emitted files
+    // are PNGs; unknown extensions keep the PNG identity rather than
+    // advertising a JPEG we never produce.
+    const MEDIA_TYPE: &str = "image/png";
     let id = format!("pdf-image-{:04}", image.index + 1);
     Ok(ImageAsset {
         id,
-        href: format!("images/pdf-image-{:04}.{extension}", image.index + 1),
-        media_type: media_type.to_string(),
+        href: format!("images/pdf-image-{:04}.png", image.index + 1),
+        media_type: MEDIA_TYPE.to_string(),
         bytes,
         page: image.page,
         top: region.map(|region| region.top),
@@ -458,6 +470,35 @@ mod ocr_tests {
         }
     }
 
+    fn figure(page: u32, top: i32) -> AnchoredBlock {
+        AnchoredBlock {
+            block: DocBlock::Figure {
+                image: ImageAsset {
+                    id: format!("pdf-figure-{page:04}"),
+                    href: "images/figure.png".to_string(),
+                    media_type: "image/png".to_string(),
+                    bytes: Vec::new(),
+                    page,
+                    top: Some(top),
+                    left: Some(0),
+                    width: Some(1),
+                    height: Some(1),
+                },
+                caption: Some(vec![Span {
+                    text: "Figure 1. Captured raster.".to_string(),
+                    bold: false,
+                    italic: false,
+                }]),
+            },
+            anchor: BlockAnchor {
+                page,
+                top,
+                left: 0,
+                width: 1,
+            },
+        }
+    }
+
     #[test]
     fn successful_ocr_replaces_page_with_paragraphs() {
         let engine = MockOcrEngine::success("First OCR paragraph.\n\nSecond OCR paragraph.");
@@ -471,6 +512,7 @@ mod ocr_tests {
             },
             &mut blocks,
             &[1],
+            usize::MAX,
         );
 
         assert_eq!(rendered, vec![1]);
@@ -491,8 +533,13 @@ mod ocr_tests {
     fn failed_ocr_leaves_page_blocks_intact_and_warns() {
         let engine = MockOcrEngine::failure("offline");
         let mut blocks = vec![paragraph(3, "original")];
-        let outcome =
-            ocr_low_confidence_pages(&engine, &mut |_page| Ok(vec![1, 2, 3]), &mut blocks, &[3]);
+        let outcome = ocr_low_confidence_pages(
+            &engine,
+            &mut |_page| Ok(vec![1, 2, 3]),
+            &mut blocks,
+            &[3],
+            usize::MAX,
+        );
 
         assert!(outcome.recovered.is_empty());
         assert_eq!(blocks[0].block.text(), "original");
@@ -504,8 +551,13 @@ mod ocr_tests {
     fn recovered_pages_are_excluded_from_later_preservation() {
         let engine = MockOcrEngine::success("Recovered");
         let mut blocks = vec![paragraph(1, "bad one"), paragraph(2, "bad two")];
-        let outcome =
-            ocr_low_confidence_pages(&engine, &mut |_page| Ok(vec![1, 2, 3]), &mut blocks, &[1]);
+        let outcome = ocr_low_confidence_pages(
+            &engine,
+            &mut |_page| Ok(vec![1, 2, 3]),
+            &mut blocks,
+            &[1],
+            usize::MAX,
+        );
         let mut preserve_pages = vec![1, 2];
         preserve_pages.retain(|page| !outcome.recovered.contains(page));
 
@@ -530,5 +582,92 @@ mod ocr_tests {
         assert!(matches!(blocks[0].block, DocBlock::Paragraph { .. }));
         assert_eq!(blocks[0].block.text(), "Recovered");
         assert!(matches!(blocks[1].block, DocBlock::Figure { .. }));
+    }
+
+    #[test]
+    fn successful_ocr_preserves_figure_blocks_anchored_on_the_page() {
+        // PDF-5: a successful OCR pass must not wipe figure/media anchors
+        // that share the replaced page.
+        let engine = MockOcrEngine::success("Recovered prose from scan.");
+        let mut blocks = vec![
+            paragraph(1, "garbage text layer"),
+            figure(1, 120),
+            paragraph(2, "keep"),
+        ];
+        let outcome = ocr_low_confidence_pages(
+            &engine,
+            &mut |_page| Ok(vec![1, 2, 3]),
+            &mut blocks,
+            &[1],
+            usize::MAX,
+        );
+
+        assert_eq!(outcome.recovered, vec![1]);
+        assert!(outcome.warnings.is_empty());
+        let texts = blocks
+            .iter()
+            .map(|block| block.block.text())
+            .collect::<Vec<_>>();
+        assert!(
+            texts.contains(&"Recovered prose from scan.".to_string()),
+            "OCR paragraphs must be inserted: {texts:?}"
+        );
+        let figures = blocks
+            .iter()
+            .filter(|block| matches!(block.block, DocBlock::Figure { .. }))
+            .count();
+        assert_eq!(figures, 1, "figure anchor must survive OCR: {blocks:?}");
+        assert_eq!(blocks.last().expect("blocks").block.text(), "keep");
+        let figure_index = blocks
+            .iter()
+            .position(|block| matches!(block.block, DocBlock::Figure { .. }))
+            .expect("figure present");
+        let ocr_index = blocks
+            .iter()
+            .position(|block| block.block.text() == "Recovered prose from scan.")
+            .expect("ocr paragraph present");
+        assert!(
+            ocr_index < figure_index,
+            "OCR text belongs before the retained lower figure anchor"
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingEngine {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl OcrEngine for CountingEngine {
+        fn ocr_page(
+            &self,
+            _image_png: &[u8],
+            _page_number: u32,
+        ) -> std::result::Result<String, crate::ocr::OcrError> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("should not happen".to_string())
+        }
+    }
+
+    #[test]
+    fn oversized_raster_is_skipped_with_a_warning_before_encoding() {
+        // PDF-22: extreme rasters must not reach base64 encoding / the
+        // engine; they are skipped and warned about instead.
+        let engine = CountingEngine::default();
+        let mut blocks = vec![paragraph(1, "garbage")];
+        let big_image = vec![0_u8; 4096];
+        let outcome = ocr_low_confidence_pages(
+            &engine,
+            &mut |_page| Ok(big_image.clone()),
+            &mut blocks,
+            &[1],
+            1024,
+        );
+
+        assert!(outcome.recovered.is_empty());
+        assert_eq!(engine.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].contains("exceeds the 1024-byte request limit"));
+        assert_eq!(blocks[0].block.text(), "garbage", "page stays as-is");
     }
 }

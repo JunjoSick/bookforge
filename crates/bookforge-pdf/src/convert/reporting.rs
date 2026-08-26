@@ -17,8 +17,17 @@ pub(super) fn mark_low_confidence_pages(
 }
 
 fn is_low_confidence_page(stats: &PageStats) -> bool {
-    stats.baseline_chars > 0
-        && (stats.chars as f64 / stats.baseline_chars as f64) < LOW_CONFIDENCE_COVERAGE_RATIO
+    if stats.baseline_chars == 0 {
+        return false;
+    }
+    // Judge coverage against the PRE-header-removal character count:
+    // running headers/footers repeat on nearly every page and pdftotext
+    // includes them in the baseline, so charging their removal against
+    // reconstruction quality pushed legitimate pages below the 95%
+    // threshold and triggered spurious rasterization/OCR spend
+    // (docs/report.md §4.5 PDF-6).
+    let credited_chars = stats.chars + stats.running_header_chars;
+    (credited_chars as f64 / stats.baseline_chars as f64) < LOW_CONFIDENCE_COVERAGE_RATIO
 }
 
 fn low_confidence_action(mode: LowConfidenceMode) -> &'static str {

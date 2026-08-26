@@ -15,6 +15,11 @@ static UNLIMITED_OCR_NO_PROCESSOR_WARNING: Once = Once::new();
 // OCR responses are JSON text, so 8 MiB leaves ample room for dense pages
 // while preventing an untrusted endpoint from streaming unbounded data.
 const MAX_OCR_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+// Raw PNG bytes above this limit are rejected before base64 encoding:
+// the encoded request body would be ~4/3× larger, and oversized rasters
+// are almost always extreme-MediaBox pages that should be downscaled or
+// skipped instead of OOMing the process (docs/report.md §4.5 PDF-22).
+pub(crate) const MAX_OCR_REQUEST_BODY_BYTES: usize = 24 * 1024 * 1024;
 const MAX_OCR_ERROR_DETAIL_CHARS: usize = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +150,14 @@ fn base_url_is_loopback(base_url: &str) -> bool {
     Url::parse(base_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
+        // IPv6 hosts serialize with square brackets ("[::1]"); strip them
+        // so the documented no-key loopback exemption also applies to
+        // bracketed literals.
+        .map(|host| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_owned()
+        })
         .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
 }
 
@@ -500,6 +513,24 @@ mod tests {
             while matches!(stream.read(&mut drain), Ok(read) if read > 0) {}
         });
         (format!("http://{address}/v1"), receiver)
+    }
+
+    #[test]
+    fn loopback_exemption_covers_bracketed_ipv6_literals() {
+        // PDF-11: url serializes IPv6 hosts with brackets, which used to
+        // break the documented no-key loopback exemption for [::1].
+        assert!(base_url_is_loopback("http://localhost/v1"));
+        assert!(base_url_is_loopback("http://127.0.0.1:8080/v1"));
+        assert!(base_url_is_loopback("http://[::1]:9000/v1"));
+        assert!(base_url_is_loopback("https://[::1]/v1"));
+        assert!(!base_url_is_loopback("http://[fe80::1]/v1"));
+        assert!(!base_url_is_loopback("http://example.com/v1"));
+        assert!(
+            Url::parse("http://[::1]:9000/v1")
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .is_some_and(|host| host == "[::1]")
+        );
     }
 
     #[test]

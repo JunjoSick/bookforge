@@ -16,7 +16,7 @@ pub mod reconstruct;
 pub mod report;
 pub mod tools;
 
-pub use convert::{ConvertOptions, ConvertOutcome, convert_pdf, convert_pdf_with_ocr};
+pub use convert::{ConvertOptions, ConvertOutcome, convert_pdf_with_ocr};
 pub use model::{
     ColumnMode, DocBlock, ImageAsset, ImageRegion, Line, LowConfidenceMode, Page, Span,
 };

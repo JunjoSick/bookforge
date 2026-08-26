@@ -588,13 +588,21 @@ pub(super) fn figure_blocks_from_images(
         .map(|page| (page.number, page))
         .collect::<HashMap<_, _>>();
     let candidates = image_figure_candidates(&pages_by_number, images);
-    let repeated_regionless = repeated_regionless_image_signatures(&candidates);
     let two_column_pages = page_stats
         .iter()
         .filter(|stats| stats.two_column)
         .map(|stats| stats.page)
         .collect::<HashSet<_>>();
     let mut warnings = Vec::new();
+    // Content signatures are computed once per image file (read-once)
+    // and shared by both the repeat-ornament detector and the drop
+    // decision below; hashing combines length + CRC-32 of the actual
+    // bytes rather than a fixed-key process-local hash.
+    let image_signatures = candidates
+        .iter()
+        .map(|candidate| image_content_signature(candidate.image))
+        .collect::<Vec<_>>();
+    let repeated_regionless = repeated_regionless_image_signatures(&candidates, &image_signatures);
     let vector_regions = vector_figure_regions(pages, &two_column_pages, &mut warnings);
     let vector_rects = vector_regions
         .iter()
@@ -686,7 +694,12 @@ pub(super) fn figure_blocks_from_images(
             warnings.push(caption_overlap_warning(candidate.image.page, caption.top));
         }
         if candidate.region.is_none()
-            && should_drop_regionless_image(candidate.image, &repeated_regionless, &mut warnings)
+            && should_drop_regionless_image(
+                candidate.image,
+                image_signatures[index],
+                &repeated_regionless,
+                &mut warnings,
+            )
         {
             continue;
         }
@@ -1036,15 +1049,18 @@ fn relative_delta(left: f64, right: f64) -> f64 {
     (left - right).abs() / left.max(right)
 }
 
-fn repeated_regionless_image_signatures(candidates: &[ImageFigureCandidate<'_>]) -> HashSet<u64> {
+fn repeated_regionless_image_signatures(
+    candidates: &[ImageFigureCandidate<'_>],
+    signatures: &[Option<u64>],
+) -> HashSet<u64> {
     let mut pages_by_signature: HashMap<u64, HashSet<u32>> = HashMap::new();
-    for candidate in candidates {
+    for (candidate, signature) in candidates.iter().zip(signatures.iter()) {
         if candidate.region.is_some() {
             continue;
         }
-        if let Some(signature) = image_byte_signature(candidate.image) {
+        if let Some(signature) = signature {
             pages_by_signature
-                .entry(signature)
+                .entry(*signature)
                 .or_default()
                 .insert(candidate.image.page);
         }
@@ -1059,6 +1075,7 @@ fn repeated_regionless_image_signatures(candidates: &[ImageFigureCandidate<'_>])
 
 fn should_drop_regionless_image(
     image: &ExtractedImage,
+    signature: Option<u64>,
     repeated_signatures: &HashSet<u64>,
     warnings: &mut Vec<String>,
 ) -> bool {
@@ -1073,8 +1090,7 @@ fn should_drop_regionless_image(
         ));
         return true;
     }
-    if image_byte_signature(image).is_some_and(|signature| repeated_signatures.contains(&signature))
-    {
+    if signature.is_some_and(|signature| repeated_signatures.contains(&signature)) {
         warnings.push(format!(
             "page {}: dropped repeated regionless image {} as likely running ornament/logo",
             image.page, image.index
@@ -1084,11 +1100,14 @@ fn should_drop_regionless_image(
     false
 }
 
-fn image_byte_signature(image: &ExtractedImage) -> Option<u64> {
+/// Content-derived signature (length + CRC-32 of the actual bytes) so
+/// identical images dedupe regardless of path; the file is read at most
+/// once per candidate. `None` when the file cannot be read.
+fn image_content_signature(image: &ExtractedImage) -> Option<u64> {
     let bytes = fs::read(&image.path).ok()?;
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    Some(hasher.finish())
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&bytes);
+    Some((u64::from(bytes.len() as u32) << 32) | u64::from(hasher.finalize()))
 }
 
 pub(super) fn vector_figure_regions<'a>(
@@ -1501,6 +1520,113 @@ fn is_figure_caption_text(text: &str) -> bool {
         || lower.starts_with("fig. ")
         || lower.starts_with("fig.\u{00a0}")
         || lower.starts_with("fig ")
+}
+
+const FOREIGN_CAPTION_MAX_CHARS: usize = 140;
+const FOREIGN_CAPTION_MAX_WORDS: usize = 20;
+/// Real captions are short; a full sentence leading with "In 2019:" is
+/// prose, not a skipped caption.
+const FOREIGN_CAPTION_MAX_CAPTION_WORDS: usize = 9;
+const FOREIGN_CAPTION_MAX_LEAD_WORD: usize = 14;
+
+/// `Some(label)` when the fragment reads like a figure/table caption
+/// ("Abbildung 3: …", "图 1：…", "Tabla 2.") yet does not match the
+/// English-only prefixes the detector actually understands — i.e. the
+/// caption was skipped purely because of the language assumption.
+/// Guarded tightly (lead word, explicit number + separator, short
+/// caption-shaped body) so ordinary body sentences and numbered lists
+/// are never counted.
+pub(super) fn localized_caption_skipped(text: &str) -> bool {
+    if is_caption_text(text) {
+        return false;
+    }
+    let trimmed = text.trim();
+    let char_count = trimmed.chars().count();
+    if !(5..=FOREIGN_CAPTION_MAX_CHARS).contains(&char_count) {
+        return false;
+    }
+    let words = trimmed.split_whitespace().count();
+    if words > FOREIGN_CAPTION_MAX_WORDS {
+        return false;
+    }
+    // A leading digit alone ("1. Introduction") is a numbered heading,
+    // not a localized caption; captions lead with a word.
+    let mut chars = trimmed.char_indices();
+    let Some((_, first)) = chars.next() else {
+        return false;
+    };
+    if first.is_ascii_digit() {
+        return false;
+    }
+    let lead_len = trimmed
+        .chars()
+        .take_while(|ch| !ch.is_whitespace() && !ch.is_numeric())
+        .count();
+    if lead_len == 0
+        || lead_len > FOREIGN_CAPTION_MAX_LEAD_WORD
+        || !trimmed.chars().take(lead_len).all(|ch| ch.is_alphabetic())
+    {
+        return false;
+    }
+    let cut = trimmed
+        .char_indices()
+        .nth(lead_len)
+        .map(|(index, _)| index)
+        .unwrap_or(trimmed.len());
+    let mut rest_chars = trimmed[cut..].chars().peekable();
+    while rest_chars
+        .peek()
+        .is_some_and(|ch| ch.is_whitespace() || *ch == '\u{00a0}')
+    {
+        rest_chars.next();
+    }
+    // An explicit ordinal followed by a caption separator: "1:", "1.",
+    // "1)", full-width variants, or a spaced dash ("Figura 12 – …").
+    let mut ordinal_digits = 0usize;
+    while rest_chars.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+        rest_chars.next();
+        ordinal_digits += 1;
+    }
+    if ordinal_digits == 0 {
+        return false;
+    }
+    while rest_chars
+        .peek()
+        .is_some_and(|ch| *ch == ' ' || *ch == '\u{00a0}')
+    {
+        rest_chars.next();
+    }
+    let separator = matches!(
+        rest_chars.peek(),
+        Some('.' | ':' | ')' | '\u{ff0e}' | '\u{ff1a}' | '\u{ff09}')
+            | Some('-' | '\u{2013}' | '\u{2014}')
+    );
+    separator && words <= FOREIGN_CAPTION_MAX_CAPTION_WORDS
+}
+
+/// Summary warning for figure/table captions that were skipped because
+/// they use a language outside the detector's English-only prefixes
+/// (docs/report.md §4.5 PDF-10, warning half). `None` when nothing was
+/// skipped, so English documents are never burdened with the notice.
+pub(super) fn skipped_foreign_caption_warning(pages: &[Page]) -> Option<String> {
+    let mut pages_affected = 0usize;
+    let mut candidates = 0usize;
+    for page in pages {
+        let on_page = page
+            .fragments
+            .iter()
+            .filter(|fragment| localized_caption_skipped(&spans_text(&fragment.spans)))
+            .count();
+        if on_page > 0 {
+            pages_affected += 1;
+            candidates += on_page;
+        }
+    }
+    (pages_affected > 0).then(|| {
+        format!(
+            "{candidates} fragment(s) on {pages_affected} page(s) look like figure or table captions in a language the caption detector does not cover (it matches only English \"figure\"/\"table\" prefixes); vector-figure and table recovery were skipped for them"
+        )
+    })
 }
 
 fn is_caption_text(text: &str) -> bool {

@@ -1705,3 +1705,246 @@ printf 'Tiny plus many baseline characters that the XML reconstruction did not r
         .expect("image reads");
     assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
 }
+
+#[test]
+fn localized_caption_detection_counts_skipped_foreign_captions() {
+    // PDF-10 warning half: captions that read like figure/table labels
+    // in other languages are counted for the report instead of vanishing.
+    let positives = [
+        "Abbildung 3: Verteilung der Genauigkeit.",
+        "Tabla 2: Resultados del experimento.",
+        "图 1：模型架构示意图。",
+        "Figura 12 – Comparativo de modelos",
+    ];
+    for text in positives {
+        assert!(
+            detection::localized_caption_skipped(text),
+            "must be counted as skipped foreign caption: {text}"
+        );
+    }
+    let negatives = [
+        "Figure 1. English caption handled normally.",
+        "Table 2. Also handled.",
+        "1. Introduction",
+        "In 2019: the study was replicated with more participants than ever before recorded.",
+        "The results were significant across all conditions tested by the authors of the paper.",
+    ];
+    for text in negatives {
+        assert!(
+            !detection::localized_caption_skipped(text),
+            "must not be counted (English-handled, heading, or prose): {text}"
+        );
+    }
+
+    let mut page = empty_page(1);
+    page.fragments = vec![fragment(300, 100, 240, 12, "Abbildung 3: Verteilung.")];
+    let pages = vec![page];
+    let warning = detection::skipped_foreign_caption_warning(&pages).expect("warning");
+    assert!(warning.contains('1'), "{warning}");
+    assert!(warning.contains("figure or table captions"), "{warning}");
+
+    assert!(detection::skipped_foreign_caption_warning(&[empty_page(1)]).is_none());
+}
+
+#[test]
+fn running_header_removal_does_not_push_pages_below_the_confidence_threshold() {
+    // PDF-6: the 95% threshold judges pre-header-removal coverage.
+    let mut credited_only_headers = PageStats {
+        page: 3,
+        lines: 4,
+        chars: 60,
+        baseline_chars: 100,
+        running_header_chars: 35,
+        two_column: false,
+        low_confidence: false,
+        low_confidence_action: None,
+    };
+    mark_low_confidence_pages(
+        std::slice::from_mut(&mut credited_only_headers),
+        LowConfidenceMode::Linearize,
+    );
+    assert!(
+        !credited_only_headers.low_confidence,
+        "deficit explained by removed headers must not rasterize the page"
+    );
+
+    let mut genuinely_missing = PageStats {
+        page: 4,
+        lines: 4,
+        chars: 40,
+        baseline_chars: 100,
+        running_header_chars: 0,
+        two_column: false,
+        low_confidence: false,
+        low_confidence_action: None,
+    };
+    mark_low_confidence_pages(
+        std::slice::from_mut(&mut genuinely_missing),
+        LowConfidenceMode::Linearize,
+    );
+    assert!(
+        genuinely_missing.low_confidence,
+        "real deficits must still flag"
+    );
+}
+
+#[test]
+fn ocr_render_dpi_caps_extreme_media_boxes() {
+    // PDF-22: A4-ish pages keep full DPI; a billboard MediaBox is
+    // downscaled under the pixel budget; degenerate inputs clamp.
+    let a4 = max_ocr_render_dpi(595.0, 842.0, MAX_OCR_RENDER_PIXELS);
+    assert_eq!(
+        a4, PDF_RENDER_DPI,
+        "ordinary pages stay at {PDF_RENDER_DPI} DPI"
+    );
+
+    let extreme = max_ocr_render_dpi(20_000.0, 40_000.0, MAX_OCR_RENDER_PIXELS);
+    let pixels = (20_000.0 * f64::from(extreme) / 72.0) * (40_000.0 * f64::from(extreme) / 72.0);
+    assert!(
+        pixels <= MAX_OCR_RENDER_PIXELS as f64,
+        "extreme MediaBox must fit the budget: {pixels}"
+    );
+
+    assert_eq!(
+        max_ocr_render_dpi(0.0, 0.0, MAX_OCR_RENDER_PIXELS),
+        PDF_RENDER_DPI,
+        "degenerate dimensions cannot over-constrain"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_figure_pass_still_removes_scratch_temp_dirs() {
+    // PDF-3 regression companion to the RAII drop test in tools.rs: the
+    // orphaned-path fixture makes `image_asset`'s fs::read fail inside
+    // figure_blocks_from_images so the error escapes before any manual
+    // cleanup line could ever run. With ScopedTempDir guards owning the
+    // directories on the convert stack frame, unwinding cannot leak.
+    use std::fs;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = dir.path().join("input.pdf");
+    let output = dir.path().join("output.epub");
+    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+
+    let pdftohtml = dir.path().join("pdftohtml");
+    fake_pdftohtml_with_xml(
+        &pdftohtml,
+        r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="80" left="100" width="300" height="16" font="0">Paper Title</text>
+    <image top="130" left="120" width="120" height="80" src="paper-1_1.png"/>
+    <text top="218" left="120" width="260" height="12" font="0">Figure 1. A test image.</text>
+  </page>
+</pdf2xml>"##,
+    );
+    let pdftotext = dir.path().join("pdftotext");
+    fake_pdftotext_with_text(&pdftotext, "Paper Title\nFigure 1. A test image.\n");
+    // Lists a healthy image but never materializes its file.
+    let pdfimages = write_executable_orphan(dir.path(), "pdfimages");
+    let pdftoppm = dir.path().join("pdftoppm");
+    fake_pdftoppm(&pdftoppm);
+
+    let tools = PopplerTools {
+        pdftohtml,
+        pdftotext,
+        pdfimages: Some(pdfimages),
+        pdftoppm: Some(pdftoppm),
+    };
+
+    let result = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None);
+
+    assert!(result.is_err(), "figure pass must fail for this fixture");
+    assert!(!output.exists(), "no EPUB is produced when a pass errors");
+
+    // And the RAII guarantee those guards provide:
+    let guard = crate::tools::ScopedTempDir::new("bookforge-pdf-probe").expect("probe dir");
+    let probe_path = guard.path().to_path_buf();
+    assert!(probe_path.is_dir());
+    drop(guard);
+    assert!(
+        !probe_path.exists(),
+        "a dropped scoped scratch dir must be gone even when owners return early"
+    );
+}
+
+fn write_executable_orphan(dir: &Path, name: &str) -> PathBuf {
+    // `pdfimages` that lists one image but never creates its file.
+    let path = dir.join(name);
+    write_executable(
+        &path,
+        r#"#!/bin/sh
+if [ "$1" = "-list" ]; then
+cat <<'LIST'
+page   num  type   width height color comp bpc  enc interp  object ID x-ppi y-ppi size ratio
+--------------------------------------------------------------------------------------------
+   1     0 image     640   480  rgb     3   8  image  no        12  0    72    72  1K  1.0%
+LIST
+exit 0
+fi
+for last do :; done
+# Advertise the output path without ever writing it.
+printf '%s-000-000.png\n' "$last"
+"#,
+    );
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn rotated_and_foreign_caption_fragments_surface_in_report_warnings() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = dir.path().join("input.pdf");
+    let output = dir.path().join("output.epub");
+    std::fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+
+    let pdftohtml = dir.path().join("pdftohtml");
+    fake_pdftohtml_with_xml(
+        &pdftohtml,
+        r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="100" left="100" width="360" height="12" font="0">Ordinary flowing prose continues here normally.</text>
+    <text top="150" left="500" width="0" height="200" font="0">VERTICAL WATERMARK</text>
+    <text top="400" left="100" width="300" height="12" font="0">Abbildung 3: Verteilung der Genauigkeit.</text>
+  </page>
+</pdf2xml>"##,
+    );
+    let pdftotext = dir.path().join("pdftotext");
+    fake_pdftotext_with_text(
+        &pdftotext,
+        "Ordinary flowing prose continues here normally.\nVERTICAL WATERMARK\nAbbildung 3: Verteilung der Genauigkeit.\n",
+    );
+    let pdfimages = dir.path().join("pdfimages");
+    fake_pdfimages_empty(&pdfimages);
+    let pdftoppm = dir.path().join("pdftoppm");
+    fake_pdftoppm(&pdftoppm);
+
+    let tools = PopplerTools {
+        pdftohtml,
+        pdftotext,
+        pdfimages: Some(pdfimages),
+        pdftoppm: Some(pdftoppm),
+    };
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
+        .expect("conversion should succeed");
+
+    assert!(
+        outcome
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("rotated/zero-width text fragment")),
+        "vertical text must be reported, not silently dropped: {:?}",
+        outcome.report.summary()
+    );
+    assert!(
+        outcome
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("caption detector does not cover")),
+        "skipped foreign captions must be counted in the report"
+    );
+}

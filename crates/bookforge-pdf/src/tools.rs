@@ -19,8 +19,8 @@ use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 
 pub const PDF_RENDER_DPI: u32 = 150;
 const PDF_XML_ZOOM: &str = "1.5";
-const PDF_XML_ZOOM_NUM: i64 = 3;
-const PDF_XML_ZOOM_DEN: i64 = 2;
+pub(crate) const PDF_XML_ZOOM_NUM: i64 = 3;
+pub(crate) const PDF_XML_ZOOM_DEN: i64 = 2;
 const PDF_POINTS_PER_INCH: i64 = 72;
 pub const DEFAULT_POPPLER_TIMEOUT: Duration = Duration::from_secs(120);
 /// XML from large, layout-heavy PDFs can be substantial, so stdout gets a
@@ -146,6 +146,11 @@ impl PopplerTools {
     }
 
     /// Run `pdftohtml -xml` and return the XML document.
+    ///
+    /// Note: deliberately launched *without* `-i`. Empirically (poppler
+    /// 26.08) `-i` does not merely skip writing image files; it also
+    /// suppresses the `<image>` placement tags in the XML, which are
+    /// required downstream for figure/caption anchoring. See docs/report.md §4.5 PDF-4.
     pub fn pdf_to_xml(&self, pdf: &Path) -> Result<String, ToolError> {
         self.pdf_to_xml_with_timeout(pdf, DEFAULT_POPPLER_TIMEOUT)
     }
@@ -156,34 +161,30 @@ impl PopplerTools {
         pdf: &Path,
         timeout: Duration,
     ) -> Result<String, ToolError> {
-        let work_dir = scoped_temp_dir("bookforge-pdftohtml")?;
+        let work_dir = ScopedTempDir::new("bookforge-pdftohtml")?;
         let pdf = absolute_path(pdf)?;
-        let result = (|| {
-            let mut command = poppler_command(&self.pdftohtml);
-            command.current_dir(&work_dir).args([
-                "-xml",
-                "-stdout",
-                "-q",
-                "-enc",
-                "UTF-8",
-                "-fmt",
-                "png",
-                "-zoom",
-                PDF_XML_ZOOM,
-            ]);
-            command.arg(pdf);
-            let output = command_output(&mut command, "pdftohtml", timeout)?;
-            if !output.status.success() {
-                return Err(ToolError::Failed {
-                    tool: "pdftohtml",
-                    code: output.status.code(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        })();
-        let _ = fs::remove_dir_all(&work_dir);
-        result
+        let mut command = poppler_command(&self.pdftohtml);
+        command.current_dir(work_dir.path()).args([
+            "-xml",
+            "-stdout",
+            "-q",
+            "-enc",
+            "UTF-8",
+            "-fmt",
+            "png",
+            "-zoom",
+            PDF_XML_ZOOM,
+        ]);
+        command.arg(pdf);
+        let output = command_output(&mut command, "pdftohtml", timeout)?;
+        if !output.status.success() {
+            return Err(ToolError::Failed {
+                tool: "pdftohtml",
+                code: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Raw text via `pdftotext`, used as the coverage baseline: it makes
@@ -266,21 +267,39 @@ impl PopplerTools {
         page: u32,
         output_dir: &Path,
     ) -> Result<PathBuf, ToolError> {
-        self.render_page_png_with_timeout(pdf, page, output_dir, DEFAULT_POPPLER_TIMEOUT)
+        self.render_page_png_scaled(pdf, page, output_dir, PDF_RENDER_DPI)
     }
 
-    /// Render one page with a caller-selected deadline.
-    pub fn render_page_png_with_timeout(
+    /// Render one page at a caller-selected DPI with the default deadline.
+    pub fn render_page_png_scaled(
         &self,
         pdf: &Path,
         page: u32,
         output_dir: &Path,
+        dpi: u32,
+    ) -> Result<PathBuf, ToolError> {
+        self.render_page_png_at_dpi_with_timeout(
+            pdf,
+            page,
+            output_dir,
+            dpi,
+            DEFAULT_POPPLER_TIMEOUT,
+        )
+    }
+
+    /// Render one page with a caller-selected deadline and DPI.
+    pub fn render_page_png_at_dpi_with_timeout(
+        &self,
+        pdf: &Path,
+        page: u32,
+        output_dir: &Path,
+        dpi: u32,
         timeout: Duration,
     ) -> Result<PathBuf, ToolError> {
         fs::create_dir_all(output_dir)?;
         let root = output_dir.join(format!("page-{page:04}"));
         let page_arg = page.to_string();
-        let dpi_arg = PDF_RENDER_DPI.to_string();
+        let dpi_arg = dpi.max(1).to_string();
         let mut command = poppler_command(self.pdftoppm_path()?);
         command
             .args([
@@ -481,6 +500,13 @@ fn command_output_with_limits(
             stream: "stdout",
             limit: stdout_limit,
         });
+    }
+    if stderr.exceeded {
+        // stderr only feeds diagnostics, so a truncated capture is not
+        // fatal — but it must never be silently swallowed.
+        tracing::warn!(
+            "poppler tool '{tool}' exceeded the {stderr_limit}-byte stderr capture limit; diagnostics are truncated"
+        );
     }
 
     Ok(Output {
@@ -1002,35 +1028,65 @@ fn absolute_path(path: &Path) -> Result<PathBuf, ToolError> {
     Ok(std::env::current_dir()?.join(path))
 }
 
-pub(crate) fn scoped_temp_dir(prefix: &str) -> Result<PathBuf, ToolError> {
-    for _ in 0..TEMP_DIR_CREATE_ATTEMPTS {
-        let mut random = [0_u8; TEMP_DIR_RANDOM_BYTES];
-        fill_secure_random(&mut random)?;
-        let suffix = random
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let path = std::env::temp_dir().join(format!("{prefix}-{suffix}"));
-        let builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        let builder = {
-            use std::os::unix::fs::DirBuilderExt;
+/// A securely randomized private temporary directory that is removed
+/// (best effort, recursively) when dropped.
+///
+/// RAII cleanup guarantees scratch directories disappear on every error
+/// path (`?`), not only on success — docs/report.md §4.5 PDF-3.
+pub(crate) struct ScopedTempDir {
+    path: PathBuf,
+}
 
-            let mut builder = builder;
-            builder.mode(0o700);
-            builder
-        };
-        match builder.create(&path) {
-            Ok(()) => return Ok(path),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err.into()),
+impl ScopedTempDir {
+    pub(crate) fn new(prefix: &str) -> Result<Self, ToolError> {
+        for _ in 0..TEMP_DIR_CREATE_ATTEMPTS {
+            let mut random = [0_u8; TEMP_DIR_RANDOM_BYTES];
+            fill_secure_random(&mut random)?;
+            let suffix = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let path = std::env::temp_dir().join(format!("{prefix}-{suffix}"));
+            let builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::DirBuilderExt;
+
+                let mut builder = builder;
+                builder.mode(0o700);
+                builder
+            };
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
         }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not create a unique secure temporary directory",
+        )
+        .into())
     }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not create a unique secure temporary directory",
-    )
-    .into())
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScopedTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+impl std::fmt::Debug for ScopedTempDir {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScopedTempDir")
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 #[cfg(unix)]
@@ -1250,15 +1306,24 @@ mod tests {
     }
 
     #[test]
-    fn scoped_temp_dirs_are_securely_randomized() {
-        let first = scoped_temp_dir("bookforge-secure-temp").expect("first temp dir");
-        let second = scoped_temp_dir("bookforge-secure-temp").expect("second temp dir");
+    fn scoped_temp_dirs_are_securely_randomized_and_removed_on_drop() {
+        let first = ScopedTempDir::new("bookforge-secure-temp").expect("first temp dir");
+        let second = ScopedTempDir::new("bookforge-secure-temp").expect("second temp dir");
 
-        assert_ne!(first, second);
-        assert!(first.is_dir());
-        assert!(second.is_dir());
-        fs::remove_dir_all(first).expect("first temp dir removes");
-        fs::remove_dir_all(second).expect("second temp dir removes");
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().is_dir());
+        assert!(second.path().is_dir());
+
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+        drop(first);
+        drop(second);
+
+        assert!(
+            !first_path.exists(),
+            "dropped temp dir must be removed (PDF-3)"
+        );
+        assert!(!second_path.exists());
     }
 
     #[test]
