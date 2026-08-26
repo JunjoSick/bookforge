@@ -234,44 +234,11 @@ impl JobStore {
         segment_id: &str,
         error: &str,
     ) -> Result<usize> {
-        let findings = classify_segment_error(error);
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
-        let exists = tx.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM segments WHERE job_id = ?1 AND id = ?2
-             )",
-            params![job_id, segment_id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !exists {
-            return Ok(0);
-        }
-
-        tx.execute(
-            "DELETE FROM qa_findings
-             WHERE job_id = ?1 AND segment_id = ?2 AND kind NOT GLOB 'llm_*'",
-            params![job_id, segment_id],
-        )?;
-        for (index, finding) in findings.iter().enumerate() {
-            let hash = stable_hash(&format!("{job_id}\u{1f}{segment_id}\u{1f}{index}"));
-            let id = format!("qaf_{}", &hash[..24]);
-            tx.execute(
-                "INSERT OR REPLACE INTO qa_findings
-                 (id, segment_id, job_id, severity, kind, message)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    id,
-                    segment_id,
-                    job_id,
-                    finding.severity.as_str(),
-                    finding.kind.as_str(),
-                    finding.message,
-                ],
-            )?;
-        }
+        let written = record_segment_findings_on(&tx, job_id, segment_id, error)?;
         tx.commit()?;
-        Ok(findings.len())
+        Ok(written)
     }
 
     /// Replace the LLM-review findings for a job without disturbing findings
@@ -328,12 +295,7 @@ impl JobStore {
     /// to NULL). LLM-review findings have their own replacement lifecycle.
     pub fn clear_segment_findings(&self, job_id: &str, segment_id: &str) -> Result<()> {
         let conn = self.conn.borrow();
-        conn.execute(
-            "DELETE FROM qa_findings
-             WHERE job_id = ?1 AND segment_id = ?2 AND kind NOT GLOB 'llm_*'",
-            params![job_id, segment_id],
-        )?;
-        Ok(())
+        clear_segment_findings_on(&conn, job_id, segment_id)
     }
 
     /// Drop stale error findings for segments that no longer carry an error.

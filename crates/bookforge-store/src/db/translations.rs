@@ -1,4 +1,23 @@
 use super::*;
+use rusqlite::TransactionBehavior;
+
+/// Model-write upsert for `translations`. Unlike the former
+/// `INSERT OR REPLACE` — which deletes and reinserts the row — the
+/// `DO UPDATE ... WHERE human_corrected = 0` guard leaves a frozen
+/// human-correction row untouched at the SQL level, so even a writer that
+/// skipped the application-level check cannot clobber `origin = 'manual'`,
+/// `human_corrected`, or `corrected_at`.
+pub(super) const MODEL_TRANSLATION_UPSERT: &str = "
+INSERT INTO translations
+  (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+ON CONFLICT(job_id, segment_id) DO UPDATE SET
+  translated_text = excluded.translated_text,
+  provider = excluded.provider,
+  model = excluded.model,
+  prompt_version = excluded.prompt_version,
+  created_at = excluded.created_at
+WHERE human_corrected = 0";
 
 impl JobStore {
     pub fn insert_segments(
@@ -13,10 +32,21 @@ impl JobStore {
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
         for segment in segments {
+            // Resume re-runs this against rows that already exist. The
+            // conflict arm refreshes the cache-attribution identity columns
+            // to the current run's config so a resume after a provider/model
+            // change cannot leave stale values that future cache lookups
+            // would misattribute; status/attempts/tokens stay untouched.
             tx.execute(
-                "INSERT OR IGNORE INTO segments
+                "INSERT INTO segments
                  (id, job_id, section_id, ordinal, source_hash, prompt_version, provider, model, status, attempts, cache_namespace)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 0, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 0, ?9)
+                 ON CONFLICT(job_id, id) DO UPDATE SET
+                   source_hash = excluded.source_hash,
+                   prompt_version = excluded.prompt_version,
+                   provider = excluded.provider,
+                   model = excluded.model,
+                   cache_namespace = excluded.cache_namespace",
                 params![
                     segment.id.0,
                     job_id,
@@ -41,172 +71,180 @@ impl JobStore {
     /// Save a successful translation and optionally replace its durable QA
     /// findings. The segment remains `succeeded`; warnings live in
     /// `qa_findings`, not `segments.error`.
+    ///
+    /// The whole checkpoint — freeze check, translation row, block rows,
+    /// segment record, findings, retry-guidance consumption, and job touch —
+    /// commits as ONE `IMMEDIATE` transaction: the write lock is taken up
+    /// front, so no other process can interleave a human correction between
+    /// the check and the write (STORE-1), and a crash can never leave the
+    /// per-segment checkpoint half-applied (STORE-3).
     pub fn save_translation_with_findings(
         &self,
         request: SaveTranslation<'_>,
         findings: Option<&str>,
     ) -> Result<()> {
-        if self.translation_is_human_corrected(request.job_id, request.segment_id)? {
-            return Ok(());
-        }
         let now = timestamp_string();
         let translated_hash = stable_hash(request.translated_text);
-        {
-            let conn = self.conn.borrow();
-            conn.execute(
-                "INSERT OR REPLACE INTO translations
-                 (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    request.segment_id,
-                    request.job_id,
-                    request.translated_text,
-                    request.provider,
-                    request.model,
-                    request.prompt_version,
-                    now
-                ],
-            )?;
-            replace_block_translations(&conn, request.job_id, request.segment_id, request.blocks)?;
-            conn.execute(
-                "UPDATE segments
-                 SET status = 'succeeded',
-                     attempts = attempts + 1,
-                     tokens_input = ?1,
-                     tokens_input_cached = ?2,
-                     tokens_output = ?3,
-                     tokens_estimated = ?4,
-                     translated_hash = ?5,
-                     error = NULL
-                 WHERE job_id = ?6 AND id = ?7",
-                params![
-                    request.input_tokens.map(|value| value as i64),
-                    request.input_cached_tokens.map(|value| value as i64),
-                    request.output_tokens.map(|value| value as i64),
-                    if request.tokens_estimated {
-                        1_i64
-                    } else {
-                        0_i64
-                    },
-                    translated_hash,
-                    request.job_id,
-                    request.segment_id,
-                ],
-            )?;
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if translation_is_human_corrected_on(&tx, request.job_id, request.segment_id)? {
+            return Ok(());
         }
+        tx.execute(
+            MODEL_TRANSLATION_UPSERT,
+            params![
+                request.segment_id,
+                request.job_id,
+                request.translated_text,
+                request.provider,
+                request.model,
+                request.prompt_version,
+                now
+            ],
+        )?;
+        replace_block_translations(&tx, request.job_id, request.segment_id, request.blocks)?;
+        tx.execute(
+            "UPDATE segments
+             SET status = 'succeeded',
+                 attempts = attempts + 1,
+                 tokens_input = ?1,
+                 tokens_input_cached = ?2,
+                 tokens_output = ?3,
+                 tokens_estimated = ?4,
+                 translated_hash = ?5,
+                 error = NULL
+             WHERE job_id = ?6 AND id = ?7",
+            params![
+                request.input_tokens.map(|value| value as i64),
+                request.input_cached_tokens.map(|value| value as i64),
+                request.output_tokens.map(|value| value as i64),
+                if request.tokens_estimated {
+                    1_i64
+                } else {
+                    0_i64
+                },
+                translated_hash,
+                request.job_id,
+                request.segment_id,
+            ],
+        )?;
         // Findings are instrumentation, so a failed findings write must never
         // fail the surrounding translation checkpoint.
         let findings = findings.map(str::trim).filter(|value| !value.is_empty());
-        let _ = if let Some(findings) = findings {
-            self.record_segment_findings(request.job_id, request.segment_id, findings)
-                .map(|_| ())
-        } else {
-            self.clear_segment_findings(request.job_id, request.segment_id)
+        let _ = match findings {
+            Some(findings) => {
+                record_segment_findings_on(&tx, request.job_id, request.segment_id, findings)
+                    .map(|_| ())
+            }
+            None => clear_segment_findings_on(&tx, request.job_id, request.segment_id),
         };
-        self.consume_dashboard_retry_guidance(request.job_id, request.segment_id)?;
-        self.touch_job_unless_status(request.job_id, "running", &["paused", "stopped"])?;
+        consume_dashboard_retry_guidance_on(&tx, request.job_id, request.segment_id)?;
+        touch_job_unless_status_on(&tx, request.job_id, "running", &["paused", "stopped"])?;
+        tx.commit()?;
         Ok(())
     }
 
+    /// Save a preserved needs-review translation. Like
+    /// [`JobStore::save_translation_with_findings`], the entire per-segment
+    /// checkpoint commits as one `IMMEDIATE` transaction guarded against
+    /// clobbering a frozen human correction.
     pub fn save_needs_review(&self, request: SaveNeedsReview<'_>) -> Result<()> {
-        if self.translation_is_human_corrected(request.job_id, request.segment_id)? {
-            return Ok(());
-        }
         let now = timestamp_string();
         let translated_hash = stable_hash(request.preserved_text);
-        {
-            let conn = self.conn.borrow();
-            conn.execute(
-                "INSERT OR REPLACE INTO translations
-                 (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    request.segment_id,
-                    request.job_id,
-                    request.preserved_text,
-                    request.provider,
-                    request.model,
-                    request.prompt_version,
-                    now
-                ],
-            )?;
-            replace_block_translations(&conn, request.job_id, request.segment_id, request.blocks)?;
-            conn.execute(
-                "UPDATE segments
-                 SET status = 'needs_review',
-                     attempts = attempts + 1,
-                     tokens_input = ?1,
-                     tokens_input_cached = ?2,
-                     tokens_output = ?3,
-                     tokens_estimated = ?4,
-                     translated_hash = ?5,
-                     error = ?6
-                 WHERE job_id = ?7 AND id = ?8",
-                params![
-                    request.input_tokens.map(|value| value as i64),
-                    request.input_cached_tokens.map(|value| value as i64),
-                    request.output_tokens.map(|value| value as i64),
-                    if request.tokens_estimated {
-                        1_i64
-                    } else {
-                        0_i64
-                    },
-                    translated_hash,
-                    request.error,
-                    request.job_id,
-                    request.segment_id
-                ],
-            )?;
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if translation_is_human_corrected_on(&tx, request.job_id, request.segment_id)? {
+            return Ok(());
         }
+        tx.execute(
+            MODEL_TRANSLATION_UPSERT,
+            params![
+                request.segment_id,
+                request.job_id,
+                request.preserved_text,
+                request.provider,
+                request.model,
+                request.prompt_version,
+                now
+            ],
+        )?;
+        replace_block_translations(&tx, request.job_id, request.segment_id, request.blocks)?;
+        tx.execute(
+            "UPDATE segments
+             SET status = 'needs_review',
+                 attempts = attempts + 1,
+                 tokens_input = ?1,
+                 tokens_input_cached = ?2,
+                 tokens_output = ?3,
+                 tokens_estimated = ?4,
+                 translated_hash = ?5,
+                 error = ?6
+             WHERE job_id = ?7 AND id = ?8",
+            params![
+                request.input_tokens.map(|value| value as i64),
+                request.input_cached_tokens.map(|value| value as i64),
+                request.output_tokens.map(|value| value as i64),
+                if request.tokens_estimated {
+                    1_i64
+                } else {
+                    0_i64
+                },
+                translated_hash,
+                request.error,
+                request.job_id,
+                request.segment_id
+            ],
+        )?;
         // Findings are instrumentation, so a failed findings write must never
         // fail the surrounding translation checkpoint.
-        let _ = self.record_segment_findings(request.job_id, request.segment_id, request.error);
-        self.consume_dashboard_retry_guidance(request.job_id, request.segment_id)?;
-        self.touch_job_unless_status(request.job_id, "needs_review", &["paused", "stopped"])?;
+        let _ = record_segment_findings_on(&tx, request.job_id, request.segment_id, request.error);
+        consume_dashboard_retry_guidance_on(&tx, request.job_id, request.segment_id)?;
+        touch_job_unless_status_on(&tx, request.job_id, "needs_review", &["paused", "stopped"])?;
+        tx.commit()?;
         Ok(())
     }
 
+    /// Save a cache-hit translation. Like the other model-write paths, this
+    /// is one `IMMEDIATE` transaction that yields to frozen human corrections.
     pub fn save_cached_translation(&self, request: SaveCachedTranslation<'_>) -> Result<()> {
-        if self.translation_is_human_corrected(request.job_id, request.segment_id)? {
-            return Ok(());
-        }
         let now = timestamp_string();
         let translated_hash = stable_hash(request.translated_text);
-        {
-            let conn = self.conn.borrow();
-            conn.execute(
-                "INSERT OR REPLACE INTO translations
-                 (segment_id, job_id, translated_text, provider, model, prompt_version, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    request.segment_id,
-                    request.job_id,
-                    request.translated_text,
-                    request.provider,
-                    request.model,
-                    request.prompt_version,
-                    now
-                ],
-            )?;
-            replace_block_translations(&conn, request.job_id, request.segment_id, request.blocks)?;
-            conn.execute(
-                "UPDATE segments
-                 SET status = 'skipped_cached',
-                     tokens_input = NULL,
-                     tokens_input_cached = NULL,
-                     tokens_output = NULL,
-                     tokens_estimated = 0,
-                     translated_hash = ?1,
-                     error = NULL
-                 WHERE job_id = ?2 AND id = ?3",
-                params![translated_hash, request.job_id, request.segment_id],
-            )?;
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if translation_is_human_corrected_on(&tx, request.job_id, request.segment_id)? {
+            return Ok(());
         }
+        tx.execute(
+            MODEL_TRANSLATION_UPSERT,
+            params![
+                request.segment_id,
+                request.job_id,
+                request.translated_text,
+                request.provider,
+                request.model,
+                request.prompt_version,
+                now
+            ],
+        )?;
+        replace_block_translations(&tx, request.job_id, request.segment_id, request.blocks)?;
+        tx.execute(
+            "UPDATE segments
+             SET status = 'skipped_cached',
+                 tokens_input = NULL,
+                 tokens_input_cached = NULL,
+                 tokens_output = NULL,
+                 tokens_estimated = 0,
+                 translated_hash = ?1,
+                 error = NULL
+             WHERE job_id = ?2 AND id = ?3",
+            params![translated_hash, request.job_id, request.segment_id],
+        )?;
         // Findings are instrumentation, so a failed findings write must never
         // fail the surrounding translation checkpoint.
-        let _ = self.clear_segment_findings(request.job_id, request.segment_id);
-        self.consume_dashboard_retry_guidance(request.job_id, request.segment_id)?;
-        self.touch_job_unless_status(request.job_id, "running", &["paused", "stopped"])?;
+        let _ = clear_segment_findings_on(&tx, request.job_id, request.segment_id);
+        consume_dashboard_retry_guidance_on(&tx, request.job_id, request.segment_id)?;
+        touch_job_unless_status_on(&tx, request.job_id, "running", &["paused", "stopped"])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -230,7 +268,9 @@ impl JobStore {
         let now = timestamp_string();
         let translated_hash = stable_hash(request.translated_text);
         let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
+        // IMMEDIATE so the policy checks below and the correction write are
+        // atomic against other processes sharing the database file.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let job_status = tx
             .query_row(
                 "SELECT status FROM jobs WHERE id = ?1",
@@ -239,7 +279,7 @@ impl JobStore {
             )
             .optional()?;
         let Some(job_status) = job_status else {
-            return Err(StoreError::InvalidCorrection(format!(
+            return Err(StoreError::NotFound(format!(
                 "job '{}' was not found",
                 request.job_id
             )));
@@ -259,7 +299,7 @@ impl JobStore {
             )
             .optional()?;
         let Some(prompt_version) = prompt_version else {
-            return Err(StoreError::InvalidCorrection(format!(
+            return Err(StoreError::NotFound(format!(
                 "segment '{}' was not found in job '{}'",
                 request.segment_id, request.job_id
             )));
@@ -311,24 +351,7 @@ impl JobStore {
 
     pub fn translation_is_human_corrected(&self, job_id: &str, segment_id: &str) -> Result<bool> {
         let conn = self.conn.borrow();
-        Ok(conn
-            .query_row(
-                "SELECT human_corrected FROM translations WHERE job_id = ?1 AND segment_id = ?2",
-                params![job_id, segment_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .is_some_and(|value| value != 0))
-    }
-
-    fn consume_dashboard_retry_guidance(&self, job_id: &str, segment_id: &str) -> Result<()> {
-        let conn = self.conn.borrow();
-        conn.execute(
-            "UPDATE segment_flags SET consumed = 1
-             WHERE job_id = ?1 AND segment_id = ?2 AND kind = 'dashboard_retry'",
-            params![job_id, segment_id],
-        )?;
-        Ok(())
+        translation_is_human_corrected_on(&conn, job_id, segment_id)
     }
 
     pub fn pending_segment_ids(&self, job_id: &str) -> Result<Vec<String>> {
@@ -689,6 +712,95 @@ impl JobStore {
 
         Ok(results)
     }
+}
+
+/// Connection-scoped freeze check so the model-write paths can run it inside
+/// their own `IMMEDIATE` transaction.
+fn translation_is_human_corrected_on(
+    conn: &Connection,
+    job_id: &str,
+    segment_id: &str,
+) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT human_corrected FROM translations WHERE job_id = ?1 AND segment_id = ?2",
+            params![job_id, segment_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some_and(|value| value != 0))
+}
+
+fn consume_dashboard_retry_guidance_on(
+    conn: &Connection,
+    job_id: &str,
+    segment_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE segment_flags SET consumed = 1
+         WHERE job_id = ?1 AND segment_id = ?2 AND kind = 'dashboard_retry'",
+        params![job_id, segment_id],
+    )?;
+    Ok(())
+}
+
+/// Connection-scoped variant of [`JobStore::record_segment_findings`] so the
+/// per-segment checkpoint can write findings inside its own transaction.
+pub(super) fn record_segment_findings_on(
+    conn: &Connection,
+    job_id: &str,
+    segment_id: &str,
+    error: &str,
+) -> Result<usize> {
+    let findings = classify_segment_error(error);
+    let exists = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM segments WHERE job_id = ?1 AND id = ?2
+         )",
+        params![job_id, segment_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        return Ok(0);
+    }
+
+    conn.execute(
+        "DELETE FROM qa_findings
+         WHERE job_id = ?1 AND segment_id = ?2 AND kind NOT GLOB 'llm_*'",
+        params![job_id, segment_id],
+    )?;
+    for (index, finding) in findings.iter().enumerate() {
+        let hash = stable_hash(&format!("{job_id}\u{1f}{segment_id}\u{1f}{index}"));
+        let id = format!("qaf_{}", &hash[..24]);
+        conn.execute(
+            "INSERT OR REPLACE INTO qa_findings
+             (id, segment_id, job_id, severity, kind, message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id,
+                segment_id,
+                job_id,
+                finding.severity.as_str(),
+                finding.kind.as_str(),
+                finding.message,
+            ],
+        )?;
+    }
+    Ok(findings.len())
+}
+
+/// Connection-scoped variant of [`JobStore::clear_segment_findings`].
+pub(super) fn clear_segment_findings_on(
+    conn: &Connection,
+    job_id: &str,
+    segment_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM qa_findings
+         WHERE job_id = ?1 AND segment_id = ?2 AND kind NOT GLOB 'llm_*'",
+        params![job_id, segment_id],
+    )?;
+    Ok(())
 }
 
 fn replace_block_translations(

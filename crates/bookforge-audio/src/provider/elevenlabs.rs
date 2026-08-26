@@ -718,18 +718,14 @@ mod tests {
             async move {
                 let (base_url, captured) =
                     one_request_server(body.into_bytes(), "application/json");
-                fetch_elevenlabs_subscription_with_key(
-                    &base_url,
-                    "explicit-subscription-key",
-                    5,
-                )
-                .await
-                .map(|subscription| {
-                    let raw = captured
-                        .recv_timeout(CAPTURE_WINDOW)
-                        .expect("mock should capture the request");
-                    (subscription, raw)
-                })
+                fetch_elevenlabs_subscription_with_key(&base_url, "explicit-subscription-key", 5)
+                    .await
+                    .map(|subscription| {
+                        let raw = captured
+                            .recv_timeout(CAPTURE_WINDOW)
+                            .expect("mock should capture the request");
+                        (subscription, raw)
+                    })
             }
         })
         .await

@@ -1,4 +1,5 @@
 use super::*;
+use rusqlite::TransactionBehavior;
 
 #[derive(Debug, Clone, Copy)]
 pub enum RetryScope {
@@ -40,7 +41,9 @@ impl JobStore {
             )));
         }
         let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
+        // IMMEDIATE so the running/paused policy check and the retry write are
+        // atomic against other processes sharing the database file.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let job_status = tx
             .query_row(
                 "SELECT status FROM jobs WHERE id = ?1",
@@ -61,7 +64,7 @@ impl JobStore {
             params![job_id, segment_id],
         )?;
         if updated == 0 {
-            return Err(StoreError::InvalidCorrection(format!(
+            return Err(StoreError::NotFound(format!(
                 "segment '{segment_id}' was not found in job '{job_id}'"
             )));
         }
@@ -120,7 +123,7 @@ impl JobStore {
             |row| row.get::<_, i64>(0),
         )? != 0;
         if !exists {
-            return Err(StoreError::InvalidCorrection(format!(
+            return Err(StoreError::NotFound(format!(
                 "segment '{segment_id}' was not found in job '{job_id}'"
             )));
         }

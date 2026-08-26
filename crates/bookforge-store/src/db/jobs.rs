@@ -538,33 +538,44 @@ impl JobStore {
         status: &str,
         protected_statuses: &[&str],
     ) -> Result<()> {
-        let now = timestamp_string();
         let conn = self.conn.borrow();
-        if protected_statuses.is_empty() {
-            conn.execute(
-                "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                params![status, now, job_id],
-            )?;
-            return Ok(());
-        }
-
-        let placeholders = std::iter::repeat_n("?", protected_statuses.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "UPDATE jobs
-             SET status = ?, updated_at = ?
-             WHERE id = ? AND status NOT IN ({placeholders})"
-        );
-        let mut params: Vec<&dyn rusqlite::types::ToSql> =
-            Vec::with_capacity(3 + protected_statuses.len());
-        params.push(&status);
-        params.push(&now);
-        params.push(&job_id);
-        for protected in protected_statuses {
-            params.push(protected);
-        }
-        conn.execute(&sql, params.as_slice())?;
-        Ok(())
+        touch_job_unless_status_on(&conn, job_id, status, protected_statuses)
     }
+}
+
+/// Connection-scoped variant of [`JobStore::touch_job_unless_status`] so the
+/// per-segment checkpoint can update the job inside its own transaction.
+pub(super) fn touch_job_unless_status_on(
+    conn: &Connection,
+    job_id: &str,
+    status: &str,
+    protected_statuses: &[&str],
+) -> Result<()> {
+    let now = timestamp_string();
+    if protected_statuses.is_empty() {
+        conn.execute(
+            "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status, now, job_id],
+        )?;
+        return Ok(());
+    }
+
+    let placeholders = std::iter::repeat_n("?", protected_statuses.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "UPDATE jobs
+         SET status = ?, updated_at = ?
+         WHERE id = ? AND status NOT IN ({placeholders})"
+    );
+    let mut params: Vec<&dyn rusqlite::types::ToSql> =
+        Vec::with_capacity(3 + protected_statuses.len());
+    params.push(&status);
+    params.push(&now);
+    params.push(&job_id);
+    for protected in protected_statuses {
+        params.push(protected);
+    }
+    conn.execute(&sql, params.as_slice())?;
+    Ok(())
 }

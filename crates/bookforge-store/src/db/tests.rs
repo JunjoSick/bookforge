@@ -1,3 +1,4 @@
+use super::translations::MODEL_TRANSLATION_UPSERT;
 use super::*;
 use bookforge_core::{
     ir::{BlockId, SectionId},
@@ -2769,4 +2770,794 @@ fn qa_finding_breakdown_orders_counts_descending() {
     drop(store);
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn model_write_paths_do_not_clobber_preexisting_human_correction() {
+    // Regression for H-1/STORE-1 (check-then-write TOCTOU). The freeze check
+    // and the write used to be separate autocommit steps, so a dashboard
+    // process committing a manual correction between them was clobbered by
+    // `INSERT OR REPLACE`. Here the frozen row already exists when each
+    // model-write checkpoint runs — exactly the interleaving a losing race
+    // produced — and every path must yield without disturbing it.
+    let db_path = temp_path("toctou_frozen.sqlite");
+    let input_path = temp_path("input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let segments = vec![segment("seg_a", 0)];
+    store
+        .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "toctou_ns")
+        .expect("segments should insert");
+
+    // The other process lands a human correction first.
+    {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "INSERT INTO translations
+             (segment_id, job_id, translated_text, provider, model, prompt_version,
+              created_at, origin, human_corrected, corrected_at)
+             VALUES ('seg_a', ?1, 'Correzione umana', 'manual', 'manual', 'v1',
+                     '1000', 'manual', 1, '1000')",
+            params![job.id],
+        )
+        .expect("frozen translation should insert");
+        conn.execute(
+            "INSERT INTO translation_blocks (segment_id, job_id, block_id, translated_text)
+             VALUES ('seg_a', ?1, 'b_000000', 'Correzione umana')",
+            params![job.id],
+        )
+        .expect("frozen block should insert");
+        conn.execute(
+            "UPDATE segments SET status = 'succeeded', attempts = 1
+             WHERE job_id = ?1 AND id = 'seg_a'",
+            params![job.id],
+        )
+        .expect("frozen segment state should update");
+    }
+
+    let model_blocks = [BlockTranslation {
+        block_id: BlockId("b_000000".to_string()),
+        text: "MODEL OVERWRITE".to_string(),
+    }];
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            translated_text: "MODEL OVERWRITE",
+            blocks: &model_blocks,
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(9),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(9),
+            tokens_estimated: false,
+        })
+        .expect("model save should be ignored rather than fail");
+    store
+        .save_needs_review(SaveNeedsReview {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            preserved_text: "MODEL REVIEW OVERWRITE",
+            blocks: &model_blocks,
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            error: "qa issue",
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            tokens_estimated: false,
+        })
+        .expect("needs-review save should be ignored rather than fail");
+    store
+        .save_cached_translation(SaveCachedTranslation {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            translated_text: "MODEL CACHE OVERWRITE",
+            blocks: &model_blocks,
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+        })
+        .expect("cached save should be ignored rather than fail");
+
+    let conn = store.conn.borrow();
+    let row = conn
+        .query_row(
+            "SELECT translated_text, provider, model, origin, human_corrected, corrected_at
+             FROM translations WHERE job_id = ?1 AND segment_id = 'seg_a'",
+            params![job.id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .expect("frozen translation should survive all three model-write paths");
+    assert_eq!(row.0, "Correzione umana");
+    assert_eq!(row.1, "manual");
+    assert_eq!(row.2, "manual");
+    assert_eq!(row.3, "manual");
+    assert_eq!(row.4, 1);
+    assert_eq!(row.5.as_deref(), Some("1000"));
+
+    let block_text: String = conn
+        .query_row(
+            "SELECT translated_text FROM translation_blocks
+             WHERE job_id = ?1 AND segment_id = 'seg_a' AND block_id = 'b_000000'",
+            params![job.id],
+            |row| row.get(0),
+        )
+        .expect("corrected block should survive");
+    assert_eq!(block_text, "Correzione umana");
+
+    let segment_state = conn
+        .query_row(
+            "SELECT status, attempts FROM segments WHERE job_id = ?1 AND id = 'seg_a'",
+            params![job.id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .expect("segment should load");
+    assert_eq!(segment_state.0, "succeeded");
+    assert_eq!(
+        segment_state.1, 1,
+        "attempts must not advance on a frozen segment"
+    );
+    drop(conn);
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn guarded_model_upsert_leaves_frozen_rows_untouched_at_sql_level() {
+    // Even if a future caller bypasses the application-level freeze check,
+    // the single-statement upsert itself must refuse to overwrite a row with
+    // `human_corrected = 1` (and must not delete-and-reinsert it the way
+    // `INSERT OR REPLACE` did).
+    let db_path = temp_path("guarded_upsert.sqlite");
+    let (store, job, _seg) =
+        build_seeded_store_with_translation(&db_path, "guard_ns", &["b_000000"]);
+    {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "UPDATE translations SET human_corrected = 1, origin = 'manual',
+                    corrected_at = '1000'
+             WHERE job_id = ?1 AND segment_id = 'seg_a'",
+            params![job.id],
+        )
+        .expect("freeze flag should update");
+    }
+
+    let overwrite_before = {
+        let conn = store.conn.borrow();
+        let before: (String, String, i64) = conn
+            .query_row(
+                "SELECT translated_text, created_at, human_corrected FROM translations
+                 WHERE job_id = ?1 AND segment_id = 'seg_a'",
+                params![job.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("frozen row should load");
+        assert_eq!(before.0, "Tradotto");
+        assert_eq!(before.2, 1);
+        let changed = conn
+            .execute(
+                MODEL_TRANSLATION_UPSERT,
+                params![
+                    "seg_a",
+                    job.id,
+                    "SQL LEVEL OVERWRITE",
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "2000"
+                ],
+            )
+            .expect("guarded upsert should execute");
+        (changed, before.1)
+    };
+    assert_eq!(overwrite_before.0, 0, "a frozen row must not be updated");
+
+    let conn = store.conn.borrow();
+    let frozen = conn
+        .query_row(
+            "SELECT translated_text, created_at, origin, human_corrected FROM translations
+             WHERE job_id = ?1 AND segment_id = 'seg_a'",
+            params![job.id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .expect("frozen row should load");
+    assert_eq!(frozen.0, "Tradotto", "frozen text must not change");
+    assert_eq!(frozen.1, overwrite_before.1, "created_at must not change");
+    assert_eq!(frozen.2, "manual", "origin must survive the guarded upsert");
+    assert_eq!(frozen.3, 1);
+    drop(conn);
+
+    // Unfreezing lets the same statement through.
+    {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "UPDATE translations SET human_corrected = 0 WHERE job_id = ?1",
+            params![job.id],
+        )
+        .expect("unfreeze should work");
+    }
+    let overwrite = {
+        let conn = store.conn.borrow();
+        conn.execute(
+            MODEL_TRANSLATION_UPSERT,
+            params![
+                "seg_a",
+                job.id,
+                "SQL LEVEL OVERWRITE",
+                "mock",
+                "mock-prefix",
+                "v1",
+                "2000"
+            ],
+        )
+        .expect("guarded upsert should execute")
+    };
+    assert_eq!(overwrite, 1, "an unfrozen row must be updated");
+    let text: String = {
+        let conn = store.conn.borrow();
+        conn.query_row(
+            "SELECT translated_text FROM translations WHERE job_id = ?1 AND segment_id = 'seg_a'",
+            params![job.id],
+            |row| row.get(0),
+        )
+        .expect("row should load")
+    };
+    assert_eq!(text, "SQL LEVEL OVERWRITE");
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn resume_reinsert_refreshes_segment_cache_identity_columns() {
+    // STORE-11: resume re-runs insert_segments against rows that already
+    // exist. `INSERT OR IGNORE` left stale provider/model/prompt_version/
+    // source_hash/cache_namespace values behind after a config change, so
+    // later cache lookups misattributed hits.
+    let db_path = temp_path("resume_identity.sqlite");
+    let input_path = temp_path("input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "old-model",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+
+    let mut seg = segment("seg_a", 0);
+    seg.checksum = "checksum_old".to_string();
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "old-model",
+            "ns_old",
+        )
+        .expect("initial insert should work");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            translated_text: "Tradotto",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "Tradotto".to_string(),
+            }],
+            provider: "mock",
+            model: "old-model",
+            prompt_version: "v1",
+            input_tokens: Some(3),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(3),
+            tokens_estimated: false,
+        })
+        .expect("translation should save");
+
+    // Resume after a config change: new provider/model/prompt/source hash.
+    seg.checksum = "checksum_new".to_string();
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v2",
+            "openrouter",
+            "new-model",
+            "ns_new",
+        )
+        .expect("resume re-insert should work");
+
+    let conn = store.conn.borrow();
+    let row = conn
+        .query_row(
+            "SELECT provider, model, prompt_version, source_hash, cache_namespace,
+                    status, attempts
+             FROM segments WHERE job_id = ?1 AND id = 'seg_a'",
+            params![job.id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .expect("segment row should load");
+    drop(conn);
+
+    assert_eq!(row.0, "openrouter");
+    assert_eq!(row.1, "new-model");
+    assert_eq!(row.2, "v2");
+    assert_eq!(row.3, "checksum_new");
+    assert_eq!(row.4, "ns_new");
+    assert_eq!(row.5, "succeeded", "resume re-insert must not reset status");
+    assert_eq!(row.6, 1, "resume re-insert must not reset attempts");
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn global_scope_unique_indexes_reject_duplicate_globals_across_connections() {
+    // STORE-13: NULL scope_id made every global row distinct to the table
+    // UNIQUE constraints, so concurrent first-inserts on two connections
+    // duplicated global terms/styles/entities. The partial unique indexes
+    // close that hole; scoped rows keep working via the table constraints.
+    let db_path = temp_path("global_unique.sqlite");
+    let store_a = JobStore::open(&db_path).expect("store a opens");
+    let store_b = JobStore::open(&db_path).expect("store b opens (second connection)");
+
+    store_a
+        .upsert_glossary_terms(&[glossary_term(
+            bookforge_core::GlossaryScopeKind::Global,
+            None,
+            "Aragorn",
+            "Aragorn",
+        )])
+        .expect("global term inserts");
+
+    // A second writer inserting the same global identity must now fail.
+    let duplicate = {
+        let conn = store_b.conn.borrow();
+        conn.execute(
+            "INSERT INTO glossary_terms
+             (scope_kind, scope_id, source_text, target_text, category, notes,
+              case_sensitive, always_active, status, source_language, target_language,
+              source_count, created_at, updated_at)
+             VALUES ('global', NULL, 'Aragorn', 'other target', 'person', NULL,
+                     1, 0, 'user_seeded', 'English', 'Italian', 0, 't1', 't1')",
+            [],
+        )
+    };
+    assert!(
+        duplicate.is_err(),
+        "duplicate global glossary term must violate the partial unique index"
+    );
+
+    // Scoped rows are unaffected by the partial index.
+    let scoped = {
+        let conn = store_b.conn.borrow();
+        conn.execute(
+            "INSERT INTO glossary_terms
+             (scope_kind, scope_id, source_text, target_text, category, notes,
+              case_sensitive, always_active, status, source_language, target_language,
+              source_count, created_at, updated_at)
+             VALUES ('book', 'lotr', 'Aragorn', 'Granpasso', 'person', NULL,
+                     1, 0, 'user_seeded', 'English', 'Italian', 0, 't1', 't1')",
+            [],
+        )
+    };
+    assert!(scoped.is_ok(), "scoped rows must remain insertable");
+
+    // Same protection for global style sheets and entities.
+    let style_first = {
+        let conn = store_a.conn.borrow();
+        conn.execute(
+            "INSERT INTO style_sheets
+             (scope_kind, scope_id, target_language, content_toml, fingerprint,
+              created_at, updated_at)
+             VALUES ('global', NULL, 'Italian', 'toml-a', 'fp-a', 't1', 't1')",
+            [],
+        )
+    };
+    assert!(style_first.is_ok());
+    let style_dup = {
+        let conn = store_b.conn.borrow();
+        conn.execute(
+            "INSERT INTO style_sheets
+             (scope_kind, scope_id, target_language, content_toml, fingerprint,
+              created_at, updated_at)
+             VALUES ('global', NULL, 'Italian', 'toml-b', 'fp-b', 't2', 't2')",
+            [],
+        )
+    };
+    assert!(
+        style_dup.is_err(),
+        "duplicate global style sheet must violate the partial unique index"
+    );
+
+    let entity_first = {
+        let conn = store_a.conn.borrow();
+        conn.execute(
+            "INSERT INTO entities
+             (scope_kind, scope_id, source_name, target_name, gender_target,
+              role, notes, source_language, target_language, created_at, updated_at)
+             VALUES ('global', NULL, 'Ivan', 'Ivan', NULL, NULL, NULL,
+                     'English', 'Italian', 't1', 't1')",
+            [],
+        )
+    };
+    assert!(entity_first.is_ok());
+    let entity_dup = {
+        let conn = store_b.conn.borrow();
+        conn.execute(
+            "INSERT INTO entities
+             (scope_kind, scope_id, source_name, target_name, gender_target,
+              role, notes, source_language, target_language, created_at, updated_at)
+             VALUES ('global', NULL, 'Ivan', 'Ivan II', NULL, NULL, NULL,
+                     'English', 'Italian', 't2', 't2')",
+            [],
+        )
+    };
+    assert!(
+        entity_dup.is_err(),
+        "duplicate global entity must violate the partial unique index"
+    );
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn migration_nine_deduplicates_legacy_global_rows_and_recreates_indexes() {
+    let db_path = temp_path("migration_nine_dedupe.sqlite");
+    {
+        let store = JobStore::open(&db_path).expect("store opens");
+        {
+            let conn = store.conn.borrow();
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS ux_glossary_terms_global_identity;
+                 DELETE FROM _migrations WHERE version = 9;
+                 INSERT INTO glossary_terms
+                   (scope_kind, scope_id, source_text, target_text, category, notes,
+                    case_sensitive, always_active, status, source_language, target_language,
+                    source_count, created_at, updated_at)
+                 VALUES
+                   ('global', NULL, 'Ivan', 'vecchio', 'person', NULL,
+                    1, 0, 'user_seeded', 'English', 'Italian', 0, '10', '10'),
+                   ('global', NULL, 'Ivan', 'recente', 'person', NULL,
+                    1, 0, 'user_seeded', 'English', 'Italian', 0, '20', '20');",
+            )
+            .expect("pre-migration legacy state should initialize");
+        }
+    }
+
+    let reopened = JobStore::open(&db_path).expect("reopen runs migration 9");
+    let survivors = reopened
+        .list_glossary_terms(GlossaryFilter {
+            scope_kind: Some(GlossaryScopeKind::Global),
+            scope_id: None,
+            source_language: Some("English"),
+            target_language: Some("Italian"),
+            active_only: false,
+        })
+        .expect("terms should list");
+    assert_eq!(survivors.len(), 1, "duplicates must collapse to one row");
+    assert_eq!(
+        survivors[0].target_text, "recente",
+        "the most recently updated duplicate must win"
+    );
+
+    {
+        let conn = reopened.conn.borrow();
+        let index: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'index'
+                 AND name = 'ux_glossary_terms_global_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("unique index should be recreated");
+        assert_eq!(index, "ux_glossary_terms_global_identity");
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _migrations WHERE version = 9",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration marker should query");
+        assert_eq!(applied, 1);
+    }
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn migrate_creates_jobs_created_at_index() {
+    // STORE-16: the dashboard/watch job lists sort by created_at on every
+    // refresh; without this index each refresh sorted the whole table.
+    let db_path = temp_path("jobs_created_at_index.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+    let conn = store.conn.borrow();
+    let index: String = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'index'
+             AND name = 'idx_jobs_created_at'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("idx_jobs_created_at exists");
+    assert_eq!(index, "idx_jobs_created_at");
+    drop(conn);
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn add_glossary_term_returns_stable_row_id_and_updates_in_place() {
+    // STORE-15: the id used to come from a re-select after a separate
+    // transaction, so a concurrent writer could make the returned id point at
+    // a different row. The upsert now returns its own id atomically.
+    let db_path = temp_path("add_glossary_term_id.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+    let mut term = glossary_term(
+        bookforge_core::GlossaryScopeKind::Global,
+        None,
+        "Aragorn",
+        "Aragorn",
+    );
+    let first = store.add_glossary_term(&term).expect("first insert");
+    term.target_text = "Granpasso".to_string();
+    let second = store.add_glossary_term(&term).expect("update in place");
+    assert_eq!(first, second, "upsert must return the existing row's id");
+
+    let rows = store
+        .list_glossary_terms(GlossaryFilter::default())
+        .expect("terms list");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, Some(second));
+    assert_eq!(rows[0].target_text, "Granpasso");
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn not_found_and_policy_rejections_use_distinct_error_variants() {
+    // STORE-18: InvalidCorrection doubled as a generic rejection, so callers
+    // could not distinguish "this does not exist" from "policy says no".
+    let db_path = temp_path("not_found_vs_policy.sqlite");
+    let (store, job, _segment) =
+        build_seeded_store_with_translation(&db_path, "variant_ns", &["b_000000"]);
+
+    // Unknown segment on an inactive job -> NotFound.
+    store
+        .mark_job_needs_review(&job.id)
+        .expect("job should become reviewable");
+    let unknown_segment = store.save_manual_correction(SaveManualCorrection {
+        job_id: &job.id,
+        segment_id: "missing_segment",
+        translated_text: "Correzione",
+        blocks: &[BlockTranslation {
+            block_id: BlockId("b_000000".to_string()),
+            text: "Correzione".to_string(),
+        }],
+    });
+    assert!(
+        matches!(unknown_segment, Err(StoreError::NotFound(_))),
+        "unknown segment must be NotFound, got: {unknown_segment:?}"
+    );
+    let unknown_retry = store.request_segment_retry(&job.id, "missing_segment", None);
+    assert!(
+        matches!(unknown_retry, Err(StoreError::NotFound(_))),
+        "unknown retry target must be NotFound, got: {unknown_retry:?}"
+    );
+    let unknown_flag = store.set_dashboard_segment_flag(&job.id, "missing_segment", true);
+    assert!(
+        matches!(unknown_flag, Err(StoreError::NotFound(_))),
+        "unknown flag target must be NotFound, got: {unknown_flag:?}"
+    );
+    let unknown_job = store.save_manual_correction(SaveManualCorrection {
+        job_id: "missing_job",
+        segment_id: "seg_a",
+        translated_text: "Correzione",
+        blocks: &[BlockTranslation {
+            block_id: BlockId("b_000000".to_string()),
+            text: "Correzione".to_string(),
+        }],
+    });
+    assert!(
+        matches!(unknown_job, Err(StoreError::NotFound(_))),
+        "unknown job must be NotFound, got: {unknown_job:?}"
+    );
+
+    // Policy rejection on an active job stays InvalidCorrection.
+    store
+        .mark_job_running_for_resume(&job.id)
+        .expect("job should run again");
+    let policy = store.save_manual_correction(SaveManualCorrection {
+        job_id: &job.id,
+        segment_id: "seg_a",
+        translated_text: "Correzione",
+        blocks: &[BlockTranslation {
+            block_id: BlockId("b_000000".to_string()),
+            text: "Correzione".to_string(),
+        }],
+    });
+    assert!(
+        matches!(policy, Err(StoreError::InvalidCorrection(_))),
+        "running-job rejection is policy, got: {policy:?}"
+    );
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn migrate_legacy_rename_cascade_completes_and_preserves_data() {
+    // STORE-4: the pre-v1_0_1 rename cascade used to run as five separate
+    // autocommit statements; a crash mid-cascade orphaned data and the next
+    // open silently recreated empty tables. The cascade now commits once, so
+    // an open either leaves zero orphans plus fresh tables, or nothing at all.
+    // The fixture hand-builds the true pre-v1_0_1 shape (translations keyed
+    // by segment_id alone, no job_id column — the trigger the migrate pass
+    // detects).
+    let db_path = temp_path("legacy_rename_cascade.sqlite");
+    {
+        let conn = Connection::open(&db_path).expect("legacy db opens");
+        conn.execute_batch(
+            "
+            CREATE TABLE _migrations (
+              version INTEGER PRIMARY KEY,
+              name TEXT NOT NULL,
+              applied_at TEXT NOT NULL
+            );
+            CREATE TABLE jobs (
+              id TEXT PRIMARY KEY,
+              input_hash TEXT NOT NULL,
+              target_lang TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE segments (
+              id TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              section_id TEXT NOT NULL,
+              ordinal INTEGER NOT NULL,
+              source_hash TEXT NOT NULL,
+              prompt_version TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              status TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              error TEXT,
+              PRIMARY KEY (job_id, id)
+            );
+            CREATE TABLE translations (
+              segment_id TEXT NOT NULL PRIMARY KEY,
+              translated_text TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE translation_blocks (
+              segment_id TEXT NOT NULL,
+              block_id TEXT NOT NULL,
+              translated_text TEXT NOT NULL,
+              PRIMARY KEY (segment_id, block_id)
+            );
+            CREATE TABLE qa_findings (
+              id TEXT PRIMARY KEY,
+              segment_id TEXT NOT NULL
+            );
+            INSERT INTO _migrations VALUES (1, 'initial', 'legacy');
+            INSERT INTO jobs
+              (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+            VALUES
+              ('legacy_job', 'legacy_hash', 'Italian', 'mock', 'mock-prefix',
+               'succeeded', 'created', 'updated');
+            INSERT INTO segments
+              (id, job_id, section_id, ordinal, source_hash, prompt_version,
+               provider, model, status)
+            VALUES
+              ('legacy_segment', 'legacy_job', 'section_0', 0, 'hash', 'v1',
+               'mock', 'mock-prefix', 'succeeded');
+            INSERT INTO translations (segment_id, translated_text, created_at)
+            VALUES ('legacy_segment', 'Traduzione', 'c');
+            ",
+        )
+        .expect("legacy data should initialize");
+    }
+
+    let store = JobStore::open(&db_path).expect("store opens and migrates");
+    let conn = store.conn.borrow();
+    let legacy_tables: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%_legacy_%'",
+            )
+            .expect("legacy scan prepares");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("legacy scan queries");
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .expect("legacy scan collects")
+    };
+    assert_eq!(
+        legacy_tables.len(),
+        5,
+        "exactly the five renamed tables may remain: {legacy_tables:?}"
+    );
+
+    let preserved: i64 = legacy_tables
+        .iter()
+        .filter(|table| table.starts_with("translations_legacy_"))
+        .map(|table| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("legacy row count")
+        })
+        .sum();
+    assert_eq!(
+        preserved, 1,
+        "legacy translation data must survive the cascade"
+    );
+
+    let fresh_jobs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+        .expect("fresh jobs count");
+    assert_eq!(
+        fresh_jobs, 0,
+        "fresh tables start empty; data lives in the copies"
+    );
+    drop(conn);
+
+    let _ = fs::remove_file(db_path);
 }
