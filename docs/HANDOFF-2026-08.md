@@ -15,7 +15,20 @@ Push it if absent: `git fetch origin && git checkout remediation/audit-2026-08`.
 3. **Serve auth (H-5):** token auth DEFAULT-ON (auto-generated session token, printed URL bootstraps browser, all API routes require it) with a `--no-auth` opt-out escape hatch.
 4. **Semver:** minor-breaking changes acceptable → final version bump likely **v3.0.0** (status enums replace magic strings, unified estimator changes cache keys, JSON envelope versioning).
 
-## 2. Current state — Wave 0 COMPLETE ✅ · Wave 1 COMPLETE ✅ (2026-08-26)
+## 2. Current state — Waves 0–2 COMPLETE ✅ (2026-08-26)
+
+**Wave 2 landed as individual commits (`fix(llm)` / `fix(audio)` / `fix(pdf)` / `fix(cli)`, all gates green post-integration: fmt/clippy 0 warnings/test 1132 passed):**
+
+- **P2-llm**: LLM-1 output-budget redesign (min(user,remainder), floor-as-net, batch+single identical); LLM-3 repair-phase control signals; LLM-4 transient backoff + 408/425 reclass; LLM-9 double-check concurrency + honest multi-round corrections; LLM-13 DeepSeek classification verified against live provider docs (thinking-mode default-on ⇒ flash gets normal multipliers when disabled); LLM-15 prompt fencing w/ sanitization; LLM-10..20 trivia group fixed; stop-determinism at double-check boundaries.
+- **P2-audio**: AUDIO-3 fail-open→cheapest tier (deterministic, visible); AUDIO-1 rename simplification; AUDIO-2 cross-process out_dir lock; AUDIO-4 CJK splitters; AUDIO-5 ffmpeg -nostdin/null-stdin/timeouts/kill-and-reap; AUDIO-11 debris sweep in --prune; AUDIO-12/13/14 honest warnings + two-phase loudnorm markers; AUDIO-15..17 perf/cancellation; nav-audio structural backstop; library-side capabilities matrix (`capabilities.rs`) + `read_narration_source` estimator pipeline (`source.rs`). **REMAINING (carried): CLI audiobook estimate-path + serve/audio.rs wiring of those two APIs (AUDIO-6/7/8 surface) — assigned as immediate follow-up.**
+- **P2-pdf**: PDF-3 RAII temp dirs; PDF-5 figure preservation under OCR; PDF-6 pre-header threshold accounting; PDF-10 warning half; PDF-8/9/12/13 cheap-correct set; PDF-14 small half (hash UID, SOURCE_DATE_EPOCH, heading-built TOC); PDF-22 render/body caps; PDF-11/15/16/18/20; **PDF-4 REFUTED with poppler 26.08 evidence** (-i strips image placement tags) — treat like PDF-1; dead arms removed.
+- **P2-ui-clap**: UI-22 stdout purity; UI-21 exit-code taxonomy + docs; UI-2 truthful attached-TUI cancel; UI-5 ANSI sanitization module; UI-9/10 epoch rebaseline + real DroppedEvents emission; UI-13 tri-state syntax unification; UI-1 scroll math; UI-28/30 epoch-aware tail folds; 🟡⚪ tail items (ArgGroups conflicts, --yes gates, planning progress events, refresh floors, env-var help). Also pinned the JSONL visibility of persisted corrections via a warning event (cross-workstream determinism).
+
+**Wave 2 hardening notes:** llm stop-determinism regression (lifecycle resume-after-stop) caught by integration gate, root-caused to JSONL buffering visibility ordering + missing pass-boundary stop checks; fixed inside double_check.rs + one warning-event emit in finalization.rs.
+
+Outstanding sub-items carried forward: STORE-5 sql-file drift reconciliation, SERVE-7 child isolation (needs plan-mode flags), tempfile promotion decision, CSP unsafe-inline removal, AUDIO capabilities/estimator CLI+serve wiring (in flight), core `cap_output_tokens` export now unused by llm crate (delete/repair during estimator/deadcode waves).
+
+## 2.b Historical — Wave 1 COMPLETE ✅ (2026-08-26)
 
 Wave 1 landed on this branch as individual commits (all gates green post-integration: fmt/clippy 0 warnings/test 1043 passed):
 
