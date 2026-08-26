@@ -591,7 +591,13 @@ where
         telemetry.as_ref(),
         &glossary_rules,
     )
-    .await?;
+    .await
+    .inspect_err(|error| {
+        // Hard finalize failures (rebuild, validation, fallback
+        // misconfiguration) must not leave the job stuck in "running"
+        // forever; only doctor/dashboard would otherwise hint at the truth.
+        mark_run_failed_on_error(&store, &job.id, error);
+    })?;
 
     if telemetry.has_glossary_entries() {
         let summary = telemetry.glossary_summary();

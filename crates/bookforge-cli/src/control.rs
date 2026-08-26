@@ -154,11 +154,27 @@ impl RuntimeLaunchClaim {
                         .ok()
                         .and_then(|modified| modified.elapsed().ok())
                         .is_some_and(|age| age >= stale_after);
-                    if stale {
-                        let _ = fs::remove_file(&path);
-                        continue;
+                    if !stale {
+                        return Ok(None);
                     }
-                    return Ok(None);
+                    // Reclaim via rename instead of check-then-delete: exactly
+                    // one racer wins the rename, so a concurrent acquirer can
+                    // never lose a freshly created claim between our staleness
+                    // check and an unlink. Whoever loses observes either
+                    // NotFound (the other racer moved it first) or a replaced
+                    // file and simply backs off.
+                    let reclaimed = path.with_file_name(format!(
+                        ".resume.launch.reclaimed-{}-{}",
+                        std::process::id(),
+                        RUNTIME_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+                    ));
+                    match fs::rename(&path, &reclaimed) {
+                        Ok(()) => {
+                            let _ = fs::remove_file(&reclaimed);
+                            continue;
+                        }
+                        Err(_) => return Ok(None),
+                    }
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -305,6 +321,12 @@ impl<'a> ControlFilePoller<'a> {
     }
 
     fn pause(&mut self, signal: &PauseSignal) -> Result<()> {
+        if self.job_outcome_is_final()? {
+            // The job already reached a completion outcome (succeeded,
+            // needs_review, or failed). A pause landing in the post-completion
+            // window must not rewrite that outcome.
+            return Ok(());
+        }
         if signal.state() == PauseState::Stopped || self.job_status_is("stopped")? {
             signal.stop();
             self.last_state = PauseState::Stopped;
@@ -345,6 +367,11 @@ impl<'a> ControlFilePoller<'a> {
     }
 
     fn stop(&mut self, signal: &PauseSignal) -> Result<()> {
+        if self.job_outcome_is_final()? {
+            // Completion is final: a stop that lands after the job recorded
+            // its outcome must not flip it back to stopped.
+            return Ok(());
+        }
         if let Some(token) = &self.stop_cancel_token {
             token.cancel();
         }
@@ -361,11 +388,20 @@ impl<'a> ControlFilePoller<'a> {
             .get_job(&self.job_id)?
             .is_some_and(|job| job.status == expected))
     }
+
+    /// True once the job row records a completion outcome that late pause/stop
+    /// commands must not rewrite (CLI-4). Work-in-progress statuses ("running",
+    /// "paused", "stopped", ...) keep the old control semantics.
+    fn job_outcome_is_final(&self) -> Result<bool> {
+        Ok(self.store.get_job(&self.job_id)?.is_some_and(|job| {
+            matches!(job.status.as_str(), "succeeded" | "needs_review" | "failed")
+        }))
+    }
 }
 
 pub(crate) struct ControlFileWatcher {
     cancel: CancellationToken,
-    handle: tokio::task::JoinHandle<()>,
+    handle: std::thread::JoinHandle<()>,
     runtime_settings: watch::Receiver<EngineRuntimeSettings>,
     job_runtime_settings: watch::Receiver<JobRuntimeSettings>,
     lease_path: PathBuf,
@@ -481,120 +517,156 @@ impl ControlFileWatcher {
         let _ = fs::remove_file(bookforge_core::run_dir_for_job(&job_id).join("resume.launch"));
         let task_lease_path = lease_path.clone();
         let task_lease_instance_id = lease_instance_id.clone();
-        let handle = tokio::spawn(async move {
-            let mut last_override_revision = initial_loaded.as_ref().map(|loaded| loaded.revision);
-            let mut last_override_error = None;
-            let mut last_heartbeat_write = Instant::now();
-            loop {
-                {
-                    match JobStore::open(store_path.clone()) {
-                        Ok(store) => {
-                            let mut poller = ControlFilePoller::new_inner(
-                                &store,
-                                job_id.clone(),
-                                control_path_for_job,
-                                progress.clone(),
-                                stop_cancel_token.clone(),
+        // JobStore holds a RefCell'd connection and is therefore !Send, so the
+        // polling loop runs on a dedicated blocking thread that OWNS one
+        // long-lived watch store. Opening + migrating the database once here —
+        // instead of every 100 ms tick — removes the per-run SQLite churn tax
+        // on the checkpoint writer (H-7); transient failures drop the store
+        // and reopen on the next tick.
+        let handle = std::thread::Builder::new()
+            .name(format!("bookforge-control-{job_id}"))
+            .spawn(move || {
+                let mut last_override_revision =
+                    initial_loaded.as_ref().map(|loaded| loaded.revision);
+                let mut last_override_error = None;
+                let mut last_store_error: Option<String> = None;
+                let mut last_heartbeat_write = Instant::now();
+                let mut watch_store = match JobStore::open(store_path.clone()) {
+                    Ok(store) => Some(store),
+                    Err(error) => {
+                        last_store_error = Some(error.to_string());
+                        None
+                    }
+                };
+                loop {
+                    match crate::commands::reconfigure::load_overrides_document_for_job(&job_id) {
+                        Ok(Some(loaded)) if last_override_revision != Some(loaded.revision) => {
+                            let mut effective = baseline_settings.clone();
+                            crate::commands::reconfigure::apply_overrides_to_settings(
+                                &mut effective,
+                                &loaded.overrides,
                             );
-                            match crate::commands::reconfigure::load_overrides_document_for_job(
-                                &job_id,
-                            ) {
-                                Ok(Some(loaded))
-                                    if last_override_revision != Some(loaded.revision) =>
-                                {
-                                    let mut effective = baseline_settings.clone();
-                                    crate::commands::reconfigure::apply_overrides_to_settings(
-                                        &mut effective,
-                                        &loaded.overrides,
-                                    );
-                                    let changed_fields = loaded.overrides.changed_fields();
-                                    let effective_qa = loaded.overrides.qa.unwrap_or(baseline_qa);
-                                    let effective_validate_output = loaded
-                                        .overrides
-                                        .validate_output
-                                        .unwrap_or(baseline_validate_output);
-                                    job_runtime_sender.send_replace(JobRuntimeSettings {
-                                        revision: loaded.revision,
-                                        settings: effective.clone(),
-                                        qa: effective_qa,
-                                        validate_output: effective_validate_output,
-                                    });
-                                    runtime_sender.send_replace(
-                                        EngineRuntimeSettings::from_resolved(
-                                            loaded.revision,
-                                            &effective,
-                                        ),
-                                    );
-                                    lease.last_loaded_revision = loaded.revision;
-                                    lease.last_applied_revision = loaded.revision;
-                                    progress.emit(ProgressEvent::RuntimeConfigChanged {
-                                        revision: loaded.revision,
-                                        changed_fields,
-                                        application: loaded.overrides.application_boundaries(),
+                            let changed_fields = loaded.overrides.changed_fields();
+                            let effective_qa = loaded.overrides.qa.unwrap_or(baseline_qa);
+                            let effective_validate_output = loaded
+                                .overrides
+                                .validate_output
+                                .unwrap_or(baseline_validate_output);
+                            job_runtime_sender.send_replace(JobRuntimeSettings {
+                                revision: loaded.revision,
+                                settings: effective.clone(),
+                                qa: effective_qa,
+                                validate_output: effective_validate_output,
+                            });
+                            runtime_sender.send_replace(EngineRuntimeSettings::from_resolved(
+                                loaded.revision,
+                                &effective,
+                            ));
+                            lease.last_loaded_revision = loaded.revision;
+                            lease.last_applied_revision = loaded.revision;
+                            progress.emit(ProgressEvent::RuntimeConfigChanged {
+                                revision: loaded.revision,
+                                changed_fields,
+                                application: loaded.overrides.application_boundaries(),
+                                timestamp_ms: now_ms(),
+                            });
+                            last_override_revision = Some(loaded.revision);
+                            last_override_error = None;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let message = error.to_string();
+                            if last_override_error.as_deref() != Some(message.as_str()) {
+                                progress.emit(ProgressEvent::RuntimeConfigRejected {
+                                    revision: None,
+                                    message: message.clone(),
+                                    timestamp_ms: now_ms(),
+                                });
+                                last_override_error = Some(message);
+                            }
+                        }
+                    }
+                    if let Some(store) = watch_store.as_ref() {
+                        let mut poller = ControlFilePoller::new_inner(
+                            store,
+                            job_id.clone(),
+                            control_path_for_job,
+                            progress.clone(),
+                            stop_cancel_token.clone(),
+                        );
+                        // Publish a newly durable override revision before a Resume
+                        // command can release paused dispatchers. This preserves the
+                        // reconfigure-then-resume ordering guarantee across processes.
+                        match poller.poll(&signal) {
+                            Ok(()) => last_store_error = None,
+                            Err(error) => {
+                                // Reopen-on-error: a corrupted or externally
+                                // closed connection must not wedge the watcher
+                                // forever; the next tick gets a fresh store.
+                                let message = format!("failed to poll control file: {error}");
+                                if last_store_error.as_deref() != Some(message.as_str()) {
+                                    progress.emit(ProgressEvent::Error {
+                                        kind: "control_file_watcher".to_string(),
+                                        message: message.clone(),
                                         timestamp_ms: now_ms(),
                                     });
-                                    last_override_revision = Some(loaded.revision);
-                                    last_override_error = None;
+                                    tracing::warn!(
+                                        job_id = %job_id,
+                                        "{message}; reopening the watch store"
+                                    );
                                 }
-                                Ok(_) => {}
-                                Err(error) => {
-                                    let message = error.to_string();
-                                    if last_override_error.as_deref() != Some(message.as_str()) {
-                                        progress.emit(ProgressEvent::RuntimeConfigRejected {
-                                            revision: None,
-                                            message: message.clone(),
-                                            timestamp_ms: now_ms(),
-                                        });
-                                        last_override_error = Some(message);
-                                    }
-                                }
+                                last_store_error = Some(message);
                             }
-                            // Publish a newly durable override revision before a Resume
-                            // command can release paused dispatchers. This preserves the
-                            // reconfigure-then-resume ordering guarantee across processes.
-                            if let Err(error) = poller.poll(&signal) {
+                        }
+                        if last_store_error.is_some() {
+                            watch_store = None;
+                        }
+                    } else {
+                        match JobStore::open(store_path.clone()) {
+                            Ok(store) => {
+                                last_store_error = None;
+                                watch_store = Some(store);
+                            }
+                            Err(error) => {
+                                let message = format!(
+                                    "failed to open job store for control watcher: {error}"
+                                );
+                                if last_store_error.as_deref() != Some(message.as_str()) {
+                                    progress.emit(ProgressEvent::Error {
+                                        kind: "control_file_watcher".to_string(),
+                                        message: message.clone(),
+                                        timestamp_ms: now_ms(),
+                                    });
+                                }
+                                last_store_error = Some(message);
+                            }
+                        }
+                    }
+                    if last_heartbeat_write.elapsed() >= RUNTIME_HEARTBEAT_INTERVAL {
+                        lease.heartbeat_at_ms = now_ms();
+                        match write_runtime_lease(&task_lease_path, &lease) {
+                            Ok(()) => {
+                                #[cfg(test)]
+                                heartbeat_sender.send_replace(lease.heartbeat_at_ms);
+                            }
+                            Err(error) => {
                                 progress.emit(ProgressEvent::Error {
-                                    kind: "control_file_watcher".to_string(),
-                                    message: format!("failed to poll control file: {error}"),
+                                    kind: "runtime_lease".to_string(),
+                                    message: format!("failed to refresh runtime lease: {error}"),
                                     timestamp_ms: now_ms(),
                                 });
                             }
                         }
-                        Err(error) => {
-                            progress.emit(ProgressEvent::Error {
-                                kind: "control_file_watcher".to_string(),
-                                message: format!(
-                                    "failed to open job store for control watcher: {error}"
-                                ),
-                                timestamp_ms: now_ms(),
-                            });
-                        }
+                        last_heartbeat_write = Instant::now();
                     }
-                }
-                if last_heartbeat_write.elapsed() >= RUNTIME_HEARTBEAT_INTERVAL {
-                    lease.heartbeat_at_ms = now_ms();
-                    match write_runtime_lease(&task_lease_path, &lease) {
-                        Ok(()) => {
-                            #[cfg(test)]
-                            heartbeat_sender.send_replace(lease.heartbeat_at_ms);
-                        }
-                        Err(error) => {
-                            progress.emit(ProgressEvent::Error {
-                                kind: "runtime_lease".to_string(),
-                                message: format!("failed to refresh runtime lease: {error}"),
-                                timestamp_ms: now_ms(),
-                            });
-                        }
+                    if task_cancel.is_cancelled() {
+                        break;
                     }
-                    last_heartbeat_write = Instant::now();
+                    std::thread::sleep(CONTROL_POLL_INTERVAL);
                 }
-                tokio::select! {
-                    _ = task_cancel.cancelled() => break,
-                    _ = tokio::time::sleep(CONTROL_POLL_INTERVAL) => {}
-                }
-            }
-            remove_runtime_lease_if_owned(&task_lease_path, &task_lease_instance_id);
-        });
+                remove_runtime_lease_if_owned(&task_lease_path, &task_lease_instance_id);
+            })
+            .expect("control watcher thread should spawn");
         Self {
             cancel,
             handle,
@@ -620,16 +692,28 @@ impl ControlFileWatcher {
         self.heartbeat_updates.clone()
     }
 
+    /// Request watcher exit and best-effort await the poll thread's final
+    /// iteration. The thread observes cancellation within one poll interval
+    /// and removes its lease on the way out; no join handle abort semantics
+    /// are needed anymore because the poll loop runs on a plain thread.
     #[allow(dead_code)]
     pub(crate) async fn shutdown(self) {
         self.cancel.cancel();
+        // Dropping the watcher from a blocking worker keeps any synchronous
+        // SQLite/fsync tail work off the async runtime.
+        let _ = tokio::task::spawn_blocking(move || drop(self)).await;
     }
 }
 
 impl Drop for ControlFileWatcher {
     fn drop(&mut self) {
+        // The poll thread observes cancellation within one CONTROL_POLL_INTERVAL
+        // and then removes the lease itself. Joining here would block on a
+        // synchronous SQLite tick, so drop only requests the exit (the
+        // heartbeat-removal test asserts this converges). Reading the handle
+        // keeps the field considered used for the join-based shutdown path.
         self.cancel.cancel();
-        self.handle.abort();
+        let _ = &self.handle;
         remove_runtime_lease_if_owned(&self.lease_path, &self.lease_instance_id);
     }
 }
@@ -1006,6 +1090,52 @@ mod tests {
                 .is_none(),
             "a launched worker's claim must remain until its watcher clears it"
         );
+
+        let _ = std::fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn runtime_launch_claim_reclaims_stale_claims_via_rename() {
+        // CLI-7 regression: stale reclaim previously used check-then-delete,
+        // where a concurrent acquirer could create a fresh claim between our
+        // staleness check and the unlink and lose it. With rename-based
+        // reclaim exactly one racer wins the rename itself.
+        let job_id = format!("launch-claim-rename-test-{}", now_ms());
+        let run_dir = bookforge_core::run_dir_for_job(&job_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let claim_path = run_dir.join("resume.launch");
+
+        // Simulate a crashed worker's leftover claim file (no live owner, so
+        // no in-process guard can clean it up).
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(&claim_path, format!("{} {}", std::process::id(), now_ms())).unwrap();
+
+        // A non-stale window never reaps an existing claim.
+        assert!(
+            RuntimeLaunchClaim::acquire_with_stale_after(&job_id, Duration::MAX)
+                .expect("fresh scan should read cleanly")
+                .is_none(),
+            "claims inside the fresh window must survive"
+        );
+        assert!(claim_path.exists());
+
+        // With an artificial always-stale deadline the leftover file is
+        // reclaimed through a winning rename and replaced by our own claim.
+        let reclaimed = RuntimeLaunchClaim::acquire_with_stale_after(&job_id, Duration::ZERO)
+            .expect("reclaiming acquire should succeed")
+            .expect("stale claim should be renamed out of the way");
+        assert!(
+            claim_path.exists(),
+            "the winner recreates its own claim at the conventional path"
+        );
+        assert!(
+            RuntimeLaunchClaim::acquire_with_stale_after(&job_id, Duration::MAX)
+                .expect("post-reclaim read ok")
+                .is_none(),
+            "the recreated claim deduplicates like any fresh one"
+        );
+        drop(reclaimed);
+        assert!(!claim_path.exists(), "drop removes the reclaimed claim");
 
         let _ = std::fs::remove_dir_all(run_dir);
     }

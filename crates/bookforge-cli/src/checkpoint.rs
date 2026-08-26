@@ -122,6 +122,7 @@ impl CheckpointWriter {
                 .map_err(|err| anyhow::anyhow!("checkpoint writer open failed: {err}"))?;
 
             let mut flushed = 0usize;
+            let mut dropped = 0usize;
 
             while let Some(cmd) = rx.blocking_recv() {
                 writer_depth.fetch_sub(1, Ordering::AcqRel);
@@ -130,7 +131,25 @@ impl CheckpointWriter {
                 let segment_finished = cmd.segment_finished_event();
                 let started = std::time::Instant::now();
 
-                apply(&store, cmd)?;
+                // One poisoned command (for example an FK violation from a
+                // phantom segment id) must not kill the writer or poison
+                // every later checkpoint: log-and-continue so the rest of a
+                // long paid run still persists honestly.
+                if let Err(error) = apply(&store, cmd) {
+                    dropped += 1;
+                    let message = format!("checkpoint write failed: {error}");
+                    writer_progress.emit(ProgressEvent::Error {
+                        kind: "checkpoint_write".to_string(),
+                        message: message.clone(),
+                        timestamp_ms: now_ms(),
+                    });
+                    tracing::warn!(
+                        segment_id = segment_id.as_deref().unwrap_or("?"),
+                        dropped_count = dropped,
+                        "{message}; keeping the checkpoint writer alive"
+                    );
+                    continue;
+                }
 
                 if let Some(event) = segment_finished {
                     writer_progress.emit(event);
@@ -140,6 +159,21 @@ impl CheckpointWriter {
                     segment_id,
                     flushed_count: flushed,
                     latency_ms: Some(started.elapsed().as_millis() as u64),
+                    timestamp_ms: now_ms(),
+                });
+            }
+
+            if dropped > 0 {
+                // Never hide how much work was lost: surface the final tally
+                // alongside the flush count so operators can quantify damage.
+                let message = format!(
+                    "checkpoint writer dropped {dropped} command(s) after write errors; \
+                     {flushed} checkpoint(s) were persisted"
+                );
+                tracing::warn!(dropped, flushed, "{message}");
+                writer_progress.emit(ProgressEvent::Warning {
+                    kind: "checkpoint_dropped_commands".to_string(),
+                    message,
                     timestamp_ms: now_ms(),
                 });
             }
@@ -652,6 +686,95 @@ mod tests {
             result.is_err(),
             "send must fail when the receiver (writer) has exited"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_writer_survives_poisoned_command_and_keeps_flushing() {
+        let db_path = temp_path("poison.sqlite");
+        let input_path = temp_path("input_poison.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture writable");
+
+        let store = JobStore::open(&db_path).expect("store open for setup");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output_poison.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-model",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job created");
+        // Only seg_known exists; the phantom command below violates the
+        // translations->segments foreign key.
+        store
+            .insert_segments(
+                &job.id,
+                &[test_segment("seg_known", 0)],
+                "v1",
+                "mock",
+                "mock-model",
+                "test_ns",
+            )
+            .expect("segments inserted");
+        drop(store);
+
+        let progress = Arc::new(RecordingProgressSink::default());
+        let writer = CheckpointWriter::spawn(db_path.clone(), progress.clone());
+        let sender = writer.sender();
+
+        sender
+            .send(CheckpointCommand::SaveTranslation {
+                job_id: job.id.clone(),
+                translation: Box::new(test_translation("seg_phantom", 0, SegmentStatus::Succeeded)),
+                provider: "mock".to_string(),
+                model: "mock-model".to_string(),
+                prompt_version: "v1".to_string(),
+            })
+            .await
+            .expect("phantom send ok");
+        sender
+            .send(CheckpointCommand::SaveTranslation {
+                job_id: job.id.clone(),
+                translation: Box::new(test_translation("seg_known", 0, SegmentStatus::Succeeded)),
+                provider: "mock".to_string(),
+                model: "mock-model".to_string(),
+                prompt_version: "v1".to_string(),
+            })
+            .await
+            .expect("known send ok");
+
+        drop(sender);
+        writer
+            .shutdown()
+            .await
+            .expect("writer must survive a poisoned command");
+
+        let events = progress.events();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ProgressEvent::Error { kind, .. } if kind == "checkpoint_write"
+            )),
+            "the failed write should be reported as an error event"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ProgressEvent::Warning { kind, .. } if kind == "checkpoint_dropped_commands"
+            )),
+            "shutdown should surface how many commands were dropped"
+        );
+
+        let store = JobStore::open(&db_path).expect("re-open ok");
+        let summary = store.summary(&job.id).unwrap().expect("summary exists");
+        assert_eq!(summary.succeeded, 1, "later checkpoints must still persist");
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
     }
 
     #[tokio::test]

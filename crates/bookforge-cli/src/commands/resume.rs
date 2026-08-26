@@ -9,7 +9,7 @@ use anyhow::Result;
 use bookforge_core::{
     ControlCommand, ProgressEvent, ProgressSink, ResolvedRunSettings, ResolvedRunSettingsSnapshot,
     RunConfigSnapshot,
-    config::DoubleCheckMode,
+    config::{DoubleCheckMode, FallbackScope},
     merge_scope_terms,
     progress::now_ms,
     segment::{
@@ -40,8 +40,8 @@ use crate::{
 use super::translate::{
     CacheContext, CheckpointRunContext, FallbackPassConfig, ProgressRequestProvider,
     apply_cached_translations, apply_double_check_corrections, job_was_stopped, mark_job_finished,
-    mock_mode, persist_corrected_translations, print_stopped_resume_hint, qa_reviews_for_mode,
-    run_checkpointed_translation, run_fallback_pass,
+    mock_mode, persist_corrected_translations, print_stopped_resume_hint,
+    qa_reviews_for_mode_with_max_output_tokens, run_checkpointed_translation, run_fallback_pass,
 };
 
 #[derive(Debug, Args)]
@@ -81,6 +81,75 @@ pub struct ResumeArgs {
     #[arg(long, default_value_t = false)]
     pub no_thinking: bool,
 
+    // --- finalize-stage flags previously translate-only (CLI-16) -----------
+    // Resume inherits the original run's settings from its snapshot; these
+    // flags override that baseline so a resumed run can finalize exactly like
+    // a fresh translate would. `Option` fields only apply when provided.
+    /// Run BookForge validators and EPUBCheck on the rebuilt EPUB.
+    #[arg(long, default_value_t = false)]
+    pub validate_output: bool,
+
+    /// Treat EPUBCheck warnings as errors. Implies --validate-output.
+    #[arg(long, default_value_t = false)]
+    pub strict_epubcheck: bool,
+
+    #[arg(long)]
+    pub qa_concurrency: Option<usize>,
+
+    #[arg(long)]
+    pub qa_batch_target_tokens: Option<usize>,
+
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub qa_max_output_tokens: Option<u32>,
+
+    #[arg(long)]
+    pub qa_model: Option<String>,
+
+    #[arg(long)]
+    pub qa_provider: Option<String>,
+
+    #[arg(long)]
+    pub qa_base_url: Option<String>,
+
+    #[arg(long)]
+    pub qa_api_key_env: Option<String>,
+
+    #[arg(long, value_enum)]
+    pub double_check: Option<DoubleCheckMode>,
+
+    #[arg(long)]
+    pub double_check_model: Option<String>,
+
+    #[arg(long)]
+    pub double_check_provider: Option<String>,
+
+    #[arg(long)]
+    pub double_check_base_url: Option<String>,
+
+    #[arg(long)]
+    pub double_check_api_key_env: Option<String>,
+
+    #[arg(long)]
+    pub double_check_concurrency: Option<usize>,
+
+    #[arg(long)]
+    pub fallback_provider: Option<String>,
+
+    #[arg(long)]
+    pub fallback_model: Option<String>,
+
+    #[arg(long)]
+    pub fallback_base_url: Option<String>,
+
+    #[arg(long)]
+    pub fallback_api_key_env: Option<String>,
+
+    #[arg(long, value_enum)]
+    pub fallback_only: Option<FallbackScope>,
+
     #[arg(
         long,
         default_value_t = false,
@@ -89,7 +158,10 @@ pub struct ResumeArgs {
     pub force: bool,
 }
 
-pub async fn run(args: ResumeArgs) -> Result<()> {
+pub async fn run(
+    args: ResumeArgs,
+    cancel_token: tokio_util::sync::CancellationToken,
+) -> Result<()> {
     let store = JobStore::open_default()?;
     let Some(job) = store.get_job(&args.job_id)? else {
         anyhow::bail!("job '{}' was not found", args.job_id);
@@ -97,6 +169,17 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
     if job.status == "paused" && !args.force {
         return live_fast_resume_paused_job(&store, &args).await;
     }
+    // Cross-process liveness for plain resume (CLI-8): reuse the same launch
+    // claim machinery the dashboard uses so concurrent resumes cannot
+    // double-spend provider budget. The claim is handed off to the run's
+    // control watcher once it spawns; early exits release it on drop.
+    let Some(mut launch_claim) = crate::control::RuntimeLaunchClaim::acquire(&args.job_id)? else {
+        anyhow::bail!(
+            "another bookforge process appears to be launching or resuming job '{}'; \
+             refusing to double-run the job",
+            args.job_id
+        );
+    };
     crate::control::clear_job_control(&args.job_id)?;
     if (job.status == "paused" && args.force) || job.status == "stopped" {
         store.mark_job_running_for_resume(&args.job_id)?;
@@ -115,8 +198,57 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
     );
     let progress = reporter.sink();
 
-    let run_result = run_inner(args, store, job, &mut snapshot, overrides, progress).await;
-    finalize_reporter(run_result, reporter).await
+    launch_claim.persist_until_worker();
+    let run_result = run_inner(
+        &args,
+        &store,
+        job,
+        &mut snapshot,
+        overrides,
+        progress,
+        cancel_token.clone(),
+    )
+    .await;
+    if let Err(error) = &run_result {
+        // Hard failures must not strand the job row in "running" forever
+        // (CLI-5); an honest terminal status beats silent limbo.
+        if let Ok(Some(record)) = store.get_job(&args.job_id)
+            && !matches!(
+                record.status.as_str(),
+                "succeeded" | "needs_review" | "failed" | "stopped"
+            )
+        {
+            tracing::warn!(
+                job_id = %args.job_id,
+                error = %error,
+                "resume failed; marking job failed"
+            );
+            let _ = store.mark_job_failed(&args.job_id);
+        }
+    }
+    let outcome = finalize_reporter(run_result, reporter).await;
+    // Ctrl+C during resume now interrupts at the next safe boundary like
+    // translate (CLI-3): cancel aborts provider calls and checkpoints drain,
+    // so record the interrupted state instead of pretending nothing happened.
+    if cancel_token.is_cancelled()
+        && let Ok(Some(record)) = store.get_job(&args.job_id)
+        && matches!(
+            record.status.as_str(),
+            "running" | "queued" | "retry_pending"
+        )
+    {
+        let _ = store.mark_job_interrupted(&args.job_id);
+        if human_stdout_enabled(args.ui) {
+            eprintln!();
+            eprintln!("Interrupted by user.");
+            eprintln!("Your progress has been saved to job: {}", args.job_id);
+            eprintln!();
+            eprintln!("Resume with:");
+            eprintln!("  bookforge resume {}", args.job_id);
+        }
+        return Ok(());
+    }
+    outcome
 }
 
 async fn live_fast_resume_paused_job(store: &JobStore, args: &ResumeArgs) -> Result<()> {
@@ -202,13 +334,15 @@ async fn finalize_reporter<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
-    args: ResumeArgs,
-    store: JobStore,
+    args: &ResumeArgs,
+    store: &JobStore,
     job: JobRecord,
     snapshot: &mut RunConfigSnapshot,
     overrides: Option<reconfigure::RunConfigOverrides>,
     progress: Arc<dyn ProgressSink>,
+    cancel_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     progress.emit(ProgressEvent::StageStarted {
@@ -240,10 +374,13 @@ async fn run_inner(
         .qa
         .or_else(|| overrides.as_ref().and_then(|overrides| overrides.qa))
         .unwrap_or_else(|| QaMode::from_snapshot(&snapshot.qa_mode));
-    let validate_output = overrides
-        .as_ref()
-        .and_then(|overrides| overrides.validate_output)
-        .unwrap_or(snapshot.validate_output);
+    let strict_epubcheck = args.strict_epubcheck;
+    let validate_output = args.validate_output
+        || args.strict_epubcheck
+        || overrides
+            .as_ref()
+            .and_then(|overrides| overrides.validate_output)
+            .unwrap_or(snapshot.validate_output);
     if let Some(overrides) = overrides.as_ref() {
         reconfigure::apply_overrides_to_settings(&mut settings, overrides);
         // A successfully applied dashboard revision becomes the durable
@@ -273,6 +410,11 @@ async fn run_inner(
     if args.no_thinking {
         settings.provider.thinking_disabled = true;
     }
+    // Explicit finalize-stage flags ride on top of the snapshot baseline so a
+    // resumed run finalizes with the same QA/double-check/fallback controls a
+    // fresh translate offers (CLI-16). Snapshot values stay authoritative for
+    // anything the caller did not set.
+    apply_resume_finalize_flag_overrides(&mut settings, args);
     progress.emit(ProgressEvent::RuntimeConfigResolved {
         profile: format!("{:?}", settings.profile),
         provider_preset: snapshot
@@ -347,13 +489,16 @@ async fn run_inner(
     let context_cfg = snapshot_context_run_config(snapshot);
     let context_registry: Option<Arc<ContextRegistry>> = if context_cfg.enabled() {
         let registry = Arc::new(ContextRegistry::new(&segments));
-        rehydrate_context_registry_from_store(&registry, &segments, &store, &job.id)?;
+        rehydrate_context_registry_from_store(&registry, &segments, store, &job.id)?;
         Some(registry)
     } else {
         None
     };
     let pause_signal = bookforge_llm::PauseSignal::new();
-    let stop_cancel_token = tokio_util::sync::CancellationToken::new();
+    // The Ctrl+C token from main feeds the same stop path the control-file
+    // Stop command uses (CLI-3): it cancels provider calls and marks an
+    // interrupted state at safe boundaries, never mid-checkpoint.
+    let stop_cancel_token = cancel_token.child_token();
     let control_watcher = crate::control::ControlFileWatcher::spawn_with_stop_cancel(
         store.path().to_path_buf(),
         job.id.clone(),
@@ -439,7 +584,7 @@ async fn run_inner(
     let cached_translations = apply_cached_translations(
         &cacheable_pending_segments,
         CacheContext {
-            store: &store,
+            store,
             job_id: &job.id,
             prompt_version,
             provider: &snapshot.provider,
@@ -469,7 +614,7 @@ async fn run_inner(
                     &run_config,
                     &settings,
                     CheckpointRunContext {
-                        store: &store,
+                        store,
                         job_id: &job.id,
                         provider: &snapshot.provider,
                         model: &snapshot.model,
@@ -492,7 +637,7 @@ async fn run_inner(
                     &run_config,
                     &settings,
                     CheckpointRunContext {
-                        store: &store,
+                        store,
                         job_id: &job.id,
                         provider: &snapshot.provider,
                         model: &snapshot.model,
@@ -506,7 +651,7 @@ async fn run_inner(
             provider => anyhow::bail!("cannot resume unsupported provider '{provider}'"),
         }?;
     }
-    if job_was_stopped(&store, &job.id)? {
+    if job_was_stopped(store, &job.id)? {
         print_stopped_resume_hint(&job.id, print_stdout);
         return Ok(());
     }
@@ -516,7 +661,7 @@ async fn run_inner(
     let mut translations =
         rebuild_segment_translations(&segments, &stored_blocks, &segment_records);
     let mut control_poller = crate::control::ControlFilePoller::new_with_stop_cancel(
-        &store,
+        store,
         &job.id,
         progress.clone(),
         stop_cancel_token.clone(),
@@ -540,6 +685,7 @@ async fn run_inner(
         snapshot,
         &qa_runtime.settings,
         qa_runtime.qa,
+        args.qa_max_output_tokens,
         progress.clone(),
         stop_cancel_token.clone(),
     )
@@ -554,15 +700,15 @@ async fn run_inner(
         return Ok(());
     }
     if qa_runtime.qa != QaMode::Off {
-        persist_qa_reviews_best_effort(&store, &job.id, &qa_reviews);
+        persist_qa_reviews_best_effort(store, &job.id, &qa_reviews);
     }
-    let fallback_config = FallbackPassConfig::from_snapshot(snapshot.fallback.as_ref());
+    let fallback_config = resolve_resume_fallback_config(args, snapshot.fallback.as_ref())?;
     let fallback_translations = run_fallback_pass(
         &stop_cancel_token,
         fallback_config.as_ref(),
         &segments,
         translations,
-        &store,
+        store,
         &job.id,
         prompt_version,
         &settings,
@@ -607,7 +753,7 @@ async fn run_inner(
             Err(error) => return Err(error),
         };
         persist_corrected_translations(
-            &store,
+            store,
             &job.id,
             &double_check_run_config,
             &translations,
@@ -632,7 +778,7 @@ async fn run_inner(
     let validation_runtime = job_runtime_settings.borrow().clone();
     if validation_runtime.validate_output {
         let validation_path = validate::default_report_path(&output);
-        let validation = validate::validate_and_write(&output, &validation_path, false)?;
+        let validation = validate::validate_and_write(&output, &validation_path, strict_epubcheck)?;
         if print_stdout {
             println!("Validation report: {}", validation_path.display());
         }
@@ -654,10 +800,10 @@ async fn run_inner(
             print_stopped_resume_hint(&job.id, print_stdout);
             return Ok(());
         }
-        if mark_job_finished(&store, &job.id, &translations)? {
+        if mark_job_finished(store, &job.id, &translations)? {
             break;
         }
-        if job_was_stopped(&store, &job.id)? {
+        if job_was_stopped(store, &job.id)? {
             print_stopped_resume_hint(&job.id, print_stdout);
             return Ok(());
         }
@@ -974,6 +1120,7 @@ async fn qa_after_resume(
     snapshot: &RunConfigSnapshot,
     settings: &ResolvedRunSettings,
     qa_mode: QaMode,
+    qa_max_output_tokens: Option<u32>,
     progress: Arc<dyn ProgressSink>,
     stop_cancel_token: tokio_util::sync::CancellationToken,
 ) -> Result<Vec<QaSegmentReview>> {
@@ -995,13 +1142,14 @@ async fn qa_after_resume(
     match provider_name {
         "mock" => {
             let provider = MockProvider::new(mock_mode(model), &job.target_lang);
-            Ok(qa_reviews_for_mode(
+            Ok(qa_reviews_for_mode_with_max_output_tokens(
                 ProgressRequestProvider::new(provider, progress),
                 segments,
                 translations,
                 &qa_run_config,
                 qa_config,
                 qa_mode,
+                qa_max_output_tokens,
             )
             .await)
         }
@@ -1016,13 +1164,14 @@ async fn qa_after_resume(
             )?;
             let provider =
                 OpenAiCompatibleProvider::new_with_cancel(provider_config, stop_cancel_token)?;
-            Ok(qa_reviews_for_mode(
+            Ok(qa_reviews_for_mode_with_max_output_tokens(
                 ProgressRequestProvider::new(provider, progress),
                 segments,
                 translations,
                 &qa_run_config,
                 qa_config,
                 qa_mode,
+                qa_max_output_tokens,
             )
             .await)
         }
@@ -1099,6 +1248,98 @@ async fn double_check_after_resume(
     Ok(apply_double_check_corrections(translations, &corrections))
 }
 
+/// Override the snapshot-derived finalize settings with explicitly provided
+/// resume flags. Snapshot values stay authoritative when a flag is unset, so
+/// resumed runs keep their original QA/double-check/fallback configuration
+/// unless the operator asks otherwise (CLI-16).
+fn apply_resume_finalize_flag_overrides(settings: &mut ResolvedRunSettings, args: &ResumeArgs) {
+    if let Some(value) = args.qa_concurrency {
+        settings.qa.concurrency = value;
+    }
+    if let Some(value) = args.qa_batch_target_tokens {
+        settings.qa.batch_target_tokens = value;
+    }
+    if let Some(value) = &args.qa_model {
+        settings.qa.model = Some(value.clone());
+    }
+    if let Some(value) = &args.qa_provider {
+        settings.qa.provider = Some(value.clone());
+    }
+    if let Some(value) = &args.qa_base_url {
+        settings.qa.base_url = Some(value.clone());
+    }
+    if let Some(value) = &args.qa_api_key_env {
+        settings.qa.api_key_env = Some(value.clone());
+    }
+
+    if let Some(mode) = args.double_check {
+        settings.double_check.mode = mode;
+    }
+    if let Some(model) = &args.double_check_model {
+        settings.double_check.model = Some(model.clone());
+    }
+    if let Some(provider) = &args.double_check_provider {
+        settings.double_check.provider = Some(provider.clone());
+    }
+    if let Some(base_url) = &args.double_check_base_url {
+        settings.double_check.base_url = Some(base_url.clone());
+    }
+    if let Some(api_key_env) = &args.double_check_api_key_env {
+        settings.double_check.api_key_env = Some(api_key_env.clone());
+    }
+    if let Some(concurrency) = args.double_check_concurrency {
+        settings.double_check.concurrency = concurrency;
+    }
+}
+
+/// Build the fallback-pass config from explicit resume flags when any are
+/// provided; otherwise inherit the snapshot's recorded fallback verbatim.
+fn resolve_resume_fallback_config(
+    args: &ResumeArgs,
+    snapshot: Option<&bookforge_core::FallbackRunConfigSnapshot>,
+) -> Result<Option<FallbackPassConfig>> {
+    let explicit = args.fallback_provider.is_some()
+        || args.fallback_model.is_some()
+        || args.fallback_base_url.is_some()
+        || args.fallback_api_key_env.is_some()
+        || args.fallback_only.is_some();
+    if !explicit {
+        return Ok(FallbackPassConfig::from_snapshot(snapshot));
+    }
+    let inherited = snapshot;
+    let provider = args
+        .fallback_provider
+        .clone()
+        .or_else(|| inherited.map(|fallback| fallback.provider.clone()))
+        .unwrap_or_else(|| "deepseek".to_string());
+    let model = args
+        .fallback_model
+        .clone()
+        .or_else(|| inherited.map(|fallback| fallback.model.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--fallback-provider requires --fallback-model (or an original run with --fallback-provider/--fallback-model)"
+            )
+        })?;
+    Ok(Some(FallbackPassConfig {
+        provider,
+        model,
+        base_url: args
+            .fallback_base_url
+            .clone()
+            .or_else(|| inherited.and_then(|fallback| fallback.base_url.clone())),
+        api_key_env: args
+            .fallback_api_key_env
+            .clone()
+            .or_else(|| inherited.and_then(|fallback| fallback.api_key_env.clone())),
+        scope: args.fallback_only.unwrap_or_else(|| {
+            inherited
+                .map(|fallback| fallback.scope)
+                .unwrap_or(FallbackScope::Failed)
+        }),
+    }))
+}
+
 fn rebuild_block_translations(
     segments: &[Segment],
     stored: &[StoredBlockTranslation],
@@ -1164,26 +1405,53 @@ fn rebuild_segment_translations(
                 });
             }
         }
-        if !blocks.is_empty() {
-            let (status, error) = status_by_segment
-                .get(segment.id.0.as_str())
-                .cloned()
-                .unwrap_or(("succeeded", None));
-            translations.push(SegmentTranslation {
-                segment_id: segment.id.clone(),
-                ordinal: segment.ordinal,
-                block_ids: segment.block_ids.clone(),
-                blocks,
-                checksum: segment.checksum.clone(),
-                status: segment_status(status),
-                template: "stored".to_string(),
-                error,
-                input_tokens: None,
-                input_cached_tokens: None,
-                output_tokens: None,
-                tokens_estimated: false,
-            });
+        let stored_status = status_by_segment
+            .get(segment.id.0.as_str())
+            .cloned()
+            .unwrap_or(("succeeded", None));
+        if blocks.is_empty() {
+            // A terminal segment can exist with a status row but NO stored
+            // blocks when its last attempt failed again during this resume.
+            // Emitting a status-only entry keeps the completion decision, QA
+            // inputs, and report honest instead of silently omitting the
+            // segment and green-lighting raw source placeholders (H-4).
+            // Pending statuses stay hidden: those are retried later waves.
+            if matches!(
+                stored_status.0,
+                "succeeded" | "skipped_cached" | "needs_review" | "failed"
+            ) {
+                translations.push(SegmentTranslation {
+                    segment_id: segment.id.clone(),
+                    ordinal: segment.ordinal,
+                    block_ids: segment.block_ids.clone(),
+                    blocks: Vec::new(),
+                    checksum: segment.checksum.clone(),
+                    status: segment_status(stored_status.0),
+                    template: "stored".to_string(),
+                    error: stored_status.1,
+                    input_tokens: None,
+                    input_cached_tokens: None,
+                    output_tokens: None,
+                    tokens_estimated: false,
+                });
+            }
+            continue;
         }
+        let (status, error) = stored_status;
+        translations.push(SegmentTranslation {
+            segment_id: segment.id.clone(),
+            ordinal: segment.ordinal,
+            block_ids: segment.block_ids.clone(),
+            blocks,
+            checksum: segment.checksum.clone(),
+            status: segment_status(status),
+            template: "stored".to_string(),
+            error,
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            tokens_estimated: false,
+        });
     }
 
     translations
@@ -1241,6 +1509,187 @@ mod tests {
         assert!(
             future.as_mut().poll(&mut context).is_pending(),
             "future should wait for the test transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_marks_job_needs_review_when_segments_fail_again() {
+        // H-4 regression: a provider whose responses fail validation on every
+        // attempt means the resumed segment fails again during the resume
+        // pass. Before the fix, the resumed-completion decision looked only at
+        // rebuilt translations and could green-light a job whose output still
+        // contained raw source placeholders.
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.batch.enabled = false;
+        let mut fixture = resume_fixture(settings, 2);
+        save_succeeded(
+            &fixture.store,
+            &fixture.job.id,
+            &fixture.segments[0],
+            "stored",
+        );
+        fixture.snapshot.model = "mock-malformed-json".to_string();
+        fixture
+            .store
+            .update_job_config_snapshot(&fixture.job.id, &fixture.snapshot)
+            .expect("snapshot should persist");
+
+        let events = run_fixture(&mut fixture)
+            .await
+            .expect("resume should complete honestly instead of aborting");
+
+        let record = fixture
+            .store
+            .get_job(&fixture.job.id)
+            .expect("job lookup")
+            .expect("job exists");
+        assert_eq!(
+            record.status, "needs_review",
+            "a resume whose segment failed again must not report success"
+        );
+        let summary = fixture
+            .store
+            .summary(&fixture.job.id)
+            .expect("summary loads")
+            .expect("summary exists");
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(summary.needs_review, 1);
+        let finished = events.iter().any(|event| {
+            matches!(
+                event,
+                ProgressEvent::TranslationFinished { needs_review, .. } if *needs_review > 0
+            )
+        });
+        assert!(
+            finished,
+            "completion event should carry the review counts honestly"
+        );
+    }
+
+    #[test]
+    fn completion_decision_includes_blockless_failed_rows_from_the_db() {
+        // The heart of H-4: a 'failed' segment row WITHOUT stored blocks —
+        // exactly what the checkpoint writer leaves behind when an attempt
+        // fails hard during resume — is invisible if you look only at rebuilt
+        // translations. mark_job_finished must consult the DB summary and
+        // refuse to green-light such a book.
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.batch.enabled = false;
+        let fixture = resume_fixture(settings.clone(), 2);
+        save_succeeded(
+            &fixture.store,
+            &fixture.job.id,
+            &fixture.segments[0],
+            "stored",
+        );
+        fixture
+            .store
+            .mark_segment_failed(
+                &fixture.job.id,
+                &fixture.segments[1].id.0,
+                "transport died mid-resume",
+            )
+            .expect("failed row written like the checkpoint writer does");
+
+        // Reproduce exactly what run_inner feeds mark_job_finished.
+        let book = read_epub(&fixture.snapshot.input_path).expect("fixture EPUB should read");
+        let segments = build_segments(&book, &settings.segmentation).expect("segments build");
+        let stored_blocks = fixture
+            .store
+            .load_block_translations(&fixture.job.id)
+            .expect("blocks load");
+        let segment_records = fixture
+            .store
+            .segment_records(&fixture.job.id)
+            .expect("records load");
+        let translations =
+            rebuild_segment_translations(&segments, &stored_blocks, &segment_records);
+
+        assert!(
+            translations
+                .iter()
+                .any(|translation| translation.status == SegmentStatus::Failed),
+            "rebuilt translations must surface the blockless failed segment"
+        );
+
+        let completed_or_review = mark_job_finished(&fixture.store, &fixture.job.id, &translations)
+            .expect("completion decision");
+        assert!(
+            completed_or_review,
+            "with no live pause/stop control the decision must finalize"
+        );
+        let record = fixture
+            .store
+            .get_job(&fixture.job.id)
+            .expect("job lookup")
+            .expect("job exists");
+        assert_eq!(
+            record.status, "needs_review",
+            "blockless failed rows must block a green light"
+        );
+    }
+
+    #[test]
+    fn rebuild_segment_translations_surfaces_blockless_terminal_segments() {
+        let segments = vec![test_segment("seg_blockless", 0), test_segment("seg_ok", 1)];
+        let records = vec![bookforge_store::SegmentRecord {
+            id: "seg_blockless".to_string(),
+            status: "failed".to_string(),
+            attempts: 3,
+            error: Some("provider rejected batch".to_string()),
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            tokens_estimated: false,
+        }];
+        let stored = vec![StoredBlockTranslation {
+            segment_id: "seg_ok".to_string(),
+            block_id: "b_000001".to_string(),
+            text: "stored ok".to_string(),
+        }];
+
+        let rebuilt = rebuild_segment_translations(&segments, &stored, &records);
+        let by_id = rebuilt
+            .iter()
+            .map(|translation| (translation.segment_id.0.as_str(), translation))
+            .collect::<HashMap<_, _>>();
+
+        let failed = by_id.get("seg_blockless").expect("failed entry present");
+        assert_eq!(
+            failed.status,
+            SegmentStatus::Failed,
+            "blockless terminal segments must surface their status"
+        );
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("provider rejected batch"),
+            "the failure reason should ride along"
+        );
+        assert!(failed.blocks.is_empty());
+        assert_eq!(
+            by_id.get("seg_ok").expect("stored entry present").status,
+            SegmentStatus::Succeeded
+        );
+
+        // A pending record without blocks stays invisible (it is work-in-
+        // progress, not a terminal outcome).
+        let rebuilt_pending_only = rebuild_segment_translations(
+            &[test_segment("seg_pending", 2)],
+            &[],
+            &[bookforge_store::SegmentRecord {
+                id: "seg_pending".to_string(),
+                status: "retry_pending".to_string(),
+                attempts: 1,
+                error: None,
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                tokens_estimated: false,
+            }],
+        );
+        assert!(
+            rebuilt_pending_only.is_empty(),
+            "pending statuses without blocks should not become completion inputs"
         );
     }
 
@@ -1919,12 +2368,13 @@ mod tests {
         let args = resume_args(&fixture.job.id);
 
         run_inner(
-            args,
-            run_store,
+            &args,
+            &run_store,
             fixture.job.clone(),
             &mut fixture.snapshot,
             overrides,
             sink,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await?;
 
@@ -1945,6 +2395,26 @@ mod tests {
             progress_jsonl: None,
             output: None,
             no_thinking: false,
+            validate_output: false,
+            strict_epubcheck: false,
+            qa_concurrency: None,
+            qa_batch_target_tokens: None,
+            qa_max_output_tokens: None,
+            qa_model: None,
+            qa_provider: None,
+            qa_base_url: None,
+            qa_api_key_env: None,
+            double_check: None,
+            double_check_model: None,
+            double_check_provider: None,
+            double_check_base_url: None,
+            double_check_api_key_env: None,
+            double_check_concurrency: None,
+            fallback_provider: None,
+            fallback_model: None,
+            fallback_base_url: None,
+            fallback_api_key_env: None,
+            fallback_only: None,
             force: false,
         }
     }

@@ -1,11 +1,23 @@
 use clap::Args;
 
-use std::{io::BufRead, path::PathBuf};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    path::PathBuf,
+};
 
 use bookforge_core::RunConfigSnapshot;
 use serde_json::Value;
 
 use bookforge_store::{JobRecord, JobStore};
+
+/// When reconstructing dashboard state from recent events, never walk further
+/// back than this many lines even if `--last` is smaller. Keeps `tail`
+/// bounded on very long logs (CLI-15).
+const RECONSTRUCT_TAIL_LINES: usize = 512;
+/// Hard ceiling on how many raw bytes a single tail read may buffer.
+const MAX_TAIL_BYTES: usize = 8 * 1024 * 1024;
+/// Backwards read granularity.
+const TAIL_CHUNK_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Args)]
 pub struct TailArgs {
@@ -26,16 +38,11 @@ pub async fn run(args: TailArgs) -> anyhow::Result<()> {
 
     ensure_event_log_exists(&args.job_id, &event_log_path)?;
 
-    let file = std::fs::File::open(&event_log_path)?;
-    let reader = std::io::BufReader::new(file);
-
-    let mut events: Vec<String> = Vec::new();
-    for line in reader.lines() {
-        match line {
-            Ok(l) if !l.trim().is_empty() => events.push(l),
-            _ => {}
-        }
-    }
+    let mut file = std::fs::File::open(&event_log_path)?;
+    // Bounded read from the end of the log: only as much history as the tail
+    // print plus the state-reconstruction window needs is ever loaded.
+    let fetch_lines = args.last.max(RECONSTRUCT_TAIL_LINES);
+    let events = read_last_lines(&mut file, fetch_lines)?;
 
     print!(
         "{}",
@@ -43,6 +50,52 @@ pub async fn run(args: TailArgs) -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+/// Read at most `max_lines` trailing lines from `file` by scanning backwards,
+/// so a multi-megabyte event log no longer has to be fully loaded (CLI-15).
+fn read_last_lines(file: &mut std::fs::File, max_lines: usize) -> std::io::Result<Vec<String>> {
+    let len = file.metadata()?.len();
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut newlines_seen = 0usize;
+    let mut end = len;
+    let mut reached_start = false;
+
+    while end > 0 {
+        let start = end.saturating_sub(TAIL_CHUNK_BYTES);
+        let chunk_len = usize::try_from(end - start).unwrap_or(0);
+        let mut chunk = vec![0_u8; chunk_len];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut chunk)?;
+        newlines_seen += chunk.iter().filter(|&&byte| byte == b'\n').count();
+
+        let mut combined = Vec::with_capacity(chunk.len() + buffer.len());
+        combined.extend_from_slice(&chunk);
+        combined.extend_from_slice(&buffer);
+        buffer = combined;
+
+        end = start;
+        reached_start = start == 0;
+        if newlines_seen > max_lines || buffer.len() >= MAX_TAIL_BYTES {
+            break;
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buffer);
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    // When the backwards window stopped before the beginning of the file, the
+    // first recovered line may be a torn fragment of an older record.
+    if !reached_start && !lines.is_empty() {
+        lines.remove(0);
+    }
+    if lines.len() > max_lines {
+        lines.drain(..lines.len() - max_lines);
+    }
+    Ok(lines)
 }
 
 fn event_log_path_for_tail(
@@ -295,5 +348,55 @@ mod tests {
 
         assert!(error.to_string().contains("event log not found"));
         assert!(error.to_string().contains("job_missing_log"));
+    }
+
+    #[test]
+    fn read_last_lines_returns_only_the_requested_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            (0..1000)
+                .map(|n| format!("line-{n:04}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let tail = read_last_lines(&mut file, 5).unwrap();
+        assert_eq!(
+            tail,
+            vec![
+                "line-0995",
+                "line-0996",
+                "line-0997",
+                "line-0998",
+                "line-0999"
+            ]
+        );
+    }
+
+    #[test]
+    fn read_last_lines_handles_short_files_and_missing_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let short = dir.path().join("short.jsonl");
+        std::fs::write(&short, "a\nb\nc").unwrap();
+
+        let mut file = std::fs::File::open(&short).unwrap();
+        assert_eq!(read_last_lines(&mut file, 10).unwrap(), vec!["a", "b", "c"]);
+
+        // Requesting fewer lines than exist must still yield exactly that many
+        // complete lines, never a torn fragment.
+        assert_eq!(read_last_lines(&mut file, 2).unwrap(), vec!["b", "c"]);
+    }
+
+    #[test]
+    fn read_last_lines_skips_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blanky.jsonl");
+        std::fs::write(&path, "\n\none\n\n\ntwo\n\n").unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(read_last_lines(&mut file, 3).unwrap(), vec!["one", "two"]);
     }
 }

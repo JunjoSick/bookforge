@@ -173,11 +173,17 @@ pub(super) async fn wait_for_finalize_stage_control(
     control: &mut crate::control::ControlFilePoller<'_>,
     signal: &bookforge_llm::PauseSignal,
 ) -> Result<bool> {
-    if let Some(delay_ms) = std::env::var("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+    // Test-only timing hook: release builds must not honor undocumented
+    // environment-controlled delays (CLI-18); the test suite keeps working
+    // because dev/test builds compile with debug assertions enabled.
+    #[cfg(any(test, debug_assertions))]
     {
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        if let Some(delay_ms) = std::env::var("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
     }
     Ok(!matches!(
         control.wait_until_running_or_stopped(signal).await?,
@@ -430,30 +436,7 @@ pub(crate) fn persist_corrected_translations(
     Ok(())
 }
 
-pub(crate) async fn qa_reviews_for_mode<P>(
-    provider: P,
-    segments: &[Segment],
-    translations: &[SegmentTranslation],
-    config: &TranslationRunConfig,
-    qa_config: &bookforge_core::config::QaRunConfig,
-    qa_mode: QaMode,
-) -> Vec<QaSegmentReview>
-where
-    P: LlmProvider,
-{
-    qa_reviews_for_mode_with_max_output_tokens(
-        provider,
-        segments,
-        translations,
-        config,
-        qa_config,
-        qa_mode,
-        None,
-    )
-    .await
-}
-
-async fn qa_reviews_for_mode_with_max_output_tokens<P>(
+pub(crate) async fn qa_reviews_for_mode_with_max_output_tokens<P>(
     provider: P,
     segments: &[Segment],
     translations: &[SegmentTranslation],
@@ -627,6 +610,10 @@ pub(super) fn mark_unfinished_segments_failed(
         .map(|segment| segment.id.0.clone())
         .collect::<Vec<_>>();
     store.mark_unfinished_segments_failed(job_id, &segment_ids, error)?;
+    // The run is dead at this point; leaving the job row stuck on "running"
+    // hides the failure from doctor/dashboard (CLI-5). Store-side guards keep
+    // an already-final outcome intact.
+    let _ = store.mark_job_failed(job_id);
     Ok(())
 }
 
@@ -643,7 +630,16 @@ pub(crate) fn mark_job_finished(
     };
     let terminal_segments =
         summary.succeeded + summary.cached + summary.failed + summary.needs_review;
+    // The DB summary is authoritative: segments can hold a Failed or
+    // NeedsReview row WITHOUT any stored translation blocks (e.g. they failed
+    // again during a resume pass), so scanning only in-memory translations
+    // would green-light a book whose output still contains raw source text
+    // (H-4 / CLI-1).
     if terminal_segments < summary.total_segments || summary.retry_pending > 0 {
+        store.mark_job_needs_review(job_id)?;
+        return Ok(!job_was_stopped(store, job_id)? && !job_is_paused(store, job_id)?);
+    }
+    if summary.failed > 0 || summary.needs_review > 0 {
         store.mark_job_needs_review(job_id)?;
         return Ok(!job_was_stopped(store, job_id)? && !job_is_paused(store, job_id)?);
     }
@@ -807,7 +803,7 @@ mod suspicious_tests {
             SegmentStatus::NeedsReview,
         );
 
-        let reviews = qa_reviews_for_mode(
+        let reviews = qa_reviews_for_mode_with_max_output_tokens(
             MockProvider::new(MockMode::Identity, "Italian"),
             std::slice::from_ref(&segment),
             std::slice::from_ref(&translation),
@@ -821,6 +817,7 @@ mod suspicious_tests {
                 api_key_env: None,
             },
             QaMode::Suspicious,
+            None,
         )
         .await;
 

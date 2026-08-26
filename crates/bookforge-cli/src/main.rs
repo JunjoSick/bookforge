@@ -152,7 +152,7 @@ async fn run_command(command: Command, cancel_token: CancellationToken) -> Resul
         Command::Translate(args) => translate::run(*args, cancel_token).await,
         Command::Pause(args) => control_commands::pause(args).await,
         Command::Reconfigure(args) => reconfigure::run(args).await,
-        Command::Resume(args) => resume::run(args).await,
+        Command::Resume(args) => resume::run(args, cancel_token).await,
         Command::Stop(args) => control_commands::stop(args).await,
         Command::Correct(args) => correct::run(args).await,
         Command::Review(args) => review::run(args).await,
