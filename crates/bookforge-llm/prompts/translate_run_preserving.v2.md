@@ -1,4 +1,4 @@
-﻿# translate_run_preserving.v2.md
+# translate_run_preserving.v2.md
 
 ## System
 

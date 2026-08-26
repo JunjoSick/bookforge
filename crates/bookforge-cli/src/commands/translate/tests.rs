@@ -220,6 +220,7 @@ async fn mock_and_openai_entry_points_share_events_and_artifacts() {
         &mock_args.provider,
         &mock_args,
         &settings,
+        None,
         &tokio_util::sync::CancellationToken::new(),
         mock_progress.clone(),
         Some(JobStore::open(&mock_store_path).unwrap()),
@@ -263,6 +264,7 @@ async fn mock_and_openai_entry_points_share_events_and_artifacts() {
             &openai_args.provider,
             &openai_args,
             &settings,
+            None,
             &tokio_util::sync::CancellationToken::new(),
             openai_progress.clone(),
             Some(JobStore::open(&openai_store_path).unwrap()),
@@ -287,7 +289,6 @@ async fn mock_and_openai_entry_points_share_events_and_artifacts() {
             "OpenAI-compatible scenario kept failing on transient transport errors: {last_failure}"
         );
     };
-
     let openai_job_id = openai_progress
         .events
         .lock()
@@ -857,6 +858,20 @@ fn temp_path(name: &str) -> PathBuf {
 }
 
 fn build_translation_fixture(path: &std::path::Path) {
+    build_epub_fixture(path, "en", &["Hello world.".to_string()]);
+}
+
+/// Writes a minimal single-chapter EPUB whose body is `paragraphs`.
+///
+/// The preflight tests need real books rather than in-memory `Book` values,
+/// because the point is to exercise parse -> segmentation -> plan. They must not
+/// reach into `tests/`: that directory is gitignored (it holds the owner's real
+/// books), so anything reading from it passes locally and fails in CI.
+fn build_epub_fixture(path: &std::path::Path, language: &str, paragraphs: &[String]) {
+    let body = paragraphs
+        .iter()
+        .map(|paragraph| format!("<p>{paragraph}</p>"))
+        .collect::<String>();
     let file = fs::File::create(path).expect("fixture EPUB should be creatable");
     let mut zip = zip::ZipWriter::new(file);
     let stored =
@@ -878,27 +893,33 @@ fn build_translation_fixture(path: &std::path::Path) {
     .unwrap();
     zip.start_file("content.opf", deflated).unwrap();
     zip.write_all(
-        br#"<?xml version="1.0" encoding="UTF-8"?>
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
     <dc:identifier id="uid">orchestration-fixture</dc:identifier>
     <dc:title></dc:title>
-    <dc:language>en</dc:language>
+    <dc:language>{language}</dc:language>
   </metadata>
   <manifest>
     <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
   </manifest>
   <spine><itemref idref="chapter"/></spine>
-</package>"#,
+</package>"#
+        )
+        .as_bytes(),
     )
     .unwrap();
     zip.start_file("chapter.xhtml", deflated).unwrap();
     zip.write_all(
-        br#"<?xml version="1.0" encoding="UTF-8"?>
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head><title>Chapter</title></head>
-<body><p>Hello world.</p></body>
-</html>"#,
+<body>{body}</body>
+</html>"#
+        )
+        .as_bytes(),
     )
     .unwrap();
     zip.finish().unwrap();
@@ -1161,6 +1182,7 @@ fn translate_args_with_preset(
 ) -> TranslateArgs {
     TranslateArgs {
         input: temp_path("input.epub"),
+        plan: false,
         language: LanguageArgs {
             source: Some("English".to_string()),
             target: "Italian".to_string(),
@@ -1236,6 +1258,210 @@ fn translate_args_with_preset(
         progress_jsonl: None,
         provider_preset,
     }
+}
+
+/// A book-shaped EPUB in one of two scripts, for the preflight tests.
+///
+/// Both scripts get the same paragraph count and the same character count per
+/// paragraph, so the only thing that differs between them is the script itself.
+/// That is the variable the plan routes on, and holding the rest equal is what
+/// makes a difference in the resulting settings attributable to it.
+///
+/// The returned `TempDir` owns the file and must stay alive while it is read.
+fn scripted_book_fixture(caseless: bool) -> (tempfile::TempDir, PathBuf) {
+    // Long enough that the plan sees a distribution rather than a single point,
+    // and that the per-paragraph token estimate lands in the range where the
+    // batch bounds actually move.
+    const PARAGRAPHS: usize = 60;
+    const CHARACTERS_PER_PARAGRAPH: usize = 600;
+
+    let (language, sentence) = if caseless {
+        ("zh", "矛盾的普遍性和特殊性的关系是矛盾问题的精髓。")
+    } else {
+        ("en", "The universal and the particular in contradiction. ")
+    };
+    let paragraphs = (0..PARAGRAPHS)
+        .map(|_| {
+            sentence
+                .chars()
+                .cycle()
+                .take(CHARACTERS_PER_PARAGRAPH)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let path = temp.path().join(if caseless {
+        "caseless.epub"
+    } else {
+        "cased.epub"
+    });
+    build_epub_fixture(&path, language, &paragraphs);
+    (temp, path)
+}
+
+#[test]
+fn explicit_batch_flag_beats_plan_while_unset_fields_are_filled() {
+    let (_fixture, input) = scripted_book_fixture(true);
+    let mut args = translate_args_with_preset(None);
+    args.input = input;
+    args.plan = true;
+    args.provider.provider = "mock".to_string();
+    args.provider.model = Some("mock-prefix-target".to_string());
+    args.batch_max_items = Some(64);
+
+    let effective_provider = apply_provider_preset(&args.provider, args.provider_preset);
+    let (settings, application) =
+        orchestration::resolve_settings_and_plan(&args, &effective_provider)
+            .expect("planned settings should resolve");
+    let applied = application.expect("--plan should produce an application");
+
+    assert_eq!(settings.batch.max_items, 64, "explicit flag must win");
+    assert!(
+        settings.batch.target_tokens < TranslationProfile::V1Fast.resolve().batch.target_tokens,
+        "the unset CJK token target should be filled by the plan"
+    );
+    assert!(
+        applied
+            .applied_plan
+            .decisions
+            .iter()
+            .any(|decision| decision.setting == "batch_target_tokens")
+    );
+    assert!(
+        applied
+            .applied_plan
+            .decisions
+            .iter()
+            .all(|decision| decision.setting != "batch_max_items"),
+        "an explicit field must not be attributed to the plan"
+    );
+}
+
+#[test]
+fn translate_without_plan_preserves_resolved_settings_bytes() {
+    let args = translate_args_with_preset(None);
+    let expected =
+        bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&resolve_settings(&args));
+    let effective_provider = apply_provider_preset(&args.provider, args.provider_preset);
+    let (actual, application) =
+        orchestration::resolve_settings_and_plan(&args, &effective_provider)
+            .expect("ordinary settings should resolve");
+    let actual = bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&actual);
+
+    assert!(application.is_none());
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_vec(&bookforge_core::FinalizeCheckpointSnapshot::default()).unwrap(),
+        br#"{"double_check_complete":false}"#,
+        "an absent plan must not change legacy snapshot bytes"
+    );
+}
+
+#[test]
+fn caseless_and_cased_translate_preflights_apply_different_settings() {
+    let planned_settings = |input: &std::path::Path| {
+        let mut args = translate_args_with_preset(None);
+        args.input = input.to_path_buf();
+        args.plan = true;
+        args.provider.provider = "mock".to_string();
+        args.provider.model = Some("mock-prefix-target".to_string());
+        let effective_provider = apply_provider_preset(&args.provider, args.provider_preset);
+        let (settings, application) =
+            orchestration::resolve_settings_and_plan(&args, &effective_provider)
+                .expect("EPUB preflight should succeed");
+        assert!(application.is_some());
+        settings
+    };
+
+    // `plan.rs` pins the rule itself against in-memory books. This asserts the
+    // same divergence survives the real path: EPUB parse, segmentation, then
+    // settings resolution.
+    let (_caseless_fixture, caseless_input) = scripted_book_fixture(true);
+    let (_cased_fixture, cased_input) = scripted_book_fixture(false);
+    let caseless = planned_settings(&caseless_input);
+    let cased = planned_settings(&cased_input);
+
+    assert!(caseless.batch.target_tokens < cased.batch.target_tokens);
+    assert!(caseless.batch.max_items < cased.batch.max_items);
+}
+
+#[tokio::test]
+async fn applied_plan_decisions_and_reasons_are_persisted_in_run_snapshot() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = temp.path().join("input.epub");
+    let output = temp.path().join("output.epub");
+    let store_path = temp.path().join("jobs.sqlite");
+    build_translation_fixture(&input);
+
+    let mut args = translate_args_with_preset(None);
+    args.input = input.clone();
+    args.out = Some(output.clone());
+    args.plan = true;
+    args.provider.provider = "mock".to_string();
+    args.provider.model = Some("mock-prefix-target".to_string());
+    let effective_provider = apply_provider_preset(&args.provider, args.provider_preset);
+    let (settings, application) =
+        orchestration::resolve_settings_and_plan(&args, &effective_provider)
+            .expect("planned settings should resolve");
+    let config = TranslationConfig {
+        source_language: args.language.source.clone(),
+        target_language: args.language.target.clone(),
+        provider: "mock".to_string(),
+        model: Some("mock-prefix-target".to_string()),
+        concurrency: settings.scheduler.concurrency,
+        max_attempts: settings.scheduler.max_attempts,
+        output,
+    };
+    let progress = Arc::new(RecordingProgressSink::default());
+    orchestration::run_mock_translation_with_store(
+        &input,
+        &config,
+        &effective_provider,
+        &args,
+        &settings,
+        application,
+        &tokio_util::sync::CancellationToken::new(),
+        progress.clone(),
+        Some(JobStore::open(&store_path).unwrap()),
+    )
+    .await
+    .expect("mock translation should finish");
+
+    let job_id = progress
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|event| match event {
+            bookforge_core::ProgressEvent::JobCreated { job_id, .. } => Some(job_id.clone()),
+            _ => None,
+        })
+        .expect("job creation should be reported");
+    let snapshot = JobStore::open(&store_path)
+        .unwrap()
+        .load_job_config_snapshot(&job_id)
+        .unwrap()
+        .expect("run snapshot should exist");
+    let applied = snapshot
+        .finalize
+        .applied_plan
+        .expect("run snapshot should record the applied plan");
+
+    assert_eq!(
+        applied.schema_version,
+        crate::commands::plan::PLAN_SCHEMA_VERSION
+    );
+    assert!(!applied.decisions.is_empty());
+    assert!(
+        applied
+            .decisions
+            .iter()
+            .all(|decision| !decision.reason.trim().is_empty())
+    );
 }
 
 #[test]

@@ -149,6 +149,78 @@ fn plain_blocks_batch_together() {
 }
 
 #[test]
+fn expected_output_bound_is_opt_in_and_only_splits_the_oversized_batch() {
+    let oversized = make_segment_in_section(
+        "oversized",
+        "sec_oversized",
+        0,
+        (0..45)
+            .map(|index| plain_block(&format!("{index:02}:{}", "x".repeat(768))))
+            .collect(),
+        vec![],
+    );
+    let ordinary = make_segment_in_section(
+        "ordinary",
+        "sec_ordinary",
+        1,
+        (0..19)
+            .map(|index| plain_block(&format!("{index:02}: small")))
+            .collect(),
+        vec![],
+    );
+    let config = BatchConfig {
+        enabled: true,
+        target_tokens: 16_000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let initial = build_translation_batches(
+        &[oversized, ordinary],
+        &config,
+        TranslationProfile::Balanced,
+    );
+    assert_eq!(initial.len(), 2);
+
+    let without_bound =
+        account_for_batch_prompt_overhead(initial.clone(), &config, &test_run_config());
+    assert_eq!(
+        without_bound
+            .iter()
+            .filter(|batch| batch.section_id.0 == "sec_oversized")
+            .count(),
+        1,
+        "no expected-output bound is enabled by default"
+    );
+
+    let mut bounded_config = test_run_config();
+    bounded_config.batch_max_output_tokens = Some(8_000);
+    let bounded = account_for_batch_prompt_overhead(initial, &config, &bounded_config);
+    assert!(
+        bounded
+            .iter()
+            .filter(|batch| batch.section_id.0 == "sec_oversized")
+            .count()
+            > 1,
+        "the measured 45-block response shape should be repacked"
+    );
+    assert_eq!(
+        bounded
+            .iter()
+            .filter(|batch| batch.section_id.0 == "sec_ordinary")
+            .count(),
+        1,
+        "ordinary small batches must not be shrunk by the output bound"
+    );
+    assert_eq!(
+        bounded.iter().map(|batch| batch.items.len()).sum::<usize>(),
+        64,
+        "repacking must preserve every item"
+    );
+}
+
+#[test]
 fn batch_construction_uses_only_block_local_markers() {
     let seg = make_segment(
         "seg1",
@@ -1232,7 +1304,7 @@ fn make_two_item_batch() -> TranslationBatch {
 }
 
 #[test]
-fn batch_items_include_segment_glossary() {
+fn batch_prompt_shares_segment_glossary_and_keeps_item_guidance() {
     let batch = make_two_item_batch();
     let mut config = test_run_config();
     config.glossary.entries_by_segment.insert(
@@ -1252,12 +1324,16 @@ fn batch_items_include_segment_glossary() {
         "Translate the greeting less literally.".to_string(),
     );
 
-    let rendered = render_batch_items(&batch, &config);
-    assert!(rendered.contains("\"glossary\""));
-    assert!(rendered.contains("\"retry_guidance\""));
-    assert!(rendered.contains("Translate the greeting less literally."));
-    assert!(rendered.contains("\"source\":\"Hello\""));
-    assert!(!rendered.contains("Use informal register."));
+    let rendered_items = render_batch_items(&batch, &config);
+    let prompt_extra = render_batch_prompt_extra(&batch.items, &config);
+    assert!(!rendered_items.contains("\"glossary\""));
+    assert!(rendered_items.contains("\"retry_guidance\""));
+    assert!(rendered_items.contains("Translate the greeting less literally."));
+    assert!(!rendered_items.contains("\"target\":\"Ciao\""));
+    assert!(prompt_extra.contains("Active batch glossary constraints"));
+    assert!(prompt_extra.contains("\"source\":\"Hello\""));
+    assert!(prompt_extra.contains("\"target\":\"Ciao\""));
+    assert!(prompt_extra.contains("Use informal register."));
 }
 
 #[test]
@@ -1345,6 +1421,84 @@ fn batch_prompt_overhead_repacks_glossary_heavy_items() {
     assert_eq!(adjusted.len(), 2);
     assert!(adjusted.iter().all(|batch| batch.items.len() == 1));
     assert!(adjusted.iter().all(|batch| batch.token_estimate > 120));
+}
+
+#[test]
+fn glossary_does_not_multiply_fixed_corpus_batch_prompts() {
+    let segments = (0..8)
+        .map(|segment_index| {
+            let blocks = (0..64)
+                .map(|block_index| {
+                    plain_block(&format!(
+                        "Segment {segment_index} block {block_index}: a compact sentence for a fixed corpus."
+                    ))
+                })
+                .collect();
+            make_segment(&format!("seg{segment_index}"), blocks, vec![])
+        })
+        .collect::<Vec<_>>();
+    let batch_config = BatchConfig {
+        enabled: true,
+        target_tokens: 16_000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let initial = build_translation_batches(&segments, &batch_config, TranslationProfile::Balanced);
+
+    let plain_config = test_run_config();
+    let plain_batches =
+        account_for_batch_prompt_overhead(initial.clone(), &batch_config, &plain_config);
+    let library = PromptLibrary::global();
+    let plain_chars = plain_batches
+        .iter()
+        .map(|batch| {
+            let rendered = render_batch_prompt(batch, &plain_config, library, "", 0)
+                .expect("plain prompt renders");
+            rendered.system.chars().count() + rendered.user.chars().count()
+        })
+        .sum::<usize>();
+
+    let mut glossary_config = test_run_config();
+    for segment_index in 0..segments.len() {
+        glossary_config.glossary.entries_by_segment.insert(
+            format!("seg{segment_index}"),
+            (0..24)
+                .map(|term_index| bookforge_core::GlossaryPromptTerm {
+                    source: format!("source term {segment_index}-{term_index}"),
+                    target: format!("target term {segment_index}-{term_index}"),
+                    category: bookforge_core::GlossaryCategory::Phrase,
+                    note: None,
+                    term_id: Some((segment_index * 100 + term_index) as i64),
+                    case_sensitive: false,
+                })
+                .collect(),
+        );
+    }
+    let glossary_batches =
+        account_for_batch_prompt_overhead(initial, &batch_config, &glossary_config);
+    let glossary_chars = glossary_batches
+        .iter()
+        .map(|batch| {
+            let rendered = render_batch_prompt(batch, &glossary_config, library, "", 0)
+                .expect("glossary prompt renders");
+            rendered.system.chars().count() + rendered.user.chars().count()
+        })
+        .sum::<usize>();
+
+    assert!(
+        glossary_batches.len() <= plain_batches.len() * 2,
+        "glossary expanded {} plain batches to {} and the rendered prompts from {plain_chars} to {glossary_chars} chars ({:.2}x)",
+        plain_batches.len(),
+        glossary_batches.len(),
+        glossary_chars as f64 / plain_chars as f64
+    );
+    assert!(
+        glossary_chars <= plain_chars * 2,
+        "glossary expanded the rendered prompts from {plain_chars} to {glossary_chars} chars ({:.2}x)",
+        glossary_chars as f64 / plain_chars as f64
+    );
 }
 
 #[tokio::test]
@@ -1962,6 +2116,152 @@ impl LlmProviderTrait for Arc<AlwaysTransientProvider> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DecodeFailureMode {
+    FirstRequest,
+    MultiItemRequests,
+}
+
+struct DecodeThenPromptEchoProvider {
+    calls: AtomicUsize,
+    decode_url: String,
+    mode: DecodeFailureMode,
+    requested_item_counts: Arc<Mutex<Vec<usize>>>,
+}
+
+impl DecodeThenPromptEchoProvider {
+    fn new(
+        decode_url: String,
+        mode: DecodeFailureMode,
+        requested_item_counts: Arc<Mutex<Vec<usize>>>,
+    ) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            decode_url,
+            mode,
+            requested_item_counts,
+        }
+    }
+}
+
+impl LlmProviderTrait for DecodeThenPromptEchoProvider {
+    async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+        let item_ids = item_ids_from_batch_prompt(&request.user);
+        self.requested_item_counts
+            .lock()
+            .unwrap()
+            .push(item_ids.len());
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let should_decode = match self.mode {
+            DecodeFailureMode::FirstRequest => call == 0,
+            DecodeFailureMode::MultiItemRequests => item_ids.len() > 1,
+        };
+        if should_decode {
+            let response = reqwest::get(&self.decode_url).await?;
+            let _: serde_json::Value = response.json().await?;
+            unreachable!("invalid JSON endpoint unexpectedly decoded")
+        }
+
+        Ok(CompletionResponse {
+            content: serde_json::json!({
+                "items": item_ids
+                    .into_iter()
+                    .map(|id| serde_json::json!({
+                        "translation": format!("[it] {id}"),
+                        "id": id,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+            .to_string(),
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            finish_reason: FinishReason::Stop,
+            provider_latency_ms: 0,
+            raw: serde_json::json!({}),
+        })
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_response_format: true,
+            supports_usage_tokens: true,
+        }
+    }
+}
+
+struct FirstEmptyThenPromptEchoProvider {
+    calls: AtomicUsize,
+}
+
+impl LlmProviderTrait for Arc<FirstEmptyThenPromptEchoProvider> {
+    async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(LlmError::InvalidResponse(
+                "the model produced no content".to_string(),
+            ));
+        }
+        let item_ids = item_ids_from_batch_prompt(&request.user);
+        Ok(CompletionResponse {
+            content: serde_json::json!({
+                "items": item_ids
+                    .into_iter()
+                    .map(|id| serde_json::json!({
+                        "translation": format!("[it] {id}"),
+                        "id": id,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+            .to_string(),
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            finish_reason: FinishReason::Stop,
+            provider_latency_ms: 0,
+            raw: serde_json::json!({}),
+        })
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_response_format: true,
+            supports_usage_tokens: true,
+        }
+    }
+}
+
+async fn invalid_json_endpoint(
+    expected_requests: usize,
+) -> Option<(String, tokio::task::JoinHandle<()>)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+        Err(error) => panic!("test listener should bind: {error}"),
+    };
+    let address = listener.local_addr().expect("listener address");
+    let handle = tokio::spawn(async move {
+        for _ in 0..expected_requests {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0_u8; 8_192];
+            let _ = stream.read(&mut request).await;
+            let body = b"{not-json";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    Some((format!("http://{address}"), handle))
+}
+
 struct DelayedPromptEchoProvider;
 
 impl LlmProviderTrait for DelayedPromptEchoProvider {
@@ -2369,6 +2669,154 @@ async fn transient_batch_errors_stop_after_max_attempts() {
         "got: {:?}",
         translations[0].error
     );
+}
+
+#[tokio::test]
+async fn decode_error_retries_the_same_batch_before_response_validation() {
+    let Some((decode_url, server)) = invalid_json_endpoint(1).await else {
+        return;
+    };
+    let segment = make_segment(
+        "seg1",
+        vec![plain_block("Hello"), plain_block("World")],
+        vec![],
+    );
+    let segments = vec![segment];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1_000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let requested_item_counts = Arc::new(Mutex::new(Vec::new()));
+    let provider = DecodeThenPromptEchoProvider::new(
+        decode_url,
+        DecodeFailureMode::FirstRequest,
+        requested_item_counts.clone(),
+    );
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut config = test_run_config();
+    config.scheduler.max_attempts = 1;
+
+    let translations = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &config,
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(RecordingProgress {
+            events: events.clone(),
+        }),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("decode retry should recover");
+
+    server.await.expect("invalid JSON server should finish");
+    assert_eq!(*requested_item_counts.lock().unwrap(), [2, 2]);
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, bookforge_core::ProgressEvent::BatchSplit { .. })),
+        "a transport decode error must not be parsed as an empty or partial batch response"
+    );
+}
+
+#[tokio::test]
+async fn persistent_decode_error_bisects_an_oversized_batch_after_retry() {
+    let Some((decode_url, server)) = invalid_json_endpoint(2).await else {
+        return;
+    };
+    let segment = make_segment(
+        "seg1",
+        vec![plain_block("Hello"), plain_block("World")],
+        vec![],
+    );
+    let segments = vec![segment];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1_000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let requested_item_counts = Arc::new(Mutex::new(Vec::new()));
+    let provider = DecodeThenPromptEchoProvider::new(
+        decode_url,
+        DecodeFailureMode::MultiItemRequests,
+        requested_item_counts.clone(),
+    );
+    let mut config = test_run_config();
+    config.scheduler.max_attempts = 1;
+
+    let translations = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &config,
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(bookforge_core::NullProgressSink),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("decode bisection should recover");
+
+    server.await.expect("invalid JSON server should finish");
+    assert_eq!(*requested_item_counts.lock().unwrap(), [2, 2, 1, 1]);
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+    assert_eq!(translations[0].blocks.len(), 2);
+}
+
+#[tokio::test]
+async fn empty_http_200_content_is_retried_for_a_single_item_batch() {
+    let segment = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+    let segments = vec![segment];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1_000,
+        max_items: 1,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let provider = Arc::new(FirstEmptyThenPromptEchoProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let mut config = test_run_config();
+    config.scheduler.max_attempts = 1;
+
+    let translations = translate_batches_with_callback(
+        provider.clone(),
+        batches,
+        &segments,
+        &config,
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(bookforge_core::NullProgressSink),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("empty-content retry should recover");
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
 }
 
 #[tokio::test]

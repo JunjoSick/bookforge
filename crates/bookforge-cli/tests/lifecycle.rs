@@ -1876,6 +1876,12 @@ fn cli_live_reconfigure_updates_later_single_requests_and_cleans_runtime_files()
         ])
         .assert()
         .success();
+    // A successful reconfigure command means the sidecar is durable, not that
+    // the live watch channel has published it. Keep request 1 parked until the
+    // worker acknowledges revision 1 so later dispatch cannot race the watcher.
+    wait_for_child_events(&events, &mut child, |events| {
+        event_count(events, "RuntimeConfigChanged") >= 1
+    });
 
     assert!(
         request_finished_ids(&read_jsonl(&events)).is_empty(),
@@ -1948,6 +1954,12 @@ fn cli_live_reconfigure_repartitions_pending_batch_work() {
         ])
         .assert()
         .success();
+    // The release gate protects only the in-flight batch. Wait for the worker's
+    // acknowledgement as well, otherwise pending work can repartition under
+    // revision 0 when the watcher loses a scheduling race.
+    wait_for_child_events(&events, &mut child, |events| {
+        event_count(events, "RuntimeConfigChanged") >= 1
+    });
 
     assert_eq!(
         batch_request_finished_count(&read_jsonl(&events)),
@@ -1990,11 +2002,10 @@ fn cli_stop_preserves_runtime_overrides_and_resume_consumes_them() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let events = temp.path().join("stop-runtime-reconfigure-events.jsonl");
     let output = temp.path().join("stop-runtime-reconfigure.epub");
-    let mut child = spawn_controlled_mock_translate(&temp, &events, &output);
+    let release = temp.path().join("stop-runtime-reconfigure-release");
+    let mut child = spawn_gated_mock_translate(&temp, &events, &output, &release);
     let job_id = wait_for_job_id_in_events(&events, &mut child);
-    wait_for_events(&events, |events| {
-        !request_started_payloads(events).is_empty()
-    });
+    wait_for_first_batch_request(&events, &mut child);
 
     bookforge()
         .current_dir(temp.path())
@@ -2010,13 +2021,16 @@ fn cli_stop_preserves_runtime_overrides_and_resume_consumes_them() {
         ])
         .assert()
         .success();
-    wait_for_event_count(&events, "RuntimeConfigChanged", 1);
+    wait_for_child_events(&events, &mut child, |events| {
+        event_count(events, "RuntimeConfigChanged") >= 1
+    });
     write_control_file(&control_path(&temp, &job_id), ControlCommand::Stop)
         .expect("stop control should write");
+    fs::write(&release, "release").expect("mock release file should write");
 
     let status = child.wait().expect("translate child should exit");
     assert!(status.success(), "translate child failed: {status}");
-    wait_for_job_status(&temp, &job_id, "stopped");
+    assert_eq!(job_status(&temp, &job_id), "stopped");
     let stopped_events = read_jsonl(&events);
     assert_eq!(event_count(&stopped_events, "TranslationFinished"), 0);
     let initially_finished = segment_finished_ids(&stopped_events);
@@ -2115,13 +2129,21 @@ fn cli_finalize_stages_snapshot_runtime_settings_at_stage_boundaries() {
         &temp,
         &events,
         &output,
-        &[
-            ("BOOKFORGE_MOCK_QA_DELAY_MS", "1500"),
-            ("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS", "200"),
-        ],
+        &[("BOOKFORGE_MOCK_QA_DELAY_MS", "3000")],
     );
     let job_id = wait_for_job_id_in_events(&events, &mut child);
-    wait_for_request_started_prefix(&events, "qa_");
+    wait_for_child_events(&events, &mut child, |events| {
+        request_started_ids(events)
+            .iter()
+            .any(|id| id.starts_with("qa_"))
+    });
+    // Freeze the later stage boundary instead of requiring a separate
+    // reconfigure process to finish inside the QA provider's delay window.
+    // The already-started QA request keeps revision 0; the paused boundary
+    // cannot dispatch double-check until revision 1 is acknowledged below.
+    write_control_file(&control_path(&temp, &job_id), ControlCommand::Pause)
+        .expect("pause control should write");
+    wait_for_child_job_status(&temp, &job_id, "paused", &mut child);
 
     bookforge()
         .current_dir(temp.path())
@@ -2139,6 +2161,14 @@ fn cli_finalize_stages_snapshot_runtime_settings_at_stage_boundaries() {
         ])
         .assert()
         .success();
+    wait_for_child_events(&events, &mut child, |events| {
+        event_count(events, "RuntimeConfigChanged") >= 1
+    });
+    bookforge()
+        .current_dir(temp.path())
+        .args(["resume", &job_id, "--ui", "quiet"])
+        .assert()
+        .success();
 
     let status = child.wait().expect("translate child should exit");
     assert!(status.success(), "translate child failed: {status}");
@@ -2151,6 +2181,17 @@ fn cli_finalize_stages_snapshot_runtime_settings_at_stage_boundaries() {
                 .is_some_and(|id| id.starts_with("qa_"))
         })
         .expect("QA request should start under the baseline stage snapshot");
+    let qa_request = &final_events[qa_started]["RequestStarted"];
+    assert_eq!(
+        qa_request["runtime_config_revision"].as_u64(),
+        Some(0),
+        "the already-started QA stage must retain the baseline revision"
+    );
+    assert_eq!(
+        qa_request["provider_max_attempts"].as_u64(),
+        Some(1),
+        "the already-started QA stage must retain the v1-fast attempt budget"
+    );
     let changed = final_events
         .iter()
         .position(|event| event.get("RuntimeConfigChanged").is_some())
@@ -2165,9 +2206,17 @@ fn cli_finalize_stages_snapshot_runtime_settings_at_stage_boundaries() {
                 .is_some_and(|id| id.starts_with("qa_"))
         })
         .expect("in-flight QA request should finish");
+    // The override watcher and the in-flight provider request are concurrent
+    // actors. The durable edit follows RequestStarted, but the watcher is not
+    // required to emit RuntimeConfigChanged before RequestFinished. Assert only
+    // the causal order plus the stage snapshots that production guarantees.
     assert!(
-        qa_started < changed && changed < qa_finished,
-        "the runtime edit should land while the frozen QA stage is in flight"
+        qa_started < changed,
+        "the runtime change cannot precede the request that triggered the edit"
+    );
+    assert!(
+        qa_started < qa_finished,
+        "the QA request must finish after it starts"
     );
     assert!(
         request_started_ids(&final_events)
@@ -2275,9 +2324,18 @@ fn cli_pause_during_inflight_batch_holds_finalize_passes() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let events = temp.path().join("finalize-pause-events.jsonl");
     let output = temp.path().join("finalize-pause.epub");
-    let mut child = spawn_finalize_controlled_mock_translate(&temp, &events, &output);
+    let release = temp.path().join("finalize-pause-release");
+    let mut child = spawn_finalize_stage_delay_mock_translate(
+        &temp,
+        &events,
+        &output,
+        &[(
+            "BOOKFORGE_MOCK_RELEASE_FILE",
+            release.to_str().expect("release path should be UTF-8"),
+        )],
+    );
     let job_id = wait_for_job_id_in_events(&events, &mut child);
-    wait_for_events(&events, |events| batch_request_started_count(events) >= 1);
+    wait_for_first_batch_request(&events, &mut child);
 
     let control_path = temp
         .path()
@@ -2285,8 +2343,11 @@ fn cli_pause_during_inflight_batch_holds_finalize_passes() {
         .join(&job_id)
         .join("control");
     write_control_file(&control_path, ControlCommand::Pause).expect("pause control should write");
-    wait_for_job_status(&temp, &job_id, "paused");
-    thread::sleep(Duration::from_millis(700));
+    wait_for_child_job_status(&temp, &job_id, "paused", &mut child);
+    fs::write(&release, "release").expect("mock release file should write");
+    wait_for_child_events(&events, &mut child, |events| {
+        batch_request_finished_count(events) >= 1
+    });
 
     let paused_events = read_jsonl(&events);
     assert!(
@@ -2328,9 +2389,18 @@ fn cli_stop_during_inflight_batch_skips_finalize_until_resume() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let events = temp.path().join("finalize-stop-events.jsonl");
     let output = temp.path().join("finalize-stop.epub");
-    let mut child = spawn_finalize_controlled_mock_translate(&temp, &events, &output);
+    let release = temp.path().join("finalize-stop-release");
+    let mut child = spawn_finalize_stage_delay_mock_translate(
+        &temp,
+        &events,
+        &output,
+        &[(
+            "BOOKFORGE_MOCK_RELEASE_FILE",
+            release.to_str().expect("release path should be UTF-8"),
+        )],
+    );
     let job_id = wait_for_job_id_in_events(&events, &mut child);
-    wait_for_events(&events, |events| batch_request_started_count(events) >= 1);
+    wait_for_first_batch_request(&events, &mut child);
 
     let control_path = temp
         .path()
@@ -2338,10 +2408,11 @@ fn cli_stop_during_inflight_batch_skips_finalize_until_resume() {
         .join(&job_id)
         .join("control");
     write_control_file(&control_path, ControlCommand::Stop).expect("stop control should write");
+    fs::write(&release, "release").expect("mock release file should write");
 
     let status = child.wait().expect("translate child should exit");
     assert!(status.success(), "translate child failed: {status}");
-    wait_for_job_status(&temp, &job_id, "stopped");
+    assert_eq!(job_status(&temp, &job_id), "stopped");
     let stopped_events = read_jsonl(&events);
     assert_eq!(
         finalize_request_started_count(&stopped_events),
@@ -2399,11 +2470,18 @@ fn cli_pause_during_inflight_qa_request_parks_before_more_finalize_work() {
         &[("BOOKFORGE_MOCK_QA_DELAY_MS", "3000")],
     );
     let job_id = wait_for_job_id_in_events(&events, &mut child);
-    wait_for_request_started_prefix(&events, "qa_");
+    wait_for_child_events(&events, &mut child, |events| {
+        request_started_ids(events)
+            .iter()
+            .any(|id| id.starts_with("qa_"))
+    });
 
     let control_path = control_path(&temp, &job_id);
     write_control_file(&control_path, ControlCommand::Pause).expect("pause control should write");
-    wait_for_job_status(&temp, &job_id, "paused");
+    wait_for_child_job_status(&temp, &job_id, "paused", &mut child);
+    // RequestStarted precedes the provider call, so Pause may park the task
+    // before it can emit RequestFinished. Observe beyond the injected provider
+    // delay, then assert that no later finalize work escaped the paused state.
     thread::sleep(Duration::from_millis(3300));
 
     let paused_events = read_jsonl(&events);
@@ -2442,11 +2520,17 @@ fn cli_pause_during_inflight_double_check_request_parks_before_corrections() {
         &[("BOOKFORGE_MOCK_DOUBLE_CHECK_DELAY_MS", "3000")],
     );
     let job_id = wait_for_job_id_in_events(&events, &mut child);
-    wait_for_request_started_prefix(&events, "double_check_");
+    wait_for_child_events(&events, &mut child, |events| {
+        request_started_ids(events)
+            .iter()
+            .any(|id| id.starts_with("double_check_"))
+    });
 
     let control_path = control_path(&temp, &job_id);
     write_control_file(&control_path, ControlCommand::Pause).expect("pause control should write");
-    wait_for_job_status(&temp, &job_id, "paused");
+    wait_for_child_job_status(&temp, &job_id, "paused", &mut child);
+    // As above, the request may be parked between RequestStarted and the
+    // provider call, in which case RequestFinished correctly cannot appear.
     thread::sleep(Duration::from_millis(3300));
 
     let paused_events = read_jsonl(&events);
@@ -2536,17 +2620,25 @@ fn cli_resume_after_stop_with_persisted_corrections_is_idempotent() {
         &temp,
         &events,
         &output,
-        &[("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS", "1200")],
+        // Correction persistence happens after RequestFinished and before the
+        // next controllable stage boundary. This existing test-only injection
+        // keeps that production-default-free window open long enough to issue
+        // Stop; child-aware waits below still fail immediately on early exit.
+        &[("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS", "3000")],
     );
     let job_id = wait_for_job_id_in_events(&events, &mut child);
-    wait_for_request_finished_prefix(&events, "repair_");
-    wait_for_corrected_block(&temp, &job_id);
+    wait_for_child_events(&events, &mut child, |events| {
+        request_finished_ids(events)
+            .iter()
+            .any(|id| id.starts_with("repair_"))
+    });
+    wait_for_child_corrected_block(&temp, &job_id, &mut child);
 
     write_control_file(&control_path(&temp, &job_id), ControlCommand::Stop)
         .expect("stop control should write");
     let status = child.wait().expect("translate child should exit");
     assert!(status.success(), "translate child failed: {status}");
-    wait_for_job_status(&temp, &job_id, "stopped");
+    assert_eq!(job_status(&temp, &job_id), "stopped");
 
     let resume_events = temp.path().join("finalize-correction-resume-events.jsonl");
     bookforge()
@@ -3238,22 +3330,6 @@ fn spawn_gated_single_mock_translate(
     )
 }
 
-fn spawn_finalize_controlled_mock_translate(
-    temp: &TempDir,
-    events: &Path,
-    output: &Path,
-) -> ChildGuard {
-    spawn_finalize_stage_delay_mock_translate(
-        temp,
-        events,
-        output,
-        &[
-            ("BOOKFORGE_MOCK_DELAY_MS", "300"),
-            ("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS", "600"),
-        ],
-    )
-}
-
 fn spawn_finalize_stage_delay_mock_translate(
     temp: &TempDir,
     events: &Path,
@@ -3431,22 +3507,6 @@ fn wait_for_event_count(path: &Path, key: &str, min_count: usize) -> Vec<serde_j
     wait_for_events(path, |events| event_count(events, key) >= min_count)
 }
 
-fn wait_for_request_started_prefix(path: &Path, prefix: &str) -> Vec<serde_json::Value> {
-    wait_for_events(path, |events| {
-        request_started_ids(events)
-            .iter()
-            .any(|id| id.starts_with(prefix))
-    })
-}
-
-fn wait_for_request_finished_prefix(path: &Path, prefix: &str) -> Vec<serde_json::Value> {
-    wait_for_events(path, |events| {
-        request_finished_ids(events)
-            .iter()
-            .any(|id| id.starts_with(prefix))
-    })
-}
-
 fn wait_for_events(
     path: &Path,
     ready: impl FnMut(&[serde_json::Value]) -> bool,
@@ -3484,6 +3544,55 @@ fn wait_for_child_events(
             panic!(
                 "translate child exited with {status} before expected events appeared in {}",
                 path.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_child_job_status(
+    temp: &TempDir,
+    job_id: &str,
+    expected: &str,
+    child: &mut process::Child,
+) {
+    // Status is the readiness signal. A wall-clock deadline would turn a
+    // runnable-but-unscheduled worker into a false failure, so only premature
+    // child exit terminates the wait.
+    let db = temp.path().join(".bookforge/jobs.sqlite");
+    loop {
+        let mut actual = None;
+        if db.exists()
+            && let Ok(store) = JobStore::open(&db)
+            && let Ok(Some(job)) = store.get_job(job_id)
+        {
+            if job.status == expected {
+                return;
+            }
+            actual = Some(job.status);
+        }
+        if let Some(status) = child.try_wait().expect("child exit status should poll") {
+            panic!(
+                "translate child exited with {status} before job {job_id} reached status \
+                 {expected}; actual={actual:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_child_corrected_block(temp: &TempDir, job_id: &str, child: &mut process::Child) {
+    loop {
+        if stored_block_texts(temp, job_id)
+            .iter()
+            .any(|text| text.contains("[corrected]"))
+        {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("child exit status should poll") {
+            panic!(
+                "translate child exited with {status} before corrected block was stored for job \
+                 {job_id}"
             );
         }
         thread::sleep(Duration::from_millis(25));
@@ -3565,23 +3674,6 @@ fn job_status(temp: &TempDir, job_id: &str) -> String {
         .expect("job should load")
         .expect("job should exist")
         .status
-}
-
-fn wait_for_corrected_block(temp: &TempDir, job_id: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if stored_block_texts(temp, job_id)
-            .iter()
-            .any(|text| text.contains("[corrected]"))
-        {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for corrected block in job {job_id}"
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
 }
 
 fn wait_for_review_or_failed_segments(temp: &TempDir, job_id: &str) {

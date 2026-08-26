@@ -60,8 +60,33 @@ fn is_transient(err: &LlmError) -> bool {
     match err {
         LlmError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
         LlmError::Http(e) => e.is_timeout() || e.is_connect() || e.is_decode() || e.is_body(),
+        LlmError::InvalidResponse(message) => is_empty_content_error(message),
         _ => false,
     }
+}
+
+fn is_response_transport_error(err: &LlmError) -> bool {
+    matches!(err, LlmError::Http(error) if error.is_decode() || error.is_body())
+}
+
+fn is_empty_content_error(message: &str) -> bool {
+    message.starts_with("the model produced no content")
+}
+
+fn transient_batch_attempt_limit(configured_limit: usize, error: &LlmError) -> usize {
+    let configured_limit = configured_limit.max(1);
+    if is_response_transport_error(error)
+        || matches!(error, LlmError::InvalidResponse(message) if is_empty_content_error(message))
+    {
+        configured_limit.max(2)
+    } else {
+        configured_limit
+    }
+}
+
+fn should_bisect_transient_batch(error: &LlmError) -> bool {
+    is_response_transport_error(error)
+        || matches!(error, LlmError::InvalidResponse(message) if is_empty_content_error(message))
 }
 
 pub fn collect_repair_items(result: &BatchTranslationResult) -> Vec<TranslationBatchItem> {
@@ -761,6 +786,85 @@ where
                     }
                     all_results.push(batch_result);
                 }
+                Err(ref error) if is_transient(error) && batch.kind == BatchKind::Translation => {
+                    truncation_alert.observe_resolved();
+                    let attempts =
+                        increment_batch_item_attempts(&mut transient_attempts_by_item, &batch);
+                    let attempt_limit =
+                        transient_batch_attempt_limit(config.scheduler.max_attempts, error);
+                    if attempts < attempt_limit {
+                        progress.emit(bookforge_core::ProgressEvent::Warning {
+                            kind: "batch_transient_retry".to_string(),
+                            message: format!(
+                                "batch {} transient error on attempt {}; retrying: {error}",
+                                batch.id, attempts
+                            ),
+                            timestamp_ms: bookforge_core::progress::now_ms(),
+                        });
+                        pending_queue.push_back(batch);
+                    } else if batch.items.len() > 1 && should_bisect_transient_batch(error) {
+                        if let Some(sizer) =
+                            adaptive_sizer_mut(&mut runtime_sizer, batch_sizer.as_deref_mut())
+                        {
+                            sizer.on_invalid_json_for_mode(batch.mode);
+                        }
+                        for item in &batch.items {
+                            transient_attempts_by_item.remove(&item.item_id);
+                        }
+                        let split = split_batch_with_config(&batch, Some(config.as_ref()));
+                        if split.len() == 2 {
+                            progress.emit(bookforge_core::ProgressEvent::BatchSplit {
+                                batch_id: batch.id.clone(),
+                                left_items: split[0].items.len(),
+                                right_items: split[1].items.len(),
+                                timestamp_ms: bookforge_core::progress::now_ms(),
+                            });
+                        }
+                        progress.emit(bookforge_core::ProgressEvent::Warning {
+                            kind: "batch_transient_split".to_string(),
+                            message: format!(
+                                "batch {} still failed after {} transient attempts; splitting: {error}",
+                                batch.id, attempts
+                            ),
+                            timestamp_ms: bookforge_core::progress::now_ms(),
+                        });
+                        pending_queue.extend(split);
+                    } else {
+                        progress.emit(bookforge_core::ProgressEvent::Warning {
+                            kind: "batch_transient_exhausted".to_string(),
+                            message: format!(
+                                "batch {} failed after {} transient attempts: {error}",
+                                batch.id, attempts
+                            ),
+                            timestamp_ms: bookforge_core::progress::now_ms(),
+                        });
+                        unblock_fence_for_batch_failure(
+                            config.context_registry.as_deref(),
+                            &segments_by_id,
+                            &batch.items,
+                        );
+                        all_results.push(BatchTranslationResult {
+                            batch_id: batch.id.clone(),
+                            translations: Vec::new(),
+                            failures: batch
+                                .items
+                                .iter()
+                                .map(|item| BatchItemFailure {
+                                    item_id: item.item_id.clone(),
+                                    segment_id: item.segment_id.clone(),
+                                    error: format!("{error}"),
+                                    input_tokens: None,
+                                    input_cached_tokens: None,
+                                    output_tokens: None,
+                                    tokens_estimated: false,
+                                })
+                                .collect(),
+                            input_tokens: None,
+                            input_cached_tokens: None,
+                            output_tokens: None,
+                        });
+                    }
+                }
                 Err(LlmError::InvalidResponse(_))
                     if batch.kind == BatchKind::Translation
                         && request_status == RequestStatus::Truncated
@@ -1031,56 +1135,6 @@ where
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
                     pending_queue.extend(split);
-                }
-                Err(ref error) if is_transient(error) && batch.kind == BatchKind::Translation => {
-                    truncation_alert.observe_resolved();
-                    let attempts =
-                        increment_batch_item_attempts(&mut transient_attempts_by_item, &batch);
-                    if attempts < config.scheduler.max_attempts.max(1) {
-                        progress.emit(bookforge_core::ProgressEvent::Warning {
-                            kind: "batch_transient_retry".to_string(),
-                            message: format!(
-                                "batch {} transient error on attempt {}; retrying: {error}",
-                                batch.id, attempts
-                            ),
-                            timestamp_ms: bookforge_core::progress::now_ms(),
-                        });
-                        pending_queue.push_back(batch);
-                    } else {
-                        progress.emit(bookforge_core::ProgressEvent::Warning {
-                            kind: "batch_transient_exhausted".to_string(),
-                            message: format!(
-                                "batch {} failed after {} transient attempts: {error}",
-                                batch.id, attempts
-                            ),
-                            timestamp_ms: bookforge_core::progress::now_ms(),
-                        });
-                        unblock_fence_for_batch_failure(
-                            config.context_registry.as_deref(),
-                            &segments_by_id,
-                            &batch.items,
-                        );
-                        all_results.push(BatchTranslationResult {
-                            batch_id: batch.id.clone(),
-                            translations: Vec::new(),
-                            failures: batch
-                                .items
-                                .iter()
-                                .map(|item| BatchItemFailure {
-                                    item_id: item.item_id.clone(),
-                                    segment_id: item.segment_id.clone(),
-                                    error: format!("{error}"),
-                                    input_tokens: None,
-                                    input_cached_tokens: None,
-                                    output_tokens: None,
-                                    tokens_estimated: false,
-                                })
-                                .collect(),
-                            input_tokens: None,
-                            input_cached_tokens: None,
-                            output_tokens: None,
-                        });
-                    }
                 }
                 Err(error) => {
                     truncation_alert.observe_resolved();
@@ -1787,54 +1841,14 @@ async fn translate_one_batch_with_evidence(
         compact_retry_attempt,
     } = request;
     let context_block = crate::scheduler::render_context_pairs(&context_pairs);
-    let items_json = render_batch_items(&batch, config);
-    let template = if config.compact_prompts {
-        match batch.mode {
-            BatchMode::Plain | BatchMode::TurboTextOnly => &library.batch_plain_compact,
-            BatchMode::MarkerSafe => &library.batch_marker_safe_compact,
-            BatchMode::RunPreserving => &library.batch_run_preserving_compact,
-        }
-    } else {
-        match batch.mode {
-            BatchMode::Plain | BatchMode::TurboTextOnly => &library.batch_plain,
-            BatchMode::MarkerSafe => &library.batch_marker_safe,
-            BatchMode::RunPreserving => &library.batch_run_preserving,
-        }
-    };
-
-    let mut vars = Substitutions::new();
-    vars.string(
-        "source_language",
-        config
-            .source_language
-            .as_deref()
-            .unwrap_or("the source language"),
-    )
-    .string("target_language", &config.target_language)
-    .raw(
-        "style_guide_block",
-        config
-            .style
-            .as_ref()
-            .map(|s| s.rendered_block.clone())
-            .unwrap_or_default(),
-    )
-    .raw(
-        "entity_agreement_block",
-        config
-            .entities
-            .as_ref()
-            .map(|e| e.rendered_block.clone())
-            .unwrap_or_default(),
-    )
-    .raw("context_translation_pairs", context_block)
-    .raw(
-        "prompt_extra",
-        config.glossary.prompt_extra.clone().unwrap_or_default(),
-    )
-    .raw("items_json", items_json);
-
-    let mut rendered = match template.render(&vars) {
+    let template = batch_prompt_template(&batch, config, &library);
+    let rendered = match render_batch_prompt(
+        &batch,
+        config,
+        &library,
+        &context_block,
+        compact_retry_attempt,
+    ) {
         Ok(rendered) => rendered,
         Err(error) => {
             return BatchRequestOutput {
@@ -1844,11 +1858,6 @@ async fn translate_one_batch_with_evidence(
             };
         }
     };
-    if compact_retry_attempt > 0 {
-        rendered.user.push_str(&format!(
-            "\n\nRECOVERY MODE {compact_retry_attempt}: Return one compact JSON object only. Translate every item exactly once. Do not repeat any word, sentence, item, or explanation. End immediately after the closing brace."
-        ));
-    }
 
     let max_tokens = max_output_tokens_override
         .unwrap_or_else(|| capped_batch_max_output_tokens(&batch, config, provider.is_reasoning()));

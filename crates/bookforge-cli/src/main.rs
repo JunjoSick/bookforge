@@ -21,7 +21,7 @@ use commands::serve;
 use commands::watch;
 use commands::{
     audiobook, control as control_commands, convert, correct, doctor, entity, estimate, glossary,
-    ingest_flags, inspect, reconfigure, reflow, resume, retry, review, status, style, tail,
+    ingest_flags, inspect, plan, reconfigure, reflow, resume, retry, review, status, style, tail,
     translate, validate,
 };
 #[cfg(any(test, not(feature = "serve")))]
@@ -64,6 +64,8 @@ enum Command {
     Audiobook(audiobook::AudiobookArgs),
     /// Estimate translation tokens and provider cost.
     Estimate(estimate::EstimateArgs),
+    /// Inspect an EPUB offline and recommend translation settings.
+    Plan(plan::PlanArgs),
     /// Translate an EPUB and checkpoint every completed segment.
     Translate(Box<translate::TranslateArgs>),
     /// Ask a running job to pause after its current safe boundary.
@@ -146,6 +148,7 @@ async fn run_command(command: Command, cancel_token: CancellationToken) -> Resul
         Command::Inspect(args) => inspect::run(args).await,
         Command::Audiobook(args) => audiobook::run(args, cancel_token).await,
         Command::Estimate(args) => estimate::run(args).await,
+        Command::Plan(args) => plan::run(args).await,
         Command::Translate(args) => translate::run(*args, cancel_token).await,
         Command::Pause(args) => control_commands::pause(args).await,
         Command::Reconfigure(args) => reconfigure::run(args).await,

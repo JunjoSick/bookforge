@@ -1,5 +1,6 @@
 use super::*;
 use serde::Deserialize;
+use std::collections::HashSet;
 
 pub fn batch_item_validation_error(
     item: &TranslationBatchItem,
@@ -115,6 +116,50 @@ fn protected_span_texts(item: &TranslationBatchItem) -> Vec<String> {
         .collect()
 }
 
+fn prompt_projected_item(
+    item: &TranslationBatchItem,
+) -> (
+    TranslationBatchItem,
+    bookforge_core::marker::MarkerPromptProjection,
+) {
+    let projection = bookforge_core::marker::collapse_nested_markers_for_prompt(&item.source_text);
+    let mut projected = item.clone();
+    projected.source_text = projection.text.clone();
+    projected
+        .required_markers
+        .retain(|id| !projection.is_omitted(id));
+    projected.text_runs = project_marker_runs(&item.text_runs, &projection);
+    (projected, projection)
+}
+
+fn project_marker_runs(
+    runs: &[SegmentTextRun],
+    projection: &bookforge_core::marker::MarkerPromptProjection,
+) -> Vec<SegmentTextRun> {
+    let mut stack = Vec::<(String, bool)>::new();
+    runs.iter()
+        .filter_map(|run| {
+            if let Some(open) = bookforge_core::marker::parse_paired_marker_open(&run.text)
+                && open.len == run.text.len()
+            {
+                let omitted = projection.is_omitted(&open.id);
+                stack.push((open.tag_name, omitted));
+                return (!omitted).then(|| run.clone());
+            }
+            if let Some(close) = bookforge_core::marker::parse_marker_close(&run.text)
+                && close.len == run.text.len()
+            {
+                let omitted = stack
+                    .pop()
+                    .filter(|(open_name, _)| open_name == &close.tag_name)
+                    .is_some_and(|(_, omitted)| omitted);
+                return (!omitted).then(|| run.clone());
+            }
+            Some(run.clone())
+        })
+        .collect()
+}
+
 fn protected_span_severity(
     item: &TranslationBatchItem,
     kind: ProtectedSpanKind,
@@ -188,43 +233,37 @@ fn number_adjacent_to_month(source: &str, number: &str) -> bool {
             .is_none_or(|ch| !ch.is_ascii_digit());
         left_boundary
             && right_boundary
-            && (adjacent_word_before(source, start).is_some_and(is_month_name)
-                || adjacent_word_after(source, end).is_some_and(is_month_name))
+            && (alphabetic_words(&source[..start])
+                .into_iter()
+                .rev()
+                .take(2)
+                .any(is_month_name)
+                || alphabetic_words(&source[end..])
+                    .into_iter()
+                    .take(2)
+                    .any(is_month_name))
     })
 }
 
-fn adjacent_word_before(source: &str, end: usize) -> Option<&str> {
-    let prefix = &source[..end];
-    let word_end = prefix
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| ch.is_ascii_alphabetic())
-        .map(|(index, ch)| index + ch.len_utf8())?;
-    let word_start = prefix[..word_end]
-        .char_indices()
-        .rev()
-        .take_while(|(_, ch)| ch.is_ascii_alphabetic())
-        .last()
-        .map_or(word_end, |(index, _)| index);
-    Some(&prefix[word_start..word_end])
-}
-
-fn adjacent_word_after(source: &str, start: usize) -> Option<&str> {
-    let suffix = &source[start..];
-    let word_start = suffix
-        .char_indices()
-        .find(|(_, ch)| ch.is_ascii_alphabetic())
-        .map(|(index, _)| index)?;
-    let word_end = suffix[word_start..]
-        .char_indices()
-        .take_while(|(_, ch)| ch.is_ascii_alphabetic())
-        .last()
-        .map(|(index, ch)| word_start + index + ch.len_utf8())?;
-    Some(&suffix[word_start..word_end])
+fn alphabetic_words(text: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (index, ch) in text.char_indices() {
+        if ch.is_alphabetic() {
+            start.get_or_insert(index);
+        } else if let Some(word_start) = start.take() {
+            words.push(&text[word_start..index]);
+        }
+    }
+    if let Some(word_start) = start {
+        words.push(&text[word_start..]);
+    }
+    words
 }
 
 fn is_month_name(word: &str) -> bool {
     const MONTHS: &[&str] = &[
+        // English
         "january",
         "jan",
         "february",
@@ -249,8 +288,84 @@ fn is_month_name(word: &str) -> bool {
         "nov",
         "december",
         "dec",
+        // Italian
+        "gennaio",
+        "gen",
+        "febbraio",
+        "marzo",
+        "aprile",
+        "maggio",
+        "mag",
+        "giugno",
+        "giu",
+        "luglio",
+        "lug",
+        "agosto",
+        "ago",
+        "settembre",
+        "set",
+        "ottobre",
+        "ott",
+        "novembre",
+        "dicembre",
+        "dic",
+        // Spanish
+        "enero",
+        "ene",
+        "febrero",
+        "abril",
+        "abr",
+        "mayo",
+        "junio",
+        "julio",
+        "septiembre",
+        "setiembre",
+        "octubre",
+        "diciembre",
+        // Portuguese
+        "janeiro",
+        "fevereiro",
+        "fev",
+        "março",
+        "maio",
+        "mai",
+        "junho",
+        "julho",
+        "outubro",
+        "out",
+        "dezembro",
+        "dez",
+        // Danish and Norwegian
+        "januar",
+        "februar",
+        "marts",
+        "mars",
+        "maj",
+        "juni",
+        "juli",
+        "oktober",
+        "okt",
+        "desember",
+        "des",
+        // French
+        "janvier",
+        "février",
+        "fevrier",
+        "avril",
+        "juin",
+        "juillet",
+        "août",
+        "aout",
+        "octobre",
+        "décembre",
+        "decembre",
+        // German
+        "jänner",
+        "märz",
+        "dezember",
     ];
-    MONTHS.iter().any(|month| word.eq_ignore_ascii_case(month))
+    let folded = word.to_lowercase();
+    MONTHS.contains(&folded.as_str())
 }
 
 fn source_copy_error(
@@ -382,9 +497,16 @@ fn parse_text_batch_response(
             continue;
         };
 
+        let translation = if turbo {
+            item.translation.clone()
+        } else {
+            let (_, projection) = prompt_projected_item(request_item);
+            projection.restore(&item.translation)
+        };
+
         if let Some(error) = crate::validation::empty_translation_validation_error(
             &request_item.source_text,
-            &item.translation,
+            &translation,
         ) {
             failures.push(BatchItemFailure {
                 item_id: item.id.clone(),
@@ -398,7 +520,6 @@ fn parse_text_batch_response(
             continue;
         }
 
-        let translation = item.translation.clone();
         let section_title = section_titles
             .and_then(|titles| titles.get(&request_item.segment_id.0))
             .map(String::as_str);
@@ -513,8 +634,9 @@ fn parse_run_batch_response(
         let Some(request_item) = requested_ids.get(item.id.as_str()) else {
             continue;
         };
+        let (projected_item, projection) = prompt_projected_item(request_item);
 
-        let expected_run_count = request_item.text_runs.len();
+        let expected_run_count = projected_item.text_runs.len();
         if item.runs.len() != expected_run_count {
             failures.push(BatchItemFailure {
                 item_id: item.id.clone(),
@@ -531,7 +653,7 @@ fn parse_run_batch_response(
             continue;
         }
 
-        let expected_ids: HashMap<&str, &SegmentTextRun> = request_item
+        let expected_ids: HashMap<&str, &SegmentTextRun> = projected_item
             .text_runs
             .iter()
             .map(|run| (run.id.as_str(), run))
@@ -552,7 +674,7 @@ fn parse_run_batch_response(
             }
         }
         if run_error.is_none() {
-            for expected in &request_item.text_runs {
+            for expected in &projected_item.text_runs {
                 if !run_by_id.contains_key(expected.id.as_str()) {
                     run_error = Some(format!("missing run ID in response: {}", expected.id));
                     break;
@@ -578,7 +700,7 @@ fn parse_run_batch_response(
             continue;
         }
 
-        let joined: Vec<String> = request_item
+        let joined: Vec<String> = projected_item
             .text_runs
             .iter()
             .map(|run| {
@@ -590,7 +712,7 @@ fn parse_run_batch_response(
             })
             .collect();
         let joined_translation = joined.join("");
-        let translation = joined_translation;
+        let translation = projection.restore(&joined_translation);
         if let Some(error) = crate::validation::empty_translation_validation_error(
             &request_item.source_text,
             &translation,
@@ -692,6 +814,140 @@ pub(super) fn batch_response_item_count(batch: &TranslationBatch, content: &str)
     )
 }
 
+fn batch_glossary_entries<'a>(
+    items: &[TranslationBatchItem],
+    config: &'a TranslationRunConfig,
+) -> Vec<&'a bookforge_core::GlossaryPromptTerm> {
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+    for item in items {
+        let segment_entries = config
+            .glossary
+            .entries_by_segment
+            .get(&item.segment_id.0)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for entry in segment_entries {
+            if seen.insert(entry) {
+                entries.push(entry);
+            }
+        }
+    }
+    entries
+}
+
+pub(super) fn render_batch_glossary(
+    items: &[TranslationBatchItem],
+    config: &TranslationRunConfig,
+) -> String {
+    let entries = batch_glossary_entries(items, config);
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    match config.glossary.format {
+        GlossaryFormat::Json => {
+            let rendered = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+            format!(
+                "Active batch glossary constraints (must be honored throughout this batch wherever applicable):\n{rendered}"
+            )
+        }
+        GlossaryFormat::Prose => {
+            let entries = entries.into_iter().cloned().collect::<Vec<_>>();
+            crate::scheduler::render_glossary_prose(&entries)
+        }
+    }
+}
+
+pub(super) fn render_batch_prompt_extra(
+    items: &[TranslationBatchItem],
+    config: &TranslationRunConfig,
+) -> String {
+    let mut blocks = Vec::new();
+    if let Some(extra) = config
+        .glossary
+        .prompt_extra
+        .as_deref()
+        .filter(|extra| !extra.trim().is_empty())
+    {
+        blocks.push(extra.to_string());
+    }
+    let glossary = render_batch_glossary(items, config);
+    if !glossary.is_empty() {
+        blocks.push(glossary);
+    }
+    blocks.join("\n\n")
+}
+
+pub(super) fn render_batch_prompt(
+    batch: &TranslationBatch,
+    config: &TranslationRunConfig,
+    library: &PromptLibrary,
+    context_block: &str,
+    compact_retry_attempt: usize,
+) -> crate::prompt::Result<crate::prompt::Rendered> {
+    let items_json = render_batch_items(batch, config);
+    let prompt_extra = render_batch_prompt_extra(&batch.items, config);
+    let template = batch_prompt_template(batch, config, library);
+
+    let mut vars = Substitutions::new();
+    vars.string(
+        "source_language",
+        config
+            .source_language
+            .as_deref()
+            .unwrap_or("the source language"),
+    )
+    .string("target_language", &config.target_language)
+    .raw(
+        "style_guide_block",
+        config
+            .style
+            .as_ref()
+            .map(|style| style.rendered_block.clone())
+            .unwrap_or_default(),
+    )
+    .raw(
+        "entity_agreement_block",
+        config
+            .entities
+            .as_ref()
+            .map(|entities| entities.rendered_block.clone())
+            .unwrap_or_default(),
+    )
+    .raw("context_translation_pairs", context_block)
+    .raw("prompt_extra", prompt_extra)
+    .raw("items_json", items_json);
+
+    let mut rendered = template.render(&vars)?;
+    if compact_retry_attempt > 0 {
+        rendered.user.push_str(&format!(
+            "\n\nRECOVERY MODE {compact_retry_attempt}: Return one compact JSON object only. Translate every item exactly once. Do not repeat any word, sentence, item, or explanation. End immediately after the closing brace."
+        ));
+    }
+    Ok(rendered)
+}
+
+pub(super) fn batch_prompt_template<'a>(
+    batch: &TranslationBatch,
+    config: &TranslationRunConfig,
+    library: &'a PromptLibrary,
+) -> &'a crate::prompt::PromptTemplate {
+    if config.compact_prompts {
+        match batch.mode {
+            BatchMode::Plain | BatchMode::TurboTextOnly => &library.batch_plain_compact,
+            BatchMode::MarkerSafe => &library.batch_marker_safe_compact,
+            BatchMode::RunPreserving => &library.batch_run_preserving_compact,
+        }
+    } else {
+        match batch.mode {
+            BatchMode::Plain | BatchMode::TurboTextOnly => &library.batch_plain,
+            BatchMode::MarkerSafe => &library.batch_marker_safe,
+            BatchMode::RunPreserving => &library.batch_run_preserving,
+        }
+    }
+}
+
 pub(super) fn render_batch_items(
     batch: &TranslationBatch,
     config: &TranslationRunConfig,
@@ -701,15 +957,17 @@ pub(super) fn render_batch_items(
         .iter()
         .map(|item| {
             let turbo = batch.mode == BatchMode::TurboTextOnly;
+            let projected = (!turbo).then(|| prompt_projected_item(item).0);
+            let prompt_item = projected.as_ref().unwrap_or(item);
             let source_text = if turbo {
-                bookforge_core::marker::strip_marker_tokens(&item.source_text)
+                bookforge_core::marker::strip_marker_tokens(&prompt_item.source_text)
             } else {
-                item.source_text.clone()
+                prompt_item.source_text.clone()
             };
             let required_markers = if turbo {
                 Vec::new()
             } else {
-                item.required_markers.clone()
+                prompt_item.required_markers.clone()
             };
             let protected_spans = protected_span_texts(item);
             let mut obj = serde_json::json!({
@@ -723,28 +981,6 @@ pub(super) fn render_batch_items(
             .cloned()
             .unwrap_or_default();
 
-            let entries = config
-                .glossary
-                .entries_by_segment
-                .get(&item.segment_id.0)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            match config.glossary.format {
-                GlossaryFormat::Json => {
-                    obj.insert(
-                        "glossary".to_string(),
-                        serde_json::to_value(entries)
-                            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
-                    );
-                }
-                GlossaryFormat::Prose => {
-                    obj.insert(
-                        "glossary_prose".to_string(),
-                        serde_json::Value::String(crate::scheduler::render_glossary_prose(entries)),
-                    );
-                }
-            }
-
             if let Some(guidance) = config.glossary.guidance_by_segment.get(&item.segment_id.0) {
                 obj.insert(
                     "retry_guidance".to_string(),
@@ -753,7 +989,7 @@ pub(super) fn render_batch_items(
             }
 
             if batch.mode == BatchMode::RunPreserving {
-                let runs: Vec<serde_json::Value> = item
+                let runs: Vec<serde_json::Value> = prompt_item
                     .text_runs
                     .iter()
                     .map(|r| serde_json::json!({"id": r.id, "text": r.text}))
@@ -790,6 +1026,97 @@ fn wrap_text_only_translation_with_source_markers(source: &str, translation: &st
         return translation;
     }
     format!("{prefix}{translation}")
+}
+
+#[cfg(test)]
+mod nested_marker_projection_tests {
+    use super::*;
+    use bookforge_core::{
+        ir::{BlockId, SectionId},
+        segment::SegmentId,
+    };
+
+    fn item(source: &str, runs: Vec<SegmentTextRun>) -> TranslationBatchItem {
+        TranslationBatchItem {
+            item_id: "item".to_string(),
+            segment_id: SegmentId("segment".to_string()),
+            section_id: SectionId("section".to_string()),
+            block_id: BlockId("block".to_string()),
+            ordinal: 0,
+            kind: "paragraph".to_string(),
+            source_text: source.to_string(),
+            text_runs: runs,
+            protected_spans: Vec::new(),
+            required_markers: bookforge_core::marker::marker_ids_in_text(source),
+            checksum: "checksum".to_string(),
+        }
+    }
+
+    fn batch(mode: BatchMode, item: TranslationBatchItem) -> TranslationBatch {
+        TranslationBatch {
+            id: "batch".to_string(),
+            ordinal: 0,
+            mode,
+            kind: BatchKind::Translation,
+            section_id: item.section_id.clone(),
+            items: vec![item],
+            token_estimate: 1,
+        }
+    }
+
+    #[test]
+    fn marker_safe_response_restores_full_source_nesting() {
+        let source = "<m1><m2>eyes</m2></m1>";
+        let original_item = item(source, Vec::new());
+        let (projected, _) = prompt_projected_item(&original_item);
+
+        assert_eq!(projected.source_text, "<m1>eyes</m1>");
+        assert_eq!(projected.required_markers, ["m1"]);
+        assert_eq!(original_item.source_text, source);
+        assert_eq!(original_item.required_markers, ["m1", "m2"]);
+
+        let result = parse_batch_response(
+            &batch(BatchMode::MarkerSafe, original_item),
+            r#"{"items":[{"id":"item","translation":"<m1>occhi</m1>"}]}"#,
+        )
+        .expect("collapsed response should parse");
+
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "<m1><m2>occhi</m2></m1>");
+    }
+
+    #[test]
+    fn run_preserving_response_can_omit_redundant_marker_runs() {
+        let source = "<m1><m2>eyes</m2></m1>";
+        let runs = ["<m1>", "<m2>", "eyes", "</m2>", "</m1>"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| SegmentTextRun {
+                id: format!("r{index}"),
+                text: text.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let original_item = item(source, runs);
+        let (projected, _) = prompt_projected_item(&original_item);
+
+        assert_eq!(
+            projected
+                .text_runs
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<Vec<_>>(),
+            ["<m1>", "eyes", "</m1>"]
+        );
+
+        let result = parse_batch_response(
+            &batch(BatchMode::RunPreserving, original_item),
+            r#"{"items":[{"id":"item","runs":[{"id":"r0","text":"<m1>"},{"id":"r2","text":"occhi"},{"id":"r4","text":"</m1>"}]}]}"#,
+        )
+        .expect("projected runs should parse");
+
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "<m1><m2>occhi</m2></m1>");
+    }
 }
 
 #[cfg(test)]
@@ -909,6 +1236,11 @@ mod protected_span_severity_tests {
             ("The value is 0.0027", "0.0027"),
             ("It cost $15", "$15"),
             ("The event was December 8", "8"),
+            ("L'evento era l'8 dicembre", "8"),
+            ("El evento fue el 8 de diciembre", "8"),
+            ("O evento foi em 8 de dezembro", "8"),
+            ("Begivenheden var den 8. december", "8"),
+            ("Arrangementet var 8. desember", "8"),
             ("1. First item", "1"),
         ] {
             let substantial = batch_item_validation_error(
@@ -924,6 +1256,18 @@ mod protected_span_severity_tests {
                 "{number} in {source:?} should be hard: {substantial}"
             );
         }
+
+        assert!(
+            batch_item_validation_error(
+                &item_with_span("The event was December 8", ProtectedSpanKind::Number, "8"),
+                "L'evento era l'8 dicembre",
+                false,
+                None,
+                None,
+            )
+            .is_none(),
+            "a localized date that preserves the day must pass"
+        );
     }
 }
 

@@ -72,7 +72,10 @@ use orchestration::human_stdout_enabled;
 pub use orchestration::run;
 use reporting::print_summary_rebuild_and_report;
 pub(crate) use reporting::{rebuild_options_from_snapshot, regenerate_report_after_correction};
-use settings::{apply_provider_preset, resolve_settings, retry_amplification_warning};
+use settings::{
+    apply_plan_recommendations, apply_provider_preset, resolve_settings,
+    retry_amplification_warning,
+};
 use snapshot::persist_snapshot;
 
 #[derive(Debug, Clone)]

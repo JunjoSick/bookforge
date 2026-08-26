@@ -4,10 +4,9 @@ pub async fn run(
     args: TranslateArgs,
     cancel_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    let settings = resolve_settings(&args);
-
     // Apply provider preset if specified (before explicit CLI overrides)
     let effective_provider = apply_provider_preset(&args.provider, args.provider_preset);
+    let (settings, plan_application) = resolve_settings_and_plan(&args, &effective_provider)?;
 
     let output = args
         .out
@@ -64,6 +63,7 @@ pub async fn run(
                     &effective_provider,
                     &args,
                     &settings,
+                    plan_application,
                     &cancel_token,
                     progress_sink,
                 )
@@ -76,6 +76,7 @@ pub async fn run(
                     &effective_provider,
                     &args,
                     &settings,
+                    plan_application,
                     &cancel_token,
                     progress_sink,
                 )
@@ -89,6 +90,33 @@ pub async fn run(
     .await;
 
     finalize_reporter(run_result, reporter).await
+}
+
+pub(super) struct PlanApplication {
+    pub(super) book: bookforge_core::ir::Book,
+    pub(super) applied_plan: bookforge_core::run_snapshot::AppliedPlanSnapshot,
+}
+
+pub(super) fn resolve_settings_and_plan(
+    args: &TranslateArgs,
+    effective_provider: &CliProviderArgs,
+) -> Result<(ResolvedRunSettings, Option<PlanApplication>)> {
+    let mut settings = resolve_settings(args);
+    if !args.plan {
+        return Ok((settings, None));
+    }
+
+    let book = read_epub(&args.input)?;
+    let plan = crate::commands::plan::plan_book(
+        &book,
+        &args.input,
+        args.language.source.as_deref(),
+        &args.language.target,
+        &effective_provider.provider,
+        effective_provider.model.as_deref(),
+    )?;
+    let applied_plan = apply_plan_recommendations(args, &mut settings, &plan);
+    Ok((settings, Some(PlanApplication { book, applied_plan })))
 }
 
 pub(super) fn human_stdout_enabled(ui: crate::progress::UiMode) -> bool {
@@ -117,12 +145,14 @@ async fn finalize_reporter<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_mock_translation(
     input: &PathBuf,
     config: &TranslationConfig,
     provider_args: &CliProviderArgs,
     cli_args: &TranslateArgs,
     settings: &ResolvedRunSettings,
+    plan_application: Option<PlanApplication>,
     cancel_token: &tokio_util::sync::CancellationToken,
     progress: Arc<dyn bookforge_core::ProgressSink>,
 ) -> Result<()> {
@@ -132,6 +162,7 @@ async fn run_mock_translation(
         provider_args,
         cli_args,
         settings,
+        plan_application,
         cancel_token,
         progress,
         None,
@@ -146,6 +177,7 @@ pub(super) async fn run_mock_translation_with_store(
     provider_args: &CliProviderArgs,
     cli_args: &TranslateArgs,
     settings: &ResolvedRunSettings,
+    plan_application: Option<PlanApplication>,
     cancel_token: &tokio_util::sync::CancellationToken,
     progress: Arc<dyn bookforge_core::ProgressSink>,
     store: Option<JobStore>,
@@ -161,6 +193,7 @@ pub(super) async fn run_mock_translation_with_store(
         provider_args,
         cli_args,
         settings,
+        plan_application,
         ProviderRun {
             provider,
             model,
@@ -183,12 +216,14 @@ pub(super) async fn run_mock_translation_with_store(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_openai_compatible_translation(
     input: &PathBuf,
     config: &TranslationConfig,
     provider_args: &CliProviderArgs,
     cli_args: &TranslateArgs,
     settings: &ResolvedRunSettings,
+    plan_application: Option<PlanApplication>,
     cancel_token: &tokio_util::sync::CancellationToken,
     progress: Arc<dyn bookforge_core::ProgressSink>,
 ) -> Result<()> {
@@ -198,6 +233,7 @@ async fn run_openai_compatible_translation(
         provider_args,
         cli_args,
         settings,
+        plan_application,
         cancel_token,
         progress,
         None,
@@ -212,6 +248,7 @@ pub(super) async fn run_openai_compatible_translation_with_store(
     provider_args: &CliProviderArgs,
     cli_args: &TranslateArgs,
     settings: &ResolvedRunSettings,
+    plan_application: Option<PlanApplication>,
     cancel_token: &tokio_util::sync::CancellationToken,
     progress: Arc<dyn bookforge_core::ProgressSink>,
     store: Option<JobStore>,
@@ -265,6 +302,7 @@ pub(super) async fn run_openai_compatible_translation_with_store(
         provider_args,
         cli_args,
         settings,
+        plan_application,
         ProviderRun {
             provider,
             model,
@@ -307,6 +345,7 @@ async fn run_translation_with_store<P>(
     provider_args: &CliProviderArgs,
     cli_args: &TranslateArgs,
     settings: &ResolvedRunSettings,
+    plan_application: Option<PlanApplication>,
     provider_run: ProviderRun<P>,
     progress: Arc<dyn bookforge_core::ProgressSink>,
     store: Option<JobStore>,
@@ -319,7 +358,10 @@ where
         stage: "read_epub".to_string(),
         timestamp_ms: bookforge_core::progress::now_ms(),
     });
-    let book = read_epub(input)?;
+    let (book, applied_plan) = match plan_application {
+        Some(application) => (application.book, Some(application.applied_plan)),
+        None => (read_epub(input)?, None),
+    };
     progress.emit(bookforge_core::ProgressEvent::StageFinished {
         stage: "read_epub".to_string(),
         timestamp_ms: bookforge_core::progress::now_ms(),
@@ -436,6 +478,7 @@ where
         &provider_run.model,
         provider_run.base_url.clone(),
         provider_run.api_key_env.clone(),
+        applied_plan.as_ref(),
     )?;
     let rebuild_options = rebuild_options_from_snapshot(&snapshot);
     store.insert_segments(

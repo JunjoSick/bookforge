@@ -13,9 +13,34 @@ The EPUB pipeline parses package metadata, preserves resources, translates XML t
 
 The reader suppresses `script`, `style`, `svg`, and `math`. It preserves package resources, stylesheets, images, fonts, and non-translated XML entries. Named and numeric entities are decoded for segmentation, while path accounting ignores entity events so reader and writer stay aligned.
 
+## PDF-derived chapter boundaries
+
+`bookforge convert` normally preserves its historical synthetic EPUB shape: one
+`content.xhtml` spine item containing every reconstructed PDF block. The opt-in
+`--chapter-prefix <TEXT>` surface instead creates one spine item per detected
+chapter boundary. Matching is case-insensitive against the literal prefix of a
+block's complete whitespace-normalized visible text. It is not limited to
+blocks classified as headings because noisy PDF extraction can reconstruct a
+visually obvious chapter label as a paragraph.
+
+Blocks before the first match become a front-matter spine item, so title pages,
+introductions, and prefaces are not dropped. A prefix matching nothing uses the
+legacy single-chapter writer. A prefix matching more than 256 text blocks, or
+matching so densely that there are fewer than two text blocks per match on
+average, also falls back to that writer and adds a conversion warning.
+
+The resulting structural sections are scheduler boundaries: segments never
+cross from one spine section into another. This removes single-chapter
+structure as a confound when evaluating PDF-derived books, but does not by
+itself establish or claim an improvement in translation quality.
+
 ## Inline Structure
 
 Inline formatting, links, anchors, and empty inline elements are represented as marker tokens inside a block's prose. New extraction emits short per-block markers such as `<m1>...</m1>` and `<r1/>`. The marker parser also accepts the older verbose marker forms so stored jobs and tests can read legacy text.
+
+The IR remains lossless even when converted EPUBs contain redundant wrappers such as `<span><span>text</span></span>`: both elements receive distinct markers because the original elements may carry different attributes. Batch prompt rendering uses a reversible projection for the narrower case where a paired marker's opening tag immediately follows its parent's opening tag and its closing tag immediately precedes the parent's closing tag. The model sees only the parent marker; BookForge restores every omitted child marker before validating or storing the translation. Nested markers with any text or marker content outside the child cover different ranges and are never collapsed.
+
+This projection does not change segment source text, checksums, inline-marker schema, or the cache namespace. Existing cached translations already contain the complete marker tree and remain valid; fresh translations are expanded to that same representation before deterministic rebuild.
 
 ## Rebuild
 

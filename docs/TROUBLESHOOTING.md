@@ -169,6 +169,20 @@ bookforge resume <job-id>
 For a known correct translation, use `bookforge correct` instead of spending
 another provider request. See [CLI_REFERENCE.md](CLI_REFERENCE.md#review-flag-and-correct).
 
+When the finding is deterministic, read the exact message before retrying:
+
+- `translation is unchanged...` and `translation retains N%...` are both
+  source-copy checks. The latter may appear as `other` in
+  `replay_validation`; it is not the Toki Pona target-language gate.
+- Number protection compares numeric value across comma/point decimals,
+  comma/point/space grouping, numeric date reordering, and translated word
+  suffixes. Thus `1,000.50` to `1.000,50`, `4th` to `4º`, and `December 8` to
+  `8 dicembre` are valid. A different digit value is still a defect.
+- A missing small number is a hard error in a list marker or recognized month
+  context and a warning otherwise. Inspect OCR-derived source text before
+  retrying: malformed scans remain the dominant source of protected-number and
+  math false positives in the measured corpus.
+
 ## Validation cannot find EPUBCheck
 
 BookForge's built-in structural validation still runs. Missing EPUBCheck is

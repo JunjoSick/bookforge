@@ -28,6 +28,11 @@ pub struct ConvertArgs {
     #[arg(long)]
     pub title: Option<String>,
 
+    /// Start chapters at text blocks beginning with this case-insensitive
+    /// literal prefix after whitespace normalization. Omit for one chapter.
+    #[arg(long)]
+    pub chapter_prefix: Option<String>,
+
     /// Low-confidence page handling: preserve as page image or keep best-effort text.
     #[arg(long, value_enum, default_value_t = LowConfidenceArg::Linearize)]
     pub low_confidence: LowConfidenceArg,
@@ -149,6 +154,7 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
         low_confidence: args.low_confidence.into(),
         language: args.language.clone(),
         title: args.title.clone().unwrap_or_default(),
+        chapter_prefix: args.chapter_prefix.clone(),
     };
 
     let mut ocr_config = args.ocr_endpoint.as_ref().map(|endpoint| {
@@ -207,6 +213,18 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
 
     println!("Input: {}", input.display());
     println!("Output: {}", outcome.output.display());
+    if args.chapter_prefix.is_some() {
+        println!("Chapters: {}", outcome.chapters);
+        println!(
+            "Blocks per chapter: {}",
+            outcome
+                .blocks_per_chapter
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     if let Some((endpoint, model, dialect)) = ocr_summary {
         println!("OCR: {endpoint} ({model}, {dialect})");
     }

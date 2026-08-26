@@ -6,7 +6,7 @@ use std::{
 
 use bookforge_core::{
     FallbackRunConfigSnapshot, FinalizeCheckpointSnapshot, GlossaryTerm, ResolvedRunSettings,
-    ResolvedRunSettingsSnapshot, RunConfigSnapshot,
+    ResolvedRunSettingsSnapshot, RunConfigSnapshot, run_snapshot::AppliedPlanSnapshot,
 };
 use bookforge_store::{JobRecord, JobStore};
 use sha2::{Digest, Sha256};
@@ -41,6 +41,7 @@ pub(crate) fn persist_snapshot(
     model: &str,
     base_url: Option<String>,
     api_key_env: Option<String>,
+    applied_plan: Option<&AppliedPlanSnapshot>,
 ) -> anyhow::Result<RunConfigSnapshot> {
     let reports = report_paths(output);
     let events_path = cli_args
@@ -87,7 +88,10 @@ pub(crate) fn persist_snapshot(
         bilingual_style: cli_args.bilingual_style,
         bilingual_css,
         fallback: fallback_snapshot(cli_args, model),
-        finalize: FinalizeCheckpointSnapshot::default(),
+        finalize: FinalizeCheckpointSnapshot {
+            applied_plan: applied_plan.cloned(),
+            ..FinalizeCheckpointSnapshot::default()
+        },
         qa_mode: cli_args.qa.as_str().to_string(),
         validate_output: cli_args.validate_output,
         settings: ResolvedRunSettingsSnapshot::from_settings(settings),

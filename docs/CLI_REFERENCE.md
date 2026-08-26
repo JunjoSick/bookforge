@@ -23,6 +23,7 @@ or supplied to CLI commands through environment variables. See
 | --- | --- |
 | `serve` | Run the local browser dashboard. Running `bookforge` with no command does the same thing and opens the browser. |
 | `inspect` | Report EPUB structure, metadata, and translatable text coverage. |
+| `plan` | Inspect an EPUB offline and recommend translation settings with reasons. |
 | `estimate` | Estimate input/output tokens and price before a hosted-provider run. |
 | `translate` | Start a checkpointed EPUB translation. |
 | `watch` | Monitor and control a job in a full-screen terminal UI. |
@@ -104,8 +105,80 @@ instead of starting the dashboard.
 
 ## A complete translation workflow
 
-Inspect the source before spending provider tokens. The coverage report calls
-out visible text that BookForge would not send for translation.
+Inspect the source before spending provider tokens. `plan` is advisory only: it
+reads the EPUB, constructs no provider, makes no network request, creates no
+`.bookforge/` state, and neither starts nor changes a translation.
+
+```bash
+bookforge plan book.epub \
+  --source English \
+  --target Italian \
+  --provider openrouter \
+  --model openai/gpt-5.6-luna
+```
+
+Every recommendation includes its reason and a disposition: set explicitly,
+keep the current `v1-fast` default, or omit an optional setting. The plan reports
+dominant script; median, p90, and maximum block and scheduler-segment sizes; the
+estimated default-batch output tail; provider output and thinking controls; and
+the translate flags that follow from those findings. `--source` is recorded for
+the operator but does not affect sizing: script is measured from the EPUB text.
+
+Use `--json` for schema-versioned, stable output suitable for tooling:
+
+```bash
+bookforge plan book.epub --target Italian --provider deepseek --json
+```
+
+The first planning slice deliberately does not reuse prior runs. The current
+job-store open path may migrate or otherwise write the database, which would
+violate `plan`'s read-only contract; the output records that no prior-run
+evidence was applied. Concurrency therefore stays at the `v1-fast` default with
+adaptive concurrency enabled until an actual run supplies latency or 429
+evidence. Glossary injection is off by default because its measured A/B found no
+detectable quality effect.
+
+Planning remains opt-in for translation. Add `--plan` to inspect the EPUB
+offline, apply the actionable recommendations, and then start the job:
+
+```bash
+bookforge translate book.epub \
+  --plan \
+  --source Chinese \
+  --target Italian \
+  --provider deepseek
+```
+
+The precedence is direct setting flag, then plan, then the resolved profile,
+target-policy, and provider-preset defaults. For example, an explicit
+`--batch-max-items 64` is never replaced; the plan may still fill an unset
+`--batch-target-tokens`. The current application surface covers batch target
+tokens, batch max items, the optional batch output bound, the provider output
+budget, and supported thinking suppression. Recommendations that merely keep a
+default, such as offline concurrency, are not rewritten.
+
+The EPUB archive is parsed once. Planning inspects that in-memory book and
+constructs the default scheduler segments needed for its size distribution;
+translation then constructs its final segments from the applied settings. Each
+applied setting, typed value, and planner reason is stored in the run snapshot
+under `finalize.applied_plan`. Without `--plan`, no planning inspection runs and
+the existing resolved settings and translation path are unchanged.
+
+`resume` does not accept or rerun the plan. It uses the settings captured when
+the job was created, so a planner rule change after a software update cannot
+silently change only the unfinished part of a book. The current cache namespace
+does not include batch target/items, output budgets, or thinking suppression,
+so those knobs are cache-safe; `reconfigure` may supersede its supported batch
+and scheduler settings for remaining work, and its durable merged settings
+compose with (without erasing) the original plan rationale.
+
+Making planning default-on requires broader evidence: a versioned rule set
+validated across substantially more books, scripts, providers, and models, with
+repeatable gains in blocks recovered, failed requests, or cost per 1,000 source
+characters and no material regression on existing runs.
+
+The coverage report from `inspect` calls out visible text that BookForge would
+not send for translation.
 
 ```bash
 bookforge inspect book.epub
@@ -136,6 +209,27 @@ bookforge translate book.epub \
   --validate-output \
   --out book.it.epub
 ```
+
+`--batch-target-tokens` bounds estimated request size. An explicit
+`--batch-max-output-tokens` also bounds the estimated JSON response while
+packing batches, in addition to capping each provider response. The response
+bound is opt-in: leaving the flag unset preserves the profile's normal batch
+packing and avoids paying prompt overhead for extra requests. If a response
+body still fails to decode after a retry, BookForge bisects a multi-item batch;
+a single item remains the recovery floor.
+
+`--no-thinking` asks the selected endpoint to suppress reasoning. BookForge
+sends OpenRouter's `reasoning.enabled=false`, OpenAI Chat Completions'
+`reasoning_effort=none`, or DeepSeek's `thinking.type=disabled`, selected from
+the base URL or a known OpenRouter/DeepSeek preset credential identity. Other
+OpenAI-compatible endpoints receive no guessed suppression field and produce a
+warning. This includes the bundled local Ollama and llama.cpp endpoints until
+they expose a compatible, documented control.
+
+Provider-reported `completion_tokens` is the billable output aggregate and
+already includes any `completion_tokens_details.reasoning_tokens` breakdown.
+BookForge stores that aggregate as `tokens_output` and uses it for status and
+cost reporting. It does not add the reasoning breakdown a second time.
 
 `--qa` controls the optional LLM review pass. `off` skips it, `all` reviews
 every non-empty successful, cached, or `needs_review` translation, and
@@ -323,6 +417,35 @@ Review the conversion report before translating. It records text coverage,
 layout decisions, preserved media, and low-confidence pages. See
 [EPUB_PIPELINE.md](EPUB_PIPELINE.md) for pipeline details.
 
+PDF conversion keeps the historical single-spine-section output unless an
+explicit chapter prefix is supplied:
+
+```bash
+bookforge convert book.pdf --out book.epub --chapter-prefix "CHAPTER "
+```
+
+`--chapter-prefix <TEXT>` starts a new EPUB chapter before each reconstructed
+text-bearing block whose whitespace-normalized visible text begins with the
+literal prefix, compared case-insensitively. It checks complete block text, not
+raw Poppler lines or a fixed character window, so a chapter label reconstructed
+as a paragraph can still form a boundary. Content before the first match is
+retained as its own front-matter chapter. No matches preserve the legacy
+single-chapter EPUB byte for byte.
+
+To prevent a broad prefix from producing thousands of tiny spine items, the
+split falls back to the legacy single chapter when it finds more than 256
+matches or fewer than two text blocks per match on average. The conversion
+report records a warning when that guard fires.
+
+A literal prefix cannot express headings that vary in their leading text, which
+is a real limit for some languages: Chinese chapter labels such as 第一章 and
+第二章 share only 第, and 第 alone also begins ordinary words, so it over-matches
+into the guard rather than splitting usefully. A regular-expression form would
+cover those cases, but `regex` is currently a dev-dependency only, so making it
+a runtime dependency would add roughly a megabyte to the shipped single binary.
+The prefix is the cheap form that covers Latin-script books; the trade is
+recorded here so it can be revisited deliberately.
+
 `reflow` is an explicit preprocessing command for broken paragraph flow; normal
 EPUB reading does not silently rewrite the source.
 
@@ -349,6 +472,139 @@ bookforge glossary --help
 bookforge style --help
 bookforge entities --help
 ```
+
+For a book-specific glossary, extract source candidates, ask an explicitly
+chosen review model for target renderings, then accept or edit them:
+
+```bash
+bookforge glossary extract-candidates book.epub \
+  --book-id cyberiad \
+  --source-lang English \
+  --target-lang Italian
+
+bookforge glossary propose book.epub \
+  --book-id cyberiad \
+  --language "English->Italian" \
+  --qa-provider openrouter \
+  --qa-model moonshotai/kimi-k3
+
+# Non-interactive: explicitly accept every usable proposal.
+bookforge glossary accept-candidates cyberiad --language "English->Italian"
+
+# Interactive: inspect, edit, or reject individual rows.
+bookforge glossary review-candidates cyberiad --language "English->Italian"
+```
+
+`extract-candidates` chooses between two extraction strategies by measuring the
+scripts in the source text itself, not by looking up the language name. If most
+alphabetic characters have Unicode case, the source uses the measured
+capitalization heuristic. This includes German: capitalized nouns are useful
+terminology candidates even though case does not distinguish them from proper
+nouns. The heuristic counts a capitalized word only when it is capitalized for
+some reason other than where it sits. English capitalises the first word of
+every sentence, quotation, and parenthetical, and headings are title-cased by
+convention, so a word attested *only* in those positions is grammar rather than
+terminology — `Finally`, `Meanwhile`, `Oh`, `Yes` and `Thus` all reached the
+glossary that way before this rule existed. A multi-word phrase gets a second
+chance: `Ivan Ilych` may open every sentence it appears in, yet both its words
+are attested mid-sentence, which is what distinguishes it from `Finally
+Klapaucius`. Contractions inherit their stem, so `I'll` and `It's` are filtered
+as the pronouns they are built from while `Trurl's` survives.
+
+Predominantly caseless sources — Han, Kana, Hangul, Thai, Arabic, Hebrew, and
+Devanagari — use an orthography-neutral recurrence sweep instead. Counting the
+dominant character kind keeps an occasional Latin word from rerouting such a
+book. The sweep considers words without relying on case and uses blocks as the
+documents in an in-book TF-IDF ranking: repetition raises a token's score,
+while vocabulary concentrated in a few blocks outranks function words spread
+throughout the book. No language stoplist or sentence-capitalization rule is
+used. Repeated headings cannot qualify without prose attestation. Unknown
+language labels need no default because routing is script-derived; if the text
+has no alphabetic evidence or the measurement ties, recurrence preserves recall
+without assuming case. Phrases that the author marks with both italics and
+enclosing quotation marks remain an explicit signal in either strategy and
+bypass the frequency floor.
+
+`--min-count` defaults to 3. On the recurrence path it is applied before the
+TF-IDF ranking, and the automatic sweep admits at most the square root of the
+book's word-token count (rounded up), plus explicitly author-marked phrases.
+This keeps the default proposal batch sublinear in book length while making
+lowercase terminology reachable. `--limit` can impose a tighter cap on the
+frequency-ordered result. Each additional candidate reserves 320 output tokens
+within bounded proposal requests by default, so lowering `--min-count` or
+widening `--limit` is not free. The proposal model remains responsible for
+rejecting ordinary language as `not_terminology`.
+
+On The Cyberiad at `--limit 60`, the rule dropped eleven non-terms and freed
+those slots for nine genuine coinages the noise had been crowding out
+(`Altruizine`, `Alacritus`, `Atrocitus`, `Gargantius`, `Gozmos`, `Multitudians`,
+`Mygrayn`, `Ramolda`, `Perfect Adviser`). Words the author genuinely capitalises
+mid-sentence — honorifics such as `Highest` and `Most`, or `Nothing` as the name
+of a machine's product — still come through, which is correct.
+
+`propose` is a standalone, opt-in pass; `translate` never runs it implicitly.
+The EPUB is required because each term is sent with one bounded source excerpt
+(up to 320 characters by default, configurable with `--context-chars`).
+`--qa-base-url` and `--qa-api-key-env` provide the same endpoint/key overrides
+as the QA provider options. `--qa-model` is required so an inexpensive
+translation model is not selected silently for this judgment-heavy pass.
+
+`propose` sends bounded chunks rather than one book-sized request.
+`--qa-max-output-tokens` is the cap for each request and defaults to 8192.
+Chunks reserve 320 output tokens per candidate, so the default carries at most
+25 candidates; a measured 40-candidate run on Kimi K3 spent 8277 output tokens,
+about 207 each including reasoning. Passing the flag changes both the
+per-request cap and the derived chunk size.
+
+If a response reaches the cap, is incomplete JSON, or fails response-shape
+validation, BookForge retries by bisecting that chunk, following the QA batch
+recovery strategy. One candidate is the floor. A terminal failure remains
+pending while completed chunks are persisted. The command prints an
+`INCOMPLETE` summary with completed and failed candidate counts and exits with
+an error, so a partially completed pass cannot be mistaken for success.
+
+The model chooses `preserve`, `translate`, `calque`, `recreate`, `decline`, or
+`not_terminology` and gives a one-sentence reason. `decline` means the item is
+genuine terminology but the excerpt is insufficient for a defensible
+rendering; `not_terminology` means it is ordinary language or extraction noise.
+Both are targetless, but they are not interchangeable.
+
+A rendering fills `target_text` but remains `auto_candidate`; it is inactive
+until a human explicitly accepts it. For a script or batch experiment, run
+`accept-candidates BOOK_ID`; for row-by-row review, use `accept N`, edit with
+`set N "..."`, or run the REPL's `accept-all`. Both bulk surfaces only promote
+candidates with a non-empty rendering and print stable outcome counts:
+
+```text
+Bulk acceptance: accepted=37 skipped-empty=1 skipped-model-rejected=2.
+```
+
+Model rejections are always skipped by bulk acceptance, even if a malformed or
+future row happens to contain a rendering. A broad opt-in would make it too easy
+to erase the distinction between "the model proposed this rendering" and "the
+model said this is not terminology." Override one deliberately in
+`review-candidates` instead. A decline writes no target and remains pending for
+manual treatment.
+
+A model rejection stays visible in `review-candidates` as an inactive
+`auto_candidate` with a `model rejection (not terminology): ...` note. That note
+both preserves the model's reason and prevents automatic re-proposal. A reviewer
+can override it with `accept N` or `set N "..."`; a human `reject N` instead
+changes the status to `rejected`, so machine and human decisions remain
+distinguishable. Existing renderings, model rejections, and `user_seeded`,
+`accepted`, or human-`rejected` decisions are not sent again. Bulk acceptance
+also leaves all three settled statuses untouched.
+
+`accept-candidates` intentionally has no category or `source_count` filters.
+`extract-candidates --min-count/--limit` already controls the batch, while an
+acceptance filter would make partially activated proposal sets easier to mistake
+for complete experiments. Add filters only when a measured workflow needs them.
+
+The command reports the request count plus aggregate estimated and
+provider-reported token counts. As an
+illustrative typical case, 50 candidates with short excerpts are about 5,000
+input and 1,500 output tokens. At $3/M input and $15/M output that is roughly
+$0.04 for the book; substitute the selected model's current prices.
 
 You can also pass TOML files directly to `translate` with repeatable
 `--glossary`, `--style`, and `--entities` flags. Stored scoped guidance is
@@ -435,5 +691,9 @@ bookforge audiobook book.epub --voice alloy --format mp3 --stitch
 ```
 
 See [audiobooks.md](audiobooks.md) for providers, formats, resume hashing,
-pruning, ffmpeg stitching, and M4B assembly.
+pruning, ffmpeg stitching, and M4B assembly. The M4B embeds the EPUB 3
+`cover-image` resource when ffmpeg accepts it, with conservative legacy
+cover-name fallbacks; missing or unusable artwork is non-fatal. Stitched
+chapter names are stable lowercase ASCII slugs, with a deterministic hashed
+fallback when stripping non-ASCII text would leave no useful name.
 
