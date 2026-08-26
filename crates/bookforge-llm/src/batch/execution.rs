@@ -1232,6 +1232,54 @@ where
         }
     };
 
+    // H-3: when the model echoes one item ID twice, the response parser
+    // keeps the first occurrence and flags each later echo as a
+    // BatchItemFailure whose segment_id is the placeholder "unknown" —
+    // rendering has no request context to attribute it. Left alone that
+    // phantom segment is aggregated as NeedsReview, reaches persistence,
+    // and its INSERT violates the segments FK, aborting the whole run.
+    // Re-point the failure at the requested item's real segment so it
+    // flows through NeedsReview aggregation and the repair list like any
+    // other retryable failure. Echoes of IDs that were never requested
+    // cannot be attributed; drop those with a warning rather than letting
+    // the phantom segment escape this crate.
+    for batch_result in &mut all_results {
+        let batch_id = batch_result.batch_id.clone();
+        batch_result.failures.retain_mut(|failure| {
+            if failure.segment_id.0 != "unknown" {
+                return true;
+            }
+            match all_items.get(failure.item_id.as_str()) {
+                Some(item) => {
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "batch_unknown_segment_failure_reattributed".to_string(),
+                        message: format!(
+                            "batch {} failure for item {} carried placeholder segment \
+                             \"unknown\"; re-attributed to segment {}",
+                            batch_id, failure.item_id, item.segment_id.0
+                        ),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    failure.segment_id = item.segment_id.clone();
+                    true
+                }
+                None => {
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "batch_unknown_segment_failure_dropped".to_string(),
+                        message: format!(
+                            "batch {} failure for unrecognized item {} carried placeholder \
+                             segment \"unknown\"; dropping it instead of creating a phantom \
+                             segment",
+                            batch_id, failure.item_id
+                        ),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    false
+                }
+            }
+        });
+    }
+
     for batch_result in &all_results {
         for translation in &batch_result.translations {
             let seg_id = translation.segment_id.0.clone();

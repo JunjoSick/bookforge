@@ -457,6 +457,62 @@ pub(super) fn parse_batch_response_with_validation(
     }
 }
 
+/// Deserialize a batch response that was requested as bare JSON. Providers
+/// occasionally wrap the payload in markdown fences or append trailing
+/// commentary, which a strict parse turns into split/retry churn; when a
+/// direct parse fails, fall back to parsing just the balanced outermost
+/// JSON value. Only the transport wrapper is stripped — the item schema is
+/// never loosened.
+fn decode_batch_json<T: serde::de::DeserializeOwned>(content: &str) -> Result<T, String> {
+    match serde_json::from_str(content) {
+        Ok(parsed) => Ok(parsed),
+        Err(direct_error) => {
+            let recovered =
+                outermost_json_value(content).and_then(|span| serde_json::from_str(span).ok());
+            recovered.ok_or_else(|| format!("invalid batch JSON: {direct_error}"))
+        }
+    }
+}
+
+/// Return the balanced outermost JSON value in `content`, if any, ignoring
+/// prose and markdown fencing around it. Scanning starts at the first `{`
+/// or `[`, respects string literals so braces inside them are skipped, and
+/// tracks a stack of open delimiters so each closer must match the most
+/// recent unclosed opener.
+fn outermost_json_value(content: &str) -> Option<&str> {
+    let (open_index, _) = content
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '{' | '['))?;
+    let mut open_delimiters = Vec::<char>::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in content[open_index..].char_indices() {
+        let index = open_index + offset;
+        if in_string {
+            match ch {
+                '\\' => escaped = !escaped,
+                '"' if !escaped => in_string = false,
+                _ => escaped = false,
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            ch @ ('{' | '[') => {
+                open_delimiters.push(if ch == '{' { '}' } else { ']' });
+            }
+            '}' | ']' if open_delimiters.last() == Some(&ch) => {
+                open_delimiters.pop();
+                if open_delimiters.is_empty() {
+                    return Some(&content[open_index..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn parse_text_batch_response(
     batch: &TranslationBatch,
     content: &str,
@@ -465,8 +521,7 @@ fn parse_text_batch_response(
     section_titles: Option<&HashMap<String, String>>,
     target_language: Option<&str>,
 ) -> Result<BatchTranslationResult, String> {
-    let parsed: BatchTextResponse =
-        serde_json::from_str(content).map_err(|e| format!("invalid batch JSON: {e}"))?;
+    let parsed: BatchTextResponse = decode_batch_json(content)?;
 
     let requested_ids: HashMap<&str, &TranslationBatchItem> = batch
         .items
@@ -603,8 +658,7 @@ fn parse_run_batch_response(
     section_titles: Option<&HashMap<String, String>>,
     target_language: Option<&str>,
 ) -> Result<BatchTranslationResult, String> {
-    let parsed: BatchRunResponse =
-        serde_json::from_str(content).map_err(|e| format!("invalid batch JSON: {e}"))?;
+    let parsed: BatchRunResponse = decode_batch_json(content)?;
 
     let requested_ids: HashMap<&str, &TranslationBatchItem> = batch
         .items
@@ -797,7 +851,7 @@ fn incomplete_batch_response_error(requested: usize, missing: &[&str]) -> String
 }
 
 pub(super) fn batch_response_item_count(batch: &TranslationBatch, content: &str) -> Option<usize> {
-    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let parsed = decode_batch_json::<serde_json::Value>(content).ok()?;
     let items = parsed.get("items")?.as_array()?;
     let requested = batch
         .items
@@ -1381,5 +1435,106 @@ mod text_only_marker_tests {
 
         assert_eq!(wrapped, "<m1></m1>toki pona");
         assert_eq!(bookforge_core::marker::marker_ids_in_text(&wrapped), ["m1"]);
+    }
+}
+
+#[cfg(test)]
+mod lenient_response_decoding_tests {
+    use super::*;
+    use bookforge_core::{
+        ir::{BlockId, SectionId},
+        segment::SegmentId,
+    };
+
+    fn plain_batch() -> TranslationBatch {
+        let item = TranslationBatchItem {
+            item_id: "item".to_string(),
+            segment_id: SegmentId("segment".to_string()),
+            section_id: SectionId("section".to_string()),
+            block_id: BlockId("block".to_string()),
+            ordinal: 0,
+            kind: "paragraph".to_string(),
+            source_text: "Hello".to_string(),
+            text_runs: Vec::new(),
+            protected_spans: Vec::new(),
+            required_markers: Vec::new(),
+            checksum: "checksum".to_string(),
+        };
+        TranslationBatch {
+            id: "batch".to_string(),
+            ordinal: 0,
+            mode: BatchMode::Plain,
+            kind: BatchKind::Translation,
+            items: vec![item],
+            token_estimate: 10,
+            section_id: SectionId("section".to_string()),
+        }
+    }
+
+    const VALID_ITEMS: &str = r#"{"items":[{"id":"item","translation":"Ciao"}]}"#;
+
+    #[test]
+    fn bare_json_still_parses_directly() {
+        let result = parse_batch_response(&plain_batch(), VALID_ITEMS).expect("bare JSON parses");
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "Ciao");
+    }
+
+    #[test]
+    fn markdown_fenced_json_is_accepted() {
+        let fenced = format!("```json\n{VALID_ITEMS}\n```");
+        let result = parse_batch_response(&plain_batch(), &fenced).expect("fenced JSON parses");
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "Ciao");
+    }
+
+    #[test]
+    fn trailing_prose_after_valid_json_is_accepted() {
+        let wrapped = format!("{VALID_ITEMS}\n\nEcco la traduzione richiesta!");
+        let result = parse_batch_response(&plain_batch(), &wrapped)
+            .expect("trailing prose must not fail the parse");
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "Ciao");
+    }
+
+    #[test]
+    fn prose_before_valid_json_is_accepted() {
+        let wrapped = format!("Certamente! Ecco il JSON richiesto:\n{VALID_ITEMS}");
+        let result = parse_batch_response(&plain_batch(), &wrapped)
+            .expect("leading prose must not fail the parse");
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "Ciao");
+    }
+
+    #[test]
+    fn garbage_response_is_rejected() {
+        let err = parse_batch_response(&plain_batch(), "this is not json at all").unwrap_err();
+        assert!(
+            err.starts_with("invalid batch JSON: "),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn braces_inside_strings_do_not_confuse_extraction() {
+        // The translation itself contains braces and the payload is fenced:
+        // string-aware scanning must recover the outermost value intact.
+        let response = concat!(
+            "```json\n",
+            r#"{"items":[{"id":"item","translation":"{braced} }"}]}"#,
+            "\n```\nFatto."
+        );
+        let result = parse_batch_response(&plain_batch(), response).expect("nested braces parse");
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "{braced} }");
+    }
+
+    #[test]
+    fn unterminated_json_is_rejected() {
+        let err = parse_batch_response(&plain_batch(), "{\"items\":[{\"id\":\"item\"").unwrap_err();
+        assert!(
+            err.starts_with("invalid batch JSON: "),
+            "unexpected error: {err}"
+        );
     }
 }

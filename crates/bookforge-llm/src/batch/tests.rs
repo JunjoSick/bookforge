@@ -2526,6 +2526,127 @@ async fn partial_repair_response_is_retried_and_present_bad_item_stays_per_item(
 }
 
 #[tokio::test]
+async fn duplicate_item_id_echo_is_reattributed_and_repaired_not_left_phantom() {
+    let segment = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+    let segments = vec![segment];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let item_id = batches[0].items[0].item_id.clone();
+    // The model echoes the same item ID twice: the parser keeps the first
+    // translation and flags the echo as a failure whose segment is the
+    // placeholder "unknown". Aggregation must re-attribute that failure to
+    // the requested segment instead of letting a phantom "unknown" record
+    // reach persistence (its checkpoint INSERT violates the segments FK).
+    let duplicated = serde_json::json!({
+        "items": [
+            {"id": item_id, "translation": "[it] Hello"},
+            {"id": item_id, "translation": "[it] Hello"},
+        ]
+    })
+    .to_string();
+    let provider = SequenceProvider::new(vec![
+        duplicated,
+        serde_json::json!({
+            "items": [{"id": item_id, "translation": "[it] Hello"}]
+        })
+        .to_string(),
+    ]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let translations = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &test_run_config(),
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(RecordingProgress {
+            events: events.clone(),
+        }),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("duplicate-echo failure must not abort aggregation");
+
+    assert_eq!(
+        translations.len(),
+        1,
+        "no phantom \"unknown\" segment record may be produced"
+    );
+    assert_eq!(translations[0].segment_id.0, "seg1");
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        bookforge_core::ProgressEvent::Warning { kind, .. }
+            if kind == "batch_unknown_segment_failure_reattributed"
+    )));
+}
+
+#[tokio::test]
+async fn duplicate_echo_of_unrequested_item_id_is_dropped_without_phantom_segment() {
+    let segment = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+    let segments = vec![segment];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let item_id = batches[0].items[0].item_id.clone();
+    // An echo of an ID that was never requested cannot be attributed to any
+    // segment; it must be dropped with a warning rather than aggregated as
+    // a phantom "unknown" segment.
+    let response = serde_json::json!({
+        "items": [
+            {"id": item_id, "translation": "[it] Hello"},
+            {"id": "ghost_item", "translation": "boo"},
+            {"id": "ghost_item", "translation": "boo again"},
+        ]
+    })
+    .to_string();
+    let provider = SequenceProvider::new(vec![response]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let translations = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &test_run_config(),
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(RecordingProgress {
+            events: events.clone(),
+        }),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("unattributable echo must not abort aggregation");
+
+    assert_eq!(translations.len(), 1);
+    assert_eq!(translations[0].segment_id.0, "seg1");
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        bookforge_core::ProgressEvent::Warning { kind, .. }
+            if kind == "batch_unknown_segment_failure_dropped"
+    )));
+}
+
+#[tokio::test]
 async fn length_finished_repair_response_is_retried() {
     let segment = make_segment("seg1", vec![plain_block("Hello")], vec![]);
     let segments = vec![segment];

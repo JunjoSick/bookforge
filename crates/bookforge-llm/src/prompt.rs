@@ -185,7 +185,7 @@ const BATCH_MARKER_SAFE_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/translate_batch_marker_safe.v3.md");
 const BATCH_RUN_PRESERVING_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/translate_batch_run_preserving.v3.md");
-const BATCH_REPAIR_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_repair.v2.md");
+const BATCH_REPAIR_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_repair.v3.md");
 const BATCH_PLAIN_COMPACT_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/translate_batch_plain_compact.v3.md");
 const BATCH_MARKER_SAFE_COMPACT_TEMPLATE_SOURCE: &str =
@@ -193,7 +193,7 @@ const BATCH_MARKER_SAFE_COMPACT_TEMPLATE_SOURCE: &str =
 const BATCH_RUN_PRESERVING_COMPACT_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/translate_batch_run_preserving_compact.v3.md");
 const BATCH_REPAIR_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_repair_compact.v2.md");
+    include_str!("../prompts/translate_batch_repair_compact.v3.md");
 const QA_BATCH_TEMPLATE_SOURCE: &str = include_str!("../prompts/qa_batch.v1.md");
 const DOUBLE_CHECK_BATCH_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/double_check_batch.v1.md");
@@ -318,6 +318,10 @@ impl PromptLibrary {
 mod tests {
     use super::*;
 
+    /// UTF-8 encoding of `â€"`: an em-dash (U+2014) whose bytes were read
+    /// back as cp1252 and re-encoded, shipping visible mojibake into prompts.
+    const MOJIBAKE_EM_DASH: &[u8] = b"\xC3\xA2\xE2\x82\xAC\xE2\x80\x9D";
+
     #[test]
     fn parses_system_and_user_sections() {
         let source = "# title\n\n## System\n\nrole text\n\n## User\n\npayload text\n";
@@ -427,9 +431,15 @@ mod tests {
     }
 
     #[test]
-    fn prompt_sources_do_not_start_with_utf8_bom() {
+    fn prompt_sources_do_not_start_with_utf8_bom_or_carry_mojibake() {
+        // A UTF-8 BOM breaks `## System` detection, and double-encoded
+        // em-dashes (`â€"`, the cp1252 mis-reading of U+2014 re-encoded as
+        // UTF-8) ship mojibake into every rendered prompt. Both defects have
+        // slipped in through editor round-trips before, so guard the whole
+        // prompt directory against their return.
         let prompt_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let mut bom_prefixed = Vec::new();
+        let mut mojibake = Vec::new();
 
         for entry in std::fs::read_dir(&prompt_dir).expect("prompt directory must be readable") {
             let entry = entry.expect("prompt directory entry must be readable");
@@ -445,12 +455,24 @@ mod tests {
             if bytes.starts_with(b"\xEF\xBB\xBF") {
                 bom_prefixed.push(entry.file_name().to_string_lossy().into_owned());
             }
+            if bytes
+                .windows(MOJIBAKE_EM_DASH.len())
+                .any(|window| window == MOJIBAKE_EM_DASH)
+            {
+                mojibake.push(entry.file_name().to_string_lossy().into_owned());
+            }
         }
 
         bom_prefixed.sort();
         assert!(
             bom_prefixed.is_empty(),
             "prompt files must not start with a UTF-8 BOM: {bom_prefixed:?}"
+        );
+        mojibake.sort();
+        assert!(
+            mojibake.is_empty(),
+            "prompt files must not contain double-encoded em-dash mojibake (U+2014 \
+             read back as cp1252): {mojibake:?}"
         );
     }
 
