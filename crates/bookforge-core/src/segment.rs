@@ -8,7 +8,12 @@ use crate::{
 };
 
 /// Bumped when the cache key derivation changes incompatibly.
-pub const CACHE_KEY_SCHEMA_VERSION: u32 = 2;
+/// v3: token estimation switched from dominant-case-class weighting
+/// (4.5 chars/token vs 1 char/token) to proportional per-character
+/// script weights (`crate::token_estimate`). Segment groupings and
+/// persisted block token estimates differ on mixed- and CJK-heavy
+/// books, so cached rows from the old estimator are ineligible.
+pub const CACHE_KEY_SCHEMA_VERSION: u32 = 3;
 /// Bumped when Segment / SegmentBlock layout changes incompatibly.
 pub const SEGMENT_SCHEMA_VERSION: u32 = 1;
 /// Stable label for the canonical unit checkpointed, retried, resumed, and
@@ -24,37 +29,16 @@ pub const SEGMENT_UNIT_NAME: &str = "scheduler_segment";
 /// between marker tokens instead of moving inside the preceding marker.
 pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 4;
 
-const CASED_SCRIPT_CHAR_UNITS_PER_TOKEN: usize = 9;
-const CASED_SCRIPT_CHAR_UNITS_PER_CHAR: usize = 2;
-
 /// Estimate model tokens from the dominant script in `text`.
 ///
-/// Unicode case is used as a script-level signal rather than a language name:
-/// alphabetic characters with case (Latin, Cyrillic, Greek, and similar
-/// scripts) use approximately 4.5 characters per token (including spaces),
-/// while predominantly caseless text (Han, Kana, Hangul, Thai, Arabic,
-/// Hebrew, Devanagari, and scripts BookForge has never enumerated) uses one
-/// character per token. Mixed text follows its dominant alphabetic script.
-/// Text without alphabetic evidence keeps the 4.5-character fallback.
+/// Thin delegating wrapper kept at its historical path for callers across
+/// the workspace. The canonical implementation and its coefficient
+/// rationale live in [`crate::token_estimate::estimate_tokens`], which
+/// weights every character by its own script (unspaced CJK scripts weigh
+/// one token per character, everything else four characters per token)
+/// instead of routing the whole text through a dominant-case class.
 pub fn estimate_tokens(text: &str) -> usize {
-    let chars = text.chars().count();
-    if chars == 0 {
-        return 0;
-    }
-
-    // Only a dominantly caseless text counts one token per character. A tie,
-    // or text with no alphabetic evidence, takes the cased ratio -- which is
-    // the choice this function has always made. Note that a genuinely mixed
-    // book is therefore estimated low, since half of it is being costed at
-    // roughly 4.5 characters per token; no measurement has yet said whether
-    // that matters in practice.
-    if crate::script::script_class(text) == crate::script::ScriptClass::Caseless {
-        chars
-    } else {
-        chars
-            .saturating_mul(CASED_SCRIPT_CHAR_UNITS_PER_CHAR)
-            .div_ceil(CASED_SCRIPT_CHAR_UNITS_PER_TOKEN)
-    }
+    crate::token_estimate::estimate_tokens(text)
 }
 
 /// Compute a cache namespace that scopes lookups to a single set of
@@ -513,9 +497,13 @@ mod tests {
     fn token_estimate_is_derived_from_the_dominant_script() {
         assert_eq!(estimate_tokens("abcdefgh"), 2);
         assert_eq!(estimate_tokens("矛盾是普遍存在的"), 8);
+        // Deliberate post-estimator expectation: proportional per-character
+        // weighting prices 18 Latin + 18 Han characters at ceil(22.5) = 23,
+        // where the retired dominant-class rule counted all 36 chars at one
+        // token each and overestimated the Latin half.
         assert_eq!(
             estimate_tokens("Project Gutenberg 矛盾是普遍存在的实践是检验真理的标准"),
-            36
+            23
         );
         assert_eq!(estimate_tokens("1234"), 1);
         assert_eq!(estimate_tokens(""), 0);
@@ -704,7 +692,7 @@ mod tests {
             "the segment source/checksum remains the unprojected IR text"
         );
         assert_eq!(
-            namespace, "e85ab6443d2be31dd5eae7f5e748c69592ac92f9582d129a4fb602d4e4ad7868",
+            namespace, "53c28d2f000b24ab654709562b90b65b368ebb1a1cf50968228dad209119da9d",
             "a reversible render projection must not move the existing cache namespace"
         );
     }

@@ -86,6 +86,36 @@ pub fn is_space_delimited(text: &str) -> bool {
     spaces as f64 / alphabetic as f64 >= UNSPACED_SPACE_RATIO
 }
 
+/// Whether a single character belongs to a script that does not delimit its
+/// words with whitespace: Han ideographs, Kana, or Hangul.
+///
+/// This is the per-character counterpart of [`is_space_delimited`]. The
+/// whole-text function answers the question "how should this text be
+/// segmented?"; this one answers "what does this character weigh?", which is
+/// what token estimation needs when a text mixes scripts. It deliberately
+/// matches only the three unspaced families of the CJK sphere: Arabic,
+/// Hebrew, Thai and Devanagari are caseless yet space-delimited, and
+/// classifying them here would misprice their prose by the token estimate's
+/// largest ratio gap. Unicode ranges are used instead of a language list for
+/// the same reason the rest of this module derives everything from the
+/// characters themselves.
+pub fn is_unspaced_script(ch: char) -> bool {
+    matches!(ch,
+        '\u{3040}'..='\u{30FF}'       // Hiragana + Katakana
+        | '\u{31F0}'..='\u{31FF}'     // Katakana phonetic extensions
+        | '\u{FF66}'..='\u{FF9D}'     // Halfwidth Katakana
+        | '\u{1100}'..='\u{11FF}'     // Hangul Jamo
+        | '\u{3130}'..='\u{318F}'     // Hangul Compatibility Jamo
+        | '\u{A960}'..='\u{A97F}'     // Hangul Jamo Extended-A
+        | '\u{AC00}'..='\u{D7A3}'     // Hangul Syllables
+        | '\u{D7B0}'..='\u{D7FF}'     // Hangul Jamo Extended-B
+        | '\u{3400}'..='\u{4DBF}'     // CJK Unified Ideographs Extension A
+        | '\u{4E00}'..='\u{9FFF}'     // CJK Unified Ideographs
+        | '\u{F900}'..='\u{FAFF}'     // CJK Compatibility Ideographs
+        | '\u{20000}'..='\u{32FFF}'   // Extensions B–I (planes 2–3)
+    )
+}
+
 /// Count alphabetic characters by whether their script has case.
 ///
 /// Non-alphabetic characters — digits, punctuation, whitespace, symbols — are
@@ -181,5 +211,20 @@ mod tests {
     fn text_without_letters_is_treated_as_spaced() {
         assert!(is_space_delimited(""));
         assert!(is_space_delimited("1234 5678 90"));
+    }
+
+    #[test]
+    fn unspaced_script_classification_matches_the_three_cjk_families() {
+        assert!(is_unspaced_script('矛'));
+        assert!(is_unspaced_script('こ'));
+        assert!(is_unspaced_script('ハ'));
+        assert!(is_unspaced_script('하'));
+        // Caseless-but-spaced scripts must not be swept in with them.
+        assert!(!is_unspaced_script('ع'));
+        assert!(!is_unspaced_script('ע'));
+        assert!(!is_unspaced_script('ก'));
+        assert!(!is_unspaced_script('a'));
+        assert!(!is_unspaced_script('1'));
+        assert!(!is_unspaced_script('。'));
     }
 }

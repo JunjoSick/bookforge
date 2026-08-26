@@ -468,8 +468,11 @@ fn estimate_qa_item_tokens(item: &QaWorkItem) -> usize {
             .sum::<usize>()
 }
 
+/// Per-item text counting for QA prompts: the canonical script-aware
+/// estimator with the historical one-token floor so tiny fields
+/// (markers, ids) still reserve space in the batch budget.
 fn estimate_text_tokens(text: &str) -> usize {
-    (text.chars().count() / 4).max(1)
+    bookforge_core::segment::estimate_tokens(text).max(1)
 }
 
 fn is_json_shape_error(error: &LlmError) -> bool {
@@ -711,7 +714,7 @@ mod tests {
                     }],
                     protected_spans: Vec::new(),
                 }],
-                token_estimate: (text.chars().count() / 4).max(1),
+                token_estimate: bookforge_core::segment::estimate_tokens(text).max(1),
             },
             context: SegmentContext::default(),
             metadata: SegmentMetadata::default(),

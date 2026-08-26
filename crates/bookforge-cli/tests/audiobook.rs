@@ -773,3 +773,119 @@ fn audiobook_prune_removes_only_stale_chunks_from_earlier_runs() {
         "idempotent prune should report nothing to remove: {stdout}"
     );
 }
+
+/// Expected plan for the fixture, computed through the same
+/// `read_narration_source` pipeline estimation and launches share (AUDIO-7).
+/// Keeps every claim below about estimate/launch parity honest offline.
+fn expected_plan(input: &Path) -> (usize, usize, usize) {
+    let scratch = tempfile::tempdir().expect("scratch temp dir");
+    let narration =
+        bookforge_audio::read_narration_source(input, scratch.path()).expect("fixture parses");
+    let options = bookforge_audio::AudiobookOptions {
+        max_chars: 2_000,
+        ..bookforge_audio::AudiobookOptions::default()
+    };
+    let plan = bookforge_audio::plan_chunks(&narration.book, &options);
+    let chapters = plan
+        .iter()
+        .map(|chunk| chunk.chapter_index)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let characters = plan.iter().map(|chunk| chunk.chars).sum();
+    (chapters, plan.len(), characters)
+}
+
+#[test]
+fn audiobook_dry_run_plan_matches_the_shared_launcher_pipeline() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    let (chapters, chunks, characters) = expected_plan(&input);
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "mock",
+            "--dry-run",
+            "--ui",
+            "json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let plan_event = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["event"] == "audiobook_plan")
+        .expect("dry run should emit an audiobook_plan event");
+
+    assert_eq!(plan_event["chapters"], chapters as u64, "{plan_event}");
+    assert_eq!(plan_event["chunks"], chunks as u64, "{plan_event}");
+    assert_eq!(plan_event["characters"], characters as u64, "{plan_event}");
+    // Degraded-model surfacing stays null unless a real ElevenLabs preflight
+    // degraded; a mock run must not invent one.
+    assert!(
+        plan_event["model_degraded_reason"].is_null(),
+        "{plan_event}"
+    );
+}
+
+#[test]
+fn audiobook_warns_and_drops_options_gemini_cannot_consume() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "gemini",
+            "--language",
+            "en-US",
+            "--text-normalization",
+            "on",
+            "--dry-run",
+        ])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains(
+            "gemini TTS does not support --language, --text-normalization; dropping them"
+        ),
+        "expected one uniform warn-and-drop notice: {stderr}"
+    );
+}
+
+#[test]
+fn audiobook_mock_warns_and_drops_speed_and_instructions() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "mock",
+            "--speed",
+            "1.5",
+            "--instructions",
+            "Calm narration.",
+            "--no-book-file",
+        ])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains(
+            "mock TTS does not support --instructions, --speed; dropping them before synthesis"
+        ),
+        "expected the matrix-driven warn-and-drop notice: {stderr}"
+    );
+}

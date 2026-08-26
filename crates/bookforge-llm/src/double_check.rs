@@ -464,8 +464,11 @@ fn estimate_correction_item_tokens(item: &CorrectionItem) -> usize {
             .sum::<usize>()
 }
 
+/// Per-field text counting for double-check prompts: the canonical
+/// script-aware estimator with the historical one-token floor so tiny
+/// fields (ids, markers, spans) still reserve space in the chunk budget.
 fn estimate_text_tokens(text: &str) -> usize {
-    (text.chars().count() / 4).max(1)
+    bookforge_core::segment::estimate_tokens(text).max(1)
 }
 
 fn is_json_shape_error(error: &LlmError) -> bool {

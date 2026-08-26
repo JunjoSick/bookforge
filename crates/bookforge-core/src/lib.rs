@@ -12,6 +12,7 @@ pub mod scheduler;
 pub mod script;
 pub mod segment;
 pub mod style;
+pub mod token_estimate;
 
 pub use config::{
     BatchConfig, BilingualMode, BilingualStyle, DoubleCheckConfig, DoubleCheckMode, FallbackScope,

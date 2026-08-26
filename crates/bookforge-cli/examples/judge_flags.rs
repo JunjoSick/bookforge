@@ -721,10 +721,11 @@ fn load_pricing(path: Option<&Path>) -> Result<PricingCatalog> {
     Ok(PricingCatalog { file, label })
 }
 
-/// Same 4-chars-per-token approximation the rest of the CLI uses for estimates.
-/// It is an estimate, and the report says so.
+/// The canonical script-aware estimator shared by every BookForge
+/// subsystem for pre-send token estimates. It is an estimate, and the
+/// report says so.
 fn estimate_tokens(text: &str) -> u64 {
-    text.chars().count().div_ceil(4) as u64
+    bookforge_core::segment::estimate_tokens(text) as u64
 }
 
 // ---------------------------------------------------------------------------

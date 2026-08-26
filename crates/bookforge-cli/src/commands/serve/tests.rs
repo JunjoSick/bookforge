@@ -527,6 +527,145 @@ fn audiobook_gap_values_are_clamped_to_ten_seconds() {
     assert_eq!(clamp_audio_gap(99_999), 10_000);
 }
 
+// -----------------------------------------------------------------------
+// AUDIO-6 / ASYM-1 + AUDIO-7: capability-gated launches and estimator
+// preprocessing parity with the launcher.
+// -----------------------------------------------------------------------
+
+/// The dashboard must refuse seed-for-the-wrong-provider before writing any
+/// upload or operation directory and before spawning a child that would only
+/// fail on the same check later inside the CLI.
+#[tokio::test]
+async fn audiobook_launch_rejects_seed_before_spawning_a_doomed_child() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let upload_dir = tempfile::tempdir().expect("temp dir should be created");
+    let epub_dir = tempfile::tempdir().expect("fixture dir should be created");
+    let epub_path = epub_dir.path().join("fixture.epub");
+    build_fixture_epub(&epub_path);
+    let epub_bytes = std::fs::read(&epub_path).expect("fixture EPUB should read");
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        b"--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fixture.epub\"\r\nContent-Type: application/epub+zip\r\n\r\n",
+    );
+    body.extend_from_slice(&epub_bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(
+        b"--B\r\nContent-Disposition: form-data; name=\"provider\"\r\n\r\nopenai\r\n--B\r\n",
+    );
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"seed\"\r\n\r\n7\r\n--B--\r\n");
+
+    let response = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        upload_dir.path().to_path_buf(),
+    ))
+    .oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/audiobook")
+            .header("host", TEST_HOST)
+            .header(CSRF_HEADER, "token-123")
+            .header("content-type", "multipart/form-data; boundary=B")
+            .body(Body::from(body))
+            .expect("request should build"),
+    )
+    .await
+    .expect("route should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload = response_json(response).await;
+    let error = payload["error"].as_str().expect("error message");
+    assert!(
+        error.contains("--seed is supported only with --provider elevenlabs"),
+        "{payload}"
+    );
+    assert_eq!(
+        std::fs::read_dir(upload_dir.path())
+            .expect("upload dir should be readable")
+            .count(),
+        0,
+        "a capability-rejected launch must not leave uploads or operation dirs"
+    );
+}
+
+/// The estimate endpoint plans through `read_narration_source` — the same
+/// PDF-cleanup reflow plus page-grouping pipeline a real launch runs — so its
+/// chapter/chunk/character numbers cannot drift from what synthesis builds.
+#[tokio::test]
+async fn audiobook_estimate_matches_the_shared_launcher_chunk_plan() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let epub_dir = tempfile::tempdir().expect("fixture dir should be created");
+    let epub_path = epub_dir.path().join("fixture.epub");
+    build_fixture_epub(&epub_path);
+    let bytes = std::fs::read(&epub_path).expect("fixture EPUB should read");
+
+    let scratch = tempfile::tempdir().expect("scratch dir should be created");
+    let narration = bookforge_audio::read_narration_source(&epub_path, scratch.path())
+        .expect("shared preprocessing should parse the fixture");
+    let options = bookforge_audio::AudiobookOptions {
+        max_chars: 2_000,
+        ..bookforge_audio::AudiobookOptions::default()
+    };
+    let plan = bookforge_audio::plan_chunks(&narration.book, &options);
+    let expected_chapters = plan
+        .iter()
+        .map(|chunk| chunk.chapter_index)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let expected_characters: usize = plan.iter().map(|chunk| chunk.chars).sum();
+    assert!(!plan.is_empty(), "fixture should yield narratable chunks");
+    // The fixture is not PDF-derived, so both sides must agree it leaves
+    // page grouping off — the boolean flows through the shared pipeline too.
+    assert!(!narration.pdf_page_grouping);
+
+    let boundary = "B";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fixture.epub\"\r\nContent-Type: application/epub+zip\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"provider\"\r\n\r\nmock\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+    let response = {
+        let upload_dir = tempfile::tempdir().expect("temp dir should be created");
+        dashboard_router(test_state_with_upload_dir(
+            "token-123",
+            upload_dir.path().to_path_buf(),
+        ))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/audiobook/estimate")
+                .header("host", TEST_HOST)
+                .header(CSRF_HEADER, "token-123")
+                .header("content-type", "multipart/form-data; boundary=B")
+                .body(Body::from(body))
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond")
+    };
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = response_json(response).await;
+    assert_eq!(payload["chapters"], json!(expected_chapters));
+    assert_eq!(payload["chunks"], json!(plan.len()));
+    assert_eq!(payload["characters"], json!(expected_characters));
+}
+
 #[tokio::test]
 async fn audiobook_cancel_rejects_missing_dashboard_token() {
     use axum::{body::Body, http::Request};
@@ -2561,5 +2700,7 @@ async fn estimate_endpoint_parses_upload_from_a_private_temp_dir_end_to_end() {
     // only ever lived inside the per-request private temp directory.
     assert_eq!(payload["segments"], json!(3), "payload: {payload}");
     assert_eq!(payload["model"], json!("mock-prefix-target"));
-    assert_eq!(payload["input_tokens"], json!(33));
+    // 36 under the canonical chars/4-style estimator (was 33 under the
+    // retired 4.5-chars/token dominant-class formula).
+    assert_eq!(payload["input_tokens"], json!(36));
 }

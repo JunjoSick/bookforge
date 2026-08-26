@@ -752,18 +752,27 @@ fn estimate_prompt_tokens(term: &GlossaryTerm) -> usize {
     // `term_id`, and `case_sensitive`; the old value-only estimate omitted
     // most of that cost. Three extra characters conservatively cover this
     // entry's comma plus the surrounding array brackets.
+    //
+    // Counting itself goes through the canonical script-aware estimator
+    // (`token_estimate::estimate_tokens`) instead of the retired
+    // chars-div-3 heuristic, so glossary budget packing measures entries
+    // exactly as batch packing and cost reporting do.
     let prompt_term = GlossaryPromptTerm::from_term(term);
-    let chars = serde_json::to_string(&prompt_term)
-        .map(|rendered| rendered.chars().count().saturating_add(3))
-        .unwrap_or_else(|_| {
-            term.source_text
-                .chars()
-                .count()
-                .saturating_add(term.target_text.chars().count())
-                .saturating_add(term.notes.as_deref().unwrap_or("").chars().count())
-                .saturating_add(64)
-        });
-    chars.div_ceil(3).max(1)
+    match serde_json::to_string(&prompt_term) {
+        Ok(rendered) => crate::segment::estimate_tokens(&rendered).saturating_add(1),
+        Err(_) => {
+            crate::segment::estimate_tokens(term.source_text.as_str())
+                .saturating_add(crate::segment::estimate_tokens(term.target_text.as_str()))
+                .saturating_add(crate::segment::estimate_tokens(
+                    term.notes.as_deref().unwrap_or(""),
+                ))
+                // Fallback for a serialization failure: the canonical
+                // estimates of the authored fields plus a fixed padding in
+                // place of the field names and JSON scaffolding.
+                .saturating_add(16)
+        }
+    }
+    .max(1)
 }
 
 fn source_counts(segments: &[Segment], terms: &[GlossaryTerm]) -> HashMap<i64, usize> {
@@ -1322,13 +1331,29 @@ mod tests {
         let budget_tokens = 200;
 
         let selections = select_glossary_for_segments(&segments, &terms, budget_tokens);
-        let rendered =
-            serde_json::to_string(&selections.entries_by_segment["seg_budget"]).expect("serialize");
-        let conservative_rendered_tokens = rendered.chars().count().div_ceil(3);
+        let selected = &selections.entries_by_segment["seg_budget"];
+        let rendered = serde_json::to_string(selected).expect("serialize");
 
+        // The enforcer packs entries with the canonical estimator plus one
+        // structural token per entry (comma + array share). Because weights
+        // are additive up to ceiling rounding, the whole-array rendering
+        // must stay within the budget plus at most one rounding unit per
+        // entry.
+        let per_entry_budget = selected
+            .iter()
+            .map(|entry| {
+                crate::segment::estimate_tokens(
+                    &serde_json::to_string(entry).expect("entry serialize"),
+                ) + 1
+            })
+            .sum::<usize>();
         assert!(
-            conservative_rendered_tokens <= budget_tokens,
-            "selected glossary rendered to {conservative_rendered_tokens} estimated tokens for a {budget_tokens}-token budget"
+            per_entry_budget <= budget_tokens,
+            "selected entries packed to {per_entry_budget} estimated tokens for a {budget_tokens}-token budget"
+        );
+        assert!(
+            crate::segment::estimate_tokens(&rendered) <= budget_tokens + selected.len(),
+            "rendered glossary exceeded the budget by more than the per-entry structural slack"
         );
     }
 
@@ -1779,7 +1804,7 @@ mod tests {
                     text_runs: Vec::new(),
                     protected_spans: Vec::new(),
                 }],
-                token_estimate: text.len() / 4,
+                token_estimate: crate::segment::estimate_tokens(text),
             },
             context: SegmentContext::default(),
             metadata: SegmentMetadata::default(),

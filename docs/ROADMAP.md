@@ -845,11 +845,14 @@ this machinery further, add counters (per rule: entries injected /
 entries honored in output) to a real translation run and check the data;
 if rules 3–4 contribute nothing measurable, simplify rather than extend.
 
-**Token estimator.** v1.2 uses a conservative `chars / 3` heuristic
-(rounded up) instead of a real BPE tokenizer. The heuristic over-counts
-slightly on Latin scripts and under-counts on Asian scripts; both
-directions stay safely inside the budget for our purposes. A real
-tokenizer (`tiktoken-rs` or per-provider equivalent) is deferred to v1.3
+**Token estimator.** v1.2 used a conservative `chars / 3` heuristic
+(rounded up) instead of a real BPE tokenizer, and later a dominant-class
+case weighting; both are retired. The audit-2026-08 wave replaced every
+estimate site with one script-aware proportional weighting in
+`bookforge_core::token_estimate` (unspaced CJK scripts ≈ 1 char/token,
+everything else ≈ 4 chars/token). A real tokenizer (`tiktoken-rs` or
+per-provider equivalent) remains deferred until measurements show the
+heuristic misses materially on real books.
 once style sheets land and per-segment token accounting becomes a more
 load-bearing concern. Code carries a `// TODO(v1.3): real tokenizer`
 marker.

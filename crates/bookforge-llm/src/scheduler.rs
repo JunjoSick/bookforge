@@ -405,7 +405,9 @@ fn apply_context_budget(
 }
 
 fn estimate_context_tokens(ctx: &CompletedContext) -> usize {
-    let translation_tokens = ctx.translated_text.len() / 4;
+    // Canonical script-aware estimate for both sides; this was the last
+    // byte-based counter left (bytes/4 miscounts multi-byte scripts).
+    let translation_tokens = bookforge_core::segment::estimate_tokens(&ctx.translated_text);
     ctx.source_token_estimate.saturating_add(translation_tokens)
 }
 

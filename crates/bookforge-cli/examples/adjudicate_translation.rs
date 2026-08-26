@@ -1168,7 +1168,7 @@ fn load_pricing(path: Option<&Path>) -> Result<PricingCatalog> {
 }
 
 fn estimate_tokens(text: &str) -> u64 {
-    text.chars().count().div_ceil(4) as u64
+    bookforge_core::segment::estimate_tokens(text) as u64
 }
 
 fn print_dry_run(

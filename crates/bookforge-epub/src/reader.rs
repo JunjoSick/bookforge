@@ -14,6 +14,7 @@ use bookforge_core::{
         is_marker_token, marker_reference_token, parse_marker_close, parse_paired_marker_open,
         strip_marker_tokens,
     },
+    segment::estimate_tokens,
 };
 use quick_xml::{
     Reader,
@@ -1303,11 +1304,6 @@ fn block_visible_text(block: &Block) -> String {
         .collect::<Vec<_>>()
         .join("");
     normalize_space(&strip_marker_tokens(&marked))
-}
-
-fn estimate_tokens(text: &str) -> usize {
-    let words = text.split_whitespace().count();
-    words.saturating_mul(4).div_ceil(3).max(1)
 }
 
 fn detect_protected_spans(text: &str) -> Vec<ProtectedSpan> {

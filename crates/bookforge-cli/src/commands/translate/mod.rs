@@ -353,7 +353,14 @@ pub(crate) fn glossary_fingerprint(
             .then_with(|| a.target_text.cmp(&b.target_text))
     });
     let payload = serde_json::json!({
-        "schema": 1,
+        // v2: glossary budget packing switched from the chars-div-3
+        // heuristic to the canonical script-aware token estimator
+        // (`bookforge_core::token_estimate`), changing which entries fit a
+        // given budget — and therefore the rendered prompt — even when the
+        // term list itself is unchanged. Bumping the payload schema keys
+        // such runs into fresh cache namespaces instead of reusing
+        // translations produced with differently-packed glossaries.
+        "schema": 2,
         "format": format.as_str(),
         "budget_tokens": budget_tokens,
         "prompt_extra": prompt_extra.unwrap_or(""),
