@@ -14,6 +14,9 @@ use serde_json::Value;
 const VALIDATION_REPORT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Environment:\n  BOOKFORGE_EPUBCHECK  Path to an EPUBCheck executable, wrapper script, or .jar (otherwise found on PATH)."
+)]
 pub struct ValidateArgs {
     pub input: PathBuf,
 

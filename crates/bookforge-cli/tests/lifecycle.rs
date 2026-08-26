@@ -266,7 +266,7 @@ exit 0
 
 #[test]
 fn cli_style_clear_book_scope_requires_scope_id() {
-    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let temp = tempfile::tempdir().expect("tempdir should be created");
     let assert = bookforge()
         .current_dir(temp.path())
         .args(["style", "clear", "--scope", "book"])
@@ -278,6 +278,54 @@ fn cli_style_clear_book_scope_requires_scope_id() {
         stderr.contains("requires a non-empty scope.id"),
         "stderr should explain missing style scope id, got: {stderr}"
     );
+}
+
+/// Destructive clears demand an explicit `--yes` before deleting anything.
+#[test]
+fn cli_clear_commands_require_explicit_yes() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    std::fs::write(temp.path().join("in.epub"), b"epub").unwrap();
+    bookforge()
+        .current_dir(temp.path())
+        .args(["glossary", "import", "--help"])
+        .assert()
+        .success(); // smoke: glossary subcommands parse
+
+    for command in ["glossary", "style", "entities"] {
+        let assert = bookforge()
+            .current_dir(temp.path())
+            .args([command, "clear", "--scope", "global"])
+            .assert()
+            .failure();
+
+        let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+        assert!(
+            stderr.contains("--yes"),
+            "{command} clear must refuse without --yes, got: {stderr}"
+        );
+    }
+}
+
+/// Mutually exclusive audiobook deliverable flags are rejected up front by
+/// clap instead of failing late in synthesis.
+#[test]
+fn cli_audiobook_rejects_m4b_and_no_book_file_together() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    std::fs::write(temp.path().join("in.epub"), b"epub").unwrap();
+
+    bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            "in.epub",
+            "--provider",
+            "mock",
+            "--m4b",
+            "--no-book-file",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be used with"));
 }
 
 #[test]
@@ -1059,6 +1107,9 @@ source_count = 2
         .args([
             "glossary",
             "clear",
+            // Destructive clears now demand an explicit confirmation flag
+            // (--yes); this suite intentionally performs the clear.
+            "--yes",
             "--scope",
             "book",
             "--scope-id",
@@ -1284,6 +1335,12 @@ fn cli_translate_json_mode_emits_valid_jsonl_stdout_and_file_log() {
             "v1-fast",
             "--ui",
             "json",
+            // UI-22 regression guard: the finalize-stage human reports
+            // (double-check/fallback) used to println straight onto stdout,
+            // corrupting the JSON event stream mid-run. The mock provider
+            // services the double-check pass, so this exercises the gate.
+            "--double-check",
+            "semantic",
             "--progress-jsonl",
             events.to_str().unwrap(),
             "--out",

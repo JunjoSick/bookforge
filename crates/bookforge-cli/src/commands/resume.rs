@@ -191,10 +191,14 @@ pub async fn run(
         .progress_jsonl
         .clone()
         .or_else(|| snapshot.events_path.clone());
-    let reporter = crate::progress::ProgressReporter::spawn_with_append(
+    // UI-2: hand the TUI the worker's cancel token so quitting an attached
+    // `resume --ui tui` actually cancels the run at the next safe boundary
+    // instead of leaving a headless worker spending in the background.
+    let reporter = crate::progress::ProgressReporter::spawn_with_options(
         args.ui.unwrap_or(crate::progress::UiMode::Auto),
         progress_jsonl,
         true,
+        Some(cancel_token.clone()),
     );
     let progress = reporter.sink();
 
@@ -246,6 +250,9 @@ pub async fn run(
             eprintln!("Resume with:");
             eprintln!("  bookforge resume {}", args.job_id);
         }
+        // UI-21: a user interruption is reported as 130 (128+SIGINT), not a
+        // silent success — progress is saved, but the run did not finish.
+        crate::exit_code::request(crate::exit_code::INTERRUPTED);
         return Ok(());
     }
     outcome
@@ -715,6 +722,7 @@ async fn run_inner(
         &run_config,
         Some(&mut control_poller),
         progress.clone(),
+        print_stdout,
     )
     .await?;
     translations = fallback_translations;
@@ -891,6 +899,12 @@ async fn run_inner(
         println!("Output: {}", output.display());
         println!("Report: {}", report.markdown.display());
         println!("Review: bookforge review {} --open", job.id);
+    }
+
+    // UI-21: completing with unresolved segments is not a clean success; the
+    // output EPUB is rebuilt, but scripts must be able to tell the difference.
+    if summary.failed > 0 || summary.needs_review > 0 {
+        crate::exit_code::request(crate::exit_code::COMPLETED_WITH_FAILURES);
     }
 
     Ok(())

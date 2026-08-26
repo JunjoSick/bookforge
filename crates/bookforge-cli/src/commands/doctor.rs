@@ -8,6 +8,8 @@ use bookforge_llm::{
 use bookforge_pdf::{HttpOcrClient, OcrConfig, PopplerTools};
 use bookforge_store::run_doctor;
 
+use crate::sanitize::{sanitize_terminal, sanitize_truncated};
+
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
     /// Check storage health
@@ -148,13 +150,19 @@ async fn run_ocr_doctor(
             if models.is_empty() {
                 println!("  Models: (none reported)");
             } else {
+                // Model ids come from the remote endpoint; strip control
+                // characters before the terminal sees them (UI-5).
+                let models = models
+                    .iter()
+                    .map(|model| sanitize_terminal(model))
+                    .collect::<Vec<_>>();
                 println!("  Models: {}", models.join(", "));
             }
             Ok(true)
         }
         Err(error) => {
             println!("  Reachable: no");
-            println!("  Error: {error}");
+            println!("  Error: {}", sanitize_terminal(&error.to_string()));
             println!(
                 "  Hint: OCR_API_KEY is only needed for non-loopback endpoints (or set --api-key-env to another variable)."
             );
@@ -368,10 +376,13 @@ async fn run_provider_doctor(
                 response.input_tokens.unwrap_or(0),
                 response.output_tokens.unwrap_or(0),
             );
-            println!("  Content preview: {}", {
-                let truncated: String = response.content.chars().take(200).collect();
-                truncated
-            });
+            // The response body is fully provider-controlled: sanitize AND
+            // bound the preview so a crafted EPUB/provider cannot inject
+            // escape sequences into the terminal (UI-5).
+            println!(
+                "  Content preview: {}",
+                sanitize_truncated(&response.content, 200)
+            );
 
             // JSON response_format support
             if response.content.trim().starts_with('{') || response.content.trim().starts_with('[')
@@ -396,7 +407,7 @@ async fn run_provider_doctor(
         }
         Err(e) => {
             println!("  Completion: FAILED");
-            println!("  Error: {e}");
+            println!("  Error: {}", sanitize_terminal(&e.to_string()));
             healthy = false;
         }
     }
@@ -462,7 +473,7 @@ async fn run_local_provider_doctor(
         println!(
             "  Models endpoint returned HTTP {}: {}",
             status.as_u16(),
-            body.chars().take(300).collect::<String>()
+            sanitize_truncated(&body, 300)
         );
         return Ok(false);
     }
@@ -479,13 +490,18 @@ async fn run_local_provider_doctor(
 
     println!("  Loaded models: {}", models.len());
     if !models.contains(&effective_model) {
+        // Remote-supplied ids: sanitize before printing (UI-5).
+        let available = if models.is_empty() {
+            "(none)".to_string()
+        } else {
+            models
+                .iter()
+                .map(|model| sanitize_terminal(model))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         println!(
-            "  Model loaded: no — model '{effective_model}' is not available; available models: {}",
-            if models.is_empty() {
-                "(none)".to_string()
-            } else {
-                models.join(", ")
-            }
+            "  Model loaded: no — model '{effective_model}' is not available; available models: {available}"
         );
         return Ok(false);
     }

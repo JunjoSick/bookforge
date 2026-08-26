@@ -23,3 +23,8 @@ pub mod translate;
 pub mod validate;
 #[cfg(feature = "tui")]
 pub mod watch;
+
+/// Lowest accepted dashboard refresh interval in milliseconds. `watch` and
+/// `serve` previously enforced different floors (20 vs 50); both now share
+/// this one so a flag value behaves identically on either UI.
+pub(crate) const MIN_REFRESH_MS: u64 = 20;

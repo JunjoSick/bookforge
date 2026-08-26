@@ -346,6 +346,23 @@ existing checkpoints incompatible. Start a new job for those changes.
 The command records a revisioned override file under the job's run directory.
 `status` shows active overrides and the worker reports when it applies them.
 
+### Tri-state boolean flags
+
+Boolean *override* flags such as `--adaptive-concurrency`,
+`--adaptive-batch-sizing`, `--validate-output` (reconfigure), and
+`--adaptive-concurrency`, `--compact-prompts`, `--retry-failed-only`
+(translate) are tri-state: unset, explicitly on, or explicitly off. They
+accept both forms everywhere — a bare flag means `true`, and an explicit value
+works in either spelling:
+
+```bash
+bookforge translate book.epub --target Italian --adaptive-concurrency=false
+bookforge reconfigure <job-id> --validate-output        # same as =true
+```
+
+The bare form is equivalent to passing `true`; passing the flag with no value
+never leaves it "unset".
+
 ## Review, flag, and correct
 
 The static review page can export `flags.json`. Importing the file persists the
@@ -640,6 +657,22 @@ bookforge translate book.epub \
 Use `tail <job-id> --json` for persisted event objects after launch. See
 [events.md](events.md) for the event schema and folding rules.
 
+## Exit codes
+
+Automation can rely on a small, stable exit-code taxonomy (also summarized by
+`bookforge --help`):
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success, including an intentional stop (`pause`, `stop`, TUI quit after the run finished). |
+| 1 | Runtime failure: provider/config errors, IO errors, failed `doctor` checks, incomplete audiobook deliverables. |
+| 2 | Usage error from the argument parser. |
+| 3 | The job reached its end but segments remain failed and/or needs-review; artifacts exist but the output is not clean. Retry or resume to finish them. |
+| 130 | Interrupted by Ctrl+C (or an attached `--ui tui` quit). Progress is checkpointed; run `resume` to continue. |
+
+An interruption always reports 130 even if a provider error followed, and any
+returned runtime error reports 1.
+
 ## Benchmark provider latency and throughput
 
 `benchmark` sends a fixed synthetic translation request to a real provider. It
@@ -664,8 +697,8 @@ however, read the `--provider` name: even though that parsed value defaults to
 `https://openrouter.ai/api/v1`, reads `OPENROUTER_API_KEY`, uses
 `openrouter/auto`, and applies a 120-second timeout.
 
-Samples currently run one at a time. `--concurrency` defaults to 1, but its
-value appears only in the printed header and does not make requests parallel.
+Samples run with bounded parallelism: `--concurrency` (default 1) sets how many
+requests are in flight at once; `1` reproduces the old sequential behavior.
 
 Each sample prints success or failure. Successful lines include latency, token
 counts, and approximate output tokens per second. The results block always

@@ -511,7 +511,12 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let csrf_token = generate_csrf_token()?;
     let auth_enabled = !args.no_auth;
     let state = AppState {
-        refresh: Duration::from_millis(args.refresh_ms.clamp(50, 5_000)),
+        // Same floor as `watch` (crate::commands::MIN_REFRESH_MS): one flag
+        // value, one floor, whichever UI consumes it.
+        refresh: Duration::from_millis(
+            args.refresh_ms
+                .clamp(crate::commands::MIN_REFRESH_MS, 5_000),
+        ),
         csrf_token: csrf_token.clone(),
         auth_enabled,
         host_port: local.port(),

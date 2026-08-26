@@ -61,7 +61,10 @@ pub async fn run(args: WatchArgs) -> Result<()> {
         );
     }
 
-    let refresh = Duration::from_millis(args.refresh_ms.clamp(20, 5_000));
+    let refresh = Duration::from_millis(
+        args.refresh_ms
+            .clamp(crate::commands::MIN_REFRESH_MS, 5_000),
+    );
     watch_job(&store, &job_id, &events_path, refresh).await
 }
 
@@ -106,11 +109,13 @@ async fn drive_watch(
     let mut tailer = EventLogTailer::new(path.to_path_buf());
     let mut tick = tokio::time::interval(refresh);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut reported_invalid_lines = 0usize;
 
     // Show the current state immediately, before waiting on the first tick.
     for event in tailer.poll()? {
         app.fold(&event);
     }
+    report_invalid_lines(&tailer, &mut reported_invalid_lines, app);
     app.draw()?;
 
     loop {
@@ -118,6 +123,7 @@ async fn drive_watch(
         for event in tailer.poll()? {
             app.fold(&event);
         }
+        report_invalid_lines(&tailer, &mut reported_invalid_lines, app);
         if app.pump_input()? {
             break;
         }
@@ -153,4 +159,16 @@ async fn drive_watch(
         app.draw()?;
     }
     Ok(())
+}
+
+/// Surface corrupt event-log lines in the footer instead of swallowing them
+/// (UI-28/30). Fires only when the cumulative count grows.
+fn report_invalid_lines(tailer: &EventLogTailer, reported: &mut usize, app: &mut TuiApp) {
+    let skipped = tailer.invalid_lines_skipped();
+    if skipped > *reported {
+        *reported = skipped;
+        app.set_status(format!(
+            "warning: {skipped} unparseable event log line(s) skipped"
+        ));
+    }
 }

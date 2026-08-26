@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -13,7 +13,15 @@ use bookforge_core::{ProgressEvent, ProgressSink, RunState};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+use crate::epoch::EpochTracker;
+use crate::sanitize::sanitize_terminal;
+
 pub const PROGRESS_EVENT_QUEUE_CAPACITY: usize = 2048;
+
+/// How often live renderers surface newly dropped events as durable
+/// `DroppedEvents` records (UI-10). A burst of drops becomes a log line within
+/// this interval instead of vanishing until shutdown.
+const DROPPED_EVENTS_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum UiMode {
@@ -63,14 +71,6 @@ pub struct ProgressReporter {
 }
 
 impl ProgressReporter {
-    pub fn spawn_with_append(ui_mode: UiMode, jsonl_path: Option<PathBuf>, append: bool) -> Self {
-        Self::spawn_with_options(ui_mode, jsonl_path, append, None)
-    }
-
-    /// Spawn the reporter, optionally passing a cancellation token. The token
-    /// is only consulted by the attached TUI renderer (`--ui tui`), which
-    /// cancels it when the user quits before the run has finished — because in
-    /// raw mode Ctrl-C does not reach the process's SIGINT handler.
     pub fn spawn_with_options(
         ui_mode: UiMode,
         jsonl_path: Option<PathBuf>,
@@ -109,6 +109,20 @@ impl ProgressReporter {
     }
 }
 
+/// Return the number of events dropped since the previous call, so a burst of
+/// queue-overflow losses becomes a durable `DroppedEvents` record with honest
+/// accounting instead of being silently absorbed (UI-10).
+fn take_newly_dropped(dropped: &AtomicUsize, reported: &mut usize) -> Option<usize> {
+    let total = dropped.load(Ordering::Relaxed);
+    if total > *reported {
+        let fresh = total - *reported;
+        *reported = total;
+        Some(fresh)
+    } else {
+        None
+    }
+}
+
 async fn render_loop(
     mut rx: mpsc::Receiver<ProgressEvent>,
     ui_mode: UiMode,
@@ -134,10 +148,17 @@ async fn render_loop(
             RenderMode::Quiet
         };
         let mut renderer = Renderer::new(fallback)?;
+        let mut reported_drops = 0usize;
         while let Some(event) = rx.recv().await {
             file_writer.write_event(&event)?;
             renderer.handle_event(&event)?;
         }
+        flush_final_dropped_events(
+            &dropped,
+            &mut reported_drops,
+            &mut file_writer,
+            &mut renderer,
+        )?;
         file_writer.flush()?;
         renderer.finish()?;
         return Ok(());
@@ -146,12 +167,36 @@ async fn render_loop(
     let _ = &cancel;
 
     let mut renderer = Renderer::new(render_mode)?;
+    let mut reported_drops = 0usize;
+    let mut drop_tick = tokio::time::interval(DROPPED_EVENTS_FLUSH_INTERVAL);
+    drop_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick so a clean start does not record drops.
+    drop_tick.tick().await;
 
-    while let Some(event) = rx.recv().await {
-        file_writer.write_event(&event)?;
-        renderer.handle_event(&event)?;
+    loop {
+        tokio::select! {
+            maybe_event = rx.recv() => {
+                let Some(event) = maybe_event else { break };
+                file_writer.write_event(&event)?;
+                renderer.handle_event(&event)?;
+            }
+            _ = drop_tick.tick() => {
+                flush_final_dropped_events(
+                    &dropped,
+                    &mut reported_drops,
+                    &mut file_writer,
+                    &mut renderer,
+                )?;
+            }
+        }
     }
 
+    flush_final_dropped_events(
+        &dropped,
+        &mut reported_drops,
+        &mut file_writer,
+        &mut renderer,
+    )?;
     file_writer.flush()?;
     renderer.finish()?;
 
@@ -160,6 +205,26 @@ async fn render_loop(
         eprintln!("({d} progress events dropped)");
     }
 
+    Ok(())
+}
+
+/// Persist and render any event-bucket overflow that happened since the last
+/// call. Writers append the `DroppedEvents` marker into the replay log so the
+/// gap stays visible in `tail`/`watch`/serve replays forever.
+fn flush_final_dropped_events(
+    dropped: &AtomicUsize,
+    reported: &mut usize,
+    file_writer: &mut JsonlFileWriter,
+    renderer: &mut Renderer,
+) -> Result<()> {
+    if let Some(count) = take_newly_dropped(dropped, reported) {
+        let event = ProgressEvent::DroppedEvents {
+            count,
+            timestamp_ms: bookforge_core::progress::now_ms(),
+        };
+        file_writer.write_event(&event)?;
+        renderer.handle_event(&event)?;
+    }
     Ok(())
 }
 
@@ -175,8 +240,14 @@ async fn run_tui_attached(
     use crate::tui::{TuiApp, TuiMode};
 
     let mut app = TuiApp::new(TuiMode::Attached)?;
-    let loop_result =
-        drive_attached_tui(&mut app, &mut rx, &mut file_writer, cancel.as_ref()).await;
+    let loop_result = drive_attached_tui(
+        &mut app,
+        &mut rx,
+        &mut file_writer,
+        &dropped,
+        cancel.as_ref(),
+    )
+    .await;
     let restore_result = app.restore();
     file_writer.flush().ok();
     loop_result.and(restore_result)?;
@@ -193,10 +264,14 @@ async fn drive_attached_tui(
     app: &mut crate::tui::TuiApp,
     rx: &mut mpsc::Receiver<ProgressEvent>,
     file_writer: &mut JsonlFileWriter,
+    dropped: &AtomicUsize,
     cancel: Option<&CancellationToken>,
 ) -> Result<()> {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick so a clean start does not record drops.
+    tick.tick().await;
+    let mut reported_drops = 0usize;
     app.draw()?;
 
     loop {
@@ -214,9 +289,23 @@ async fn drive_attached_tui(
                 }
             }
             _ = tick.tick() => {
+                if let Some(count) =
+                    take_newly_dropped_for_tui(dropped, &mut reported_drops)
+                {
+                    let event = ProgressEvent::DroppedEvents {
+                        count,
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    };
+                    file_writer.write_event(&event)?;
+                    app.fold(&event);
+                }
                 if app.pump_input()? {
-                    // Quitting before the run finishes aborts it (Ctrl-C cannot
-                    // reach the SIGINT handler while the terminal is in raw mode).
+                    // Quitting before the run finishes cancels it at the next
+                    // safe boundary (Ctrl-C cannot reach the SIGINT handler
+                    // while the terminal is in raw mode). The token is shared
+                    // with the worker, so attached TUIs quit truthfully for
+                    // both `translate` and `resume` (UI-2): no orphaned
+                    // headless worker keeps spending after the user leaves.
                     if !app.state.finished && let Some(token) = cancel {
                         token.cancel();
                     }
@@ -228,6 +317,13 @@ async fn drive_attached_tui(
         }
     }
     Ok(())
+}
+
+/// TUI-side alias of [`take_newly_dropped`] so both render paths share the
+/// same honest drop accounting (UI-10).
+#[cfg(feature = "tui")]
+fn take_newly_dropped_for_tui(dropped: &AtomicUsize, reported: &mut usize) -> Option<usize> {
+    take_newly_dropped(dropped, reported)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,6 +518,9 @@ struct ProgressBars {
     /// Renderer-agnostic state, kept in sync by folding each event. The bars
     /// below only render numbers sourced from here.
     state: RunState,
+    /// Epoch bookkeeping so resumed runs show current-epoch rate/ETA instead
+    /// of numbers poisoned by earlier epochs and idle gaps (UI-9).
+    epochs: EpochTracker,
 }
 
 impl ProgressBars {
@@ -482,13 +581,14 @@ impl ProgressBars {
             rate_bar,
             checkpoint_bar,
             state: RunState::default(),
+            epochs: EpochTracker::default(),
         })
     }
 
     fn handle_event(&mut self, event: &ProgressEvent) -> Result<()> {
         // Fold first so the bars below render numbers from a single source of
         // truth; the match only handles indicatif-specific presentation.
-        self.state.fold(event);
+        self.epochs.fold(&mut self.state, event);
         match event {
             ProgressEvent::StageStarted { stage, .. } => {
                 self.stage_bar.set_message(format!("{stage}..."));
@@ -515,8 +615,8 @@ impl ProgressBars {
                         "{}/{} done, {:.1} seg/min, ETA {}",
                         self.state.done_segments,
                         self.state.total_segments,
-                        self.state.segments_per_minute(),
-                        format_eta(self.state.eta_secs()),
+                        self.epochs.segments_per_minute(&self.state),
+                        format_eta(self.epochs.eta_secs(&self.state)),
                     ));
                 }
                 _ => {}
@@ -561,19 +661,37 @@ impl ProgressBars {
                     ))
                     .ok();
             }
+            // `changed_fields`/`application` above are crate-generated
+            // identifiers, but rejection reasons and warning/error messages
+            // carry provider- or book-controlled text; sanitize anything
+            // external before the terminal sees it (UI-5).
             ProgressEvent::RuntimeConfigRejected {
                 revision, message, ..
             } => {
                 let revision = revision.map_or_else(String::new, |value| format!(" r{value}"));
                 self.multi
-                    .println(format!("  [runtime{revision} rejected] {message}"))
+                    .println(format!(
+                        "  [runtime{revision} rejected] {}",
+                        sanitize_terminal(message)
+                    ))
                     .ok();
             }
             ProgressEvent::Warning { message, .. } => {
-                self.multi.println(format!("  [warn] {message}")).ok();
+                self.multi
+                    .println(format!("  [warn] {}", sanitize_terminal(message)))
+                    .ok();
             }
             ProgressEvent::Error { message, .. } => {
-                self.multi.println(format!("  [error] {message}")).ok();
+                self.multi
+                    .println(format!("  [error] {}", sanitize_terminal(message)))
+                    .ok();
+            }
+            ProgressEvent::DroppedEvents { count, .. } => {
+                self.multi
+                    .println(format!(
+                        "  [dropped] {count} progress event(s) lost to queue overflow"
+                    ))
+                    .ok();
             }
             ProgressEvent::TranslationFinished {
                 needs_review,
@@ -846,6 +964,51 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("Warning"));
+    }
+
+    /// UI-10: queue overflow must be reported with honest accounting. The
+    /// delta helper only surfaces fresh drops once each.
+    #[test]
+    fn newly_dropped_events_are_reported_exactly_once_per_batch() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut reported = 0usize;
+
+        assert!(take_newly_dropped(&dropped, &mut reported).is_none());
+
+        dropped.fetch_add(7, Ordering::Relaxed);
+        assert_eq!(take_newly_dropped(&dropped, &mut reported), Some(7));
+        assert!(take_newly_dropped(&dropped, &mut reported).is_none());
+
+        dropped.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(take_newly_dropped(&dropped, &mut reported), Some(2));
+        assert_eq!(reported, 9);
+    }
+
+    /// UI-10: a `DroppedEvents` marker written through the JSONL writer lands
+    /// in the durable replay log so burst losses stay visible to tail/watch.
+    #[test]
+    fn dropped_events_marker_is_persisted_to_the_replay_log() {
+        let path = std::env::temp_dir().join(format!(
+            "bookforge-test-dropped-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut writer = JsonlFileWriter::new(Some(path.clone()), false);
+        writer
+            .write_event(&ProgressEvent::DroppedEvents {
+                count: 12,
+                timestamp_ms: 42,
+            })
+            .unwrap();
+        writer.flush().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let parsed: serde_json::Value = serde_json::from_str(content.trim())
+            .expect("dropped-events marker should be valid JSONL");
+        assert_eq!(parsed["DroppedEvents"]["count"], 12);
     }
 
     #[test]

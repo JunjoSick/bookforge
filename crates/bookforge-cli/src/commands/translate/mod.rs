@@ -767,6 +767,7 @@ pub(crate) async fn run_fallback_pass(
     primary_run_config: &TranslationRunConfig,
     control: Option<&mut crate::control::ControlFilePoller<'_>>,
     progress: Arc<dyn bookforge_core::ProgressSink>,
+    print_stdout: bool,
 ) -> Result<Vec<SegmentTranslation>> {
     let telemetry = TelemetryLog::new();
     let glossary_rules = std::collections::HashMap::new();
@@ -784,6 +785,7 @@ pub(crate) async fn run_fallback_pass(
         progress,
         &telemetry,
         &glossary_rules,
+        print_stdout,
     )
     .await
 }
@@ -806,6 +808,7 @@ pub(crate) async fn run_fallback_pass_instrumented(
         String,
         Vec<bookforge_core::glossary::GlossarySelectionRule>,
     >,
+    print_stdout: bool,
 ) -> Result<Vec<SegmentTranslation>> {
     let Some(fallback_config) = fallback_config else {
         return Ok(translations);
@@ -858,12 +861,17 @@ pub(crate) async fn run_fallback_pass_instrumented(
         return Ok(translations);
     }
 
-    println!(
-        "Fallback: retrying {} segments with {}/{}",
-        candidates.len(),
-        provider_str,
-        model_str
-    );
+    // UI-22: human-only stdout must stay quiet in `--ui json`/quiet/TUI modes
+    // so automation sees a parseable event stream; the same information is
+    // available via fallback-prefixed request events on the progress sink.
+    if print_stdout {
+        println!(
+            "Fallback: retrying {} segments with {}/{}",
+            candidates.len(),
+            provider_str,
+            model_str
+        );
+    }
 
     let run_config = TranslationRunConfig {
         source_language: primary_run_config.source_language.clone(),
@@ -1150,6 +1158,8 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
     let model = provider.model().to_string();
 
     println!("Benchmarking {} / {}", provider_config.base_url, model);
+    // --concurrency was previously parsed and printed but ignored (every
+    // sample ran sequentially); it now actually bounds parallel samples.
     println!(
         "Samples: {}, Tokens: {}, Concurrency: {}",
         args.samples, args.tokens, args.concurrency
@@ -1162,25 +1172,49 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
     let mut ratelimit_count = 0usize;
     let mut timeout_count = 0usize;
     let mut total_output_tokens = 0u64;
-    let mut _total_input_tokens = 0u64;
 
-    for i in 0..args.samples {
-        let request = bookforge_llm::CompletionRequest {
-            system: "You are a translator. Return JSON only: {\"translation\":\"...\"}".to_string(),
-            user: format!("Translate: {{\"text\":\"{}\"}} Return JSON.", pigeon),
-            response_format: bookforge_llm::ResponseFormat::Json,
-            temperature: 0.2,
-            max_output_tokens: Some(args.tokens as u32),
-            metadata: Default::default(),
+    let make_request = || bookforge_llm::CompletionRequest {
+        system: "You are a translator. Return JSON only: {\"translation\":\"...\"}".to_string(),
+        user: format!("Translate: {{\"text\":\"{pigeon}\"}} Return JSON."),
+        response_format: bookforge_llm::ResponseFormat::Json,
+        temperature: 0.2,
+        max_output_tokens: Some(args.tokens as u32),
+        metadata: Default::default(),
+    };
+
+    // Bounded-concurrency sample loop: up to `--concurrency` requests are in
+    // flight at once; `concurrency == 1` degenerates to the old sequential
+    // behavior. Results are reported in completion order.
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut next_sample = 0usize;
+    let mut reported_samples = 0usize;
+    while next_sample < args.samples.min(args.concurrency.max(1)) {
+        let provider_clone = provider.clone();
+        let request = make_request();
+        let index = next_sample;
+        join_set.spawn(async move { (index, provider_clone.complete(request).await) });
+        next_sample += 1;
+    }
+
+    while let Some(join_result) = join_set.join_next().await {
+        reported_samples += 1;
+        let (index, result) = match join_result {
+            Ok(pair) => pair,
+            Err(join_err) => {
+                failure_count += 1;
+                println!(
+                    "  [{}/{}] FAIL [join] {join_err}",
+                    reported_samples, args.samples
+                );
+                continue;
+            }
         };
-
-        print!("  [{}/{}] ", i + 1, args.samples);
-        match provider.complete(request).await {
+        print!("  [{}/{}] ", index + 1, args.samples);
+        match result {
             Ok(resp) => {
                 latencies.push(resp.provider_latency_ms);
                 success_count += 1;
                 total_output_tokens += resp.output_tokens.unwrap_or(0);
-                _total_input_tokens += resp.input_tokens.unwrap_or(0);
                 let tok_sec = if resp.provider_latency_ms > 0 {
                     resp.output_tokens.unwrap_or(0) as f64
                         / (resp.provider_latency_ms as f64 / 1000.0)
@@ -1205,6 +1239,13 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
                 }
                 println!("FAIL [{kind}] {e}");
             }
+        }
+        if next_sample < args.samples {
+            let provider_clone = provider.clone();
+            let request = make_request();
+            let index = next_sample;
+            join_set.spawn(async move { (index, provider_clone.complete(request).await) });
+            next_sample += 1;
         }
     }
 

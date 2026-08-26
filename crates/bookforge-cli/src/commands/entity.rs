@@ -54,6 +54,11 @@ struct ClearArgs {
 
     #[arg(long)]
     scope_id: Option<String>,
+
+    /// Confirm the deletion. Required so a stray Enter cannot wipe stored
+    /// guidance; nothing is removed without this flag.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -223,9 +228,21 @@ fn list_entities(store: &JobStore, args: ListArgs) -> Result<()> {
 
 fn clear_entities(store: &JobStore, args: ClearArgs) -> Result<()> {
     validate_scope(args.scope, args.scope_id.as_deref())?;
+    confirm_destructive_clear(args.yes, "entity")?;
     let count = store.clear_entities_scope(args.scope, args.scope_id.as_deref())?;
     println!("Cleared {count} entity rows.");
     Ok(())
+}
+
+/// Shared guard for destructive `clear` subcommands: refuse to delete stored
+/// guidance unless the caller passed an explicit `--yes`.
+fn confirm_destructive_clear(confirmed: bool, what: &str) -> Result<()> {
+    if confirmed {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to clear {what} without --yes; re-run with --yes to delete the selected scope"
+    )
 }
 
 fn show_entities(store: &JobStore, args: ShowArgs) -> Result<()> {

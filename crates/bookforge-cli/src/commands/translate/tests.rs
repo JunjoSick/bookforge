@@ -456,6 +456,7 @@ async fn fallback_pass_honors_stop_control_file() {
         &run_config,
         Some(&mut control),
         Arc::new(NullProgressSink),
+        false,
     )
     .await
     .expect("fallback should stop before provider request");

@@ -567,6 +567,14 @@ cargo run -p bookforge-cli -- translate book.epub \
 
 Review artifacts contain the full source and translated text of the book. They are written locally under `.bookforge/runs/<job-id>/review/`; treat them as private user data.
 
+### Exit codes
+
+Scripts can rely on a small taxonomy (full table in
+[docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md)): `0` success or intentional
+stop, `1` runtime failure, `2` usage error, `3` the job finished but segments
+remain failed/needs-review, and `130` interrupted by Ctrl+C with progress saved
+for `resume`.
+
 Known limitations: terminal commands read provider API keys from environment
 variables, while the browser dashboard can also accept a session-only pasted
 key. PDF ingestion currently prioritizes text reconstruction; complex figures

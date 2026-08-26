@@ -104,6 +104,11 @@ struct ClearArgs {
 
     #[arg(long)]
     scope_id: Option<String>,
+
+    /// Confirm the deletion. Required so a stray Enter cannot wipe stored
+    /// terminology; nothing is removed without this flag.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1042,9 +1047,21 @@ fn remove_term(store: &JobStore, args: RemoveArgs) -> Result<()> {
 
 fn clear_terms(store: &JobStore, args: ClearArgs) -> Result<()> {
     validate_scope(args.scope, args.scope_id.as_deref())?;
+    confirm_destructive_clear(args.yes)?;
     let removed = store.clear_glossary_scope(args.scope, args.scope_id.as_deref())?;
     println!("Removed {removed} glossary terms.");
     Ok(())
+}
+
+/// Shared guard for destructive `clear` subcommands: refuse to delete stored
+/// terminology unless the caller passed an explicit `--yes`.
+fn confirm_destructive_clear(confirmed: bool) -> Result<()> {
+    if confirmed {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to clear glossary without --yes; re-run with --yes to delete the selected scope"
+    )
 }
 
 fn glossary_toml_to_terms(parsed: GlossaryToml) -> Result<Vec<GlossaryTerm>> {

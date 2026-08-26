@@ -609,12 +609,17 @@ where
 
     if provider_run.cancel_token.is_cancelled() && !job_was_stopped(&store, &job.id)? {
         let _ = store.mark_job_interrupted(&job.id);
-        eprintln!();
-        eprintln!("Interrupted by user.");
-        eprintln!("Your progress has been saved to job: {}", job.id);
-        eprintln!();
-        eprintln!("Resume with:");
-        eprintln!("  bookforge resume {}", job.id);
+        if human_stdout_enabled(cli_args.ui) {
+            eprintln!();
+            eprintln!("Interrupted by user.");
+            eprintln!("Your progress has been saved to job: {}", job.id);
+            eprintln!();
+            eprintln!("Resume with:");
+            eprintln!("  bookforge resume {}", job.id);
+        }
+        // UI-21: a user interruption is reported as 130 (128+SIGINT), not a
+        // silent success — progress is saved, but the run did not finish.
+        crate::exit_code::request(crate::exit_code::INTERRUPTED);
         return Ok(());
     }
 

@@ -3,11 +3,14 @@ mod checkpoint;
 mod commands;
 mod control;
 mod cost;
+mod epoch;
 #[cfg(any(feature = "tui", feature = "serve"))]
 mod eventlog;
+mod exit_code;
 mod performance;
 mod progress;
 mod report;
+pub(crate) mod sanitize;
 #[cfg(feature = "tui")]
 mod tui;
 
@@ -37,15 +40,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[command(
     name = "bookforge",
     version,
-    about = "EPUB-first AI book translation tool"
-)]
-#[cfg_attr(
-    feature = "serve",
-    command(after_help = "Run `bookforge` without a command to open the local browser dashboard.")
-)]
-#[cfg_attr(
-    not(feature = "serve"),
-    command(after_help = "This build was compiled without the local browser dashboard.")
+    about = "EPUB-first AI book translation tool",
+    after_help = exit_codes_help_text()
 )]
 struct Cli {
     #[command(subcommand)]
@@ -108,8 +104,29 @@ enum Command {
     Serve(serve::ServeArgs),
 }
 
+fn exit_codes_help_text() -> &'static str {
+    #[cfg(feature = "serve")]
+    {
+        concat!(
+            "Exit codes: 0 success or intentional stop · 1 runtime failure · ",
+            "2 usage error · 3 job finished with failed/needs-review segments · ",
+            "130 interrupted by Ctrl+C (progress saved)\n",
+            "Run `bookforge` without a command to open the local browser dashboard."
+        )
+    }
+    #[cfg(not(feature = "serve"))]
+    {
+        concat!(
+            "Exit codes: 0 success or intentional stop · 1 runtime failure · ",
+            "2 usage error · 3 job finished with failed/needs-review segments · ",
+            "130 interrupted by Ctrl+C (progress saved)\n",
+            "This build was compiled without the local browser dashboard."
+        )
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     init_tracing();
     install_panic_hook();
 
@@ -120,21 +137,33 @@ async fn main() -> Result<()> {
         cancel.cancel();
     });
 
-    match parse_cli()?.command {
+    let result = match parse_cli().command {
         Some(command) => run_command(command, cancel_token).await,
         None => run_default().await,
-    }
+    };
+    std::process::exit(match result {
+        Ok(()) => exit_code::resolve(false),
+        // Preserve the `Error: …` diagnostic that Rust's Termination impl used
+        // to print for `async fn main() -> anyhow::Result<()>`.
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            exit_code::resolve(true)
+        }
+    });
 }
 
-fn parse_cli() -> Result<Cli> {
+/// Parse the CLI. On a parse error the error is printed and the process exits
+/// with clap's usage code (2), so this never returns `Err` to `main`.
+fn parse_cli() -> Cli {
     match Cli::try_parse() {
-        Ok(cli) => Ok(cli),
+        Ok(cli) => cli,
         Err(err) => {
             let exit_code = err.exit_code();
             if let Err(print_err) = err.print()
                 && !is_broken_pipe(&print_err)
             {
-                return Err(print_err.into());
+                eprintln!("Error: {print_err}");
+                std::process::exit(exit_code::FAILURE);
             }
             std::process::exit(exit_code);
         }
@@ -391,5 +420,70 @@ mod tests {
             "top-level commands without help text: {}",
             missing.join(", ")
         );
+    }
+
+    #[test]
+    fn top_level_help_documents_the_exit_code_taxonomy() {
+        let mut help = Vec::new();
+        Cli::command()
+            .write_long_help(&mut help)
+            .expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf-8");
+
+        assert!(help.contains("Exit codes"));
+        // Each documented bucket is named with its number.
+        for needle in [
+            "0 success",
+            "1 runtime failure",
+            "2 usage error",
+            "3 job finished",
+            "130 interrupted",
+        ] {
+            assert!(help.contains(needle), "help must mention `{needle}`");
+        }
+    }
+
+    /// UI-13: tri-state bool flags accept the bare form (flag alone = true)
+    /// and an explicit value (`=false` / ` false`) — the same syntax
+    /// `reconfigure` uses, instead of translate-only "value required".
+    #[test]
+    fn tri_state_flags_accept_bare_and_explicit_forms() {
+        let bare = Cli::parse_from([
+            "bookforge",
+            "translate",
+            "book.epub",
+            "--target",
+            "Italian",
+            "--compact-prompts",
+            "--retry-failed-only",
+            "--adaptive-concurrency",
+        ]);
+        match bare.command {
+            Some(Command::Translate(args)) => {
+                assert_eq!(args.compact_prompts, Some(true));
+                assert_eq!(args.retry_failed_only, Some(true));
+                assert_eq!(args.adaptive_concurrency, Some(true));
+            }
+            _ => panic!("expected translate command"),
+        }
+
+        let explicit = Cli::parse_from([
+            "bookforge",
+            "translate",
+            "book.epub",
+            "--target",
+            "Italian",
+            "--compact-prompts=false",
+            "--retry-failed-only=false",
+            "--adaptive-concurrency=false",
+        ]);
+        match explicit.command {
+            Some(Command::Translate(args)) => {
+                assert_eq!(args.compact_prompts, Some(false));
+                assert_eq!(args.retry_failed_only, Some(false));
+                assert_eq!(args.adaptive_concurrency, Some(false));
+            }
+            _ => panic!("expected translate command"),
+        }
     }
 }

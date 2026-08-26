@@ -69,8 +69,9 @@ async fn job_detail(
         }
         let mut tailer = EventLogTailer::new(events_path);
         let mut state = RunState::default();
+        let mut epochs = crate::epoch::EpochTracker::default();
         for event in tailer.poll()? {
-            state.fold(&event);
+            epochs.fold(&mut state, &event);
         }
         Ok(Some(JobDetail::new(lookup, job, state)))
     })
@@ -174,6 +175,7 @@ async fn job_events(
         }
         let mut tailer = EventLogTailer::new(path);
         let mut run = RunState::default();
+        let mut epochs = crate::epoch::EpochTracker::default();
         let mut ticker = tokio::time::interval(refresh);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last = String::new();
@@ -182,7 +184,7 @@ async fn job_events(
             ticker.tick().await;
             if let Ok(events) = tailer.poll() {
                 for event in events {
-                    run.fold(&event);
+                    epochs.fold(&mut run, &event);
                 }
             }
             if let Ok(payload) = serde_json::to_string(&run)

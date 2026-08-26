@@ -40,13 +40,19 @@ pub struct TranslateArgs {
     #[arg(long)]
     pub batch_max_items: Option<usize>,
 
-    #[arg(long)]
+    /// Emit compact prompts (fewer boilerplate tokens). Bare flag means
+    /// true; use `--compact-prompts=false` to disable a plan preset.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub compact_prompts: Option<bool>,
 
-    #[arg(long)]
+    /// Only retranslate segments marked failed in a snapshot resume.
+    /// Bare flag means true; use `--retry-failed-only=false` to force off.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub retry_failed_only: Option<bool>,
 
-    #[arg(long)]
+    /// Let the scheduler adapt concurrency to provider feedback. Bare flag
+    /// means true; use `--adaptive-concurrency=false` to pin the fixed limit.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub adaptive_concurrency: Option<bool>,
 
     #[arg(long)]

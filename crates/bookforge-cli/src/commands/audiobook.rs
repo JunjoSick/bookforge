@@ -18,6 +18,7 @@ use clap::{Args, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio_util::sync::CancellationToken;
 
+use crate::sanitize::sanitize_terminal;
 use crate::{audio_cost::AudioCost, progress::UiMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -85,6 +86,9 @@ impl TextNormalizationArg {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Environment:\n  BOOKFORGE_AUDIO_PRICING_PATH  Override the bundled audio pricing table with a TOML file."
+)]
 pub struct AudiobookArgs {
     /// Source EPUB to narrate.
     pub input: Option<PathBuf>,
@@ -132,7 +136,7 @@ pub struct AudiobookArgs {
     #[arg(long, default_value_t = 4)]
     pub concurrency: usize,
 
-    #[arg(long, default_value_t = 120)]
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_seconds: u64,
 
     /// Optional delivery or pronunciation guidance. Supported by Gemini and
@@ -194,7 +198,9 @@ pub struct AudiobookArgs {
     pub m4b: bool,
 
     /// Do not automatically create the default chapter-marked `.m4b`.
-    #[arg(long, default_value_t = false)]
+    /// Mutually exclusive with `--m4b` (a book file cannot be both required
+    /// and suppressed); clap rejects the combination up front.
+    #[arg(long, default_value_t = false, conflicts_with = "m4b")]
     pub no_book_file: bool,
 
     /// Print the chapter/chunk plan and exit without synthesizing.
@@ -237,8 +243,21 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     if args.seed.is_some() && args.provider != AudioProviderKind::Elevenlabs {
         anyhow::bail!("--seed is supported only with --provider elevenlabs");
     }
-    if args.timeout_seconds == 0 {
-        anyhow::bail!("--timeout-seconds must be greater than zero");
+
+    // Long phases (EPUB parse, provider model preflight, chunk planning,
+    // quota checks) previously ran without any feedback before the header
+    // printed. Emit early progress so users know the command is alive (and
+    // so `--ui json` streams a machine-readable start marker).
+    match args.ui {
+        UiMode::Json => println!(
+            "{}",
+            serde_json::json!({
+                "event": "audiobook_planning_started",
+                "input": input.display().to_string(),
+            })
+        ),
+        UiMode::Quiet | UiMode::Tui => {}
+        UiMode::Auto | UiMode::Progress => println!("Planning audio chunks..."),
     }
 
     let (book, pdf_page_grouping) = read_epub_for_audio(input)?;
@@ -454,6 +473,27 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     let total_chars: usize = plan.iter().map(|chunk| chunk.chars).sum();
+
+    // Detected sizes land before provider cost/quota preflights, which can
+    // take seconds on hosted providers — surface them as soon as they exist.
+    match args.ui {
+        UiMode::Json => println!(
+            "{}",
+            serde_json::json!({
+                "event": "audiobook_plan_detected_sizes",
+                "chapters": chapter_count,
+                "chunks": plan.len(),
+                "characters": total_chars,
+            })
+        ),
+        UiMode::Quiet | UiMode::Tui => {}
+        UiMode::Auto | UiMode::Progress => println!(
+            "Detected {} chapters, {} chunks, {total_chars} characters; estimating cost...",
+            chapter_count,
+            plan.len()
+        ),
+    }
+
     let provider_name = audio_provider_name(args.provider);
     crate::audio_cost::load_audio_pricing()?;
     let estimated_cost = crate::audio_cost::estimate_audio_cost(provider_name, &model, total_chars);
@@ -469,9 +509,15 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     let human_output = !matches!(args.ui, UiMode::Quiet | UiMode::Json | UiMode::Tui);
     if human_output {
         println!("Input: {}", input.display());
+        // EPUB metadata is externally controlled; sanitize before the
+        // terminal sees it (UI-5).
         println!(
             "Title: {}",
-            book.metadata.title.as_deref().unwrap_or("(untitled)")
+            book.metadata
+                .title
+                .as_deref()
+                .map(sanitize_terminal)
+                .unwrap_or_else(|| "(untitled)".to_string())
         );
         println!("Output: {}", out_dir.display());
         println!("Voice: {voice} | Format: {}", format.extension());
@@ -650,7 +696,7 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                     failure.chapter_index + 1,
                     failure.part,
                     failure.file,
-                    failure.error
+                    sanitize_terminal(&failure.error)
                 );
             }
             eprintln!(
@@ -984,9 +1030,6 @@ async fn list_voices_and_exit(args: &AudiobookArgs) -> Result<()> {
     if args.provider != AudioProviderKind::Elevenlabs {
         anyhow::bail!("--list-voices requires --provider elevenlabs");
     }
-    if args.timeout_seconds == 0 {
-        anyhow::bail!("--timeout-seconds must be greater than zero");
-    }
     let base_url = args
         .base_url
         .as_deref()
@@ -1180,7 +1223,12 @@ fn progress_callback(ui: UiMode, total: usize) -> Arc<dyn Fn(Progress) + Send + 
         } else {
             "synthesized"
         };
-        progress.set_message(format!("{state}: {}", event.chapter_title));
+        // Chapter titles come from the EPUB; strip control characters before
+        // the indicatif bar echoes them to the terminal (UI-5).
+        progress.set_message(format!(
+            "{state}: {}",
+            sanitize_terminal(&event.chapter_title)
+        ));
         if event.done == event.total {
             progress.finish_and_clear();
         }

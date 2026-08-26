@@ -11,6 +11,9 @@ use crate::{
 };
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Environment:\n  BOOKFORGE_PRICING_PATH  Override the bundled provider pricing table with a TOML file."
+)]
 pub struct EstimateArgs {
     pub input: PathBuf,
 

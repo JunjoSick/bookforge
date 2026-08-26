@@ -195,6 +195,10 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
     let input = args.input.clone();
     let conversion_input = input.clone();
     let conversion_output = output.clone();
+    // The conversion (and optional OCR of low-confidence pages) can take
+    // minutes; previously everything printed only after completion, leaving
+    // a silent start. Announce the work up front.
+    println!("Converting {} → {} ...", input.display(), output.display());
     let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
         let ocr_client = ocr_config
             .map(HttpOcrClient::new)

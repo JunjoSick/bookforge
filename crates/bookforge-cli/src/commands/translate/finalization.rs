@@ -82,6 +82,7 @@ where
         progress.clone(),
         telemetry,
         glossary_rules,
+        human_stdout_enabled(cli_args.ui),
     )
     .await?;
     *translations = fallback_translations;
@@ -165,6 +166,12 @@ where
         elapsed_ms: started.elapsed().as_millis() as u64,
         timestamp_ms: bookforge_core::progress::now_ms(),
     });
+
+    // UI-21: finishing with unresolved segments is not a clean success. The
+    // artifacts are written, but scripts can distinguish this outcome from 0.
+    if summary.failed > 0 || summary.needs_review > 0 {
+        crate::exit_code::request(crate::exit_code::COMPLETED_WITH_FAILURES);
+    }
 
     Ok(())
 }
@@ -262,6 +269,10 @@ where
     if settings.double_check.mode == DoubleCheckMode::Off {
         return Ok(true);
     }
+    // UI-22: double-check progress is human-only stdout; `--ui json` must
+    // stay a parseable event stream end to end. The audited requests still
+    // surface as double-check-prefixed RequestStarted/Finished events.
+    let print_stdout = human_stdout_enabled(cli_args.ui);
 
     let (dc_provider, dc_provider_name, dc_model) =
         if cli_args.double_check_provider.is_some() || cli_args.double_check_model.is_some() {
@@ -317,9 +328,11 @@ where
     double_check_config.provider = dc_provider_name;
     double_check_config.model = dc_model;
 
-    println!("Double-check: auditing translations...");
+    if print_stdout {
+        println!("Double-check: auditing translations...");
+    }
     let corrections = match run_double_check(
-        ProgressRequestProvider::new(dc_provider, progress),
+        ProgressRequestProvider::new(dc_provider, progress.clone()),
         segments,
         translations,
         &double_check_config,
@@ -360,10 +373,37 @@ where
     let changed_segment_ids = apply_double_check_corrections(translations, &corrections);
     persist_corrected_translations(store, job_id, config, translations, &changed_segment_ids)?;
 
-    println!(
-        "  Corrections: {applied} applied, {rejected} rejected, {unresolved} unresolved, {} segments updated",
-        changed_segment_ids.len()
-    );
+    // Deterministic stop/lifecycle ordering (wave-2 LLM-9 follow-up): the
+    // correction chunks' ok-status RequestFinished events are *not*
+    // important to the JSONL flush policy and could otherwise sit in the
+    // writer buffer while finalize advanced into its terminal stage, making
+    // externally observed completion of corrections race with the final
+    // outcome. Emitting one important event here drains that buffer now,
+    // so any control request recorded after corrected blocks are visible is
+    // guaranteed a pre-terminal observation window.
+    if !changed_segment_ids.is_empty() {
+        progress.emit(bookforge_core::ProgressEvent::Warning {
+            kind: "double_check_corrections_persisted".to_string(),
+            message: format!(
+                "{applied} applied correction{} persisted for {} segment{}",
+                if applied == 1 { "" } else { "s" },
+                changed_segment_ids.len(),
+                if changed_segment_ids.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ),
+            timestamp_ms: bookforge_core::progress::now_ms(),
+        });
+    }
+
+    if print_stdout {
+        println!(
+            "  Corrections: {applied} applied, {rejected} rejected, {unresolved} unresolved, {} segments updated",
+            changed_segment_ids.len()
+        );
+    }
 
     Ok(true)
 }
