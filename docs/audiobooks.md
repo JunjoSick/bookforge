@@ -120,6 +120,11 @@ aloud instead of treating them as directives.
   `eleven_multilingual_v2`. An explicit `--model` bypasses auto-selection.
   Supported outputs are MP3, Opus, WAV, and PCM.
 
+  If the models endpoint cannot be reached because of a transient network
+  failure, the run does not abort: it degrades deterministically to the
+  cheapest suitable tier instead — see
+  [Cost and quota preflight](#cost-and-quota-preflight).
+
   ```bash
   bookforge audiobook book.epub --provider elevenlabs \
     --voice JBFqnCBsd6RMkjVDRZzb \
@@ -204,15 +209,32 @@ prints the applicable dollar and/or provider-credit estimate, for example:
 Estimated cost: ~$1.23 / ~4500 credits
 ```
 
-Pricing is per character, so changing chunk size does not change the estimate.
-These figures are planning estimates, not invoices: provider plans and rates
-can change, and the provider's own billing is authoritative.
+Set `BOOKFORGE_AUDIO_PRICING_PATH` to a JSON file with the same structure to
+override the bundled table (for new models or updated rates). Pricing is per
+character, so changing chunk size does not change the estimate. These figures
+are planning estimates, not invoices: provider plans and rates can change, and
+the provider's own billing is authoritative.
 
 Before a live ElevenLabs run, BookForge queries `/v1/user/subscription` and
 prints a line such as `ElevenLabs quota: 12000 remaining of 20000`. It warns
 when the plan exceeds the remaining quota. A dry run performs the same check
-when the configured key environment variable is available. Network or quota
-preflight failure is always a warning and never prevents synthesis.
+when the configured key environment variable is available. Network failures
+during that quota lookup are always a warning and never prevent synthesis.
+
+Model preflight behaves differently from the quota lookup. If the account's
+model list cannot be fetched because of a transient network failure, BookForge
+degrades deterministically to the cheapest suitable tier — Flash v2.5 first,
+then Turbo v2.5, then Multilingual v2, each only if its character limit fits
+the request; the priciest tiers (`eleven_v3`, Multilingual v2 when Flash fits)
+are never selected by this degraded path. The choice is a pure function of the
+run settings, so a resumed run after an outage resolves to the same model,
+hashes identically, and reuses previously paid chunks instead of re-synthesizing.
+The library reports degraded selections with `degraded: true` plus a
+human-readable `reason`; the CLI surfaces the reason in plan output
+(`Degraded model choice: …` and `model_degraded_reason` in the JSON
+`audiobook_plan` event) and other (non-transient) preflight errors keep failing
+hard in the engine and are reported as a warning by the CLI, which then falls
+back to Multilingual v2 as before.
 
 ## Book files, stitching, and loudness
 
@@ -238,10 +260,13 @@ stitching and ordinary flat-file assembly use stream copy. Raw PCM is rejected
 for stitching because it has no container-level sample metadata; choose WAV
 for uncompressed intermediates.
 
-`--loudnorm` applies ffmpeg's loudness filter once while assembling the `.m4b`
-and flat file. It deliberately does not normalize each chapter independently,
-which would allow target differences to create audible level jumps. Individual
-chapter downloads therefore remain unnormalized.
+`--loudnorm` normalizes the assembled book to `I=-18:TP=-2:LRA=11`. The
+`.m4b` path normalizes each chapter into a bounded intermediate first, probes
+durations from those intermediates, and then assembles — chapter markers match
+the published audio even though loudnorm resamples internally (skipped loudly,
+never published with drifted markers, if normalization fails). The flat-file
+path applies the filter in one pass at assembly. Chapter files and downloads
+remain unnormalized either way.
 
 If ffmpeg is unavailable, BookForge keeps the completed chunks and warns that
 it could not create the automatic book file. An explicitly requested `--m4b`
@@ -269,10 +294,16 @@ stitch warnings into the additive `warnings` array in `process.json`.
 ## Resume and cache cleanup
 
 Re-run the same command and every matching hashed chunk already on disk is
-skipped. A normal resume repairs every missing or invalid cache entry. After a
-partial failure, add `--retry-failed` for the stronger paid-run guarantee: only
-records whose prior status is `failed` may call the provider. Previously
-successful records are validated against the manifest's byte count and SHA-256
+skipped. A normal resume repairs every missing or invalid cache entry. The
+output directory is guarded by a cross-process lock while a build runs, so a
+second invocation fails fast
+(`output directory is locked by another BookForge audiobook run`) instead of
+corrupting the manifest or pruning another run's freshly paid chunks; a lock
+left behind by a process that died without cleanup is reclaimed automatically.
+After a partial failure, add `--retry-failed` for the stronger paid-run
+guarantee: only records whose prior status is `failed` may call the provider.
+Previously successful records are validated against the manifest's byte count
+and SHA-256
 hash; if one is missing or changed, failed-only mode reports it rather than
 silently paying to regenerate it.
 
@@ -289,7 +320,10 @@ Superseded chunks stay on disk so prior generations remain auditable. Pass
 `--prune` to remove chunk files the current run does not use and free the
 space; combine it with `--dry-run` to list them without deleting anything.
 Stitched per-chapter outputs, assembled book files, and `manifest.json` are
-never pruned.
+never pruned. `--prune` also sweeps crash debris that no run will ever consume
+— interrupted atomic writes (`*.part.tmp`), legacy backup copies
+(`*.replace.bak`), and staged concatenation inputs — while never touching the
+live run's lock file or any managed output.
 
 Stitched chapter filenames are ASCII-only, lowercase slugs with repeated
 separators collapsed. Non-ASCII characters are stripped rather than

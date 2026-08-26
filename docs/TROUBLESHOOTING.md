@@ -39,9 +39,17 @@ bookforge serve --open
 ```
 
 The default address is `http://127.0.0.1:8765`. BookForge intentionally
-accepts only a loopback bind because the dashboard is unauthenticated and can
-launch runs with session-only provider keys. Do not expose it through a public
-interface or reverse proxy.
+accepts only a loopback bind, and the dashboard requires a session token by
+default: the console prints a one-time bootstrap URL containing it, and every
+other request needs the token header (see the dashboard notes in
+[CLI_REFERENCE.md](CLI_REFERENCE.md#local-browser-dashboard)). Open that printed
+URL rather than typing a bare address — with `--no-auth` any local process could
+reach remembered provider keys. Do not expose the port through a public
+interface or reverse proxy in either mode.
+
+If the URL from an older terminal or shell history stopped working, restart
+`bookforge serve` and use the freshly printed bootstrap link: each server
+process generates its own session token.
 
 If port 8765 is occupied, choose another loopback port:
 
@@ -59,7 +67,13 @@ bookforge status <job-id>
 ```
 
 The dashboard follows the same rule. Starting it from another folder displays
-that folder's independent job library.
+that folder's independent job library — with one exception: when the dashboard's
+working directory is not writable, `serve` relocates to a per-user data
+directory and says so on its console
+(`working directory was not writable; storing data in …`). Dashboard jobs then
+live under the printed directory and stay invisible to CLI commands run from
+the original folder; run them from there instead. There is no global store-path
+override today.
 
 Do not move only `jobs.sqlite`: run directories contain event logs, snapshots,
 review artifacts, and control files referenced by the database. Move or back

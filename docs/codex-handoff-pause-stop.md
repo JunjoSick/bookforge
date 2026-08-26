@@ -1,5 +1,8 @@
 # Handoff to Codex — §10.1.1 Pause + Stop (2026-07-04)
 
+> **Historical snapshot:** this milestone shipped in v2.3.0 (2026-07-05).
+> Content preserved as written; behavior details may have evolved since.
+
 Written by Claude Code on behalf of the maintainer. Second of two
 quality-of-life milestones after v2.2.0 (the first, §9c reflow, is on
 `feat/reflow`).

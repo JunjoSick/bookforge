@@ -1,5 +1,8 @@
 # Handoff to Codex — v1.7 Bilingual output (2026-07-03)
 
+> **Historical snapshot:** this milestone shipped as v2.2.0 (2026-07-04).
+> Content preserved as written; behavior details may have evolved since.
+
 Written by Claude Code on behalf of the maintainer. This is the next
 roadmap milestone after v1.6 shipped in v2.1.0.
 

@@ -2,6 +2,140 @@
 
 ## Unreleased
 
+Remediation campaign for the 2026-08 deep audit (`docs/report.md`, waves 0–2):
+security hardening around the local dashboard, reliability repairs in the
+checkpoint/resume lifecycle, translation-quality work, audio/PDF fixes, plus
+corrections to two audit findings that turned out wrong. See
+`docs/HANDOFF-2026-08.md` for the wave-by-wave record.
+
+### Security
+
+- **Security:** the browser dashboard authenticates by default. The server
+  prints a one-time bootstrap URL containing its session token, and every
+  route beyond that page requires the token in the `x-bookforge-csrf` header —
+  closing the hole where any local process could harvest a token from `/` and
+  spend remembered provider keys. `--no-auth` restores unauthenticated serving
+  for consoles-only environments.
+- **Security:** `.bookforge` roots are created private (0700 on Unix) from the
+  first moment, pre-existing loose components are tightened at startup,
+  dashboard-uploaded EPUBs are written 0600, and estimate-upload parsing uses
+  unpredictable owner-only temporary directories that self-delete.
+- **Security:** cancel requests check whether the stored worker PID is alive
+  before any process action, so PID reuse can no longer kill unrelated trees.
+- **Security:** job ids passed through dashboard routes are strictly
+  allowlisted before reaching filesystem paths, blocking traversal-shaped
+  reads of arbitrary files.
+- **Security:** concurrent dashboard launches are capped, protecting against
+  many parallel billable runs sharing remembered keys, and every launch runs
+  behind a panic boundary so a crash cannot take the server down mid-run.
+- **Security:** book text enters prompts inside fenced, sanitized context
+  blocks instead of unfenced sections, shrinking the prompt-injection surface
+  while validation still bounds structural damage.
+- **Security:** archive reads for `reflow` and `validate` now go through the
+  same decompression budget as translation parsing — no CLI command remains
+  that an under-declared zip entry can OOM.
+- Infrastructure hardening: CI gains a least-privilege permissions block,
+  SHA-pinned actions, and a checksum-verified EPUBCheck download; zip is built
+  deflate-only on the pure-Rust zlib-rs backend (drops the zstd-sys C
+  toolchain requirement); explicit ignore rules cover test-key files and
+  editor scratch directories.
+
+### Reliability
+
+- Human corrections are frozen by SQL inside single immediate transactions:
+  `INSERT … WHERE human_corrected = 0` guarantees neither the CLI worker nor a
+  dashboard job racing the same segment can overwrite an accepted correction,
+  including during deliberate double-runs via `resume --force`.
+- Each segment checkpoint commits as one transaction instead of three to five
+  separate autocommits, removing crash windows between related writes.
+- One malformed batch response can no longer abort a paid run. Failures
+  carrying the phantom `"unknown"` segment id are re-attributed to the actual
+  requested segment (or dropped with a warning when unattributable), and the
+  checkpoint writer survives per-command errors: each poisoned command is
+  logged as an error event and skipped, with a final
+  `checkpoint_dropped_commands` warning totaling what was lost versus saved.
+- Resume tells the truth again. Completion is decided from persisted segment
+  statuses — not merely from rebuilt blocks — so jobs whose segments failed
+  again during resume no longer report `succeeded`, and dead-row failures are
+  surfaced. Hard command errors mark jobs `failed` instead of leaving them
+  stuck `running`.
+- Plain `resume` acquires a worker lease just like the dashboard, preventing
+  two live workers from doubling provider spend on the same job.
+- The pause/stop watcher owns one long-lived store connection instead of
+  reopening and fully migrating SQLite roughly ten times per second for the
+  life of every run.
+- Interrupting matters everywhere: Ctrl+C during `resume` cancels cleanly, an
+  attached TUI quit passes cancellation through, and late pause/stop requests
+  can no longer rewrite terminal outcomes in the completion window.
+- Exit codes are a stable documented taxonomy: `0` success/intentional stop,
+  `1` runtime failure, `2` usage error, `3` finished-with-unresolved-segments,
+  `130` interrupted. `doctor` exits non-zero on failed checks with `--no-fail`
+  preserving green scripts.
+
+### Quality and performance
+
+- Output-token budgets are honored uniformly: the effective ceiling is the
+  smaller of the user cap and the context remainder, floors apply to net
+  output, and batch and single-segment paths behave identically.
+- Transient batch retries are paced with backoff and classify 408/425 as
+  retryable; malformed JSON responses tolerate markdown fences and trailing
+  prose, avoiding needless split/retry churn.
+- Double-check concurrency settings are actually used; multiple correction
+  rounds run for real, and applied corrections persist transactionally with a
+  visible persistence marker before terminal events drain.
+- Long prompts stopped shipping mojibake em-dashes; seven templates were
+  repaired and a guard test keeps them clean.
+- EPUB internals: script/style/svg/math content is suppressed as verbatim
+  paired markers instead of being absorbed as translatable inline text;
+  marker nesting is depth-capped; sixteen divergent helper implementations
+  collapsed into one platform-neutral utility; validation matches extensions
+  case-insensitively and checks each file once.
+- Script-aware source-copy detection replaces the heuristic's Latin biases.
+- Terminal surfaces sanitize external text, unify tri-state flag syntax,
+  keep `--ui json` stdout free of human chatter, emit honest
+  `DroppedEvents` records when events are lost, and rebaseline rate/ETA on
+  resume epochs.
+
+### Audio
+
+- A transient network failure during ElevenLabs auto-model selection now
+  degrades deterministically to the cheapest suitable tier (never Eleven v3 or
+  another premium tier) instead of failing open to Multilingual v2 pricing;
+  the deterministic choice keeps resumed runs cache-compatible, and library
+  consumers see `degraded: true` plus a reason.
+- Audiobook output directories are locked cross-process while a build runs;
+  concurrent invocations fail fast instead of corrupting manifests or pruning
+  the other run's paid chunks, and stale locks left by dead processes are
+  reclaimed automatically.
+- Sentence chunking understands CJK punctuation (`。！？`) and stops cutting CJK
+  prose mid-word and English sentences after abbreviations such as "Mr.".
+- ffmpeg never blocks waiting for terminal input (`-nostdin`, null stdin),
+  runs under timeouts, and is killed-and-reaped when hung; `--loudnorm`
+  normalizes per-chapter intermediates so chapter markers track the published
+  audio, and silently ignored options now warn loudly instead.
+- `--prune` sweeps crash debris (interrupted `.part.tmp` writes, legacy
+  `.replace.bak` backups, staged concat inputs) while never deleting managed
+  outputs or lock files.
+
+### PDF
+
+- Temporary working directories are cleaned up through RAII even when figure
+  or media passes fail early; successful OCR no longer wipes figure blocks
+  anchored on the same pages; running-header removal is accounted for before
+  coverage thresholds fire spurious OCR.
+- Generated conversion artifacts gain deterministic content-hashed UIDs,
+  respect `SOURCE_DATE_EPOCH`, and build their table of contents from the
+  detected heading structure; caption detection warns when non-English labels
+  will be missed; render sizes and OCR request bodies are capped.
+
+### Audit corrections
+
+- PDF-1 was refuted: `cargo test -p bookforge-pdf` compiles and runs on
+  Windows, and the ungated tests touch none of the cfg(unix) helpers.
+- PDF-4 was refuted with poppler 26.08 evidence: adding `-i` to pdftohtml
+  strips the image-placement tags the converter relies on, so the flag stays
+  absent deliberately.
+
 ## v2.6.1 - 2026-07-21
 
 - **Security:** ElevenLabs keys are no longer passed to the quota lookup through

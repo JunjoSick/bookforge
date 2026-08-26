@@ -60,8 +60,9 @@ bookforge serve --open
 ```
 
 Use `--bind` to select another loopback address or port. `--refresh-ms` controls
-the live-update interval; values are clamped to the range from 50 through 5,000
-milliseconds.
+the live-update interval; values are clamped to the range from 20 through 5,000
+milliseconds — the same floor (`MIN_REFRESH_MS`, 20 ms) that
+`watch --refresh-ms` uses.
 
 ```bash
 bookforge serve --bind 127.0.0.1:9000 --refresh-ms 500
@@ -81,15 +82,33 @@ unwritable directory is replaced with `%LOCALAPPDATA%\BookForge`, falling back
 to `%USERPROFILE%\BookForge`. On other platforms it uses
 `$XDG_DATA_HOME/bookforge`, falling back to `$HOME/.local/share/bookforge`.
 Uploads, job state, outputs, and dashboard-launched child processes then use
-that relocated working directory.
+that relocated working directory. When the relocation happens, the server
+prints `working directory was not writable; storing data in …` on its console.
+The CLI has no relocation logic: a job launched in the dashboard is visible to
+`bookforge status`, `resume`, and friends only when you run them from the same
+directory the server resolved — which is your current directory whenever it was
+writable. There is no global override that redirects all BookForge state to one
+shared location today, so treat relocation notices as the signal to start other
+commands from the printed directory.
 
-The dashboard is deliberately unauthenticated and may hold provider API keys,
-so it is only for the person at that machine. This is enforced at the network
-boundary: `--bind` rejects every non-loopback address and directs remote users
-to an SSH tunnel. Keys pasted into the dashboard remain in server memory only
-for the lifetime of the process. They are never written to disk, logged, or
-placed on a child process's command line; spawned runs receive them through
-their environment.
+The dashboard is authenticated by default. At startup the server generates a
+per-session token, prints a bootstrap URL of the form
+`http://127.0.0.1:8765/?token=…` on its console, and requires that token on
+every route outside that one bootstrap page: API and mutating requests must
+carry it in the `x-bookforge-csrf` header, which is also what mutation requests
+always used; wrong or missing tokens get a bare 401. The bootstrap URL is the
+console equivalent of handing the browser the session — never share or re-print
+it (and redact it in screenshots). `--no-auth` disables the token check as an
+escape hatch for environments where the console is unreachable (for example a
+container orchestrator that only forwards the port); with the token disabled,
+any local process can spend remembered provider keys, so prefer an SSH tunnel
+plus the default token flow instead.
+
+Because only loopback processes should hold session tokens anyway, `--bind`
+rejects every non-loopback address and directs remote users to an SSH tunnel.
+Keys pasted into the dashboard remain in server memory only for the lifetime
+of the process. They are never written to disk, logged, or placed on a child
+process's command line; spawned runs receive them through their environment.
 
 Mutating requests require the per-server CSRF token in the
 `x-bookforge-csrf` header, and Host-header middleware rejects requests that do
@@ -279,6 +298,10 @@ bookforge status <job-id>
 bookforge watch <job-id>
 bookforge tail <job-id> --last 40
 ```
+
+`watch` follows a job's durable event log live in the terminal dashboard. Its
+`--refresh-ms` flag (default 150) sets the replay/refresh cadence and is clamped
+to the shared 20–5,000 ms range, exactly like `serve --refresh-ms`.
 
 After translation, review and validate the output:
 
@@ -643,6 +666,32 @@ Set `BOOKFORGE_EPUBCHECK` to an EPUBCheck executable, its directory, or an
 `epubcheck.jar` when automatic discovery is insufficient. Without EPUBCheck,
 the report records `unavailable`; BookForge's own checks still run.
 
+## UI modes (`--ui`)
+
+Translation-family commands (`translate`, `resume`, and the audiobook command)
+accept `--ui` to select how progress is presented:
+
+| Mode | Behavior |
+| --- | --- |
+| `auto` | Default. Live progress bars when stderr is attached to a terminal; silent otherwise. |
+| `progress` | Always render live multi-bar progress on the terminal, even without a TTY. |
+| `quiet` | No progress rendering at all — no bars, no event lines. Command-level errors still reach stderr through the normal error path, and run artifacts/checkpoints are unaffected. |
+| `json` | One JSON line per progress event on stdout. For translation runs these are the [events.md](events.md) objects exactly as persisted. Script against stdout only after verifying you use this mode: everything human-facing moves out of the way. |
+| `tui` | Full-screen terminal dashboard attached to the in-process run (requires the `tui` build feature). |
+
+JSON stdout purity: with `--ui json`, `translate` and `resume` emit *only*
+`ProgressEvent` lines on stdout — banners, warnings, QA/double-check notices,
+and resume hints are suppressed there (they would otherwise pollute a
+machine-parsed stream) instead of being redirected. Human-readable diagnostics
+continue on stderr, so automation can safely parse stdout alone. The audiobook
+command's `json` dialect is its own envelope (see the note at the end of
+[events.md](events.md)); it keeps the same stdout-only-json discipline but with
+different object shapes.
+
+Regardless of mode, passing `--progress-jsonl <path>` durably records the full
+event stream in every mode — including `quiet` and `progress` — using lazy file
+creation after the job id is known.
+
 For automation, select JSON progress and a durable event file:
 
 ```bash
@@ -671,7 +720,10 @@ Automation can rely on a small, stable exit-code taxonomy (also summarized by
 | 130 | Interrupted by Ctrl+C (or an attached `--ui tui` quit). Progress is checkpointed; run `resume` to continue. |
 
 An interruption always reports 130 even if a provider error followed, and any
-returned runtime error reports 1.
+returned runtime error reports 1. `doctor` participates directly: with failed
+checks it exits 1 and tells you so on stderr; scripts that relied on the old
+always-green behavior can pass `--no-fail` to keep a zero exit while the report
+itself still records every failure.
 
 ## Benchmark provider latency and throughput
 
@@ -722,6 +774,12 @@ provider:
 bookforge audiobook book.epub --provider mock --dry-run
 bookforge audiobook book.epub --voice alloy --format mp3 --stitch
 ```
+
+Cost estimates come from the bundled schema-1
+`crates/bookforge-cli/pricing/audio-providers.json`; set
+`BOOKFORGE_AUDIO_PRICING_PATH` to a JSON file with the same structure to
+override it for every estimate, dry run, and plan. Estimates are planning
+figures only.
 
 See [audiobooks.md](audiobooks.md) for providers, formats, resume hashing,
 pruning, ffmpeg stitching, and M4B assembly. The M4B embeds the EPUB 3

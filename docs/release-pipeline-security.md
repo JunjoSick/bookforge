@@ -100,7 +100,13 @@ and the official action release pages for [checkout](https://github.com/actions/
 
 ## Accepted risk: no local authentication on the dashboard (audit finding 5)
 
-**Status:** deliberately deferred, owner decision 2026-07-21.
+**Status:** deliberately deferred, owner decision 2026-07-21. **Update
+2026-08-26:** the primary intended mitigation has since shipped (audit wave 1,
+H-5) — the dashboard now mints a random session token at startup, includes it
+only in the printed bootstrap URL, and requires it on every route outside that
+page; `--no-auth` restores unauthenticated serving explicitly. The analysis
+below is preserved as written when the risk was accepted; concurrent-launch
+caps also landed, while cookie exchange and spend limits remain open ideas.
 
 The dashboard binds to loopback and defends against cross-origin browser
 requests with a CSRF token, but the token is embedded in the unauthenticated

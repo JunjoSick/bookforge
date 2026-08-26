@@ -171,8 +171,10 @@ open a new one, and try `bookforge` again.
 10. If segments fail or need review, use **Retry failed / needs-review**.
 
 Outputs, uploads, checkpoints, review data, and validation reports are stored
-locally under `.bookforge/` in the folder where you started BookForge. Do not
-share `.bookforge/` if the book or translation is private.
+locally under `.bookforge/` in the folder where you started BookForge (if that
+folder is not writable, the dashboard relocates its data to a per-user
+directory and prints the new location). Do not share `.bookforge/` if the book
+or translation is private.
 
 To stop the web app, return to the terminal running `bookforge` and press
 `Ctrl+C`. The translation data stays on disk and can be opened again later.
@@ -509,8 +511,11 @@ only whole-book assembly; per-chapter files remain unnormalized. Point
 `--base-url` at a local server such as kokoro-fastapi to synthesize offline.
 
 Plans and dry runs use `crates/bookforge-cli/pricing/audio-providers.json` for
-cost estimates, and ElevenLabs performs a non-fatal quota preflight. The
-estimates are planning figures only; provider billing is authoritative. The
+cost estimates; point `BOOKFORGE_AUDIO_PRICING_PATH` at a same-structure JSON
+file to override it. ElevenLabs performs a non-fatal quota preflight, and a
+transient failure while auto-selecting the ElevenLabs model degrades
+deterministically to the cheapest suitable tier instead of an expensive one.
+The estimates are planning figures only; provider billing is authoritative. The
 browser dashboard adds ElevenLabs Auto model selection and a voice picker, a
 pre-launch cost/quota estimate, per-chapter progress, in-page playback, and
 Advanced controls for chapter pause, flat output, loudness, seed, and language.
@@ -622,7 +627,7 @@ export OPENROUTER_API_KEY=...
 ```bash
 cargo fmt --all --check
 cargo test --workspace
-cargo clippy --workspace --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
+cargo clippy --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for what's expected in issues
