@@ -308,23 +308,18 @@ pub fn extract_glossary_candidates(
 /// occasional Latin word from rerouting a Han, Kana, Hangul, Thai, Arabic,
 /// Hebrew, or Devanagari source.
 fn candidate_extraction_strategy(blocks: &[Block]) -> CandidateExtractionStrategy {
-    let (cased, caseless) = blocks.iter().fold((0usize, 0usize), |counts, block| {
-        block_visible_text(block)
-            .chars()
-            .filter(|ch| ch.is_alphabetic())
-            .fold(counts, |(cased, caseless), ch| {
-                if ch.is_lowercase() || ch.is_uppercase() {
-                    (cased + 1, caseless)
-                } else {
-                    (cased, caseless + 1)
-                }
-            })
+    let counts = blocks.iter().fold((0usize, 0usize), |counts, block| {
+        let (cased, caseless) = crate::script::script_counts(&block_visible_text(block));
+        (counts.0 + cased, counts.1 + caseless)
     });
 
-    if cased > caseless {
-        CandidateExtractionStrategy::Capitalization
-    } else {
-        CandidateExtractionStrategy::Recurrence
+    match crate::script::classify(counts) {
+        crate::script::ScriptClass::Cased => CandidateExtractionStrategy::Capitalization,
+        // Ties and text without alphabetic evidence fall here deliberately;
+        // see the note above on preserving recall.
+        crate::script::ScriptClass::Caseless | crate::script::ScriptClass::Undetermined => {
+            CandidateExtractionStrategy::Recurrence
+        }
     }
 }
 

@@ -9,6 +9,7 @@ pub mod math;
 pub mod progress;
 pub mod run_snapshot;
 pub mod scheduler;
+pub mod script;
 pub mod segment;
 pub mod style;
 
@@ -41,6 +42,7 @@ pub use run_snapshot::{
     RunConfigSnapshot,
 };
 pub use scheduler::SchedulerConfig;
+pub use script::{ScriptClass, is_space_delimited, script_class, script_counts};
 pub use style::{
     DoNotFields, RegisterFields, StyleSheet, VoiceFields, merge_style_sheets, render_style_block,
     style_fingerprint,
