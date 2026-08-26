@@ -71,20 +71,6 @@ pub fn rebuild_epub(book: &Book, translations: &[BlockTranslation], output: &Pat
     rebuild_epub_with_options(book, translations, output, &RebuildOptions::default())
 }
 
-pub fn rebuild_epub_with_language(
-    book: &Book,
-    translations: &[BlockTranslation],
-    output: &Path,
-    target_language: Option<&str>,
-) -> Result<()> {
-    rebuild_epub_with_options(
-        book,
-        translations,
-        output,
-        &RebuildOptions::replace_with_target_language(target_language),
-    )
-}
-
 pub fn rebuild_epub_with_options(
     book: &Book,
     translations: &[BlockTranslation],

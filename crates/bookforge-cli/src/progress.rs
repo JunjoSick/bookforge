@@ -44,11 +44,6 @@ impl ChannelProgressSink {
     pub fn new(tx: mpsc::Sender<ProgressEvent>, dropped: Arc<AtomicUsize>) -> Self {
         Self { tx, dropped }
     }
-
-    #[allow(dead_code)]
-    pub fn dropped_count(&self) -> usize {
-        self.dropped.load(Ordering::Relaxed)
-    }
 }
 
 impl ProgressSink for ChannelProgressSink {

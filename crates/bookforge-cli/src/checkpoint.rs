@@ -16,7 +16,6 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 pub const CHECKPOINT_QUEUE_CAPACITY: usize = 64;
 
-#[allow(dead_code)]
 pub enum CheckpointCommand {
     SaveTranslation {
         job_id: String,
@@ -25,27 +24,16 @@ pub enum CheckpointCommand {
         model: String,
         prompt_version: String,
     },
-    MarkFailed {
-        job_id: String,
-        segment_id: String,
-        error: String,
-    },
 }
 
 impl CheckpointCommand {
     fn segment_id_for_progress(&self) -> Option<String> {
-        match self {
-            CheckpointCommand::SaveTranslation { translation, .. } => {
-                Some(translation.segment_id.0.clone())
-            }
-            CheckpointCommand::MarkFailed { segment_id, .. } => Some(segment_id.clone()),
-        }
+        let CheckpointCommand::SaveTranslation { translation, .. } = self;
+        Some(translation.segment_id.0.clone())
     }
 
     fn segment_finished_event(&self) -> Option<ProgressEvent> {
-        let CheckpointCommand::SaveTranslation { translation, .. } = self else {
-            return None;
-        };
+        let CheckpointCommand::SaveTranslation { translation, .. } = self;
         Some(ProgressEvent::SegmentFinished {
             segment_id: translation.segment_id.0.clone(),
             status: segment_status_str(translation.status).to_string(),
@@ -197,15 +185,6 @@ impl CheckpointWriter {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn sender_with_progress(&self, progress: Arc<dyn ProgressSink>) -> CheckpointSender {
-        CheckpointSender {
-            tx: self.tx.clone(),
-            queue_depth: self.queue_depth.clone(),
-            progress,
-        }
-    }
-
     pub async fn shutdown(self) -> Result<()> {
         let CheckpointWriter { tx, join, .. } = self;
         drop(tx);
@@ -217,70 +196,60 @@ impl CheckpointWriter {
 }
 
 fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
-    match cmd {
-        CheckpointCommand::SaveTranslation {
-            job_id,
-            translation,
-            provider,
-            model,
-            prompt_version,
-        } => {
-            let joined = translation.joined_text();
-            match translation.status {
-                SegmentStatus::Succeeded => {
-                    store.save_translation_with_findings(
-                        SaveTranslation {
-                            job_id: &job_id,
-                            segment_id: &translation.segment_id.0,
-                            translated_text: &joined,
-                            blocks: &translation.blocks,
-                            provider: &provider,
-                            model: &model,
-                            prompt_version: &prompt_version,
-                            input_tokens: translation.input_tokens,
-                            input_cached_tokens: translation.input_cached_tokens,
-                            output_tokens: translation.output_tokens,
-                            tokens_estimated: translation.tokens_estimated,
-                        },
-                        translation.error.as_deref(),
-                    )?;
-                }
-                SegmentStatus::NeedsReview => {
-                    store.save_needs_review(SaveNeedsReview {
-                        job_id: &job_id,
-                        segment_id: &translation.segment_id.0,
-                        preserved_text: &joined,
-                        blocks: &translation.blocks,
-                        provider: &provider,
-                        model: &model,
-                        prompt_version: &prompt_version,
-                        error: translation
-                            .error
-                            .as_deref()
-                            .unwrap_or("translation requires review"),
-                        input_tokens: translation.input_tokens,
-                        input_cached_tokens: translation.input_cached_tokens,
-                        output_tokens: translation.output_tokens,
-                        tokens_estimated: translation.tokens_estimated,
-                    })?;
-                }
-                SegmentStatus::Failed => {
-                    store.mark_segment_failed(
-                        &job_id,
-                        &translation.segment_id.0,
-                        translation.error.as_deref().unwrap_or("translation failed"),
-                    )?;
-                }
-                _ => {}
-            }
+    let CheckpointCommand::SaveTranslation {
+        job_id,
+        translation,
+        provider,
+        model,
+        prompt_version,
+    } = cmd;
+    let joined = translation.joined_text();
+    match translation.status {
+        SegmentStatus::Succeeded => {
+            store.save_translation_with_findings(
+                SaveTranslation {
+                    job_id: &job_id,
+                    segment_id: &translation.segment_id.0,
+                    translated_text: &joined,
+                    blocks: &translation.blocks,
+                    provider: &provider,
+                    model: &model,
+                    prompt_version: &prompt_version,
+                    input_tokens: translation.input_tokens,
+                    input_cached_tokens: translation.input_cached_tokens,
+                    output_tokens: translation.output_tokens,
+                    tokens_estimated: translation.tokens_estimated,
+                },
+                translation.error.as_deref(),
+            )?;
         }
-        CheckpointCommand::MarkFailed {
-            job_id,
-            segment_id,
-            error,
-        } => {
-            store.mark_segment_failed(&job_id, &segment_id, &error)?;
+        SegmentStatus::NeedsReview => {
+            store.save_needs_review(SaveNeedsReview {
+                job_id: &job_id,
+                segment_id: &translation.segment_id.0,
+                preserved_text: &joined,
+                blocks: &translation.blocks,
+                provider: &provider,
+                model: &model,
+                prompt_version: &prompt_version,
+                error: translation
+                    .error
+                    .as_deref()
+                    .unwrap_or("translation requires review"),
+                input_tokens: translation.input_tokens,
+                input_cached_tokens: translation.input_cached_tokens,
+                output_tokens: translation.output_tokens,
+                tokens_estimated: translation.tokens_estimated,
+            })?;
         }
+        SegmentStatus::Failed => {
+            store.mark_segment_failed(
+                &job_id,
+                &translation.segment_id.0,
+                translation.error.as_deref().unwrap_or("translation failed"),
+            )?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -676,10 +645,12 @@ mod tests {
         drop(rx);
 
         let result = sender
-            .send(CheckpointCommand::MarkFailed {
+            .send(CheckpointCommand::SaveTranslation {
                 job_id: "job".to_string(),
-                segment_id: "seg".to_string(),
-                error: "some error".to_string(),
+                translation: Box::new(test_translation("seg", 0, SegmentStatus::Succeeded)),
+                provider: "mock".to_string(),
+                model: "mock-model".to_string(),
+                prompt_version: "v1".to_string(),
             })
             .await;
         assert!(

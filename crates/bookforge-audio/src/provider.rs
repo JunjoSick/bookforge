@@ -13,14 +13,10 @@ mod elevenlabs;
 mod gemini;
 
 pub use elevenlabs::{
-    ELEVENLABS_DEGRADED_FALLBACK_ORDER, ELEVENLABS_MAX_INPUT_CHARS, ELEVENLABS_PREFERRED_MODELS,
     ElevenLabsModelResolution, ElevenLabsSubscription, ElevenLabsTtsConfig, ElevenLabsTtsProvider,
-    ElevenLabsVoice, degraded_elevenlabs_model, elevenlabs_model_max_input_chars,
-    fetch_elevenlabs_subscription, fetch_elevenlabs_subscription_with_cancel,
-    fetch_elevenlabs_subscription_with_key, fetch_elevenlabs_subscription_with_key_and_cancel,
-    list_elevenlabs_voices, list_elevenlabs_voices_with_cancel, resolve_preferred_elevenlabs_model,
-    resolve_preferred_elevenlabs_model_reported,
-    resolve_preferred_elevenlabs_model_reported_with_cancel,
+    ElevenLabsVoice, elevenlabs_model_max_input_chars, fetch_elevenlabs_subscription,
+    fetch_elevenlabs_subscription_with_key_and_cancel, list_elevenlabs_voices,
+    list_elevenlabs_voices_with_cancel, resolve_preferred_elevenlabs_model_reported_with_cancel,
 };
 pub use gemini::{GeminiTtsConfig, GeminiTtsProvider};
 

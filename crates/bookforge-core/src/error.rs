@@ -15,7 +15,4 @@ pub enum BookforgeError {
 
     #[error("ZIP error: {0}")]
     Zip(#[from] zip::result::ZipError),
-
-    #[error("operation is not implemented yet: {0}")]
-    NotImplemented(&'static str),
 }

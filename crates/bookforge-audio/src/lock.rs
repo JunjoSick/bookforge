@@ -33,13 +33,13 @@ use std::time::Duration;
 
 /// Lock file convention inside every audiobook out_dir. Prune sweeps treat
 /// the name as protected: a live build's lock file is never deleted.
-pub const LOCK_FILE_NAME: &str = ".bookforge-audio.lock";
+pub(crate) const LOCK_FILE_NAME: &str = ".bookforge-audio.lock";
 
 const ACQUIRE_ATTEMPTS: usize = 3;
 const RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
-pub struct OutDirLock {
+pub(crate) struct OutDirLock {
     path: PathBuf,
     /// Process that wrote the record; exposed for tests and diagnostics.
     pub(crate) pid: u32,
@@ -70,7 +70,7 @@ impl Drop for OutDirLock {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum LockError {
+pub(crate) enum LockError {
     #[error("{detail}")]
     Held { detail: HeldDetail },
 
@@ -179,7 +179,7 @@ fn try_acquire(path: &Path) -> std::io::Result<std::fs::File> {
 /// Acquire the process-lifetime build lock for `out_dir`, retrying briefly
 /// around a reclaimed dead-owner race so two simultaneous reclaimers do not
 /// spuriously fail each other.
-pub fn acquire_out_dir_lock(out_dir: &Path) -> Result<OutDirLock, LockError> {
+pub(crate) fn acquire_out_dir_lock(out_dir: &Path) -> Result<OutDirLock, LockError> {
     let path = out_dir.join(LOCK_FILE_NAME);
     let mut last_seen_holder = None;
     for _attempt in 0..ACQUIRE_ATTEMPTS {

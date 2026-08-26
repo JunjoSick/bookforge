@@ -28,11 +28,8 @@ impl fmt::Debug for ApiKey {
     }
 }
 
-/// Absolute maximum Unicode characters accepted by an ElevenLabs TTS model.
-pub const ELEVENLABS_MAX_INPUT_CHARS: usize = 40_000;
-
 /// ElevenLabs models in BookForge's preferred auto-selection order.
-pub const ELEVENLABS_PREFERRED_MODELS: &[&str] = &[
+pub(crate) const ELEVENLABS_PREFERRED_MODELS: &[&str] = &[
     "eleven_v3",
     "eleven_flash_v2_5",
     "eleven_turbo_v2_5",
@@ -45,7 +42,7 @@ pub const ELEVENLABS_PREFERRED_MODELS: &[&str] = &[
 /// tier. `eleven_v3` is deliberately absent — as the priciest option it must
 /// never be chosen by a *degraded* path, and it is additionally excluded by
 /// request whenever speed control is needed.
-pub const ELEVENLABS_DEGRADED_FALLBACK_ORDER: &[&str] = &[
+pub(crate) const ELEVENLABS_DEGRADED_FALLBACK_ORDER: &[&str] = &[
     "eleven_flash_v2_5",
     "eleven_turbo_v2_5",
     "eleven_multilingual_v2",
@@ -75,7 +72,7 @@ pub async fn fetch_elevenlabs_subscription(
 
 /// AUDIO-17: cancellation-safe variant; a cancelled token aborts an
 /// in-flight metadata request instead of waiting out the timeout.
-pub async fn fetch_elevenlabs_subscription_with_cancel(
+async fn fetch_elevenlabs_subscription_with_cancel(
     config: &ElevenLabsTtsConfig,
     cancel_token: CancellationToken,
 ) -> Result<ElevenLabsSubscription> {
@@ -97,26 +94,6 @@ pub async fn fetch_elevenlabs_subscription_with_cancel(
     .await
 }
 
-/// Fetch ElevenLabs subscription usage with a caller-supplied API key.
-///
-/// This path never reads or mutates the process environment.
-pub async fn fetch_elevenlabs_subscription_with_key(
-    base_url: &str,
-    api_key: &str,
-    timeout_seconds: u64,
-) -> Result<ElevenLabsSubscription> {
-    fetch_elevenlabs_subscription_request(
-        base_url,
-        Some(&ApiKey::new(api_key)),
-        timeout_seconds,
-        ELEVENLABS_METADATA_MAX_ATTEMPTS,
-        &CancellationToken::new(),
-    )
-    .await
-}
-
-/// Cancellation-safe explicit-key twin of
-/// [`fetch_elevenlabs_subscription_with_key`].
 pub async fn fetch_elevenlabs_subscription_with_key_and_cancel(
     base_url: &str,
     api_key: &str,
@@ -225,7 +202,7 @@ pub fn elevenlabs_model_max_input_chars(model: &str) -> usize {
 ///
 /// Fail-open target per DOC-15: the CHEAPEST tier that can still satisfy the
 /// request, never `eleven_v3` or any premium tier.
-pub fn degraded_elevenlabs_model(
+pub(crate) fn degraded_elevenlabs_model(
     max_chars: usize,
     needs_speed_control: bool,
 ) -> Option<&'static str> {
@@ -252,16 +229,6 @@ pub struct ElevenLabsModelResolution {
 }
 
 /// Select the best available ElevenLabs model for the requested contract.
-pub async fn resolve_preferred_elevenlabs_model(
-    config: &ElevenLabsTtsConfig,
-    max_chars: usize,
-    needs_speed_control: bool,
-) -> Result<String> {
-    resolve_preferred_elevenlabs_model_reported(config, max_chars, needs_speed_control)
-        .await
-        .map(|resolution| resolution.model)
-}
-
 /// Cancellation-safe, fully-reporting resolver. Callers that own a run-level
 /// token must use this so a cancel during model preflight aborts instead of
 /// silently waiting for retries.
@@ -300,27 +267,6 @@ pub async fn resolve_preferred_elevenlabs_model_reported_with_cancel(
         }
         Err(error) => Err(error),
     }
-}
-
-/// Full-resolution variant of [`resolve_preferred_elevenlabs_model`]:
-/// identical selection when reachable, but on a transient transport failure
-/// (timeout / connection refused) it fails OPEN to the cheapest suitable
-/// tier instead of erroring out or defaulting to the most expensive one.
-/// Parse failures and HTTP errors keep failing hard — those mean the
-/// account/endpoint state is wrong, not merely flaky, and guessing could
-/// bill against a model the caller did not expect.
-pub async fn resolve_preferred_elevenlabs_model_reported(
-    config: &ElevenLabsTtsConfig,
-    max_chars: usize,
-    needs_speed_control: bool,
-) -> Result<ElevenLabsModelResolution> {
-    resolve_preferred_elevenlabs_model_reported_with_cancel(
-        config,
-        max_chars,
-        needs_speed_control,
-        CancellationToken::new(),
-    )
-    .await
 }
 
 impl TtsError {
@@ -560,6 +506,21 @@ mod tests {
         CAPTURE_WINDOW, one_request_server, one_request_server_with_content_length,
         retry_transient_transport,
     };
+
+    async fn resolve_preferred_elevenlabs_model(
+        config: &ElevenLabsTtsConfig,
+        max_chars: usize,
+        needs_speed_control: bool,
+    ) -> Result<String> {
+        resolve_preferred_elevenlabs_model_reported_with_cancel(
+            config,
+            max_chars,
+            needs_speed_control,
+            CancellationToken::new(),
+        )
+        .await
+        .map(|resolution| resolution.model)
+    }
 
     fn request(format: AudioFormat) -> SpeechRequest {
         SpeechRequest {
@@ -887,9 +848,14 @@ mod tests {
     #[tokio::test]
     async fn unreachable_preflight_fails_open_to_the_cheapest_suitable_tier() {
         let config = resolver_config(closed_loopback_url(), "RESOLVER_DEGRADE_UNUSED_KEY");
-        let resolution = resolve_preferred_elevenlabs_model_reported(&config, 5_000, false)
-            .await
-            .expect("transient outage must degrade, not fail the run");
+        let resolution = resolve_preferred_elevenlabs_model_reported_with_cancel(
+            &config,
+            5_000,
+            false,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("transient outage must degrade, not fail the run");
 
         assert!(resolution.degraded);
         assert_eq!(resolution.model, "eleven_flash_v2_5");
@@ -914,12 +880,22 @@ mod tests {
     #[tokio::test]
     async fn degraded_choice_is_deterministic_across_resume_attempts() {
         let config = resolver_config(closed_loopback_url(), "RESOLVER_DEGRADE_STABLE_KEY");
-        let first = resolve_preferred_elevenlabs_model_reported(&config, 12_000, false)
-            .await
-            .unwrap();
-        let second = resolve_preferred_elevenlabs_model_reported(&config, 12_000, false)
-            .await
-            .unwrap();
+        let first = resolve_preferred_elevenlabs_model_reported_with_cancel(
+            &config,
+            12_000,
+            false,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let second = resolve_preferred_elevenlabs_model_reported_with_cancel(
+            &config,
+            12_000,
+            false,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(first, second, "identical inputs must resolve identically");
         // Flash carries the 40k ceiling too, so 12k chars still fit the
         // cheapest tier; turbo would only appear for models that out-live
@@ -982,14 +958,19 @@ mod tests {
             async move {
                 let (base_url, captured) =
                     one_request_server(body.into_bytes(), "application/json");
-                fetch_elevenlabs_subscription_with_key(&base_url, "explicit-subscription-key", 5)
-                    .await
-                    .map(|subscription| {
-                        let raw = captured
-                            .recv_timeout(CAPTURE_WINDOW)
-                            .expect("mock should capture the request");
-                        (subscription, raw)
-                    })
+                fetch_elevenlabs_subscription_with_key_and_cancel(
+                    &base_url,
+                    "explicit-subscription-key",
+                    5,
+                    CancellationToken::new(),
+                )
+                .await
+                .map(|subscription| {
+                    let raw = captured
+                        .recv_timeout(CAPTURE_WINDOW)
+                        .expect("mock should capture the request");
+                    (subscription, raw)
+                })
             }
         })
         .await
@@ -1074,9 +1055,14 @@ mod tests {
                 MAX_JSON_RESPONSE_BODY_BYTES as u64 + 1,
             );
             let outcome: std::result::Result<(), TtsError> =
-                fetch_elevenlabs_subscription_with_key(&base_url, "oversize-key", 5)
-                    .await
-                    .map(|_| panic!("oversized response should be rejected"));
+                fetch_elevenlabs_subscription_with_key_and_cancel(
+                    &base_url,
+                    "oversize-key",
+                    5,
+                    CancellationToken::new(),
+                )
+                .await
+                .map(|_| panic!("oversized response should be rejected"));
             outcome
         })
         .await

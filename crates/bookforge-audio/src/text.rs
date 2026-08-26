@@ -13,14 +13,14 @@ use bookforge_core::marker::strip_marker_tokens;
 use bookforge_core::script::is_space_delimited;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NarrationBlockKind {
+pub(crate) enum NarrationBlockKind {
     Title,
     Heading(u8),
     Paragraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NarrationBlock {
+pub(crate) struct NarrationBlock {
     pub kind: NarrationBlockKind,
     pub text: String,
 }
@@ -35,7 +35,7 @@ pub enum ChunkKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NarrationChunk {
+pub(crate) struct NarrationChunk {
     pub kind: ChunkKind,
     pub text: String,
 }
@@ -44,7 +44,7 @@ pub struct NarrationChunk {
 /// with a display title used for filenames and (when stitched) chapter
 /// markers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Chapter {
+pub(crate) struct Chapter {
     /// Zero-based position in reading order.
     pub index: usize,
     pub title: String,
@@ -54,35 +54,18 @@ pub struct Chapter {
 }
 
 impl Chapter {
-    pub fn text(&self) -> String {
-        self.blocks
-            .iter()
-            .map(|block| block.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    }
-
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.blocks.iter().all(|block| block.text.trim().is_empty())
     }
-}
-
-/// Extract narratable chapters in reading order.
-///
-/// The reader synthesizes structural sections from the OPF metadata and the
-/// NCX table of contents so those get translated; narration does not want
-/// them (nobody wants a table of contents read aloud), so they are skipped
-/// here. Chapters are numbered contiguously over the sections that survive
-/// filtering. Sections with no readable prose are still returned (with empty
-/// `text`) so the builder can skip them via [`Chapter::is_empty`].
-pub fn chapters_from_book(book: &Book) -> Vec<Chapter> {
-    chapters_from_book_with_options(book, false)
 }
 
 /// Extract chapters with optional physical-page grouping for positively
 /// identified pdftohtml sources. Ordinary EPUBs always preserve their spine
 /// section boundaries.
-pub fn chapters_from_book_with_options(book: &Book, pdf_page_grouping: bool) -> Vec<Chapter> {
+pub(crate) fn chapters_from_book_with_options(
+    book: &Book,
+    pdf_page_grouping: bool,
+) -> Vec<Chapter> {
     let block_index: std::collections::HashMap<&BlockId, &Block> =
         book.blocks.iter().map(|block| (&block.id, block)).collect();
     let navigation_hrefs: std::collections::HashSet<String> = book
@@ -611,7 +594,7 @@ fn collapse_whitespace(text: &str) -> String {
 /// `max_chars` counts Unicode scalar values, not bytes; every returned
 /// chunk is a valid string and non-empty. Returns an empty vector for
 /// blank input.
-pub fn chunk_blocks(blocks: &[NarrationBlock], max_chars: usize) -> Vec<NarrationChunk> {
+pub(crate) fn chunk_blocks(blocks: &[NarrationBlock], max_chars: usize) -> Vec<NarrationChunk> {
     let max_chars = max_chars.max(1);
     let mut chunks = Vec::new();
     let mut paragraphs = Vec::new();
@@ -655,20 +638,6 @@ pub fn chunk_blocks(blocks: &[NarrationBlock], max_chars: usize) -> Vec<Narratio
     }
     flush_paragraphs(&mut paragraphs, &mut chunks);
     chunks
-}
-
-/// Compatibility wrapper for callers that have unstructured prose.
-pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
-    chunk_blocks(
-        &[NarrationBlock {
-            kind: NarrationBlockKind::Paragraph,
-            text: text.to_string(),
-        }],
-        max_chars,
-    )
-    .into_iter()
-    .map(|chunk| chunk.text)
-    .collect()
 }
 
 fn chunk_body_text(text: &str, max_chars: usize) -> Vec<String> {
@@ -947,6 +916,28 @@ fn split_by_chars(word: &str, max_chars: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn chapter_text(chapter: &Chapter) -> String {
+        chapter
+            .blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
+        chunk_blocks(
+            &[NarrationBlock {
+                kind: NarrationBlockKind::Paragraph,
+                text: text.to_string(),
+            }],
+            max_chars,
+        )
+        .into_iter()
+        .map(|chunk| chunk.text)
+        .collect()
+    }
+
     #[test]
     fn collapses_internal_whitespace() {
         assert_eq!(collapse_whitespace("  a\n\t b  "), "a b");
@@ -1155,9 +1146,9 @@ mod tests {
             blocks,
         };
 
-        let chapters = chapters_from_book(&book);
+        let chapters = chapters_from_book_with_options(&book, false);
         assert_eq!(chapters.len(), 1);
-        assert!(chapters[0].text().starts_with("Il capitolo numero"));
+        assert!(chapter_text(&chapters[0]).starts_with("Il capitolo numero"));
     }
 
     #[test]
@@ -1256,7 +1247,7 @@ mod tests {
             blocks,
         };
 
-        let chapters = chapters_from_book(&book);
+        let chapters = chapters_from_book_with_options(&book, false);
         assert_eq!(chapters.len(), 3);
         assert_eq!(chapters[0].title, "Test Book");
         assert_eq!(chapters[1].title, "CAPITOLO I:");
@@ -1267,12 +1258,12 @@ mod tests {
         assert!(
             chapters
                 .iter()
-                .all(|chapter| !chapter.text().contains("Repeated Book Title"))
+                .all(|chapter| !chapter_text(chapter).contains("Repeated Book Title"))
         );
         assert!(
             chapters
                 .iter()
-                .all(|chapter| chapter.text().lines().all(|line| {
+                .all(|chapter| chapter_text(chapter).lines().all(|line| {
                     let line = line.trim();
                     line.is_empty() || !line.chars().all(|ch| ch.is_ascii_digit())
                 }))
@@ -1327,7 +1318,7 @@ mod tests {
             ],
         };
 
-        let chapters = chapters_from_book(&book);
+        let chapters = chapters_from_book_with_options(&book, false);
         assert_eq!(chapters[0].blocks[0].kind, NarrationBlockKind::Title);
         assert_eq!(chapters[0].blocks[2].kind, NarrationBlockKind::Heading(2));
         assert_eq!(

@@ -16,7 +16,7 @@ pub mod token_estimate;
 
 pub use config::{
     BatchConfig, BilingualMode, BilingualStyle, DoubleCheckConfig, DoubleCheckMode, FallbackScope,
-    JsonMode, ModelEndpoint, ModelRouteConfig, PromptVersion, ProviderErrorKind, ProviderPreset,
+    JsonMode, ModelEndpoint, PromptVersion, ProviderErrorKind, ProviderPreset,
     ProviderPresetResolved, ProviderPresetRuntimeOverrides, ProviderRequestMetric,
     ProviderRuntimeConfig, QaRunConfig, ResolvedRunSettings, RetryAfterPolicy, SegmentationConfig,
     TranslationConfig, TranslationProfile, cap_output_tokens,

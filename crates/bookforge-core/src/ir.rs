@@ -47,7 +47,6 @@ pub struct Resource {
 pub struct SpineItem {
     pub idref: String,
     pub href: Option<String>,
-    pub linear: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

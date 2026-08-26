@@ -45,12 +45,12 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// schema and segmentation parameters. Cached rows from a different
 /// namespace are not eligible for reuse.
 ///
-/// `style_fingerprint` and `entities_fingerprint` are opt-in mixins:
-/// pass an empty string to preserve cache compatibility with runs that
-/// didn't use the feature; pass a non-empty fingerprint when the
-/// rendered prompt actually changes. The two slots use distinct domain
-/// separators so a style fingerprint can never collide with an entity
-/// fingerprint of the same content.
+/// `glossary_fingerprint`, `style_fingerprint`, and `entities_fingerprint`
+/// are opt-in mixins: pass an empty string to preserve cache compatibility
+/// with runs that didn't use the feature; pass a non-empty fingerprint when
+/// the rendered prompt actually changes. The three slots use distinct domain
+/// separators so a fingerprint of one kind can never collide with another
+/// kind's fingerprint of the same content (CORE-13).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_cache_namespace(
     max_segment_tokens: usize,
@@ -124,7 +124,10 @@ fn compute_cache_namespace_inner(
     hasher.update(profile.as_bytes());
     hasher.update([batch_enabled as u8]);
     hasher.update(prompt_version.as_bytes());
-    if let Some(glossary_fingerprint) = glossary_fingerprint {
+    if let Some(glossary_fingerprint) =
+        glossary_fingerprint.filter(|fingerprint| !fingerprint.is_empty())
+    {
+        hasher.update(b"|glossary|");
         hasher.update(glossary_fingerprint.as_bytes());
     }
     if let Some(style_fingerprint) = style_fingerprint {
@@ -692,7 +695,7 @@ mod tests {
             "the segment source/checksum remains the unprojected IR text"
         );
         assert_eq!(
-            namespace, "53c28d2f000b24ab654709562b90b65b368ebb1a1cf50968228dad209119da9d",
+            namespace, "60bdecff5342c2a413e077c23b8a647208043258616c5beda9f2fc0ec25c1347",
             "a reversible render projection must not move the existing cache namespace"
         );
     }
@@ -822,7 +825,6 @@ mod tests {
             spine: vec![SpineItem {
                 idref: "chapter".to_string(),
                 href: Some("chapter.xhtml".to_string()),
-                linear: true,
             }],
             sections: vec![
                 Section {

@@ -30,8 +30,10 @@ use commands::{
 #[cfg(any(test, not(feature = "serve")))]
 use std::io::Write;
 use std::{
+    fs,
     io::{self, ErrorKind},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    time::SystemTime,
 };
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -129,6 +131,7 @@ fn exit_codes_help_text() -> &'static str {
 async fn main() {
     init_tracing();
     install_panic_hook();
+    sweep_stale_retry_override_dirs_at_startup();
 
     let cancel_token = CancellationToken::new();
     let cancel = cancel_token.clone();
@@ -233,6 +236,145 @@ fn is_broken_pipe(err: &io::Error) -> bool {
     err.kind() == ErrorKind::BrokenPipe
 }
 
+// ---------------------------------------------------------------------------
+// INFRA-10: startup sweep for abandoned `retry_pending_overrides_<pid>` run
+// directories under `.bookforge/runs`.
+//
+// These directories are created for retry-pending override sidecars; when the
+// owner process dies between creating and clearing one, an empty directory
+// lingers forever. A previous audit counted 51 of them. The sweep only ever
+// deletes directories that are (a) named after a parseable pid, (b) provably
+// empty, and (c) provably not owned by a live process — or, where liveness
+// cannot be determined (Windows), older than RETRY_OVERRIDE_FALLBACK_MAX_AGE.
+// Directories with any content are never touched, because they may hold a
+// live worker's pending override sidecar.
+// ---------------------------------------------------------------------------
+
+const RETRY_OVERRIDE_DIR_PREFIX: &str = "retry_pending_overrides_";
+const RETRY_OVERRIDES_RUNS_ROOT: &str = ".bookforge/runs";
+/// Windows-safe fallback window (INFRA-10): without a portable liveness probe,
+/// only treat a dir as stale once it has sat untouched for at least this long.
+const RETRY_OVERRIDE_FALLBACK_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerLiveness {
+    Alive,
+    Gone,
+    /// Platform cannot tell cheaply and safely (e.g. Windows fallback) — or
+    /// the probe itself failed on a non-Linux Unix box.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    Indeterminate,
+}
+
+fn sweep_stale_retry_override_dirs_at_startup() {
+    let reaped = sweep_stale_retry_override_dirs(Path::new(RETRY_OVERRIDES_RUNS_ROOT));
+    if reaped > 0 {
+        tracing::info!("reaped {reaped} empty retry_pending_overrides directories");
+    }
+}
+
+fn sweep_stale_retry_override_dirs(runs_root: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(runs_root) else {
+        // No runs root (or unreadable): nothing to sweep, never fail startup.
+        return 0;
+    };
+
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_text) = name.to_str() else {
+            continue;
+        };
+        let Some(pid_text) = name_text.strip_prefix(RETRY_OVERRIDE_DIR_PREFIX) else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+        if !entry
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let is_empty = fs::read_dir(entry.path())
+            .map(|mut contents| contents.next().is_none())
+            .unwrap_or(false);
+        if !is_empty {
+            continue;
+        }
+
+        let stale_since_fallback_window =
+            dir_idle_for_at_least(&entry.path(), RETRY_OVERRIDE_FALLBACK_MAX_AGE);
+        if retry_override_dir_is_reapable(owner_liveness(pid), stale_since_fallback_window)
+            && fs::remove_dir(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn retry_override_dir_is_reapable(
+    liveness: OwnerLiveness,
+    idle_over_fallback_window: bool,
+) -> bool {
+    match liveness {
+        OwnerLiveness::Alive => false,
+        OwnerLiveness::Gone => true,
+        OwnerLiveness::Indeterminate => idle_over_fallback_window,
+    }
+}
+
+fn dir_idle_for_at_least(path: &Path, min_age: std::time::Duration) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age >= min_age)
+}
+
+/// Liveness of the pid encoded in a `retry_pending_overrides_<pid>` name.
+///
+/// Fail-closed like the SERVE-3 signal path (`serve/audio.rs`): when identity
+/// cannot be established we return [`OwnerLiveness::Indeterminate`] instead of
+/// guessing, and the caller falls back to the conservative age rule.
+fn owner_liveness(pid: u32) -> OwnerLiveness {
+    if pid == std::process::id() {
+        return OwnerLiveness::Alive;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if PathBuf::from(format!("/proc/{pid}")).exists() {
+            OwnerLiveness::Alive
+        } else {
+            OwnerLiveness::Gone
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        match std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+        {
+            Ok(output) if output.status.success() && !output.stdout.trim().is_empty() => {
+                OwnerLiveness::Alive
+            }
+            Ok(_) => OwnerLiveness::Gone,
+            Err(_) => OwnerLiveness::Indeterminate,
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        OwnerLiveness::Indeterminate
+    }
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     fmt()
@@ -320,6 +462,108 @@ fn default_output_path(input: &std::path::Path, target: &str) -> PathBuf {
         .collect::<String>();
     let target = target.trim_matches('-');
     input.with_file_name(format!("{stem}.{target}.epub"))
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{Duration, SystemTime},
+    };
+
+    fn temp_runs_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "bookforge-sweep-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("runs root creates");
+        dir
+    }
+
+    #[test]
+    fn reap_decision_never_touches_live_owners() {
+        use OwnerLiveness::{Alive, Gone, Indeterminate};
+        assert!(!retry_override_dir_is_reapable(Alive, false));
+        assert!(!retry_override_dir_is_reapable(Alive, true));
+        assert!(retry_override_dir_is_reapable(Gone, false));
+        assert!(retry_override_dir_is_reapable(Gone, true));
+        // Indeterminate platforms (Windows) demand the >=24h age window.
+        assert!(!retry_override_dir_is_reapable(Indeterminate, false));
+        assert!(retry_override_dir_is_reapable(Indeterminate, true));
+    }
+
+    #[test]
+    fn missing_runs_root_is_a_no_op() {
+        assert_eq!(
+            sweep_stale_retry_override_dirs(Path::new("/nonexistent/bookforge-runs")),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_dir_of_dead_owner_is_swept_alive_owner_and_content_survive() {
+        let root = temp_runs_root("unix");
+        // A pid beyond any plausible pid_max on linux/BSDs/macOS.
+        let dead_pid = u32::MAX - 1;
+        let dead_empty = root.join(format!("{RETRY_OVERRIDE_DIR_PREFIX}{dead_pid}"));
+        fs::create_dir(&dead_empty).expect("empty dead-owner dir");
+        let live_dir = root.join(format!("{RETRY_OVERRIDE_DIR_PREFIX}{}", std::process::id()));
+        fs::create_dir(&live_dir).expect("self-owned (alive) dir");
+        let busy_dead = root.join(format!("{RETRY_OVERRIDE_DIR_PREFIX}{}", u32::MAX - 2));
+        fs::create_dir(&busy_dead).expect("dead-owner with content");
+        fs::write(busy_dead.join("overrides.json"), "{}").expect("sidecar content");
+        fs::create_dir(root.join("something_else")).expect("unrelated dir");
+
+        let removed = sweep_stale_retry_override_dirs(&root);
+        assert_eq!(removed, 1, "exactly the empty dead-owner dir is swept");
+        assert!(!dead_empty.exists());
+        assert!(live_dir.exists(), "dirs of live pids are NEVER deleted");
+        assert!(busy_dead.exists(), "non-empty dirs are never deleted");
+        assert!(root.join("something_else").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_names_are_ignored_entirely() {
+        let root = temp_runs_root("junk");
+        for junk in [
+            format!("{RETRY_OVERRIDE_DIR_PREFIX}notanumber"),
+            format!("{RETRY_OVERRIDE_DIR_PREFIX}-1"),
+            RETRY_OVERRIDE_DIR_PREFIX.to_string(),
+        ] {
+            fs::create_dir(root.join(junk)).expect("junk dir");
+        }
+        assert_eq!(
+            sweep_stale_retry_override_dirs(&root),
+            0,
+            "no parseable pid means no sweep"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fallback_age_window_boundary_logic_is_exclusive_to_old_dirs() {
+        let root = temp_runs_root("age");
+        let dir = root.join(format!("{RETRY_OVERRIDE_DIR_PREFIX}{}", u32::MAX - 3));
+        fs::create_dir(&dir).expect("fresh dir");
+        // Fresh mtime: age is ~0, so any positive window rejects it...
+        assert!(!dir_idle_for_at_least(
+            &dir,
+            Duration::from_secs(24 * 60 * 60)
+        ));
+        // ...while a zero window accepts it (proves the comparison runs).
+        assert!(dir_idle_for_at_least(&dir, Duration::ZERO));
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]

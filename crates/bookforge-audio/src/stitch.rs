@@ -727,7 +727,7 @@ fn assemble_single_file(
     result.map(|()| output_path)
 }
 
-pub fn single_file_ffmpeg_args(
+pub(crate) fn single_file_ffmpeg_args(
     list_name: &str,
     extension: &str,
     loudnorm: bool,

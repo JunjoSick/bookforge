@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use bookforge_core::{IssueLevel, ProgressEvent, RunState};
+use bookforge_core::{ProgressEvent, RunState};
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -799,15 +799,6 @@ fn format_event_line(event: &ProgressEvent) -> Line<'static> {
         _ => return Line::from(Span::raw("")),
     };
     Line::from(Span::styled(text, style))
-}
-
-/// Issue level → display colour, kept for any future issues panel.
-#[allow(dead_code)]
-fn issue_style(level: IssueLevel) -> Style {
-    match level {
-        IssueLevel::Warning => Style::new().fg(Color::Yellow),
-        IssueLevel::Error => Style::new().fg(Color::Red),
-    }
 }
 
 fn format_duration(secs: f64) -> String {

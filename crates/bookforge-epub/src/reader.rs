@@ -626,13 +626,8 @@ fn parse_manifest_item(
 
 fn parse_spine_item(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<SpineItem> {
     let idref = required_attr(reader, element, b"idref", "spine item idref")?;
-    let linear = attr_value(reader, element, b"linear")?.is_none_or(|value| value != "no");
 
-    Ok(SpineItem {
-        idref,
-        href: None,
-        linear,
-    })
+    Ok(SpineItem { idref, href: None })
 }
 
 fn required_attr(

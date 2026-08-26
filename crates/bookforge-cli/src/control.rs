@@ -691,18 +691,6 @@ impl ControlFileWatcher {
     fn heartbeat_updates(&self) -> watch::Receiver<u64> {
         self.heartbeat_updates.clone()
     }
-
-    /// Request watcher exit and best-effort await the poll thread's final
-    /// iteration. The thread observes cancellation within one poll interval
-    /// and removes its lease on the way out; no join handle abort semantics
-    /// are needed anymore because the poll loop runs on a plain thread.
-    #[allow(dead_code)]
-    pub(crate) async fn shutdown(self) {
-        self.cancel.cancel();
-        // Dropping the watcher from a blocking worker keeps any synchronous
-        // SQLite/fsync tail work off the async runtime.
-        let _ = tokio::task::spawn_blocking(move || drop(self)).await;
-    }
 }
 
 impl Drop for ControlFileWatcher {

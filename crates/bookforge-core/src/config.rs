@@ -74,10 +74,7 @@ impl Default for SegmentationConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PromptVersion {
-    V1,
-    BatchV1,
     V2,
-    BatchV2,
     /// Batch prompts (plain / marker-safe / run-preserving, and their
     /// compact variants) gained a per-item `retry_guidance` field. The
     /// underlying `bookforge-llm` templates moved from v2 to v3; this tag
@@ -92,10 +89,7 @@ pub enum PromptVersion {
 impl PromptVersion {
     pub fn as_str(self) -> &'static str {
         match self {
-            PromptVersion::V1 => "v1",
-            PromptVersion::BatchV1 => "batch_v1",
             PromptVersion::V2 => "v2",
-            PromptVersion::BatchV2 => "batch_v2",
             PromptVersion::BatchV3 => "batch_v3",
         }
     }
@@ -926,15 +920,6 @@ pub struct ModelEndpoint {
     pub model: String,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ModelRouteConfig {
-    pub translation: ModelEndpoint,
-    pub repair: Option<ModelEndpoint>,
-    pub qa: Option<ModelEndpoint>,
-    pub double_check: Option<ModelEndpoint>,
-    pub fallback: Option<ModelEndpoint>,
 }
 
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]

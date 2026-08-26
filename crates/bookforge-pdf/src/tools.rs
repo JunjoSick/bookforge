@@ -1013,7 +1013,7 @@ fn extracted_image_paths(output_dir: &Path) -> Result<Vec<PathBuf>, ToolError> {
         let is_image = path
             .extension()
             .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg"));
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
         if is_image {
             paths.push(path);
         }
