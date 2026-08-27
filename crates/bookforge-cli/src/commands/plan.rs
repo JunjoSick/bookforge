@@ -590,12 +590,7 @@ fn inspect_provider(provider: &str, model: Option<&str>) -> ProviderInspection {
 }
 
 fn default_model(provider: &str) -> &'static str {
-    match provider {
-        "mock" => "mock-prefix-target",
-        "deepseek" => "deepseek-v4-flash",
-        "openrouter" => "openrouter/auto",
-        _ => "unknown",
-    }
+    bookforge_core::providers::default_model_id(provider)
 }
 
 // Keep this in lockstep with the current provider's offline name heuristic.

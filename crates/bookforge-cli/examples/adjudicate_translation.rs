@@ -18,7 +18,6 @@
 //! `--api-key-env` accepts only the environment-variable name read by the
 //! provider at request time.
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -41,7 +40,6 @@ const SUMMARY_SCHEMA_VERSION: u32 = 1;
 const SUPPORTED_RESULTS_SCHEMA_VERSION: u32 = 1;
 const MAX_JUDGE_RESPONSE_BYTES: usize = 8 * 1024;
 const MAX_RATIONALE_CHARS: usize = 300;
-const EMBEDDED_PRICING: &str = include_str!("../pricing/providers.json");
 
 const ALL_CATEGORIES: [DefectCategory; 6] = [
     DefectCategory::MeaningChanged,
@@ -684,41 +682,34 @@ struct Endpoint {
 }
 
 fn resolve_endpoint(args: &Args) -> Result<Endpoint> {
-    let (default_url, default_key_env, default_model) = match args.provider.as_str() {
-        "deepseek" => (
-            "https://api.deepseek.com/v1",
-            "DEEPSEEK_API_KEY",
-            "deepseek-v4-flash",
-        ),
-        "openrouter" => (
-            "https://openrouter.ai/api/v1",
-            "OPENROUTER_API_KEY",
-            "openrouter/auto",
-        ),
-        "openai-compatible" => {
-            if args.base_url.is_none() {
-                bail!("--provider openai-compatible requires --base-url");
-            }
-            ("", "OPENAI_API_KEY", "local-model")
+    let defaults = match args.provider.as_str() {
+        "deepseek" | "openrouter" | "openai-compatible" => {
+            bookforge_core::providers::provider_defaults(&args.provider)
+                .expect("allow-list above matches registry entries")
         }
         other => {
             bail!("unsupported provider '{other}'; use deepseek, openrouter, or openai-compatible")
         }
     };
+    if defaults.base_url.is_none() && args.base_url.is_none() {
+        bail!("--provider openai-compatible requires --base-url");
+    }
     Ok(Endpoint {
         provider: args.provider.clone(),
         base_url: args
             .base_url
             .clone()
-            .unwrap_or_else(|| default_url.to_string()),
+            .unwrap_or_else(|| defaults.base_url.unwrap_or_default().to_string()),
         api_key_env: args
             .api_key_env
             .clone()
-            .unwrap_or_else(|| default_key_env.to_string()),
-        model: args
-            .model
-            .clone()
-            .unwrap_or_else(|| default_model.to_string()),
+            .unwrap_or_else(|| defaults.api_key_env.to_string()),
+        model: args.model.clone().unwrap_or_else(|| {
+            defaults
+                .default_model
+                .unwrap_or(bookforge_core::providers::LOCAL_MODEL_PLACEHOLDER)
+                .to_string()
+        }),
     })
 }
 
@@ -1109,62 +1100,13 @@ fn percent(part: usize, whole: usize) -> String {
 // Pricing and dry run
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct PricingFile {
-    schema_version: u32,
-    providers: BTreeMap<String, ProviderPricing>,
-}
+// Pricing routes through the shared core catalog; the judge tools keep no
+// local copy of the schema or embedded JSON.
 
-#[derive(Debug, Deserialize)]
-struct ProviderPricing {
-    models: BTreeMap<String, ModelPricing>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-struct ModelPricing {
-    input_per_million_usd: f64,
-    output_per_million_usd: f64,
-}
-
-struct PricingCatalog {
-    file: PricingFile,
-    label: String,
-}
-
-impl PricingCatalog {
-    fn model_pricing(&self, provider: &str, model: &str) -> Option<ModelPricing> {
-        self.file
-            .providers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(provider))
-            .and_then(|(_, pricing)| {
-                pricing
-                    .models
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(model))
-                    .map(|(_, pricing)| *pricing)
-            })
-    }
-}
+type PricingCatalog = bookforge_core::providers::PricingCatalog;
 
 fn load_pricing(path: Option<&Path>) -> Result<PricingCatalog> {
-    let (body, label) = match path {
-        Some(path) => (
-            fs::read_to_string(path)
-                .with_context(|| format!("reading pricing catalog {}", path.display()))?,
-            path.display().to_string(),
-        ),
-        None => (EMBEDDED_PRICING.to_string(), "embedded catalog".to_string()),
-    };
-    let file: PricingFile =
-        serde_json::from_str(&body).with_context(|| format!("parsing {label}"))?;
-    if file.schema_version != 1 {
-        bail!(
-            "unsupported pricing schema_version {}; expected 1",
-            file.schema_version
-        );
-    }
-    Ok(PricingCatalog { file, label })
+    bookforge_core::providers::load_pricing(path).map_err(anyhow::Error::from)
 }
 
 fn estimate_tokens(text: &str) -> u64 {
@@ -1195,6 +1137,7 @@ fn print_dry_run(
     }
     let output_cap = tasks.len() as u64 * u64::from(args.max_output_tokens);
     let pricing = load_pricing(args.pricing.as_deref())?;
+    let label = pricing.source_label();
 
     println!("\n=== Dry run estimate ===");
     println!("mode               : DRY RUN - no provider calls or output writes");
@@ -1212,18 +1155,15 @@ fn print_dry_run(
     println!("findings selected  : {}", tasks.len());
     println!("estimated input    : {input_tokens} tokens");
     println!("output token cap   : {output_cap} tokens");
-    match pricing.model_pricing(&endpoint.provider, &endpoint.model) {
+    match pricing.token_prices(&endpoint.provider, &endpoint.model) {
         Some(model) => {
-            let maximum_cost = input_tokens as f64 / 1_000_000.0 * model.input_per_million_usd
-                + output_cap as f64 / 1_000_000.0 * model.output_per_million_usd;
-            println!(
-                "maximum cost       : ${maximum_cost:.6} ({})",
-                pricing.label
-            );
+            let maximum_cost = input_tokens as f64 / 1_000_000.0 * model.input_per_million
+                + output_cap as f64 / 1_000_000.0 * model.output_per_million;
+            println!("maximum cost       : ${maximum_cost:.6} ({label})");
         }
         None => println!(
             "maximum cost       : unavailable; no {}/{} entry in {}",
-            endpoint.provider, endpoint.model, pricing.label
+            endpoint.provider, endpoint.model, label
         ),
     }
     Ok(())

@@ -267,7 +267,8 @@ See [audiobooks.md](audiobooks.md) for provider-specific formats and limits.
 
 ## Cost estimates are unavailable or stale
 
-Pricing comes from the bundled `pricing/providers.json`. A custom or newly
+Pricing comes from the bundled `crates/bookforge-core/pricing/providers.json`.
+A custom or newly
 released model may not have a known price even though translation works.
 Override the catalog per command or environment:
 

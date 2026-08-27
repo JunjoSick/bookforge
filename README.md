@@ -292,7 +292,8 @@ cargo run -p bookforge-cli -- estimate book.epub \
   --model deepseek/deepseek-v4-flash
 ```
 
-Pricing is loaded from the bundled `pricing/providers.json`. Override it with
+Pricing is loaded from the bundled
+`crates/bookforge-core/pricing/providers.json`. Override it with
 `--pricing custom.json` or `BOOKFORGE_PRICING_PATH`.
 
 Translate with OpenRouter:
@@ -510,7 +511,7 @@ chapter markers and title/artist metadata. `--no-book-file` opts out,
 only whole-book assembly; per-chapter files remain unnormalized. Point
 `--base-url` at a local server such as kokoro-fastapi to synthesize offline.
 
-Plans and dry runs use `crates/bookforge-cli/pricing/audio-providers.json` for
+Plans and dry runs use `crates/bookforge-core/pricing/audio-providers.json` for
 cost estimates; point `BOOKFORGE_AUDIO_PRICING_PATH` at a same-structure JSON
 file to override it. ElevenLabs performs a non-fatal quota preflight, and a
 transient failure while auto-selecting the ElevenLabs model degrades

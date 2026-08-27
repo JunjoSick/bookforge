@@ -185,7 +185,7 @@ pub(super) async fn run_mock_translation_with_store(
     let model = config
         .model
         .clone()
-        .unwrap_or_else(|| "mock-prefix-target".to_string());
+        .unwrap_or_else(|| bookforge_core::providers::MOCK_DEFAULT_MODEL.to_string());
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     run_translation_with_store(
         input,

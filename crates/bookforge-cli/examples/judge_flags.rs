@@ -67,11 +67,6 @@ const MAX_RATIONALE_CHARS: usize = 300;
 /// Rough per-unit output budget used only by `--dry-run` pricing.
 const ESTIMATED_OUTPUT_TOKENS_PER_UNIT: u64 = 80;
 
-/// The pricing catalog shipped with the CLI. `crates/bookforge-cli/src/cost.rs`
-/// owns the real loader; examples cannot import it (the crate has no lib
-/// target), so this is a minimal read-only re-implementation over the same file.
-const EMBEDDED_PRICING: &str = include_str!("../pricing/providers.json");
-
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -538,45 +533,38 @@ struct Endpoint {
     model: String,
 }
 
-/// Mirrors the preset table in `crates/bookforge-cli/src/commands/doctor.rs` so
-/// the judge is configured exactly like every other BookForge provider call.
+/// Reads provider defaults from the shared core registry so the judge is
+/// configured exactly like every other BookForge provider call.
 fn resolve_endpoint(args: &Args) -> Result<Endpoint> {
-    let (default_url, default_key_env, default_model) = match args.provider.as_str() {
-        "deepseek" => (
-            "https://api.deepseek.com/v1",
-            "DEEPSEEK_API_KEY",
-            "deepseek-v4-flash",
-        ),
-        "openrouter" => (
-            "https://openrouter.ai/api/v1",
-            "OPENROUTER_API_KEY",
-            "openrouter/auto",
-        ),
-        "openai-compatible" => {
-            if args.base_url.is_none() {
-                bail!("--provider openai-compatible requires --base-url");
-            }
-            ("", "OPENAI_API_KEY", "local-model")
+    let defaults = match args.provider.as_str() {
+        "deepseek" | "openrouter" | "openai-compatible" => {
+            bookforge_core::providers::provider_defaults(&args.provider)
+                .expect("allow-list above matches registry entries")
         }
         other => {
             bail!("unsupported provider '{other}'; use deepseek, openrouter, or openai-compatible")
         }
     };
+    if defaults.base_url.is_none() && args.base_url.is_none() {
+        bail!("--provider openai-compatible requires --base-url");
+    }
 
     Ok(Endpoint {
         provider: args.provider.clone(),
         base_url: args
             .base_url
             .clone()
-            .unwrap_or_else(|| default_url.to_string()),
+            .unwrap_or_else(|| defaults.base_url.unwrap_or_default().to_string()),
         api_key_env: args
             .api_key_env
             .clone()
-            .unwrap_or_else(|| default_key_env.to_string()),
-        model: args
-            .model
-            .clone()
-            .unwrap_or_else(|| default_model.to_string()),
+            .unwrap_or_else(|| defaults.api_key_env.to_string()),
+        model: args.model.clone().unwrap_or_else(|| {
+            defaults
+                .default_model
+                .unwrap_or(bookforge_core::providers::LOCAL_MODEL_PLACEHOLDER)
+                .to_string()
+        }),
     })
 }
 
@@ -660,65 +648,13 @@ fn hex_digest(bytes: &[u8]) -> String {
 // Pricing (dry-run estimate only)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct PricingFile {
-    schema_version: u32,
-    providers: BTreeMap<String, ProviderPricing>,
-}
+// Pricing routes through the shared core catalog; the judge tools keep no
+// local copy of the schema or embedded JSON.
 
-#[derive(Debug, Deserialize)]
-struct ProviderPricing {
-    models: BTreeMap<String, ModelPricing>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-struct ModelPricing {
-    input_per_million_usd: f64,
-    output_per_million_usd: f64,
-}
-
-struct PricingCatalog {
-    file: PricingFile,
-    label: String,
-}
-
-impl PricingCatalog {
-    fn model_pricing(&self, provider: &str, model: &str) -> Option<ModelPricing> {
-        self.file
-            .providers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(provider))
-            .and_then(|(_, pricing)| {
-                pricing
-                    .models
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(model))
-                    .map(|(_, pricing)| *pricing)
-            })
-    }
-}
+type PricingCatalog = bookforge_core::providers::PricingCatalog;
 
 fn load_pricing(path: Option<&Path>) -> Result<PricingCatalog> {
-    let (body, label) = match path {
-        Some(path) => (
-            fs::read_to_string(path)
-                .with_context(|| format!("reading pricing catalog {}", path.display()))?,
-            path.display().to_string(),
-        ),
-        None => (
-            EMBEDDED_PRICING.to_string(),
-            "embedded pricing catalog".to_string(),
-        ),
-    };
-
-    let file: PricingFile = serde_json::from_str(&body).context("parsing pricing catalog")?;
-    if file.schema_version != 1 {
-        bail!(
-            "unsupported pricing schema_version {}; expected 1",
-            file.schema_version
-        );
-    }
-    Ok(PricingCatalog { file, label })
+    bookforge_core::providers::load_pricing(path).map_err(anyhow::Error::from)
 }
 
 /// The canonical script-aware estimator shared by every BookForge
@@ -1148,6 +1084,7 @@ fn print_dry_run_estimate(
     summary: &RunSummary,
 ) -> Result<()> {
     let pricing = load_pricing(args.pricing.as_deref())?;
+    let label = pricing.source_label();
 
     human.say("=== Dry run estimate ===");
     human.say("mode       : DRY RUN - no provider calls were made");
@@ -1161,20 +1098,19 @@ fn print_dry_run_estimate(
         summary.estimated_output_tokens
     ));
 
-    match pricing.model_pricing(&endpoint.provider, &endpoint.model) {
+    match pricing.token_prices(&endpoint.provider, &endpoint.model) {
         Some(prices) => {
             let cost = summary.estimated_input_tokens as f64 / 1_000_000.0
-                * prices.input_per_million_usd
-                + summary.estimated_output_tokens as f64 / 1_000_000.0
-                    * prices.output_per_million_usd;
+                * prices.input_per_million
+                + summary.estimated_output_tokens as f64 / 1_000_000.0 * prices.output_per_million;
             human.say(format!(
                 "est. cost  : ${cost:.6} ({} / {}, {})",
-                endpoint.provider, endpoint.model, pricing.label
+                endpoint.provider, endpoint.model, label
             ));
         }
         None => human.say(format!(
             "est. cost  : no pricing entry for {} / {} in {}; cannot estimate cost",
-            endpoint.provider, endpoint.model, pricing.label
+            endpoint.provider, endpoint.model, label
         )),
     }
 

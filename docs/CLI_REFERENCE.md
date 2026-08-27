@@ -215,6 +215,28 @@ bookforge estimate book.epub \
   --model google/gemini-2.5-flash-lite
 ```
 
+The printed estimate prices the primary translation pass only. QA review,
+double-check, and repair re-runs are real extra passes during a run, so
+`--pass-costs` appends an approximate breakdown for them:
+
+```text
+Pass-cost estimates (approximate planning heuristics; not metered):
+  assumptions: 1 qa pass(es) @1.25x in/0.20x out | 0 double-check pass(es) @1.50x in/0.15x out | repair share 0.05
+  qa review              ~120998 in / ~22264 out tokens (~$0.023174)
+  repair re-runs         ~4840 in / ~5566 out tokens (~$0.002236)
+  Estimated cost incl. passes: $0.025410
+```
+
+Each row reuses the same estimator and pricing catalog as the primary line:
+input tokens are the primary estimate scaled by the pass's input multiplier,
+and output tokens by its output multiplier, with one QA pass per run and one
+double-check pass when the profile's double-check mode is enabled
+(`--double-check-passes` overrides it; `--repair-share`, default `0.05`,
+models the fraction of segments assumed to need a batch repair re-run). Every
+figure is deterministic but approximate: cache discounts, failed-request
+billing, provider rounding, and per-segment variability are not modeled, so
+treat totals as planning heuristics rather than expected spend.
+
 Start the translation. Presets bundle a provider, model, endpoint, and suitable
 defaults; explicit provider flags remain available when you need them.
 
@@ -776,7 +798,7 @@ bookforge audiobook book.epub --voice alloy --format mp3 --stitch
 ```
 
 Cost estimates come from the bundled schema-1
-`crates/bookforge-cli/pricing/audio-providers.json`; set
+`crates/bookforge-core/pricing/audio-providers.json`; set
 `BOOKFORGE_AUDIO_PRICING_PATH` to a JSON file with the same structure to
 override it for every estimate, dry run, and plan. Estimates are planning
 figures only.

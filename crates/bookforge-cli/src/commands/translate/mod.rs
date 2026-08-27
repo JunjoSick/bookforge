@@ -516,44 +516,44 @@ fn provider_config(
     max_idle_per_host: usize,
     json_mode: bookforge_core::JsonMode,
 ) -> Result<OpenAiCompatibleConfig> {
-    let (default_url, default_key_env, default_model) = match provider {
-        "deepseek" => (
-            "https://api.deepseek.com/v1",
-            "DEEPSEEK_API_KEY",
-            "deepseek-v4-flash",
-        ),
-        "openrouter" => (
-            "https://openrouter.ai/api/v1",
-            "OPENROUTER_API_KEY",
-            "openrouter/auto",
-        ),
-        "openai-compatible" => (
-            base_url.ok_or_else(|| {
-                anyhow::anyhow!("--base-url is required for --provider openai-compatible")
-            })?,
-            "OPENAI_API_KEY",
-            model.ok_or_else(|| {
-                anyhow::anyhow!("--model is required for --provider openai-compatible")
-            })?,
-        ),
+    let defaults_for_named = match provider {
+        "deepseek" | "openrouter" | "openai-compatible" => {
+            bookforge_core::providers::provider_defaults(provider)
+                .expect("allow-list above matches registry entries")
+        }
         _ => {
             return Err(anyhow::anyhow!(
                 "unsupported translation provider '{provider}'"
             ));
         }
     };
-
-    Ok(OpenAiCompatibleConfig {
-        base_url: base_url
+    let resolved_base_url = match defaults_for_named.base_url {
+        Some(default_url) => base_url
             .map(String::from)
             .unwrap_or_else(|| default_url.to_string()),
+        None => base_url
+            .ok_or_else(|| {
+                anyhow::anyhow!("--base-url is required for --provider openai-compatible")
+            })?
+            .to_string(),
+    };
+    let resolved_model = match (model, defaults_for_named.default_model) {
+        (Some(model), _) => model.to_string(),
+        (None, Some(default)) => default.to_string(),
+        // Registry models this as None; mirror the historic strictness.
+        (None, None) => {
+            return Err(anyhow::anyhow!(
+                "--model is required for --provider openai-compatible"
+            ));
+        }
+    };
+
+    Ok(OpenAiCompatibleConfig {
+        base_url: resolved_base_url,
         api_key_env: api_key_env
             .map(String::from)
-            .unwrap_or_else(|| default_key_env.to_string()),
-        model: model
-            .or(Some(default_model))
-            .map(String::from)
-            .unwrap_or_else(|| default_model.to_string()),
+            .unwrap_or_else(|| defaults_for_named.api_key_env.to_string()),
+        model: resolved_model,
         timeout_seconds,
         provider_max_attempts: provider_max_attempts.max(1),
         thinking_disabled,

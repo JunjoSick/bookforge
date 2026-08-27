@@ -74,6 +74,16 @@ corrections to two audit findings that turned out wrong. See
 
 ### Quality and performance
 
+- One canonical script-aware token estimator (`bookforge_core::token_estimate::estimate_tokens`)
+  replaces eight divergent per-crate helpers (chars/4, bytes/4, words×4/3,
+  dominant-case-class weighting) across batch packing, scheduler context
+  budgets, glossary selection, QA and double-check chunking, the EPUB reader,
+  provider mocks, and the judge examples. Unspaced-script characters (Han,
+  Kana, Hangul) weigh one token each; everything else keeps the classic four
+  characters per token, so mixed-script text is priced by proportion instead of
+  a whole-text verdict. `CACHE_KEY_SCHEMA_VERSION` bumps to v3 and glossary
+  fingerprint payloads to schema 2, invalidating cached translations produced
+  under differently-sized segment groupings or glossary packing.
 - Output-token budgets are honored uniformly: the effective ceiling is the
   smaller of the user cap and the context remainder, floors apply to net
   output, and batch and single-segment paths behave identically.

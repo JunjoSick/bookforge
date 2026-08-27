@@ -7,6 +7,7 @@ pub mod ir;
 pub mod marker;
 pub mod math;
 pub mod progress;
+pub mod providers;
 pub mod run_snapshot;
 pub mod scheduler;
 pub mod script;

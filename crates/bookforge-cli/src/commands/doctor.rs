@@ -274,36 +274,35 @@ async fn run_provider_doctor(
             .await;
     }
 
-    // 1. Determine config
-    let (default_url, default_key_env, default_model) = match provider {
-        "deepseek" => (
-            "https://api.deepseek.com/v1",
-            "DEEPSEEK_API_KEY",
-            "deepseek-v4-flash",
-        ),
-        "openrouter" => (
-            "https://openrouter.ai/api/v1",
-            "OPENROUTER_API_KEY",
-            "openrouter/auto",
-        ),
-        "openai-compatible" if base_url.is_some() => (
-            base_url.expect("checked above"),
-            api_key_env.unwrap_or("OPENAI_API_KEY"),
-            model.unwrap_or("local-model"),
-        ),
+    // 1. Determine config (registry-backed; exact-match ids mirror the
+    //    literal tables this replaces)
+    let defaults = match provider {
+        "deepseek" | "openrouter" | "openai-compatible" => {
+            bookforge_core::providers::provider_defaults(provider)
+                .expect("allow-list above matches registry entries")
+        }
         _ => {
             anyhow::bail!(
                 "Provider '{provider}' is not supported for doctor checks. Use deepseek, openrouter, local-ollama, local-llamacpp, or openai-compatible with --base-url."
             );
         }
     };
+    if provider == "openai-compatible" && base_url.is_none() {
+        anyhow::bail!(
+            "Provider '{provider}' is not supported for doctor checks. Use deepseek, openrouter, local-ollama, local-llamacpp, or openai-compatible with --base-url."
+        );
+    }
 
     let provider_name = provider;
     let _ = provider_name; // used below in recommended preset
 
-    let effective_url = base_url.unwrap_or(default_url);
-    let effective_key_env = api_key_env.unwrap_or(default_key_env);
-    let effective_model = model.unwrap_or(default_model);
+    let effective_url = base_url.unwrap_or_else(|| defaults.base_url.unwrap_or_default());
+    let effective_key_env = api_key_env.unwrap_or(defaults.api_key_env);
+    let effective_model = model.unwrap_or_else(|| {
+        defaults
+            .default_model
+            .unwrap_or(bookforge_core::providers::LOCAL_MODEL_PLACEHOLDER)
+    });
 
     println!("  Base URL: {effective_url}");
     println!("  Model: {effective_model}");
@@ -427,18 +426,20 @@ async fn run_local_provider_doctor(
     api_key_env: Option<&str>,
     timeout_seconds: u64,
 ) -> anyhow::Result<bool> {
-    let (default_url, default_key_env, default_model) = match provider {
-        "local-ollama" => ("http://localhost:11434/v1", "OLLAMA_API_KEY", "qwen2.5:14b"),
-        "local-llamacpp" => (
-            "http://localhost:8080/v1",
-            "LLAMACPP_API_KEY",
-            "local-model",
-        ),
+    let defaults = match provider {
+        "local-ollama" | "local-llamacpp" => bookforge_core::providers::provider_defaults(provider)
+            .expect("caller filters local providers"),
         _ => unreachable!("caller filters local providers"),
     };
-    let effective_url = base_url.unwrap_or(default_url).trim_end_matches('/');
-    let effective_key_env = api_key_env.unwrap_or(default_key_env);
-    let effective_model = model.unwrap_or(default_model);
+    let effective_url = base_url
+        .unwrap_or_else(|| defaults.base_url.unwrap_or_default())
+        .trim_end_matches('/');
+    let effective_key_env = api_key_env.unwrap_or(defaults.api_key_env);
+    let effective_model = model.unwrap_or_else(|| {
+        defaults
+            .default_model
+            .unwrap_or(bookforge_core::providers::LOCAL_MODEL_PLACEHOLDER)
+    });
     let models_url = format!("{effective_url}/models");
 
     println!("  Base URL: {effective_url}");

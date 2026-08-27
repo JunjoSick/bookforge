@@ -202,7 +202,7 @@ The `--text-normalization` setting maps to ElevenLabs'
 ## Cost and quota preflight
 
 After the `Plan:` summary, BookForge estimates the narration price from the
-bundled schema-1 `crates/bookforge-cli/pricing/audio-providers.json` table and
+bundled schema-1 `crates/bookforge-core/pricing/audio-providers.json` table and
 prints the applicable dollar and/or provider-credit estimate, for example:
 
 ```text
