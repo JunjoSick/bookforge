@@ -21,6 +21,7 @@ fn test_state(token: &str) -> AppState {
         launch_slots: Arc::new(Mutex::new(0)),
         resume_launches: None,
         resume_child_environments: None,
+        retry_launches: None,
         audio_restart_cancels: None,
     }
 }
@@ -1095,14 +1096,14 @@ fn dashboard_ships_store_curation_screens_and_audio_parity_controls() {
 fn dashboard_assets_reassemble_byte_stably() {
     use sha2::{Digest, Sha256};
 
-    assert_eq!(DASHBOARD_HTML.len(), 140_521);
+    assert_eq!(DASHBOARD_HTML.len(), 140_401);
     assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
     assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
     let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
     let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
         digest_hex,
-        "c7594c607274db4075b704843f5d9cbd4010d1c3bfe410c1c12a329303362958"
+        "2ac98484cf857f01263d309f35bbce24768f9bd018e64c12b84c532d6e0cc2e3"
     );
 
     let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");
@@ -1139,7 +1140,114 @@ fn dashboard_ships_runtime_editor_and_inline_retry_guidance() {
 #[test]
 fn dashboard_posts_include_csrf_header() {
     assert!(DASHBOARD_HTML.contains(CSRF_TOKEN_PLACEHOLDER));
-    assert!(DASHBOARD_HTML.contains("headers: { [CSRF_HEADER]: CSRF_TOKEN }"));
+    // The header literal lives inside the API-seam helpers now (see the
+    // fetch-seam test below); every browser call inherits it from there.
+    assert!(DASHBOARD_JS.contains("function bfAuthHeaders(extra)"));
+}
+
+/// F2 regression net: reads used to bypass the session-CSRF header mutations
+/// carried, silently 401-ing entire screens once auth became default-on.
+/// Structural guarantee, not spot checks:
+///
+/// 1. exactly one raw `fetch(` may exist, and only between the
+///    `BFAPISEAM-BEGIN`/`BFAPISEAM-END` markers where the header is stamped;
+/// 2. every screen's endpoints are asserted to reach the server through
+///    `apiGet`/`apiSend`, covering Library, Progress polling, Review,
+///    Glossary, Styles/Entities lists, Audiobook wizard/voices/status/
+///    artifact hydration and the provider/options metadata bootstraps.
+#[test]
+fn dashboard_fetches_all_route_through_the_csrf_api_seam() {
+    const SEAM_BEGIN: &str = "BFAPISEAM-BEGIN";
+    const SEAM_END: &str = "BFAPISEAM-END";
+
+    let js = DASHBOARD_JS;
+    let total_fetch_calls = count_fetch_calls(js);
+    let outside_seam = match (js.find(SEAM_BEGIN), js.find(SEAM_END)) {
+        (Some(begin), Some(end)) if begin < end => {
+            count_fetch_calls(&js[..begin]) + count_fetch_calls(&js[end..])
+        }
+        _ => panic!("dashboard.js must carry unique {SEAM_BEGIN}/{SEAM_END} markers"),
+    };
+    assert_eq!(
+        outside_seam, 0,
+        "every raw fetch( must live between {SEAM_BEGIN}/{SEAM_END} \
+         and go through bfAuthHeaders/apiGet/apiSend"
+    );
+    assert!(
+        total_fetch_calls >= 1,
+        "the seam itself should perform the transport"
+    );
+
+    for marker in [
+        // Header injection helper stamps the header name unconditionally.
+        "[CSRF_HEADER]: CSRF_TOKEN",
+        "async function apiGet(",
+        "async function apiSend(",
+        // Library: job list + audiobook list poll through the seam.
+        "Promise.all([apiGet(\"/api/jobs\"), apiGet(\"/api/audiobooks\")])",
+        // Narrate-from-library job hydration.
+        "await apiGet(\"/api/jobs/\" + encodeURIComponent(id))",
+        // Progress polling: job + runtime settings refresh + SSE stream.
+        "apiGet(\"/api/jobs/\" + encodeURIComponent(id) + \"/reconfigure\")",
+        "apiGet(\"/api/jobs/\" + encodeURIComponent(state.id) + \"/events\"",
+        "await apiGet(`/api/jobs/${encodeURIComponent(id)}/reconfigure`)",
+        // Review: document load + post-save reload.
+        "apiGet(\"/api/jobs/\" + encodeURIComponent(id) + \"/review\")",
+        "apiGet(\"/api/jobs/\" + encodeURIComponent(App.selected) + \"/review\")",
+        // Glossary list.
+        "apiGet(\"/api/glossary\" + q)",
+        // Styles + Entities lists (new store-curation screens).
+        "apiGet(\"/api/styles\")",
+        "apiGet(`/api/styles/${id}`)",
+        "apiGet(\"/api/entities\")",
+        // Audiobook wizard: estimate, voices, status polling, artifact
+        // playback/download hydration, and the launch handshake.
+        "apiSend(\"/api/audiobook/estimate\", {method:\"POST\", body:fd})",
+        "apiGet(\"/api/audio/voices?provider=elevenlabs\")",
+        "apiSend(\"/api/audiobook\", {method:\"POST\", body:fd})",
+        "apiGet(`/api/audiobooks/${encodeURIComponent(id)}`)",
+        "apiGet(`/api/audiobooks/${encodeURIComponent(id)}/artifact?disposition=inline`)",
+        "apiGet(`/api/audiobooks/${encodeURIComponent(id)}/artifact`)",
+        // Maintenance + control mutations reuse the same seam.
+        "apiGet(`/api/audiobooks/${encodeURIComponent(id)}/prune-preview`)",
+        "apiSend(`/api/audiobooks/${encodeURIComponent(id)}/prune`",
+        "apiSend(`/api/audiobooks/${encodeURIComponent(id)}/retry-failed`",
+        "apiSend(`/api/audiobooks/${encodeURIComponent(id)}/cancel`",
+        // Bootstraps: options + provider key status.
+        "apiGet(\"/api/options\")",
+        "apiGet(\"/api/providers\")",
+    ] {
+        assert!(js.contains(marker), "missing api-seam usage: {marker}");
+    }
+
+    // Mutations with bodies keep their explicit content-type while the seam
+    // adds the session token on top.
+    for marker in [
+        "\"content-type\": \"application/json\"",
+        "{ method: \"DELETE\" }",
+    ] {
+        assert!(js.contains(marker), "missing {marker}");
+    }
+}
+
+/// Count textual `fetch(` occurrences with a real word boundary (so template
+/// helpers like `prefetch(` can never hide from the audit).
+fn count_fetch_calls(source: &str) -> usize {
+    let mut count = 0;
+    let mut offset = 0;
+    while let Some(found) = source[offset..].find("fetch(") {
+        let absolute = offset + found;
+        let boundary_ok = absolute == 0
+            || !source[..absolute]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric);
+        if boundary_ok {
+            count += 1;
+        }
+        offset = absolute + "fetch(".len();
+    }
+    count
 }
 
 #[test]
@@ -3029,6 +3137,18 @@ async fn styles_crud_end_to_end_with_precise_single_row_delete() {
     let missing_delete = axum_delete(&router, "/api/styles/99999", Some("token-123")).await;
     assert_eq!(missing_delete.status(), StatusCode::NOT_FOUND);
 
+    // Pin the sibling id before the delete: with the atomic single-row
+    // primitive the surviving sibling must keep exactly this id (the retired
+    // snapshot-clear-restore path reassigned sibling ids on every removal).
+    let before = response_json(get_route(&router, "/api/styles").await).await;
+    let spanish_id_before = before
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row["target_language"] == "Spanish")
+        .map(|row| row["id"].clone())
+        .expect("spanish sibling present");
+
     let deleted = axum_delete(
         &router,
         &format!("/api/styles/{italian_id}"),
@@ -3046,6 +3166,10 @@ async fn styles_crud_end_to_end_with_precise_single_row_delete() {
         "only the untouched sibling remains: {remaining}"
     );
     assert_eq!(rows[0]["target_language"], "Spanish");
+    assert_eq!(
+        rows[0]["id"], spanish_id_before,
+        "sibling ids must stay stable across a delete (F1)"
+    );
     assert_eq!(rows[0]["content_toml"], json!(spanish_content));
     assert_eq!(rows[0]["fingerprint"], json!(spanish_fp));
 
@@ -3240,6 +3364,14 @@ async fn entities_crud_end_to_end_with_precise_single_row_delete() {
     // Precise delete with a Spanish sibling seeded directly through the
     // store upsert API.
     seed_spanish_sibling(&store_path);
+    let before = response_json(get_route(&router, "/api/entities").await).await;
+    let samwise_id_before = before
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row["source"] == "Samwise Gamgee")
+        .map(|row| row["id"].clone())
+        .expect("spanish sibling present");
     let missing_delete = axum_delete(&router, "/api/entities/99999", Some("token-123")).await;
     assert_eq!(missing_delete.status(), StatusCode::NOT_FOUND);
     let deleted = axum_delete(
@@ -3260,6 +3392,10 @@ async fn entities_crud_end_to_end_with_precise_single_row_delete() {
     );
     assert_eq!(rows[0]["target_language"], "Spanish");
     assert_eq!(rows[0]["source"], "Samwise Gamgee");
+    assert_eq!(
+        rows[0]["id"], samwise_id_before,
+        "sibling ids must stay stable across a delete (F1)"
+    );
 
     // The sibling kept its stored fields untouched, including the manual
     // correction applied above, which the request never saw.
@@ -3621,4 +3757,190 @@ fn flip_first_chunk_status(operation_dir: &Path, status: &str) {
     let chunks = manifest["chunks"].as_array_mut().expect("chunks array");
     chunks[0]["status"] = json!(status);
     std::fs::write(&path, manifest.to_string()).expect("manifest rewritten");
+}
+
+/// A fully relaunchable failed operation: recorded options, one failed chunk,
+/// and the original EPUB still stored so preparation reaches the spawn seam.
+fn write_retryable_fixture(temp: &std::path::Path, id: &str) -> PathBuf {
+    let dir = write_prune_fixture(temp, id, full_plan_options_json());
+    flip_first_chunk_status(&dir, "failed");
+    std::fs::write(
+        temp.join(format!("audiobook-{id}.epub")),
+        b"fixture epub bytes",
+    )
+    .expect("input epub written");
+    dir
+}
+
+// -----------------------------------------------------------------------
+// F3: retry-failed double-click protection (atomic claim + launch slot)
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn retry_failed_conflicts_while_another_retry_holds_the_claim() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        temp.path().to_path_buf(),
+    ));
+    let dir = write_retryable_fixture(temp.path(), "claimedop");
+
+    // Simulate a first retry sitting between its atomic rename and its spawn:
+    // process.json has been claimed away and the claim temp exists.
+    std::fs::rename(
+        dir.join("process.json"),
+        dir.join("process.retry-claim.tmp"),
+    )
+    .expect("claim simulated");
+
+    let loser = post_json(
+        &router,
+        "/api/audiobooks/claimedop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(loser.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(loser).await["error"],
+        json!("retry already starting")
+    );
+
+    // The settled (`running`) branch keeps its distinct refusal so operators
+    // can tell "in flight" from "starting up".
+    std::fs::rename(
+        dir.join("process.retry-claim.tmp"),
+        dir.join("process.json"),
+    )
+    .expect("restore original state");
+    let mut process: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("process.json")).expect("state read"))
+            .expect("state parse");
+    process["status"] = json!("running");
+    std::fs::write(dir.join("process.json"), process.to_string()).expect("state rewritten");
+
+    let in_flight = post_json(
+        &router,
+        "/api/audiobooks/claimedop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(in_flight.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(in_flight).await["error"],
+        json!("audiobook operation is not finished")
+    );
+}
+
+/// Concurrent handler calls against one shared AppState (the harness shape
+/// used by the SERVE-6 slot-cap tests): exactly one of the two simultaneous
+/// "double clicks" may spawn; the other must be refused without spending.
+#[tokio::test]
+async fn retry_failed_double_click_starts_exactly_one_operation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let _ = write_retryable_fixture(temp.path(), "racecase");
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    // Test hook (parity with resume_launches): records the relaunch instead
+    // of exec'ing this binary as an audiobook child.
+    state.retry_launches = Some(launches.clone());
+    let router = dashboard_router(state);
+
+    let (winner, loser) = tokio::join!(
+        post_json(
+            &router,
+            "/api/audiobooks/racecase/retry-failed",
+            Some("token-123"),
+            json!({}),
+        ),
+        post_json(
+            &router,
+            "/api/audiobooks/racecase/retry-failed",
+            Some("token-123"),
+            json!({}),
+        ),
+    );
+
+    let statuses = [
+        (winner.status(), response_json(winner).await),
+        (loser.status(), response_json(loser).await),
+    ];
+    let successes = statuses
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::OK)
+        .count();
+    let conflicts = statuses
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::CONFLICT)
+        .count();
+    assert_eq!(successes, 1, "exactly one click wins: {statuses:?}");
+    assert_eq!(conflicts, 1, "the losing click is refused: {statuses:?}");
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        1,
+        "only one child may start regardless of interleaving"
+    );
+
+    // The winner leaves durable `running` state; no stray claim temp survives.
+    let process: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(temp.path().join("audiobook-racecase/process.json")).expect("state read"),
+    )
+    .expect("state parse");
+    assert_eq!(process["status"], json!("running"));
+    assert!(
+        !temp
+            .path()
+            .join("audiobook-racecase/process.retry-claim.tmp")
+            .exists(),
+        "the atomic claim must be consumed by the successful relaunch"
+    );
+}
+
+/// Failure paths below the claim restore the durable state file and release
+/// the launch slot, so a refused retry costs nothing and blocks nobody.
+#[tokio::test]
+async fn retry_failed_refusals_restore_state_and_release_the_launch_slot() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    let launch_slots = Arc::clone(&state.launch_slots);
+    let router = dashboard_router(state);
+    let dir = write_prune_fixture(temp.path(), "refusedop", full_plan_options_json());
+    flip_first_chunk_status(&dir, "failed");
+    // No input EPUB on purpose: preparation only fails after the atomic
+    // claim was already taken.
+
+    let before = std::fs::read(dir.join("process.json")).expect("original state");
+
+    let refused = post_json(
+        &router,
+        "/api/audiobooks/refusedop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response_json(refused).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("original EPUB is no longer stored")
+    );
+
+    assert!(
+        !dir.join("process.retry-claim.tmp").exists(),
+        "the claim must be rolled back after a refusal"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("process.json")).expect("restored state"),
+        before,
+        "the pre-retry process.json must survive byte-for-byte"
+    );
+
+    // Launch-slot bookkeeping: nothing leaked from the refused request; four
+    // more launches must still fit under the cap afterwards.
+    assert_eq!(*launch_slots.lock().unwrap(), 0, "slot released");
 }

@@ -3,6 +3,23 @@ const CSRF_HEADER = "x-bookforge-csrf";
 // the session credential; regular browsers get it from sessionStorage, seeded
 // by the ?token= bootstrap link printed by `bookforge serve`.
 const CSRF_TOKEN = sessionStorage.getItem(CSRF_HEADER) || "__BOOKFORGE_CSRF_TOKEN__";
+/* ===== BFAPISEAM-BEGIN: the only raw fetch( calls live between these markers =====
+ * F2 remediation: reads used to skip the x-bookforge-csrf session header that
+ * mutation helpers carried, so under default-on auth (H-5) entire screens
+ * (Library lists, Progress polling, Review, Glossary/Styles/Entities tables,
+ * Audiobook voices/status polls, provider metadata) silently 401'd while the
+ * user watched empty data. Every browser call — reads included — is routed
+ * through apiGet/apiSend, which stamp the header unconditionally, so no new
+ * call site can forget it. */
+function bfAuthHeaders(extra) { return Object.assign({}, { [CSRF_HEADER]: CSRF_TOKEN }, extra || {}); }
+function bfFetch(path, options) {
+  const request = Object.assign({}, options || {});
+  request.headers = bfAuthHeaders(request.headers);
+  return fetch(path, request);
+}
+async function apiGet(path, init) { return bfFetch(path, init); }
+async function apiSend(path, options) { return bfFetch(path, options); }
+/* ===== BFAPISEAM-END ===== */
 function bfSessionSeeded() { return !!sessionStorage.getItem(CSRF_HEADER); }
 function bfSignedOut() {
   try { sessionStorage.removeItem(CSRF_HEADER); } catch (e) {}
@@ -132,7 +149,7 @@ async function renderLibrary(stage) {
 async function loadLibraryJobs() {
   let jobs = [], audiobooks = [];
   try {
-    const [jobResponse, audiobookResponse] = await Promise.all([fetch("/api/jobs"), fetch("/api/audiobooks")]);
+    const [jobResponse, audiobookResponse] = await Promise.all([apiGet("/api/jobs"), apiGet("/api/audiobooks")]);
     if (jobResponse.ok) jobs = await jobResponse.json();
     if (audiobookResponse.ok) audiobooks = await audiobookResponse.json();
   } catch (e) {}
@@ -192,7 +209,7 @@ function bfOpenAudiobook(id) {
 }
 async function bfNarrateJob(id) {
   try {
-    const response = await fetch("/api/jobs/" + encodeURIComponent(id));
+    const response = await apiGet("/api/jobs/" + encodeURIComponent(id));
     const job = await response.json();
     if (!response.ok || !job.output_path) throw new Error(job.error || "translated EPUB is unavailable");
     const w = freshAudioWizard();
@@ -386,7 +403,7 @@ async function requestEstimate() {
   if (w.model) fd.append("model", w.model);
   if (w.to) fd.append("target", w.to);
   try {
-    const r = await fetch("/api/estimate", { method: "POST", headers: { [CSRF_HEADER]: CSRF_TOKEN }, body: fd });
+    const r = await apiSend("/api/estimate", { method: "POST", body: fd });
     const j = await r.json();
     if (!r.ok) return;
     if (App.screen === "wizard" && App.wizard === w) {
@@ -431,7 +448,7 @@ async function launchTranslation() {
   if (w.apiKey) fd.append("api_key", w.apiKey);
   if (w.baseUrl) fd.append("base_url", w.baseUrl);
   try {
-    const r = await fetch("/api/translate", { method: "POST", headers: { [CSRF_HEADER]: CSRF_TOKEN }, body: fd });
+    const r = await apiSend("/api/translate", { method: "POST", body: fd });
     const j = await r.json();
     if (!r.ok) { reenable(); toastWiz(j.error || "launch failed"); return; }
     toastWiz("started — locating job…");
@@ -442,7 +459,7 @@ async function launchTranslation() {
 async function trySelectPending(inputPath, attempt) {
   if (attempt > 25) return;
   let jobs = [];
-  try { jobs = await (await fetch("/api/jobs")).json(); } catch (e) {}
+  try { jobs = await (await apiGet("/api/jobs")).json(); } catch (e) {}
   const match = jobs.find(j => j.input_path === inputPath);
   if (match) { bfGo("progress", { selected: match.id }); return; }
   setTimeout(() => trySelectPending(inputPath, attempt + 1), 900);
@@ -558,7 +575,7 @@ async function bfAudioEstimate() {
   if (w.model) fd.append("model", w.model);
   fd.append("max_chars", String(w.maxChars));
   try {
-    const response = await fetch("/api/audiobook/estimate", {method:"POST", headers:{[CSRF_HEADER]:CSRF_TOKEN}, body:fd});
+    const response = await apiSend("/api/audiobook/estimate", {method:"POST", body:fd});
     const result = await response.json();
     if (!response.ok || request !== App.audioEstimateRequest || App.audioWizard !== w) throw new Error();
     w.estimate = result;
@@ -572,7 +589,7 @@ async function loadElevenLabsVoices() {
   if (App.audioVoices !== null || App.audioVoicesLoading) return;
   App.audioVoicesLoading = true;
   try {
-    const response = await fetch("/api/audio/voices?provider=elevenlabs");
+    const response = await apiGet("/api/audio/voices?provider=elevenlabs");
     const result = await response.json();
     App.audioVoices = response.ok && Array.isArray(result.voices) ? result.voices : [];
   } catch (error) {
@@ -678,7 +695,7 @@ async function bfLaunchAudiobook() {
   if (w.provider === "elevenlabs" && w.seed) fd.append("seed", w.seed);
   if (w.provider === "elevenlabs" && w.language) fd.append("language", w.language);
   try {
-    const response = await fetch("/api/audiobook", {method:"POST", headers:{[CSRF_HEADER]:CSRF_TOKEN}, body:fd});
+    const response = await apiSend("/api/audiobook", {method:"POST", body:fd});
     const result = await response.json();
     if (!response.ok) { w.launching=false; if(button){button.disabled=false;button.textContent="Start audiobook";} return audioToast(result.error||"launch failed"); }
     await loadProviderStatus(); App.audioSelected = result.id; localStorage.setItem("bf-audiobook-id", result.id); renderAudiobook($("#stage"));
@@ -705,7 +722,7 @@ function audiobookChapterProgress(chunks) {
 }
 async function pollAudiobook(id) {
   if (App.screen !== "audiobook" || App.audioSelected !== id) return;
-  let data; try { const response=await fetch(`/api/audiobooks/${encodeURIComponent(id)}`); data=await response.json(); if(!response.ok) throw new Error(); }
+  let data; try { const response=await apiGet(`/api/audiobooks/${encodeURIComponent(id)}`); data=await response.json(); if(!response.ok) throw new Error(); }
   catch(error) { const panel=$("#audio-progress"); if(panel) panel.innerHTML=`<div class="empty">Could not load this audiobook operation.</div>`; return; }
   const chunks = data.chunks || [], done = data.completed_chunks || 0, total = chunks.length, progress = pct(done,total);
   const processStatus = data.process && data.process.status;
@@ -758,7 +775,7 @@ async function hydrateArtifact(id, succeeded) {
     if (player) {
       let url = cachedArtifactUrl(inlineKey);
       if (!url) {
-        const response = await fetch(`/api/audiobooks/${encodeURIComponent(id)}/artifact?disposition=inline`, { headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+        const response = await apiGet(`/api/audiobooks/${encodeURIComponent(id)}/artifact?disposition=inline`);
         if (response.status === 401) { bfSignedOut(); return; }
         if (!response.ok) throw new Error("artifact unavailable");
         url = URL.createObjectURL(await response.blob());
@@ -771,7 +788,7 @@ async function hydrateArtifact(id, succeeded) {
         try {
           let entry = artifactUrls.get(downloadKey);
           if (!entry || !entry.name) {
-            const response = await fetch(`/api/audiobooks/${encodeURIComponent(id)}/artifact`, { headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+            const response = await apiGet(`/api/audiobooks/${encodeURIComponent(id)}/artifact`);
             if (response.status === 401) { bfSignedOut(); return; }
             if (!response.ok) throw new Error("artifact unavailable");
             const disposition = response.headers.get("content-disposition") || "";
@@ -794,7 +811,7 @@ async function hydrateArtifact(id, succeeded) {
 }
 async function bfCancelAudiobook(id) {
   try {
-    const response = await fetch(`/api/audiobooks/${encodeURIComponent(id)}/cancel`, {method:"POST", headers:{[CSRF_HEADER]:CSRF_TOKEN}});
+    const response = await apiSend(`/api/audiobooks/${encodeURIComponent(id)}/cancel`, {method:"POST"});
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "cancel failed");
     pollAudiobook(id);
@@ -810,9 +827,8 @@ async function bfAudiobookRetryFailed(id) {
   const panel = $("#audio-progress");
   const info = $("#prune-info");
   try {
-    const response = await fetch(`/api/audiobooks/${encodeURIComponent(id)}/retry-failed`, {
+    const response = await apiSend(`/api/audiobooks/${encodeURIComponent(id)}/retry-failed`, {
       method: "POST",
-      headers: { [CSRF_HEADER]: CSRF_TOKEN, "content-type": "application/json" },
       body: "{}",
     });
     const result = await response.json();
@@ -832,7 +848,7 @@ async function bfPrunePreview(id) {
   const info = $("#prune-info"), button = $("#prune-preview-btn");
   if (info) info.textContent = "scanning…";
   try {
-    const response = await fetch(`/api/audiobooks/${encodeURIComponent(id)}/prune-preview`, { headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    const response = await apiGet(`/api/audiobooks/${encodeURIComponent(id)}/prune-preview`);
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "preview failed");
     if (button) button.remove();
@@ -854,8 +870,8 @@ async function bfPrunePreview(id) {
 async function bfPruneConfirm(id) {
   const info = $("#prune-info");
   try {
-    const response = await fetch(`/api/audiobooks/${encodeURIComponent(id)}/prune`, {
-      method: "POST", headers: { [CSRF_HEADER]: CSRF_TOKEN },
+    const response = await apiSend(`/api/audiobooks/${encodeURIComponent(id)}/prune`, {
+      method: "POST",
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "prune failed");
@@ -873,8 +889,8 @@ async function renderProgress(stage) {
   let d, runtime = null;
   try {
     const [jobResponse, runtimeResponse] = await Promise.all([
-      fetch("/api/jobs/" + encodeURIComponent(id)),
-      fetch("/api/jobs/" + encodeURIComponent(id) + "/reconfigure"),
+      apiGet("/api/jobs/" + encodeURIComponent(id)),
+      apiGet("/api/jobs/" + encodeURIComponent(id) + "/reconfigure"),
     ]);
     if (!jobResponse.ok) throw new Error();
     d = await jobResponse.json();
@@ -968,7 +984,7 @@ async function bfSaveRuntimeSettings() {
   if (button) button.disabled = true;
   if (feedback) { feedback.textContent="Saving..."; feedback.classList.remove("bad"); }
   try {
-    const r = await fetch(`/api/jobs/${encodeURIComponent(App.selected)}/reconfigure`, {method:"POST",headers:{"Content-Type":"application/json",[CSRF_HEADER]:CSRF_TOKEN},body:JSON.stringify(payload)});
+    const r = await apiSend(`/api/jobs/${encodeURIComponent(App.selected)}/reconfigure`, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
     const body = await r.json(); if (!r.ok) throw new Error(body.error || "runtime update failed");
     App.runtimeSettings = body; drawRuntimeSettings(body);
     const next = (body.next_boundary || []).map(v => v.replace(/_/g," ")).join(", ");
@@ -981,7 +997,7 @@ async function refreshRuntimeSettings() {
   if (!id || App.runtimeRefreshPending || App.screen !== "progress") return;
   App.runtimeRefreshPending = true;
   try {
-    const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/reconfigure`);
+    const r = await apiGet(`/api/jobs/${encodeURIComponent(id)}/reconfigure`);
     if (r.ok && App.screen === "progress" && App.selected === id) { App.runtimeSettings = await r.json(); App.runtimeJob=id; drawRuntimeSettings(App.runtimeSettings); }
   } catch (_) {}
   finally { App.runtimeRefreshPending=false; }
@@ -1056,8 +1072,7 @@ function openStream(id) {
 }
 async function consumeEventStream(state, controller) {
   try {
-    const response = await fetch("/api/jobs/" + encodeURIComponent(state.id) + "/events", {
-      headers: { [CSRF_HEADER]: CSRF_TOKEN },
+    const response = await apiGet("/api/jobs/" + encodeURIComponent(state.id) + "/events", {
       signal: controller.signal,
     });
     if (response.status === 401) { bfSignedOut(); setLive(false, "signed out"); return; }
@@ -1119,7 +1134,7 @@ async function bfRetry(id) {
   const btn = $("#retrybtn"), toast = $("#toast");
   if (btn) btn.disabled = true; if (toast) toast.textContent = "submitting…";
   try {
-    const r = await fetch("/api/jobs/" + encodeURIComponent(id) + "/retry", { method: "POST", headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    const r = await apiSend("/api/jobs/" + encodeURIComponent(id) + "/retry", { method: "POST" });
     const j = await r.json();
     if (toast) toast.textContent = r.ok ? `marked ${j.retried} segment(s) — run: bookforge resume ${id}` : (j.error || "retry failed");
   } catch (e) { if (toast) toast.textContent = "retry failed"; }
@@ -1153,12 +1168,12 @@ async function bfJobControl(id, command, apiKey) {
   buttons.forEach(b => b.disabled = true);
   if (toast) toast.textContent = command + " requested…";
   try {
-    const request = { method: "POST", headers: { [CSRF_HEADER]: CSRF_TOKEN } };
+    const request = { method: "POST" };
     if (command === "resume") {
-      request.headers["content-type"] = "application/json";
+      request.headers = { "content-type": "application/json" };
       request.body = JSON.stringify(apiKey ? { api_key: apiKey } : {});
     }
-    const r = await fetch("/api/jobs/" + encodeURIComponent(id) + "/" + command, request);
+    const r = await apiSend("/api/jobs/" + encodeURIComponent(id) + "/" + command, request);
     const j = await r.json();
     if (r.ok) {
       if (command === "pause") setProgressStatus("paused");
@@ -1200,7 +1215,7 @@ async function renderReview(stage) {
   stage.innerHTML = `<div class="review"><div class="rev-empty">Loading review…</div></div>`;
   let doc;
   try {
-    const r = await fetch("/api/jobs/" + encodeURIComponent(id) + "/review");
+    const r = await apiGet("/api/jobs/" + encodeURIComponent(id) + "/review");
     doc = await r.json();
     if (!r.ok) { stage.innerHTML = `<div class="wrap"><div class="empty">${esc(doc.error || "Review is not available for this job.")}</div></div>`; return; }
   } catch (e) { stage.innerHTML = `<div class="wrap"><div class="empty">Could not load review.</div></div>`; return; }
@@ -1214,8 +1229,8 @@ async function bfReviewFlag() {
   const R = App.review, seg = R.doc.segments[R.idx]; if (!seg) return;
   const next = !seg.flagged;
   try {
-    const r = await fetch(`/api/jobs/${encodeURIComponent(App.selected)}/segments/${encodeURIComponent(seg.segment_id)}/flag`, {
-      method:"POST", headers:{"Content-Type":"application/json",[CSRF_HEADER]:CSRF_TOKEN}, body:JSON.stringify({flagged:next})
+    const r = await apiSend(`/api/jobs/${encodeURIComponent(App.selected)}/segments/${encodeURIComponent(seg.segment_id)}/flag`, {
+      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({flagged:next})
     });
     const body = await r.json(); if (!r.ok) throw new Error(body.error || "flag update failed");
     seg.flagged = next; drawReview();
@@ -1228,13 +1243,13 @@ async function bfReviewSave() {
   if (blocks.some(block => !block.text.trim())) { if (status) status.textContent = "every block needs translation text"; return; }
   if (button) button.disabled = true; if (status) status.textContent = "saving and rebuilding…";
   try {
-    const r = await fetch(`/api/jobs/${encodeURIComponent(App.selected)}/segments/${encodeURIComponent(seg.segment_id)}/translation`, {
-      method: "POST", headers: { "Content-Type":"application/json", [CSRF_HEADER]: CSRF_TOKEN }, body: JSON.stringify({ blocks })
+    const r = await apiSend(`/api/jobs/${encodeURIComponent(App.selected)}/segments/${encodeURIComponent(seg.segment_id)}/translation`, {
+      method: "POST", headers: { "Content-Type":"application/json" }, body: JSON.stringify({ blocks })
     });
     const body = await r.json();
     if (!r.ok) throw new Error(body.error || "correction failed");
     if (status) status.textContent = `saved · ${body.job_status}`;
-    const refreshed = await fetch("/api/jobs/" + encodeURIComponent(App.selected) + "/review");
+    const refreshed = await apiGet("/api/jobs/" + encodeURIComponent(App.selected) + "/review");
     R.doc = await refreshed.json(); drawReview();
   } catch (e) { if (status) status.textContent = e.message || "correction failed"; }
   finally { if (button) button.disabled = false; }
@@ -1254,7 +1269,7 @@ function bfReviewRetryCancel() {
 async function bfReviewStopForRetry() {
   const status = $("#rev-save-status"); if (status) status.textContent = "requesting stop…";
   try {
-    const r = await fetch(`/api/jobs/${encodeURIComponent(App.selected)}/stop`, {method:"POST",headers:{[CSRF_HEADER]:CSRF_TOKEN}});
+    const r = await apiSend(`/api/jobs/${encodeURIComponent(App.selected)}/stop`, {method:"POST"});
     const body = await r.json(); if (!r.ok) throw new Error(body.error || "stop failed");
     if (status) status.textContent = "Stop requested. Wait for the worker to stop, then queue the retry.";
   } catch (e) { if (status) status.textContent = e.message || "stop failed"; }
@@ -1265,8 +1280,8 @@ async function bfReviewRetrySubmit() {
   R.hintText = guidance;
   const status = $("#rev-save-status"); if (status) status.textContent = "queuing segment retry…";
   try {
-    const r = await fetch(`/api/jobs/${encodeURIComponent(App.selected)}/segments/${encodeURIComponent(seg.segment_id)}/retry`, {
-      method:"POST", headers:{"Content-Type":"application/json",[CSRF_HEADER]:CSRF_TOKEN}, body:JSON.stringify({guidance})
+    const r = await apiSend(`/api/jobs/${encodeURIComponent(App.selected)}/segments/${encodeURIComponent(seg.segment_id)}/retry`, {
+      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({guidance})
     });
     const body = await r.json(); if (!r.ok) throw new Error(body.error || "retry request failed");
     seg.status = "retry_pending"; R.hintOpen=false; R.hintText=""; R.notice=`Retry queued. Resume ${App.selected}.`; drawReview();
@@ -1327,7 +1342,7 @@ async function runValidation() {
   const id = App.selected;
   $("#stage").innerHTML = `<div class="wrap"><div class="empty">Running validators…</div></div>`;
   try {
-    const r = await fetch("/api/jobs/" + encodeURIComponent(id) + "/validate", { method: "POST", headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    const r = await apiSend("/api/jobs/" + encodeURIComponent(id) + "/validate", { method: "POST" });
     const j = await r.json();
     if (!r.ok) { $("#stage").innerHTML = `<div class="wrap"><div class="empty">${esc(j.error || "Validation could not run.")}</div></div>`; return; }
     (App.validation = App.validation || {})[id] = j;
@@ -1400,7 +1415,7 @@ async function loadGlossary() {
   const g = App.glossary;
   const q = `?source=${encodeURIComponent(g.from)}&target=${encodeURIComponent(g.to)}&scope=global`;
   let terms = [];
-  try { terms = await (await fetch("/api/glossary" + q)).json(); } catch (e) { terms = []; }
+  try { terms = await (await apiGet("/api/glossary" + q)).json(); } catch (e) { terms = []; }
   g.terms = Array.isArray(terms) ? terms : [];
   drawGlossaryTable();
 }
@@ -1426,9 +1441,9 @@ async function bfGlossaryAdd() {
   if (!source || !target) { status.textContent = "enter a source term and its translation"; return; }
   status.textContent = "saving…";
   try {
-    const r = await fetch("/api/glossary", {
+    const r = await apiSend("/api/glossary", {
       method: "POST",
-      headers: { [CSRF_HEADER]: CSRF_TOKEN, "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ source, target, category, scope: "global", source_language: g.from, target_language: g.to, always_active: true }),
     });
     const j = await r.json();
@@ -1438,7 +1453,7 @@ async function bfGlossaryAdd() {
   } catch (e) { status.textContent = "could not add term"; }
 }
 async function bfGlossaryRemove(id) {
-  try { await fetch("/api/glossary/" + id, { method: "DELETE", headers: { [CSRF_HEADER]: CSRF_TOKEN } }); loadGlossary(); } catch (e) {}
+  try { await apiSend("/api/glossary/" + id, { method: "DELETE" }); loadGlossary(); } catch (e) {}
 }
 
 /* ---------------- Style sheets (store CRUD parity with `bookforge style`) ---------------- */
@@ -1484,7 +1499,7 @@ function renderStyles(stage) {
 }
 async function loadStyles() {
   let items = [];
-  try { items = await (await fetch("/api/styles", { headers: { [CSRF_HEADER]: CSRF_TOKEN } })).json(); } catch (e) {}
+  try { items = await (await apiGet("/api/styles")).json(); } catch (e) {}
   App.styles.items = Array.isArray(items) ? items : [];
   drawStylesTable();
 }
@@ -1528,7 +1543,7 @@ async function bfStyleEdit(id) {
   const item = (App.styles.items || []).find(row => Number(row.id) === id); if (!item) return;
   if (!item.content_toml) {
     try {
-      const response = await fetch(`/api/styles/${id}`, { headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+      const response = await apiGet(`/api/styles/${id}`);
       if (response.ok) Object.assign(item, await response.json());
     } catch (e) {}
   }
@@ -1551,9 +1566,9 @@ async function bfStyleAdd() {
   if (!payload.content_toml.trim()) { status.textContent = "paste or generate the TOML content"; return; }
   status.textContent = "saving…";
   try {
-    const r = await fetch("/api/styles", {
+    const r = await apiSend("/api/styles", {
       method: "POST",
-      headers: { [CSRF_HEADER]: CSRF_TOKEN, "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
     const j = await r.json();
@@ -1571,9 +1586,9 @@ async function bfStyleSave() {
   try {
     const body = { content_toml: payload.content_toml };
     if (payload.target_language) body.target_language = payload.target_language;
-    const r = await fetch(`/api/styles/${encodeURIComponent(ed.editing)}`, {
+    const r = await apiSend(`/api/styles/${encodeURIComponent(ed.editing)}`, {
       method: "PUT",
-      headers: { [CSRF_HEADER]: CSRF_TOKEN, "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
     const j = await r.json();
@@ -1585,7 +1600,7 @@ async function bfStyleSave() {
 async function bfStyleRemove(id) {
   const status = $("#st_status"); if (status) status.textContent = "deleting…";
   try {
-    const r = await fetch(`/api/styles/${id}`, { method: "DELETE", headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    const r = await apiSend(`/api/styles/${id}`, { method: "DELETE" });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) { status.textContent = j.error || "delete failed"; return; }
     if (status) status.textContent = "";
@@ -1623,7 +1638,7 @@ function renderEntities(stage) {
 }
 async function loadEntities() {
   let items = [];
-  try { items = await (await fetch("/api/entities", { headers: { [CSRF_HEADER]: CSRF_TOKEN } })).json(); } catch (e) {}
+  try { items = await (await apiGet("/api/entities")).json(); } catch (e) {}
   App.entities.items = Array.isArray(items) ? items : [];
   drawEntitiesTable();
 }
@@ -1680,9 +1695,9 @@ async function bfEntityAdd() {
   if (payload.scope !== "global" && !payload.scope_id) { status.textContent = `${payload.scope} scope needs an id`; return; }
   status.textContent = "saving…";
   try {
-    const r = await fetch("/api/entities", {
+    const r = await apiSend("/api/entities", {
       method: "POST",
-      headers: { [CSRF_HEADER]: CSRF_TOKEN, "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
     const j = await r.json();
@@ -1697,9 +1712,9 @@ async function bfEntitySave() {
   if (!payload.target_name) { status.textContent = "the rendered name is required"; return; }
   status.textContent = "saving…";
   try {
-    const r = await fetch(`/api/entities/${encodeURIComponent(ed.editing)}`, {
+    const r = await apiSend(`/api/entities/${encodeURIComponent(ed.editing)}`, {
       method: "PUT",
-      headers: { [CSRF_HEADER]: CSRF_TOKEN, "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
     const j = await r.json();
@@ -1710,7 +1725,7 @@ async function bfEntitySave() {
 async function bfEntityRemove(id) {
   const status = $("#en_status"); if (status) status.textContent = "deleting…";
   try {
-    const r = await fetch(`/api/entities/${id}`, { method: "DELETE", headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    const r = await apiSend(`/api/entities/${id}`, { method: "DELETE" });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) { status.textContent = j.error || "delete failed"; return; }
     if (status) status.textContent = "";
@@ -1720,14 +1735,14 @@ async function bfEntityRemove(id) {
 
 /* ---------------- boot ---------------- */
 async function loadOptions() {
-  try { const r = await fetch("/api/options", { headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+  try { const r = await apiGet("/api/options");
     if (r.ok) App.options = await r.json();
     else if (r.status === 401) bfSignedOut();
   } catch (e) {}
 }
 async function loadProviderStatus() {
   try {
-    const r = await fetch("/api/providers", { headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    const r = await apiGet("/api/providers");
     if (r.ok) App.providerKeys = await r.json();
     else if (r.status === 401) bfSignedOut();
   } catch (e) { App.providerKeys = {}; }

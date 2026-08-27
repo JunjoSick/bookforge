@@ -4101,3 +4101,339 @@ fn file_hash_streams_chunks_matching_the_single_shot_digest() {
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_file(big_input);
 }
+
+// ---------------------------------------------------------------------------
+// Audit remediation: S-1 / S-2 / S-3 regressions + file_hash NIT
+// ---------------------------------------------------------------------------
+
+#[test]
+fn harden_failure_path_restores_foreign_key_enforcement() {
+    use super::restore_safe_status_harden;
+
+    let failing_step = |message: &'static str| {
+        move |_conn: &mut Connection| -> rusqlite::Result<()> {
+            Err(rusqlite::Error::InvalidParameterName(message.to_string()))
+        }
+    };
+
+    // Case 1: the inner rebuild fails immediately (no transaction open).
+    {
+        let db_path = temp_path("harden_fk_restore_instant.sqlite");
+        let mut conn = Connection::open(&db_path).expect("test db opens");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE parent (id TEXT PRIMARY KEY);
+             CREATE TABLE child (
+               id TEXT PRIMARY KEY,
+               parent_id TEXT NOT NULL REFERENCES parent(id)
+             );",
+        )
+        .expect("schema builds");
+        assert!(conn.is_autocommit(), "clean start is in autocommit");
+
+        let outcome = restore_safe_status_harden(&mut conn, failing_step("boom-instant"));
+        assert!(outcome.is_err(), "inner failure must propagate");
+
+        let enforcement: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign_keys pragma readable");
+        assert!(
+            enforcement,
+            "S-1: the failure path must switch foreign_keys back on"
+        );
+        let orphaned = conn.execute(
+            "INSERT INTO child (id, parent_id) VALUES ('orphan', 'ghost')",
+            [],
+        );
+        assert!(
+            orphaned.is_err(),
+            "enforcement must be active, not merely reporting ON"
+        );
+        drop(conn);
+        let _ = fs::remove_file(db_path);
+    }
+
+    // Case 2: the inner step fails while a raw transaction it opened via SQL
+    // is still open — exactly what a failed rollback leaves behind. PRAGMA
+    // inside a transaction is a silent no-op, so the guard must roll that
+    // stray transaction back before restoring.
+    {
+        let db_path = temp_path("harden_fk_restore_stray_txn.sqlite");
+        let mut conn = Connection::open(&db_path).expect("test db opens");
+        conn.execute_batch(
+            "CREATE TABLE parent (id TEXT PRIMARY KEY);
+             CREATE TABLE child (
+               id TEXT PRIMARY KEY,
+               parent_id TEXT NOT NULL REFERENCES parent(id)
+             );",
+        )
+        .expect("schema builds");
+        let stray_txn_step = |conn: &mut Connection| -> rusqlite::Result<()> {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            Err(rusqlite::Error::InvalidParameterName(
+                "boom-stray".to_string(),
+            ))
+        };
+
+        let outcome = restore_safe_status_harden(&mut conn, stray_txn_step);
+        assert!(outcome.is_err(), "stray-txn failure must propagate");
+
+        assert!(
+            conn.is_autocommit(),
+            "the stranded transaction must be rolled back first"
+        );
+        let enforcement: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign_keys pragma readable");
+        assert!(
+            enforcement,
+            "S-1: enforcement restored even when the txn was left open"
+        );
+        drop(conn);
+        let _ = fs::remove_file(db_path);
+    }
+
+    // Control: success still records enforcement and passes through.
+    {
+        let db_path = temp_path("harden_fk_restore_success.sqlite");
+        let mut conn = Connection::open(&db_path).expect("test db opens");
+        conn.execute_batch("CREATE TABLE marker (x INTEGER);")
+            .expect("schema builds");
+        let outcome = restore_safe_status_harden(&mut conn, |_| Ok(()));
+        assert!(outcome.is_ok(), "happy path stays happy");
+        let enforcement: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign_keys pragma readable");
+        assert!(enforcement, "success path also leaves FK enforced");
+        drop(conn);
+        let _ = fs::remove_file(db_path);
+    }
+}
+
+#[test]
+fn prune_skips_job_flipped_to_running_after_selection() {
+    // Regression for S-2: the running-guard used to be checked only during
+    // selection; each per-job deletion transaction never re-read status, so a
+    // job that turned `running` between the two phases could be deleted
+    // underneath its live checkpointing process. Emulate the interleaving
+    // with two connections: selection commits first, connection B flips the
+    // job to `running`, then A drives its pruning path.
+    let db_path = temp_path("prune_toctou_running.sqlite");
+    let artifacts_dir = temp_path("prune-toctou-artifacts");
+    let store = JobStore::open(&db_path).expect("store opens (conn A)");
+
+    let victim = prune_fixture_job(&store, "victim");
+    populate_full_job_tree(&store, &victim, &artifacts_dir);
+    store.mark_job_stopped(&victim.id).expect("job stopped");
+
+    // Phase 1 — select candidates on connection A. The job is stopped here.
+    let selection = store
+        .select_prune_candidates(None, None)
+        .expect("selection runs");
+    assert_eq!(selection.candidate_count, 1);
+    assert_eq!(selection.to_delete, vec![victim.id.clone()]);
+    assert_eq!(selection.protected_running_jobs, 0);
+
+    // Phase 2 — connection B flips the selected job to `running` after A's
+    // selection transaction has already committed.
+    {
+        let conn_b = Connection::open(&db_path).expect("second connection");
+        let flipped = conn_b
+            .execute(
+                "UPDATE jobs SET status = 'running' WHERE id = ?1",
+                params![victim.id],
+            )
+            .expect("concurrent flip applies");
+        assert_eq!(flipped, 1);
+    }
+
+    // Phase 3 — drive A's deletion path for the stale candidate list.
+    let options = PruneJobsOptions::default();
+    let mut report = PruneJobsReport {
+        dry_run: false,
+        candidate_count: selection.candidate_count,
+        protected_running_jobs: selection.protected_running_jobs,
+        retained_by_keep_last_n: selection.retained_by_keep_last_n,
+        deletions: Vec::new(),
+    };
+    store
+        .execute_prune_selection(&selection.to_delete, &options, &mut report)
+        .expect("execution runs");
+
+    assert!(
+        report.deletions.is_empty(),
+        "the re-check inside the deletion txn must skip this job entirely"
+    );
+    assert_eq!(
+        report.protected_running_jobs, 1,
+        "the late flip counts as protected"
+    );
+    assert_eq!(
+        report.candidate_count, 0,
+        "a running job is no longer an honest prune candidate"
+    );
+
+    // The whole tree plus artifacts survive untouched.
+    assert!(
+        store.get_job(&victim.id).expect("lookup").is_some(),
+        "flipped-to-running job row survives"
+    );
+    assert_eq!(count_rows(&store, "segments", &victim.id), 2);
+    assert!(
+        count_rows(&store, "translations", &victim.id) >= 1,
+        "model translation rows survive the skip"
+    );
+    assert!(
+        artifacts_dir
+            .join(format!("{}-events.jsonl", victim.id))
+            .exists(),
+        "artifact files are not unlinked for protected jobs"
+    );
+
+    // Sanity: once stopped again, pruning proceeds normally.
+    store.mark_job_stopped(&victim.id).expect("stopped again");
+    let second = store.prune_jobs(options).expect("normal prune resumes");
+    assert_eq!(second.pruned_job_count(), 1);
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(artifacts_dir);
+}
+
+#[test]
+fn request_segment_retry_freeze_check_rides_inside_the_write_txn() {
+    // Regression for S-3 (H-1 TOCTOU family): the human-correction freeze
+    // check used to run BEFORE opening the IMMEDIATE write transaction. Hold
+    // the writer lock with a second connection so the retry blocks at the
+    // transaction door, land a frozen correction meanwhile, then release:
+    // the retry's in-transaction freeze check must now see it and refuse.
+    // The pre-transaction placement would instead pass the window and flip
+    // the segment to retry_pending over the correction.
+    let db_path = temp_path("retry_freeze_inside_txn.sqlite");
+    let input_path = temp_path("input.sqlite-retry.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture writes");
+
+    let store = JobStore::open(&db_path).expect("store opens");
+    let job_id = {
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output-retry.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job creates");
+        store
+            .insert_segments(
+                &job.id,
+                &[segment("seg_a", 0)],
+                "v1",
+                "mock",
+                "mock-prefix",
+                "freeze_ns",
+            )
+            .expect("segments insert");
+        store.mark_job_stopped(&job.id).expect("stopped for retry");
+        job.id
+    };
+
+    {
+        // Second process grabs the IMMEDIATE writer lock FIRST so the
+        // retry's transaction below deterministically starts only after the
+        // correction is committed.
+        let conn_b = Connection::open(&db_path).expect("second connection");
+        conn_b
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("writer lock acquired before the retry can begin");
+        let job_id_for_thread = job_id.clone();
+        let db_path_for_thread = db_path.clone();
+        let handle = std::thread::spawn(move || {
+            // All migrations are already recorded, so this open takes no
+            // write lock and proceeds happily while B holds the writer.
+            let retry_store = JobStore::open(&db_path_for_thread).expect("retry-side store opens");
+            retry_store.request_segment_retry(&job_id_for_thread, "seg_a", Some("late guidance"))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        conn_b
+            .execute(
+                "INSERT INTO translations
+                 (segment_id, job_id, translated_text, provider, model, prompt_version,
+                  created_at, origin, human_corrected, corrected_at)
+                 VALUES ('seg_a', ?1, 'Correzione umana', 'manual', 'manual', 'v1',
+                         '2000', 'manual', 1, '2000')",
+                params![job_id],
+            )
+            .expect("frozen translation inserts under the lock");
+        conn_b
+            .execute(
+                "INSERT INTO translation_blocks
+                 (segment_id, job_id, block_id, translated_text)
+                 VALUES ('seg_a', ?1, 'b_000000', 'Correzione umana')",
+                params![job_id],
+            )
+            .expect("frozen block inserts under the lock");
+        conn_b
+            .execute_batch("COMMIT")
+            .expect("correction committed");
+
+        let result = handle.join().expect("retry thread joins without panic");
+        match result {
+            Err(StoreError::InvalidCorrection(message)) => {
+                assert!(
+                    message.contains("frozen human correction"),
+                    "the in-txn freeze check must reject, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidCorrection from the freeze check, got {other:?}"),
+        }
+    }
+
+    // The segment was NOT flipped and the correction survives verbatim.
+    {
+        let conn = store.conn.borrow();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM segments WHERE job_id = ?1 AND id = 'seg_a'",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .expect("segment readable");
+        assert_eq!(
+            status, "queued",
+            "a frozen segment must never transition to retry_pending"
+        );
+        let (origin, corrected): (String, i64) = conn
+            .query_row(
+                "SELECT origin, human_corrected FROM translations WHERE job_id = ?1 AND segment_id = 'seg_a'",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("translation readable");
+        assert_eq!(origin, "manual");
+        assert_eq!(corrected, 1);
+    }
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn file_hash_of_empty_input_is_the_canonical_sha256_digest() {
+    let empty_input = temp_path("empty-input.epub");
+    fs::write(&empty_input, b"").expect("empty fixture writes");
+
+    let hash = file_hash(&empty_input).expect("hashing succeeds");
+    assert_eq!(
+        hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "streaming zero chunks must equal SHA-256 of the empty string"
+    );
+
+    let _ = fs::remove_file(empty_input);
+}

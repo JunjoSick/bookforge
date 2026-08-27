@@ -240,6 +240,11 @@ struct AppState {
     resume_launches: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     resume_child_environments: Option<Arc<Mutex<Vec<CapturedChildEnvironment>>>>,
+    /// Test hook mirroring [`Self::resume_launches`] for audiobook
+    /// retry-failed relaunches: when set, endpoint tests record the launch
+    /// count instead of exec'ing this binary as a child.
+    #[cfg(test)]
+    retry_launches: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     audio_restart_cancels: Option<Arc<Mutex<Vec<u32>>>>,
 }
@@ -322,6 +327,25 @@ fn data_root_is_writable(base: &std::path::Path) -> bool {
 fn ensure_private_data_root() -> Result<()> {
     ensure_private_dir_under(Path::new("."), Path::new(".bookforge"))
         .context("failed to prepare the .bookforge data directory")
+}
+
+/// Drain store-open diagnostics once per serve process so schema-tolerance
+/// notes (unknown legacy statuses, skipped hardening) reach the operator
+/// instead of dying in the store's queue, matching the CLI surface behavior.
+fn drain_store_diagnostics_once() {
+    match bookforge_store::JobStore::open_default() {
+        Ok(store) => {
+            for diagnostic in store.take_diagnostics() {
+                tracing::warn!(surface = "serve", "{diagnostic}");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                surface = "serve",
+                "store open failed during diagnostics drain: {error}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +523,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // `.bookforge` there.
     ensure_writable_workdir()?;
     ensure_private_data_root()?;
+    drain_store_diagnostics_once();
 
     let addr: SocketAddr = args
         .bind
@@ -534,6 +559,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         resume_launches: None,
         #[cfg(test)]
         resume_child_environments: None,
+        #[cfg(test)]
+        retry_launches: None,
         #[cfg(test)]
         audio_restart_cancels: None,
     };

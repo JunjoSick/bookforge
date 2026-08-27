@@ -1,3 +1,4 @@
+use super::translations::translation_is_human_corrected_on;
 use super::*;
 use rusqlite::TransactionBehavior;
 
@@ -37,15 +38,19 @@ impl JobStore {
         segment_id: &str,
         guidance: Option<&str>,
     ) -> Result<()> {
-        if self.translation_is_human_corrected(job_id, segment_id)? {
+        let mut conn = self.conn.borrow_mut();
+        // IMMEDIATE so the freeze check, the running/paused policy check, and
+        // the retry write are atomic against other processes sharing the
+        // database file. Checking human corrections here rather than before
+        // the transaction closes the window where a dashboard process could
+        // land a frozen correction between the check and the write (same
+        // TOCTOU family as H-1).
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if translation_is_human_corrected_on(&tx, job_id, segment_id)? {
             return Err(StoreError::InvalidCorrection(format!(
                 "segment '{segment_id}' has a frozen human correction"
             )));
         }
-        let mut conn = self.conn.borrow_mut();
-        // IMMEDIATE so the running/paused policy check and the retry write are
-        // atomic against other processes sharing the database file.
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let job_status = tx
             .query_row(
                 "SELECT status FROM jobs WHERE id = ?1",

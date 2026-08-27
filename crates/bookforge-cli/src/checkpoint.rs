@@ -108,6 +108,12 @@ impl CheckpointWriter {
         let join = tokio::task::spawn_blocking(move || -> Result<()> {
             let store = JobStore::open(&db_path)
                 .map_err(|err| anyhow::anyhow!("checkpoint writer open failed: {err}"))?;
+            // Canonical open point: drain warn-on-open storage diagnostics so
+            // legacy unknown statuses / skipped hardening surface in logs
+            // instead of rotting unnoticed on the writer's connection.
+            for diagnostic in store.take_diagnostics() {
+                tracing::warn!(surface = "checkpoint_writer", "{diagnostic}");
+            }
 
             let mut flushed = 0usize;
             let mut dropped = 0usize;
@@ -243,7 +249,7 @@ fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
             })?;
         }
         SegmentStatus::Failed => {
-            store.mark_segment_failed(
+            store.mark_segment_failed_if_unfinished(
                 &job_id,
                 &translation.segment_id.0,
                 translation.error.as_deref().unwrap_or("translation failed"),

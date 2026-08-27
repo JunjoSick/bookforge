@@ -727,15 +727,39 @@ fn harden_status_tables_with_check_constraints(conn: &mut Connection) -> Result<
         );"
     );
 
+    restore_safe_status_harden(conn, |conn| {
+        harden_status_tables_inner(
+            conn,
+            &create_jobs,
+            &create_segments,
+            &jobs_table_name,
+            &segments_table_name,
+        )
+    })
+}
+
+/// Runs one `foreign_keys`-disabled hardening step with an
+/// unconditional pragma restore: the result is computed first, enforcement is
+/// switched back on whatever the step outcome was, and only then is the
+/// result propagated. Parameterized over the step so tests can inject
+/// failures; without this, a short-circuiting `?` used to leave every later
+/// statement on the connection silently unenforced.
+pub(super) fn restore_safe_status_harden(
+    conn: &mut Connection,
+    step: impl FnOnce(&mut Connection) -> rusqlite::Result<()>,
+) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", false)?;
-    harden_status_tables_inner(
-        conn,
-        &create_jobs,
-        &create_segments,
-        &jobs_table_name,
-        &segments_table_name,
-    )?;
-    conn.pragma_update(None, "foreign_keys", true)?;
+    let step_result = step(conn);
+    // `PRAGMA foreign_keys` is a silent no-op while any transaction is open.
+    // rusqlite rolls its transaction back on drop, but a failed rollback can
+    // strand one: close that stray transaction first or the restore below
+    // would be ignored and enforcement would stay off for good.
+    if !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    let pragma_result = conn.pragma_update(None, "foreign_keys", true);
+    step_result?;
+    pragma_result?;
 
     // Data was only ever copied (not mutated), so by construction the swapped
     // schema has no dangling references. Still verify: any violation here

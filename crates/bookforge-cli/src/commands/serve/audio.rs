@@ -1780,16 +1780,20 @@ async fn prune_audiobook(
         match scan_audiobook_debris(&upload_dir, &id)? {
             DebrisScan::NotFound => Ok(PruneOutcome::NotFound),
             DebrisScan::Running => Ok(PruneOutcome::Running),
-            DebrisScan::Found { stale, restricted } => {
-                let listed = stale.len();
-                let (removed, freed) = bookforge_audio::remove_stale_chunks(&stale)?;
-                Ok(PruneOutcome::Ran(json!({
-                    "removed": removed,
-                    "freed_bytes": freed,
-                    "listed": listed,
-                    "restricted": restricted,
-                })))
-            }
+        DebrisScan::Found { stale, restricted } => {
+            let listed = stale.len();
+            let (removed, freed) = bookforge_audio::remove_stale_chunks(&stale)?;
+            // F7 audit trail: a confirmed prune deletes files for good.
+            eprintln!(
+                "[serve] audiobook prune id={id} removed={removed}/{listed} freed_bytes={freed} restricted={restricted}"
+            );
+            Ok(PruneOutcome::Ran(json!({
+                "removed": removed,
+                "freed_bytes": freed,
+                "listed": listed,
+                "restricted": restricted,
+            })))
+        }
         }
     })
     .await??;
@@ -1802,7 +1806,23 @@ async fn prune_audiobook(
 
 // ---------------------------------------------------------------------------
 // retry-failed relaunches
+//
+// Double-click protection (F3): between the last "is this run finished?"
+// recheck and the child actually spawning there was an unprotected window in
+// which two requests could both pass validation and both spawn -- double
+// provider spend. Two independent guards close it:
+//
+// (a) an atomic filesystem claim: after the status recheck the winner renames
+//     `process.json` to [`RETRY_CLAIM_FILE_NAME`] -- a single rename admits
+//     exactly one worker; every loser reports 409 "retry already starting".
+//     Validation-refusals rename the original back, so durable state is never
+//     destroyed;
+// (b) a SERVE-6 launch slot held around preparation + spawn (released on
+//     every failure path by dropping [`RetryClaimLaunch`] alongside its
+//     sibling slot guard).
 // ---------------------------------------------------------------------------
+
+const RETRY_CLAIM_FILE_NAME: &str = "process.retry-claim.tmp";
 
 #[derive(Deserialize)]
 struct RetryFailedRequest {
@@ -1833,8 +1853,17 @@ struct PreparedRetry {
 enum PreparedOutcome {
     NotFound,
     Running,
+    /// A concurrent retry won the atomic claim rename; this caller loses.
+    RetryStarting,
     /// A deliberate refusal with its user-facing reason.
     Client(String),
+    Ready(Box<PreparedRetry>),
+}
+
+/// Outcome of the validation tail of [`prepare_retry_failed`], after the
+/// atomic claim has already been taken.
+enum PrepareStep {
+    Refused(String),
     Ready(Box<PreparedRetry>),
 }
 
@@ -1850,58 +1879,91 @@ fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> 
     if !out_dir.is_dir() {
         return Ok(PreparedOutcome::NotFound);
     }
-    let process = std::fs::read(out_dir.join("process.json"))
+    let process_path = out_dir.join("process.json");
+    let claim_path = out_dir.join(RETRY_CLAIM_FILE_NAME);
+    let process = match std::fs::read(&process_path)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .unwrap_or_else(|| json!({}));
+        .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or(json!({})))
+    {
+        Some(process) => process,
+        // A missing/unreadable state file alongside a live claim temp means a
+        // concurrent retry has already won the rename race.
+        None if claim_path.exists() => return Ok(PreparedOutcome::RetryStarting),
+        None => json!({}),
+    };
     if audiobook_process_is_running(&process) {
         return Ok(PreparedOutcome::Running);
     }
+
+    // F3(a): atomic single-winner claim AFTER the status recheck. Exactly one
+    // concurrent caller's rename can succeed; every loser sees NotFound and
+    // reports "already starting" without touching anything.
+    if let Err(error) = std::fs::rename(&process_path, &claim_path) {
+        return Ok(match error.kind() {
+            std::io::ErrorKind::NotFound => PreparedOutcome::RetryStarting,
+            _ => PreparedOutcome::Client(format!("retry could not be started ({error})")),
+        });
+    }
+
+    match finish_prepare_retry(upload_dir, id, &process)? {
+        PrepareStep::Ready(prepared) => Ok(PreparedOutcome::Ready(prepared)),
+        PrepareStep::Refused(message) => {
+            // Refusals must not destroy the durable state file (or strand the
+            // operation in claimed limbo): put the original bytes back.
+            settle_retry_claim(&out_dir);
+            Ok(PreparedOutcome::Client(message))
+        }
+    }
+}
+
+/// Validation tail of [`prepare_retry_failed`], run only once the atomic
+/// claim is held. Every refusal becomes [`PrepareStep::Refused`] so the
+/// caller can restore the claim uniformly.
+fn finish_prepare_retry(
+    upload_dir: &Path,
+    id: &str,
+    process: &serde_json::Value,
+) -> Result<PrepareStep> {
+    let refused = |message: &str| Ok(PrepareStep::Refused(message.to_string()));
+    let out_dir = audiobook_operation_out_dir(upload_dir, id);
     let Some(options) = process
         .get("options")
         .filter(|value| value.is_object())
         .cloned()
     else {
-        return Ok(PreparedOutcome::Client(
-            "relaunch settings are unavailable for this run; recreate the audiobook instead"
-                .to_string(),
-        ));
+        return refused(
+            "relaunch settings are unavailable for this run; recreate the audiobook instead",
+        );
     };
 
     let failed = match bookforge_audio::failed_chunk_files(&out_dir.join("manifest.json")) {
         Ok(files) => files,
         Err(error) => {
-            return Ok(PreparedOutcome::Client(format!(
+            return refused(&format!(
                 "--retry-failed requires a readable prior manifest ({error})"
-            )));
+            ));
         }
     };
     let failed_count = failed.len();
     if failed_count == 0 {
-        return Ok(PreparedOutcome::Client(
-            "--retry-failed found no failed chunks matching this run".to_string(),
-        ));
+        return refused("--retry-failed found no failed chunks matching this run");
     }
 
     let input_path = upload_dir.join(format!("audiobook-{id}.epub"));
     if !input_path.is_file() {
-        return Ok(PreparedOutcome::Client(format!(
+        return refused(&format!(
             "the original EPUB is no longer stored at {}; recreate the audiobook instead",
             input_path.display()
-        )));
+        ));
     }
 
     let Some(provider) = options_string(&options, "provider")
         .filter(|value| matches!(value.as_str(), "mock" | "openai" | "gemini" | "elevenlabs"))
     else {
-        return Ok(PreparedOutcome::Client(
-            "the recorded provider is unknown; recreate the audiobook instead".to_string(),
-        ));
+        return refused("the recorded provider is unknown; recreate the audiobook instead");
     };
     let Some(voice) = options_string(&options, "voice").filter(|value| !value.is_empty()) else {
-        return Ok(PreparedOutcome::Client(
-            "the recorded voice setting is unusable; recreate the audiobook instead".to_string(),
-        ));
+        return refused("the recorded voice setting is unusable; recreate the audiobook instead");
     };
     let Some(format) = options_string(&options, "format").filter(|value| {
         matches!(
@@ -1909,18 +1971,14 @@ fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> 
             "mp3" | "opus" | "aac" | "flac" | "wav" | "pcm"
         )
     }) else {
-        return Ok(PreparedOutcome::Client(
-            "the recorded output format is unusable; recreate the audiobook instead".to_string(),
-        ));
+        return refused("the recorded output format is unusable; recreate the audiobook instead");
     };
     let speed = options
         .get("speed")
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(1.0) as f32;
     if !speed.is_finite() || !(0.25..=4.0).contains(&speed) {
-        return Ok(PreparedOutcome::Client(
-            "the recorded speed setting is unusable; recreate the audiobook instead".to_string(),
-        ));
+        return refused("the recorded speed setting is unusable; recreate the audiobook instead");
     }
     let max_chars_u64 = options
         .get("max_chars")
@@ -1928,10 +1986,9 @@ fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> 
         .unwrap_or(2_000);
     let provider_max_chars = audio_provider_max_chars(&provider, "") as u64;
     if max_chars_u64 == 0 || max_chars_u64 > provider_max_chars {
-        return Ok(PreparedOutcome::Client(
-            "the recorded characters-per-request setting is unusable; recreate the audiobook instead"
-                .to_string(),
-        ));
+        return refused(
+            "the recorded characters-per-request setting is unusable; recreate the audiobook instead",
+        );
     }
     let max_chars = max_chars_u64.min(usize::MAX as u64) as usize;
     let concurrency = options
@@ -1970,9 +2027,7 @@ fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> 
             Some(value) => match value.as_u64().and_then(|seed| u32::try_from(seed).ok()) {
                 Some(seed) => Some(seed),
                 None => {
-                    return Ok(PreparedOutcome::Client(
-                        "the recorded seed setting is unusable".to_string(),
-                    ));
+                    return refused("the recorded seed setting is unusable");
                 }
             },
         },
@@ -1984,9 +2039,7 @@ fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> 
                 if super::audiobook::parse_chapter_ranges(text).is_ok() {
                     (!text.is_empty()).then(|| text.to_string())
                 } else {
-                    return Ok(PreparedOutcome::Client(
-                        "the recorded chapter filter no longer parses".to_string(),
-                    ));
+                    return refused("the recorded chapter filter no longer parses");
                 }
             }
         },
@@ -1995,9 +2048,7 @@ fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> 
             Some(policy) => match policy.as_str() {
                 Some(policy @ ("on" | "off")) => Some(policy.to_string()),
                 _ => {
-                    return Ok(PreparedOutcome::Client(
-                        "the recorded text-normalization policy is unusable".to_string(),
-                    ));
+                    return refused("the recorded text-normalization policy is unusable");
                 }
             },
         },
@@ -2017,7 +2068,7 @@ fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> 
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    Ok(PreparedOutcome::Ready(Box::new(PreparedRetry {
+    Ok(PrepareStep::Ready(Box::new(PreparedRetry {
         out_dir,
         input_path,
         model_opt: model_for_child.filter(|model| !model.is_empty()),
@@ -2044,6 +2095,44 @@ fn u32_checked(value: Option<&serde_json::Value>) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
+/// Resolve the atomic retry claim one way or the other:
+/// - when the fresh `running` state already exists, the claim file is debris
+///   and is removed;
+/// - otherwise the original `process.json` bytes are renamed back, so a
+///   refusal or a crash below the claim can never strand the operation in
+///   claimed limbo or destroy its durable state.
+fn settle_retry_claim(out_dir: &Path) {
+    let claim_path = out_dir.join(RETRY_CLAIM_FILE_NAME);
+    if !claim_path.exists() {
+        return;
+    }
+    if out_dir.join("process.json").exists() {
+        let _ = std::fs::remove_file(&claim_path);
+    } else {
+        let _ = std::fs::rename(&claim_path, out_dir.join("process.json"));
+    }
+}
+
+/// Guard pair held for the whole spawn handoff of [`retry_failed_chunks`].
+/// Dropping it releases the SERVE-6 launch slot *and* settles the atomic
+/// claim per [`settle_retry_claim`], so every failure path — early `?`, panic
+/// unwind, refused key, failed spawn — unwinds to a consistent operation
+/// directory.
+struct RetryClaimLaunch {
+    /// Held (never read) purely so its Drop releases the launch slot.
+    #[allow(dead_code)]
+    slot: LaunchSlotGuard,
+    out_dir: PathBuf,
+}
+
+impl Drop for RetryClaimLaunch {
+    fn drop(&mut self) {
+        // LaunchSlotGuard's own Drop frees the slot first (field order); the
+        // claim settlement follows before this struct is fully gone.
+        settle_retry_claim(&self.out_dir);
+    }
+}
+
 fn options_u64(value: Option<&serde_json::Value>) -> Option<u64> {
     value.and_then(serde_json::Value::as_u64)
 }
@@ -2064,6 +2153,13 @@ async fn retry_failed_chunks(
         return Ok(response);
     }
 
+    // F3(b): one launch slot covers preparation + the spawn handoff. On every
+    // failure path below (including `?` error returns and panics) dropping
+    // the guard releases the capacity again.
+    let LaunchSlot::Acquired(slot) = try_acquire_launch_slot(&state)? else {
+        return Ok(launch_slot_exhausted());
+    };
+
     let upload_dir = state.upload_dir.clone();
     let retry_id = id.clone();
     let prepared =
@@ -2071,8 +2167,22 @@ async fn retry_failed_chunks(
     let prepared = match prepared {
         PreparedOutcome::NotFound => return Ok(debris_not_found_response()),
         PreparedOutcome::Running => return Ok(debris_running_response()),
+        // F3(a): a concurrent double-click lost the atomic rename race.
+        PreparedOutcome::RetryStarting => {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "retry already starting" })),
+            )
+                .into_response());
+        }
         PreparedOutcome::Client(message) => return Ok(bad_request(&message)),
         PreparedOutcome::Ready(prepared) => prepared,
+    };
+    // From here on the claim must be settled no matter which way control
+    // leaves this handler; the guard pairs that with the launch slot.
+    let _guard = RetryClaimLaunch {
+        slot,
+        out_dir: prepared.out_dir.clone(),
     };
 
     // Key handling mirrors launch_audiobook exactly: a supplied key replaces
@@ -2124,6 +2234,36 @@ async fn retry_failed_chunks(
     command.arg("--retry-failed");
     configure_dashboard_child_environment(&mut command, api_key_env.zip(key.as_deref()));
 
+    // Test parity with the resume hook (state.resume_launches): installs a
+    // deterministic spawn boundary so endpoint tests can drive the full
+    // claim/slot/state machinery without exec'ing the test binary as an
+    // audiobook child.
+    #[cfg(test)]
+    if let Some(launches) = &state.retry_launches {
+        launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        write_audio_process_state(
+            &prepared.out_dir,
+            "running",
+            None,
+            None,
+            prepared.auto_model,
+            Some(&prepared.options_snapshot),
+        )?;
+        eprintln!(
+            "[serve] audiobook retry-failed id={id} pid=none failed_chunks={}",
+            prepared.failed_count
+        );
+        return Ok(Json(json!({
+            "ok": true,
+            "id": id,
+            "mode": "spawned",
+            "retry_failed": true,
+            "failed_chunks": prepared.failed_count,
+            "pid": serde_json::Value::Null,
+        }))
+        .into_response());
+    }
+
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -2148,6 +2288,12 @@ async fn retry_failed_chunks(
         prepared.out_dir.clone(),
         pid,
         prepared.auto_model,
+    );
+    // F7 audit trail: relaunches spend provider credits on retry, so record
+    // the operation, pid and chunk count on the serve console.
+    eprintln!(
+        "[serve] audiobook retry-failed id={id} pid={pid:?} failed_chunks={}",
+        prepared.failed_count
     );
 
     Ok(Json(json!({

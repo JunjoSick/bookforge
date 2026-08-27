@@ -20,6 +20,7 @@ use rusqlite::{Connection, OptionalExtension, params, types::Type};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 
+mod assets_delete;
 mod findings;
 mod flags;
 mod glossary;
@@ -44,7 +45,7 @@ pub use flags::RetryScope;
 pub use prune::{PruneJobDeletion, PruneJobsOptions, PruneJobsReport};
 pub use schema::run_doctor;
 #[cfg(test)]
-use schema::table_column_is_not_null;
+use schema::{restore_safe_status_harden, table_column_is_not_null};
 pub use status::{JobStatus, SegmentStatus};
 
 pub type Result<T> = std::result::Result<T, StoreError>;

@@ -376,6 +376,12 @@ where
         Some(store) => store,
         None => JobStore::open_default()?,
     };
+    // Canonical open point: drain warn-on-open storage diagnostics once so
+    // legacy unknown statuses / skipped hardening surface here, not just in
+    // tests (taking clears the queue; re-draining later stays idempotent).
+    for diagnostic in store.take_diagnostics() {
+        tracing::warn!(surface = "translate", "{diagnostic}");
+    }
     let glossary = prepare_glossary_run_config(
         &store,
         &cli_args.glossary,

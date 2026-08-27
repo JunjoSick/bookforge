@@ -235,6 +235,14 @@ impl JobStore {
         self.touch_job_unless_status(job_id, JobStatus::Failed, &[JobStatus::Stopped])
     }
 
+    /// Force a segment into `failed` regardless of its current status.
+    ///
+    /// Production checkpoint paths should prefer
+    /// [`JobStore::mark_segment_failed_if_unfinished`], which refuses to
+    /// clobber terminal-with-translation states (`succeeded`,
+    /// `needs_review`, ...) so a late failure report can never destroy work
+    /// already persisted. Keep this twin only where overwriting is the point
+    /// (fixtures, deliberate state repair).
     pub fn mark_segment_failed(&self, job_id: &str, segment_id: &str, error: &str) -> Result<()> {
         {
             let conn = self.conn.borrow();

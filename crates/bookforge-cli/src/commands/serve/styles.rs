@@ -19,15 +19,17 @@ pub(super) fn routes() -> Router<AppState> {
 // ---------------------------------------------------------------------------
 // Style sheets (wraps the `style` command's JobStore methods)
 //
-// The store keys a style sheet on (scope, scope_id, target_language) and has
-// no single-row delete, so "remove one sheet" is implemented as
-// snapshot-everything-in-the-scope -> clear the scope -> restore every other
-// row through the same public upsert API. Each route opens its own store
-// connection per request exactly like the glossary routes do.
+// The store keys a sheet on (scope, scope_id, target_language); single-row
+// removal goes through the store's atomic `remove_style_sheet` primitive —
+// one immediate transaction issuing a precise DELETE with identity-tuple
+// matching — so there is no snapshot-clear-restore round trip and no torn
+// state window. Each route opens its own store connection per request exactly
+// like the glossary routes do.
 //
-// Consequence worth knowing before depending on it: sibling row ids are
-// re-assigned by SQLite during a removal, so treat ids as session-local
-// handles (the bundled UI always reloads the list after mutating).
+// Sibling ids are stable across deletions now: nothing is re-inserted after a
+// removal, so no renumbering happens. The earlier doc note warning that ids
+// were session-local handles (sibling rows got reassigned by SQLite during a
+// removal) describes retired behavior.
 //
 // Parity note with the CLI surface: a stored style sheet keys on target
 // language only — there is no source-language or display-name column, so the
@@ -289,26 +291,15 @@ async fn remove_style_sheet(
     let store_path = state.store_path.clone();
     let removed = tokio::task::spawn_blocking(move || -> Result<bool> {
         let store = JobStore::open(store_path)?;
-        let Some(record) = locate_style_record(&store, id)? else {
-            return Ok(false);
-        };
-        // Precise single-row removal without a store-layer delete primitive:
-        // snapshot every sibling sheet in this scope, clear the scope, then
-        // restore the siblings verbatim through the public upsert.
-        let mut others =
-            store.list_style_sheets(None, Some(record.scope_kind), record.scope_id.as_deref())?;
-        others.retain(|other| other.id != id);
-        store.clear_style_scope(record.scope_kind, record.scope_id.as_deref())?;
-        for other in &others {
-            store.upsert_style_sheet(&NewStyleSheet {
-                scope_kind: other.scope_kind,
-                scope_id: other.scope_id.as_deref(),
-                target_language: &other.target_language,
-                content_toml: &other.content_toml,
-                fingerprint: &other.fingerprint,
-            })?;
+        // One atomic single-row delete (F1): identity-tuple matching inside a
+        // single immediate transaction replaces the former
+        // snapshot-clear-restore sequence that could tear under concurrent
+        // writers and reassigned sibling ids.
+        let removed = store.remove_style_sheet(id)?;
+        if removed {
+            eprintln!("[serve] style sheet delete id={id}");
         }
-        Ok(true)
+        Ok(removed)
     })
     .await??;
     if removed {

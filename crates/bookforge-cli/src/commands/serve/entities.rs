@@ -17,10 +17,11 @@ pub(super) fn routes() -> Router<AppState> {
 //
 // Field parity with `bookforge entities --help` / its import TOML: source and
 // target name, optional target-side gender (m/f/n), role, notes, plus the
-// scope and language-pair identity. The store has no per-row delete either,
-// so removal follows the same snapshot-clear-restore strategy as the style
-// routes; ids are therefore session-local handles that may renumber when a
-// sibling is removed (the UI reloads after every mutation).
+// scope and language-pair identity. Removal goes through the store's atomic
+// `remove_entity` primitive — one immediate transaction issuing a precise
+// DELETE with identity-tuple matching — so ids are stable across deletions;
+// the earlier snapshot-clear-restore strategy (and its sibling-renumbering
+// caveat) is retired.
 // ---------------------------------------------------------------------------
 
 fn parse_entity_scope(value: &str) -> GlossaryScopeKind {
@@ -378,38 +379,15 @@ async fn remove_entity(
     let store_path = state.store_path.clone();
     let removed = tokio::task::spawn_blocking(move || -> Result<bool> {
         let store = JobStore::open(store_path)?;
-        let Some(record) = locate_entity_record(&store, id)? else {
-            return Ok(false);
-        };
-        // Precise single-row removal without a store-layer delete primitive:
-        // snapshot every sibling entity in this scope, clear the scope, then
-        // restore the siblings verbatim through the public upsert.
-        let mut others = store.list_entities(
-            None,
-            None,
-            Some(record.scope_kind),
-            record.scope_id.as_deref(),
-        )?;
-        others.retain(|other| other.id != id);
-        store.clear_entities_scope(record.scope_kind, record.scope_id.as_deref())?;
-        let rows = others
-            .iter()
-            .map(|other| {
-                new_entity(
-                    other.scope_kind,
-                    other.scope_id.as_deref(),
-                    &other.source_name,
-                    &other.target_name,
-                    other.gender_target,
-                    other.role.as_deref(),
-                    other.notes.as_deref(),
-                    &other.source_language,
-                    &other.target_language,
-                )
-            })
-            .collect::<Vec<_>>();
-        store.upsert_entities(&rows)?;
-        Ok(true)
+        // One atomic single-row delete (F1): identity-tuple matching inside a
+        // single immediate transaction replaces the former
+        // snapshot-clear-restore sequence that could tear under concurrent
+        // writers and reassigned sibling ids.
+        let removed = store.remove_entity(id)?;
+        if removed {
+            eprintln!("[serve] entity delete id={id}");
+        }
+        Ok(removed)
     })
     .await??;
     if removed {

@@ -163,6 +163,11 @@ pub async fn run(
     cancel_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let store = JobStore::open_default()?;
+    // Canonical open point: drain warn-on-open storage diagnostics so legacy
+    // unknown statuses / skipped hardening are visible at resume start.
+    for diagnostic in store.take_diagnostics() {
+        tracing::warn!(surface = "resume", "{diagnostic}");
+    }
     let Some(job) = store.get_job(&args.job_id)? else {
         anyhow::bail!("job '{}' was not found", args.job_id);
     };
@@ -1579,7 +1584,7 @@ mod tests {
         );
         fixture
             .store
-            .mark_segment_failed(
+            .mark_segment_failed_if_unfinished(
                 &fixture.job.id,
                 &fixture.segments[1].id.0,
                 "transport died mid-resume",

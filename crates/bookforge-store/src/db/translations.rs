@@ -760,9 +760,10 @@ impl JobStore {
     }
 }
 
-/// Connection-scoped freeze check so the model-write paths can run it inside
-/// their own `IMMEDIATE` transaction.
-fn translation_is_human_corrected_on(
+/// Connection-scoped freeze check so the model-write paths and
+/// `request_segment_retry` can run it inside their own `IMMEDIATE`
+/// transaction.
+pub(super) fn translation_is_human_corrected_on(
     conn: &Connection,
     job_id: &str,
     segment_id: &str,

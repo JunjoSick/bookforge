@@ -60,11 +60,14 @@ pub struct PruneJobsReport {
     /// of this actually happened.
     pub dry_run: bool,
     /// Non-running jobs matched by the age filter (before keep_last_n).
+    /// A selected job later re-checked as `running` inside its own deletion
+    /// transaction stops being a candidate and is subtracted from this count.
     pub candidate_count: usize,
     /// Jobs withheld by `keep_last_n`.
     pub retained_by_keep_last_n: usize,
-    /// Running jobs found in the store; always protected, never counted as
-    /// candidates.
+    /// Running jobs found in the store at selection time PLUS candidates that
+    /// flipped to `running` before their deletion transaction re-checked
+    /// them; always protected, never counted as candidates.
     pub protected_running_jobs: usize,
     pub deletions: Vec<PruneJobDeletion>,
 }
@@ -88,6 +91,18 @@ fn epoch_seconds(time: SystemTime) -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
+/// Result of the selection pass: everything downstream deletion needs, kept
+/// separate from execution so tests can interleave a concurrent status flip
+/// between the two phases (the TOCTOU window this module guards).
+#[derive(Debug, Clone)]
+pub(super) struct PruneSelection {
+    /// Candidate job ids scheduled for deletion (already past keep_last_n).
+    pub(super) to_delete: Vec<String>,
+    pub(super) candidate_count: usize,
+    pub(super) protected_running_jobs: usize,
+    pub(super) retained_by_keep_last_n: usize,
+}
+
 impl JobStore {
     /// Delete finished jobs and every row/file they own per the given filter.
     ///
@@ -95,6 +110,10 @@ impl JobStore {
     /// - Jobs with status `running` are NEVER touched (`PruneJobsReport::
     ///   protected_running_jobs` reports how many were skipped for this
     ///   reason).
+    /// - The running guard is enforced twice: once during selection and again
+    ///   as the first statement inside every per-job deletion transaction, so
+    ///   a job that turns `running` after selection is skipped instead of
+    ///   being deleted underneath a live checkpointing process.
     /// - Selection order: `older_than` cutoff on `created_at`, newest-first;
     ///   `keep_last_n` spares the N newest survivors; both compose.
     /// - DB rows go atomically per job inside an IMMEDIATE transaction, in
@@ -110,16 +129,29 @@ impl JobStore {
             .older_than
             .and_then(epoch_seconds)
             .and_then(|secs| i64::try_from(secs).ok());
-        let running_guard = JobStatus::Running.as_db_text();
-
+        let selection = self.select_prune_candidates(cutoff_secs, options.keep_last_n)?;
         let mut report = PruneJobsReport {
             dry_run: options.dry_run,
-            ..PruneJobsReport::default()
+            candidate_count: selection.candidate_count,
+            protected_running_jobs: selection.protected_running_jobs,
+            retained_by_keep_last_n: selection.retained_by_keep_last_n,
+            deletions: Vec::new(),
         };
+        self.execute_prune_selection(&selection.to_delete, &options, &mut report)?;
+        Ok(report)
+    }
 
+    /// Snapshot one consistent view of prune candidates plus the running-job
+    /// guard count. Read-only apart from its IMMEDIATE transaction lock.
+    pub(super) fn select_prune_candidates(
+        &self,
+        cutoff_secs: Option<i64>,
+        keep_last_n: Option<usize>,
+    ) -> Result<PruneSelection> {
+        let running_guard = JobStatus::Running.as_db_text();
+        let mut conn = self.conn.borrow_mut();
         // Single consistent snapshot for selection: read candidates and the
         // running-job guard count together before deleting anything.
-        let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let select_sql = "SELECT id FROM jobs
              WHERE status <> ?1
@@ -133,30 +165,52 @@ impl JobStore {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
 
-        report.protected_running_jobs = tx.query_row(
+        let protected_running_jobs = tx.query_row(
             "SELECT COUNT(*) FROM jobs WHERE status = ?1",
             params![running_guard],
             |row| row.get::<_, i64>(0),
         )? as usize;
-        report.candidate_count = candidate_ids.len();
-        let to_delete: &[String] = match options.keep_last_n {
-            Some(keep) => &candidate_ids[keep.min(candidate_ids.len())..],
-            None => &candidate_ids,
+        let candidate_count = candidate_ids.len();
+        let to_delete = match keep_last_n {
+            Some(keep) => candidate_ids[keep.min(candidate_ids.len())..].to_vec(),
+            None => candidate_ids,
         };
-        report.retained_by_keep_last_n = candidate_ids.len() - to_delete.len();
+        let retained_by_keep_last_n = candidate_count - to_delete.len();
         tx.commit()?;
-        // Release the connection before per-job operations re-borrow it.
-        drop(conn);
+        Ok(PruneSelection {
+            to_delete,
+            candidate_count,
+            protected_running_jobs,
+            retained_by_keep_last_n,
+        })
+    }
 
+    /// Drive the deletion/dry-run path for previously selected candidates.
+    /// Jobs that re-read as `running` as the first statement of their deletion
+    /// transaction are skipped untouched and reflected honestly in `report`.
+    pub(super) fn execute_prune_selection(
+        &self,
+        to_delete: &[String],
+        options: &PruneJobsOptions,
+        report: &mut PruneJobsReport,
+    ) -> Result<()> {
         for job_id in to_delete {
             let deletion = if options.dry_run {
                 self.prune_job_dry_run(job_id)?
             } else {
                 self.prune_job_now(job_id)?
             };
-            report.deletions.push(deletion);
+            match deletion {
+                Some(deletion) => report.deletions.push(deletion),
+                None => {
+                    // Re-check under the write lock found `running`: skip
+                    // without deleting anything and keep the report honest.
+                    report.protected_running_jobs += 1;
+                    report.candidate_count = report.candidate_count.saturating_sub(1);
+                }
+            }
         }
-        Ok(report)
+        Ok(())
     }
 
     fn prune_job_deletion_columns(conn: &Connection, job_id: &str) -> Result<PruneJobDeletion> {
@@ -179,22 +233,35 @@ impl JobStore {
         })
     }
 
-    fn prune_job_dry_run(&self, job_id: &str) -> Result<PruneJobDeletion> {
+    /// Dry-run: re-checks the running guard (same rule as a real deletion
+    /// would apply) and returns `None` when the job must be skipped.
+    fn prune_job_dry_run(&self, job_id: &str) -> Result<Option<PruneJobDeletion>> {
         let conn = self.conn.borrow();
+        if job_status_is_running(&conn, job_id)? {
+            return Ok(None);
+        }
         let mut deletion = Self::prune_job_deletion_columns(&conn, job_id)?;
         deletion.artifacts_missing = artifact_paths(&conn, job_id)?
             .into_iter()
             .filter(|path| !path.exists())
             .count();
-        Ok(deletion)
+        Ok(Some(deletion))
     }
 
-    fn prune_job_now(&self, job_id: &str) -> Result<PruneJobDeletion> {
+    /// Real deletion. The FIRST statement inside the IMMEDIATE transaction
+    /// re-reads the job status so a job flipped to `running` after selection
+    /// is never deleted underneath its checkpointing process; that case
+    /// returns `None` without deleting anything.
+    fn prune_job_now(&self, job_id: &str) -> Result<Option<PruneJobDeletion>> {
         // Child-before-parent inside one IMMEDIATE transaction; only plain FKs
         // point at segments/translations/blocks/findings, so explicit deletes
         // keep this correct even where ON DELETE CASCADE is absent.
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if job_status_is_running(&tx, job_id)? {
+            // No writes happened yet, so rolling back is a pure no-op.
+            return Ok(None);
+        }
         let qa_findings = delete_job_rows(&tx, "qa_findings", job_id)?;
         let translation_blocks = delete_job_rows(&tx, "translation_blocks", job_id)?;
         let translations = delete_job_rows(&tx, "translations", job_id)?;
@@ -208,10 +275,10 @@ impl JobStore {
         if removed_jobs == 0 {
             // Raced with another process pruning the same job: its tree is
             // already gone, report a no-op.
-            return Ok(PruneJobDeletion {
+            return Ok(Some(PruneJobDeletion {
                 job_id: job_id.to_string(),
                 ..PruneJobDeletion::default()
-            });
+            }));
         }
 
         let mut missing = 0usize;
@@ -223,7 +290,7 @@ impl JobStore {
                 Err(_) => {}
             }
         }
-        Ok(PruneJobDeletion {
+        Ok(Some(PruneJobDeletion {
             job_id: job_id.to_string(),
             segments,
             translations,
@@ -232,8 +299,22 @@ impl JobStore {
             segment_flags,
             artifacts_removed: removed_files,
             artifacts_missing: missing,
-        })
+        }))
     }
+}
+
+/// Running-guard read scoped to whichever connection/transaction is in scope.
+/// `row is NULL` (job vanished between phases) reads as not-running so the
+/// existing deleted-under-us no-op accounting still applies.
+fn job_status_is_running(conn: &Connection, job_id: &str) -> Result<bool> {
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(status.is_some_and(|status| status == JobStatus::Running.as_db_text()))
 }
 
 /// Delete all rows of `table` scoped to one job.

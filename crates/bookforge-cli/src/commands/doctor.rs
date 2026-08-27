@@ -6,7 +6,7 @@ use bookforge_llm::{
     RequestMetadata, ResponseFormat,
 };
 use bookforge_pdf::{HttpOcrClient, OcrConfig, PopplerTools};
-use bookforge_store::run_doctor;
+use bookforge_store::{JobStore, run_doctor};
 
 use crate::sanitize::{sanitize_terminal, sanitize_truncated};
 
@@ -248,6 +248,30 @@ async fn run_storage_doctor() -> anyhow::Result<bool> {
                 "  WARNING: integrity check failed — consider running PRAGMA integrity_check manually"
             );
             healthy = false;
+        }
+
+        // Canonical open point for the diagnostics queue: legacy warn-on-open
+        // conditions (unknown statuses, skipped hardening) would otherwise be
+        // unreachable in any shipped surface. Listing is verbose here; the
+        // take clears the queue so repeat runs only show new entries.
+        match JobStore::open_default() {
+            Ok(store) => {
+                let diagnostics = store.take_diagnostics();
+                if !diagnostics.is_empty() {
+                    println!();
+                    println!("Storage diagnostics (open/migration warnings):");
+                    for diagnostic in &diagnostics {
+                        println!("  {diagnostic}");
+                        tracing::warn!(surface = "doctor", "{diagnostic}");
+                    }
+                }
+            }
+            Err(error) => {
+                println!();
+                println!(
+                    "  WARNING: could not open jobs database to collect storage diagnostics: {error}"
+                );
+            }
         }
     } else {
         println!("  database: {} (not found)", doctor.database_path.display());
