@@ -85,9 +85,12 @@ pub(super) fn capped_batch_max_output_tokens(
         target_min_output_tokens,
     );
     let user_cap = config.batch_max_output_tokens.or(config.max_output_tokens);
+    // Audit LLM-P3b: the remainder math must deduct the fixed template
+    // scaffold too, not just the packed item payload, or near-full windows
+    // get an oversized response budget.
     crate::scheduler::clamped_output_budget(
         computed,
-        batch.token_estimate,
+        batch_prompt_estimate(batch),
         config.model_context_tokens,
         user_cap,
     )
@@ -118,10 +121,16 @@ fn batch_output_token_ceiling(
     } else {
         16_384
     };
+    // Audit LLM-P3a: this ceiling used to pass `None` for the user cap, so
+    // an escalated retry could exceed an explicitly configured
+    // `batch_max_output_tokens` / `max_output_tokens`. Thread the same cap
+    // that `capped_batch_max_output_tokens` honours through here, preserving
+    // the documented "explicit cap outranks everything" semantics.
+    let user_cap = config.batch_max_output_tokens.or(config.max_output_tokens);
     crate::scheduler::clamped_output_budget(
         ceiling,
-        batch.token_estimate,
+        batch_prompt_estimate(batch),
         config.model_context_tokens,
-        None,
+        user_cap,
     )
 }

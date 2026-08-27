@@ -783,6 +783,7 @@ pub struct OpenAiCompatibleProvider {
     reasoning_detected: AtomicBool,
     response_format_supported: AtomicBool,
     thinking_warning_emitted: AtomicBool,
+    collapsed_budget_warning_emitted: AtomicBool,
     pub cancel_token: CancellationToken,
 }
 
@@ -797,6 +798,10 @@ impl Clone for OpenAiCompatibleProvider {
             ),
             thinking_warning_emitted: AtomicBool::new(
                 self.thinking_warning_emitted.load(Ordering::Relaxed),
+            ),
+            collapsed_budget_warning_emitted: AtomicBool::new(
+                self.collapsed_budget_warning_emitted
+                    .load(Ordering::Relaxed),
             ),
             cancel_token: self.cancel_token.clone(),
         }
@@ -837,6 +842,7 @@ impl OpenAiCompatibleProvider {
             reasoning_detected: AtomicBool::new(bootstrapped_reasoning),
             response_format_supported: AtomicBool::new(true),
             thinking_warning_emitted: AtomicBool::new(false),
+            collapsed_budget_warning_emitted: AtomicBool::new(false),
             cancel_token,
         })
     }
@@ -856,7 +862,27 @@ impl OpenAiCompatibleProvider {
         });
 
         if let Some(max_tokens) = request.max_output_tokens {
-            body["max_tokens"] = json!(max_tokens);
+            // Audit LLM-P3c: a degenerate plan (context remainder clamped to
+            // zero, e.g. a pathological segment bigger than the whole window)
+            // must never serialize a zero-token request — that is a guaranteed
+            // opaque HTTP 400 on most endpoints. Floor the wire value at 1 and
+            // surface a plan warning so oversized segments are visible instead
+            // of vanishing into a silent 400 chase.
+            let limit = max_tokens.max(1);
+            if max_tokens == 0
+                && !self
+                    .collapsed_budget_warning_emitted
+                    .swap(true, Ordering::Relaxed)
+            {
+                warn!(
+                    base_url = %self.config.base_url,
+                    model = %self.config.model,
+                    segment_id = ?request.metadata.segment_id,
+                    "plan warning: output budget collapsed to 1 token — segment exceeds its \
+                     context window; request sent with max_tokens=1 and will likely truncate"
+                );
+            }
+            body["max_tokens"] = json!(limit);
         }
 
         if self.config.thinking_disabled {
@@ -1381,7 +1407,18 @@ fn parse_http_date_unix(input: &str) -> Option<u64> {
     let hour: u32 = clock.next()?.parse().ok()?;
     let minute: u32 = clock.next()?.parse().ok()?;
     let second: u32 = clock.next()?.parse().ok()?;
-    if clock.next().is_some() || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    // Audit LLM-P3d: bound the year like every other field above. Years
+    // below 1600 predate any sane HTTP semantics and can wrap the unsigned
+    // Unix result negative-side (days-from-civil goes negative); years
+    // beyond 9999 are nonsense on the wire and could overflow the day math.
+    // Both collapse to `None` — the same rejection style as the other
+    // bounds — so a hostile header falls back to exponential backoff.
+    if clock.next().is_some()
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+        || !(1600..=9999).contains(&year)
     {
         return None;
     }
@@ -1726,6 +1763,119 @@ mod tests {
         );
     }
 
+    // ---- Audit LLM-P3c: zero-token budgets never reach the wire ------------
+
+    #[test]
+    fn degenerate_zero_token_budget_is_floored_and_flagged() {
+        let provider = offline_provider("https://llm.example.test/v1", "custom-model");
+        assert!(
+            !provider
+                .collapsed_budget_warning_emitted
+                .load(Ordering::Relaxed)
+        );
+
+        let mut request = offline_request();
+        request.max_output_tokens = Some(0);
+        let body = provider.request_body(&request);
+
+        assert_eq!(body["max_tokens"], json!(1), "the wire value must be 1");
+        assert!(
+            provider
+                .collapsed_budget_warning_emitted
+                .load(Ordering::Relaxed),
+            "a collapsed budget must surface its plan warning"
+        );
+
+        // A healthy budget passes through untouched and emits no warning.
+        let healthy_provider = offline_provider("https://llm.example.test/v1", "custom-model");
+        let body = healthy_provider.request_body(&offline_request());
+        assert_eq!(body["max_tokens"], json!(256));
+        assert!(
+            !healthy_provider
+                .collapsed_budget_warning_emitted
+                .load(Ordering::Relaxed)
+        );
+    }
+
+    /// Pathological case end-to-end: a segment whose plan collapsed to a
+    /// one-token budget still completes against the endpoint — floored at
+    /// max_tokens=1, warning flagged, and no error/400-chase behavior.
+    #[tokio::test]
+    async fn collapsed_budget_request_still_proceeds_with_floored_limit() {
+        let (response, wire_body, budget_flagged) = retry_transient_transport(|| {
+            use tokio::io::AsyncWriteExt;
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("test listener should bind");
+                let addr = listener.local_addr().unwrap();
+                let server_handle = tokio::spawn(async move {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return None;
+                    };
+                    let inbound = read_mock_request(&mut stream).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let payload = json!({
+                        "choices": [
+                            {"message": {"content": "ok"}, "finish_reason": "stop"}
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    });
+                    let _ = stream.write_all(payload.to_string().as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    Some(inbound)
+                });
+
+                let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+                    base_url: format!("http://{addr}"),
+                    // Local providers intentionally permit an absent API key.
+                    api_key_env: "OLLAMA_API_KEY".to_string(),
+                    model: "test-model".to_string(),
+                    timeout_seconds: 10,
+                    provider_max_attempts: 1,
+                    thinking_disabled: true,
+                    retry_after_policy: RetryAfterPolicy::None,
+                    max_backoff_seconds: 1,
+                    max_idle_per_host: 1,
+                    json_mode: bookforge_core::JsonMode::PromptOnly,
+                })
+                .expect("offline provider config should be valid");
+                let mut request = offline_request();
+                request.max_output_tokens = Some(0);
+                // A floored budget completes normally instead of erroring.
+                let response = provider.complete(request).await?;
+                let inbound = server_handle
+                    .await
+                    .expect("mock server joins")
+                    .expect("mock server should capture the inbound request");
+                let budget_flagged =
+                    provider.collapsed_budget_warning_emitted.load(Ordering::Relaxed);
+                Ok((response, inbound, budget_flagged))
+            }
+        })
+        .await
+        .expect("floored budget scenario should succeed without transport flake");
+
+        // The run proceeded: the endpoint answered, nothing chased a 400.
+        assert_eq!(response.content, "ok");
+        assert_eq!(response.finish_reason, FinishReason::Stop);
+        assert!(
+            budget_flagged,
+            "the collapsed budget must be surfaced as a plan warning"
+        );
+
+        // And the wire actually carried the floored limit, not zero.
+        let raw = String::from_utf8_lossy(&wire_body);
+        let body_start = raw.find("\r\n\r\n").expect("headers/body split") + 4;
+        let parsed: Value =
+            serde_json::from_str(raw[body_start..].trim()).expect("JSON request body");
+        assert_eq!(parsed["max_tokens"], json!(1));
+    }
+
     #[test]
     fn billable_output_does_not_double_count_reasoning_breakdown() {
         let raw = json!({
@@ -1866,6 +2016,38 @@ mod tests {
             Some(946_684_800)
         );
         assert_eq!(parse_http_date_unix("not a date"), None);
+    }
+
+    // Audit LLM-P3d: absurd years must be rejected, not run through the
+    // civil-calendar math where they underflow the unsigned Unix result
+    // (or overflow it). The bounds keep hostile Retry-After headers on the
+    // same graceful None path as any other malformed date.
+    #[test]
+    fn http_dates_outside_the_plausible_year_window_are_rejected() {
+        assert_eq!(
+            parse_http_date_unix("Wed, 01 Jan 1599 00:00:00 GMT"),
+            None,
+            "pre-1600 years must be rejected"
+        );
+        assert_eq!(
+            parse_http_date_unix("Wed, 01 Jan 10000 00:00:00 GMT"),
+            None,
+            "five-digit years must be rejected"
+        );
+        assert_eq!(
+            parse_http_date_unix("Wed, 01 Jan -0500 00:00:00 GMT"),
+            None,
+            "negative years must be rejected before the unsigned cast"
+        );
+        // Boundary values inside the window still parse.
+        assert!(
+            parse_http_date_unix("Wed, 01 Jan 1600 00:00:00 GMT").is_some(),
+            "the lower bound itself is accepted"
+        );
+        assert!(
+            parse_http_date_unix("Sun, 01 Jan 9999 12:00:00 GMT").is_some(),
+            "the upper bound itself is accepted"
+        );
     }
 
     #[test]

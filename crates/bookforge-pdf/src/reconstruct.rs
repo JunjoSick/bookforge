@@ -535,9 +535,10 @@ fn fuses_line_end_hyphen(tail_text: &str, head_text: &str) -> bool {
         .is_some_and(|ch| ch.is_lowercase())
 }
 
-/// CJK ideographs, kana and hangul syllables have no case; treat them
-/// as eligible continuations for the mechanical cross-page paragraph
-/// merge when the previous text does not end in any sentence terminal.
+/// CJK ideographs, kana, hangul syllables, Arabic and Hebrew have no
+/// letter case; treat them as eligible continuations for the mechanical
+/// cross-page paragraph merge when the previous text does not end in any
+/// sentence terminal.
 fn starts_caseless_script(head_text: &str) -> bool {
     head_text
         .chars()
@@ -549,6 +550,10 @@ fn starts_caseless_script(head_text: &str) -> bool {
                 | 0x4E00..=0x9FFF        // CJK unified ideographs
                 | 0xAC00..=0xD7A3        // hangul syllables
                 | 0xF900..=0xFAFF        // CJK compatibility ideographs
+                | 0x0600..=0x06FF        // Arabic block (PDF F-2)
+                | 0xFB50..=0xFEFF        // Arabic presentation forms A/B —
+                                         // shaper-emitted ligature glyphs (PDF F-2)
+                | 0x0590..=0x05FF        // Hebrew block (PDF F-2)
             )
         })
 }
@@ -597,7 +602,15 @@ fn needs_joining_space(tail_text: &str, head_text: &str) -> bool {
 }
 
 /// Sentence terminals include the full-width/CJK repertoire so a CJK
-/// sentence ending in 。！？； is never merged into the next page.
+/// sentence ending in 。！？； is never merged into the next page, plus
+/// the Arabic full stop ۔ and Arabic question mark ؟ (PDF F-2).
+///
+/// Deliberately excluded (PDF F-2): the Arabic comma ، (U+060C) and the
+/// Hebrew maqaf ‎־‎ (U+05BE). The Arabic comma separates clauses inside a
+/// single sentence — treating it as a terminal would fragment legitimate
+/// paragraphs at every page break — and the maqaf is an intra-word
+/// hyphen-like separator inside Hebrew compounds (אב־הטיפוס), not a
+/// sentence boundary. Both must let the cross-page merge continue.
 fn ends_sentence_terminal(tail_text: &str) -> bool {
     tail_text.trim_end().ends_with([
         '.', '!', '?', ':', ';', '"', '\u{201d}', '\u{2019}', '\u{3002}', // 。
@@ -609,6 +622,8 @@ fn ends_sentence_terminal(tail_text: &str) -> bool {
         '\u{300d}', // 」
         '\u{300f}', // 』
         '\u{ff09}', // ）
+        '\u{061f}', // ؟ Arabic question mark (PDF F-2)
+        '\u{06d4}', // ۔ Arabic full stop (PDF F-2)
     ])
 }
 
@@ -1111,6 +1126,122 @@ mod tests {
         assert!(
             !result.blocks[0].block.text().ends_with("升起，"),
             "first paragraph must end at its own terminal"
+        );
+    }
+
+    #[test]
+    fn arabic_and_hebrew_terminal_punctuation_classifies_correctly() {
+        // PDF F-2: genuine Arabic sentence terminals end a sentence...
+        assert!(ends_sentence_terminal("وأخيرًا انتهى الأمر۔"));
+        assert!(ends_sentence_terminal("ماذا حدث؟"));
+        // ...while the Arabic comma and the Hebrew maqaf are separators
+        // inside a sentence / inside a word and must never end one.
+        assert!(!ends_sentence_terminal("قال الخبير، ثم ذهب"));
+        assert!(!ends_sentence_terminal("أبو الكلام"));
+        assert!(!ends_sentence_terminal("אב־הטיפוס"));
+    }
+
+    #[test]
+    fn arabic_paragraphs_merge_across_pages_and_terminals_block() {
+        // PDF F-2: an Arabic book spanning two pages continues its
+        // paragraph (not fragmenting) — after the PDF-7 logical-order
+        // repair the page-1 tail ends in an Arabic comma (U+060C), a
+        // clause separator that is NOT a sentence terminal. Fixture text
+        // is in poppler's visual word order (logical reversed), mirroring
+        // what the repair step consumes.
+        let flowing = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="760" left="80" width="440" height="12" font="0">كانت الضجيج، عن بعيد وادٍ في</text>
+</page>
+<page number="2" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="80" left="80" width="440" height="12" font="0">توقف. بلا تُروى الحكايات</text>
+</page>
+</pdf2xml>"#;
+        let pages = parse_pdf2xml(flowing).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
+        assert_eq!(texts.len(), 1, "Arabic comma tail must merge: {texts:?}");
+        assert!(
+            texts[0].contains("كانت الحكايات"),
+            "the repaired logical sentence must continue across the page join: {texts:?}"
+        );
+
+        // Genuine sentence breaks hold: the Arabic full stop and the
+        // Arabic question mark both block the merge (they land on the
+        // repaired tail's end, exactly where the check looks).
+        for terminal in ["۔", "؟"] {
+            let terminated = flowing.replace("كانت الضجيج", &format!("كانت{terminal} الضجيج"));
+            let pages = parse_pdf2xml(&terminated).expect("fixture parses");
+            let result = reconstruct(&pages, ColumnMode::Auto);
+            assert_eq!(
+                result.blocks.len(),
+                2,
+                "terminal {terminal} must block the Arabic merge: {:?}",
+                result
+                    .blocks
+                    .iter()
+                    .map(|b| b.block.text())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn hebrew_paragraphs_merge_across_pages_and_maqaf_is_not_terminal() {
+        // PDF F-2: a Hebrew book spanning two pages continues its
+        // paragraph even when the repaired tail ends with a maqaf
+        // (U+05BE) — an intra-word hyphen-like separator, not a sentence
+        // end. A real sentence stop still holds the paragraphs apart.
+        // Fixture text is in poppler's visual word order.
+        let flowing = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="760" left="80" width="440" height="12" font="0">אב־ה־ עבר אל המסע</text>
+</page>
+<page number="2" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="80" left="80" width="440" height="12" font="0">בזריחה. החל ההרים</text>
+</page>
+</pdf2xml>"#;
+        let pages = parse_pdf2xml(flowing).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
+        assert_eq!(
+            texts.len(),
+            1,
+            "a maqaf tail must not end the sentence: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("אב־ה־ ההרים"),
+            "the repaired logical sentence must continue across the page join: {texts:?}"
+        );
+
+        let terminated = flowing.replace("אב־ה־ עבר אל המסע", "ההרים. עבר אל המסע");
+        let pages = parse_pdf2xml(&terminated).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+        assert_eq!(
+            result.blocks.len(),
+            2,
+            "a real sentence stop still blocks the Hebrew merge: {:?}",
+            result
+                .blocks
+                .iter()
+                .map(|b| b.block.text())
+                .collect::<Vec<_>>()
         );
     }
 

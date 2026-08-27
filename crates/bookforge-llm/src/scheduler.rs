@@ -1023,6 +1023,14 @@ async fn context_pairs_for_segment(
     }
 }
 
+/// Prompt-token estimate for one single-segment request as seen by the
+/// model's context window: the rendered user payload plus the rendered
+/// system scaffold (audit LLM-P3b — previously only `user` was counted).
+fn estimated_request_prompt_tokens(rendered: &crate::prompt::Rendered) -> usize {
+    bookforge_core::segment::estimate_tokens(&rendered.system)
+        .saturating_add(bookforge_core::segment::estimate_tokens(&rendered.user))
+}
+
 fn select_mode(segment: &Segment) -> TranslationMode {
     if segment.source.blocks.len() <= 1 && segment.constraints.preserve_markers.is_empty() {
         TranslationMode::Plain
@@ -1075,9 +1083,12 @@ where
         // applies must also apply here. An explicit cap stays authoritative,
         // and a nearly-full context window can never be "solved" by raising
         // the budget back to an arbitrary floor.
+        // Audit LLM-P3b: the remainder estimate used to count only the
+        // rendered user payload; the system scaffold was deducted from
+        // nobody's budget, inflating the response allowance. Include it.
         clamped_output_budget(
             computed,
-            bookforge_core::segment::estimate_tokens(&rendered.user),
+            estimated_request_prompt_tokens(&rendered),
             config.model_context_tokens,
             requested,
         )
@@ -3459,6 +3470,26 @@ mod tests {
     #[test]
     fn clamp_applies_identically_without_any_limits() {
         assert_eq!(clamped_output_budget(4_712, 1_000, None, None), 4_712);
+    }
+
+    // ---- Audit LLM-P3b: prompt remainder must include the system scaffold --
+
+    #[test]
+    fn request_prompt_estimate_includes_system_and_user_payload() {
+        let rendered = crate::prompt::Rendered {
+            system: "x".repeat(400),
+            user: "y".repeat(2_000),
+        };
+        assert_eq!(
+            estimated_request_prompt_tokens(&rendered),
+            100 + 500,
+            "estimate_tokens rounds each field up separately"
+        );
+        let system_only = crate::prompt::Rendered {
+            system: "s".repeat(400),
+            user: String::new(),
+        };
+        assert_eq!(estimated_request_prompt_tokens(&system_only), 100);
     }
 
     // ---- Audit LLM-15: fenced book data -----------------------------------

@@ -560,6 +560,24 @@ pub(super) fn token_estimate(text: &str) -> usize {
     bookforge_core::segment::estimate_tokens(text)
 }
 
+/// Fixed prompt-scaffold overhead for one batch request, measured over the
+/// built-in templates (`translate_batch_plain.v3.md`, `_marker_safe_`,
+/// `_run_preserving_`, `_repair_`; system section plus the fixed user
+/// instructions): their static text alone estimates to roughly 180–680
+/// tokens at the ~4-chars-per-token heuristic, before any item payload.
+/// 512 is the conservative middle used when the context-window remainder
+/// is computed, because the per-item JSON payload is already part of
+/// `token_estimate`.
+pub(super) const BATCH_TEMPLATE_OVERHEAD_TOKENS: usize = 512;
+
+/// Prompt-token estimate for one batch request as seen by the model's
+/// context window: the packed item payload plus the fixed template scaffold.
+pub(super) fn batch_prompt_estimate(batch: &TranslationBatch) -> usize {
+    batch
+        .token_estimate
+        .saturating_add(BATCH_TEMPLATE_OVERHEAD_TOKENS)
+}
+
 fn item_token_estimate(
     item: &TranslationBatchItem,
     config: Option<&TranslationRunConfig>,

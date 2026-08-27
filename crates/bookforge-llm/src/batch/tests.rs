@@ -1638,6 +1638,59 @@ async fn batch_truncation_retries_same_batch_with_escalated_budget() {
     );
 }
 
+// Audit LLM-P3a: the escalation ladder's ceiling used to be computed without
+// the user cap (`None` passed through), letting an escalated retry exceed an
+// explicitly configured max-output-tokens limit. The cap outranks everything,
+// including the profile/context ceiling used for escalation.
+#[test]
+fn escalation_ladder_tops_out_at_the_explicit_user_cap() {
+    let batch = make_two_item_batch();
+    const USER_CAP: u32 = 600;
+    let mut config = test_run_config();
+    config.batch_max_output_tokens = Some(USER_CAP);
+
+    let mut budgets = vec![capped_batch_max_output_tokens(&batch, &config, false)];
+    while let Some(next) = next_escalated_batch_max_output_tokens(
+        *budgets.last().expect("seeded"),
+        &batch,
+        &config,
+        false,
+    ) {
+        budgets.push(next);
+    }
+    assert!(
+        budgets.iter().all(|budget| *budget <= USER_CAP),
+        "every escalated budget must respect the user cap: {budgets:?}"
+    );
+    assert_eq!(
+        budgets.last().copied(),
+        Some(USER_CAP),
+        "ladder should still climb freely up to exactly the user cap: {budgets:?}"
+    );
+}
+
+// Audit LLM-P3b: the context-window remainder deduction used only the packed
+// item payload (`token_estimate`); the fixed template scaffold was invisible
+// to the remainder math. The planner now adds a documented constant.
+#[test]
+fn batch_context_remainder_deducts_the_template_scaffold() {
+    let batch = make_two_item_batch();
+    let window = Some(8_000_u32);
+    let bare_payload =
+        crate::scheduler::clamped_output_budget(16_384, batch.token_estimate, window, None);
+    let planned = crate::scheduler::clamped_output_budget(
+        16_384,
+        crate::batch::planning::batch_prompt_estimate(&batch),
+        window,
+        None,
+    );
+    assert_eq!(
+        bare_payload.saturating_sub(planned),
+        crate::batch::planning::BATCH_TEMPLATE_OVERHEAD_TOKENS as u32,
+        "planning must deduct exactly the documented template overhead"
+    );
+}
+
 #[tokio::test]
 async fn single_item_truncation_retries_once_with_same_compact_budget() {
     let segment = make_segment("seg1", vec![plain_block("Hello")], vec![]);
@@ -3469,6 +3522,232 @@ async fn paused_batch_reconfigure_repartitions_before_resume_dispatch() {
         })
         .collect::<Vec<_>>();
     assert_eq!(request_shapes, vec![(4, Some(2), Some(3))]);
+}
+
+/// Provider for the paused-repair test: call 0 is the initial translation
+/// batch (first item satisfied, all later items blank so they funnel into
+/// repair); repair calls echo corrected text. Repair calls 1 and 2 park on
+/// a semaphore gate so the test can inject a pause while both first-wave
+/// batches are in flight; later repairs run freely once resumed.
+#[derive(Clone)]
+struct GatedRepairEchoProvider {
+    started: Arc<AtomicUsize>,
+    release_gated_repairs: Arc<tokio::sync::Semaphore>,
+}
+
+impl GatedRepairEchoProvider {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(AtomicUsize::new(0)),
+            release_gated_repairs: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+fn item_ids_from_repair_prompt(user_prompt: &str) -> Vec<String> {
+    let Some(items_section) = user_prompt.split("Items to repair:\n").nth(1) else {
+        return Vec::new();
+    };
+    let json_text = items_section
+        .split("\n\nValidation errors:")
+        .next()
+        .unwrap_or(items_section);
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(json_text.trim()) else {
+        return Vec::new();
+    };
+    items
+        .into_iter()
+        .filter_map(|item| item.get("id")?.as_str().map(ToString::to_string))
+        .collect()
+}
+
+impl LlmProviderTrait for GatedRepairEchoProvider {
+    async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+        let call_index = self.started.fetch_add(1, Ordering::AcqRel);
+        let content = if call_index == 0 {
+            let ids = item_ids_from_batch_prompt(&request.user);
+            serde_json::json!({
+                "items": ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| {
+                        let text = if index == 0 { "[it] ok" } else { " \n" };
+                        serde_json::json!({"id": id, "translation": text})
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        } else {
+            if call_index == 1 || call_index == 2 {
+                self.release_gated_repairs
+                    .acquire()
+                    .await
+                    .expect("test gate should remain open")
+                    .forget();
+            }
+            let ids = item_ids_from_repair_prompt(&request.user);
+            serde_json::json!({
+                "items": ids
+                    .iter()
+                    .map(|id| serde_json::json!({"id": id, "translation": format!("[fixed] {id}")}))
+                    .collect::<Vec<_>>(),
+            })
+        };
+        Ok(CompletionResponse {
+            content: content.to_string(),
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            finish_reason: FinishReason::Stop,
+            provider_latency_ms: 0,
+            raw: serde_json::json!({}),
+        })
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_response_format: true,
+            supports_usage_tokens: true,
+        }
+    }
+}
+
+// Audit LLM-P2: pausing the run while repair batches are in flight used to
+// `break` out of the repair loop, dropping the JoinSet — billed completions
+// were discarded and queued-not-started repairs silently froze at
+// NeedsReview. The drain must mirror the translation phase: no NEW dispatch
+// while paused, in-flight results still joined, everything completes after
+// resume. The Stopped abort-with-skips path stays as-is.
+#[tokio::test]
+async fn paused_repair_phase_drains_inflight_results_without_losing_completions() {
+    // One good block plus two repair-batch-limits worth of failing items:
+    // the 33 failures chunk into three batches [16, 16, 1]. With
+    // concurrency=2 both first batches dispatch, so a pause can land while
+    // tasks are IN FLIGHT and one batch is still queued-not-started — the
+    // exact shape where the old code dropped the JoinSet.
+    let total_items = repair_batch_item_limit("Italian") * 2 + 2;
+    let failed_items = total_items - 1;
+    let segment = make_segment(
+        "seg_pause_drain",
+        (0..total_items)
+            .map(|index| plain_block(&format!("text_{index}")))
+            .collect(),
+        vec![],
+    );
+    let segments = vec![segment];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 16_000,
+        max_items: usize::MAX / 2,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    assert_eq!(batches.len(), 1);
+
+    let provider = GatedRepairEchoProvider::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let signal = crate::PauseSignal::new();
+    let mut config = test_run_config();
+    config.scheduler.concurrency = 2;
+    config.pause_signal = Some(signal.clone());
+
+    let run_provider = provider.clone();
+    let run_segments = segments.clone();
+    let run_events = events.clone();
+    let run = tokio::spawn(async move {
+        translate_batches_with_callback(
+            run_provider,
+            batches,
+            &run_segments,
+            &config,
+            Arc::new(TelemetryLog::new()),
+            None,
+            None,
+            Arc::new(RecordingProgress { events: run_events }),
+            None,
+            |_| Ok(()),
+        )
+        .await
+        .expect("batch translation should finish")
+    });
+
+    // Call 0 is the initial translation batch; calls 1 and 2 are the two
+    // concurrent repair batches (one parked on its gate).
+    wait_for_atomic_count(&provider.started, 3).await;
+
+    // Pause with BOTH repair batches in flight and a third queued.
+    signal.pause();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        provider.started.load(Ordering::Acquire),
+        3,
+        "queued-not-started repair must not dispatch while paused"
+    );
+
+    // Release ONE gated batch: its billed output must be JOINED (drained)
+    // while the pause persists — not dropped — and the second in-flight batch
+    // plus the queued-not-started one must stay held.
+    provider.release_gated_repairs.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        provider.started.load(Ordering::Acquire),
+        3,
+        "pause must keep holding new dispatch after draining the finished task"
+    );
+    assert!(
+        !run.is_finished(),
+        "pausing with in-flight/queued repairs must not finalize the run"
+    );
+
+    // Drain the second in-flight batch: still paused, still holding.
+    provider.release_gated_repairs.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        provider.started.load(Ordering::Acquire),
+        3,
+        "draining in-flight work while paused must not dispatch queued batches"
+    );
+    assert!(
+        !run.is_finished(),
+        "after draining all in-flight repairs, a paused run waits for resume"
+    );
+
+    // Resume: the queued-not-started repair runs and every item is repaired.
+    signal.resume();
+    let translations = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run should finish after resume")
+        .expect("task should join");
+    assert_eq!(translations.len(), 1);
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+    assert_eq!(
+        translations[0].joined_text().matches("[fixed] ").count(),
+        failed_items,
+        "zero lost completions: every failed item must be repaired exactly once"
+    );
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        bookforge_core::ProgressEvent::BatchRepairStarted { failed_item_count, .. }
+            if *failed_item_count == failed_items
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        bookforge_core::ProgressEvent::BatchRepairFinished {
+            repaired_items,
+            still_failed_items,
+            ..
+        } if *repaired_items == failed_items && *still_failed_items == 0
+    )));
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            bookforge_core::ProgressEvent::Warning { kind, .. }
+                if kind == "batch_repair_stopped" || kind == "batch_repair_cancelled"
+        )),
+        "a drained pause must not be recorded as stopped/cancelled"
+    );
 }
 
 #[tokio::test]

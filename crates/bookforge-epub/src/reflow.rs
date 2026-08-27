@@ -487,6 +487,19 @@ struct BuildingElement {
     paragraph_index: Option<usize>,
 }
 
+/// Audit EPUB P2 (crash vector): the reflow walkers (`reflow_nodes`,
+/// `cleanup_pdf_nodes`, `contains_page_anchor`, `count_paragraphs*`,
+/// `visible_text`/`append_visible_text`, `write_nodes`) recurse once per
+/// tree level, so a hostile ~10^5-deep element ladder stack-aborts
+/// `bookforge reflow` before any result can be produced. `parse_xml` is
+/// already iterative; capping nesting depth HERE — at parse time, where the
+/// event stream is naturally flat — protects every downstream walker in one
+/// place. Genuine EPUB XHTML nests a few dozen levels deep at worst, so
+/// 10_000 leaves a >100x margin for legitimately deep documents while
+/// turning hostile ladders into the standard graceful `InvalidInput`
+/// rejection instead of a process abort.
+const MAX_XHTML_NESTING_DEPTH: usize = 10_000;
+
 fn parse_xml(xml: &str) -> Result<(Vec<XmlNode>, usize)> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
@@ -497,6 +510,11 @@ fn parse_xml(xml: &str) -> Result<(Vec<XmlNode>, usize)> {
     loop {
         match reader.read_event()? {
             Event::Start(element) => {
+                if stack.len() >= MAX_XHTML_NESTING_DEPTH {
+                    return Err(BookforgeError::InvalidInput(format!(
+                        "XHTML nesting exceeds the supported depth of {MAX_XHTML_NESTING_DEPTH}"
+                    )));
+                }
                 let start = element.into_owned();
                 let paragraph_index = paragraph_index_for(&start, &mut paragraph_count);
                 stack.push(BuildingElement {
@@ -1641,6 +1659,42 @@ mod tests {
         assert!(!output.exists(), "no output may be committed on rejection");
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn hostile_deep_element_ladder_is_rejected_gracefully_not_stack_aborted() {
+        // Audit EPUB P2: a ~10^5-deep element ladder used to stack-abort the
+        // reflow walkers (reflow_nodes, count_paragraphs, visible_text and
+        // friends all recurse once per tree level). The parse-time depth cap
+        // turns the same document into a clean InvalidInput error attributed
+        // to the depth limit — the process returns, it does not abort.
+        const LADDER_DEPTH: usize = 60_000;
+        let mut ladder = String::new();
+        for index in 0..LADDER_DEPTH {
+            // A unique attribute per level defeats text compression so the
+            // fixture reaches the depth cap without tripping the archive's
+            // 100:1 decompression-ratio guard first.
+            ladder.push_str(&format!("<div data-i=\"{index}\">"));
+        }
+        ladder.push_str("<p class=\"body\">bottom</p>");
+        for _ in 0..LADDER_DEPTH {
+            ladder.push_str("</div>");
+        }
+
+        let input = create_minimal_epub(&ladder);
+        let output = unique_temp_path("bookforge-reflow-ladder-out", "epub");
+        let _ = fs::remove_file(&output);
+
+        let error = reflow_epub(&input, &output, &ReflowOptions::default())
+            .expect_err("a hostile element ladder must be rejected, not abort");
+
+        assert!(
+            error.to_string().contains("exceeds the supported depth"),
+            "the rejection must attribute itself to the depth cap: {error}"
+        );
+        assert!(!output.exists(), "no output may be committed on rejection");
+
+        let _ = fs::remove_file(input);
     }
 
     #[test]

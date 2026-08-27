@@ -1548,10 +1548,19 @@ where
             // adaptive rate controller — unlike every other stage that
             // issues provider calls. It now observes the exact same control
             // boundaries.
-            if let Some(signal) = pause_signal.as_ref() {
+            //
+            // Audit LLM-P2: `Paused` used to fall through to a bare `break`,
+            // dropping this JoinSet with repair batches still in flight —
+            // billed completions were discarded while queued-not-started
+            // items silently stayed NeedsReview. Mirror the translation
+            // phase instead: on Paused stop dispatching NEW repair batches
+            // but keep selecting finished tasks until the JoinSet drains,
+            // then block in the resume/stop wait below. Only an actual
+            // Stopped keeps its abort-with-skips behavior.
+            let paused_with_inflight = if let Some(signal) = pause_signal.as_ref() {
                 on_control_boundary(signal)?;
                 match signal.state() {
-                    PauseState::Running => {}
+                    PauseState::Running => false,
                     PauseState::Stopped => {
                         repair_stopped = true;
                         break;
@@ -1563,50 +1572,54 @@ where
                             repair_stopped = true;
                             break;
                         }
+                        false
                     }
-                    PauseState::Paused => break,
+                    PauseState::Paused => true,
                 }
-            }
-            loop {
-                let runtime_snapshot = config
-                    .runtime_settings
-                    .as_ref()
-                    .map(|receiver| receiver.borrow().clone());
-                let concurrency = runtime_snapshot
-                    .as_ref()
-                    .map(|runtime| runtime.concurrency)
-                    .unwrap_or(config.scheduler.concurrency)
-                    .max(1);
-                if repair_tasks.len() >= concurrency {
-                    break;
-                }
-                let Some(repair_batch) = repair_batches.pop_front() else {
-                    break;
-                };
-                progress.emit(bookforge_core::ProgressEvent::BatchQueued {
-                    batch_id: repair_batch.id.clone(),
-                    item_count: repair_batch.items.len(),
-                    timestamp_ms: bookforge_core::progress::now_ms(),
-                });
+            } else {
+                false
+            };
+            if !paused_with_inflight {
+                loop {
+                    let runtime_snapshot = config
+                        .runtime_settings
+                        .as_ref()
+                        .map(|receiver| receiver.borrow().clone());
+                    let concurrency = runtime_snapshot
+                        .as_ref()
+                        .map(|runtime| runtime.concurrency)
+                        .unwrap_or(config.scheduler.concurrency)
+                        .max(1);
+                    if repair_tasks.len() >= concurrency {
+                        break;
+                    }
+                    let Some(repair_batch) = repair_batches.pop_front() else {
+                        break;
+                    };
+                    progress.emit(bookforge_core::ProgressEvent::BatchQueued {
+                        batch_id: repair_batch.id.clone(),
+                        item_count: repair_batch.items.len(),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
 
-                let provider = provider.clone();
-                let library = library.clone();
-                let mut task_config = config.as_ref().clone();
-                if let Some(runtime) = runtime_snapshot {
-                    task_config.scheduler.concurrency = runtime.concurrency.max(1);
-                    task_config.batch_max_output_tokens = runtime.batch_max_output_tokens;
-                    task_config.runtime_settings = Some(runtime.frozen_receiver());
-                }
-                let config = Arc::new(task_config);
-                let repair_errors = repair_errors.clone();
-                let progress = progress.clone();
-                let section_titles = section_titles.clone();
-                let active_requests = active_requests.clone();
-                let request_limiter = request_limiter.clone();
-                let rate_controller = rate_controller.clone();
-                let pause_signal = pause_signal.clone();
+                    let provider = provider.clone();
+                    let library = library.clone();
+                    let mut task_config = config.as_ref().clone();
+                    if let Some(runtime) = runtime_snapshot {
+                        task_config.scheduler.concurrency = runtime.concurrency.max(1);
+                        task_config.batch_max_output_tokens = runtime.batch_max_output_tokens;
+                        task_config.runtime_settings = Some(runtime.frozen_receiver());
+                    }
+                    let config = Arc::new(task_config);
+                    let repair_errors = repair_errors.clone();
+                    let progress = progress.clone();
+                    let section_titles = section_titles.clone();
+                    let active_requests = active_requests.clone();
+                    let request_limiter = request_limiter.clone();
+                    let rate_controller = rate_controller.clone();
+                    let pause_signal = pause_signal.clone();
 
-                repair_tasks.spawn(async move {
+                    repair_tasks.spawn(async move {
                     // Never start new provider traffic for a stopped run.
                     if let Some(signal) = pause_signal.as_ref()
                         && signal.wait_until_running_or_stopped().await == PauseState::Stopped
@@ -1860,6 +1873,7 @@ where
                         skipped: false,
                     }
                 });
+                }
             }
 
             let joined = match pause_signal.as_ref() {
