@@ -1,21 +1,131 @@
 use super::*;
 
-#[cfg(unix)]
+use crate::convert::fake_backend::{FakePoppler, FixtureImage};
+
+// pdftohtml documents shared verbatim by BOTH tool paths below: the
+// Unix-only path ships them through /bin/sh poppler stand-ins, while the
+// in-process fake (`FakePoppler`) feeds the same strings through
+// [`PopplerBackend`] without spawning anything. Keeping them in shared
+// constants is what makes the two paths exercise identical conversions.
 const BERT_FIGURE1_CAPTION_BOUNDARY_XML: &str =
     include_str!("../../fixtures/bert_figure1_caption_boundary.xml");
-#[cfg(unix)]
 const BERT_FIGURE4_MULTIPANEL_XML: &str =
     include_str!("../../fixtures/bert_figure4_multipanel.xml");
-#[cfg(unix)]
 const BERT_FIGURE5_VECTOR_CHART_XML: &str =
     include_str!("../../fixtures/bert_figure5_vector_chart.xml");
 const BERT_PAGE16_VECTOR_CHART_TWOCOL_XML: &str =
     include_str!("../../fixtures/bert_page16_vector_chart_twocol.xml");
 const BERT_FIGURE1_TOKEN_STRIP_XML: &str =
     include_str!("../../fixtures/bert_figure1_token_strip.xml");
-#[cfg(unix)]
 const BERT_MODEL_PARAMETER_FALSE_POSITIVE_XML: &str =
     include_str!("../../fixtures/bert_model_parameter_false_positive.xml");
+
+/// PDF-10 synthetic fixtures: ja/zh CJK captions over chart labels.
+const JA_VECTOR_FIGURES_XML: &str = include_str!("../../fixtures/ja_vector_figures.xml");
+const ZH_VECTOR_FIGURES_XML: &str = include_str!("../../fixtures/zh_vector_figures.xml");
+
+const MINIMAL_HELLO_XML: &str = r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="100" left="100" width="80" height="12" font="0">Hello PDF</text>
+  </page>
+</pdf2xml>"##;
+
+const TEXT_ONLY_XML: &str = r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="100" left="100" width="180" height="12" font="0">Text only PDF.</text>
+  </page>
+</pdf2xml>"##;
+
+const TEXT_ONLY_BASELINE: &str = "Text only PDF.\n";
+
+const EMBED_IMAGE_XML: &str = r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="14" family="Times" color="#000000"/>
+    <fontspec id="1" size="12" family="Times" color="#000000"/>
+    <text top="80" left="100" width="300" height="16" font="0">Paper Title</text>
+    <image top="130" left="120" width="120" height="80" src="paper-1_1.png"/>
+    <text top="218" left="120" width="260" height="12" font="1">Figure 1. A test image.</text>
+    <text top="280" left="100" width="300" height="12" font="1">Body text after the figure.</text>
+  </page>
+</pdf2xml>"##;
+
+const EMBED_IMAGE_BASELINE: &str =
+    "Paper Title\nFigure 1. A test image.\nBody text after the figure.\n";
+
+const TABLE_CROP_XML: &str = r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="80" left="100" width="260" height="12" font="0">Body before table.</text>
+    <text top="120" left="100" width="220" height="12" font="0">Table 1. Scores.</text>
+    <text top="170" left="100" width="50" height="12" font="0">Metric</text>
+    <text top="170" left="240" width="40" height="12" font="0">2019</text>
+    <text top="170" left="360" width="40" height="12" font="0">2020</text>
+    <text top="190" left="100" width="20" height="12" font="0">A</text>
+    <text top="190" left="240" width="40" height="12" font="0">0.91</text>
+    <text top="190" left="360" width="40" height="12" font="0">0.93</text>
+    <text top="210" left="100" width="20" height="12" font="0">B</text>
+    <text top="210" left="240" width="40" height="12" font="0">0.81</text>
+    <text top="210" left="360" width="40" height="12" font="0">0.84</text>
+    <text top="280" left="100" width="260" height="12" font="0">Body after table.</text>
+  </page>
+</pdf2xml>"##;
+
+const TABLE_CROP_BASELINE: &str = "Body before table.\nTable 1. Scores.\nMetric 2019 2020\nA 0.91 0.93\nB 0.81 0.84\nBody after table.\n";
+
+const DISPLAY_EQUATION_XML: &str = r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="80" left="100" width="260" height="12" font="0">Body before equation.</text>
+    <text top="160" left="240" width="120" height="12" font="0">E = mc^2</text>
+    <text top="230" left="100" width="260" height="12" font="0">Body after equation.</text>
+  </page>
+</pdf2xml>"##;
+
+const DISPLAY_EQUATION_BASELINE: &str = "Body before equation.\nE = mc^2\nBody after equation.\n";
+
+const LOWERCASE_CONTINUATION_XML: &str = r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="80" left="100" width="260" height="12" font="0">This paragraph</text>
+    <image top="130" left="120" width="120" height="80" src="paper-1_1.png"/>
+    <text top="260" left="100" width="260" height="12" font="0">continues after the figure.</text>
+  </page>
+</pdf2xml>"##;
+
+const LOWERCASE_CONTINUATION_BASELINE: &str = "This paragraph\ncontinues after the figure.\n";
+
+const INLINE_MATH_XML: &str = r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="100" left="100" width="360" height="12" font="0">The energy term E = mc^2 appears inline.</text>
+  </page>
+</pdf2xml>"##;
+
+const INLINE_MATH_BASELINE: &str = "The energy term E = mc^2 appears inline.\n";
+
+const TINY_PAGE_XML: &str = r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="100" left="100" width="20" height="12" font="0">Tiny</text>
+  </page>
+</pdf2xml>"##;
+
+const TINY_PAGE_BASELINE: &str =
+    "Tiny plus many baseline characters that the XML reconstruction did not recover.\n";
+
+const ROTATED_AND_UNKNOWN_CAPTION_XML: &str = r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <text top="100" left="100" width="360" height="12" font="0">Ordinary flowing prose continues here normally.</text>
+    <text top="150" left="500" width="0" height="200" font="0">VERTICAL WATERMARK</text>
+    <text top="400" left="100" width="300" height="12" font="0">चित्र ३: नतीजों की तुलना।</text>
+  </page>
+</pdf2xml>"##;
+
+const ROTATED_AND_UNKNOWN_CAPTION_BASELINE: &str =
+    "Ordinary flowing prose continues here normally.\nVERTICAL WATERMARK\nचित्र ३: नतीजों की तुलना।\n";
 
 fn span(text: &str) -> Span {
     Span {
@@ -157,6 +267,79 @@ script_dir=$(dirname "$0")
 cp "$script_dir/pdftoppm.fixture.png" "$last.png"
 "#,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Dual-path harness (TEST-2/PDF-2).
+//
+// Every migrated integration test below runs over BOTH implementations of
+// [`PopplerBackend`]:
+//
+//   real-tool path — `cfg(unix)` only; poppler is stood in by /bin/sh
+//     scripts, so the *actual* subprocess pipeline (spawn, env scrubbing,
+//     pipes, exit statuses) executes end-to-end;
+//   fake path — any OS; [`FakePoppler`] answers every backend surface
+//     in-process with the same payloads/failure shapes and materializes
+//     on-disk artifacts exactly as downstream code expects.
+//
+// Both paths consume the same shared document constants, so a divergence
+// between "what poppler feeds us" and "what the fake feeds us" cannot
+// hide. Tests whose extra value lies only in real-executable details are
+// left single-path (unix); see the migration table in docs/report.md §4.5.
+
+#[cfg(unix)]
+fn shell_cat(body: &str, tag: &str) -> String {
+    format!("#!/bin/sh\ncat <<'{tag}'\n{body}\n{tag}\n")
+}
+
+/// Which `pdfimages`/`pdftoppm` stand-ins a given case needs.
+#[cfg(unix)]
+enum UnixImageTools {
+    /// Optional binaries absent (`pdfimages`/`pdftoppm` = `None`).
+    Absent,
+    /// Present and healthy; extraction yields no embedded images.
+    HealthyEmpty,
+    /// Extraction yields one image file with the given contents.
+    OneRaster,
+}
+
+#[cfg(unix)]
+fn unix_tools(root: &Path, doc: &str, baseline: &str, images: UnixImageTools) -> PopplerTools {
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin dir");
+    let pdftohtml = bin.join("pdftohtml");
+    write_executable(&pdftohtml, &shell_cat(doc, "XMLDOC"));
+    let pdftotext = bin.join("pdftotext");
+    write_executable(&pdftotext, &shell_cat(baseline, "TEXTBASE"));
+    match images {
+        UnixImageTools::Absent => PopplerTools {
+            pdftohtml,
+            pdftotext,
+            pdfimages: None,
+            pdftoppm: None,
+        },
+        UnixImageTools::HealthyEmpty | UnixImageTools::OneRaster => {
+            let pdfimages = bin.join("pdfimages");
+            match images {
+                UnixImageTools::OneRaster => fake_pdfimages(&pdfimages),
+                _ => fake_pdfimages_empty(&pdfimages),
+            }
+            let pdftoppm = bin.join("pdftoppm");
+            fake_pdftoppm(&pdftoppm);
+            PopplerTools {
+                pdftohtml,
+                pdftotext,
+                pdfimages: Some(pdfimages),
+                pdftoppm: Some(pdftoppm),
+            }
+        }
+    }
+}
+
+fn write_input_pdf(dir: &Path) -> PathBuf {
+    let input = dir.join("input.pdf");
+    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+    input
 }
 
 #[test]
@@ -814,106 +997,68 @@ fn caption_ranking_prefers_closer_caption_below_image_bottom() {
     assert_eq!(spans_text(&caption.spans), "Figure 2. True caption.");
 }
 
-#[cfg(unix)]
-#[cfg(unix)]
 #[test]
-fn convert_pdf_does_not_write_epub_when_baseline_fails() {
-    use std::fs;
+fn pdftohtml_timeout_aborts_conversion_before_any_baseline_work() {
+    use crate::tools::ToolError;
 
-    let dir = tempfile::tempdir().expect("temp dir");
-    let input = dir.path().join("input.pdf");
+    // Timing failure injected through the in-process fake: the pipeline
+    // must surface ToolError::TimedOut, write nothing, and never touch
+    // the remaining surfaces (call counters prove the abort point).
+    let dir = tempfile::tempdir().expect("fake-path temp dir");
+    let input = write_input_pdf(dir.path());
     let output = dir.path().join("output.epub");
-    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+    let fake = FakePoppler::new(MINIMAL_HELLO_XML, "baseline would exist")
+        .timing_out_xml(crate::tools::DEFAULT_POPPLER_TIMEOUT);
 
-    let pdftohtml = dir.path().join("pdftohtml");
-    write_executable(
-        &pdftohtml,
-        r##"#!/bin/sh
-cat <<'XML'
-<pdf2xml>
-  <page number="1" width="600" height="800">
-    <fontspec id="0" size="12" family="Times" color="#000000"/>
-    <text top="100" left="100" width="80" height="12" font="0">Hello PDF</text>
-  </page>
-</pdf2xml>
-XML
-"##,
-    );
+    let result = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &fake, None);
 
-    let pdftotext = dir.path().join("pdftotext");
-    write_executable(
-        &pdftotext,
-        r#"#!/bin/sh
-echo baseline failed >&2
-exit 9
-"#,
-    );
-    let pdfimages = dir.path().join("pdfimages");
-    fake_pdfimages(&pdfimages);
-    let pdftoppm = dir.path().join("pdftoppm");
-    fake_pdftoppm(&pdftoppm);
-
-    let tools = PopplerTools {
-        pdftohtml,
-        pdftotext,
-        pdfimages: Some(pdfimages),
-        pdftoppm: Some(pdftoppm),
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("timed-out XML extraction aborts"),
     };
-
-    let result = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None);
-
-    assert!(result.is_err());
     assert!(
-        !output.exists(),
-        "output EPUB should not be written after baseline failure"
+        matches!(
+            &error,
+            crate::PdfError::Tool(ToolError::TimedOut {
+                tool: "pdftohtml",
+                ..
+            })
+        ),
+        "unexpected error: {error}"
     );
+    assert!(!output.exists());
+    assert_eq!(fake.call_count("pdf_to_xml"), 1);
+    assert_eq!(fake.call_count("pdf_to_text"), 0);
+    assert_eq!(fake.call_count("extract_images"), 0);
 }
 
-#[cfg(unix)]
 #[test]
-fn convert_pdf_continues_text_only_without_optional_image_tools() {
-    use std::{fs, io::Read};
+fn raster_render_failure_skips_media_crops_with_warnings_and_keeps_text() {
+    use std::io::Read;
     use zip::ZipArchive;
 
-    let dir = tempfile::tempdir().expect("temp dir");
-    let input = dir.path().join("input.pdf");
+    let dir = tempfile::tempdir().expect("fake-path temp dir");
+    let input = write_input_pdf(dir.path());
     let output = dir.path().join("output.epub");
-    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+    let fake = FakePoppler::new(TABLE_CROP_XML, TABLE_CROP_BASELINE)
+        .with_render_failure("pdftoppm exploded");
 
-    let pdftohtml = dir.path().join("pdftohtml");
-    write_executable(
-        &pdftohtml,
-        r##"#!/bin/sh
-cat <<'XML'
-<pdf2xml>
-  <page number="1" width="600" height="800">
-    <fontspec id="0" size="12" family="Times" color="#000000"/>
-    <text top="100" left="100" width="180" height="12" font="0">Text only PDF.</text>
-  </page>
-</pdf2xml>
-XML
-"##,
-    );
-    let pdftotext = dir.path().join("pdftotext");
-    fake_pdftotext_with_text(&pdftotext, "Text only PDF.\n");
-    let tools = PopplerTools {
-        pdftohtml,
-        pdftotext,
-        pdfimages: None,
-        pdftoppm: None,
-    };
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &fake, None)
+        .expect("conversion degrades gracefully when rendering fails");
 
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
-        .expect("conversion should succeed without optional image tools");
-
-    assert!(output.exists());
+    assert_eq!(outcome.report.tables, 0);
+    assert_eq!(outcome.report.figures, 0);
     assert!(
         outcome
             .report
             .warnings
             .iter()
-            .any(|warning| warning.contains("image extraction unavailable"))
+            .any(|warning| warning.contains("skipped table crop")
+                && warning.contains("raster rendering failed")),
+        "{:?}",
+        outcome.report.warnings
     );
+    // Nothing was cropped away, so the whole page stays translatable text.
     let mut archive =
         ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
     let mut content = String::new();
@@ -922,94 +1067,176 @@ XML
         .expect("content exists")
         .read_to_string(&mut content)
         .expect("content reads");
-    assert!(content.contains("Text only PDF."));
+    assert!(content.contains("0.91"));
+    assert_eq!(
+        fake.call_count("render_page"),
+        1,
+        "page renders are cached per crop pass"
+    );
 }
 
-#[cfg(unix)]
-#[cfg(unix)]
 #[test]
-fn convert_pdf_embeds_extracted_image_with_translatable_caption() {
-    use std::{fs, io::Read};
+fn convert_pdf_does_not_write_epub_when_baseline_fails() {
+    fn case(dir: &Path, tools: &dyn PopplerBackend) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
+
+        let result =
+            convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), tools, None);
+
+        assert!(result.is_err());
+        assert!(
+            !output.exists(),
+            "output EPUB should not be written after baseline failure"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        // Real-tool path: pdftotext stand-in exits 9 with a stderr note.
+        let root = tempfile::tempdir().expect("real-path temp dir");
+        let tools = unix_tools(
+            root.path(),
+            MINIMAL_HELLO_XML,
+            "unused baseline",
+            UnixImageTools::Absent,
+        );
+        let pdftotext = tools.pdftotext.clone();
+        write_executable(
+            &pdftotext,
+            r#"#!/bin/sh
+echo baseline failed >&2
+exit 9
+"#,
+        );
+        let input = write_input_pdf(root.path());
+        let output = root.path().join("output.epub");
+        assert!(
+            convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
+                .is_err()
+        );
+        assert!(!output.exists());
+    }
+
+    // In-process path: identical pdftotext failure, zero processes.
+    let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+    let fake = FakePoppler::new(MINIMAL_HELLO_XML, "unused baseline")
+        .failing_baseline(9, "baseline failed");
+    case(fake_dir.path(), &fake);
+}
+
+#[test]
+fn convert_pdf_continues_text_only_without_optional_image_tools() {
+    use std::io::Read;
     use zip::ZipArchive;
 
-    let dir = tempfile::tempdir().expect("temp dir");
-    let input = dir.path().join("input.pdf");
-    let output = dir.path().join("output.epub");
-    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+    fn case(dir: &Path, tools: &dyn PopplerBackend) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
 
-    let pdftohtml = dir.path().join("pdftohtml");
-    write_executable(
-        &pdftohtml,
-        r##"#!/bin/sh
-cat <<'XML'
-<pdf2xml>
-  <page number="1" width="600" height="800">
-    <fontspec id="0" size="14" family="Times" color="#000000"/>
-    <fontspec id="1" size="12" family="Times" color="#000000"/>
-    <text top="80" left="100" width="300" height="16" font="0">Paper Title</text>
-    <image top="130" left="120" width="120" height="80" src="paper-1_1.png"/>
-    <text top="218" left="120" width="260" height="12" font="1">Figure 1. A test image.</text>
-    <text top="280" left="100" width="300" height="12" font="1">Body text after the figure.</text>
-  </page>
-</pdf2xml>
-XML
-"##,
-    );
+        let outcome =
+            convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), tools, None)
+                .expect("conversion should succeed without optional image tools");
 
-    let pdftotext = dir.path().join("pdftotext");
-    write_executable(
-        &pdftotext,
-        r#"#!/bin/sh
-printf 'Paper Title\nFigure 1. A test image.\nBody text after the figure.\n'
-"#,
-    );
-    let pdfimages = dir.path().join("pdfimages");
-    fake_pdfimages(&pdfimages);
-    let pdftoppm = dir.path().join("pdftoppm");
-    fake_pdftoppm(&pdftoppm);
+        assert!(output.exists());
+        assert!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("image extraction unavailable"))
+        );
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("Text only PDF."));
+    }
 
-    let tools = PopplerTools {
-        pdftohtml,
-        pdftotext,
-        pdfimages: Some(pdfimages),
-        pdftoppm: Some(pdftoppm),
-    };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
-        .expect("conversion should succeed");
+    #[cfg(unix)]
+    {
+        let root = tempfile::tempdir().expect("real-path temp dir");
+        let tools = unix_tools(
+            root.path(),
+            TEXT_ONLY_XML,
+            TEXT_ONLY_BASELINE,
+            UnixImageTools::Absent,
+        );
+        case(root.path(), &tools);
+    }
 
-    assert_eq!(outcome.report.images, 1);
-    assert_eq!(outcome.report.figures, 1, "{}", outcome.report.summary());
-
-    let mut archive =
-        ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
-    let mut content = String::new();
-    archive
-        .by_name("content.xhtml")
-        .expect("content exists")
-        .read_to_string(&mut content)
-        .expect("content reads");
-    assert!(content.contains("<figure id=\"pdf-image-0001\">"));
-    assert!(content.contains("<figcaption>Figure 1. A test image.</figcaption>"));
-    assert_eq!(content.matches("Figure 1. A test image.").count(), 1);
-
-    let mut image = Vec::new();
-    archive
-        .by_name("images/pdf-image-0001.png")
-        .expect("image exists")
-        .read_to_end(&mut image)
-        .expect("image reads");
-    assert_eq!(image, b"fake-image");
-
-    let book = bookforge_epub::read_epub(&output).expect("converted EPUB should be readable");
-    assert!(
-        book.blocks
-            .iter()
-            .any(|block| matches!(block.kind, bookforge_core::ir::BlockKind::Caption)),
-        "figcaption should remain a normal translatable caption block"
-    );
+    let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+    let fake = FakePoppler::new(TEXT_ONLY_XML, TEXT_ONLY_BASELINE).without_image_tool();
+    case(fake_dir.path(), &fake);
 }
 
-#[cfg(unix)]
+#[test]
+fn convert_pdf_embeds_extracted_image_with_translatable_caption() {
+    use std::io::Read;
+    use zip::ZipArchive;
+
+    fn case(dir: &Path, tools: &dyn PopplerBackend) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
+
+        let outcome =
+            convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), tools, None)
+                .expect("conversion should succeed");
+
+        assert_eq!(outcome.report.images, 1);
+        assert_eq!(outcome.report.figures, 1, "{}", outcome.report.summary());
+
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("<figure id=\"pdf-image-0001\">"));
+        assert!(content.contains("<figcaption>Figure 1. A test image.</figcaption>"));
+        assert_eq!(content.matches("Figure 1. A test image.").count(), 1);
+
+        let mut image = Vec::new();
+        archive
+            .by_name("images/pdf-image-0001.png")
+            .expect("image exists")
+            .read_to_end(&mut image)
+            .expect("image reads");
+        assert_eq!(image, b"fake-image");
+
+        let book = bookforge_epub::read_epub(&output).expect("converted EPUB should be readable");
+        assert!(
+            book.blocks
+                .iter()
+                .any(|block| matches!(block.kind, bookforge_core::ir::BlockKind::Caption)),
+            "figcaption should remain a normal translatable caption block"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        let root = tempfile::tempdir().expect("real-path temp dir");
+        let tools = unix_tools(
+            root.path(),
+            EMBED_IMAGE_XML,
+            EMBED_IMAGE_BASELINE,
+            UnixImageTools::OneRaster,
+        );
+        case(root.path(), &tools);
+    }
+
+    let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+    let fake = FakePoppler::new(EMBED_IMAGE_XML, EMBED_IMAGE_BASELINE)
+        .with_extracted_image(FixtureImage::with_bytes(1, 120, 80, b"fake-image"));
+    case(fake_dir.path(), &fake);
+}
+
 #[cfg(unix)]
 #[test]
 fn convert_pdf_snaps_figure_crop_above_caption_boundary_fixture() {
@@ -1079,7 +1306,6 @@ fn convert_pdf_snaps_figure_crop_above_caption_boundary_fixture() {
 }
 
 #[cfg(unix)]
-#[cfg(unix)]
 #[test]
 fn convert_pdf_groups_multipanel_figure_fixture_as_one_captioned_crop() {
     use std::{fs, io::Read};
@@ -1134,114 +1360,74 @@ fn convert_pdf_groups_multipanel_figure_fixture_as_one_captioned_crop() {
     assert!(content.contains("Discussion resumes after the figure."));
 }
 
-#[cfg(unix)]
-#[cfg(unix)]
 #[test]
 fn convert_pdf_preserves_vector_chart_fixture_as_captioned_crop() {
-    use std::{fs, io::Read};
+    use std::io::Read;
     use zip::ZipArchive;
 
-    let dir = tempfile::tempdir().expect("temp dir");
-    let input = dir.path().join("input.pdf");
-    let output = dir.path().join("output.epub");
-    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+    const BASELINE: &str = "Vector-chart results are below.\n1.0 0.5 0.0 0 10 20 Epoch\nFigure 5. Vector chart of held-out accuracy.\nThe next paragraph should stay prose.\n";
 
-    let pdftohtml = dir.path().join("pdftohtml");
-    fake_pdftohtml_with_xml(&pdftohtml, BERT_FIGURE5_VECTOR_CHART_XML);
-    let pdftotext = dir.path().join("pdftotext");
-    fake_pdftotext_with_text(
-        &pdftotext,
-        "Vector-chart results are below.\n1.0 0.5 0.0 0 10 20 Epoch\nFigure 5. Vector chart of held-out accuracy.\nThe next paragraph should stay prose.\n",
-    );
-    let pdfimages = dir.path().join("pdfimages");
-    fake_pdfimages_empty(&pdfimages);
-    let pdftoppm = dir.path().join("pdftoppm");
-    fake_pdftoppm(&pdftoppm);
+    fn case(dir: &Path, tools: &dyn PopplerBackend) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
 
-    let tools = PopplerTools {
-        pdftohtml,
-        pdftotext,
-        pdfimages: Some(pdfimages),
-        pdftoppm: Some(pdftoppm),
-    };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
-        .expect("conversion should succeed");
+        let outcome =
+            convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), tools, None)
+                .expect("conversion should succeed");
 
-    assert_eq!(outcome.report.images, 0);
-    assert_eq!(outcome.report.figures, 1, "{}", outcome.report.summary());
-    assert_eq!(outcome.report.tables, 0);
-    assert_eq!(outcome.report.equations, 0);
+        assert_eq!(outcome.report.images, 0);
+        assert_eq!(outcome.report.figures, 1, "{}", outcome.report.summary());
+        assert_eq!(outcome.report.tables, 0);
+        assert_eq!(outcome.report.equations, 0);
 
-    let mut archive =
-        ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
-    let mut content = String::new();
-    archive
-        .by_name("content.xhtml")
-        .expect("content exists")
-        .read_to_string(&mut content)
-        .expect("content reads");
-    assert!(content.contains("<figure id=\"pdf-figure-0001\">"));
-    assert_eq!(
-        content
-            .matches("Figure 5. Vector chart of held-out accuracy.")
-            .count(),
-        1
-    );
-    assert!(content.contains("The next paragraph should stay prose."));
-    assert!(!content.contains("1.0 0.5"));
-    assert!(!content.contains("Epoch"));
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("<figure id=\"pdf-figure-0001\">"));
+        assert_eq!(
+            content
+                .matches("Figure 5. Vector chart of held-out accuracy.")
+                .count(),
+            1
+        );
+        assert!(content.contains("The next paragraph should stay prose."));
+        assert!(!content.contains("1.0 0.5"));
+        assert!(!content.contains("Epoch"));
+    }
+
+    #[cfg(unix)]
+    {
+        let root = tempfile::tempdir().expect("real-path temp dir");
+        let tools = unix_tools(
+            root.path(),
+            BERT_FIGURE5_VECTOR_CHART_XML,
+            BASELINE,
+            UnixImageTools::HealthyEmpty,
+        );
+        case(root.path(), &tools);
+    }
+
+    let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+    let fake = FakePoppler::new(BERT_FIGURE5_VECTOR_CHART_XML, BASELINE);
+    case(fake_dir.path(), &fake);
 }
 
-#[cfg(unix)]
-#[cfg(unix)]
 #[test]
 fn convert_pdf_warns_on_lowercase_continuation_after_media() {
-    use std::fs;
+    fn case(dir: &Path, tools: &dyn PopplerBackend) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
 
-    let dir = tempfile::tempdir().expect("temp dir");
-    let input = dir.path().join("input.pdf");
-    let output = dir.path().join("output.epub");
-    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+        let outcome =
+            convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), tools, None)
+                .expect("conversion should succeed");
 
-    let pdftohtml = dir.path().join("pdftohtml");
-    write_executable(
-        &pdftohtml,
-        r##"#!/bin/sh
-cat <<'XML'
-<pdf2xml>
-  <page number="1" width="600" height="800">
-    <fontspec id="0" size="12" family="Times" color="#000000"/>
-    <text top="80" left="100" width="260" height="12" font="0">This paragraph</text>
-    <image top="130" left="120" width="120" height="80" src="paper-1_1.png"/>
-    <text top="260" left="100" width="260" height="12" font="0">continues after the figure.</text>
-  </page>
-</pdf2xml>
-XML
-"##,
-    );
-
-    let pdftotext = dir.path().join("pdftotext");
-    write_executable(
-        &pdftotext,
-        r#"#!/bin/sh
-printf 'This paragraph\ncontinues after the figure.\n'
-"#,
-    );
-    let pdfimages = dir.path().join("pdfimages");
-    fake_pdfimages(&pdfimages);
-    let pdftoppm = dir.path().join("pdftoppm");
-    fake_pdftoppm(&pdftoppm);
-
-    let tools = PopplerTools {
-        pdftohtml,
-        pdftotext,
-        pdfimages: Some(pdfimages),
-        pdftoppm: Some(pdftoppm),
-    };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
-        .expect("conversion should succeed");
-
-    assert!(
+        assert!(
             outcome
                 .report
                 .warnings
@@ -1250,248 +1436,196 @@ printf 'This paragraph\ncontinues after the figure.\n'
                     .contains("lowercase paragraph continuation follows media block")),
             "media-separated lowercase continuations should be flagged"
         );
+    }
+
+    #[cfg(unix)]
+    {
+        let root = tempfile::tempdir().expect("real-path temp dir");
+        let tools = unix_tools(
+            root.path(),
+            LOWERCASE_CONTINUATION_XML,
+            LOWERCASE_CONTINUATION_BASELINE,
+            UnixImageTools::OneRaster,
+        );
+        case(root.path(), &tools);
+    }
+
+    let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+    let fake = FakePoppler::new(LOWERCASE_CONTINUATION_XML, LOWERCASE_CONTINUATION_BASELINE)
+        .with_extracted_image(FixtureImage::with_bytes(1, 120, 80, b"fake-image"));
+    case(fake_dir.path(), &fake);
 }
 
-#[cfg(unix)]
-#[cfg(unix)]
 #[test]
 fn convert_pdf_preserves_detected_table_as_crop_with_caption() {
-    use std::{fs, io::Read};
+    use std::io::Read;
     use zip::ZipArchive;
 
-    let dir = tempfile::tempdir().expect("temp dir");
-    let input = dir.path().join("input.pdf");
-    let output = dir.path().join("output.epub");
-    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+    fn case(dir: &Path, tools: &dyn PopplerBackend) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
 
-    let pdftohtml = dir.path().join("pdftohtml");
-    write_executable(
-        &pdftohtml,
-        r##"#!/bin/sh
-cat <<'XML'
-<pdf2xml>
-  <page number="1" width="600" height="800">
-    <fontspec id="0" size="12" family="Times" color="#000000"/>
-    <text top="80" left="100" width="260" height="12" font="0">Body before table.</text>
-    <text top="120" left="100" width="220" height="12" font="0">Table 1. Scores.</text>
-    <text top="170" left="100" width="50" height="12" font="0">Metric</text>
-    <text top="170" left="240" width="40" height="12" font="0">2019</text>
-    <text top="170" left="360" width="40" height="12" font="0">2020</text>
-    <text top="190" left="100" width="20" height="12" font="0">A</text>
-    <text top="190" left="240" width="40" height="12" font="0">0.91</text>
-    <text top="190" left="360" width="40" height="12" font="0">0.93</text>
-    <text top="210" left="100" width="20" height="12" font="0">B</text>
-    <text top="210" left="240" width="40" height="12" font="0">0.81</text>
-    <text top="210" left="360" width="40" height="12" font="0">0.84</text>
-    <text top="280" left="100" width="260" height="12" font="0">Body after table.</text>
-  </page>
-</pdf2xml>
-XML
-"##,
-    );
+        let outcome =
+            convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), tools, None)
+                .expect("conversion should succeed");
 
-    let pdftotext = dir.path().join("pdftotext");
-    write_executable(
-        &pdftotext,
-        r#"#!/bin/sh
-printf 'Body before table.\nTable 1. Scores.\nMetric 2019 2020\nA 0.91 0.93\nB 0.81 0.84\nBody after table.\n'
-"#,
-    );
-    let pdfimages = dir.path().join("pdfimages");
-    fake_pdfimages_empty(&pdfimages);
-    let pdftoppm = dir.path().join("pdftoppm");
-    fake_pdftoppm(&pdftoppm);
+        assert_eq!(outcome.report.tables, 1);
+        assert_eq!(outcome.report.equations, 0);
+        assert_eq!(outcome.report.figures, 1);
+        assert!(outcome.report.media_preserved_chars > 0);
+        assert_eq!(outcome.report.coverage_percent, 100.0);
+        assert!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("preserved as image near y="))
+        );
+        assert!(
+            !outcome
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("reconstructed text covers only"))
+        );
 
-    let tools = PopplerTools {
-        pdftohtml,
-        pdftotext,
-        pdfimages: Some(pdfimages),
-        pdftoppm: Some(pdftoppm),
-    };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
-        .expect("conversion should succeed");
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("Body before table."));
+        assert!(content.contains("Body after table."));
+        assert!(content.contains("<figure id=\"pdf-table-0001\">"));
+        assert!(content.contains("<figcaption>Table 1. Scores.</figcaption>"));
+        assert_eq!(content.matches("Table 1. Scores.").count(), 1);
+        assert!(!content.contains("0.91"));
+        assert!(!content.contains("2019"));
 
-    assert_eq!(outcome.report.tables, 1);
-    assert_eq!(outcome.report.equations, 0);
-    assert_eq!(outcome.report.figures, 1);
-    assert!(outcome.report.media_preserved_chars > 0);
-    assert_eq!(outcome.report.coverage_percent, 100.0);
-    assert!(
-        outcome
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("preserved as image near y="))
-    );
-    assert!(
-        !outcome
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("reconstructed text covers only"))
-    );
+        let mut image = Vec::new();
+        archive
+            .by_name("images/pdf-table-0001.png")
+            .expect("table crop exists")
+            .read_to_end(&mut image)
+            .expect("image reads");
+        assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
 
-    let mut archive =
-        ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
-    let mut content = String::new();
-    archive
-        .by_name("content.xhtml")
-        .expect("content exists")
-        .read_to_string(&mut content)
-        .expect("content reads");
-    assert!(content.contains("Body before table."));
-    assert!(content.contains("Body after table."));
-    assert!(content.contains("<figure id=\"pdf-table-0001\">"));
-    assert!(content.contains("<figcaption>Table 1. Scores.</figcaption>"));
-    assert_eq!(content.matches("Table 1. Scores.").count(), 1);
-    assert!(!content.contains("0.91"));
-    assert!(!content.contains("2019"));
+    #[cfg(unix)]
+    {
+        let root = tempfile::tempdir().expect("real-path temp dir");
+        let tools = unix_tools(
+            root.path(),
+            TABLE_CROP_XML,
+            TABLE_CROP_BASELINE,
+            UnixImageTools::HealthyEmpty,
+        );
+        case(root.path(), &tools);
+    }
 
-    let mut image = Vec::new();
-    archive
-        .by_name("images/pdf-table-0001.png")
-        .expect("table crop exists")
-        .read_to_end(&mut image)
-        .expect("image reads");
-    assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+    let fake = FakePoppler::new(TABLE_CROP_XML, TABLE_CROP_BASELINE);
+    case(fake_dir.path(), &fake);
 }
 
-#[cfg(unix)]
-#[cfg(unix)]
 #[test]
 fn convert_pdf_preserves_display_equation_as_crop() {
-    use std::{fs, io::Read};
+    use std::io::Read;
     use zip::ZipArchive;
 
-    let dir = tempfile::tempdir().expect("temp dir");
-    let input = dir.path().join("input.pdf");
-    let output = dir.path().join("output.epub");
-    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+    fn case(dir: &Path, tools: &dyn PopplerBackend) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
 
-    let pdftohtml = dir.path().join("pdftohtml");
-    write_executable(
-        &pdftohtml,
-        r##"#!/bin/sh
-cat <<'XML'
-<pdf2xml>
-  <page number="1" width="600" height="800">
-    <fontspec id="0" size="12" family="Times" color="#000000"/>
-    <text top="80" left="100" width="260" height="12" font="0">Body before equation.</text>
-    <text top="160" left="240" width="120" height="12" font="0">E = mc^2</text>
-    <text top="230" left="100" width="260" height="12" font="0">Body after equation.</text>
-  </page>
-</pdf2xml>
-XML
-"##,
-    );
+        let outcome =
+            convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), tools, None)
+                .expect("conversion should succeed");
 
-    let pdftotext = dir.path().join("pdftotext");
-    write_executable(
-        &pdftotext,
-        r#"#!/bin/sh
-printf 'Body before equation.\nE = mc^2\nBody after equation.\n'
-"#,
-    );
-    let pdfimages = dir.path().join("pdfimages");
-    fake_pdfimages_empty(&pdfimages);
-    let pdftoppm = dir.path().join("pdftoppm");
-    fake_pdftoppm(&pdftoppm);
+        assert_eq!(outcome.report.tables, 0);
+        assert_eq!(outcome.report.equations, 1);
+        assert_eq!(outcome.report.figures, 1);
 
-    let tools = PopplerTools {
-        pdftohtml,
-        pdftotext,
-        pdfimages: Some(pdfimages),
-        pdftoppm: Some(pdftoppm),
-    };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
-        .expect("conversion should succeed");
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("Body before equation."));
+        assert!(content.contains("Body after equation."));
+        assert!(content.contains("<figure id=\"pdf-equation-0001\">"));
+        assert!(content.contains("images/pdf-equation-0001.png"));
+        assert!(!content.contains("E = mc^2"));
 
-    assert_eq!(outcome.report.tables, 0);
-    assert_eq!(outcome.report.equations, 1);
-    assert_eq!(outcome.report.figures, 1);
+        let mut image = Vec::new();
+        archive
+            .by_name("images/pdf-equation-0001.png")
+            .expect("equation crop exists")
+            .read_to_end(&mut image)
+            .expect("image reads");
+        assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
 
-    let mut archive =
-        ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
-    let mut content = String::new();
-    archive
-        .by_name("content.xhtml")
-        .expect("content exists")
-        .read_to_string(&mut content)
-        .expect("content reads");
-    assert!(content.contains("Body before equation."));
-    assert!(content.contains("Body after equation."));
-    assert!(content.contains("<figure id=\"pdf-equation-0001\">"));
-    assert!(content.contains("images/pdf-equation-0001.png"));
-    assert!(!content.contains("E = mc^2"));
+    #[cfg(unix)]
+    {
+        let root = tempfile::tempdir().expect("real-path temp dir");
+        let tools = unix_tools(
+            root.path(),
+            DISPLAY_EQUATION_XML,
+            DISPLAY_EQUATION_BASELINE,
+            UnixImageTools::HealthyEmpty,
+        );
+        case(root.path(), &tools);
+    }
 
-    let mut image = Vec::new();
-    archive
-        .by_name("images/pdf-equation-0001.png")
-        .expect("equation crop exists")
-        .read_to_end(&mut image)
-        .expect("image reads");
-    assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+    let fake = FakePoppler::new(DISPLAY_EQUATION_XML, DISPLAY_EQUATION_BASELINE);
+    case(fake_dir.path(), &fake);
 }
 
-#[cfg(unix)]
-#[cfg(unix)]
 #[test]
 fn convert_pdf_marks_inline_math_as_protected_span() {
-    use std::fs;
+    fn case(dir: &Path, tools: &dyn PopplerBackend) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
 
-    let dir = tempfile::tempdir().expect("temp dir");
-    let input = dir.path().join("input.pdf");
-    let output = dir.path().join("output.epub");
-    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+        convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), tools, None)
+            .expect("conversion should succeed");
 
-    let pdftohtml = dir.path().join("pdftohtml");
-    write_executable(
-        &pdftohtml,
-        r##"#!/bin/sh
-cat <<'XML'
-<pdf2xml>
-  <page number="1" width="600" height="800">
-    <fontspec id="0" size="12" family="Times" color="#000000"/>
-    <text top="100" left="100" width="360" height="12" font="0">The energy term E = mc^2 appears inline.</text>
-  </page>
-</pdf2xml>
-XML
-"##,
-    );
+        let book = bookforge_epub::read_epub(&output).expect("converted EPUB should be readable");
+        assert!(
+            book.blocks.iter().any(|block| {
+                block.protected_spans.iter().any(|span| {
+                    span.kind == bookforge_core::ir::ProtectedSpanKind::Math
+                        && span.text == "E = mc^2"
+                })
+            }),
+            "inline math should become a protected span after PDF conversion"
+        );
+    }
 
-    let pdftotext = dir.path().join("pdftotext");
-    write_executable(
-        &pdftotext,
-        r#"#!/bin/sh
-printf 'The energy term E = mc^2 appears inline.\n'
-"#,
-    );
-    let pdfimages = dir.path().join("pdfimages");
-    fake_pdfimages_empty(&pdfimages);
-    let pdftoppm = dir.path().join("pdftoppm");
-    fake_pdftoppm(&pdftoppm);
+    #[cfg(unix)]
+    {
+        let root = tempfile::tempdir().expect("real-path temp dir");
+        let tools = unix_tools(
+            root.path(),
+            INLINE_MATH_XML,
+            INLINE_MATH_BASELINE,
+            UnixImageTools::HealthyEmpty,
+        );
+        case(root.path(), &tools);
+    }
 
-    let tools = PopplerTools {
-        pdftohtml,
-        pdftotext,
-        pdfimages: Some(pdfimages),
-        pdftoppm: Some(pdftoppm),
-    };
-    convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
-        .expect("conversion should succeed");
-
-    let book = bookforge_epub::read_epub(&output).expect("converted EPUB should be readable");
-    assert!(
-        book.blocks.iter().any(|block| {
-            block.protected_spans.iter().any(|span| {
-                span.kind == bookforge_core::ir::ProtectedSpanKind::Math && span.text == "E = mc^2"
-            })
-        }),
-        "inline math should become a protected span after PDF conversion"
-    );
+    let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+    let fake = FakePoppler::new(INLINE_MATH_XML, INLINE_MATH_BASELINE);
+    case(fake_dir.path(), &fake);
 }
 
-#[cfg(unix)]
 #[cfg(unix)]
 #[test]
 fn convert_pdf_does_not_crop_model_parameter_prose_as_equation() {
@@ -1541,190 +1675,169 @@ fn convert_pdf_does_not_crop_model_parameter_prose_as_equation() {
     assert!(!content.contains("pdf-equation-0001.png"));
 }
 
-#[cfg(unix)]
-#[cfg(unix)]
 #[test]
 fn low_confidence_pages_linearize_by_default() {
-    use std::{fs, io::Read};
+    use std::io::Read;
     use zip::ZipArchive;
 
-    let dir = tempfile::tempdir().expect("temp dir");
-    let input = dir.path().join("input.pdf");
-    let output = dir.path().join("output.epub");
-    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+    fn case(dir: &Path, tools: &dyn PopplerBackend) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
 
-    let pdftohtml = dir.path().join("pdftohtml");
-    write_executable(
-        &pdftohtml,
-        r##"#!/bin/sh
-cat <<'XML'
-<pdf2xml>
-  <page number="1" width="600" height="800">
-    <fontspec id="0" size="12" family="Times" color="#000000"/>
-    <text top="100" left="100" width="20" height="12" font="0">Tiny</text>
-  </page>
-</pdf2xml>
-XML
-"##,
-    );
+        let outcome =
+            convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), tools, None)
+                .expect("conversion should succeed");
 
-    let pdftotext = dir.path().join("pdftotext");
-    write_executable(
-        &pdftotext,
-        r#"#!/bin/sh
-printf 'Tiny plus many baseline characters that the XML reconstruction did not recover.\n'
-"#,
-    );
-    let pdfimages = dir.path().join("pdfimages");
-    fake_pdfimages_empty(&pdfimages);
-    let pdftoppm = dir.path().join("pdftoppm");
-    fake_pdftoppm(&pdftoppm);
+        assert_eq!(outcome.report.low_confidence_pages, 1);
+        assert_eq!(
+            outcome.report.page_stats[0]
+                .low_confidence_action
+                .as_deref(),
+            Some("linearize")
+        );
+        assert!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("page 1: low-confidence")
+                    && warning.contains("action=linearize"))
+        );
 
-    let tools = PopplerTools {
-        pdftohtml,
-        pdftotext,
-        pdfimages: Some(pdfimages),
-        pdftoppm: Some(pdftoppm),
-    };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
-        .expect("conversion should succeed");
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("Tiny"));
+        assert!(!content.contains("pdf-page-0001.png"));
+    }
 
-    assert_eq!(outcome.report.low_confidence_pages, 1);
-    assert_eq!(
-        outcome.report.page_stats[0]
-            .low_confidence_action
-            .as_deref(),
-        Some("linearize")
-    );
-    assert!(
-        outcome
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("page 1: low-confidence")
-                && warning.contains("action=linearize"))
-    );
+    #[cfg(unix)]
+    {
+        let root = tempfile::tempdir().expect("real-path temp dir");
+        let tools = unix_tools(
+            root.path(),
+            TINY_PAGE_XML,
+            TINY_PAGE_BASELINE,
+            UnixImageTools::HealthyEmpty,
+        );
+        case(root.path(), &tools);
+    }
 
-    let mut archive =
-        ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
-    let mut content = String::new();
-    archive
-        .by_name("content.xhtml")
-        .expect("content exists")
-        .read_to_string(&mut content)
-        .expect("content reads");
-    assert!(content.contains("Tiny"));
-    assert!(!content.contains("pdf-page-0001.png"));
+    let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+    let fake = FakePoppler::new(TINY_PAGE_XML, TINY_PAGE_BASELINE);
+    case(fake_dir.path(), &fake);
 }
 
-#[cfg(unix)]
-#[cfg(unix)]
 #[test]
 fn low_confidence_pages_can_be_preserved_as_page_images() {
-    use std::{fs, io::Read};
+    use std::io::Read;
     use zip::ZipArchive;
 
-    let dir = tempfile::tempdir().expect("temp dir");
-    let input = dir.path().join("input.pdf");
-    let output = dir.path().join("output.epub");
-    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+    fn case(dir: &Path, tools: &dyn PopplerBackend) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
 
-    let pdftohtml = dir.path().join("pdftohtml");
-    write_executable(
-        &pdftohtml,
-        r##"#!/bin/sh
-cat <<'XML'
-<pdf2xml>
-  <page number="1" width="600" height="800">
-    <fontspec id="0" size="12" family="Times" color="#000000"/>
-    <text top="100" left="100" width="20" height="12" font="0">Tiny</text>
-  </page>
-</pdf2xml>
-XML
-"##,
-    );
+        let options = ConvertOptions {
+            low_confidence: LowConfidenceMode::Preserve,
+            ..ConvertOptions::default()
+        };
+        let outcome = convert_pdf_with_tools(&input, &output, &options, tools, None)
+            .expect("conversion should succeed");
 
-    let pdftotext = dir.path().join("pdftotext");
-    write_executable(
-        &pdftotext,
-        r#"#!/bin/sh
-printf 'Tiny plus many baseline characters that the XML reconstruction did not recover.\n'
-"#,
-    );
-    let pdfimages = dir.path().join("pdfimages");
-    fake_pdfimages_empty(&pdfimages);
-    let pdftoppm = dir.path().join("pdftoppm");
-    fake_pdftoppm(&pdftoppm);
+        assert_eq!(outcome.report.low_confidence_pages, 1);
+        assert_eq!(
+            outcome.report.page_stats[0]
+                .low_confidence_action
+                .as_deref(),
+            Some("preserve")
+        );
+        assert!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("page 1: low-confidence")
+                    && warning.contains("action=preserve"))
+        );
 
-    let tools = PopplerTools {
-        pdftohtml,
-        pdftotext,
-        pdfimages: Some(pdfimages),
-        pdftoppm: Some(pdftoppm),
-    };
-    let options = ConvertOptions {
-        low_confidence: LowConfidenceMode::Preserve,
-        ..ConvertOptions::default()
-    };
-    let outcome = convert_pdf_with_tools(&input, &output, &options, &tools, None)
-        .expect("conversion should succeed");
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(content.contains("<figure id=\"pdf-page-0001\">"));
+        assert!(content.contains("images/pdf-page-0001.png"));
+        assert!(!content.contains("Tiny"));
 
-    assert_eq!(outcome.report.low_confidence_pages, 1);
-    assert_eq!(
-        outcome.report.page_stats[0]
-            .low_confidence_action
-            .as_deref(),
-        Some("preserve")
-    );
-    assert!(
-        outcome
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("page 1: low-confidence")
-                && warning.contains("action=preserve"))
-    );
+        let mut image = Vec::new();
+        archive
+            .by_name("images/pdf-page-0001.png")
+            .expect("preserved page image exists")
+            .read_to_end(&mut image)
+            .expect("image reads");
+        assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
 
-    let mut archive =
-        ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
-    let mut content = String::new();
-    archive
-        .by_name("content.xhtml")
-        .expect("content exists")
-        .read_to_string(&mut content)
-        .expect("content reads");
-    assert!(content.contains("<figure id=\"pdf-page-0001\">"));
-    assert!(content.contains("images/pdf-page-0001.png"));
-    assert!(!content.contains("Tiny"));
+    #[cfg(unix)]
+    {
+        let root = tempfile::tempdir().expect("real-path temp dir");
+        let tools = unix_tools(
+            root.path(),
+            TINY_PAGE_XML,
+            TINY_PAGE_BASELINE,
+            UnixImageTools::HealthyEmpty,
+        );
+        case(root.path(), &tools);
+    }
 
-    let mut image = Vec::new();
-    archive
-        .by_name("images/pdf-page-0001.png")
-        .expect("preserved page image exists")
-        .read_to_end(&mut image)
-        .expect("image reads");
-    assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+    let fake = FakePoppler::new(TINY_PAGE_XML, TINY_PAGE_BASELINE);
+    case(fake_dir.path(), &fake);
 }
 
 #[test]
-fn localized_caption_detection_counts_skipped_foreign_captions() {
-    // PDF-10 warning half: captions that read like figure/table labels
-    // in other languages are counted for the report instead of vanishing.
+fn unrecognized_numeral_systems_are_the_only_skipped_caption_residue() {
+    // PDF-10 deep half: after English, CJK prefixes and Latin/fullwidth
+    // digit shapes became POSITIVE detections, only captions whose
+    // ordinals use unhandled numeral systems (Devanagari, Thai) remain
+    // "skipped" — the wave-2 warning narrows to genuinely unknown scripts.
     let positives = [
-        "Abbildung 3: Verteilung der Genauigkeit.",
-        "Tabla 2: Resultados del experimento.",
-        "图 1：模型架构示意图。",
-        "Figura 12 – Comparativo de modelos",
+        "चित्र ३: परिणामों की तुलना।",
+        "รูปที่ ๓: ผลการทดลองทั้งหมด",
+        // Arabic-Indic ordinals sit outside the Latin/fullwidth
+        // repertoire the detector acts on, so they stay unhandled too.
+        "شكل ١٢: مقارنة النماذج",
     ];
     for text in positives {
         assert!(
             detection::localized_caption_skipped(text),
-            "must be counted as skipped foreign caption: {text}"
+            "non-Latin ordinals stay unhandled and must be counted: {text}"
         );
     }
+    // Everything below is now DETECTED, so it must not be warned about.
     let negatives = [
         "Figure 1. English caption handled normally.",
         "Table 2. Also handled.",
+        "Abbildung 3: Verteilung der Genauigkeit.",
+        "Tabla 2: Resultados del experimento.",
+        "Figura 12 – Comparativo de modelos",
+        "図1 学習曲線の比較",
+        "図 12：推定結果",
+        "図１（全文）を示す",
+        "图１ 全局精度对比",
+        "圖7 系統架構示意",
+        "表5 実験結果の一覧",
+        "表 5：測定値のまとめ",
+        "그림 1: 모델 구조 비교",
+        "Afbeelding 4 – Geminieten waarden",
         "1. Introduction",
         "In 2019: the study was replicated with more participants than ever before recorded.",
         "The results were significant across all conditions tested by the authors of the paper.",
@@ -1732,18 +1845,198 @@ fn localized_caption_detection_counts_skipped_foreign_captions() {
     for text in negatives {
         assert!(
             !detection::localized_caption_skipped(text),
-            "must not be counted (English-handled, heading, or prose): {text}"
+            "covered repertoire must not warn: {text}"
         );
     }
 
     let mut page = empty_page(1);
-    page.fragments = vec![fragment(300, 100, 240, 12, "Abbildung 3: Verteilung.")];
+    page.fragments = vec![fragment(300, 100, 240, 12, "चित्र ३: परिणामों की तुलना।")];
     let pages = vec![page];
     let warning = detection::skipped_foreign_caption_warning(&pages).expect("warning");
     assert!(warning.contains('1'), "{warning}");
-    assert!(warning.contains("figure or table captions"), "{warning}");
+    assert!(warning.contains("does not recognize"), "{warning}");
 
     assert!(detection::skipped_foreign_caption_warning(&[empty_page(1)]).is_none());
+}
+
+#[test]
+fn cjk_caption_prefixes_take_ascii_or_fullwidth_ordinals() {
+    // Tier 2 of the detector: typed CJK prefixes; Japanese figure, both
+    // Chinese figure variants, shared table prefix, fullwidth digits.
+    for text in [
+        "図1 学習曲線の比較",
+        "図 12：推定誤差の分解",
+        "図３ 推定手法ごとの比較", // fullwidth ３ directly attached
+        "図\u{3000}10 全体構成",   // ideographic space
+        "图１ 全局精度对比",       // simplified + fullwidth ordinal
+        "圖7 系統架構示意",        // traditional + ASCII ordinal
+        "表5 実験結果の一覧",
+        "表 5：測定値のまとめ",
+        "表５ 灰色予測モデル誤差", // table + fullwidth
+    ] {
+        assert!(
+            is_figure_caption_text(text) || is_table_caption_text(text),
+            "must classify as a caption: {text}"
+        );
+    }
+    for (text, figure_expected) in [
+        ("図1 学習曲線の比較", true),
+        ("图３ 架构对比", true),
+        ("圖2 通訊流程圖", true),
+        ("表5 実験結果の一覧", false),
+        ("表４ 三種介入的效果", false),
+    ] {
+        assert!(
+            is_figure_caption_text(text) || is_table_caption_text(text),
+            "expected caption classification: {text}"
+        );
+        assert_eq!(
+            is_figure_caption_text(text),
+            figure_expected,
+            "wrong tier assignment: {text}"
+        );
+    }
+    // CJK characters WITHOUT an ordinal are ordinary prose starts, not
+    // captions.
+    for text in [
+        "表現力の高い新規性项",
+        "図は研究開発費と生産性との関係を示している。",
+        "表紙に戻る読者は少なくない。",
+        "第一章　序論",
+    ] {
+        assert!(
+            !is_figure_caption_text(text) && !is_table_caption_text(text),
+            "prose-like CJK lead must not classify: {text}"
+        );
+    }
+}
+
+#[test]
+fn language_neutral_fallback_detects_localized_captions_without_prefix_tables() {
+    // Tier 3: short alphabetic leading word in ANY script + explicit
+    // Latin/fullwidth ordinal + separator. These previously only fed the
+    // skipped-caption warning; they now associate with figures/tables.
+    for text in [
+        "Abbildung 3: Verteilung der Genauigkeit.", // German
+        "Tabla 2: Resultados del experimento.",     // Spanish
+        "Figura 12 – Comparativo de modelos",       // Portuguese, spaced dash
+        "그림 1: 모델 구조 비교.",                  // Korean, no prefix table entry
+        "Абзацей 5: вынікі эксперыментаў.",         // Cyrillic script
+        "Ανικόυρε 6. Σύνολο μοντέλων",              // Greek-script lead (synthetic)
+        "Tafel 8: gemiddelde prestasie.",           // Afrikaans table lead via fallback
+    ] {
+        assert!(
+            is_figure_caption_text(text) || is_table_caption_text(text),
+            "fallback must detect the caption shape: {text}"
+        );
+    }
+
+    // Prose guards survive: numbered headings, long sentences, year-led
+    // sentences without a leading word+ordinal+separator shape.
+    for text in [
+        "1. Introduction",
+        "In 2019: the study was replicated with more participants than ever before recorded.",
+        "A longer sentence with many words that happens to contain 42 values but never ends with a proper separator pattern early enough to look like one.",
+    ] {
+        assert!(
+            !is_figure_caption_text(text) && !is_table_caption_text(text),
+            "must not classify prose/heading as caption: {text}"
+        );
+    }
+
+    // The fallback feeds vector-figure association end to end: give it a
+    // caption plus chart labels and confirm a region is recovered.
+    let mut page = empty_page(1);
+    page.width = 600;
+    page.height = 800;
+    page.fragments = vec![
+        fragment(100, 250, 24, 10, "80"),
+        fragment(140, 252, 22, 10, "60"),
+        fragment(180, 252, 22, 10, "40"),
+        fragment(220, 252, 22, 10, "20"),
+        fragment(330, 180, 240, 15, "Tabella 9 – Rendimento dei modelli."),
+    ];
+    let mut warnings = Vec::new();
+    let single_page = [page];
+    let unmarked_columns = HashSet::new();
+    let regions = vector_figure_regions(&single_page, &unmarked_columns, &mut warnings);
+
+    assert_eq!(
+        regions.len(),
+        1,
+        "Italian-tab-shaped caption recovers a region: {warnings:?}"
+    );
+}
+
+#[test]
+fn converted_japanese_and_chinese_vector_figures_associate_via_cjk_captions() {
+    use std::io::Read;
+    use zip::ZipArchive;
+
+    fn case(dir: &Path, tools: &dyn PopplerBackend, expected_caption: &str) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
+
+        let outcome =
+            convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), tools, None)
+                .expect("conversion should succeed");
+
+        assert_eq!(outcome.report.images, 0);
+        assert_eq!(outcome.report.figures, 1, "{}", outcome.report.summary());
+        assert!(
+            !outcome
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("caption detector")),
+            "CJK captions are detected now; nothing may be reported as skipped: {:?}",
+            outcome.report.warnings
+        );
+
+        let mut archive =
+            ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip opens");
+        let mut content = String::new();
+        archive
+            .by_name("content.xhtml")
+            .expect("content exists")
+            .read_to_string(&mut content)
+            .expect("content reads");
+        assert!(
+            content.contains("<figure id=\"pdf-figure-0001\">"),
+            "vector chart becomes one figure crop: {content}"
+        );
+        assert_eq!(content.matches(expected_caption).count(), 1, "{content}");
+        assert!(
+            content.contains(&format!("<figcaption>{expected_caption}</figcaption>")),
+            "caption is carried on the figure: {content}"
+        );
+        // Chart label rows must have been consumed into the raster crop
+        // (credited as media), not left behind as scattered paragraphs.
+        assert!(
+            outcome.report.media_preserved_chars > 0,
+            "axis labels leave the text flow: {:?}",
+            outcome.report.summary()
+        );
+    }
+
+    const JA_BASELINE: &str = "80\n60\n40\n20\n0\nエポック数\n図1 学習曲線の比較\n";
+    const ZH_BASELINE: &str = "95\n90\n85\n80\n75\n训练轮次\n图１ 全局精度对比\n";
+
+    for (doc, baseline, caption) in [
+        (JA_VECTOR_FIGURES_XML, JA_BASELINE, "図1 学習曲線の比較"),
+        (ZH_VECTOR_FIGURES_XML, ZH_BASELINE, "图１ 全局精度对比"),
+    ] {
+        #[cfg(unix)]
+        {
+            let root = tempfile::tempdir().expect("real-path temp dir");
+            let tools = unix_tools(root.path(), doc, baseline, UnixImageTools::HealthyEmpty);
+            case(root.path(), &tools, caption);
+        }
+
+        let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+        let fake = FakePoppler::new(doc, baseline);
+        case(fake_dir.path(), &fake, caption);
+    }
 }
 
 #[test]
@@ -1756,6 +2049,7 @@ fn running_header_removal_does_not_push_pages_below_the_confidence_threshold() {
         baseline_chars: 100,
         running_header_chars: 35,
         two_column: false,
+        rtl_dominant: false,
         low_confidence: false,
         low_confidence_action: None,
     };
@@ -1775,6 +2069,7 @@ fn running_header_removal_does_not_push_pages_below_the_confidence_threshold() {
         baseline_chars: 100,
         running_header_chars: 0,
         two_column: false,
+        rtl_dominant: false,
         low_confidence: false,
         low_confidence_action: None,
     };
@@ -1812,63 +2107,76 @@ fn ocr_render_dpi_caps_extreme_media_boxes() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn failed_figure_pass_still_removes_scratch_temp_dirs() {
     // PDF-3 regression companion to the RAII drop test in tools.rs: the
-    // orphaned-path fixture makes `image_asset`'s fs::read fail inside
+    // dangling-image fixture makes `image_asset`'s fs::read fail inside
     // figure_blocks_from_images so the error escapes before any manual
     // cleanup line could ever run. With ScopedTempDir guards owning the
     // directories on the convert stack frame, unwinding cannot leak.
-    use std::fs;
+    fn case(dir: &Path, tools: &dyn PopplerBackend) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
 
-    let dir = tempfile::tempdir().expect("temp dir");
-    let input = dir.path().join("input.pdf");
-    let output = dir.path().join("output.epub");
-    fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+        let result =
+            convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), tools, None);
 
-    let pdftohtml = dir.path().join("pdftohtml");
-    fake_pdftohtml_with_xml(
-        &pdftohtml,
-        r##"<pdf2xml>
+        assert!(result.is_err(), "figure pass must fail for this fixture");
+        assert!(!output.exists(), "no EPUB is produced when a pass errors");
+
+        // And the RAII guarantee those guards provide:
+        let guard = crate::tools::ScopedTempDir::new("bookforge-pdf-probe").expect("probe dir");
+        let probe_path = guard.path().to_path_buf();
+        assert!(probe_path.is_dir());
+        drop(guard);
+        assert!(
+            !probe_path.exists(),
+            "a dropped scoped scratch dir must be gone even when owners return early"
+        );
+    }
+
+    const DANGLING_IMAGE_XML: &str = r##"<pdf2xml>
   <page number="1" width="600" height="800">
     <fontspec id="0" size="12" family="Times" color="#000000"/>
     <text top="80" left="100" width="300" height="16" font="0">Paper Title</text>
     <image top="130" left="120" width="120" height="80" src="paper-1_1.png"/>
     <text top="218" left="120" width="260" height="12" font="0">Figure 1. A test image.</text>
   </page>
-</pdf2xml>"##,
-    );
-    let pdftotext = dir.path().join("pdftotext");
-    fake_pdftotext_with_text(&pdftotext, "Paper Title\nFigure 1. A test image.\n");
-    // Lists a healthy image but never materializes its file.
-    let pdfimages = write_executable_orphan(dir.path(), "pdfimages");
-    let pdftoppm = dir.path().join("pdftoppm");
-    fake_pdftoppm(&pdftoppm);
+</pdf2xml>"##;
+    const DANGLING_IMAGE_BASELINE: &str = "Paper Title\nFigure 1. A test image.\n";
 
-    let tools = PopplerTools {
-        pdftohtml,
-        pdftotext,
-        pdfimages: Some(pdfimages),
-        pdftoppm: Some(pdftoppm),
-    };
+    #[cfg(unix)]
+    {
+        // Real-tool path: pdfimages lists one healthy image but never
+        // materializes its file (`write_executable_orphan`).
+        let root = tempfile::tempdir().expect("real-path temp dir");
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).expect("bin dir");
+        let pdftohtml = bin.join("pdftohtml");
+        write_executable(&pdftohtml, &shell_cat(DANGLING_IMAGE_XML, "XMLDOC"));
+        let pdftotext = bin.join("pdftotext");
+        write_executable(&pdftotext, &shell_cat(DANGLING_IMAGE_BASELINE, "TEXTBASE"));
+        let pdfimages = write_executable_orphan(&bin, "pdfimages");
+        let pdftoppm = bin.join("pdftoppm");
+        fake_pdftoppm(&pdftoppm);
+        let tools = PopplerTools {
+            pdftohtml,
+            pdftotext,
+            pdfimages: Some(pdfimages),
+            pdftoppm: Some(pdftoppm),
+        };
+        case(root.path(), &tools);
+    }
 
-    let result = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None);
-
-    assert!(result.is_err(), "figure pass must fail for this fixture");
-    assert!(!output.exists(), "no EPUB is produced when a pass errors");
-
-    // And the RAII guarantee those guards provide:
-    let guard = crate::tools::ScopedTempDir::new("bookforge-pdf-probe").expect("probe dir");
-    let probe_path = guard.path().to_path_buf();
-    assert!(probe_path.is_dir());
-    drop(guard);
-    assert!(
-        !probe_path.exists(),
-        "a dropped scoped scratch dir must be gone even when owners return early"
-    );
+    // In-process path: an advertised-but-unwritten extraction artifact
+    // produces the identical dangling path and failure.
+    let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+    let fake = FakePoppler::new(DANGLING_IMAGE_XML, DANGLING_IMAGE_BASELINE)
+        .with_extracted_image(FixtureImage::dangling(1, 640, 480));
+    case(fake_dir.path(), &fake);
 }
 
+#[cfg(unix)]
 fn write_executable_orphan(dir: &Path, name: &str) -> PathBuf {
     // `pdfimages` that lists one image but never creates its file.
     let path = dir.join(name);
@@ -1891,60 +2199,121 @@ printf '%s-000-000.png\n' "$last"
     path
 }
 
-#[cfg(unix)]
 #[test]
-fn rotated_and_foreign_caption_fragments_surface_in_report_warnings() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let input = dir.path().join("input.pdf");
-    let output = dir.path().join("output.epub");
-    std::fs::write(&input, b"dummy pdf").expect("input pdf fixture");
+fn rotated_and_unknown_script_captions_surface_in_report_warnings() {
+    // PDF-10, narrowed-warning half: since detection now covers English,
+    // CJK prefixes and any Latin/fullwidth-digit caption shape, the report
+    // notice fires ONLY for captions whose ordinals use genuinely
+    // unhandled numeral systems (Devanagari here). The rotated fragment
+    // assertion is unchanged.
+    fn case(dir: &Path, tools: &dyn PopplerBackend) {
+        let input = write_input_pdf(dir);
+        let output = dir.join("output.epub");
 
-    let pdftohtml = dir.path().join("pdftohtml");
-    fake_pdftohtml_with_xml(
-        &pdftohtml,
-        r##"<pdf2xml>
-  <page number="1" width="600" height="800">
-    <fontspec id="0" size="12" family="Times" color="#000000"/>
-    <text top="100" left="100" width="360" height="12" font="0">Ordinary flowing prose continues here normally.</text>
-    <text top="150" left="500" width="0" height="200" font="0">VERTICAL WATERMARK</text>
-    <text top="400" left="100" width="300" height="12" font="0">Abbildung 3: Verteilung der Genauigkeit.</text>
-  </page>
-</pdf2xml>"##,
+        let outcome =
+            convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), tools, None)
+                .expect("conversion should succeed");
+
+        assert!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("rotated/zero-width text fragment")),
+            "vertical text must be reported, not silently dropped: {:?}",
+            outcome.report.summary()
+        );
+        assert!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("caption detector does not recognize")),
+            "unknown-script captions must still be counted in the report: {:?}",
+            outcome.report.warnings
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        let root = tempfile::tempdir().expect("real-path temp dir");
+        let tools = unix_tools(
+            root.path(),
+            ROTATED_AND_UNKNOWN_CAPTION_XML,
+            ROTATED_AND_UNKNOWN_CAPTION_BASELINE,
+            UnixImageTools::HealthyEmpty,
+        );
+        case(root.path(), &tools);
+    }
+
+    let fake_dir = tempfile::tempdir().expect("fake-path temp dir");
+    let fake = FakePoppler::new(
+        ROTATED_AND_UNKNOWN_CAPTION_XML,
+        ROTATED_AND_UNKNOWN_CAPTION_BASELINE,
     );
-    let pdftotext = dir.path().join("pdftotext");
-    fake_pdftotext_with_text(
-        &pdftotext,
-        "Ordinary flowing prose continues here normally.\nVERTICAL WATERMARK\nAbbildung 3: Verteilung der Genauigkeit.\n",
+    case(fake_dir.path(), &fake);
+}
+
+#[test]
+fn invisible_formatting_marks_do_not_skew_rtl_page_coverage() {
+    // PDF-7, coverage-metric half: poppler's shapers leak zero-width
+    // formatting controls (ZWNJ/ZWJ/RLM…) asymmetrically between
+    // pdftotext and pdftohtml -xml. Counting them on either side made
+    // RTL pages swing under the 95% threshold and spend OCR purely for
+    // their script. Both sides of the ratio now weigh the same visible
+    // repertoire.
+    let visible = "المنظومة القياسية الدولية للوحدات تعرف بسبع وحدات اساس.";
+    let mut baseline = String::with_capacity(visible.len() * 2);
+    for ch in visible.chars() {
+        baseline.push(ch);
+        if !ch.is_whitespace() {
+            baseline.push('\u{200c}'); // ZWNJ between every letter
+        }
+    }
+
+    let xml = format!(
+        r#"<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="12" family="T"/>
+<text top="100" left="80" width="440" height="14" font="0">{visible}</text>
+</page>
+</pdf2xml>"#
     );
-    let pdfimages = dir.path().join("pdfimages");
-    fake_pdfimages_empty(&pdfimages);
-    let pdftoppm = dir.path().join("pdftoppm");
-    fake_pdftoppm(&pdftoppm);
+    let pages = parse_pdf2xml(&xml).expect("fixture parses");
 
-    let tools = PopplerTools {
-        pdftohtml,
-        pdftotext,
-        pdfimages: Some(pdfimages),
-        pdftoppm: Some(pdftoppm),
-    };
-    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &tools, None)
-        .expect("conversion should succeed");
+    let reconstruction = reconstruct_with_chapter_guard(&pages, ColumnMode::Single, None);
+    let reconstructed_chars = reconstruction
+        .blocks
+        .iter()
+        .map(|anchored| anchored.block.char_count())
+        .sum::<usize>();
+    assert_eq!(
+        reconstructed_chars,
+        crate::model::count_visible_chars(visible),
+        "reconstruction weighs visible characters only"
+    );
 
+    // Naive char counting would have seen roughly half of the baseline
+    // missing; the symmetric metric sees full coverage.
+    let naive_baseline = baseline.chars().filter(|ch| !ch.is_whitespace()).count();
+    // The pre-fix asymmetry was material — nearly half of the naive
+    // baseline counted invisible controls.
     assert!(
-        outcome
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("rotated/zero-width text fragment")),
-        "vertical text must be reported, not silently dropped: {:?}",
-        outcome.report.summary()
+        naive_baseline >= reconstructed_chars + 20,
+        "fixture must exhibit real drift: {naive_baseline} vs {reconstructed_chars}"
     );
+
+    let mut page_stats = reconstruction.pages;
+    assert_eq!(page_stats.len(), 1);
     assert!(
-        outcome
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("caption detector does not cover")),
-        "skipped foreign captions must be counted in the report"
+        page_stats[0].rtl_dominant,
+        "the fixture is genuinely RTL-dominant"
+    );
+    page_stats[0].baseline_chars = crate::model::count_visible_chars(&baseline);
+    mark_low_confidence_pages(&mut page_stats, LowConfidenceMode::Linearize);
+    assert!(
+        !page_stats[0].low_confidence,
+        "formatting controls must not rasterize/OCR an RTL page: {:?}",
+        page_stats[0]
     );
 }

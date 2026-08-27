@@ -21,15 +21,17 @@ use crate::{
     },
     ocr::OcrEngine,
     parse::parse_pdf2xml,
-    reconstruct::{AnchoredBlock, BlockAnchor, PageStats, reconstruct},
+    reconstruct::{AnchoredBlock, BlockAnchor, PageStats, reconstruct_with_chapter_guard},
     report::{ConversionReport, LOW_CONFIDENCE_COVERAGE_RATIO, ReportMetrics},
     tools::{
-        ExtractedImage, PDF_RENDER_DPI, PDF_XML_ZOOM_DEN, PDF_XML_ZOOM_NUM, PageCrop, PopplerTools,
-        ScopedTempDir, crop_png_to_file,
+        ExtractedImage, PDF_RENDER_DPI, PDF_XML_ZOOM_DEN, PDF_XML_ZOOM_NUM, PageCrop,
+        PopplerBackend, PopplerTools, ScopedTempDir, crop_png_to_file,
     },
 };
 
 mod detection;
+#[cfg(test)]
+mod fake_backend;
 mod rendering;
 mod reporting;
 
@@ -41,8 +43,9 @@ use detection::{
 #[cfg(test)]
 use detection::{
     detect_caption_fragment, detect_media_regions, image_candidate_clusters,
-    image_figure_candidates, is_display_equation_fragment, is_prose_like_fragment,
-    padded_vector_crop_rect, table_regions_for_page, vector_figure_regions,
+    image_figure_candidates, is_display_equation_fragment, is_figure_caption_text,
+    is_prose_like_fragment, is_table_caption_text, padded_vector_crop_rect, table_regions_for_page,
+    vector_figure_regions,
 };
 #[cfg(test)]
 use rendering::remove_blocks_in_region;
@@ -107,14 +110,15 @@ fn convert_pdf_with_tools(
     input: &Path,
     output: &Path,
     options: &ConvertOptions,
-    tools: &PopplerTools,
+    tools: &dyn PopplerBackend,
     ocr: Option<&dyn OcrEngine>,
 ) -> Result<ConvertOutcome> {
     let xml = tools.pdf_to_xml(input)?;
     let pages = parse_pdf2xml(&xml)?;
-    let reconstruction = reconstruct(&pages, options.columns);
+    let reconstruction =
+        reconstruct_with_chapter_guard(&pages, options.columns, options.chapter_prefix.as_deref());
     let baseline = tools.pdf_to_text(input)?;
-    let baseline_chars = baseline.chars().filter(|ch| !ch.is_whitespace()).count();
+    let baseline_chars = crate::model::count_visible_chars(&baseline);
     let baseline_page_chars = baseline_page_char_counts(&baseline, reconstruction.pages.len());
     let mut page_stats = reconstruction.pages;
     for (stats, chars) in page_stats.iter_mut().zip(baseline_page_chars) {
@@ -283,7 +287,7 @@ fn render_ocr_page_png(
     input: &Path,
     pages: &[Page],
     page_number: u32,
-    tools: &PopplerTools,
+    tools: &dyn PopplerBackend,
     output_dir: &Path,
 ) -> Result<PathBuf> {
     let dpi = match pages.iter().find(|page| page.number == page_number) {

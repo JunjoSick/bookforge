@@ -109,7 +109,7 @@ fn replace_page_with_ocr_text(blocks: &mut Vec<AnchoredBlock>, page_number: u32,
 pub(super) fn preserve_low_confidence_pages(
     input: &Path,
     pages: &[Page],
-    tools: &PopplerTools,
+    tools: &dyn PopplerBackend,
     blocks: &mut Vec<AnchoredBlock>,
     low_confidence_pages: &[u32],
 ) -> Result<Vec<String>> {
@@ -195,13 +195,13 @@ fn replace_page_with_preserved_image(
 
 pub(super) struct PageCropRenderer<'a> {
     input: &'a Path,
-    tools: &'a PopplerTools,
+    tools: &'a dyn PopplerBackend,
     page_dir: &'a Path,
     rendered_pages: HashMap<u32, PathBuf>,
 }
 
 impl<'a> PageCropRenderer<'a> {
-    pub(super) fn new(input: &'a Path, tools: &'a PopplerTools, page_dir: &'a Path) -> Self {
+    pub(super) fn new(input: &'a Path, tools: &'a dyn PopplerBackend, page_dir: &'a Path) -> Self {
         Self {
             input,
             tools,

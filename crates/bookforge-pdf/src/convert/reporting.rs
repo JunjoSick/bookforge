@@ -69,7 +69,7 @@ fn starts_with_lowercase_or_suffix(block: &DocBlock) -> bool {
 pub(super) fn baseline_page_char_counts(text: &str, pages: usize) -> Vec<usize> {
     let mut counts = text
         .split('\x0c')
-        .map(|page| page.chars().filter(|ch| !ch.is_whitespace()).count())
+        .map(crate::model::count_visible_chars)
         .collect::<Vec<_>>();
     while counts.last() == Some(&0) && counts.len() > pages {
         counts.pop();

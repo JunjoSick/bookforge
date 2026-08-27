@@ -403,16 +403,22 @@ impl PopplerTools {
     }
 }
 
-fn poppler_command(program: &Path) -> Command {
-    let mut command = Command::new(program);
+/// Environment-variable allowlist applied to every poppler invocation,
+/// shared verbatim by the real subprocess path and by tests that build
+/// commands in-process on any OS. Lookups are injected so scrub
+/// behaviour is observable without spawning anything.
+fn apply_environment_allowlist(
+    command: &mut Command,
+    lookup: &mut dyn FnMut(&str) -> Option<std::ffi::OsString>,
+) {
     command.env_clear();
-    copy_environment_variable(&mut command, "PATH");
+    copy_environment_variable(command, "PATH", lookup);
     #[cfg(windows)]
     {
         // Windows needs these for system DLL discovery and temporary-file APIs.
-        copy_environment_variable(&mut command, "SYSTEMROOT");
-        copy_environment_variable(&mut command, "TEMP");
-        copy_environment_variable(&mut command, "TMP");
+        copy_environment_variable(command, "SYSTEMROOT", lookup);
+        copy_environment_variable(command, "TEMP", lookup);
+        copy_environment_variable(command, "TMP", lookup);
     }
     #[cfg(unix)]
     {
@@ -435,15 +441,98 @@ fn poppler_command(program: &Path) -> Command {
             "FONTCONFIG_FILE",
             "TMPDIR",
         ] {
-            copy_environment_variable(&mut command, name);
+            copy_environment_variable(command, name, lookup);
         }
     }
+}
+
+fn copy_environment_variable(
+    command: &mut Command,
+    name: &'static str,
+    lookup: &mut dyn FnMut(&str) -> Option<std::ffi::OsString>,
+) {
+    if let Some(value) = lookup(name) {
+        command.env(name, value);
+    }
+}
+
+fn poppler_command(program: &Path) -> Command {
+    let mut command = Command::new(program);
+    apply_environment_allowlist(&mut command, &mut |name| std::env::var_os(name));
     command
 }
 
-fn copy_environment_variable(command: &mut Command, name: &'static str) {
-    if let Some(value) = std::env::var_os(name) {
-        command.env(name, value);
+/// The tool surface reconstruction/OCR orchestration actually drives.
+///
+/// Implemented by [`PopplerTools`] over real subprocesses; integration
+/// tests supply an in-process fake so failure, timing and cleanup paths
+/// run identically on any OS (TEST-2/PDF-2).
+pub trait PopplerBackend {
+    /// `pdftohtml -xml` output for the whole document.
+    fn pdf_to_xml(&self, pdf: &Path) -> Result<String, ToolError>;
+
+    /// Raw `pdftotext` output used as the coverage baseline.
+    fn pdf_to_text(&self, pdf: &Path) -> Result<String, ToolError>;
+
+    /// Extract embedded images into `output_dir`.
+    fn extract_images(
+        &self,
+        pdf: &Path,
+        output_dir: &Path,
+    ) -> Result<Vec<ExtractedImage>, ToolError>;
+
+    /// Render one page at [`PDF_RENDER_DPI`].
+    fn render_page_png(
+        &self,
+        pdf: &Path,
+        page: u32,
+        output_dir: &Path,
+    ) -> Result<PathBuf, ToolError>;
+
+    /// Render one page at a caller-selected DPI.
+    fn render_page_png_scaled(
+        &self,
+        pdf: &Path,
+        page: u32,
+        output_dir: &Path,
+        dpi: u32,
+    ) -> Result<PathBuf, ToolError>;
+}
+
+impl PopplerBackend for PopplerTools {
+    fn pdf_to_xml(&self, pdf: &Path) -> Result<String, ToolError> {
+        self.pdf_to_xml(pdf)
+    }
+
+    fn pdf_to_text(&self, pdf: &Path) -> Result<String, ToolError> {
+        self.pdf_to_text(pdf)
+    }
+
+    fn extract_images(
+        &self,
+        pdf: &Path,
+        output_dir: &Path,
+    ) -> Result<Vec<ExtractedImage>, ToolError> {
+        self.extract_images(pdf, output_dir)
+    }
+
+    fn render_page_png(
+        &self,
+        pdf: &Path,
+        page: u32,
+        output_dir: &Path,
+    ) -> Result<PathBuf, ToolError> {
+        self.render_page_png(pdf, page, output_dir)
+    }
+
+    fn render_page_png_scaled(
+        &self,
+        pdf: &Path,
+        page: u32,
+        output_dir: &Path,
+        dpi: u32,
+    ) -> Result<PathBuf, ToolError> {
+        self.render_page_png_scaled(pdf, page, output_dir, dpi)
     }
 }
 
@@ -578,7 +667,24 @@ enum WaitError {
     Io(io::Error),
 }
 
-fn wait_with_timeout(child: &mut ChildGuard, timeout: Duration) -> Result<ExitStatus, WaitError> {
+/// The wait surface [`wait_with_timeout`] needs: polling exit status.
+/// [`ChildGuard`] implements it over a real process; tests drive it
+/// with synthetic children so deadline/kill arithmetic runs in-process
+/// on any OS (TEST-2/PDF-2).
+trait PollWait {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
+}
+
+impl PollWait for ChildGuard {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        Self::try_wait_status(self)
+    }
+}
+
+fn wait_with_timeout(
+    child: &mut impl PollWait,
+    timeout: Duration,
+) -> Result<ExitStatus, WaitError> {
     let started = Instant::now();
     loop {
         match child.try_wait().map_err(WaitError::Io)? {
@@ -614,7 +720,7 @@ impl ChildGuard {
         self.child.as_mut()?.stderr.take()
     }
 
-    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+    fn try_wait_status(&mut self) -> io::Result<Option<ExitStatus>> {
         let status = self
             .child
             .as_mut()
@@ -1251,6 +1357,48 @@ mod tests {
             !dir.path().join("fake-tool-completed").exists(),
             "completion marker proves the timed-out child survived"
         );
+    }
+
+    /// A process substitute that never yields an exit status, letting the
+    /// poll/deadline arithmetic of [`wait_with_timeout`] run on any OS
+    /// without spawning anything (TEST-2/PDF-2).
+    struct NeverYieldingChild;
+
+    impl PollWait for NeverYieldingChild {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn deadline_fires_for_a_synthetic_never_exiting_child() {
+        let started = Instant::now();
+        let outcome = wait_with_timeout(&mut NeverYieldingChild, Duration::from_millis(40));
+
+        assert!(
+            matches!(outcome, Err(WaitError::TimedOut)),
+            "a child that never reports a status must hit the deadline"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "deadline respected: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "no unbounded waiting: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn exhausted_deadline_stops_polling_immediately() {
+        // The remaining-time delay must clamp to zero once the deadline
+        // has passed, so the loop cannot keep sleeping past it.
+        let started = Instant::now();
+        let outcome = wait_with_timeout(&mut NeverYieldingChild, Duration::ZERO);
+
+        assert!(matches!(outcome, Err(WaitError::TimedOut)));
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]

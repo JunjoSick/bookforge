@@ -7,6 +7,7 @@
 //! flows through the ordinary BookForge pipeline — this crate is an
 //! ingestion front-end, not a parallel translation path.
 
+pub mod bidi;
 pub mod convert;
 pub mod epub;
 pub mod model;
@@ -24,7 +25,7 @@ pub use ocr::{HttpOcrClient, OcrConfig, OcrDialect, OcrEngine, OcrError};
 pub use parse::parse_pdf2xml;
 pub use reconstruct::reconstruct;
 pub use report::ConversionReport;
-pub use tools::{PopplerTools, ToolError};
+pub use tools::{PopplerBackend, PopplerTools, ToolError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PdfError {

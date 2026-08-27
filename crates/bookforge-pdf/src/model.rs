@@ -38,6 +38,38 @@ impl ImageRegion {
     }
 }
 
+/// Formatting-control characters that shape display but carry no
+/// translatable content. Poppler's text pipeline leaks them freely and
+/// asymmetrically between `pdftotext` and `pdftohtml -xml` (PDF-7):
+/// shapers emit zero-width joiners/non-joiners around Arabic ligatures
+/// and directional marks that reconstruction legitimately reorders or
+/// drops. Counting them as content made RTL pages swing below the 95%
+/// coverage threshold and triggered OCR spend purely because of their
+/// script.
+pub(crate) fn is_invisible_formatting(ch: char) -> bool {
+    matches!(ch as u32,
+        0x00AD             // soft hyphen
+        | 0x061C           // Arabic letter mark
+        | 0x180E           // Mongolian vowel separator
+        | 0x200B..=0x200F  // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | 0x202A..=0x202E  // bidi embedding controls
+        | 0x2060..=0x2064  // word joiner, invisible plus/minus/hyphen
+        | 0x2066..=0x2069  // bidi isolate initiators/PDI
+        | 0xFEFF           // BOM / zero-width no-break space
+        | 0xFFF9..=0xFFFB  // interlinear annotation anchors
+    )
+}
+
+/// Non-whitespace characters a translator would actually see: both
+/// whitespace and formatting-control characters are excluded so every
+/// coverage comparison (per-page and document totals) weighs the same
+/// repertoire on both sides of the ratio.
+pub(crate) fn count_visible_chars(text: &str) -> usize {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace() && !is_invisible_formatting(*ch))
+        .count()
+}
+
 impl Fragment {
     pub fn right(&self) -> i32 {
         self.left + self.width
@@ -46,7 +78,7 @@ impl Fragment {
     pub fn char_count(&self) -> usize {
         self.spans
             .iter()
-            .map(|span| span.text.chars().filter(|ch| !ch.is_whitespace()).count())
+            .map(|span| count_visible_chars(&span.text))
             .sum()
     }
 }
@@ -74,7 +106,7 @@ impl Line {
     pub fn char_count(&self) -> usize {
         self.spans
             .iter()
-            .map(|span| span.text.chars().filter(|ch| !ch.is_whitespace()).count())
+            .map(|span| count_visible_chars(&span.text))
             .sum()
     }
 }
@@ -143,7 +175,7 @@ impl DocBlock {
     pub fn char_count(&self) -> usize {
         self.spans()
             .iter()
-            .map(|span| span.text.chars().filter(|ch| !ch.is_whitespace()).count())
+            .map(|span| count_visible_chars(&span.text))
             .sum()
     }
 }
