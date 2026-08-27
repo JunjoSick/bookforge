@@ -2,11 +2,14 @@
 
 ## Unreleased
 
-Remediation campaign for the 2026-08 deep audit (`docs/report.md`, waves 0–2):
-security hardening around the local dashboard, reliability repairs in the
-checkpoint/resume lifecycle, translation-quality work, audio/PDF fixes, plus
-corrections to two audit findings that turned out wrong. See
-`docs/HANDOFF-2026-08.md` for the wave-by-wave record.
+## v3.0.0 - 2026-08-27
+
+Remediation campaign for the 2026-08 deep audit (`docs/report.md`, waves 0–4),
+shipped as v3.0.0: security hardening around the local dashboard, reliability
+repairs in the checkpoint/resume lifecycle, translation-quality work,
+audio/PDF fixes, breaking JSON/CLI surface changes, and corrections to two
+audit findings that turned out wrong. See `docs/HANDOFF-2026-08.md` for the
+wave-by-wave record.
 
 ### Security
 
@@ -71,6 +74,15 @@ corrections to two audit findings that turned out wrong. See
   `1` runtime failure, `2` usage error, `3` finished-with-unresolved-segments,
   `130` interrupted. `doctor` exits non-zero on failed checks with `--no-fail`
   preserving green scripts.
+- Store hardening: job and segment statuses gain typed enums at the boundary
+  enforced by CHECK constraints (migration 10, defensive `Unknown` decode);
+  the bundled SQL migration files become documented-and-parity-guarded rather
+  than silently drifted; retention groundwork lands as the store API
+  `JobStore::prune_jobs` (age/count/dry-run, running jobs protected per
+  deletion; a user-facing command is planned separately); file hashing
+  streams in chunks instead of reading whole EPUBs into RAM; startup sweeps
+  empty `retry_pending_overrides_<pid>` directories whose owner process is
+  gone.
 
 ### Quality and performance
 
@@ -105,6 +117,17 @@ corrections to two audit findings that turned out wrong. See
   keep `--ui json` stdout free of human chatter, emit honest
   `DroppedEvents` records when events are lost, and rebaseline rate/ETA on
   resume epochs.
+- Pricing loaders and provider/model defaults collapsed into one
+  `bookforge_core::providers` registry (CLI wrappers, judge examples, and the
+  glossary base-url table all consume it); bundled pricing JSON lives in a
+  single package-owned copy instead of three divergent tree paths; `estimate`
+  gains an optional `--pass-costs` breakdown covering QA/double-check/repair
+  planning heuristics (`--double-check-passes`, `--repair-share`).
+- Dead code removed after caller verification: unused core config/marker/
+  entity/IR helpers, several CLI-only store/test plumbing pieces, PDF's dead
+  image-type arms, and a wide slice of audiobook crate internals (public
+  serde/report schemas untouched); the cache namespace gains its missing
+  glossary domain separator.
 
 ### Audio
 
@@ -137,6 +160,16 @@ corrections to two audit findings that turned out wrong. See
   respect `SOURCE_DATE_EPOCH`, and build their table of contents from the
   detected heading structure; caption detection warns when non-English labels
   will be missed; render sizes and OCR request bodies are capped.
+- RTL lines (Arabic/Hebrew) emerge in logical reading order via a line-level
+  bidi pass; dominant-RTL pages report `rtl_dominant` and stop skewing the
+  coverage metric with embedding controls; justified-CJK kinsoku continuations
+  merge across pages without invented spaces; caption detection now covers
+  CJK typed prefixes (図/图/圖/表), a language-neutral lead-word fallback, and
+  fullwidth ordinals — the foreign-caption warning fires only for numeral
+  systems outside that repertoire.
+- A PopplerBackend seam plus an in-process fake poppler drive the conversion
+  test matrix on any OS, so env-scrubbing, timeouts, pipes, and cleanup claims
+  no longer ship untested on Windows (TEST-2/PDF-2).
 
 ### Breaking-ish changes
 
@@ -160,6 +193,18 @@ Automation consumers: `--ui json` stdout now carries a versioned envelope
   block gained a `status:` row using the shared status vocabulary. Counts,
   rates, and ETA values were already cross-checked by the wave-2 epoch tests
   and remain identical otherwise.
+- `glossary clear`, `style clear`, and `entities clear` now require an
+  explicit `--yes` before they destroy data.
+- `doctor` exits non-zero when health checks fail (see Reliability) — scripts
+  that treated a failed check as green need `--no-fail`.
+- The dashboard authenticates by default (see Security): scripts driving the
+  loopback API without the session token receive `401`. `--no-auth` opts out.
+- The `bookforge-audio` crate's internal surface was trimmed: narration text
+  helpers (`Chapter::text`, `chunk_text`, `chapters_from_book`), ElevenLabs
+  constants/`fetch_elevenlabs_subscription_with_key`/`resolve_preferred_elevenlabs_model`
+  (superseded by `*_reported_with_cancel` variants), and
+  `single_file_ffmpeg_args` are no longer public. The serde report/manifest
+  schemas are unchanged.
 
 ### Audit corrections
 

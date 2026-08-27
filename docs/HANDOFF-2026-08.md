@@ -15,7 +15,29 @@ Push it if absent: `git fetch origin && git checkout remediation/audit-2026-08`.
 3. **Serve auth (H-5):** token auth DEFAULT-ON (auto-generated session token, printed URL bootstraps browser, all API routes require it) with a `--no-auth` opt-out escape hatch.
 4. **Semver:** minor-breaking changes acceptable → final version bump likely **v3.0.0** (status enums replace magic strings, unified estimator changes cache keys, JSON envelope versioning).
 
-## 2. Current state — Waves 0–2 COMPLETE ✅ (2026-08-26)
+## 2. Current state — Waves 0–4 COMPLETE ✅ · Review round COMPLETE ✅ · v3.0.0 released (2026-08-27)
+
+All five audit waves executed to completion plus a professional pre-merge review round (six specialist reviewers: store integrity, serve security, llm engine, cli lifecycle, epub+pdf protocol, release readiness). Every BLOCKER/MAJOR finding from the review round was fixed and mutation/red-green verified before merge; P2/P3 leftovers are recorded as fast-follow tickets below.
+
+**Wave 4 highlights:** EPUB-18 seeded property harness (200 seeds, byte-stability + ordinal-protocol invariants) + 15-case hostile corpus + EPUB2 parity — the harness caught a real bug (unattributable zip-open errors, fixed); PDF gained a line-level bidi pass (Arabic/Hebrew logical order), justified-CJK kinsoku merging, tri-tier caption detection, and an in-process FakePoppler driving 15 conversion tests dual-path on any OS; pricing loaders + provider defaults collapsed into `bookforge_core::providers` (single package-owned JSON, anti-duplication guard test); `--pass-costs` estimate breakdown; `--ui json` stdout now carries a versioned envelope (`--ui json-v1` preserves legacy streams); one RunView presentation layer feeds all four dashboards; styles/entities CRUD + audiobook parity controls on the dashboard; entities export; atomic single-row store deletes.
+
+**Review-round fixes (commit `17176a4`):** FK-restore on failed hardening, prune running-protection TOCTOU (mutation-proven test), retry freeze-check inside txn, diagnostics drained at all canonical opens, dashboard auth-header seam across all 40 fetch sites (static-analysis guarded), atomic styles/entities delete primitives, retry-failed claim+slot race, paused-repair in-flight drain, escalation user-cap, prompt-overhead estimates, max_tokens=0 floor+warning, HTTP-date year bound, reflow 10k depth cap (pre-fix SIGABRT proven), Arabic/Hebrew continuation support.
+
+**Fast-follow tickets (intentionally post-release):** SERVE-7 child isolation (needs audiobook plan-mode flags), CSP nonce work to drop `unsafe-inline`, `doctor`/CLI surface for `JobStore::prune_jobs` retention, batch upsert paths routing partial-index collisions to update arms (STORE-13 tail), mixed-script street-address bidi regression fixtures + configurable poppler logical-order escape hatch, prompt-fencing extension to item payloads (LLM-15 tail vs current context-block scope), lease-heartbeat error dedup, fallback-pass progress sink visibility, `LogPersistenceFailed` warning event, property-harness grammar extensions (suppression-nesting, marker omission/reorder stress).
+
+## 2.a Historical — Wave 3 COMPLETE ✅ (2026-08-26)
+
+- **P3-docs**: ~28 doc claims reconciled with landed code; 7 historical banners; full CHANGELOG Unreleased written; 70 links verified.
+- **P3-estimator (solo, cross-crate)**: canonical `bookforge_core::token_estimate::estimate_tokens` (per-char weights: Han/Kana/Hangul ×1, else ×¼) replacing 9 divergent implementations; `CACHE_KEY_SCHEMA_VERSION` 2→3 + glossary fingerprint schema 2 in the same change set.
+- **P3-deadcode**: 15 items removed after caller-grep proofs; 6 kept-with-evidence (incl. refuted Xml/Zip-variant claim); CORE-13 `|glossary|` namespace separator fixed with pin re-derived.
+- **P3-store-hardening**: STORE-5 resolved (SQL files demoted to guarded documentation, parity test); STORE-12 typed statuses + CHECK migration 10; STORE-17 prune_jobs + streaming hash; INFRA-10 startup reaper.
+
+## 2.b Historical — Wave 4 COMPLETE ✅ (2026-08-26/27)
+
+- **4a**: EPUB-18 harness + hostile fixtures + EPUB2 sample + injectable limits (epub); PopplerBackend seam + FakePoppler dual-path suite, bidi.rs UAX#9 line subset, PDF-9/10 completion (pdf); pricing/provider registry + `--pass-costs` (core/cli).
+- **4b**: UI-23 envelope v2 + UI-31 RunView consolidation; styles/entities dashboard CRUD + `entities export` + audiobook flag parity (chapters/retry-failed/prune/text-norm/timeout) + options.rs registry consumption.
+
+## 2.c Historical — Wave 2 COMPLETE ✅ (2026-08-26)
 
 **Wave 2 landed as individual commits (`fix(llm)` / `fix(audio)` / `fix(pdf)` / `fix(cli)`, all gates green post-integration: fmt/clippy 0 warnings/test 1132 passed):**
 
@@ -28,7 +50,7 @@ Push it if absent: `git fetch origin && git checkout remediation/audit-2026-08`.
 
 Outstanding sub-items carried forward: STORE-5 sql-file drift reconciliation, SERVE-7 child isolation (needs plan-mode flags), tempfile promotion decision, CSP unsafe-inline removal, AUDIO capabilities/estimator CLI+serve wiring (in flight), core `cap_output_tokens` export now unused by llm crate (delete/repair during estimator/deadcode waves).
 
-## 2.b Historical — Wave 1 COMPLETE ✅ (2026-08-26)
+## 2.d Historical — Wave 1 COMPLETE ✅ (2026-08-26)
 
 Wave 1 landed on this branch as individual commits (all gates green post-integration: fmt/clippy 0 warnings/test 1043 passed):
 
@@ -42,7 +64,7 @@ Wave 1 landed on this branch as individual commits (all gates green post-integra
 
 Outstanding sub-items carried forward: STORE-5 sql-file drift reconciliation (wave 3), SERVE-7 child isolation needs plan-mode flags (note for future audio/ui waves), tempfile promotion decision (dev-dep only), CSP unsafe-inline removal (needs nonce plumbing).
 
-## 2.a Historical — Wave 0 COMPLETE ✅
+## 2.e Historical — Wave 0 COMPLETE ✅
 
 Commits on this branch:
 - `636b3a89` docs: add 2026-08 deep audit report (remediation tracking base)

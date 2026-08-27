@@ -18,7 +18,7 @@ of translation quality.
 
 ## Status
 
-BookForge v2.6.1 is usable for EPUB translation, PDF-to-EPUB ingestion, and
+BookForge v3.0.0 is usable for EPUB translation, PDF-to-EPUB ingestion, and
 local browser-based translation runs:
 
 - EPUB inspect, parse, segment, and rebuild
@@ -142,10 +142,12 @@ bookforge
 ```
 
 Running `bookforge` with no extra words opens the local web app. If the browser
-does not open automatically, go to:
+does not open automatically, open the link the terminal prints — it contains
+your one-time session token (the dashboard authenticates every request by
+default; `--no-auth` opts out):
 
 ```txt
-http://127.0.0.1:8765
+http://127.0.0.1:8765/?token=…
 ```
 
 The dashboard is intentionally local-only. It binds to `127.0.0.1`, so it is
@@ -647,7 +649,6 @@ crates/bookforge-audio  Audiobook TTS: chunking, providers, stitch
 crates/bookforge-store  SQLite checkpoint store
 crates/bookforge-cli    CLI commands and reports
 docs/                   Architecture notes
-pricing/                bundled provider/model pricing
 tests/corpus/            pinned Standard Ebooks corpus manifest
 ```
 
