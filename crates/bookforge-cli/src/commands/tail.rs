@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use bookforge_store::{JobRecord, JobStore};
 
-use crate::epoch::EpochTracker;
+use crate::presentation::RunView;
 
 /// When reconstructing dashboard state from recent events, never walk further
 /// back than this many lines even if `--last` is smaller. Keeps `tail`
@@ -190,13 +190,13 @@ fn render_tail(job_id: &str, events: &[String], last: usize, json: bool) -> Stri
 
     output.push('\n');
 
-    // Reconstruct dashboard state by folding every parseable event into the
-    // same RunState the dashboards use, with epoch-aware baselines so counts
-    // and rates agree across resume epochs (UI-28/30). The hand-scanner this
-    // replaces drifted from fold semantics (it counted every SegmentFinished,
-    // ignored terminal-status rules) and miscounted across epochs.
-    let mut state = bookforge_core::RunState::default();
-    let mut epochs = EpochTracker::default();
+    // Reconstruct dashboard state by folding every parseable event through
+    // the canonical RunView (RunState + epoch baselines) the other dashboards
+    // use, so counts and rates agree across resume epochs (UI-28/30/31). The
+    // hand-scanner this replaces drifted from fold semantics (it counted every
+    // SegmentFinished, ignored terminal-status rules) and miscounted across
+    // epochs.
+    let mut view = RunView::new();
     let mut cache_misses = 0usize;
     for line in events {
         match serde_json::from_str::<Value>(line)
@@ -207,7 +207,7 @@ fn render_tail(job_id: &str, events: &[String], last: usize, json: bool) -> Stri
                 if let bookforge_core::ProgressEvent::CacheScanFinished { misses, .. } = &event {
                     cache_misses = *misses;
                 }
-                epochs.fold(&mut state, &event);
+                view.fold(&event);
             }
             None => {
                 // Already counted in the per-line rendering above for the
@@ -219,22 +219,28 @@ fn render_tail(job_id: &str, events: &[String], last: usize, json: bool) -> Stri
     }
 
     output.push_str("Reconstructed state:\n");
+    // Status naming comes from the shared presentation vocabulary (UI-31);
+    // additive for `tail`, matching what watch/serve would title the run.
+    output.push_str(&format!(
+        "  status:       {}\n",
+        crate::presentation::run_status_name(&view)
+    ));
     output.push_str(&format!(
         "  stage:        {}\n",
-        state.stage.as_deref().unwrap_or("")
+        view.stage.as_deref().unwrap_or("")
     ));
     output.push_str(&format!(
         "  segments:     {}/{}\n",
-        state.done_segments, state.total_segments
+        view.done_segments, view.total_segments
     ));
     output.push_str(&format!(
         "  cache:        {} hits, {} misses",
-        state.cached, cache_misses
+        view.cached, cache_misses
     ));
     output.push('\n');
-    output.push_str(&format!("  input tokens:  {}\n", state.input_tokens));
-    output.push_str(&format!("  output tokens: {}\n", state.output_tokens));
-    output.push_str(&format!("  checkpoints:   {}\n", state.checkpoint_flushed));
+    output.push_str(&format!("  input tokens:  {}\n", view.input_tokens));
+    output.push_str(&format!("  output tokens: {}\n", view.output_tokens));
+    output.push_str(&format!("  checkpoints:   {}\n", view.checkpoint_flushed));
 
     if unparsed_lines > 0 {
         // Corrupt log lines are skipped for counting, but never silently.

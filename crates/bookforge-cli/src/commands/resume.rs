@@ -877,28 +877,14 @@ async fn run_inner(
     });
 
     if print_stdout {
-        println!(
-            "Translated: {}/{} segments",
-            summary.succeeded, summary.total_segments
-        );
-        println!("Cached: {}", summary.cached);
-        println!("Retried: {}", summary.retried);
-        println!("Needs review: {}", summary.needs_review);
-        println!("Failed: {}", summary.failed);
-        println!("Input tokens: {}", summary.input_tokens);
-        println!("Output tokens: {}", summary.output_tokens);
-        if let Some(cost) = crate::cost::estimate_cost_usd_with_cached(
+        crate::commands::translate::print_run_summary(
+            &summary,
             &job.provider,
             &job.model,
-            summary.input_tokens,
-            summary.input_cached_tokens,
-            summary.output_tokens,
-        ) {
-            println!("Estimated cost: ${cost:.6}");
-        }
-        println!("Output: {}", output.display());
-        println!("Report: {}", report.markdown.display());
-        println!("Review: bookforge review {} --open", job.id);
+            &output,
+            &report.markdown,
+            &job.id,
+        );
     }
 
     // UI-21: completing with unresolved segments is not a clean success; the
@@ -911,14 +897,9 @@ async fn run_inner(
 }
 
 fn human_stdout_enabled(ui: Option<crate::progress::UiMode>) -> bool {
-    !matches!(
-        ui,
-        Some(
-            crate::progress::UiMode::Json
-                | crate::progress::UiMode::Quiet
-                | crate::progress::UiMode::Tui
-        )
-    )
+    // Single source of truth in `UiMode` so `json-v1` cannot drift from the
+    // UI-22 machine-stdout contract.
+    ui.is_none_or(|mode| mode.human_stdout())
 }
 
 fn resolve_resume_input(job: &JobRecord, snapshot: &RunConfigSnapshot) -> Result<PathBuf> {

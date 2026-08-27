@@ -1356,19 +1356,76 @@ fn cli_translate_json_mode_emits_valid_jsonl_stdout_and_file_log() {
         .map(serde_json::from_str::<serde_json::Value>)
         .collect::<Result<Vec<_>, _>>()
         .expect("stdout should be valid JSONL");
+
+    // UI-23: every stdout line carries the versioned envelope.
+    assert!(
+        stdout_events.iter().all(|event| {
+            event.get("v").and_then(|v| v.as_u64()) == Some(2)
+                && event.get("kind").and_then(|k| k.as_str()) == Some("event")
+                && event.get("payload").is_some_and(|p| p.is_object())
+        }),
+        "every stdout line must use the v2 event envelope"
+    );
     assert!(
         stdout_events
             .iter()
-            .any(|event| event.get("JobCreated").is_some()),
-        "stdout JSONL should include job creation"
+            .any(|event| event["payload"].get("JobCreated").is_some()),
+        "stdout JSONL should include job creation inside the envelope payload"
     );
 
     let file_events = read_jsonl(&events);
+    // The file log keeps its own (un-enveloped, v1-style) schema.
     assert!(
         file_events
             .iter()
             .any(|event| event.get("TranslationFinished").is_some()),
         "file JSONL should include completion"
+    );
+}
+
+/// UI-23 backward compatibility: the deprecated `--ui json-v1` alias keeps
+/// the pre-envelope raw-`ProgressEvent` stdout dialect byte-compatible for
+/// automation pinned to it.
+#[test]
+fn cli_translate_ui_json_v1_keeps_legacy_raw_stdout_lines() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = fixture_input();
+    let output = temp.path().join("json1.epub");
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args([
+            "translate",
+            input.to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-prefix-target",
+            "--profile",
+            "v1-fast",
+            "--ui",
+            "json-v1",
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("stdout should be valid JSONL");
+    assert!(
+        lines.iter().any(|event| event.get("JobCreated").is_some()),
+        "json-v1 stdout must stay raw ProgressEvent objects"
+    );
+    assert!(
+        lines.iter().all(|event| event.get("v").is_none()),
+        "legacy dialect must not leak envelope fields"
     );
 }
 

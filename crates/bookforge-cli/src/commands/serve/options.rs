@@ -33,42 +33,51 @@ async fn provider_status(
     Ok(Json(serde_json::Value::Object(status)))
 }
 
+/// One translation-provider chip in the dashboard form, sourced from
+/// [`bookforge_core::providers::PROVIDER_ENDPOINT_DEFAULTS`] wherever the
+/// core registry carries the truth (base-URL requirement, key requirement,
+/// default model) so this list cannot drift from doctor/plan/estimate tooling
+/// that already consults it. Curated model lists remain local to the UI.
+fn provider_option(
+    id: &'static str,
+    label: &'static str,
+    models: &'static [&'static str],
+    fallback_default_model: &'static str,
+) -> ProviderOption {
+    let defaults = bookforge_core::providers::provider_defaults(id);
+    let registered = defaults.is_some();
+    ProviderOption {
+        id,
+        label,
+        models,
+        // Registry-backed providers publish their default there; entries the
+        // registry deliberately does not own keep their curated UI default.
+        default_model: defaults
+            .and_then(|defaults| defaults.default_model)
+            .unwrap_or(fallback_default_model),
+        requires_base_url: matches!(defaults, Some(defaults) if defaults.base_url.is_none()),
+        requires_key: registered,
+    }
+}
+
 pub(super) fn dashboard_options_payload() -> DashboardOptions {
     DashboardOptions {
         languages: LANGUAGE_OPTIONS,
         providers: vec![
-            ProviderOption {
-                id: "mock",
-                label: "mock (offline test)",
-                models: MOCK_MODELS,
-                default_model: "mock-identity",
-                requires_base_url: false,
-                requires_key: false,
-            },
-            ProviderOption {
-                id: "deepseek",
-                label: "deepseek",
-                models: DEEPSEEK_MODELS,
-                default_model: "deepseek-v4-flash",
-                requires_base_url: false,
-                requires_key: true,
-            },
-            ProviderOption {
-                id: "openrouter",
-                label: "openrouter",
-                models: OPENROUTER_MODELS,
-                default_model: "openrouter/auto",
-                requires_base_url: false,
-                requires_key: true,
-            },
-            ProviderOption {
-                id: "openai-compatible",
-                label: "openai-compatible",
-                models: OPENAI_COMPATIBLE_MODELS,
-                default_model: "gpt-4o-mini",
-                requires_base_url: true,
-                requires_key: true,
-            },
+            provider_option("mock", "mock (offline test)", MOCK_MODELS, "mock-identity"),
+            provider_option("deepseek", "deepseek", DEEPSEEK_MODELS, "deepseek-v4-flash"),
+            provider_option(
+                "openrouter",
+                "openrouter",
+                OPENROUTER_MODELS,
+                "openrouter/auto",
+            ),
+            provider_option(
+                "openai-compatible",
+                "openai-compatible",
+                OPENAI_COMPATIBLE_MODELS,
+                "gpt-4o-mini",
+            ),
         ],
         audio_providers: vec![
             AudioProviderOption {
@@ -84,6 +93,7 @@ pub(super) fn dashboard_options_payload() -> DashboardOptions {
                 supports_auto_model: false,
                 supports_instructions: false,
                 supports_speed: true,
+                supports_text_normalization: text_normalization_supported("mock"),
                 max_chars: 40_000,
                 model_max_chars: BTreeMap::new(),
             },
@@ -100,6 +110,7 @@ pub(super) fn dashboard_options_payload() -> DashboardOptions {
                 supports_auto_model: false,
                 supports_instructions: true,
                 supports_speed: true,
+                supports_text_normalization: text_normalization_supported("openai"),
                 max_chars: 4_096,
                 model_max_chars: BTreeMap::new(),
             },
@@ -116,6 +127,7 @@ pub(super) fn dashboard_options_payload() -> DashboardOptions {
                 supports_auto_model: false,
                 supports_instructions: true,
                 supports_speed: false,
+                supports_text_normalization: text_normalization_supported("gemini"),
                 max_chars: 4_096,
                 model_max_chars: BTreeMap::new(),
             },
@@ -132,6 +144,7 @@ pub(super) fn dashboard_options_payload() -> DashboardOptions {
                 supports_auto_model: true,
                 supports_instructions: false,
                 supports_speed: true,
+                supports_text_normalization: text_normalization_supported("elevenlabs"),
                 max_chars: bookforge_audio::elevenlabs_model_max_input_chars(
                     "eleven_multilingual_v2",
                 ),
@@ -164,8 +177,8 @@ pub(super) struct ProviderOption {
     label: &'static str,
     pub(super) models: &'static [&'static str],
     pub(super) default_model: &'static str,
-    requires_base_url: bool,
-    requires_key: bool,
+    pub(super) requires_base_url: bool,
+    pub(super) requires_key: bool,
 }
 
 #[derive(Serialize)]
@@ -182,8 +195,17 @@ pub(super) struct AudioProviderOption {
     pub(super) supports_auto_model: bool,
     pub(super) supports_instructions: bool,
     pub(super) supports_speed: bool,
+    /// Wave-wired capability from the provider feature matrix (single source
+    /// of truth shared with synthesis), served so the browser shows the
+    /// text-normalization control only where it can actually be honored.
+    pub(super) supports_text_normalization: bool,
     pub(super) max_chars: usize,
     /// Per-model input ceilings, so the browser never keeps its own copy of a
     /// provider's limits. Empty when every model shares `max_chars`.
     pub(super) model_max_chars: BTreeMap<&'static str, usize>,
+}
+
+fn text_normalization_supported(provider_id: &str) -> bool {
+    bookforge_audio::feature_set_for_id(provider_id)
+        .is_some_and(|features| features.text_normalization)
 }

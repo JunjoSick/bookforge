@@ -9,11 +9,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use bookforge_core::{ProgressEvent, ProgressSink, RunState};
+use bookforge_core::{ProgressEvent, ProgressSink};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use crate::epoch::EpochTracker;
+use crate::envelope;
+use crate::presentation::RunView;
 use crate::sanitize::sanitize_terminal;
 
 pub const PROGRESS_EVENT_QUEUE_CAPACITY: usize = 2048;
@@ -27,10 +28,33 @@ const DROPPED_EVENTS_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 pub enum UiMode {
     Auto,
     Progress,
+    /// Machine-readable stdout: every progress line is wrapped in the
+    /// versioned JSON envelope (v2; see `crate::envelope`).
     Json,
+    /// Deprecated alias reproducing the legacy pre-envelope stdout dialects
+    /// byte-for-byte (`translate`/`resume`: raw `ProgressEvent` objects;
+    /// `audiobook`: raw `{"event":…}` objects). For consumers pinned to v1.
+    JsonV1,
     Quiet,
     /// Full-screen terminal dashboard (requires the `tui` build feature and a TTY).
     Tui,
+}
+
+impl UiMode {
+    /// True when the mode suppresses all human-facing stdout chatter so a
+    /// machine can own the stream (UI-22). `--ui json` and its legacy alias
+    /// behave identically here.
+    pub fn machine_stdout(self) -> bool {
+        matches!(
+            self,
+            UiMode::Json | UiMode::JsonV1 | UiMode::Quiet | UiMode::Tui
+        )
+    }
+
+    /// Inverse of [`UiMode::machine_stdout`].
+    pub fn human_stdout(self) -> bool {
+        !self.machine_stdout()
+    }
 }
 
 /// A progress sink that sends events over a bounded mpsc channel using
@@ -301,7 +325,7 @@ async fn drive_attached_tui(
                     // with the worker, so attached TUIs quit truthfully for
                     // both `translate` and `resume` (UI-2): no orphaned
                     // headless worker keeps spending after the user leaves.
-                    if !app.state.finished && let Some(token) = cancel {
+                    if !app.view.finished && let Some(token) = cancel {
                         token.cancel();
                     }
                     app.draw().ok();
@@ -325,7 +349,11 @@ fn take_newly_dropped_for_tui(dropped: &AtomicUsize, reported: &mut usize) -> Op
 enum RenderMode {
     Quiet,
     Progress,
-    JsonStdout,
+    /// JSON lines on stdout. `legacy_v1` selects the historical raw-line
+    /// dialect (`--ui json-v1`) instead of the versioned envelope.
+    JsonStdout {
+        legacy_v1: bool,
+    },
     #[cfg(feature = "tui")]
     Tui,
 }
@@ -335,7 +363,8 @@ fn resolve_render_mode(ui_mode: UiMode, stderr_is_tty: bool) -> RenderMode {
         UiMode::Auto if stderr_is_tty => RenderMode::Progress,
         UiMode::Auto => RenderMode::Quiet,
         UiMode::Progress => RenderMode::Progress,
-        UiMode::Json => RenderMode::JsonStdout,
+        UiMode::Json => RenderMode::JsonStdout { legacy_v1: false },
+        UiMode::JsonV1 => RenderMode::JsonStdout { legacy_v1: true },
         UiMode::Quiet => RenderMode::Quiet,
         UiMode::Tui => {
             #[cfg(feature = "tui")]
@@ -466,7 +495,7 @@ impl JsonlFileWriter {
 
 enum Renderer {
     Quiet,
-    JsonStdout,
+    JsonStdout { legacy_v1: bool },
     // Boxed: `ProgressBars` is far larger than the other variants.
     Progress(Box<ProgressBars>),
 }
@@ -475,7 +504,7 @@ impl Renderer {
     fn new(mode: RenderMode) -> Result<Self> {
         match mode {
             RenderMode::Quiet => Ok(Renderer::Quiet),
-            RenderMode::JsonStdout => Ok(Renderer::JsonStdout),
+            RenderMode::JsonStdout { legacy_v1 } => Ok(Renderer::JsonStdout { legacy_v1 }),
             RenderMode::Progress => Ok(Renderer::Progress(Box::new(ProgressBars::new()?))),
             #[cfg(feature = "tui")]
             RenderMode::Tui => {
@@ -487,8 +516,14 @@ impl Renderer {
     fn handle_event(&mut self, event: &ProgressEvent) -> Result<()> {
         match self {
             Renderer::Quiet => Ok(()),
-            Renderer::JsonStdout => {
-                println!("{}", serde_json::to_string(event)?);
+            Renderer::JsonStdout { legacy_v1 } => {
+                if *legacy_v1 {
+                    // v1 contract: raw `ProgressEvent` objects, byte-identical
+                    // to the file log.
+                    println!("{}", serde_json::to_string(event)?);
+                } else {
+                    println!("{}", envelope::stdout_line(envelope::KIND_EVENT, event));
+                }
                 Ok(())
             }
             Renderer::Progress(bars) => bars.handle_event(event),
@@ -510,12 +545,9 @@ struct ProgressBars {
     batch_bar: indicatif::ProgressBar,
     rate_bar: indicatif::ProgressBar,
     checkpoint_bar: indicatif::ProgressBar,
-    /// Renderer-agnostic state, kept in sync by folding each event. The bars
-    /// below only render numbers sourced from here.
-    state: RunState,
-    /// Epoch bookkeeping so resumed runs show current-epoch rate/ETA instead
-    /// of numbers poisoned by earlier epochs and idle gaps (UI-9).
-    epochs: EpochTracker,
+    /// Canonical presentation view (UI-31): the shared RunState+EpochTracker
+    /// fold, so the bars below only render numbers sourced from here.
+    view: RunView,
 }
 
 impl ProgressBars {
@@ -575,15 +607,14 @@ impl ProgressBars {
             batch_bar,
             rate_bar,
             checkpoint_bar,
-            state: RunState::default(),
-            epochs: EpochTracker::default(),
+            view: RunView::new(),
         })
     }
 
     fn handle_event(&mut self, event: &ProgressEvent) -> Result<()> {
         // Fold first so the bars below render numbers from a single source of
         // truth; the match only handles indicatif-specific presentation.
-        self.epochs.fold(&mut self.state, event);
+        self.view.fold(event);
         match event {
             ProgressEvent::StageStarted { stage, .. } => {
                 self.stage_bar.set_message(format!("{stage}..."));
@@ -594,35 +625,35 @@ impl ProgressBars {
                     .enable_steady_tick(std::time::Duration::from_millis(80));
             }
             ProgressEvent::SegmentationFinished { .. } => {
-                self.seg_bar.set_length(self.state.total_segments as u64);
+                self.seg_bar.set_length(self.view.total_segments as u64);
                 self.seg_bar
-                    .set_message(format!("{} cached", self.state.cached));
+                    .set_message(format!("{} cached", self.view.cached));
             }
             ProgressEvent::CacheScanFinished { .. } => {
-                self.seg_bar.set_position(self.state.done_segments as u64);
+                self.seg_bar.set_position(self.view.done_segments as u64);
                 self.seg_bar
-                    .set_message(format!("{} cached", self.state.cached));
+                    .set_message(format!("{} cached", self.view.cached));
             }
             ProgressEvent::SegmentFinished { status, .. } => match status.as_str() {
                 "succeeded" | "skipped_cached" | "needs_review" | "failed" => {
-                    self.seg_bar.set_position(self.state.done_segments as u64);
+                    self.seg_bar.set_position(self.view.done_segments as u64);
                     self.rate_bar.set_message(format!(
-                        "{}/{} done, {:.1} seg/min, ETA {}",
-                        self.state.done_segments,
-                        self.state.total_segments,
-                        self.epochs.segments_per_minute(&self.state),
-                        format_eta(self.epochs.eta_secs(&self.state)),
+                        "{}/{} done, {}, ETA {}",
+                        self.view.done_segments,
+                        self.view.total_segments,
+                        crate::presentation::format_rate(self.view.segments_per_minute()),
+                        crate::presentation::format_eta(self.view.eta_secs()),
                     ));
                 }
                 _ => {}
             },
             ProgressEvent::RequestStarted { .. } | ProgressEvent::RequestFinished { .. } => {
                 self.batch_bar
-                    .set_message(format!("{} active", self.state.active_requests));
+                    .set_message(format!("{} active", self.view.active_requests));
             }
             ProgressEvent::CheckpointFlushed { .. } => {
                 self.checkpoint_bar
-                    .set_message(format!("flushed {}", self.state.checkpoint_flushed));
+                    .set_message(format!("flushed {}", self.view.checkpoint_flushed));
             }
             ProgressEvent::JobPaused { .. } => {
                 self.stage_bar.set_message("paused");
@@ -632,7 +663,7 @@ impl ProgressBars {
             ProgressEvent::JobResumed { .. } => {
                 self.stage_bar.set_message("translating...");
                 self.batch_bar
-                    .set_message(format!("{} active", self.state.active_requests));
+                    .set_message(format!("{} active", self.view.active_requests));
             }
             ProgressEvent::BatchQueued { batch_id, .. } => {
                 self.batch_bar
@@ -693,10 +724,10 @@ impl ProgressBars {
                 failed,
                 ..
             } => {
-                self.seg_bar.set_position(self.state.done_segments as u64);
+                self.seg_bar.set_position(self.view.done_segments as u64);
                 self.seg_bar.finish_with_message(format!(
                     "{} done, {} needs review, {} failed",
-                    self.state.done_segments, *needs_review, *failed
+                    self.view.done_segments, *needs_review, *failed
                 ));
                 self.stage_bar.finish_and_clear();
                 self.batch_bar.finish_and_clear();
@@ -711,16 +742,6 @@ impl ProgressBars {
     fn finish(&mut self) -> Result<()> {
         self.multi.clear().ok();
         Ok(())
-    }
-}
-
-fn format_eta(eta_secs: f64) -> String {
-    if eta_secs > 3600.0 {
-        format!("{:.1}h", eta_secs / 3600.0)
-    } else if eta_secs > 60.0 {
-        format!("{:.0}m", eta_secs / 60.0)
-    } else {
-        format!("{:.0}s", eta_secs)
     }
 }
 
@@ -775,12 +796,37 @@ mod tests {
     fn ui_json_always_uses_json_stdout() {
         assert_eq!(
             resolve_render_mode(UiMode::Json, false),
-            RenderMode::JsonStdout
+            RenderMode::JsonStdout { legacy_v1: false }
         );
         assert_eq!(
             resolve_render_mode(UiMode::Json, true),
-            RenderMode::JsonStdout
+            RenderMode::JsonStdout { legacy_v1: false }
         );
+    }
+
+    #[test]
+    fn ui_json_v1_selects_the_legacy_raw_stdout_dialect() {
+        assert_eq!(
+            resolve_render_mode(UiMode::JsonV1, false),
+            RenderMode::JsonStdout { legacy_v1: true }
+        );
+        assert_eq!(
+            resolve_render_mode(UiMode::JsonV1, true),
+            RenderMode::JsonStdout { legacy_v1: true }
+        );
+    }
+
+    /// The human-stdout gate treats `json` and its deprecated `json-v1`
+    /// alias identically (UI-22 contract extended to the new mode).
+    #[test]
+    fn json_modes_suppress_human_stdout() {
+        for mode in [UiMode::Json, UiMode::JsonV1, UiMode::Quiet, UiMode::Tui] {
+            assert!(mode.machine_stdout(), "{mode:?} must suppress human stdout");
+            assert!(!mode.human_stdout());
+        }
+        for mode in [UiMode::Auto, UiMode::Progress] {
+            assert!(mode.human_stdout(), "{mode:?} is human-facing");
+        }
     }
 
     #[test]
@@ -810,7 +856,7 @@ mod tests {
         })
         .expect("translation finished event should render");
 
-        assert_eq!(bars.state.done_segments, 4);
+        assert_eq!(bars.view.done_segments, 4);
         assert_eq!(bars.seg_bar.position(), 4);
     }
 

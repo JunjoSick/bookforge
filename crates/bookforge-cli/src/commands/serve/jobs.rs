@@ -68,12 +68,13 @@ async fn job_detail(
             return Ok(None);
         }
         let mut tailer = EventLogTailer::new(events_path);
-        let mut state = RunState::default();
-        let mut epochs = crate::epoch::EpochTracker::default();
+        // Canonical presentation view (UI-31); the detail payload serializes
+        // the plain RunState exactly as before.
+        let mut run = crate::presentation::RunView::new();
         for event in tailer.poll()? {
-            epochs.fold(&mut state, &event);
+            run.fold(&event);
         }
-        Ok(Some(JobDetail::new(lookup, job, state)))
+        Ok(Some(JobDetail::new(lookup, job, run.into_state())))
     })
     .await??;
 
@@ -174,8 +175,10 @@ async fn job_events(
             return;
         }
         let mut tailer = EventLogTailer::new(path);
-        let mut run = RunState::default();
-        let mut epochs = crate::epoch::EpochTracker::default();
+        // Canonical presentation view (UI-31): same RunState+EpochTracker
+        // fold as the TUI/bars/tail; the SSE payload serializes the plain
+        // RunState so the wave-1 frame contract is unchanged.
+        let mut run = crate::presentation::RunView::new();
         let mut ticker = tokio::time::interval(refresh);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last = String::new();
@@ -184,10 +187,10 @@ async fn job_events(
             ticker.tick().await;
             if let Ok(events) = tailer.poll() {
                 for event in events {
-                    epochs.fold(&mut run, &event);
+                    run.fold(&event);
                 }
             }
-            if let Ok(payload) = serde_json::to_string(&run)
+            if let Ok(payload) = serde_json::to_string(&*run)
                 && payload != last
             {
                 last = payload.clone();

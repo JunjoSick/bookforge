@@ -19,7 +19,7 @@ use ratatui::{
     widgets::{Block, Gauge, List, ListItem, ListState, Paragraph},
 };
 
-use crate::epoch::EpochTracker;
+use crate::presentation::{RunView, format_count, format_eta, format_rate, run_status_name};
 
 /// One row in the job picker shown by `bookforge watch` with no job id.
 pub struct JobPickerEntry {
@@ -201,13 +201,13 @@ pub enum TuiAction {
     StopJob,
 }
 
-/// Owns the terminal and the folded [`RunState`]; renders the dashboard.
+/// Owns the terminal and the folded run view; renders the dashboard.
 pub struct TuiApp {
     terminal: DefaultTerminal,
     mode: TuiMode,
-    pub state: RunState,
-    /// Epoch bookkeeping so resumed runs show current-epoch rate/ETA (UI-9).
-    epochs: EpochTracker,
+    /// Canonical presentation view (UI-31): the one RunState+EpochTracker
+    /// pairing shared with the bars, `tail`, and serve folds.
+    pub view: RunView,
     /// Event-log pane scroll/follow state (UI-1).
     log_scroll: LogScroll,
     quit: bool,
@@ -387,8 +387,7 @@ impl TuiApp {
         Ok(Self {
             terminal,
             mode,
-            state: RunState::default(),
-            epochs: EpochTracker::default(),
+            view: RunView::new(),
             log_scroll: LogScroll::new(),
             quit: false,
             actions: Vec::new(),
@@ -404,7 +403,7 @@ impl TuiApp {
 
     /// Fold one event into the displayed state.
     pub fn fold(&mut self, event: &ProgressEvent) {
-        self.epochs.fold(&mut self.state, event);
+        self.view.fold(event);
     }
 
     /// Drain and handle all currently-pending key input without blocking.
@@ -471,20 +470,30 @@ impl TuiApp {
         let Self {
             terminal,
             mode,
-            state,
-            epochs,
+            view,
             log_scroll,
             status_message,
             ..
         } = self;
         let mode = *mode;
         let status = status_message.as_deref();
-        // Rate/ETA are computed from the epoch-aware view so resumed runs do
-        // not inherit timing baselines from earlier epochs (UI-9).
-        let per_min = epochs.segments_per_minute(state);
-        let eta = epochs.eta_secs(state);
-        terminal
-            .draw(|frame| render_dashboard(frame, state, mode, per_min, eta, log_scroll, status))?;
+        // Rate/ETA come from the canonical epoch-aware view so resumed runs do
+        // not inherit timing baselines from earlier epochs (UI-9/31).
+        let per_min = view.segments_per_minute();
+        let eta = view.eta_secs();
+        let ratio = view.progress_ratio();
+        terminal.draw(|frame| {
+            render_dashboard(
+                frame,
+                &view.state,
+                mode,
+                per_min,
+                eta,
+                ratio,
+                log_scroll,
+                status,
+            )
+        })?;
         Ok(())
     }
 }
@@ -495,6 +504,7 @@ fn render_dashboard(
     mode: TuiMode,
     segments_per_minute: f64,
     eta_secs: f64,
+    ratio: f64,
     scroll: &mut LogScroll,
     status: Option<&str>,
 ) {
@@ -508,22 +518,16 @@ fn render_dashboard(
     .split(frame.area());
 
     render_header(frame, chunks[0], state, mode);
-    render_gauge(frame, chunks[1], state);
+    // Gauge ratio comes from the canonical epoch-aware view (UI-31).
+    render_gauge(frame, chunks[1], state, ratio);
     render_stats(frame, chunks[2], state, segments_per_minute, eta_secs);
     render_log(frame, chunks[3], state, scroll);
     render_footer(frame, chunks[4], state, mode, status);
 }
 
 fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunState, mode: TuiMode) {
-    let status = if state.finished {
-        "done"
-    } else if state.paused {
-        "paused"
-    } else if state.total_segments > 0 {
-        "running"
-    } else {
-        "starting"
-    };
+    // Status naming comes from the shared presentation vocabulary (UI-31).
+    let status = run_status_name(state);
     let job = state.job_id.as_deref().unwrap_or("(no job yet)");
     let model = match (state.provider.as_deref(), state.model.as_deref()) {
         (Some(p), Some(m)) => format!("{p} / {m}"),
@@ -554,12 +558,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunStat
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_gauge(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunState) {
-    let ratio = if state.total_segments > 0 {
-        (state.done_segments as f64 / state.total_segments as f64).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+fn render_gauge(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunState, ratio: f64) {
     let stage = state.stage.as_deref().unwrap_or("…");
     let label = format!(
         "{}/{} ({} cached)",
@@ -604,11 +603,11 @@ fn render_stats(
     let eta = if state.finished {
         "—".to_string()
     } else {
-        format_duration(eta_secs)
+        format_eta(eta_secs)
     };
     let rates = Line::from(format!(
-        "{:.1} seg/min · ETA {} · tokens {} in / {} out · flushed {}",
-        segments_per_minute,
+        "{} · ETA {} · tokens {} in / {} out · flushed {}",
+        format_rate(segments_per_minute),
         eta,
         format_count(state.input_tokens),
         format_count(state.output_tokens),
@@ -801,48 +800,9 @@ fn format_event_line(event: &ProgressEvent) -> Line<'static> {
     Line::from(Span::styled(text, style))
 }
 
-fn format_duration(secs: f64) -> String {
-    if secs <= 0.0 {
-        return "—".to_string();
-    }
-    if secs > 3600.0 {
-        format!("{:.1}h", secs / 3600.0)
-    } else if secs > 60.0 {
-        format!("{:.0}m", secs / 60.0)
-    } else {
-        format!("{secs:.0}s")
-    }
-}
-
-fn format_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn count_formatting_is_compact() {
-        assert_eq!(format_count(0), "0");
-        assert_eq!(format_count(999), "999");
-        assert_eq!(format_count(12_345), "12.3k");
-        assert_eq!(format_count(2_000_000), "2.0M");
-    }
-
-    #[test]
-    fn duration_formatting_buckets_by_scale() {
-        assert_eq!(format_duration(0.0), "—");
-        assert_eq!(format_duration(45.0), "45s");
-        assert_eq!(format_duration(150.0), "2m");
-        assert_eq!(format_duration(7200.0), "2.0h");
-    }
 
     #[test]
     fn dashboard_renders_key_fields_into_buffer() {
@@ -873,7 +833,16 @@ mod tests {
         let mut scroll = LogScroll::new();
         terminal
             .draw(|frame| {
-                render_dashboard(frame, &state, TuiMode::Watch, 0.0, 0.0, &mut scroll, None);
+                render_dashboard(
+                    frame,
+                    &state,
+                    TuiMode::Watch,
+                    0.0,
+                    0.0,
+                    0.0,
+                    &mut scroll,
+                    None,
+                );
             })
             .unwrap();
 
@@ -916,6 +885,7 @@ mod tests {
                     TuiMode::Attached,
                     0.0,
                     0.0,
+                    0.0,
                     &mut scroll,
                     None,
                 );
@@ -955,6 +925,7 @@ mod tests {
                     frame,
                     &state,
                     TuiMode::Attached,
+                    0.0,
                     0.0,
                     0.0,
                     &mut scroll,
@@ -1037,7 +1008,16 @@ mod tests {
         let mut scroll = LogScroll::new();
         terminal
             .draw(|frame| {
-                render_dashboard(frame, &state, TuiMode::Watch, 0.0, 0.0, &mut scroll, None);
+                render_dashboard(
+                    frame,
+                    &state,
+                    TuiMode::Watch,
+                    0.0,
+                    0.0,
+                    0.0,
+                    &mut scroll,
+                    None,
+                );
             })
             .unwrap();
         let text: String = terminal

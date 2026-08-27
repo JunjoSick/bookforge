@@ -698,21 +698,25 @@ accept `--ui` to select how progress is presented:
 | `auto` | Default. Live progress bars when stderr is attached to a terminal; silent otherwise. |
 | `progress` | Always render live multi-bar progress on the terminal, even without a TTY. |
 | `quiet` | No progress rendering at all — no bars, no event lines. Command-level errors still reach stderr through the normal error path, and run artifacts/checkpoints are unaffected. |
-| `json` | One JSON line per progress event on stdout. For translation runs these are the [events.md](events.md) objects exactly as persisted. Script against stdout only after verifying you use this mode: everything human-facing moves out of the way. |
+| `json` | One JSON line per progress event on stdout, wrapped in the versioned envelope `{"v":2,"kind":"event"|"audiobook","payload":{…}}` (UI-23): translation runs carry the [events.md](events.md) objects in `payload`, audiobook runs keep their own payload with its inner `"event":"audiobook_*"` discriminator. See [events.md § Stdout JSON envelope](events.md#stdout-json-envelope---ui-json). Script against stdout only after verifying you use this mode: everything human-facing moves out of the way. |
+| `json-v1` | Deprecated compatibility alias. Reproduces the pre-envelope raw-line stdout dialects byte-for-byte: raw `ProgressEvent` objects for `translate`/`resume`, raw `{"event":…}` objects for `audiobook`. Use only to keep consumers pinned to v1; new automation should read the `v`/`kind` fields of `json`. |
 | `tui` | Full-screen terminal dashboard attached to the in-process run (requires the `tui` build feature). |
 
-JSON stdout purity: with `--ui json`, `translate` and `resume` emit *only*
-`ProgressEvent` lines on stdout — banners, warnings, QA/double-check notices,
-and resume hints are suppressed there (they would otherwise pollute a
-machine-parsed stream) instead of being redirected. Human-readable diagnostics
-continue on stderr, so automation can safely parse stdout alone. The audiobook
-command's `json` dialect is its own envelope (see the note at the end of
-[events.md](events.md)); it keeps the same stdout-only-json discipline but with
-different object shapes.
+JSON stdout purity: with `--ui json` (or its legacy alias), `translate` and
+`resume` emit *only* enveloped progress lines on stdout — banners, warnings,
+QA/double-check notices, and resume hints are suppressed there (they would
+otherwise pollute a machine-parsed stream) instead of being redirected.
+Human-readable diagnostics continue on stderr, so automation can safely parse
+stdout alone. The audiobook command uses the same purity discipline with
+`kind:"audiobook"` payloads (see [events.md](events.md)).
 
 Regardless of mode, passing `--progress-jsonl <path>` durably records the full
 event stream in every mode — including `quiet` and `progress` — using lazy file
 creation after the job id is known.
+
+The envelope applies **only** to stdout in these modes: the persisted
+`--progress-jsonl` file log keeps the plain un-enveloped `ProgressEvent`
+schema, and `tail <job-id> --json` passes those file-log lines through raw.
 
 For automation, select JSON progress and a durable event file:
 
@@ -725,8 +729,16 @@ bookforge translate book.epub \
   --progress-jsonl .bookforge/runs/example/events.jsonl
 ```
 
+Example stdout lines:
+
+```jsonl
+{"v":2,"kind":"event","payload":{"JobCreated":{"job_id":"job_abc","input_path":"book.epub","output_path":"book.it.epub","timestamp_ms":1710000000000}}}
+{"v":2,"kind":"event","payload":{"TranslationFinished":{"succeeded":42,"cached":0,"needs_review":0,"failed":0,"input_tokens":1234,"output_tokens":456,"elapsed_ms":120000,"timestamp_ms":1710000120000}}}
+```
+
 Use `tail <job-id> --json` for persisted event objects after launch. See
-[events.md](events.md) for the event schema and folding rules.
+[events.md](events.md) for the event schema, folding rules, and the full
+envelope contract including the stream coverage table.
 
 ## Exit codes
 

@@ -81,6 +81,7 @@ function freshAudioWizard() {
     voice:"alloy", format:"mp3", speed:1, maxChars:2000, concurrency:4,
     instructions:"", baseUrl:"", apiKey:"", stitch:canM4b, m4b:canM4b,
     advancedOpen:false, chapterGap:1200, single:false, loudnorm:false, seed:"", language:"",
+    chapters:"", textNormalization:"auto", timeoutSeconds:"",
     estimate:null, launching:false, status:"" };
 }
 
@@ -95,7 +96,7 @@ function bfGo(screen, opts) { Object.assign(App, opts || {}); App.screen = scree
 function bfStartNew() { App.wizard = freshWizard(); App.screen = "wizard"; closeStream(); render(); }
 function bfStartAudiobook() { App.audioWizard = freshAudioWizard(); App.audioSelected = null; localStorage.removeItem("bf-audiobook-id"); App.screen = "audiobook"; closeStream(); render(); }
 
-const NAV = [["library","Library"],["audiobook","Audiobooks"],["progress","Progress"],["review","Review"],["validation","Validation"],["glossary","Glossary"]];
+const NAV = [["library","Library"],["audiobook","Audiobooks"],["progress","Progress"],["review","Review"],["validation","Validation"],["glossary","Glossary"],["styles","Styles"],["entities","Entities"]];
 function renderNav() {
   const active = App.screen === "wizard" ? "library" : App.screen;
   $("#nav").innerHTML = NAV.map(([id,label]) =>
@@ -113,6 +114,8 @@ function render() {
     case "review": return renderReview(stage);
     case "validation": return renderValidation(stage);
     case "glossary": return renderGlossary(stage);
+    case "styles": return renderStyles(stage);
+    case "entities": return renderEntities(stage);
     default: return renderLibrary(stage);
   }
 }
@@ -516,6 +519,12 @@ function syncAudioInputs() {
   const loudnorm = $("#a_loudnorm"); if (loudnorm) w.loudnorm = loudnorm.checked;
   const seed = $("#a_seed"); if (seed) w.seed = seed.value.trim();
   const language = $("#a_language"); if (language) w.language = language.value.trim();
+  // AUDIO parity knobs (chapters / text normalization / timeout). The server
+  // re-validates everything through the same CLI parsers and capability
+  // matrix; the fields only pre-shape the payload.
+  const chapters = $("#a_chapters"); if (chapters) w.chapters = chapters.value.trim();
+  const norm = $("#a_text_normalization"); if (norm) w.textNormalization = norm.value;
+  const timeout = $("#a_timeout"); if (timeout) w.timeoutSeconds = timeout.value.trim();
 }
 function audioToast(message) { const el = $("#audio-status"); if (el) el.textContent = message; if (App.audioWizard) App.audioWizard.status = message; }
 
@@ -633,6 +642,11 @@ function renderAudiobook(stage) {
           <label class="audio-check"><input id="a_loudnorm" type="checkbox" ${w.loudnorm?"checked":""}> Normalize loudness</label>
           ${w.provider==="elevenlabs"?`<div><div class="field-label">Seed</div><input class="inp" id="a_seed" type="number" min="0" max="4294967295" step="1" value="${esc(w.seed)}" placeholder="unset"></div>
           <div><div class="field-label">Language</div><input class="inp" id="a_language" value="${esc(w.language)}" placeholder="auto (from EPUB)"></div>`:""}
+          <div><div class="field-label">Chapters subset</div><input class="inp" id="a_chapters" value="${esc(w.chapters)}" placeholder="all (e.g. 1-3,7)"></div>
+          ${p.supports_text_normalization?`<div><div class="field-label">Text normalization</div><select class="inp" id="a_text_normalization">
+            ${["auto","on","off"].map(v=>`<option value="${v}" ${w.textNormalization===v?"selected":""}>${v}</option>`).join("")}
+          </select></div>`:""}
+          <div><div class="field-label">Request timeout (s)</div><input class="inp" id="a_timeout" type="number" min="1" max="86400" step="1" value="${esc(w.timeoutSeconds)}" placeholder="120"></div>
         </div></div>
       </details>
       <div class="audio-estimate" id="audio-estimate" ${estimateLine?"":"hidden"}>${estimateLine}</div>
@@ -658,6 +672,9 @@ async function bfLaunchAudiobook() {
   if (w.apiKey) fd.append("api_key", w.apiKey); if (w.stitch) fd.append("stitch", "true"); if (w.m4b) fd.append("m4b", "true");
   fd.append("gap_chapter_ms", String(w.chapterGap)); fd.append("gap_title_ms", String(Math.min(800, w.chapterGap)));
   if (w.single) fd.append("single", "true"); if (w.loudnorm) fd.append("loudnorm", "true");
+  if (w.chapters) fd.append("chapters", w.chapters);
+  if (p.supports_text_normalization && w.textNormalization && w.textNormalization !== "auto") fd.append("text_normalization", w.textNormalization);
+  if (/^\d+$/.test(w.timeoutSeconds || "")) fd.append("timeout_seconds", w.timeoutSeconds);
   if (w.provider === "elevenlabs" && w.seed) fd.append("seed", w.seed);
   if (w.provider === "elevenlabs" && w.language) fd.append("language", w.language);
   try {
@@ -704,6 +721,7 @@ async function pollAudiobook(id) {
     return `<div class="audio-chapter ${complete?"complete":""}"><span class="audio-chapter-check">${complete?"✓":""}</span><span class="audio-chapter-title">${esc(chapter.title)}</span><span class="audio-chapter-count">${chapter.done}/${chapter.total}</span></div>`;
   }).join("");
   const autoSelected = data.process && data.process.auto_model === true;
+  const failedChunks = chunks.filter(chunk => chunk.status === "failed").length;
   const panel = $("#audio-progress"); if (!panel) return;
   panel.innerHTML = `<div class="facts">
       <div class="fact"><div class="k">Status</div><div class="v"><span class="badge ${esc(badgeClass(statusLabel))}">${esc(statusLabel)}</span></div></div>
@@ -715,6 +733,9 @@ async function pollAudiobook(id) {
     ${status==="succeeded"&&warningList?`<div class="audio-warnings"><div class="audio-warnings-title">Succeeded with warnings</div>${warningList}</div>`:""}
     ${chapterList?`<div class="audio-chapters"><div class="audio-chapters-head">Chapters</div><div class="audio-chapter-list">${chapterList}</div></div>`:""}
     <div class="costbox"><div><div class="ck">Output</div><div class="mono" style="margin-top:8px;word-break:break-all">${esc(data.artifact||data.out_dir||"")}</div></div><div class="cm">${progress}% complete<br>${num(chunks.reduce((sum,chunk)=>sum+(chunk.chars||0),0))} characters planned</div></div>
+    ${failedChunks?`<div class="audio-warnings"><button class="btn btn-primary" onclick="bfAudiobookRetryFailed('${esc(id)}')">Retry ${failedChunks} failed chunk${failedChunks===1?"":"s"}</button></div>`:""}
+    <div class="facts"><div class="fact"><div class="k">Maintenance</div><div class="v"><span id="prune-info"></span>
+      <button class="btn btn-ghost" id="prune-preview-btn" onclick="bfPrunePreview('${esc(id)}')">Find stale files</button></div></div></div>
     <div class="wizfoot" style="padding:18px 0 0"><span class="grow"></span>
       ${!terminal?`<button class="btn btn-ghost" onclick="bfCancelAudiobook('${esc(id)}')">Cancel</button>`:""}
       ${status==="succeeded"?`<audio class="audio-player" id="audio-player" controls preload="none"></audio>
@@ -779,6 +800,68 @@ async function bfCancelAudiobook(id) {
     pollAudiobook(id);
   } catch (error) {
     const panel=$("#audio-progress"); if(panel) panel.insertAdjacentHTML("beforeend", `<div class="empty" style="color:var(--bad)">${esc(error.message||"cancel failed")}</div>`);
+  }
+}
+
+// Relaunch a finished-but-failed operation in place: the server re-reads the
+// recorded launch settings and passes the CLI's --retry-failed, so only
+// manifest-marked failed chunks can call the provider again.
+async function bfAudiobookRetryFailed(id) {
+  const panel = $("#audio-progress");
+  const info = $("#prune-info");
+  try {
+    const response = await fetch(`/api/audiobooks/${encodeURIComponent(id)}/retry-failed`, {
+      method: "POST",
+      headers: { [CSRF_HEADER]: CSRF_TOKEN, "content-type": "application/json" },
+      body: "{}",
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "retry request failed");
+    if (info) info.textContent = "";
+    pollAudiobook(id);
+  } catch (error) {
+    if (panel) panel.insertAdjacentHTML("beforeend", `<div class="empty" style="color:var(--bad)">${esc(error.message||"retry request failed")}</div>`);
+  }
+}
+
+// Prune is deliberately two-step: preview first (dry run — counts only,
+// nothing deleted), then an explicit confirm executes the deletion and the
+// poll refreshes. `restricted` means the scan could only vouch for crash
+// debris (the recorded run used a chapter subset), so far less is offered.
+async function bfPrunePreview(id) {
+  const info = $("#prune-info"), button = $("#prune-preview-btn");
+  if (info) info.textContent = "scanning…";
+  try {
+    const response = await fetch(`/api/audiobooks/${encodeURIComponent(id)}/prune-preview`, { headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "preview failed");
+    if (button) button.remove();
+    const summary = result.restricted
+      ? `${num(result.stale_files)} crash-debris file(s)`
+      : `${num(result.stale_files)} stale file(s)`;
+    if (!result.stale_files) { if (info) info.textContent = "nothing to prune"; return; }
+    const megabytes = Math.max(0.1, Math.round(result.stale_bytes / 1024 / 1024 * 10) / 10);
+    if (info) info.innerHTML = `${esc(summary)} (~${megabytes} MB). `;
+    const confirm = document.createElement("button");
+    confirm.className = "btn btn-ghost";
+    confirm.textContent = `Delete ${num(result.stale_files)} file(s)`;
+    confirm.onclick = () => bfPruneConfirm(id);
+    if (info) info.appendChild(confirm);
+  } catch (error) {
+    if (info) info.textContent = error.message || "preview failed";
+  }
+}
+async function bfPruneConfirm(id) {
+  const info = $("#prune-info");
+  try {
+    const response = await fetch(`/api/audiobooks/${encodeURIComponent(id)}/prune`, {
+      method: "POST", headers: { [CSRF_HEADER]: CSRF_TOKEN },
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "prune failed");
+    if (info) info.textContent = `removed ${num(result.removed)} file(s)`;
+  } catch (error) {
+    if (info) info.textContent = error.message || "prune failed";
   }
 }
 
@@ -1356,6 +1439,283 @@ async function bfGlossaryAdd() {
 }
 async function bfGlossaryRemove(id) {
   try { await fetch("/api/glossary/" + id, { method: "DELETE", headers: { [CSRF_HEADER]: CSRF_TOKEN } }); loadGlossary(); } catch (e) {}
+}
+
+/* ---------------- Style sheets (store CRUD parity with `bookforge style`) ---------------- */
+// The store keys a sheet on (scope, scope_id, target_language) and keeps its
+// full TOML verbatim, so the form edits exactly those fields plus the raw
+// content; there is intentionally no name or source-language field because the
+// storage schema has neither.
+const STYLE_SCOPE_KINDS = [["global","Global"],["series","Series"],["book","Book"]];
+const GL_GENDERS = ["", "m", "f", "n"];
+function freshStyleEditor(language) {
+  return { targetLanguage: language || "Italian", scope: "global", scopeId: "", content: "", editing: null };
+}
+function styleContentTemplate(editor) {
+  const lines = [
+    "[meta]",
+    "schema_version = 1",
+    `target_language = "${editor.targetLanguage}"`,
+    "",
+    "[meta.scope]",
+    `kind = "${editor.scope}"`,
+  ];
+  if (editor.scope !== "global" && editor.scopeId) lines.push(`id = "${editor.scopeId}"`);
+  lines.push("", "[register]", "[voice]", "[do_not]", "");
+  return lines.join("\n");
+}
+function renderStyles(stage) {
+  if (!App.styles) App.styles = { editor: null, items: [] };
+  if (!App.styles.editor) App.styles.editor = freshStyleEditor(App.options.languages?.includes("Italian") ? "Italian" : undefined);
+  const ed = App.styles.editor;
+  stage.innerHTML = `<div class="wrap">
+    <div class="pagehead"><div><h1>Styles</h1><p>Per-language register, voice and do-not rules folded into every translation run for that language.</p></div></div>
+    <div class="gl-add" style="flex-wrap:wrap">
+      <input class="inp" id="st_target" list="langopts" placeholder="Target language (e.g. Italian)" style="max-width:220px" value="${esc(ed.targetLanguage)}">
+      <select class="inp" id="st_scope" style="max-width:150px" onchange="bfStylePickScope(this.value)">${STYLE_SCOPE_KINDS.map(([k,l]) => `<option value="${k}" ${ed.scope===k?"selected":""}>${l}</option>`).join("")}</select>
+      ${ed.scope !== "global" ? `<input class="inp" id="st_scope_id" placeholder="${ed.scope === "book" ? "Book id" : "Series id"} (required)" style="max-width:180px" value="${esc(ed.scopeId)}">` : ""}
+      <textarea class="inp" id="st_content" rows="7" spellcheck="false" style="flex-basis:100%" placeholder="[meta] … schema_version = 1 …">${esc(ed.content)}</textarea>
+      <span class="grow"></span>${ed.editing ? `<button class="btn btn-primary" onclick="bfStyleSave()">Save changes</button><button class="btn btn-ghost" onclick="bfStyleCancelEdit()">Cancel</button>` : `<button class="btn btn-primary" onclick="bfStyleAdd()">Add sheet</button>`}
+    </div>
+    <datalist id="langopts">${(App.options.languages || []).map(l => `<option value="${esc(l)}">`).join("")}</datalist>
+    <div class="gl-status" id="st_status"></div>
+    <div class="gl-table" id="st_table"><div class="empty" style="margin-top:20px">Loading…</div></div></div>`;
+  loadStyles();
+}
+async function loadStyles() {
+  let items = [];
+  try { items = await (await fetch("/api/styles", { headers: { [CSRF_HEADER]: CSRF_TOKEN } })).json(); } catch (e) {}
+  App.styles.items = Array.isArray(items) ? items : [];
+  drawStylesTable();
+}
+function drawStylesTable() {
+  const st = App.styles, box = $("#st_table"); if (!box) return;
+  if (!st.items.length) { box.innerHTML = `<div class="empty" style="margin-top:20px">No style sheets stored yet.</div>`; return; }
+  const rows = st.items.map(t => `<div class="gl-row">
+    <div class="gl-c s mono">${esc(String(t.id))}</div>
+    <div class="gl-c t">${esc(t.target_language)}</div>
+    <div class="gl-c cat">${esc(t.scope || "global")}${t.scope_id ? ` · ${esc(t.scope_id)}` : ""}</div>
+    <div class="gl-c cat mono" title="fingerprint">${esc(shorten(t.fingerprint || "", 12))}</div>
+    <div class="gl-c x" style="display:flex;gap:10px">
+      <span title="Edit" style="cursor:pointer" onclick="bfStyleEdit(${Number(t.id)})">✎</span>
+      <span title="Delete" style="cursor:pointer;color:var(--bad)" onclick="bfStyleRemove(${Number(t.id)})">×</span>
+    </div></div>`).join("");
+  box.innerHTML = `<div class="gl-head"><div>ID</div><div>Target</div><div>Scope</div><div>Fingerprint</div><div></div></div>${rows}
+    <div class="gl-foot">${st.items.length} sheet${st.items.length === 1 ? "" : "s"} stored</div>`;
+}
+function syncStyleEditor() {
+  const ed = App.styles.editor; if (!ed) return;
+  const target = $("#st_target"); if (target) ed.targetLanguage = target.value.trim();
+  const scope = $("#st_scope"); if (scope) ed.scope = scope.value;
+  const scopeId = $("#st_scope_id"); if (scopeId) ed.scopeId = scopeId.value.trim(); else if (ed.scope === "global") ed.scopeId = "";
+  const content = $("#st_content"); if (content) ed.content = content.value;
+}
+function bfStylePickScope(kind) {
+  syncStyleEditor(); const ed = App.styles.editor; ed.scope = kind;
+  if (!ed.content.trim()) ed.content = styleContentTemplate(ed);
+  else if (kind !== "global" && !ed.scopeId) ed.content = ed.content.replace(/^\s*kind\s*=\s*"global"\s*$/m, `kind = "${kind}"`);
+  renderStyles($("#stage"));
+}
+function bfStyleCancelEdit() { App.styles.editor = freshStyleEditor(); loadStyles(); renderStyles($("#stage")); }
+function bfStyleStartEdit(item) {
+  App.styles.editor = {
+    targetLanguage: item.target_language, scope: item.scope || "global",
+    scopeId: item.scope_id || "", content: item.content_toml || "", editing: item.id,
+  };
+  renderStyles($("#stage"));
+}
+async function bfStyleEdit(id) {
+  const item = (App.styles.items || []).find(row => Number(row.id) === id); if (!item) return;
+  if (!item.content_toml) {
+    try {
+      const response = await fetch(`/api/styles/${id}`, { headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+      if (response.ok) Object.assign(item, await response.json());
+    } catch (e) {}
+  }
+  bfStyleStartEdit(item);
+}
+function stylePayloadFromForm() {
+  syncStyleEditor();
+  const ed = App.styles.editor;
+  const payload = {
+    target_language: ed.targetLanguage,
+    content_toml: ed.content,
+    scope: ed.scope,
+  };
+  if (ed.scope !== "global") payload.scope_id = ed.scopeId;
+  return payload;
+}
+async function bfStyleAdd() {
+  const status = $("#st_status"), payload = stylePayloadFromForm();
+  if (!payload.target_language) { status.textContent = "choose a target language"; return; }
+  if (!payload.content_toml.trim()) { status.textContent = "paste or generate the TOML content"; return; }
+  status.textContent = "saving…";
+  try {
+    const r = await fetch("/api/styles", {
+      method: "POST",
+      headers: { [CSRF_HEADER]: CSRF_TOKEN, "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json();
+    if (!r.ok) { status.textContent = j.error || "could not save the style sheet"; return; }
+    status.textContent = ""; App.styles.editor = freshStyleEditor(payload.target_language);
+    loadStyles();
+  } catch (e) { status.textContent = "could not save the style sheet"; }
+}
+async function bfStyleSave() {
+  const ed = App.styles.editor, status = $("#st_status");
+  if (!ed || !ed.editing) return;
+  const payload = stylePayloadFromForm();
+  if (!payload.content_toml.trim()) { status.textContent = "the TOML content is required"; return; }
+  status.textContent = "saving…";
+  try {
+    const body = { content_toml: payload.content_toml };
+    if (payload.target_language) body.target_language = payload.target_language;
+    const r = await fetch(`/api/styles/${encodeURIComponent(ed.editing)}`, {
+      method: "PUT",
+      headers: { [CSRF_HEADER]: CSRF_TOKEN, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) { status.textContent = j.error || "could not save the style sheet"; return; }
+    status.textContent = ""; App.styles.editor = freshStyleEditor(payload.target_language);
+    loadStyles();
+  } catch (e) { status.textContent = "could not save the style sheet"; }
+}
+async function bfStyleRemove(id) {
+  const status = $("#st_status"); if (status) status.textContent = "deleting…";
+  try {
+    const r = await fetch(`/api/styles/${id}`, { method: "DELETE", headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { status.textContent = j.error || "delete failed"; return; }
+    if (status) status.textContent = "";
+    loadStyles();
+  } catch (e) { if (status) status.textContent = "delete failed"; }
+}
+
+/* ---------------- Entities (store CRUD parity with `bookforge entities`) ---------------- */
+function freshEntityEditor() { return { editing: null, scope: "global", scopeId: "" }; }
+function renderEntities(stage) {
+  if (!App.entities) App.entities = { editor: freshEntityEditor(), items: [] };
+  const ed = App.entities.editor;
+  const langOpts = (App.options.languages || []).map(l => `<option value="${esc(l)}">`).join("");
+  const title = ed.editing ? `Editing entity #${ed.editing}` : "Add an entity";
+  stage.innerHTML = `<div class="wrap">
+    <div class="pagehead"><div><h1>Entities</h1><p>Name-level guidance: how recurring characters, places and objects render across scopes and books.</p></div></div>
+    <div class="gl-add" style="flex-wrap:wrap">
+      <input class="inp" id="en_source" placeholder="Source name (e.g. Frodo Baggins)" style="max-width:240px">
+      <span style="color:var(--faint)">→</span>
+      <input class="inp" id="en_target" placeholder="Rendered name" style="max-width:240px">
+      <select class="inp" id="en_gender" style="max-width:130px"><option value="">gender —</option>${GL_GENDERS.filter(Boolean).map(g => `<option value="${g}">${g}</option>`).join("")}</select>
+      <input class="inp" id="en_role" placeholder="Role (optional)" style="max-width:180px">
+      <input class="inp" id="en_notes" placeholder="Notes (optional)" style="flex-basis:46%">
+      <input class="inp" id="en_source_lang" list="entlangs" placeholder="Source language" style="max-width:170px" value="${esc(App.options.languages?.includes("English") ? "English" : "")}">
+      <input class="inp" id="en_target_lang" list="entlangs" placeholder="Target language" style="max-width:170px" value="${esc(App.options.languages?.includes("Italian") ? "Italian" : "")}">
+      <select class="inp" id="en_scope" style="max-width:130px">${STYLE_SCOPE_KINDS.map(([k, l]) => `<option value="${k}" ${ed.scope === k ? "selected" : ""}>${l}</option>`).join("")}</select>
+      ${ed.scope !== "global" ? `<input class="inp" id="en_scope_id" placeholder="${ed.scope === "book" ? "Book id" : "Series id"} (required)" style="max-width:170px" value="${esc(ed.scopeId || "")}">` : ""}
+      <span class="grow"></span>${ed.editing ? `<button class="btn btn-primary" onclick="bfEntitySave()">Save changes</button><button class="btn btn-ghost" onclick="bfEntityCancelEdit()">Cancel</button>` : `<button class="btn btn-primary" onclick="bfEntityAdd()">Add entity</button>`}
+      <div class="keyline" style="flex-basis:100%;margin-top:6px">${esc(title)}</div>
+    </div>
+    <datalist id="entlangs">${langOpts}</datalist>
+    <div class="gl-status" id="en_status"></div>
+    <div class="gl-table" id="en_table"><div class="empty" style="margin-top:20px">Loading…</div></div></div>`;
+  loadEntities();
+}
+async function loadEntities() {
+  let items = [];
+  try { items = await (await fetch("/api/entities", { headers: { [CSRF_HEADER]: CSRF_TOKEN } })).json(); } catch (e) {}
+  App.entities.items = Array.isArray(items) ? items : [];
+  drawEntitiesTable();
+}
+function drawEntitiesTable() {
+  const en = App.entities, box = $("#en_table"); if (!box) return;
+  if (!en.items.length) { box.innerHTML = `<div class="empty" style="margin-top:20px">No entities stored yet.</div>`; return; }
+  const rows = en.items.map(t => `<div class="gl-row">
+    <div class="gl-c s mono">${esc(String(t.id))}</div>
+    <div class="gl-c s">${esc(t.source)}</div><div class="gl-c t">${esc(t.target)}</div>
+    <div class="gl-c cat">${esc(t.gender || "")}${t.role ? ` · ${esc(t.role)}` : ""}</div>
+    <div class="gl-c cat">${esc(t.source_language)} → ${esc(t.target_language)}</div>
+    <div class="gl-c x" style="display:flex;gap:10px">
+      <span title="Edit" style="cursor:pointer" onclick="bfEntityEdit(${Number(t.id)})">✎</span>
+      <span title="Delete" style="cursor:pointer;color:var(--bad)" onclick="bfEntityRemove(${Number(t.id)})">×</span>
+    </div></div>`).join("");
+  box.innerHTML = `<div class="gl-head"><div>ID</div><div>Source</div><div>Rendered</div><div>Gender · Role</div><div>Languages</div><div></div></div>${rows}
+    <div class="gl-foot">${en.items.length} entit${en.items.length === 1 ? "y" : "ies"} stored</div>`;
+}
+function entityEditorOpen(id) {
+  const item = (App.entities.items || []).find(row => Number(row.id) === Number(id));
+  if (!item) return false;
+  Object.assign(App.entities.editor, { editing: id, scope: item.scope || "global", scopeId: item.scope_id || "" });
+  renderEntities($("#stage"));
+  const set = (sel, value) => { const el = $(sel); if (el) el.value = value == null ? "" : value; };
+  set("#en_source", item.source); set("#en_target", item.target);
+  set("#en_gender", item.gender || ""); set("#en_role", item.role || ""); set("#en_notes", item.notes || "");
+  set("#en_source_lang", item.source_language); set("#en_target_lang", item.target_language);
+  set("#en_scope", item.scope || "global"); set("#en_scope_id", item.scope_id || "");
+  return true;
+}
+function bfEntityEdit(id) { if (!entityEditorOpen(id)) { const status = $("#en_status"); if (status) status.textContent = "reloading…"; loadEntities().then(() => entityEditorOpen(id)); } }
+function bfEntityCancelEdit() { App.entities.editor = freshEntityEditor(); loadEntities().then(() => renderEntities($("#stage"))); }
+function entityPayloadFromForm(requireIdentity) {
+  const value = sel => { const el = $(sel); return el ? el.value.trim() : ""; };
+  const payload = {
+    target_name: value("#en_target"),
+    gender: value("#en_gender") || null,
+    role: value("#en_role") || null,
+    notes: value("#en_notes") || null,
+  };
+  if (requireIdentity) {
+    payload.source_name = value("#en_source");
+    payload.source_language = value("#en_source_lang");
+    payload.target_language = value("#en_target_lang");
+    payload.scope = $("#en_scope") ? $("#en_scope").value : "global";
+    if (payload.scope !== "global") payload.scope_id = value("#en_scope_id");
+  }
+  return payload;
+}
+async function bfEntityAdd() {
+  const status = $("#en_status"), payload = entityPayloadFromForm(true);
+  if (!payload.source_name || !payload.target_name) { status.textContent = "enter both names"; return; }
+  if (!payload.source_language || !payload.target_language) { status.textContent = "enter the language pair"; return; }
+  if (payload.scope !== "global" && !payload.scope_id) { status.textContent = `${payload.scope} scope needs an id`; return; }
+  status.textContent = "saving…";
+  try {
+    const r = await fetch("/api/entities", {
+      method: "POST",
+      headers: { [CSRF_HEADER]: CSRF_TOKEN, "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json();
+    if (!r.ok) { status.textContent = j.error || "could not save the entity"; return; }
+    status.textContent = ""; loadEntities();
+  } catch (e) { status.textContent = "could not save the entity"; }
+}
+async function bfEntitySave() {
+  const ed = App.entities.editor, status = $("#en_status");
+  if (!ed || !ed.editing) return;
+  const payload = entityPayloadFromForm(false);
+  if (!payload.target_name) { status.textContent = "the rendered name is required"; return; }
+  status.textContent = "saving…";
+  try {
+    const r = await fetch(`/api/entities/${encodeURIComponent(ed.editing)}`, {
+      method: "PUT",
+      headers: { [CSRF_HEADER]: CSRF_TOKEN, "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json();
+    if (!r.ok) { status.textContent = j.error || "could not save the entity"; return; }
+    status.textContent = ""; bfEntityCancelEdit();
+  } catch (e) { status.textContent = "could not save the entity"; }
+}
+async function bfEntityRemove(id) {
+  const status = $("#en_status"); if (status) status.textContent = "deleting…";
+  try {
+    const r = await fetch(`/api/entities/${id}`, { method: "DELETE", headers: { [CSRF_HEADER]: CSRF_TOKEN } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { status.textContent = j.error || "delete failed"; return; }
+    if (status) status.textContent = "";
+    loadEntities();
+  } catch (e) { if (status) status.textContent = "delete failed"; }
 }
 
 /* ---------------- boot ---------------- */

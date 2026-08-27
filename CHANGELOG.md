@@ -138,6 +138,29 @@ corrections to two audit findings that turned out wrong. See
   detected heading structure; caption detection warns when non-English labels
   will be missed; render sizes and OCR request bodies are capped.
 
+### Breaking-ish changes
+
+Automation consumers: `--ui json` stdout now carries a versioned envelope
+(UI-23). Every line is `{"v":2,"kind":"event"|"audiobook","payload":{…}}`:
+
+- `translate --ui json` and `resume --ui json`: each line previously was a raw
+  `ProgressEvent` object; it is now `kind:"event"` with that same object as
+  `payload`. Update parsers to read `payload`.
+- `audiobook --ui json`: each line previously was a raw `{"event":"…",…}`
+  object; it is now `kind:"audiobook"` with that object unchanged as
+  `payload`.
+- Scripts pinned to the old shapes can pass `--ui json-v1`, a deprecated alias
+  that reproduces the raw v1 streams byte-for-byte. The persisted
+  `events.jsonl` file log, `tail <job-id> --json`, and dashboard SSE frames are
+  **unchanged**. See `docs/events.md` for the full contract and stream table.
+- Rendering consolidation (UI-31): all four dashboards (TUI, progress bars,
+  `tail` reconstruction, serve folds) now share one RunState+EpochTracker view
+  and formatter set. Visible nits: an ETA of zero/unknown renders as `—`
+  instead of `0s` in the bars' rate line, and `tail`'s human reconstruction
+  block gained a `status:` row using the shared status vocabulary. Counts,
+  rates, and ETA values were already cross-checked by the wave-2 epoch tests
+  and remain identical otherwise.
+
 ### Audit corrections
 
 - PDF-1 was refuted: `cargo test -p bookforge-pdf` compiles and runs on

@@ -130,10 +130,53 @@ lost — even though no previously persisted data is affected.
 Within v1, existing variants and required fields are not removed. New variants
 and optional fields may be added in minor releases.
 
-Note: `bookforge audiobook --ui json` writes a separate envelope on stdout —
-`{"event": …}` objects with event names `audiobook_planning_started`
-(`input`), `audiobook_plan_detected_sizes` (`chapters`, `chunks`,
-`characters`), `audiobook_plan`, `audiobook_chunk_finished`, `audiobook_pruned`,
-and `audiobook_finished` (plan/deliverable payloads) rather than the
-`ProgressEvent` lines described here. Treat the two dialects as distinct;
-`tail <job-id> --json` always prints persisted `ProgressEvent` objects.
+Note: `bookforge audiobook` uses its own event names rather than the
+`ProgressEvent` variants above; see [Stdout JSON envelope](#stdout-json-envelope---ui-json) below.
+
+## Stdout JSON envelope (`--ui json`) {#stdout-json-envelope---ui-json}
+
+The `events.jsonl` schema above is the *file* log. The `--ui json` stdout
+stream wraps every line in a single versioned envelope (UI-23), so consumers no
+longer face two incompatible unversioned dialects:
+
+```jsonl
+{"v":2,"kind":"event","payload":{"JobCreated":{"job_id":"job_abc","input_path":"book.epub","output_path":"book.it.epub","timestamp_ms":1710000000000}}}
+{"v":2,"kind":"event","payload":{"SegmentFinished":{"segment_id":"s1","status":"succeeded","input_tokens":1234,"output_tokens":456,"timestamp_ms":1710000002200}}}
+{"v":2,"kind":"audiobook","payload":{"event":"audiobook_plan","chapters":3,"chunks":27,"characters":42000}}
+{"v":2,"kind":"audiobook","payload":{"event":"audiobook_finished","status":"succeeded"}}
+```
+
+Envelope rules:
+
+- `v`: u64 wire-dialect version, currently `2`. Bumped on any change to the
+  `kind` set or payload layouts. Fail fast on an unknown `v`.
+- `kind`: `"event"` — payload is exactly one `ProgressEvent`, serialized as in
+  the file log (externally tagged). Emitted by `translate --ui json` and
+  `resume --ui json`.
+- `"audiobook"` — payload is the audiobook command's own progress object and
+  keeps its inner `"event":"audiobook_*"` discriminator:
+  `audiobook_planning_started` (`input`), `audiobook_plan_detected_sizes`
+  (`chapters`, `chunks`, `characters`), `audiobook_plan`,
+  `audiobook_chunk_finished`, `audiobook_pruned`, and `audiobook_finished`
+  (plan/deliverable payloads). Inner field meanings are unchanged.
+- `"serialization_error"` — `payload` is `null`; emitted instead of ever
+  writing a torn or malformed line.
+- Unknown `kind` values must be ignored by consumers; every line is one
+  self-contained JSON object terminated by LF.
+- One line per event, stdout only, in the same order as the file log. All
+  human-facing stdout chatter stays suppressed in this mode (UI-22).
+
+Exactly which streams are enveloped:
+
+| Stream | Dialect |
+| --- | --- |
+| `translate --ui json` / `resume --ui json` stdout | Enveloped (`v2`, `kind:"event"`) |
+| `audiobook --ui json` stdout | Enveloped (`v2`, `kind:"audiobook"`) |
+| `--ui json-v1` stdout (deprecated alias) | Legacy raw lines: raw `ProgressEvent` objects for translate/resume, raw `{"event":…}` objects for audiobook — byte-compatible with pre-envelope releases. |
+| `events.jsonl` file log (`--progress-jsonl` or default run dir) | **Not enveloped** — always the plain `ProgressEvent` schema above. |
+| `tail <job-id> --json` | **Not enveloped** — raw pass-through of the persisted file-log lines. |
+| Dashboard SSE frames | Not affected: `/jobs/<id>/events` keeps its wave-1 `state`/`done` framing. |
+
+Versioning note: there was previously no version signal on either dialect;
+the historical raw streams are retroactively designated v1 and remain
+reachable via `--ui json-v1`.

@@ -8,6 +8,15 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/api/audiobooks", get(list_audiobooks))
         .route("/api/audiobooks/{id}", get(audiobook_status))
         .route("/api/audiobooks/{id}/cancel", post(cancel_audiobook))
+        .route(
+            "/api/audiobooks/{id}/prune-preview",
+            get(audiobook_prune_preview),
+        )
+        .route("/api/audiobooks/{id}/prune", post(prune_audiobook))
+        .route(
+            "/api/audiobooks/{id}/retry-failed",
+            post(retry_failed_chunks),
+        )
         .route("/api/audiobooks/{id}/artifact", get(audiobook_artifact))
 }
 
@@ -384,6 +393,44 @@ async fn launch_audiobook(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(4)
         .clamp(1, 16);
+    let chapters = match field_value(&fields, "chapters") {
+        Some(value) => match super::audiobook::parse_chapter_ranges(&value) {
+            // A normalized 1-based range list ("1-3,7"), mirroring the CLI
+            // parser's semantics before it reaches the child command line.
+            Ok(chapters) => Some(format_chapter_ranges(&chapters)),
+            Err(error) => return Ok(bad_request(&format!("invalid chapters: {error}"))),
+        },
+        None => None,
+    };
+    let text_normalization = match field_value(&fields, "text_normalization") {
+        Some(value) => {
+            let value = value.to_ascii_lowercase();
+            if !matches!(value.as_str(), "auto" | "on" | "off") {
+                return Ok(bad_request("text normalization must be auto, on, or off"));
+            }
+            let supported = bookforge_audio::feature_set_for_id(&provider)
+                .is_some_and(|features| features.text_normalization);
+            if !supported {
+                return Ok(bad_request(
+                    "--text-normalization is supported only with --provider elevenlabs",
+                ));
+            }
+            (value != "auto").then_some(value)
+        }
+        None => None,
+    };
+    let timeout_seconds = match field_value(&fields, "timeout_seconds") {
+        Some(value) => match value.trim().parse::<u64>() {
+            // One floor per the CLI parser's range(1..); the ceiling keeps a
+            // fat-fingered dashboard field from parking a TTS child forever.
+            Ok(seconds) if (1..=86_400).contains(&seconds) => Some(seconds),
+            Ok(_) => {
+                return Ok(bad_request("timeout seconds must be between 1 and 86400"));
+            }
+            Err(_) => return Ok(bad_request("timeout seconds must be an integer")),
+        },
+        None => None,
+    };
     let gap_chapter_ms = match parse_audio_gap(&fields, "gap_chapter_ms") {
         Ok(value) => value,
         Err(error) => return Ok(bad_request(&error)),
@@ -430,6 +477,9 @@ async fn launch_audiobook(
         loudnorm: truthy_field(&fields, "loudnorm"),
         seed,
         language,
+        chapters,
+        text_normalization,
+        timeout_seconds,
     };
     let make_m4b = truthy_field(&fields, "m4b");
     let stitch_audio = truthy_field(&fields, "stitch") || make_m4b;
@@ -511,7 +561,37 @@ async fn launch_audiobook(
         let _ = std::fs::remove_file(&input_path);
         return Ok(bad_request(&format!("could not read EPUB: {error}")));
     }
-    write_audio_process_state(&out_dir, "starting", None, None, auto_model)?;
+    // Relaunchable launch-shaping settings persisted next to the run so the
+    // retry-failed endpoint can reproduce the exact command later without
+    // browser cooperation (and without secrets: env names only).
+    let launch_options = json!({
+        "provider": provider.clone(),
+        "model": model.clone(),
+        "voice": voice.clone(),
+        "format": format.clone(),
+        "speed": speed,
+        "max_chars": max_chars,
+        "concurrency": concurrency,
+        "instructions": instructions.clone(),
+        "base_url": base_url.clone(),
+        "gap_chapter_ms": advanced.gap_chapter_ms,
+        "gap_title_ms": advanced.gap_title_ms,
+        "single": advanced.single,
+        "loudnorm": advanced.loudnorm,
+        "seed": advanced.seed,
+        "language": advanced.language.clone(),
+        "chapters": advanced.chapters.clone(),
+        "text_normalization": advanced.text_normalization.clone(),
+        "timeout_seconds": advanced.timeout_seconds,
+    });
+    write_audio_process_state(
+        &out_dir,
+        "starting",
+        None,
+        None,
+        auto_model,
+        Some(&launch_options),
+    )?;
 
     let exe = std::env::current_exe()?;
     let mut command = tokio::process::Command::new(exe);
@@ -538,7 +618,7 @@ async fn launch_audiobook(
 
     // On spawn failure the freshly written upload (and empty operation dir)
     // must not linger as orphans; remove them before surfacing the error.
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             let _ = std::fs::remove_file(&input_path);
@@ -549,40 +629,15 @@ async fn launch_audiobook(
         }
     };
     let pid = child.id();
-    write_audio_process_state(&out_dir, "running", pid, None, auto_model)?;
-    let cancel = tokio_util::sync::CancellationToken::new();
-    state
-        .audio_cancels
-        .lock()
-        .map_err(|_| anyhow::anyhow!("audiobook cancellation registry is unavailable"))?
-        .insert(id.clone(), cancel.clone());
-    let monitor_dir = out_dir.clone();
-    let monitor_id = id.clone();
-    let cancel_registry = state.audio_cancels.clone();
-    tokio::spawn(async move {
-        let operation_state = tokio::select! {
-            status = child.wait() => match status {
-                Ok(status) if status.success() => ("succeeded", None),
-                Ok(status) => ("failed", Some(format!("audiobook process exited with {status}"))),
-                Err(error) => ("failed", Some(format!("could not wait for audiobook process: {error}"))),
-            },
-            _ = cancel.cancelled() => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                ("cancelled", None)
-            }
-        };
-        let _ = write_audio_process_state(
-            &monitor_dir,
-            operation_state.0,
-            pid,
-            operation_state.1.as_deref(),
-            auto_model,
-        );
-        if let Ok(mut registry) = cancel_registry.lock() {
-            registry.remove(&monitor_id);
-        }
-    });
+    write_audio_process_state(
+        &out_dir,
+        "running",
+        pid,
+        None,
+        auto_model,
+        Some(&launch_options),
+    )?;
+    register_audio_cancellation(&state, id.clone(), child, out_dir.clone(), pid, auto_model);
     // The child now owns the operation's lifetime; the launch slot is free.
     drop(slot);
 
@@ -607,6 +662,12 @@ pub(super) struct AudiobookCommandOptions {
     pub(super) loudnorm: bool,
     pub(super) seed: Option<u32>,
     pub(super) language: Option<String>,
+    /// Canonical 1-based chapter ranges ("1-3,7") already validated through
+    /// the shared CLI parser.
+    pub(super) chapters: Option<String>,
+    /// Non-auto ElevenLabs text-normalization policy ("on" / "off").
+    pub(super) text_normalization: Option<String>,
+    pub(super) timeout_seconds: Option<u64>,
 }
 
 pub(super) fn clamp_audio_gap(value: u32) -> u32 {
@@ -716,7 +777,49 @@ pub(super) fn audiobook_command_args(
     if let Some(language) = advanced.language.as_deref() {
         args.extend([OsString::from("--language"), language.into()]);
     }
+    if let Some(chapters) = advanced.chapters.as_deref() {
+        args.extend([OsString::from("--chapters"), chapters.into()]);
+    }
+    if let Some(policy) = advanced.text_normalization.as_deref() {
+        args.extend([OsString::from("--text-normalization"), policy.into()]);
+    }
+    if let Some(seconds) = advanced.timeout_seconds {
+        args.extend([
+            OsString::from("--timeout-seconds"),
+            seconds.to_string().into(),
+        ]);
+    }
     args
+}
+
+/// Compact a validated chapter set back into CLI range syntax ("1-3,7").
+pub(super) fn format_chapter_ranges(chapters: &std::collections::BTreeSet<usize>) -> String {
+    let mut parts = Vec::new();
+    let mut iter = chapters.iter().copied();
+    let mut run_start = match iter.next() {
+        Some(first) => first,
+        None => return String::new(),
+    };
+    let mut run_end = run_start;
+    for next in iter {
+        if next == run_end + 1 {
+            run_end = next;
+        } else {
+            parts.push(render_chapter_run(run_start, run_end));
+            run_start = next;
+            run_end = next;
+        }
+    }
+    parts.push(render_chapter_run(run_start, run_end));
+    parts.join(",")
+}
+
+fn render_chapter_run(start: usize, end: usize) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
 }
 
 pub(super) fn resolved_model_from_synthesis_id(synthesis_id: &str) -> Option<&str> {
@@ -980,7 +1083,7 @@ async fn cancel_audiobook(
         .get("auto_model")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    write_audio_process_state(&out_dir, "cancelled", Some(pid), None, auto_model)?;
+    write_audio_process_state(&out_dir, "cancelled", Some(pid), None, auto_model, None)?;
     Ok(Json(json!({"ok": true, "status": "cancelled"})).into_response())
 }
 
@@ -1280,19 +1383,76 @@ pub(super) fn valid_audiobook_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+/// Register a spawned audiobook child with the cancellation registry and
+/// watch it to completion, durably folding its terminal state back into
+/// `process.json`. Shared by the launch and retry-failed endpoints so both
+/// children are cancellable identically.
+fn register_audio_cancellation(
+    state: &AppState,
+    id: String,
+    mut child: tokio::process::Child,
+    out_dir: PathBuf,
+    pid: Option<u32>,
+    auto_model: bool,
+) {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    if let Ok(mut registry) = state.audio_cancels.lock() {
+        registry.insert(id.clone(), cancel.clone());
+    }
+    let cancel_registry = state.audio_cancels.clone();
+    tokio::spawn(async move {
+        let operation_state = tokio::select! {
+            status = child.wait() => match status {
+                Ok(status) if status.success() => ("succeeded", None),
+                Ok(status) => ("failed", Some(format!("audiobook process exited with {status}"))),
+                Err(error) => ("failed", Some(format!("could not wait for audiobook process: {error}"))),
+            },
+            _ = cancel.cancelled() => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                ("cancelled", None)
+            }
+        };
+        let _ = write_audio_process_state(
+            &out_dir,
+            operation_state.0,
+            pid,
+            operation_state.1.as_deref(),
+            auto_model,
+            None,
+        );
+        if let Ok(mut registry) = cancel_registry.lock() {
+            registry.remove(&id);
+        }
+    });
+}
+
 fn write_audio_process_state(
     out_dir: &std::path::Path,
     status: &str,
     pid: Option<u32>,
     error: Option<&str>,
     auto_model: bool,
+    options: Option<&serde_json::Value>,
 ) -> Result<()> {
     let path = out_dir.join("process.json");
     let temp = out_dir.join("process.part.tmp");
-    let warnings = std::fs::read(&path)
+    let previous = std::fs::read(&path)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let warnings = previous
+        .as_ref()
         .and_then(|process| process.get("warnings").cloned());
+    // Launch-shaping settings ride the durable state so a relaunch (the
+    // retry-failed endpoint) can reproduce the exact command without the
+    // browser resending anything. A fresh launch's snapshot wins over the
+    // preserved one; every rewrite preserves the newest known value.
+    let effective_options = options.cloned().or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|process| process.get("options").cloned())
+            .filter(serde_json::Value::is_object)
+    });
     let mut process = json!({
         "status": status,
         "pid": pid,
@@ -1302,6 +1462,12 @@ fn write_audio_process_state(
     });
     if let (Some(object), Some(warnings)) = (process.as_object_mut(), warnings) {
         object.insert("warnings".to_string(), warnings);
+    }
+    if let (Some(object), Some(options)) = (
+        process.as_object_mut(),
+        effective_options.filter(serde_json::Value::is_object),
+    ) {
+        object.insert("options".to_string(), options);
     }
     let bytes = serde_json::to_vec_pretty(&process)?;
     std::fs::write(&temp, bytes)?;
@@ -1432,4 +1598,565 @@ pub(super) fn audio_provider_max_chars(provider: &str, model: &str) -> usize {
 fn truthy_field(fields: &HashMap<String, String>, key: &str) -> bool {
     field_value(fields, key)
         .is_some_and(|value| matches!(value.as_str(), "true" | "on" | "1" | "yes"))
+}
+
+// ---------------------------------------------------------------------------
+// AUDIO-6/8 remainder parity on durable operations: prune (with a dry-run
+// preview first) and retry-failed relaunches of a failed run.
+//
+// Both operate on the SAME operation directory as the original launch, which
+// is what makes chunk-reuse semantics true rather than theatrical: prune
+// never deletes a file the recorded plan still references, and
+// --retry-failed passes through to the CLI's cost-capped retry mode, so
+// previously successful chunks are validated but can never call the provider
+// again.
+// ---------------------------------------------------------------------------
+
+fn audiobook_operation_out_dir(upload_dir: &Path, id: &str) -> PathBuf {
+    upload_dir.join(format!("audiobook-{id}"))
+}
+
+/// True while the operation still owns a live child; maintenance endpoints
+/// refuse to touch it until the builder exits.
+fn audiobook_process_is_running(process: &serde_json::Value) -> bool {
+    matches!(
+        process.get("status").and_then(serde_json::Value::as_str),
+        Some("starting" | "running"),
+    )
+}
+
+enum DebrisScan {
+    NotFound,
+    Running,
+    /// Safe-to-remove files plus whether the scan had to degrade to
+    /// crash-debris-only matching.
+    Found {
+        stale: Vec<bookforge_audio::StaleChunk>,
+        restricted: bool,
+    },
+}
+
+/// Identify deletable files in one audiobook operation directory.
+///
+/// The preferred full scan feeds `find_stale_chunks` the manifest's own chunk
+/// records as the kept set — exactly what a CLI `--prune` pass does. That is
+/// only trustworthy when the manifest provably covers every chapter, so
+/// launches record their `chapters` filter in process.json and an unknown or
+/// subset-filtered manifest degrades honestly to a crash-debris-only sweep
+/// instead of deleting valid reusable chunks from chapters outside the
+/// original filter.
+fn scan_audiobook_debris(upload_dir: &Path, id: &str) -> Result<DebrisScan> {
+    let out_dir = audiobook_operation_out_dir(upload_dir, id);
+    if !out_dir.is_dir() {
+        return Ok(DebrisScan::NotFound);
+    }
+    let process = std::fs::read(out_dir.join("process.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    if audiobook_process_is_running(&process) {
+        return Ok(DebrisScan::Running);
+    }
+    let chapters_recorded = process
+        .get("options")
+        .filter(|value| value.is_object())
+        .and_then(|options| options.get("chapters"))
+        .and_then(serde_json::Value::as_str);
+    // An absent or null chapter filter proves the manifest is a whole-book
+    // plan; a non-empty one (or missing options entirely, i.e. an operation
+    // from before relaunch metadata existed) means we cannot vouch for it.
+    let known_unfiltered = process
+        .get("options")
+        .filter(|value| value.is_object())
+        .map(|_| chapters_recorded.is_none_or(str::is_empty))
+        .unwrap_or(false);
+    if known_unfiltered
+        && let Ok(manifest) = serde_json::from_slice::<bookforge_audio::AudiobookManifest>(
+            &std::fs::read(out_dir.join("manifest.json")).unwrap_or_default(),
+        )
+    {
+        let stale = bookforge_audio::find_stale_chunks(&out_dir, &manifest.chunks)?;
+        return Ok(DebrisScan::Found {
+            stale,
+            restricted: false,
+        });
+    }
+    Ok(DebrisScan::Found {
+        stale: debris_only_chunks(&out_dir)?,
+        restricted: true,
+    })
+}
+
+/// Crash-debris shapes only (`is_debris_name`); managed chunk files are never
+/// candidates here, whatever their cache state.
+fn debris_only_chunks(out_dir: &Path) -> std::io::Result<Vec<bookforge_audio::StaleChunk>> {
+    let mut stale = Vec::new();
+    for entry in std::fs::read_dir(out_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if bookforge_audio::cleanup::is_debris_name(name) {
+            stale.push(bookforge_audio::StaleChunk {
+                path: entry.path(),
+                bytes: entry.metadata()?.len(),
+            });
+        }
+    }
+    Ok(stale)
+}
+
+fn debris_not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "no such audiobook operation" })),
+    )
+        .into_response()
+}
+
+fn debris_running_response() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "error": "audiobook operation is not finished" })),
+    )
+        .into_response()
+}
+
+fn debris_preview_response(stale: &[bookforge_audio::StaleChunk], restricted: bool) -> Response {
+    let stale_files = stale.len();
+    let stale_bytes = stale.iter().map(|chunk| chunk.bytes).sum::<u64>();
+    Json(json!({
+        "stale_files": stale_files,
+        "stale_bytes": stale_bytes,
+        "restricted": restricted,
+    }))
+    .into_response()
+}
+
+/// Dry-run prune: report how many debris/orphan files a confirm would delete,
+/// without touching anything.
+async fn audiobook_prune_preview(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, AppError> {
+    if !valid_audiobook_id(&id) {
+        return Ok(bad_request("invalid audiobook operation id"));
+    }
+    let upload_dir = state.upload_dir.clone();
+    let scan =
+        tokio::task::spawn_blocking(move || scan_audiobook_debris(&upload_dir, &id)).await??;
+    Ok(match scan {
+        DebrisScan::NotFound => debris_not_found_response(),
+        DebrisScan::Running => debris_running_response(),
+        DebrisScan::Found { stale, restricted } => debris_preview_response(&stale, restricted),
+    })
+}
+
+enum PruneOutcome {
+    NotFound,
+    Running,
+    Ran(serde_json::Value),
+}
+
+/// Live prune: rescan then delete in one blocking task so nothing can widen
+/// the gap between what was listed and what gets removed.
+async fn prune_audiobook(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    if !valid_audiobook_id(&id) {
+        return Ok(bad_request("invalid audiobook operation id"));
+    }
+    if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+    let upload_dir = state.upload_dir.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<PruneOutcome> {
+        match scan_audiobook_debris(&upload_dir, &id)? {
+            DebrisScan::NotFound => Ok(PruneOutcome::NotFound),
+            DebrisScan::Running => Ok(PruneOutcome::Running),
+            DebrisScan::Found { stale, restricted } => {
+                let listed = stale.len();
+                let (removed, freed) = bookforge_audio::remove_stale_chunks(&stale)?;
+                Ok(PruneOutcome::Ran(json!({
+                    "removed": removed,
+                    "freed_bytes": freed,
+                    "listed": listed,
+                    "restricted": restricted,
+                })))
+            }
+        }
+    })
+    .await??;
+    Ok(match outcome {
+        PruneOutcome::NotFound => debris_not_found_response(),
+        PruneOutcome::Running => debris_running_response(),
+        PruneOutcome::Ran(payload) => Json(payload).into_response(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// retry-failed relaunches
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RetryFailedRequest {
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+struct PreparedRetry {
+    out_dir: PathBuf,
+    input_path: PathBuf,
+    provider: String,
+    model_opt: Option<String>,
+    voice: String,
+    format: String,
+    speed: f32,
+    max_chars: usize,
+    concurrency: usize,
+    instructions: Option<String>,
+    base_url: Option<String>,
+    advanced: AudiobookCommandOptions,
+    make_m4b: bool,
+    stitch_audio: bool,
+    auto_model: bool,
+    options_snapshot: serde_json::Value,
+    failed_count: usize,
+}
+
+enum PreparedOutcome {
+    NotFound,
+    Running,
+    /// A deliberate refusal with its user-facing reason.
+    Client(String),
+    Ready(Box<PreparedRetry>),
+}
+
+fn options_string(options: &serde_json::Value, key: &str) -> Option<String> {
+    options
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> {
+    let out_dir = audiobook_operation_out_dir(upload_dir, id);
+    if !out_dir.is_dir() {
+        return Ok(PreparedOutcome::NotFound);
+    }
+    let process = std::fs::read(out_dir.join("process.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    if audiobook_process_is_running(&process) {
+        return Ok(PreparedOutcome::Running);
+    }
+    let Some(options) = process
+        .get("options")
+        .filter(|value| value.is_object())
+        .cloned()
+    else {
+        return Ok(PreparedOutcome::Client(
+            "relaunch settings are unavailable for this run; recreate the audiobook instead"
+                .to_string(),
+        ));
+    };
+
+    let failed = match bookforge_audio::failed_chunk_files(&out_dir.join("manifest.json")) {
+        Ok(files) => files,
+        Err(error) => {
+            return Ok(PreparedOutcome::Client(format!(
+                "--retry-failed requires a readable prior manifest ({error})"
+            )));
+        }
+    };
+    let failed_count = failed.len();
+    if failed_count == 0 {
+        return Ok(PreparedOutcome::Client(
+            "--retry-failed found no failed chunks matching this run".to_string(),
+        ));
+    }
+
+    let input_path = upload_dir.join(format!("audiobook-{id}.epub"));
+    if !input_path.is_file() {
+        return Ok(PreparedOutcome::Client(format!(
+            "the original EPUB is no longer stored at {}; recreate the audiobook instead",
+            input_path.display()
+        )));
+    }
+
+    let Some(provider) = options_string(&options, "provider")
+        .filter(|value| matches!(value.as_str(), "mock" | "openai" | "gemini" | "elevenlabs"))
+    else {
+        return Ok(PreparedOutcome::Client(
+            "the recorded provider is unknown; recreate the audiobook instead".to_string(),
+        ));
+    };
+    let Some(voice) = options_string(&options, "voice").filter(|value| !value.is_empty()) else {
+        return Ok(PreparedOutcome::Client(
+            "the recorded voice setting is unusable; recreate the audiobook instead".to_string(),
+        ));
+    };
+    let Some(format) = options_string(&options, "format").filter(|value| {
+        matches!(
+            value.as_str(),
+            "mp3" | "opus" | "aac" | "flac" | "wav" | "pcm"
+        )
+    }) else {
+        return Ok(PreparedOutcome::Client(
+            "the recorded output format is unusable; recreate the audiobook instead".to_string(),
+        ));
+    };
+    let speed = options
+        .get("speed")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(1.0) as f32;
+    if !speed.is_finite() || !(0.25..=4.0).contains(&speed) {
+        return Ok(PreparedOutcome::Client(
+            "the recorded speed setting is unusable; recreate the audiobook instead".to_string(),
+        ));
+    }
+    let max_chars_u64 = options
+        .get("max_chars")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(2_000);
+    let provider_max_chars = audio_provider_max_chars(&provider, "") as u64;
+    if max_chars_u64 == 0 || max_chars_u64 > provider_max_chars {
+        return Ok(PreparedOutcome::Client(
+            "the recorded characters-per-request setting is unusable; recreate the audiobook instead"
+                .to_string(),
+        ));
+    }
+    let max_chars = max_chars_u64.min(usize::MAX as u64) as usize;
+    let concurrency = options
+        .get("concurrency")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(4)
+        .clamp(1, 16) as usize;
+
+    let recorded_model = options_string(&options, "model").unwrap_or_default();
+    let synthesis_model = std::fs::read(out_dir.join("manifest.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<bookforge_audio::AudiobookManifest>(&bytes).ok())
+        .as_ref()
+        .and_then(|manifest| resolved_model_from_synthesis_id(&manifest.synthesis_id))
+        .map(str::to_string);
+    let model_for_child = (!recorded_model.is_empty())
+        .then_some(recorded_model)
+        .or(synthesis_model);
+
+    // The recorded values were validated when written; anything that no
+    // longer parses means a tampered or foreign state file, and silently
+    // widening the work would be dishonest — refuse instead.
+    let advanced = AudiobookCommandOptions {
+        gap_chapter_ms: u32_checked(options.get("gap_chapter_ms")),
+        gap_title_ms: u32_checked(options.get("gap_title_ms")),
+        single: options
+            .get("single")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        loudnorm: options
+            .get("loudnorm")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        seed: match options.get("seed") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => match value.as_u64().and_then(|seed| u32::try_from(seed).ok()) {
+                Some(seed) => Some(seed),
+                None => {
+                    return Ok(PreparedOutcome::Client(
+                        "the recorded seed setting is unusable".to_string(),
+                    ));
+                }
+            },
+        },
+        language: options_string(&options, "language"),
+        chapters: match options.get("chapters") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(chapters) => {
+                let text = chapters.as_str().unwrap_or_default();
+                if super::audiobook::parse_chapter_ranges(text).is_ok() {
+                    (!text.is_empty()).then(|| text.to_string())
+                } else {
+                    return Ok(PreparedOutcome::Client(
+                        "the recorded chapter filter no longer parses".to_string(),
+                    ));
+                }
+            }
+        },
+        text_normalization: match options.get("text_normalization") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(policy) => match policy.as_str() {
+                Some(policy @ ("on" | "off")) => Some(policy.to_string()),
+                _ => {
+                    return Ok(PreparedOutcome::Client(
+                        "the recorded text-normalization policy is unusable".to_string(),
+                    ));
+                }
+            },
+        },
+        timeout_seconds: options_u64(options.get("timeout_seconds")),
+    };
+
+    let auto_model = process
+        .get("auto_model")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let make_m4b = options
+        .get("m4b")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let stitch = options
+        .get("stitch")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(PreparedOutcome::Ready(Box::new(PreparedRetry {
+        out_dir,
+        input_path,
+        model_opt: model_for_child.filter(|model| !model.is_empty()),
+        provider,
+        voice,
+        format,
+        speed,
+        max_chars,
+        concurrency,
+        instructions: options_string(&options, "instructions"),
+        base_url: options_string(&options, "base_url"),
+        advanced,
+        make_m4b,
+        stitch_audio: make_m4b || stitch,
+        auto_model,
+        options_snapshot: options,
+        failed_count,
+    })))
+}
+
+fn u32_checked(value: Option<&serde_json::Value>) -> Option<u32> {
+    value
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn options_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    value.and_then(serde_json::Value::as_u64)
+}
+
+/// Relaunch one finished-but-failed audiobook operation in place with the
+/// CLI's `--retry-failed` flag: only chunks the prior manifest marked failed
+/// may reach the provider, everything else is cache-validated.
+async fn retry_failed_chunks(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(req): Json<RetryFailedRequest>,
+) -> Result<Response, AppError> {
+    if !valid_audiobook_id(&id) {
+        return Ok(bad_request("invalid audiobook operation id"));
+    }
+    if let Some(response) = reject_mutation(&headers, &state) {
+        return Ok(response);
+    }
+
+    let upload_dir = state.upload_dir.clone();
+    let retry_id = id.clone();
+    let prepared =
+        tokio::task::spawn_blocking(move || prepare_retry_failed(&upload_dir, &retry_id)).await??;
+    let prepared = match prepared {
+        PreparedOutcome::NotFound => return Ok(debris_not_found_response()),
+        PreparedOutcome::Running => return Ok(debris_running_response()),
+        PreparedOutcome::Client(message) => return Ok(bad_request(&message)),
+        PreparedOutcome::Ready(prepared) => prepared,
+    };
+
+    // Key handling mirrors launch_audiobook exactly: a supplied key replaces
+    // the remembered session slot, remembered beats environment, loopback
+    // openai-compatible endpoints stay exempt from a paid cloud key.
+    let supplied = req
+        .api_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let key_slot = format!("audio:{}", prepared.provider);
+    if let Some(key) = supplied.clone() {
+        lock_keys(&state)?.insert(key_slot.clone(), key);
+    }
+    let key = resolve_audio_provider_key(&state, &prepared.provider)?;
+    if prepared.provider != "mock"
+        && key.is_none()
+        && !audio_provider_env_has_key(&prepared.provider)
+        && !(prepared.provider == "openai"
+            && prepared
+                .base_url
+                .as_deref()
+                .is_some_and(audio_base_url_is_loopback))
+    {
+        return Ok(bad_request("TTS provider API key is required"));
+    }
+
+    let api_key_env = (prepared.provider != "mock" && key.is_some())
+        .then(|| audio_provider_key_env(&prepared.provider))
+        .flatten();
+    let exe = std::env::current_exe()?;
+    let mut command = tokio::process::Command::new(exe);
+    command.args(audiobook_command_args(
+        &prepared.input_path,
+        &prepared.out_dir,
+        &prepared.provider,
+        prepared.model_opt.as_deref(),
+        &prepared.voice,
+        &prepared.format,
+        prepared.speed,
+        prepared.max_chars,
+        prepared.concurrency,
+        prepared.instructions.as_deref(),
+        prepared.base_url.as_deref(),
+        prepared.make_m4b,
+        prepared.stitch_audio,
+        api_key_env,
+        &prepared.advanced,
+    ));
+    command.arg("--retry-failed");
+    configure_dashboard_child_environment(&mut command, api_key_env.zip(key.as_deref()));
+
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(anyhow::Error::from(error)
+                .context("failed to spawn audiobook retry process")
+                .into());
+        }
+    };
+    let pid = child.id();
+    write_audio_process_state(
+        &prepared.out_dir,
+        "running",
+        pid,
+        None,
+        prepared.auto_model,
+        Some(&prepared.options_snapshot),
+    )?;
+    register_audio_cancellation(
+        &state,
+        id.clone(),
+        child,
+        prepared.out_dir.clone(),
+        pid,
+        prepared.auto_model,
+    );
+
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "mode": "spawned",
+        "retry_failed": true,
+        "failed_chunks": prepared.failed_count,
+        "pid": pid,
+    }))
+    .into_response())
 }

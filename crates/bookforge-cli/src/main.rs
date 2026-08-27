@@ -3,11 +3,13 @@ mod checkpoint;
 mod commands;
 mod control;
 mod cost;
+mod envelope;
 mod epoch;
 #[cfg(any(feature = "tui", feature = "serve"))]
 mod eventlog;
 mod exit_code;
 mod performance;
+mod presentation;
 mod progress;
 mod report;
 pub(crate) mod sanitize;

@@ -1049,18 +1049,60 @@ fn dashboard_ships_all_screen_renderers() {
     assert!(!DASHBOARD_HTML.contains("fonts.gstatic.com"));
 }
 
+/// Audit Feature-asymmetry closers: style-sheet + entity store management,
+/// and the audiobook flags that previously had no dashboard surface
+/// (chapters subset, text normalization, timeout, prune with a preview step,
+/// retry-failed relaunch). Every mutating call keeps the session-CSRF header
+/// convention.
+#[test]
+fn dashboard_ships_store_curation_screens_and_audio_parity_controls() {
+    for marker in [
+        "case \"styles\": return renderStyles(stage)",
+        "case \"entities\": return renderEntities(stage)",
+        "function renderStyles",
+        "async function loadStyles",
+        "async function bfStyleAdd",
+        "async function bfStyleSave",
+        "async function bfStyleRemove",
+        "function renderEntities",
+        "async function loadEntities",
+        "async function bfEntityAdd",
+        "async function bfEntitySave",
+        "async function bfEntityRemove",
+        "\"/api/styles\"",
+        "/api/styles/",
+        "\"/api/entities\"",
+        "/api/entities/",
+        // Audiobook parity remainder.
+        "id=\"a_chapters\"",
+        "id=\"a_text_normalization\"",
+        "id=\"a_timeout\"",
+        "fd.append(\"chapters\"",
+        "fd.append(\"text_normalization\"",
+        "timeout_seconds",
+        "bfAudiobookRetryFailed",
+        "/api/audiobooks/${encodeURIComponent(id)}/retry-failed",
+        "bfPrunePreview",
+        "/prune-preview",
+        "/prune",
+        "restricted",
+    ] {
+        assert!(DASHBOARD_HTML.contains(marker), "missing {marker}");
+    }
+}
+
 #[test]
 fn dashboard_assets_reassemble_byte_stably() {
     use sha2::{Digest, Sha256};
 
-    assert_eq!(DASHBOARD_HTML.len(), 118_849);
+    assert_eq!(DASHBOARD_HTML.len(), 140_521);
     assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
     assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
     let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
     let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
         digest_hex,
-        "dfe1806d8d93a812893a330200fad6458dfe696977be5b8062ff53fa4cade73b"
+        "c7594c607274db4075b704843f5d9cbd4010d1c3bfe410c1c12a329303362958"
     );
 
     let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");
@@ -1120,7 +1162,7 @@ fn csrf_token_is_hex_encoded_random_bytes() {
 // -----------------------------------------------------------------------
 
 use bookforge_core::segment::BlockTranslation;
-use bookforge_store::{CreateJob, SaveTranslation};
+use bookforge_store::{CreateJob, NewEntity, NewStyleSheet, SaveTranslation};
 use std::io::Write as _;
 
 const FIXTURE_CONTAINER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1377,8 +1419,54 @@ async fn post_json(
         .expect("route should respond")
 }
 
-/// GET with the default test session token; pass a deliberately different
-/// token to assert authentication behavior.
+/// PUT variant of [`post_json`] for the store-curation update routes.
+async fn axum_put_json(
+    router: &Router,
+    uri: &str,
+    csrf: Option<&str>,
+    body: serde_json::Value,
+) -> Response {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let mut builder = Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("host", TEST_HOST)
+        .header("content-type", "application/json");
+    if let Some(token) = csrf {
+        builder = builder.header(CSRF_HEADER, token);
+    }
+    router
+        .clone()
+        .oneshot(
+            builder
+                .body(Body::from(body.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond")
+}
+
+/// DELETE with the given CSRF header value (or none).
+async fn axum_delete(router: &Router, uri: &str, csrf: Option<&str>) -> Response {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let mut builder = Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("host", TEST_HOST);
+    if let Some(token) = csrf {
+        builder = builder.header(CSRF_HEADER, token);
+    }
+    router
+        .clone()
+        .oneshot(builder.body(Body::empty()).expect("request should build"))
+        .await
+        .expect("route should respond")
+}
+
 async fn get_route(router: &Router, uri: &str) -> Response {
     get_route_with_token(router, uri, Some("token-123")).await
 }
@@ -2244,13 +2332,17 @@ async fn auth_on_requires_session_tokens_on_representative_api_routes() {
     let router = dashboard_router(test_state("sekrit-token"));
 
     // Missing tokens: 401 on reads AND mutations, including the two heavy
-    // protectees (review documents, job listing) and options metadata.
+    // protectees (review documents, job listing) and options metadata, plus
+    // the store-curation reads added for style/entity parity.
     for uri in [
         "/api/jobs",
         "/api/jobs/some-job/review",
         "/api/jobs/some-job",
         "/api/options",
         "/api/providers",
+        "/api/styles",
+        "/api/entities",
+        "/api/audiobooks/some-op/prune-preview",
     ] {
         let response = router
             .clone()
@@ -2703,4 +2795,830 @@ async fn estimate_endpoint_parses_upload_from_a_private_temp_dir_end_to_end() {
     // 36 under the canonical chars/4-style estimator (was 33 under the
     // retired 4.5-chars/token dominant-class formula).
     assert_eq!(payload["input_tokens"], json!(36));
+}
+
+// -----------------------------------------------------------------------
+// Provider options <-> core registry sync (DUP-6 follow-through): the
+// dashboard must never grow a second copy of endpoint defaults, and the
+// per-provider capability flags it serves come from the same matrix
+// synthesis consults.
+// -----------------------------------------------------------------------
+
+#[test]
+fn dashboard_provider_options_stay_synced_with_core_registry() {
+    let options = dashboard_options_payload();
+
+    for provider in &options.providers {
+        match bookforge_core::providers::provider_defaults(provider.id) {
+            Some(defaults) => {
+                assert_eq!(
+                    provider.requires_base_url,
+                    defaults.base_url.is_none(),
+                    "{} base-url requirement must follow the registry",
+                    provider.id
+                );
+                assert!(
+                    provider.requires_key,
+                    "registry-backed cloud providers require keys"
+                );
+                assert_eq!(provider_key_env(provider.id), Some(defaults.api_key_env));
+                if let Some(default_model) = defaults.default_model {
+                    assert_eq!(provider.default_model, default_model);
+                }
+            }
+            None => {
+                // The only intentionally unregistered chip is the offline
+                // mock; anything else that appears here must be added to the
+                // core registry first.
+                assert_eq!(provider.id, "mock");
+                assert!(!provider.requires_key);
+                assert!(!provider.requires_base_url);
+            }
+        }
+    }
+
+    // Every env mapping the dashboard remembers must equal the registry's.
+    for (provider, env) in PROVIDER_KEY_ENVS {
+        assert_eq!(
+            bookforge_core::providers::provider_defaults(provider)
+                .map(|defaults| defaults.api_key_env),
+            Some(*env),
+            "{provider} env mapping drifted from the core registry"
+        );
+    }
+}
+
+#[test]
+fn audio_options_flag_text_normalization_from_the_capability_matrix() {
+    let options = dashboard_options_payload();
+    for provider in &options.audio_providers {
+        let expected = bookforge_audio::feature_set_for_id(provider.id)
+            .is_some_and(|features| features.text_normalization);
+        assert_eq!(
+            provider.supports_text_normalization, expected,
+            "{} text-normalization flag must mirror feature_set_for_id",
+            provider.id
+        );
+        assert!(
+            DASHBOARD_JS.contains("supports_text_normalization"),
+            "the browser must gate the control on the served flag"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
+// Style-sheet store CRUD on the dashboard (audit Feature-asymmetry: zero
+// dashboard endpoints -> full create/read/update/delete).
+// -----------------------------------------------------------------------
+
+fn global_style_toml(target_language: &str) -> String {
+    format!(
+        r#"[meta]
+schema_version = 1
+target_language = "{target_language}"
+
+[meta.scope]
+kind = "global"
+
+[register]
+narration = "literary"
+
+[voice]
+
+[do_not]
+
+[free_text]
+instructions = "Keep loanwords as-is."
+"#
+    )
+}
+
+#[tokio::test]
+async fn styles_crud_end_to_end_with_precise_single_row_delete() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let store_path = temp.path().join("jobs.sqlite");
+    let router = dashboard_router(test_state_with_store("token-123", store_path.clone()));
+
+    // Create.
+    let created = post_json(
+        &router,
+        "/api/styles",
+        Some("token-123"),
+        json!({
+            "target_language": "Italian",
+            "content_toml": global_style_toml("Italian"),
+            "scope": "global",
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK, "create");
+    let italian_id = response_json(created).await["id"]
+        .as_i64()
+        .expect("created id");
+
+    // Read (list + single + fingerprint derived like `style import` does).
+    let list = response_json(get_route(&router, "/api/styles").await).await;
+    assert_eq!(list.as_array().expect("array").len(), 1);
+    assert_eq!(list[0]["id"], italian_id);
+    assert_eq!(list[0]["target_language"], "Italian");
+    assert_eq!(list[0]["scope"], "global");
+    let record =
+        response_json(get_route(&router, &format!("/api/styles/{italian_id}")).await).await;
+    let content = record["content_toml"].as_str().expect("stored content");
+    assert_eq!(content, global_style_toml("Italian"));
+    let sheet = crate::commands::style::parse_style_toml(content).expect("valid stored TOML");
+    let merged = bookforge_core::style::merge_style_sheets(&[sheet]);
+    assert_eq!(
+        record["fingerprint"],
+        bookforge_core::style::style_fingerprint(merged.as_ref())
+    );
+
+    // Upsert duplicate identity updates rather than forks.
+    let mut updated_content = global_style_toml("Italian");
+    updated_content = updated_content.replace("\"literary\"", "\"lyrical\"");
+    let upserted = post_json(
+        &router,
+        "/api/styles",
+        Some("token-123"),
+        json!({ "target_language": "Italian", "content_toml": updated_content, "scope": "global" }),
+    )
+    .await;
+    assert_eq!(upserted.status(), StatusCode::OK);
+    assert_eq!(response_json(upserted).await["id"], json!(italian_id));
+
+    // Honest error states.
+    let empty_lang = post_json(
+        &router,
+        "/api/styles",
+        Some("token-123"),
+        json!({ "target_language": "  ", "content_toml": global_style_toml("Italian"), "scope": "global" }),
+    )
+    .await;
+    assert_eq!(empty_lang.status(), StatusCode::BAD_REQUEST);
+    let garbage = post_json(
+        &router,
+        "/api/styles",
+        Some("token-123"),
+        json!({ "target_language": "Italian", "content_toml": "[meta\nbroken", "scope": "global" }),
+    )
+    .await;
+    assert_eq!(garbage.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response_json(garbage).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invalid style sheet"),
+        "a malformed payload explains itself"
+    );
+    let no_scope_id = post_json(
+        &router,
+        "/api/styles",
+        Some("token-123"),
+        json!({
+            "target_language": "Italian",
+            "content_toml": global_style_toml("Italian"),
+            "scope": "book"
+        }),
+    )
+    .await;
+    assert_eq!(no_scope_id.status(), StatusCode::BAD_REQUEST);
+
+    // Update in place; identity change is refused with guidance.
+    let put = axum_put_json(
+        &router,
+        &format!("/api/styles/{italian_id}"),
+        Some("token-123"),
+        json!({ "content_toml": global_style_toml("Italian") }),
+    )
+    .await;
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_eq!(response_json(put).await["updated"], true);
+    let relanguage = axum_put_json(
+        &router,
+        &format!("/api/styles/{italian_id}"),
+        Some("token-123"),
+        json!({ "content_toml": global_style_toml("Spanish"), "target_language": "Spanish" }),
+    )
+    .await;
+    assert_eq!(relanguage.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response_json(relanguage).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("delete and recreate")
+    );
+
+    // Precise delete: a sibling Spanish row written directly into the same
+    // scope survives exactly intact while the Italian one is gone.
+    let direct_store = JobStore::open(store_path.clone()).expect("store reopen");
+    let spanish_content = global_style_toml("Spanish");
+    let spanish_sheet =
+        crate::commands::style::parse_style_toml(&spanish_content).expect("spanish parse");
+    let spanish_merged = bookforge_core::style::merge_style_sheets(&[spanish_sheet]);
+    let spanish_fp = bookforge_core::style::style_fingerprint(spanish_merged.as_ref());
+    direct_store
+        .upsert_style_sheet(&NewStyleSheet {
+            scope_kind: GlossaryScopeKind::Global,
+            scope_id: None,
+            target_language: "Spanish",
+            content_toml: &spanish_content,
+            fingerprint: &spanish_fp,
+        })
+        .expect("sibling seeded");
+
+    let missing_delete = axum_delete(&router, "/api/styles/99999", Some("token-123")).await;
+    assert_eq!(missing_delete.status(), StatusCode::NOT_FOUND);
+
+    let deleted = axum_delete(
+        &router,
+        &format!("/api/styles/{italian_id}"),
+        Some("token-123"),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(response_json(deleted).await["removed"], 1);
+
+    let remaining = response_json(get_route(&router, "/api/styles").await).await;
+    let rows = remaining.as_array().expect("rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the untouched sibling remains: {remaining}"
+    );
+    assert_eq!(rows[0]["target_language"], "Spanish");
+    assert_eq!(rows[0]["content_toml"], json!(spanish_content));
+    assert_eq!(rows[0]["fingerprint"], json!(spanish_fp));
+
+    // Removal is proven by content: the Italian triple cannot resolve again
+    // (a matching-sheet read now misses), while unknown numeric ids stay 404.
+    let repolished = post_json(
+        &router,
+        "/api/styles",
+        Some("token-123"),
+        json!({
+            "target_language": "Italian",
+            "content_toml": global_style_toml("Italian"),
+            "scope": "global"
+        }),
+    )
+    .await;
+    let second_italian_id = response_json(repolished).await["id"].as_i64().expect("id");
+    let wiped = axum_delete(
+        &router,
+        &format!("/api/styles/{second_italian_id}"),
+        Some("token-123"),
+    )
+    .await;
+    assert_eq!(wiped.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn store_asset_mutations_reject_missing_dashboard_token() {
+    // Styles: create / update / delete.
+    let add_style = post_json(
+        &dashboard_router(test_state("token-123")),
+        "/api/styles",
+        None,
+        json!({ "target_language": "Italian", "content_toml": "x", "scope": "global" }),
+    )
+    .await;
+    assert_eq!(add_style.status(), StatusCode::UNAUTHORIZED);
+
+    let put_style = axum_put_json(
+        &dashboard_router(test_state("token-123")),
+        "/api/styles/1",
+        None,
+        json!({ "content_toml": "x" }),
+    )
+    .await;
+    assert_eq!(put_style.status(), StatusCode::UNAUTHORIZED);
+
+    let delete_style = axum_delete(
+        &dashboard_router(test_state("token-123")),
+        "/api/styles/1",
+        None,
+    )
+    .await;
+    assert_eq!(delete_style.status(), StatusCode::UNAUTHORIZED);
+
+    // Entities: create / update / delete.
+    let add_entity = post_json(
+        &dashboard_router(test_state("token-123")),
+        "/api/entities",
+        None,
+        json!({
+            "source_name": "a", "target_name": "b",
+            "source_language": "English", "target_language": "Italian"
+        }),
+    )
+    .await;
+    assert_eq!(add_entity.status(), StatusCode::UNAUTHORIZED);
+
+    let put_entity = axum_put_json(
+        &dashboard_router(test_state("token-123")),
+        "/api/entities/1",
+        None,
+        json!({ "target_name": "b" }),
+    )
+    .await;
+    assert_eq!(put_entity.status(), StatusCode::UNAUTHORIZED);
+
+    let delete_entity = axum_delete(
+        &dashboard_router(test_state("token-123")),
+        "/api/entities/1",
+        None,
+    )
+    .await;
+    assert_eq!(delete_entity.status(), StatusCode::UNAUTHORIZED);
+}
+
+fn spanish_sibling_row() -> NewEntity<'static> {
+    NewEntity {
+        scope_kind: GlossaryScopeKind::Global,
+        scope_id: None,
+        source_name: "Samwise Gamgee",
+        target_name: "Sancho Panza",
+        gender_target: None,
+        role: Some("gardener"),
+        notes: None,
+        source_language: "English",
+        target_language: "Spanish",
+    }
+}
+
+fn seed_spanish_sibling(store_path: &std::path::Path) {
+    let store = JobStore::open(store_path).expect("store reopen");
+    store
+        .upsert_entities(&[spanish_sibling_row()])
+        .expect("sibling row seeded");
+}
+
+#[tokio::test]
+async fn entities_crud_end_to_end_with_precise_single_row_delete() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let store_path = temp.path().join("jobs.sqlite");
+    let router = dashboard_router(test_state_with_store("token-123", store_path.clone()));
+
+    // Create.
+    let created = post_json(
+        &router,
+        "/api/entities",
+        Some("token-123"),
+        json!({
+            "source_name": "Frodo Baggins",
+            "target_name": "Frodo Baggins",
+            "gender": "m",
+            "role": "ring-bearer",
+            "notes": "protagonist",
+            "source_language": "English",
+            "target_language": "Italian",
+            "scope": "global"
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK, "create");
+    let frodo_id = response_json(created).await["id"]
+        .as_i64()
+        .expect("created id");
+
+    // Read list + single.
+    let list = response_json(get_route(&router, "/api/entities").await).await;
+    assert_eq!(list.as_array().expect("rows").len(), 1);
+    assert_eq!(list[0]["id"], frodo_id);
+    assert_eq!(list[0]["source"], "Frodo Baggins");
+    assert_eq!(list[0]["gender"], "m");
+    assert_eq!(list[0]["role"], "ring-bearer");
+    assert_eq!(list[0]["target_language"], "Italian");
+    let single =
+        response_json(get_route(&router, &format!("/api/entities/{frodo_id}")).await).await;
+    assert_eq!(single["id"], frodo_id);
+
+    // Validation refusals: unknown gender code and scoped-without-id.
+    let bad_gender = post_json(
+        &router,
+        "/api/entities",
+        Some("token-123"),
+        json!({
+            "source_name": "x", "target_name": "y", "gender": "q",
+            "source_language": "English", "target_language": "Italian"
+        }),
+    )
+    .await;
+    assert_eq!(bad_gender.status(), StatusCode::BAD_REQUEST);
+    let missing_scope_id = post_json(
+        &router,
+        "/api/entities",
+        Some("token-123"),
+        json!({
+            "source_name": "x", "target_name": "y",
+            "source_language": "English", "target_language": "Italian",
+            "scope": "book"
+        }),
+    )
+    .await;
+    assert_eq!(missing_scope_id.status(), StatusCode::BAD_REQUEST);
+
+    // Update mutable fields; identity echo mismatch is refused.
+    let put = axum_put_json(
+        &router,
+        &format!("/api/entities/{frodo_id}"),
+        Some("token-123"),
+        json!({ "target_name": "Frodo", "gender": null, "role": null, "notes": null }),
+    )
+    .await;
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_eq!(response_json(put).await["updated"], true);
+    let renamed_identity = axum_put_json(
+        &router,
+        &format!("/api/entities/{frodo_id}"),
+        Some("token-123"),
+        json!({ "target_name": "Frodo", "source_name": "Bilbo" }),
+    )
+    .await;
+    assert_eq!(renamed_identity.status(), StatusCode::BAD_REQUEST);
+
+    // Precise delete with a Spanish sibling seeded directly through the
+    // store upsert API.
+    seed_spanish_sibling(&store_path);
+    let missing_delete = axum_delete(&router, "/api/entities/99999", Some("token-123")).await;
+    assert_eq!(missing_delete.status(), StatusCode::NOT_FOUND);
+    let deleted = axum_delete(
+        &router,
+        &format!("/api/entities/{frodo_id}"),
+        Some("token-123"),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(response_json(deleted).await["removed"], 1);
+
+    let remaining = response_json(get_route(&router, "/api/entities").await).await;
+    let rows = remaining.as_array().expect("rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the untouched sibling remains: {remaining}"
+    );
+    assert_eq!(rows[0]["target_language"], "Spanish");
+    assert_eq!(rows[0]["source"], "Samwise Gamgee");
+
+    // The sibling kept its stored fields untouched, including the manual
+    // correction applied above, which the request never saw.
+    let rows = JobStore::open(store_path)
+        .expect("store reopen")
+        .list_entities(None, None, None, None)
+        .expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source_name, "Samwise Gamgee");
+    assert_eq!(rows[0].target_name, "Sancho Panza");
+    assert_eq!(rows[0].role.as_deref(), Some("gardener"));
+}
+
+// -----------------------------------------------------------------------
+// AUDIO-6/8 remainder parity on the dashboard: chapters passthrough,
+// text normalization gating, timeout, prune preview/execute, retry-failed
+// relaunch validation.
+// -----------------------------------------------------------------------
+
+#[test]
+fn audiobook_command_args_forward_chapters_normalization_and_timeout() {
+    let advanced = AudiobookCommandOptions {
+        seed: Some(7),
+        language: Some("pt-BR".to_string()),
+        chapters: Some("1-3,7".to_string()),
+        text_normalization: Some("off".to_string()),
+        timeout_seconds: Some(90),
+        ..AudiobookCommandOptions::default()
+    };
+    let args = audiobook_command_args(
+        Path::new("book.epub"),
+        Path::new("audio-out"),
+        "elevenlabs",
+        None,
+        "voice-id",
+        "mp3",
+        1.0,
+        2_000,
+        4,
+        None,
+        None,
+        true,
+        true,
+        None,
+        &advanced,
+    );
+    let args: Vec<String> = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect();
+    for pair in [
+        ("--chapters", "1-3,7"),
+        ("--text-normalization", "off"),
+        ("--timeout-seconds", "90"),
+    ] {
+        let index = args
+            .iter()
+            .position(|value| value == pair.0)
+            .unwrap_or_else(|| panic!("{} must be forwarded", pair.0));
+        assert_eq!(args.get(index + 1).map(String::as_str), Some(pair.1));
+    }
+
+    // Unset values stay off the command line (CLI defaults cover them),
+    // mirroring launch_audiobook's skip rules.
+    let default_args = audiobook_command_args(
+        Path::new("book.epub"),
+        Path::new("audio-out"),
+        "openai",
+        Some("gpt-4o-mini-tts"),
+        "alloy",
+        "mp3",
+        1.0,
+        4_096,
+        4,
+        None,
+        None,
+        true,
+        true,
+        None,
+        &AudiobookCommandOptions::default(),
+    );
+    for flag in ["--chapters", "--text-normalization", "--timeout-seconds"] {
+        assert!(
+            !default_args.iter().any(|arg| arg == flag),
+            "{flag} must be omitted when unset"
+        );
+    }
+}
+
+#[test]
+fn chapter_ranges_roundtrip_through_the_shared_cli_parser() {
+    use crate::commands::audiobook::parse_chapter_ranges;
+
+    assert_eq!(
+        format_chapter_ranges(&parse_chapter_ranges("3").unwrap()),
+        "3"
+    );
+    assert_eq!(
+        format_chapter_ranges(&parse_chapter_ranges("1-3, 7").unwrap()),
+        "1-3,7"
+    );
+    assert_eq!(
+        format_chapter_ranges(&parse_chapter_ranges("2,3,9-11,5").unwrap()),
+        "2-3,5,9-11"
+    );
+}
+
+fn write_prune_fixture(upload_dir: &Path, id: &str, options: serde_json::Value) -> PathBuf {
+    let out_dir = upload_dir.join(format!("audiobook-{id}"));
+    std::fs::create_dir_all(&out_dir).expect("operation directory");
+    std::fs::write(
+        out_dir.join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "title": null,
+            "synthesis_id": "mock:mock-silence",
+            "voice": "mock",
+            "format": "wav",
+            "speed": 1.0,
+            "max_chars": 2000,
+            "gaps": {"chapter_ms": 1200, "title_ms": 800, "paragraph_ms": 0},
+            "chapters": 1,
+            "chunks": [{
+                "chapter_index": 0,
+                "chapter_title": "One",
+                "part": 1,
+                "kind": "body",
+                "file": "chapter-001-part-001-aabbccddeeff0011.wav",
+                "chars": 40,
+                "synthesis_sha256": "a".repeat(64),
+                "status": "synthesized"
+            }],
+            "status": "succeeded"
+        }))
+        .expect("manifest should serialize"),
+    )
+    .expect("manifest written");
+    std::fs::write(
+        out_dir.join("process.json"),
+        serde_json::to_vec(&json!({
+            "status": "succeeded",
+            "pid": null,
+            "error": null,
+            "auto_model": false,
+            "options": options,
+            "updated_at_ms": 1
+        }))
+        .expect("process state should serialize"),
+    )
+    .expect("process written");
+    // One crash-debris file plus one orphaned-but-managed chunk from an older
+    // settings mix; both are prunable when the plan is a full plan, while the
+    // kept chunk above is not.
+    std::fs::write(out_dir.join(".audiobook.m4b.42.part.m4b"), b"debris").expect("debris written");
+    std::fs::write(
+        out_dir.join("chapter-001-part-002-deadbeefdeadbeef.wav"),
+        vec![0u8; 100],
+    )
+    .expect("orphan chunk written");
+    out_dir
+}
+
+#[tokio::test]
+async fn prune_preview_lists_debris_then_confirm_removes_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let _ = write_prune_fixture(temp.path(), "fullplan", full_plan_options_json());
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        temp.path().to_path_buf(),
+    ));
+
+    let preview = get_route(&router, "/api/audiobooks/fullplan/prune-preview").await;
+    assert_eq!(preview.status(), StatusCode::OK);
+    let payload = response_json(preview).await;
+    assert_eq!(
+        payload["stale_files"], 2,
+        "debris + orphan chunk: {payload}"
+    );
+    assert_eq!(payload["restricted"], false);
+    assert!(payload["stale_bytes"].as_u64().expect("bytes") >= 106);
+
+    let executed = post_json(
+        &router,
+        "/api/audiobooks/fullplan/prune",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(executed.status(), StatusCode::OK);
+    let removed = response_json(executed).await;
+    assert_eq!(removed["removed"], 2);
+    assert!(removed["freed_bytes"].as_u64().expect("freed") > 0);
+
+    let after =
+        response_json(get_route(&router, "/api/audiobooks/fullplan/prune-preview").await).await;
+    assert_eq!(after["stale_files"], 0, "second preview is empty: {after}");
+}
+
+fn full_plan_options_json() -> serde_json::Value {
+    json!({
+        "provider": "mock", "model": "", "voice": "mock", "format": "wav",
+        "speed": 1.0, "max_chars": 2000, "concurrency": 2,
+        "instructions": null, "base_url": null, "gap_chapter_ms": null,
+        "gap_title_ms": null, "single": false, "loudnorm": false,
+        "m4b": false, "stitch": false, "seed": null, "language": null,
+        "chapters": null, "text_normalization": null, "timeout_seconds": null
+    })
+}
+
+#[tokio::test]
+async fn prune_degrades_to_debris_only_for_subset_runs_and_refuses_running_ops() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let _ = write_prune_fixture(temp.path(), "subsetrun", json!({ "chapters": "1-3" }));
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        temp.path().to_path_buf(),
+    ));
+
+    let preview =
+        response_json(get_route(&router, "/api/audiobooks/subsetrun/prune-preview").await).await;
+    assert_eq!(preview["restricted"], true, "{preview}");
+    // Only the crash-debris shape is offered; managed chunk names cannot be
+    // judged stale without the source book to re-plan against.
+    assert_eq!(preview["stale_files"], 1);
+
+    let unknown = get_route(&router, "/api/audiobooks/nope/prune-preview").await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    // A live operation is refused before anything is listed or deleted.
+    let out_dir = temp.path().join("audiobook-liveone");
+    std::fs::create_dir_all(&out_dir).expect("operation dir");
+    std::fs::write(
+        out_dir.join("process.json"),
+        serde_json::to_vec(&json!({"status":"running"})).expect("json should serialize"),
+    )
+    .expect("process overwritten");
+    let preview_live = get_route(&router, "/api/audiobooks/liveone/prune-preview").await;
+    assert_eq!(preview_live.status(), StatusCode::CONFLICT);
+    let prune_live = post_json(
+        &router,
+        "/api/audiobooks/liveone/prune",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(prune_live.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn retry_failed_validates_manifest_state_before_spawning_anything() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        temp.path().to_path_buf(),
+    ));
+
+    // Unknown operation.
+    let unknown = post_json(
+        &router,
+        "/api/audiobooks/nosuch/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    // A run with recorded settings but zero failed chunks refuses honestly.
+    let _ = write_prune_fixture(temp.path(), "cleanop", full_plan_options_json());
+    let clean = post_json(
+        &router,
+        "/api/audiobooks/cleanop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(clean.status(), StatusCode::BAD_REQUEST, "{clean:?}");
+    let clean_error = response_json(clean).await["error"]
+        .as_str()
+        .expect("error string")
+        .to_string();
+    assert!(
+        clean_error.contains("no failed chunks"),
+        "clean relaunch must refuse honestly: {clean_error}"
+    );
+
+    // A genuinely failed chunk whose process.json predates relaunch metadata
+    // explains why it cannot relaunch rather than guessing at flags.
+    let legacy_dir = write_prune_fixture(temp.path(), "legacyop", json!({}));
+    std::fs::write(
+        legacy_dir.join("process.json"),
+        serde_json::to_vec(&json!({"status": "failed"})).expect("json should serialize"),
+    )
+    .expect("process rewritten");
+    flip_first_chunk_status(&legacy_dir, "failed");
+
+    let legacy = post_json(
+        &router,
+        "/api/audiobooks/legacyop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(legacy.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response_json(legacy).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("relaunch settings are unavailable"),
+        "legacy relaunch must be refused with a usable explanation"
+    );
+
+    // The original upload is required to relaunch in place.
+    let with_options_dir = write_prune_fixture(temp.path(), "noinp", full_plan_options_json());
+    std::fs::write(
+        with_options_dir.join("process.json"),
+        serde_json::to_vec(&json!({
+            "status": "failed",
+            "pid": null,
+            "error": null,
+            "auto_model": false,
+            "options": full_plan_options_json(),
+            "updated_at_ms": 3
+        }))
+        .expect("json should serialize"),
+    )
+    .expect("process rewritten");
+    flip_first_chunk_status(&with_options_dir, "failed");
+    std::fs::remove_file(temp.path().join("audiobook-noinp.epub")).ok();
+
+    let no_input = post_json(
+        &router,
+        "/api/audiobooks/noinp/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(no_input.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response_json(no_input).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("original EPUB is no longer stored")
+    );
+
+    // Auth: every new mutation endpoint rejects anonymous callers.
+    for uri in ["/api/audiobooks/x/prune", "/api/audiobooks/x/retry-failed"] {
+        let rejected = post_json(&router, uri, None, json!({})).await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+}
+
+/// Flip the first manifest chunk's status so `failed_chunk_files` reports a
+/// genuine failure state for relaunch validation tests.
+fn flip_first_chunk_status(operation_dir: &Path, status: &str) {
+    let path = operation_dir.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("manifest read"))
+            .expect("manifest parse");
+    let chunks = manifest["chunks"].as_array_mut().expect("chunks array");
+    chunks[0]["status"] = json!(status);
+    std::fs::write(&path, manifest.to_string()).expect("manifest rewritten");
 }

@@ -49,10 +49,12 @@ use crate::eventlog::{EventLogTailer, events_path_for};
 
 mod assets;
 mod audio;
+mod entities;
 mod glossary;
 mod jobs;
 mod options;
 mod security;
+mod styles;
 mod translation;
 
 use super::{audiobook, correct, estimate, reconfigure, review, validate};
@@ -573,6 +575,8 @@ fn dashboard_router(state: AppState) -> Router {
         .merge(audio::routes())
         .merge(translation::routes())
         .merge(glossary::routes())
+        .merge(styles::routes())
+        .merge(entities::routes())
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         // H-5 / SERVE-1: every route outside the `/` bootstrap exchange must
         // carry the session token; hardened headers are stamped onto every

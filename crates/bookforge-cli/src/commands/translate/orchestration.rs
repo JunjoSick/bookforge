@@ -120,14 +120,10 @@ pub(super) fn resolve_settings_and_plan(
 }
 
 pub(super) fn human_stdout_enabled(ui: crate::progress::UiMode) -> bool {
-    // The TUI owns the screen, so suppress plain stdout/stderr prints that would
-    // corrupt it; the dashboard surfaces the same information.
-    !matches!(
-        ui,
-        crate::progress::UiMode::Json
-            | crate::progress::UiMode::Quiet
-            | crate::progress::UiMode::Tui
-    )
+    // The TUI owns the screen, and machine-JSON modes own the stdout stream,
+    // so suppress plain stdout/stderr prints that would corrupt them
+    // (UI-22; single source of truth in `UiMode` so `json-v1` cannot drift).
+    ui.human_stdout()
 }
 
 async fn finalize_reporter<T>(

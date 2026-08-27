@@ -221,7 +221,9 @@ pub struct AudiobookArgs {
     pub retry_failed: bool,
 
     /// Progress output mode. `tui` opens an attached full-screen audiobook
-    /// dashboard; `json` emits one JSON object per completed chunk.
+    /// dashboard; `json` emits one versioned-envelope JSON line per completed
+    /// chunk and plan milestone (`kind:"audiobook"`, see docs/events.md);
+    /// `json-v1` keeps the deprecated raw `{"event":…}` lines.
     #[arg(long, value_enum, default_value_t = UiMode::Auto)]
     pub ui: UiMode,
 }
@@ -230,6 +232,30 @@ pub struct AudiobookArgs {
 struct QuotaInfo {
     remaining: u64,
     limit: u64,
+}
+
+/// Single choke point for every stdout JSON line this command emits (UI-23):
+/// `--ui json` wraps payloads in the versioned envelope (`kind:"audiobook"`,
+/// see `crate::envelope`); the deprecated `--ui json-v1` alias keeps the
+/// legacy raw `{"event":…}` lines byte-compatible for existing consumers.
+#[derive(Debug, Clone, Copy)]
+struct AudiobookJson(UiMode);
+
+impl AudiobookJson {
+    fn enabled(&self) -> bool {
+        matches!(self.0, UiMode::Json | UiMode::JsonV1)
+    }
+
+    fn emit(&self, payload: serde_json::Value) {
+        if self.0 == UiMode::Json {
+            println!(
+                "{}",
+                crate::envelope::stdout_line(crate::envelope::KIND_AUDIOBOOK, &payload)
+            );
+        } else if self.0 == UiMode::JsonV1 {
+            println!("{payload}");
+        }
+    }
 }
 
 pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
@@ -248,14 +274,12 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     // quota checks) previously ran without any feedback before the header
     // printed. Emit early progress so users know the command is alive (and
     // so `--ui json` streams a machine-readable start marker).
+    let json_out = AudiobookJson(args.ui);
     match args.ui {
-        UiMode::Json => println!(
-            "{}",
-            serde_json::json!({
-                "event": "audiobook_planning_started",
-                "input": input.display().to_string(),
-            })
-        ),
+        UiMode::Json | UiMode::JsonV1 => json_out.emit(serde_json::json!({
+            "event": "audiobook_planning_started",
+            "input": input.display().to_string(),
+        })),
         UiMode::Quiet | UiMode::Tui => {}
         UiMode::Auto | UiMode::Progress => println!("Planning audio chunks..."),
     }
@@ -493,15 +517,12 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     // Detected sizes land before provider cost/quota preflights, which can
     // take seconds on hosted providers — surface them as soon as they exist.
     match args.ui {
-        UiMode::Json => println!(
-            "{}",
-            serde_json::json!({
-                "event": "audiobook_plan_detected_sizes",
-                "chapters": chapter_count,
-                "chunks": plan.len(),
-                "characters": total_chars,
-            })
-        ),
+        UiMode::Json | UiMode::JsonV1 => json_out.emit(serde_json::json!({
+            "event": "audiobook_plan_detected_sizes",
+            "chapters": chapter_count,
+            "chunks": plan.len(),
+            "characters": total_chars,
+        })),
         UiMode::Quiet | UiMode::Tui => {}
         UiMode::Auto | UiMode::Progress => println!(
             "Detected {} chapters, {} chunks, {total_chars} characters; estimating cost...",
@@ -522,7 +543,7 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     )
     .await;
 
-    let human_output = !matches!(args.ui, UiMode::Quiet | UiMode::Json | UiMode::Tui);
+    let human_output = args.ui.human_stdout();
     if human_output {
         println!("Input: {}", input.display());
         // EPUB metadata is externally controlled; sanitize before the
@@ -577,41 +598,8 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         } else {
             Vec::new()
         };
-        if args.ui == UiMode::Json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "audiobook_plan",
-                    "chapters": chapter_count,
-                    "chunks": plan.len(),
-                    "characters": total_chars,
-                    "provider": provider_name,
-                    "model": model,
-                    "estimated_cost_usd": estimated_cost.and_then(|cost| cost.usd),
-                    "estimated_credits": estimated_cost.and_then(|cost| cost.credits),
-                    "quota_remaining": quota.map(|quota| quota.remaining),
-                    "quota_limit": quota.map(|quota| quota.limit),
-                    "book_file": make_m4b,
-                    "single_file": args.single,
-                    "dry_run": true,
-                    "stale_chunks": stale.len(),
-                    "stale_bytes": stale.iter().map(|chunk| chunk.bytes).sum::<u64>(),
-                    "model_degraded_reason": &degraded_model_reason,
-                })
-            );
-        } else if human_output {
-            println!("Dry run: no audio synthesized.");
-            if args.prune {
-                report_stale_chunks(&stale, true);
-            }
-        }
-        return Ok(());
-    }
-
-    if args.ui == UiMode::Json {
-        println!(
-            "{}",
-            serde_json::json!({
+        if json_out.enabled() {
+            json_out.emit(serde_json::json!({
                 "event": "audiobook_plan",
                 "chapters": chapter_count,
                 "chunks": plan.len(),
@@ -624,10 +612,37 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                 "quota_limit": quota.map(|quota| quota.limit),
                 "book_file": make_m4b,
                 "single_file": args.single,
-                "dry_run": false,
+                "dry_run": true,
+                "stale_chunks": stale.len(),
+                "stale_bytes": stale.iter().map(|chunk| chunk.bytes).sum::<u64>(),
                 "model_degraded_reason": &degraded_model_reason,
-            })
-        );
+            }));
+        } else if human_output {
+            println!("Dry run: no audio synthesized.");
+            if args.prune {
+                report_stale_chunks(&stale, true);
+            }
+        }
+        return Ok(());
+    }
+
+    if json_out.enabled() {
+        json_out.emit(serde_json::json!({
+            "event": "audiobook_plan",
+            "chapters": chapter_count,
+            "chunks": plan.len(),
+            "characters": total_chars,
+            "provider": provider_name,
+            "model": model,
+            "estimated_cost_usd": estimated_cost.and_then(|cost| cost.usd),
+            "estimated_credits": estimated_cost.and_then(|cost| cost.credits),
+            "quota_remaining": quota.map(|quota| quota.remaining),
+            "quota_limit": quota.map(|quota| quota.limit),
+            "book_file": make_m4b,
+            "single_file": args.single,
+            "dry_run": false,
+            "model_degraded_reason": &degraded_model_reason,
+        }));
     }
 
     #[cfg(feature = "tui")]
@@ -731,25 +746,22 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                 "Retry: rerun the same command with --retry-failed to call the provider only for these failures."
             );
             eprintln!("Manifest: {}", report.manifest_path.display());
-        } else if args.ui == UiMode::Json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "audiobook_finished",
-                    "status": "failed",
-                    "synthesized": report.chunks_synthesized,
-                    "cached": report.chunks_skipped,
-                    "failed": report.chunks_failed,
-                    "chunks": report.chunks_total,
-                    "manifest": report.manifest_path,
-                    "chunk_files": report.files,
-                    "chapter_files": [],
-                    "audiobook": null,
-                    "single_file": null,
-                    "failures": report.failures,
-                    "warnings": [],
-                })
-            );
+        } else if json_out.enabled() {
+            json_out.emit(serde_json::json!({
+                "event": "audiobook_finished",
+                "status": "failed",
+                "synthesized": report.chunks_synthesized,
+                "cached": report.chunks_skipped,
+                "failed": report.chunks_failed,
+                "chunks": report.chunks_total,
+                "manifest": report.manifest_path,
+                "chunk_files": report.files,
+                "chapter_files": [],
+                "audiobook": null,
+                "single_file": null,
+                "failures": report.failures,
+                "warnings": [],
+            }));
         }
         anyhow::bail!(
             "{} audiobook chunk(s) failed; successful chunks are resumable from {}",
@@ -837,26 +849,23 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         for error in &deliverable_errors {
             eprintln!("error: {error}");
         }
-    } else if args.ui == UiMode::Json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "event": "audiobook_finished",
-                "status": final_status,
-                "deliverable_status": deliverable_status,
-                "synthesized": report.chunks_synthesized,
-                "cached": report.chunks_skipped,
-                "failed": 0,
-                "chunks": report.chunks_total,
-                "manifest": report.manifest_path,
-                "chunk_files": report.files,
-                "chapter_files": stitch_report.as_ref().map(|result| &result.chapter_files),
-                "audiobook": stitch_report.as_ref().and_then(|result| result.book_file.as_ref()),
-                "single_file": stitch_report.as_ref().and_then(|result| result.single_file.as_ref()),
-                "warnings": stitch_report.as_ref().map(|result| &result.warnings),
-                "deliverable_errors": deliverable_errors,
-            })
-        );
+    } else if json_out.enabled() {
+        json_out.emit(serde_json::json!({
+            "event": "audiobook_finished",
+            "status": final_status,
+            "deliverable_status": deliverable_status,
+            "synthesized": report.chunks_synthesized,
+            "cached": report.chunks_skipped,
+            "failed": 0,
+            "chunks": report.chunks_total,
+            "manifest": report.manifest_path,
+            "chunk_files": report.files,
+            "chapter_files": stitch_report.as_ref().map(|result| &result.chapter_files),
+            "audiobook": stitch_report.as_ref().and_then(|result| result.book_file.as_ref()),
+            "single_file": stitch_report.as_ref().and_then(|result| result.single_file.as_ref()),
+            "warnings": stitch_report.as_ref().map(|result| &result.warnings),
+            "deliverable_errors": deliverable_errors,
+        }));
     }
 
     if !strict_deliverable_errors.is_empty() {
@@ -880,15 +889,12 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         }
         let (removed, freed) = bookforge_audio::remove_stale_chunks(&stale)
             .with_context(|| format!("removing stale chunks in {}", out_dir.display()))?;
-        if args.ui == UiMode::Json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "audiobook_pruned",
-                    "removed": removed,
-                    "freed_bytes": freed,
-                })
-            );
+        if json_out.enabled() {
+            json_out.emit(serde_json::json!({
+                "event": "audiobook_pruned",
+                "removed": removed,
+                "freed_bytes": freed,
+            }));
         } else if human_output || fallback_tui_output {
             if removed == 0 {
                 println!("Prune: no stale chunks from earlier runs.");
@@ -1232,20 +1238,18 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn progress_callback(ui: UiMode, total: usize) -> Arc<dyn Fn(Progress) + Send + Sync> {
-    if ui == UiMode::Json {
-        return Arc::new(|event: Progress| {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "audiobook_chunk_finished",
-                    "done": event.done,
-                    "total": event.total,
-                    "chapter": event.chapter_title,
-                    "cached": event.skipped,
-                    "failed": event.failed,
-                    "error": event.error,
-                })
-            );
+    if matches!(ui, UiMode::Json | UiMode::JsonV1) {
+        let json_out = AudiobookJson(ui);
+        return Arc::new(move |event: Progress| {
+            json_out.emit(serde_json::json!({
+                "event": "audiobook_chunk_finished",
+                "done": event.done,
+                "total": event.total,
+                "chapter": event.chapter_title,
+                "cached": event.skipped,
+                "failed": event.failed,
+                "error": event.error,
+            }));
         });
     }
     if ui == UiMode::Quiet {

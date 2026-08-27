@@ -663,8 +663,19 @@ fn audiobook_json_output_remains_json_through_stitching() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON event line"))
         .collect::<Vec<_>>();
     assert!(!events.is_empty());
-    assert_eq!(events.last().unwrap()["event"], "audiobook_finished");
-    assert_eq!(events.last().unwrap()["status"], "succeeded");
+    // UI-23: audiobook stdout uses the versioned envelope, with the legacy
+    // `{"event":…}` object preserved as the payload.
+    for event in &events {
+        assert_eq!(event["v"], 2, "envelope version: {event}");
+        assert_eq!(event["kind"], "audiobook", "envelope kind: {event}");
+        assert!(
+            event["payload"]["event"].is_string(),
+            "payload keeps its event discriminator: {event}"
+        );
+    }
+    let last = events.last().unwrap()["payload"].clone();
+    assert_eq!(last["event"], "audiobook_finished");
+    assert_eq!(last["status"], "succeeded");
 }
 
 #[test]
@@ -818,17 +829,21 @@ fn audiobook_dry_run_plan_matches_the_shared_launcher_pipeline() {
     let plan_event = stdout
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|event| event["event"] == "audiobook_plan")
-        .expect("dry run should emit an audiobook_plan event");
+        .find(|event| event["kind"] == "audiobook" && event["payload"]["event"] == "audiobook_plan")
+        .expect("dry run should emit an enveloped audiobook_plan event");
+    let plan_payload = plan_event["payload"].clone();
 
-    assert_eq!(plan_event["chapters"], chapters as u64, "{plan_event}");
-    assert_eq!(plan_event["chunks"], chunks as u64, "{plan_event}");
-    assert_eq!(plan_event["characters"], characters as u64, "{plan_event}");
+    assert_eq!(plan_payload["chapters"], chapters as u64, "{plan_payload}");
+    assert_eq!(plan_payload["chunks"], chunks as u64, "{plan_payload}");
+    assert_eq!(
+        plan_payload["characters"], characters as u64,
+        "{plan_payload}"
+    );
     // Degraded-model surfacing stays null unless a real ElevenLabs preflight
     // degraded; a mock run must not invent one.
     assert!(
-        plan_event["model_degraded_reason"].is_null(),
-        "{plan_event}"
+        plan_payload["model_degraded_reason"].is_null(),
+        "{plan_payload}"
     );
 }
 

@@ -1159,7 +1159,9 @@ fn normalized_scope_id(scope: GlossaryScopeKind, scope_id: Option<String>) -> Op
     }
 }
 
-fn parse_language_pair(value: &str) -> Result<(String, String)> {
+/// Parse a `SOURCE->TARGET` language pair (also accepts `:` or `/`),
+/// shared with sibling commands so filter syntax cannot drift.
+pub(crate) fn parse_language_pair(value: &str) -> Result<(String, String)> {
     for delimiter in ["->", ":", "/"] {
         if let Some((source, target)) = value.split_once(delimiter) {
             let source = source.trim();
