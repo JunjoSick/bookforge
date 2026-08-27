@@ -1,3 +1,15 @@
+//! Bounded-decompression budget for untrusted EPUB archives.
+//!
+//! Production code paths construct budgets exclusively through
+//! [`validate_archive_metadata`] with [`crate::archive_limits::DEFAULT_ARCHIVE_LIMITS`].
+//! The module is additionally exposed publicly under `#[doc(hidden)]` as a
+//! test-support surface: integration-test harnesses (hostile corpus,
+//! property harness) inject tiny explicit bounds via
+//! [`ArchiveReadBudget::new`] so zip-bomb and ratio-lie cases run in
+//! milliseconds instead of needing ≥64 MiB fixtures. Nothing in this module
+//! consults the injected limits at any other call site, and the production
+//! constants stay unchanged.
+
 use std::io::{Read, Seek};
 
 use bookforge_core::{BookforgeError, Result};
@@ -20,12 +32,12 @@ pub(crate) const MAX_ENTRY_COMPRESSION_RATIO: u64 = 200;
 pub(crate) const MAX_ARCHIVE_COMPRESSION_RATIO: u64 = 100;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ArchiveLimits {
-    pub(crate) max_entries: usize,
-    pub(crate) max_entry_uncompressed_size: u64,
-    pub(crate) max_total_uncompressed_size: u64,
-    pub(crate) max_entry_compression_ratio: u64,
-    pub(crate) max_archive_compression_ratio: u64,
+pub struct ArchiveLimits {
+    pub max_entries: usize,
+    pub max_entry_uncompressed_size: u64,
+    pub max_total_uncompressed_size: u64,
+    pub max_entry_compression_ratio: u64,
+    pub max_archive_compression_ratio: u64,
 }
 
 pub(crate) const DEFAULT_ARCHIVE_LIMITS: ArchiveLimits = ArchiveLimits {
@@ -37,20 +49,27 @@ pub(crate) const DEFAULT_ARCHIVE_LIMITS: ArchiveLimits = ArchiveLimits {
 };
 
 #[derive(Debug)]
-pub(crate) struct ArchiveReadBudget {
+pub struct ArchiveReadBudget {
     limits: ArchiveLimits,
     total_uncompressed_read: u64,
 }
 
 impl ArchiveReadBudget {
-    fn new(limits: ArchiveLimits) -> Self {
+    /// Test-support constructor (see module docs): builds a budget with
+    /// caller-supplied bounds. Production callers must keep going through
+    /// [`validate_archive_metadata`], which also checks declared archive
+    /// metadata before any entry bytes move.
+    pub fn new(limits: ArchiveLimits) -> Self {
         Self {
             limits,
             total_uncompressed_read: 0,
         }
     }
 
-    pub(crate) fn read_entry<R: Read + ?Sized>(
+    /// Read one entry through this budget's limits. Reads one byte past
+    /// the effective limit only, so lying compressed streams cannot balloon
+    /// allocations.
+    pub fn read_entry<R: Read + ?Sized>(
         &mut self,
         reader: &mut R,
         name: &str,
@@ -101,7 +120,10 @@ impl ArchiveReadBudget {
     }
 }
 
-pub(crate) fn validate_archive_metadata<R: Read + Seek>(
+/// Validate the archive's declared metadata against `limits` and return the
+/// per-entry read budget. Exposed publicly under the module's test-support
+/// contract; production callers always pass [`DEFAULT_ARCHIVE_LIMITS`].
+pub fn validate_archive_metadata<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     limits: ArchiveLimits,
 ) -> Result<ArchiveReadBudget> {
@@ -166,13 +188,23 @@ fn exceeds_ratio(uncompressed: u64, compressed: u64, maximum_ratio: u64) -> bool
 
 /// Read one text entry through the caller's budget and decode UTF-8.
 /// Every untrusted-archive read in the crate funnels here so the
-/// bounded-decompression guarantee has no exceptions.
-pub(crate) fn read_archive_text<R: Read + Seek>(
+/// bounded-decompression guarantee has no exceptions. ZIP-level failures are
+/// re-raised with the entry name attached: `zip::ZipError` alone reports
+/// "specified file not found in archive" with no hint of which declared
+/// path lied, leaving hostile manifests indistinguishable from code bugs.
+pub fn read_archive_text<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     read_budget: &mut ArchiveReadBudget,
     name: &str,
 ) -> Result<String> {
-    let mut file = archive.by_name(name)?;
+    let mut file = match archive.by_name(name) {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB entry '{name}' could not be opened: {error}"
+            )));
+        }
+    };
     let compressed_size = file.compressed_size();
     let bytes = read_budget.read_entry(&mut file, name, compressed_size)?;
     String::from_utf8(bytes).map_err(|error| {
