@@ -58,7 +58,8 @@ so a durable log replays identically for `watch`, `serve`, and `tail`.
 | `BatchSplit` | `batch_id`, `left_items`, `right_items` | An oversized/failed batch was bisected into two child batches. |
 | `BatchRepairStarted` | `failed_item_count` | The repair pass over failed batch items began. |
 | `BatchRepairFinished` | `repaired_items`, `still_failed_items` | Repair pass ended with these outcomes. |
-| `RequestStarted` | `request_id`, `batch_id?`, `segment_id?`, `provider?`, `model?`, `prompt_template?`, `items`, `estimated_input_tokens`, `max_output_tokens?`, `active_requests`, `target_concurrency` (+ optional `runtime_config_revision`, `provider_max_attempts`, serde-defaulted so older logs parse) | One provider request left. `active_requests` is the authoritative in-flight count at emit time — replay consumers sync to it rather than incrementing. |
+| `RequestStarted` | `request_id`, `batch_id?`, `segment_id?`, `provider?`, `model?`, `prompt_template?`, `items`, `estimated_input_tokens`, `max_output_tokens?`, `active_requests`, `target_concurrency` (+ optional `runtime_config_revision`, `provider_max_attempts`, `effective_timeout_seconds`, serde-defaulted so older logs parse) | One provider request left. `active_requests` is the authoritative in-flight count at emit time — replay consumers sync to it rather than incrementing. `effective_timeout_seconds` appears when the request's output budget extends the deadline beyond the configured timeout (latency-aware budgeting; never shorter than the configured value). |
+| `RequestProgress` | `batch_id`, `items`, `elapsed_ms`, `timestamp_ms` | In-flight heartbeat emitted every 5 s per outstanding request so long normal generations are distinguishable from a stall. Informational only: counters do not change and the event is deliberately not "important" for JSONL flush cadence. |
 | `RequestFinished` | `request_id`, `batch_id?`, `segment_id?`, `status`, `latency_ms`, `status_code?`, `finish_reason?`, `retry_count`, `input_tokens?`, `output_tokens?`, `error_kind?` | One provider attempt settled. `status: "ok"` means success; other statuses carry `error_kind`. |
 | `ConcurrencyChanged` | `previous`, `current`, `reason` | Adaptive concurrency retuned itself. |
 | `BatchSizingChanged` | `batch_id?`, `previous_target`, `new_target`, `previous_max_items`, `new_max_items`, `reason` | Adaptive batch sizing retuned itself. |
@@ -112,9 +113,31 @@ emitted:
 - `double_check_corrections_persisted` — the double-check pass applied model
   corrections that were persisted to the store; emitted at finalize so external
   observers get one ordered visibility point before terminal events drain.
+- `batch_latency_split` — a batch's output budget implied a generation time
+  beyond the latency-aware planning share, so it was split before dispatch
+  rather than risking a timeout against a legitimate generation.
+- `replacement_worker_died` — a supervised replacement worker (retry/resume
+  supervisor) exited without success; the message carries the exit status and
+  a bounded stderr tail. Respawns back off exponentially and terminate
+  boundedly after repeated failures instead of looping silently.
 - Repair/QA plumbing failures such as `repair_batch_failed`,
   `repair_batch_invalid_response`, `qa_request_failed`,
   `systemic_truncation`, and `retry_amplification`.
+
+### Structured QA findings
+
+Deterministic findings (source-copy hits, marker/mismatch violations, …) are
+persisted as structured rows in the store's `qa_findings` table with
+`kind`, instance `severity` (`error`/`warning`), a human-readable `message`,
+and — whenever the finding can be pinned to one block — a `block_id`. The kind
+vocabulary lives in `bookforge_core::finding::QaFindingKind`. Notable policy:
+a source-copy hit on a title/heading/short proper-noun block is a **warning**
+(leaving "Cannibal Capitalism" or an author line untranslated is editorially
+correct), while unchanged prose is an **error**. Pre-v3.0 rows without block
+attribution read `block_id = NULL`; segments whose error text predates
+structured findings are decomposed by the documented legacy parser
+(`bookforge_core::finding::findings_from_legacy_error_text`) so reports render
+the same vocabulary for old data.
 
 `DroppedEvents` records quantify in-process progress losses honestly. The
 progress channel between workers and renderers is bounded (2048 entries); if a

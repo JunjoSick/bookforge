@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+Dogfooding round on a real 400-page-scale EPUB (English→Italian, DeepSeek):
+fixes for every issue the live run surfaced.
+
+- **Latency-aware batch budgets:** batch planning caps output tokens so the
+  expected generation fits inside 80% of the request timeout, and the provider
+  extends an individual request's deadline to cover its own output budget
+  (never below the configured timeout, with a one-time log when it engages).
+  Large single-segment batches no longer race a fixed 180s deadline. A
+  slow-trickling-body regression test now proves the client timeout fires
+  mid-body instead of hanging.
+- **In-flight visibility:** `RequestProgress` heartbeats (every 5s per
+  outstanding request) make long normal generations distinguishable from a
+  stall, and `RequestStarted` gained an optional `effective_timeout_seconds`.
+- **Structured, block-attributed QA findings:** deterministic findings persist
+  with `kind`, instance severity, message, and `block_id` (migration 11).
+  Source-copy hits on title/heading/short proper-noun blocks are warnings —
+  leaving a book title or author line untranslated is editorially correct —
+  while unchanged prose stays an error. Reports, `status`, and the review page
+  prefer structured rows; legacy error strings decompose through a documented
+  parser. The CLI no longer regex-parses engine error text.
+- **Honest `estimate --pass-costs`:** per-pass surcharge lines plus a real
+  `Estimated total incl. passes` (the old line printed the surcharge alone,
+  less than the primary estimate). JSON events gained
+  `est_cost_usd_passes`/`est_cost_usd_total`.
+- **Supervised retries:** `retry` gains `--ui`, spawns a supervised
+  replacement worker whose deaths are surfaced (`replacement_worker_died`
+  events with exit status and stderr tail), respawn with exponential backoff,
+  and bounded give-up that marks the job honestly. Root-caused and fixed the
+  silent respawn loop from the dogfood run: the dashboard resume path held
+  the runtime launch claim across child spawn, so every replacement worker
+  bailed instantly on the claim check with its stderr discarded.
+- **Friendly validation errors:** persisted error text no longer leaks raw
+  serde internals ("missing field `translation` at line 1 column 157");
+  categorized plain-language sentences instead, with raw detail in debug logs.
+- `--no-thinking` and the provider connection flags gained real help text.
+
 ## v3.0.0 - 2026-08-27
 
 Remediation campaign for the 2026-08 deep audit (`docs/report.md`, waves 0–4),

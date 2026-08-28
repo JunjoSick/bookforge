@@ -15,7 +15,17 @@ Push it if absent: `git fetch origin && git checkout remediation/audit-2026-08`.
 3. **Serve auth (H-5):** token auth DEFAULT-ON (auto-generated session token, printed URL bootstraps browser, all API routes require it) with a `--no-auth` opt-out escape hatch.
 4. **Semver:** minor-breaking changes acceptable → final version bump likely **v3.0.0** (status enums replace magic strings, unified estimator changes cache keys, JSON envelope versioning).
 
-## 2. Current state — Waves 0–4 COMPLETE ✅ · Review round COMPLETE ✅ · v3.0.0 released (2026-08-27)
+## 2. Current state — Waves 0–4 COMPLETE ✅ · Review round COMPLETE ✅ · v3.0.0 released (2026-08-27) · Dogfooding round 1 complete (2026-08-28)
+
+**Dogfooding round 1** (real book: Cannibal Capitalism EN→IT, deepseek-v4-flash, ~$0.14 real spend, final EPUB EPUBCheck-valid with all chapters Italian; log: `test/DOGFOOD-2026-08-27.md`):
+
+- **Agent-ergonomics gotchas for future unattended sessions (learned the hard way):**
+  1. Background children die with the Bash tool-call teardown — `nohup … &` is NOT enough; launch long runs with `setsid nohup … < /dev/null & disown` and find the real PID via `pgrep -a bookforge` (`$!` after a pipeline captures the wrong process).
+  2. NEVER `pkill -f <pattern>` where the pattern appears in your own command line — it self-matches the tool shell and wedges the session for hours. Kill by explicit PID only.
+  3. Avoid touching paths outside the repo (e.g. `/tmp`) in unattended sessions — harness confirmations stall everything.
+  4. A frozen `events.jsonl` does NOT mean a hung engine — first verify the worker process is still alive.
+- **Product fixes landed for every dogfood finding** (see CHANGELOG `Unreleased`): latency-aware batch budgets + slow-trickle timeout proof, `RequestProgress` heartbeats + `effective_timeout_seconds`, structured block-attributed findings (migration 11, title/author blocks = warnings), honest `--pass-costs` totals, supervised retries with surfaced deaths + bounded give-up, root cause of the silent respawn loop fixed (dashboard resume held the launch claim across spawn), friendly validation errors, `--no-thinking`/connection-flag help text, `retry --ui`.
+- **Known residual (ticketed):** engine `BatchItemFailure.findings` are produced and persisted via the legacy-parse fallback; threading them through `SegmentTranslation` end-to-end (instead of the `ENGINE_FINDINGS_PLACEHOLDER`) is the last wiring step. Mixed-script bidi fixtures and the property-harness grammar extensions from the review round remain on the fast-follow list.
 
 All five audit waves executed to completion plus a professional pre-merge review round (six specialist reviewers: store integrity, serve security, llm engine, cli lifecycle, epub+pdf protocol, release readiness). Every BLOCKER/MAJOR finding from the review round was fixed and mutation/red-green verified before merge; P2/P3 leftovers are recorded as fast-follow tickets below.
 
