@@ -632,10 +632,33 @@ fn expected_batch_output_tokens(mode: BatchMode, items: &[TranslationBatchItem])
         .saturating_add(run_envelope)
 }
 
-fn configured_batch_output_limit(config: Option<&TranslationRunConfig>) -> Option<usize> {
+/// The configured provider timeout, when the run surfaces one through its
+/// live runtime settings. Library callers without runtime settings get `None`
+/// and planning then imposes no latency constraint (the provider-side
+/// per-request timeout extension still applies).
+pub(super) fn configured_timeout_seconds(config: Option<&TranslationRunConfig>) -> Option<u64> {
     config
+        .and_then(|config| config.runtime_settings.as_ref())
+        .map(|receiver| receiver.borrow().timeout_seconds)
+}
+
+fn configured_batch_output_limit(config: Option<&TranslationRunConfig>) -> Option<usize> {
+    let user_cap = config
         .and_then(|config| config.batch_max_output_tokens.or(config.max_output_tokens))
-        .map(|limit| limit as usize)
+        .map(|limit| limit as usize);
+    // Latency-aware output dimension: a batch whose expected output would
+    // take longer than 80% of the configured timeout to generate is treated
+    // as exceeding the output limit, so the normal planning machinery splits
+    // it instead of dispatching a request that can only succeed by luck.
+    // Single-item batches cannot split and keep their budget — the
+    // provider's per-request timeout extension covers them.
+    let latency_cap = configured_timeout_seconds(config)
+        .map(crate::latency::planning_output_token_cap)
+        .map(|limit| limit as usize);
+    match (user_cap, latency_cap) {
+        (Some(user_cap), Some(latency_cap)) => Some(user_cap.min(latency_cap)),
+        (user_cap, latency_cap) => user_cap.or(latency_cap),
+    }
 }
 
 fn batch_fits_limits(

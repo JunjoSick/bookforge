@@ -148,9 +148,9 @@ fn push_legacy_fragment(fragment: &str, findings: &mut Vec<EngineFinding>) {
         QaFindingKind::ProtectedSpanMissing
     } else if fragment.contains("inline marker") || fragment.contains("marker") {
         QaFindingKind::MarkerStructure
-    } else if fragment.starts_with("error:") {
-        QaFindingKind::Other
     } else {
+        // Includes the legacy "error: " prefix fragments and anything
+        // unrecognized; both classify as Other.
         QaFindingKind::Other
     };
     findings.push(EngineFinding::new(kind, fragment));
@@ -189,9 +189,6 @@ mod tests {
         ] {
             assert_eq!(QaFindingKind::from_db_str(kind.as_str()), kind);
         }
-        assert_eq!(
-            QaFindingKind::from_db_str("mystery"),
-            QaFindingKind::Other
-        );
+        assert_eq!(QaFindingKind::from_db_str("mystery"), QaFindingKind::Other);
     }
 }

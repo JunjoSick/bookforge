@@ -86,6 +86,11 @@ pub struct EngineRuntimeSettings {
     pub concurrency: usize,
     pub provider_max_attempts: usize,
     pub adaptive_concurrency: bool,
+    /// The configured provider request timeout in seconds. Batch planning
+    /// uses it to shape the output dimension of requests (latency-aware
+    /// splitting) and `RequestStarted` events report the derived effective
+    /// timeout; the provider still owns the actual per-request timeout.
+    pub timeout_seconds: u64,
 }
 
 impl EngineRuntimeSettings {
@@ -97,6 +102,7 @@ impl EngineRuntimeSettings {
             concurrency: settings.scheduler.concurrency.max(1),
             provider_max_attempts: settings.provider.provider_max_attempts.max(1),
             adaptive_concurrency: settings.adaptive_concurrency,
+            timeout_seconds: settings.provider.timeout_seconds,
         }
     }
 
@@ -2129,6 +2135,7 @@ mod tests {
             concurrency: 2,
             provider_max_attempts: 1,
             adaptive_concurrency: false,
+            timeout_seconds: 1_200,
         };
         let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
         cfg.runtime_settings = Some(receiver);
@@ -2182,6 +2189,7 @@ mod tests {
             concurrency: 1,
             provider_max_attempts: 1,
             adaptive_concurrency: false,
+            timeout_seconds: 1_200,
         };
         let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
         cfg.runtime_settings = Some(receiver);
@@ -2226,6 +2234,7 @@ mod tests {
             concurrency: 1,
             provider_max_attempts: 3,
             adaptive_concurrency: false,
+            timeout_seconds: 1_200,
         };
         let (sender, receiver) = tokio::sync::watch::channel(runtime);
         cfg.runtime_settings = Some(receiver);
@@ -2257,6 +2266,7 @@ mod tests {
             concurrency: 2,
             provider_max_attempts: 1,
             adaptive_concurrency: false,
+            timeout_seconds: 1_200,
         };
         let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
         cfg.runtime_settings = Some(receiver);

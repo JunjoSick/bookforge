@@ -3257,6 +3257,7 @@ async fn live_batch_settings_bound_dispatch_and_update_later_request_budget() {
         concurrency: 2,
         provider_max_attempts: 1,
         adaptive_concurrency: false,
+        timeout_seconds: 1_200,
     };
     let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
     config.runtime_settings = Some(receiver);
@@ -3369,6 +3370,7 @@ async fn live_batch_revision_merges_only_unstarted_items() {
         concurrency: 1,
         provider_max_attempts: 1,
         adaptive_concurrency: false,
+        timeout_seconds: 1_200,
     };
     let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
     config.runtime_settings = Some(receiver);
@@ -3462,6 +3464,7 @@ async fn paused_batch_reconfigure_repartitions_before_resume_dispatch() {
         concurrency: 1,
         provider_max_attempts: 1,
         adaptive_concurrency: false,
+        timeout_seconds: 1_200,
     };
     let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
     config.runtime_settings = Some(receiver);
@@ -3780,6 +3783,7 @@ async fn live_adaptive_concurrency_enable_gates_later_requests() {
         concurrency: 2,
         provider_max_attempts: 1,
         adaptive_concurrency: false,
+        timeout_seconds: 1_200,
     };
     let (sender, receiver) = tokio::sync::watch::channel(runtime.clone());
     config.runtime_settings = Some(receiver);
@@ -3846,4 +3850,384 @@ async fn wait_for_atomic_count(value: &AtomicUsize, expected: usize) {
     })
     .await
     .expect("request count should be reached");
+}
+
+// ---- Structured, block-attributed findings (#8 engine half) ----------------
+
+fn failure_with_findings() -> BatchItemFailure {
+    BatchItemFailure {
+        item_id: "seg1:block1".to_string(),
+        segment_id: SegmentId("seg1".to_string()),
+        error: "error: protected span missing: https://example.com".to_string(),
+        input_tokens: None,
+        input_cached_tokens: None,
+        output_tokens: None,
+        tokens_estimated: false,
+        findings: vec![
+            bookforge_core::finding::EngineFinding::new(
+                bookforge_core::finding::QaFindingKind::ProtectedSpanMissing,
+                "protected span missing: https://example.com",
+            )
+            .with_block_id("block1"),
+        ],
+    }
+}
+
+#[test]
+fn batch_item_failure_findings_round_trip_through_serde() {
+    let failure = failure_with_findings();
+    let json = serde_json::to_string(&failure).expect("failure serializes");
+    let parsed: BatchItemFailure = serde_json::from_str(&json).expect("failure parses");
+    assert_eq!(parsed, failure);
+    assert_eq!(parsed.findings.len(), 1);
+    assert_eq!(parsed.findings[0].block_id.as_deref(), Some("block1"));
+}
+
+#[test]
+fn legacy_batch_item_failure_payloads_without_findings_still_parse() {
+    // A payload written before the findings field existed (no serde marker).
+    let legacy = r#"{
+        "item_id": "seg1:block1",
+        "segment_id": "seg1",
+        "error": "error: protected span missing: https://example.com",
+        "input_tokens": null,
+        "input_cached_tokens": null,
+        "output_tokens": null,
+        "tokens_estimated": false
+    }"#;
+    let parsed: BatchItemFailure = serde_json::from_str(legacy).expect("legacy payload parses");
+    assert!(parsed.findings.is_empty(), "findings default to empty");
+    assert_eq!(parsed.item_id, "seg1:block1");
+}
+
+#[test]
+fn block_mismatch_produces_per_block_findings_plus_summary() {
+    let summary = "batch translation block mismatch: missing=[\"b_000001\", \"b_000002\"], \
+                   extra=[\"b_000009\"], duplicate=[\"b_000003\"]";
+    let findings = block_mismatch_findings(
+        &["b_000001".to_string(), "b_000002".to_string()],
+        &["b_000009".to_string()],
+        &["b_000003".to_string()],
+        summary,
+    );
+
+    // One finding per missing/extra/duplicate block id, each block-attributed.
+    assert_eq!(findings.len(), 5);
+    for (finding, expected_block) in findings[..4]
+        .iter()
+        .zip(["b_000001", "b_000002", "b_000009", "b_000003"])
+    {
+        assert_eq!(
+            finding.kind,
+            bookforge_core::finding::QaFindingKind::BatchBlockMismatch
+        );
+        assert_eq!(finding.block_id.as_deref(), Some(expected_block));
+        assert_eq!(finding.severity, QaFindingSeverity::Error);
+    }
+    // The summary message itself carries no block attribution.
+    assert_eq!(findings[4].message, summary);
+    assert_eq!(findings[4].block_id, None);
+}
+
+// ---- Latency-aware batch budgets (#3) --------------------------------------
+
+#[test]
+fn latency_planning_splits_batches_whose_expected_output_overruns_the_timeout() {
+    let long_text = "word ".repeat(2_400); // ~2,400 tokens of source prose
+    let seg = make_segment(
+        "seg_latency",
+        vec![plain_block(&long_text), plain_block(&long_text)],
+        vec![],
+    );
+    let batch = TranslationBatch {
+        id: "batch_latency".to_string(),
+        ordinal: 0,
+        mode: BatchMode::Plain,
+        kind: BatchKind::Translation,
+        items: vec![
+            batch_item("a", long_text.trim()),
+            batch_item("b", long_text.trim()),
+        ],
+        token_estimate: 4_800,
+        section_id: seg.section_id.clone(),
+    };
+
+    // 180s timeout -> latency output cap = 0.8 * 180 * 30 = 4,320 expected
+    // output tokens; this batch expects ~4,800 + envelope, so normalization
+    // must split it even though no user output cap is configured.
+    let batch_config = BatchConfig {
+        enabled: true,
+        target_tokens: 16_000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let mut config = test_run_config();
+    config.runtime_settings = Some(
+        EngineRuntimeSettings {
+            revision: 1,
+            batch: batch_config,
+            batch_max_output_tokens: None,
+            concurrency: 1,
+            provider_max_attempts: 1,
+            adaptive_concurrency: false,
+            timeout_seconds: 180,
+        }
+        .frozen_receiver(),
+    );
+
+    let sizer = BatchSizer::new(16_000, 64);
+    let parts = normalize_batch_for_current_sizer(batch, Some(&sizer), Some(&config));
+    assert!(
+        parts.len() > 1,
+        "a batch whose expected output overruns the 180s timeout must be split"
+    );
+
+    // A single-item batch cannot split and keeps its budget.
+    let single = TranslationBatch {
+        id: "batch_latency_single".to_string(),
+        ordinal: 0,
+        mode: BatchMode::Plain,
+        kind: BatchKind::Translation,
+        items: vec![batch_item("a", long_text.trim())],
+        token_estimate: 2_400,
+        section_id: seg.section_id,
+    };
+    let parts = normalize_batch_for_current_sizer(single, Some(&sizer), Some(&config));
+    assert_eq!(parts.len(), 1, "single-item batches keep their budget");
+}
+
+#[test]
+fn latency_planning_leaves_batches_alone_without_a_timeout() {
+    let long_text = "word ".repeat(2_400);
+    let batch = TranslationBatch {
+        id: "batch_no_timeout".to_string(),
+        ordinal: 0,
+        mode: BatchMode::Plain,
+        kind: BatchKind::Translation,
+        items: vec![
+            batch_item("a", long_text.trim()),
+            batch_item("b", long_text.trim()),
+        ],
+        token_estimate: 4_800,
+        section_id: bookforge_core::ir::SectionId("section".to_string()),
+    };
+    // No runtime settings: no timeout knowledge, no latency constraint.
+    let parts = normalize_batch_for_current_sizer(batch, None, Some(&test_run_config()));
+    assert_eq!(parts.len(), 1);
+}
+
+/// A request whose computed output budget implies more generation time than
+/// the latency share of the configured timeout is split *before dispatch*,
+/// instead of being sent with a budget that can only succeed by luck.
+#[tokio::test]
+async fn latency_aware_dispatch_splits_oversized_output_budgets() {
+    let seg = make_segment(
+        "seg_dispatch",
+        vec![plain_block("Hello"), plain_block("Goodbye")],
+        vec![],
+    );
+    let segments = vec![seg];
+    let batch_config = BatchConfig {
+        enabled: true,
+        target_tokens: 16_000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &batch_config, TranslationProfile::Balanced);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].items.len(), 2);
+
+    let provider = GatedPromptEchoProvider::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut config = test_run_config();
+    config.scheduler.concurrency = 1;
+    // 20s timeout: the planning output cap (480 tokens) still admits the
+    // two-item batch (expected output ~260), but the computed 512-token
+    // request budget implies ~17s of generation at the conservative 30 tok/s
+    // floor — beyond 0.8 * 20s — so the batch must be split before dispatch.
+    config.runtime_settings = Some(
+        EngineRuntimeSettings {
+            revision: 1,
+            batch: batch_config,
+            batch_max_output_tokens: None,
+            concurrency: 1,
+            provider_max_attempts: 1,
+            adaptive_concurrency: false,
+            timeout_seconds: 20,
+        }
+        .frozen_receiver(),
+    );
+
+    provider.release.add_permits(2);
+    let translations = translate_batches_with_callback(
+        provider.clone(),
+        batches,
+        &segments,
+        &config,
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(RecordingProgress {
+            events: events.clone(),
+        }),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("latency split should complete successfully");
+
+    // Both items still translated, via two single-item requests.
+    assert_eq!(translations.len(), 1);
+    assert_eq!(provider.started.load(Ordering::Acquire), 2);
+    let mut budgets = provider.budgets.lock().unwrap().clone();
+    budgets.sort_by_key(|(index, _)| *index);
+    assert_eq!(
+        budgets,
+        vec![(0, Some(512)), (1, Some(512))],
+        "each single-item child dispatches with the floored budget"
+    );
+
+    let split_emitted = events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| matches!(event, bookforge_core::ProgressEvent::BatchSplit { .. }));
+    assert!(split_emitted, "the latency split must be observable");
+    let latency_warning = events.lock().unwrap().iter().any(|event| {
+        matches!(
+            event,
+            bookforge_core::ProgressEvent::Warning { kind, .. } if kind == "batch_latency_split"
+        )
+    });
+    assert!(latency_warning, "the split reason must be surfaced");
+}
+
+/// The watchdog emits RequestProgress heartbeats while a batch request is in
+/// flight, so dashboards are not blind between RequestStarted and
+/// RequestFinished. Real time is used: the heartbeat cadence is 5s, so the
+/// request is held in flight for ~5.6s.
+#[tokio::test]
+async fn watchdog_emits_request_progress_while_requests_are_in_flight() {
+    let seg = make_segment("seg_watchdog", vec![plain_block("Hello")], vec![]);
+    let segments = vec![seg];
+    let batch_config = BatchConfig {
+        enabled: true,
+        target_tokens: 16_000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &batch_config, TranslationProfile::Balanced);
+
+    let provider = GatedPromptEchoProvider::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut config = test_run_config();
+    config.runtime_settings = Some(
+        EngineRuntimeSettings {
+            revision: 1,
+            batch: batch_config,
+            batch_max_output_tokens: None,
+            concurrency: 1,
+            provider_max_attempts: 1,
+            adaptive_concurrency: false,
+            timeout_seconds: 1_200,
+        }
+        .frozen_receiver(),
+    );
+
+    let run_provider = provider.clone();
+    let run_events = events.clone();
+    let run = tokio::spawn(async move {
+        translate_batches_with_callback(
+            run_provider,
+            batches,
+            &segments,
+            &config,
+            Arc::new(TelemetryLog::new()),
+            None,
+            None,
+            Arc::new(RecordingProgress { events: run_events }),
+            None,
+            |_| Ok(()),
+        )
+        .await
+        .expect("watchdog run should finish")
+    });
+
+    // Hold the request in flight for a little over one heartbeat interval.
+    wait_for_atomic_count(&provider.started, 1).await;
+    tokio::time::sleep(Duration::from_millis(5_600)).await;
+    assert!(!run.is_finished(), "request still gated in flight");
+    provider.release.add_permits(1);
+    let _translations = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run should finish")
+        .expect("task should join");
+
+    let heartbeats = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            bookforge_core::ProgressEvent::RequestProgress {
+                batch_id,
+                items,
+                elapsed_ms,
+                ..
+            } => Some((batch_id.clone(), *items, *elapsed_ms)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !heartbeats.is_empty(),
+        "at least one in-flight heartbeat must be emitted"
+    );
+    let batch_id = &heartbeats[0].0;
+    assert!(!batch_id.is_empty(), "heartbeat carries the batch id");
+    assert_eq!(heartbeats[0].1, 1, "heartbeat carries the item count");
+    assert!(
+        heartbeats[0].2 >= 5_000,
+        "heartbeat elapsed_ms should cover the gated window, got {}",
+        heartbeats[0].2
+    );
+    // Emissions are capped: at most one heartbeat per 5s bucket per batch.
+    let mut buckets = heartbeats
+        .iter()
+        .map(|(id, _, elapsed)| (id.clone(), elapsed / 5_000))
+        .collect::<Vec<_>>();
+    buckets.sort();
+    buckets.dedup();
+    assert_eq!(buckets.len(), heartbeats.len(), "no duplicate signatures");
+}
+
+#[test]
+fn invalid_response_errors_persist_friendly_text_not_serde_internals() {
+    let raw = LlmError::InvalidResponse(
+        "invalid batch JSON: missing field `translation` at line 1 column 157".to_string(),
+    );
+    let persisted = super::execution::summarize_error_for_items(&raw);
+    assert!(
+        !persisted.contains("line 1 column"),
+        "serde internals must not be persisted: {persisted}"
+    );
+    assert!(
+        persisted.contains("missing a required field"),
+        "persisted text should be the friendly sentence: {persisted}"
+    );
+
+    // Non invalid-response errors keep their raw text (the provider error
+    // chain remains honest in segments.error).
+    let status = LlmError::HttpStatus {
+        status: 429,
+        body: "slow down".to_string(),
+    };
+    assert_eq!(
+        super::execution::summarize_error_for_items(&status),
+        "HTTP status 429: slow down"
+    );
 }

@@ -1,4 +1,5 @@
 use super::*;
+use bookforge_core::finding::QaFindingKind;
 
 pub(super) fn repair_batch_item_limit(target_language: &str) -> usize {
     if target_language.trim().eq_ignore_ascii_case("Toki Pona") {
@@ -57,6 +58,111 @@ impl InFlightRequestGuard {
 impl Drop for InFlightRequestGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How often the in-flight watchdog emits `RequestProgress` per batch.
+const REQUEST_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// One batch request currently being served, as observed by the watchdog.
+struct InFlightBatch {
+    items: usize,
+    started_ms: u64,
+    /// Last emitted (items, 5s bucket of elapsed_ms). Emissions are capped:
+    /// a batch whose observable state has not changed since its last
+    /// heartbeat is skipped.
+    last_signature: Option<(usize, u64)>,
+}
+
+type InFlightBatches = Arc<std::sync::Mutex<HashMap<String, InFlightBatch>>>;
+
+/// Removes a batch from the watchdog registry when the worker task ends, on
+/// any path (success, retry decision, or early return).
+struct InFlightBatchGuard {
+    registry: InFlightBatches,
+    batch_id: String,
+}
+
+impl InFlightBatchGuard {
+    fn register(registry: &InFlightBatches, batch_id: &str, items: usize) -> Self {
+        registry.lock().expect("in-flight batch registry").insert(
+            batch_id.to_string(),
+            InFlightBatch {
+                items,
+                started_ms: bookforge_core::progress::now_ms(),
+                last_signature: None,
+            },
+        );
+        Self {
+            registry: registry.clone(),
+            batch_id: batch_id.to_string(),
+        }
+    }
+}
+
+impl Drop for InFlightBatchGuard {
+    fn drop(&mut self) {
+        self.registry
+            .lock()
+            .expect("in-flight batch registry")
+            .remove(&self.batch_id);
+    }
+}
+
+/// Between RequestStarted and RequestFinished a live run used to be blind.
+/// This watchdog emits a `RequestProgress { batch_id, items, elapsed_ms }`
+/// heartbeat every 5 seconds for every in-flight batch so dashboards can show
+/// liveness without waiting for the request to finish. Heartbeats are
+/// explicitly *not* important events for JSONL flush purposes (see the CLI's
+/// `is_important_event`): a periodic event must never force a flush.
+fn spawn_request_progress_watchdog(
+    registry: InFlightBatches,
+    progress: Arc<dyn bookforge_core::ProgressSink>,
+) -> WatchdogHandle {
+    WatchdogHandle(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(REQUEST_PROGRESS_HEARTBEAT);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick of an interval completes immediately; skip it.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let mut emissions = Vec::new();
+            {
+                let mut registry = registry.lock().expect("in-flight batch registry");
+                if registry.is_empty() {
+                    continue;
+                }
+                let now = bookforge_core::progress::now_ms();
+                for (batch_id, info) in registry.iter_mut() {
+                    let elapsed_ms = now.saturating_sub(info.started_ms);
+                    let signature = (info.items, elapsed_ms / 5_000);
+                    if info.last_signature == Some(signature) {
+                        continue;
+                    }
+                    info.last_signature = Some(signature);
+                    emissions.push((batch_id.clone(), info.items, elapsed_ms));
+                }
+            }
+            for (batch_id, items, elapsed_ms) in emissions {
+                progress.emit(bookforge_core::ProgressEvent::RequestProgress {
+                    batch_id,
+                    items,
+                    elapsed_ms,
+                    timestamp_ms: bookforge_core::progress::now_ms(),
+                });
+            }
+        }
+    }))
+}
+
+/// Aborts the watchdog whenever the run exits, including the `?` early-return
+/// paths. Aborting is safe: the watchdog holds the registry lock only across
+/// synchronous code.
+struct WatchdogHandle(tokio::task::JoinHandle<()>);
+
+impl Drop for WatchdogHandle {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -171,12 +277,92 @@ impl BatchRetryLedger {
 /// to an 8 KiB provider dump N times (audit ⚪ group).
 pub(super) fn summarize_error_for_items(error: &LlmError) -> String {
     const MAX_PERSISTED_ERROR_CHARS: usize = 400;
-    let text = error.to_string();
+    let text = friendly_persisted_error(error);
     if text.chars().count() <= MAX_PERSISTED_ERROR_CHARS {
         return text;
     }
     let truncated: String = text.chars().take(MAX_PERSISTED_ERROR_CHARS).collect();
     format!("{truncated}\u{2026} [error text truncated]")
+}
+
+/// The text persisted into `segments.error`. Invalid-response failures keep
+/// their raw serde/parse detail in the error chain (progress warnings,
+/// telemetry, `tracing::debug!`) but persist a user-facing sentence instead
+/// of internals like "missing field `translation` at line 1 column 157".
+pub(super) fn friendly_persisted_error(error: &LlmError) -> String {
+    match error {
+        LlmError::InvalidResponse(message) => {
+            tracing::debug!(
+                raw = %message,
+                "batch failure persisted with friendly invalid-response phrasing; raw detail stays in the error chain"
+            );
+            crate::validation::friendly_validation_error(message)
+        }
+        LlmError::Json(error) => {
+            tracing::debug!(
+                raw = %error,
+                "batch failure persisted with friendly invalid-response phrasing; raw detail stays in the error chain"
+            );
+            crate::validation::friendly_validation_error(&error.to_string())
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Friendly phrasing for warning/retry messages that quote the error, without
+/// the debug logging the persistence path performs.
+pub(super) fn friendly_error_text(error: &LlmError) -> String {
+    match error {
+        LlmError::InvalidResponse(message) => crate::validation::friendly_validation_error(message),
+        LlmError::Json(error) => crate::validation::friendly_validation_error(&error.to_string()),
+        other => other.to_string(),
+    }
+}
+
+/// Structured mirror of the legacy "batch translation block mismatch"
+/// summary: one finding per missing/extra/duplicate block id (block_id set so
+/// reports can pin the affected blocks) plus the summary message itself with
+/// no block attribution. Surfaces that still parse the summary string can
+/// call this instead of re-deriving block attribution.
+pub fn block_mismatch_findings(
+    missing: &[String],
+    extra: &[String],
+    duplicate: &[String],
+    summary: &str,
+) -> Vec<EngineFinding> {
+    let mut findings = Vec::new();
+    for block_id in missing {
+        findings.push(
+            EngineFinding::new(
+                QaFindingKind::BatchBlockMismatch,
+                format!("block '{block_id}' is missing from the batch translation"),
+            )
+            .with_block_id(block_id.clone()),
+        );
+    }
+    for block_id in extra {
+        findings.push(
+            EngineFinding::new(
+                QaFindingKind::BatchBlockMismatch,
+                format!("block '{block_id}' was returned by the model but was not requested"),
+            )
+            .with_block_id(block_id.clone()),
+        );
+    }
+    for block_id in duplicate {
+        findings.push(
+            EngineFinding::new(
+                QaFindingKind::BatchBlockMismatch,
+                format!("block '{block_id}' was returned more than once"),
+            )
+            .with_block_id(block_id.clone()),
+        );
+    }
+    findings.push(EngineFinding::new(
+        QaFindingKind::BatchBlockMismatch,
+        summary,
+    ));
+    findings
 }
 
 fn is_response_transport_error(err: &LlmError) -> bool {
@@ -201,6 +387,23 @@ fn transient_batch_attempt_limit(configured_limit: usize, error: &LlmError) -> u
 fn should_bisect_transient_batch(error: &LlmError) -> bool {
     is_response_transport_error(error)
         || matches!(error, LlmError::InvalidResponse(message) if is_empty_content_error(message))
+}
+
+/// Whether the request a batch would produce implies a generation time
+/// beyond the latency-planning share of the configured timeout. Mirrors the
+/// budget computation the worker itself performs (the frozen runtime snapshot
+/// may adjust it by a revision in rare races; the check is a planning
+/// heuristic, not a hard guarantee).
+fn latency_split_warranted(
+    batch: &TranslationBatch,
+    config: &TranslationRunConfig,
+    reasoning: bool,
+    timeout_seconds: u64,
+) -> bool {
+    let budget = capped_batch_max_output_tokens(batch, config, reasoning);
+    crate::latency::expected_generation_seconds(budget)
+        > crate::latency::PLANNING_TIMEOUT_SHARE
+            * f64::from(u32::try_from(timeout_seconds).unwrap_or(u32::MAX))
 }
 
 pub fn collect_repair_items(result: &BatchTranslationResult) -> Vec<TranslationBatchItem> {
@@ -329,6 +532,8 @@ where
         Some(progress.clone()),
     ));
     let active_requests = Arc::new(AtomicUsize::new(0));
+    let in_flight_batches: InFlightBatches = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let _watchdog = spawn_request_progress_watchdog(in_flight_batches.clone(), progress.clone());
 
     let all_items: HashMap<String, TranslationBatchItem> = batches
         .iter()
@@ -461,6 +666,53 @@ where
                 let batch = normalized.remove(0);
                 let output_override =
                     take_batch_output_override(&mut escalated_output_tokens_by_item, &batch);
+                // Latency-aware request shaping (#3a): before dispatching,
+                // check that the request's own output budget implies a
+                // generation time that fits under the effective timeout. If
+                // not, prefer splitting — the same bisection the invalid-
+                // response path uses — instead of sending a request that can
+                // only succeed by luck. Escalated retries carry an explicit
+                // output override and are exempt; single-item batches cannot
+                // split and keep their budget (the provider's per-request
+                // timeout extension covers them).
+                if output_override.is_none()
+                    && batch.items.len() > 1
+                    && let Some(timeout_seconds) = configured_timeout_seconds(Some(config.as_ref()))
+                    && latency_split_warranted(
+                        &batch,
+                        config.as_ref(),
+                        provider.is_reasoning(),
+                        timeout_seconds,
+                    )
+                {
+                    let split = split_batch_with_config(&batch, Some(config.as_ref()));
+                    if split.len() == 2 {
+                        progress.emit(bookforge_core::ProgressEvent::BatchSplit {
+                            batch_id: batch.id.clone(),
+                            left_items: split[0].items.len(),
+                            right_items: split[1].items.len(),
+                            timestamp_ms: bookforge_core::progress::now_ms(),
+                        });
+                    }
+                    progress.emit(bookforge_core::ProgressEvent::Warning {
+                        kind: "batch_latency_split".to_string(),
+                        message: format!(
+                            "batch {} output budget implies a generation time beyond 80% of the {}s timeout; splitting before dispatch",
+                            batch.id, timeout_seconds
+                        ),
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    // Children go to the front, ahead of any sibling pieces
+                    // the sizer repack already queued, preserving document
+                    // order within the section.
+                    for extra in normalized.into_iter().rev() {
+                        pending_queue.push_front(extra);
+                    }
+                    for part in split.into_iter().rev() {
+                        pending_queue.push_front(part);
+                    }
+                    continue;
+                }
                 let compact_retry_attempt = batch
                     .items
                     .iter()
@@ -486,6 +738,7 @@ where
                 let section_titles = section_titles.clone();
                 let pause_signal = pause_signal.clone();
                 let active_requests = active_requests.clone();
+                let in_flight_batches = in_flight_batches.clone();
 
                 tasks.spawn(async move {
                     let output_escalated = output_override.is_some();
@@ -625,6 +878,18 @@ where
                         config.request_runtime_metadata();
                     let (_in_flight, active_request_count) =
                         InFlightRequestGuard::start(active_requests);
+                    let _in_flight_batch = InFlightBatchGuard::register(
+                        &in_flight_batches,
+                        &batch.id,
+                        batch.items.len(),
+                    );
+                    let effective_timeout_seconds =
+                        configured_timeout_seconds(Some(config.as_ref())).and_then(|configured| {
+                            crate::latency::effective_request_timeout_seconds(
+                                configured,
+                                Some(max_output_tokens),
+                            )
+                        });
                     progress.emit(bookforge_core::ProgressEvent::RequestStarted {
                         request_id: request_id.clone(),
                         batch_id: Some(batch.id.clone()),
@@ -639,6 +904,7 @@ where
                         target_concurrency: config.scheduler.concurrency,
                         runtime_config_revision,
                         provider_max_attempts,
+                        effective_timeout_seconds,
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
 
@@ -994,6 +1260,7 @@ where
                                     input_cached_tokens: None,
                                     output_tokens: None,
                                     tokens_estimated: false,
+                                    findings: Vec::new(),
                                 })
                                 .collect(),
                             input_tokens: None,
@@ -1103,6 +1370,7 @@ where
                                 input_cached_tokens: None,
                                 output_tokens: None,
                                 tokens_estimated: false,
+                                findings: Vec::new(),
                             })
                             .collect(),
                         input_tokens: None,
@@ -1141,11 +1409,15 @@ where
                             .map(|item| BatchItemFailure {
                                 item_id: item.item_id.clone(),
                                 segment_id: item.segment_id.clone(),
-                                error: format!("single-item batch truncated: {error}"),
+                                error: format!(
+                                    "single-item batch truncated: {}",
+                                    friendly_persisted_error(&error)
+                                ),
                                 input_tokens: None,
                                 input_cached_tokens: None,
                                 output_tokens: None,
                                 tokens_estimated: false,
+                                findings: Vec::new(),
                             })
                             .collect(),
                         input_tokens: None,
@@ -1182,8 +1454,10 @@ where
                         progress.emit(bookforge_core::ProgressEvent::Warning {
                             kind: "single_item_batch_invalid_response_retry".to_string(),
                             message: format!(
-                                "single-item batch {} returned invalid response on attempt {}; retrying: {error}",
-                                batch.id, attempts
+                                "single-item batch {} returned invalid response on attempt {}; retrying: {}",
+                                batch.id,
+                                attempts,
+                                friendly_error_text(&error)
                             ),
                             timestamp_ms: bookforge_core::progress::now_ms(),
                         });
@@ -1211,11 +1485,15 @@ where
                                 .map(|item| BatchItemFailure {
                                     item_id: item.item_id.clone(),
                                     segment_id: item.segment_id.clone(),
-                                    error: format!("single-item batch invalid response: {error}"),
+                                    error: format!(
+                                        "single-item batch invalid response: {}",
+                                        friendly_persisted_error(&error)
+                                    ),
                                     input_tokens: None,
                                     input_cached_tokens: None,
                                     output_tokens: None,
                                     tokens_estimated: false,
+                                    findings: Vec::new(),
                                 })
                                 .collect(),
                             input_tokens: None,
@@ -1300,6 +1578,7 @@ where
                                 input_cached_tokens: None,
                                 output_tokens: None,
                                 tokens_estimated: false,
+                                findings: Vec::new(),
                             })
                             .collect(),
                         input_tokens: None,
@@ -1618,6 +1897,7 @@ where
                     let request_limiter = request_limiter.clone();
                     let rate_controller = rate_controller.clone();
                     let pause_signal = pause_signal.clone();
+                    let in_flight_batches = in_flight_batches.clone();
 
                     repair_tasks.spawn(async move {
                     // Never start new provider traffic for a stopped run.
@@ -1693,6 +1973,18 @@ where
                         config.request_runtime_metadata();
                     let (_in_flight, active_request_count) =
                         InFlightRequestGuard::start(active_requests);
+                    let _in_flight_batch = InFlightBatchGuard::register(
+                        &in_flight_batches,
+                        &repair_batch.id,
+                        repair_batch.items.len(),
+                    );
+                    let effective_timeout_seconds = configured_timeout_seconds(Some(config.as_ref()))
+                        .and_then(|configured| {
+                            crate::latency::effective_request_timeout_seconds(
+                                configured,
+                                Some(max_output_tokens),
+                            )
+                        });
 
                     progress.emit(bookforge_core::ProgressEvent::RequestStarted {
                         request_id: request_id.clone(),
@@ -1708,6 +2000,7 @@ where
                         target_concurrency: config.scheduler.concurrency,
                         runtime_config_revision,
                         provider_max_attempts,
+                        effective_timeout_seconds,
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
 

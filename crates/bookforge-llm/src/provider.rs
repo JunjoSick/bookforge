@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 use bookforge_core::{RetryAfterPolicy, marker::is_marker_token};
 
@@ -780,10 +780,16 @@ impl OpenAiCompatibleConfig {
 pub struct OpenAiCompatibleProvider {
     config: OpenAiCompatibleConfig,
     client: reqwest::Client,
+    /// The total timeout actually baked into `client` (the configured timeout,
+    /// raised to the ≥300s reasoning floor when applicable). Per-request
+    /// timeout extensions are computed against this value so they can never
+    /// accidentally *shorten* the client default.
+    client_timeout_seconds: u64,
     reasoning_detected: AtomicBool,
     response_format_supported: AtomicBool,
     thinking_warning_emitted: AtomicBool,
     collapsed_budget_warning_emitted: AtomicBool,
+    timeout_extension_emitted: AtomicBool,
     pub cancel_token: CancellationToken,
 }
 
@@ -792,6 +798,7 @@ impl Clone for OpenAiCompatibleProvider {
         Self {
             config: self.config.clone(),
             client: self.client.clone(),
+            client_timeout_seconds: self.client_timeout_seconds,
             reasoning_detected: AtomicBool::new(self.reasoning_detected.load(Ordering::Relaxed)),
             response_format_supported: AtomicBool::new(
                 self.response_format_supported.load(Ordering::Relaxed),
@@ -802,6 +809,9 @@ impl Clone for OpenAiCompatibleProvider {
             collapsed_budget_warning_emitted: AtomicBool::new(
                 self.collapsed_budget_warning_emitted
                     .load(Ordering::Relaxed),
+            ),
+            timeout_extension_emitted: AtomicBool::new(
+                self.timeout_extension_emitted.load(Ordering::Relaxed),
             ),
             cancel_token: self.cancel_token.clone(),
         }
@@ -839,10 +849,12 @@ impl OpenAiCompatibleProvider {
         Ok(Self {
             config,
             client,
+            client_timeout_seconds: effective_timeout,
             reasoning_detected: AtomicBool::new(bootstrapped_reasoning),
             response_format_supported: AtomicBool::new(true),
             thinking_warning_emitted: AtomicBool::new(false),
             collapsed_budget_warning_emitted: AtomicBool::new(false),
+            timeout_extension_emitted: AtomicBool::new(false),
             cancel_token,
         })
     }
@@ -987,6 +999,27 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .provider_max_attempts
             .unwrap_or(self.config.provider_max_attempts)
             .max(1);
+        // Latency-aware per-request timeout (see crate::latency): a request's
+        // own output budget implies a minimum generation time, so the preset
+        // client timeout is extended for it — never shortened. Silently
+        // failing a legitimate 6-minute generation is worse than a bounded,
+        // explained extension; the extension is derived from the request, not
+        // from wall-clock observation.
+        let (request_timeout, timeout_extended) = crate::latency::effective_request_timeout(
+            Duration::from_secs(self.client_timeout_seconds),
+            request.max_output_tokens,
+        );
+        if timeout_extended && !self.timeout_extension_emitted.swap(true, Ordering::Relaxed) {
+            info!(
+                model = %self.config.model,
+                configured_seconds = self.client_timeout_seconds,
+                effective_seconds = request_timeout.as_secs(),
+                max_output_tokens = ?request.max_output_tokens,
+                "provider: per-request timeout extended beyond the configured timeout to cover \
+                 this request's output budget; legitimate long generations are given a bounded \
+                 window derived from the request itself instead of being failed at the preset"
+            );
+        }
         let body_len = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
         let max_backoff = Duration::from_secs(self.config.max_backoff_seconds);
         let policy = self.config.retry_after_policy;
@@ -995,7 +1028,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let mut tried_response_format_fallback = false;
         let mut attempt = 0usize;
         while attempt < max_attempts {
-            let mut request_builder = self.client.post(&endpoint).json(&body);
+            // RequestBuilder::timeout overrides the client default for this
+            // request only, and covers the whole cycle including the response
+            // body — so slow-trickling bodies are bounded by it too.
+            let mut request_builder = self
+                .client
+                .post(&endpoint)
+                .timeout(request_timeout)
+                .json(&body);
             if let Some(api_key) = api_key.as_deref() {
                 request_builder = request_builder.bearer_auth(api_key);
             }
@@ -2314,6 +2354,150 @@ mod tests {
                 "exceeded the {MAX_PROVIDER_RESPONSE_BODY_BYTES}-byte limit"
             )),
             "unexpected error: {error}"
+        );
+    }
+
+    /// Regression for the dogfood "slow-trickle" open question: reqwest's
+    /// total request timeout must fire on a body that keeps trickling in
+    /// forever (headers arrive, bytes dribble), not only on a dead-quiet
+    /// connection. One byte per 100ms is slower than any timeout-related
+    /// idle detection could rescue; the request must end in a timeout error
+    /// at about the configured timeout rather than hang.
+    #[tokio::test]
+    async fn slow_trickling_body_times_out_instead_of_hanging() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_mock_request(&mut stream).await;
+            let _ = stream
+                .write_all(
+                    // Declare a body far larger than we will ever send, then
+                    // drip it out one byte per 100ms — forever.
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            loop {
+                if stream.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://{addr}"),
+            // Local providers intentionally permit an absent API key.
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            model: "test-model".to_string(),
+            timeout_seconds: 2,
+            provider_max_attempts: 1,
+            thinking_disabled: true,
+            retry_after_policy: RetryAfterPolicy::None,
+            max_backoff_seconds: 1,
+            max_idle_per_host: 1,
+            json_mode: bookforge_core::JsonMode::PromptOnly,
+        })
+        .expect("offline provider config should be valid");
+
+        // No output budget => the timeout extension cannot engage, so the
+        // effective timeout is exactly the configured 2s.
+        let mut request = offline_request();
+        request.max_output_tokens = None;
+        let started = Instant::now();
+        let error = provider
+            .complete(request)
+            .await
+            .expect_err("a slow-trickling body must end in a timeout");
+        let elapsed = started.elapsed();
+        server_handle.abort();
+
+        assert!(
+            matches!(&error, LlmError::Http(error) if error.is_timeout()),
+            "expected a timeout error, got: {error}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(1_500),
+            "timeout fired too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(10),
+            "the request hung instead of timing out: {elapsed:?}"
+        );
+        assert!(
+            !provider.timeout_extension_emitted.load(Ordering::Relaxed),
+            "a request without an output budget must not extend the timeout"
+        );
+    }
+
+    /// The counterpart guarantee: a slow but legitimate generation that needs
+    /// longer than the configured timeout must SURVIVE when its output budget
+    /// extends the per-request timeout. The body arrives after 3s — past the
+    /// 2s configured timeout — and the request still completes.
+    #[tokio::test]
+    async fn timeout_extension_covers_a_slow_but_legitimate_generation() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_mock_request(&mut stream).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            // A "legitimate" generation that takes 3s against a 2s preset.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let payload = json!({
+                "choices": [
+                    {"message": {"content": "ok"}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            });
+            let _ = stream.write_all(payload.to_string().as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://{addr}"),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            model: "test-model".to_string(),
+            timeout_seconds: 2,
+            provider_max_attempts: 1,
+            thinking_disabled: true,
+            retry_after_policy: RetryAfterPolicy::None,
+            max_backoff_seconds: 1,
+            max_idle_per_host: 1,
+            json_mode: bookforge_core::JsonMode::PromptOnly,
+        })
+        .expect("offline provider config should be valid");
+
+        let started = Instant::now();
+        let response = provider
+            .complete(offline_request())
+            .await
+            .expect("the extended per-request timeout must cover a slow legit generation");
+        let elapsed = started.elapsed();
+        server_handle.abort();
+
+        assert_eq!(response.content, "ok");
+        assert!(
+            elapsed >= Duration::from_millis(2_500),
+            "the 2s configured timeout must not have fired before the 3s body: {elapsed:?}"
+        );
+        assert!(
+            provider.timeout_extension_emitted.load(Ordering::Relaxed),
+            "the output-budget extension must have engaged"
         );
     }
 
