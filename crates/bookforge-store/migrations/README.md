@@ -43,6 +43,7 @@ records, the canonical pair is:
 | 8       | `v2_7_qa_findings`           | `0008_v2_7_qa_findings.sql`                 |
 | 9       | `v2_7_1_global_scope_unique_indexes` | `0009_v2_7_1_global_scope_unique_indexes.sql` |
 | 10      | `v2_8_status_check_constraints` *(gated, see below)* | documented in this README |
+| 11      | `v3_0_qa_finding_block_attribution` *(gated, see below)* | `0011_v3_0_qa_finding_block_attribution.sql` |
 
 Version 3 is the one historical drift: files document what the ledger has
 always called `v1_1_segment_flags` under its more descriptive stem. New
@@ -65,3 +66,11 @@ migrations pick one canonical name at birth and register any future drift in
   Databases containing values outside those sets are deliberately left
   un-hardened (plain TEXT) and warn on open until corrected, so pre-existing
   rows are always tolerated and never silently rewritten.
+- Migration 11 (`v3_0_qa_finding_block_attribution`, gated): adds the nullable
+  `qa_findings.block_id` column so findings can be pinned to a single
+  translated block (audit remediation — findings used to lose block
+  attribution when the CLI re-parsed engine error strings). Plain
+  `ensure_column`-style `ADD COLUMN`, no table rebuild: legacy rows read back
+  NULL and keep the segment-level meaning. `severity` stays plain TEXT; only
+  `'error'`/`'warning'` may be persisted, enforced in Rust at the single
+  findings insert choke point (`db::findings::insert_qa_finding_row`).

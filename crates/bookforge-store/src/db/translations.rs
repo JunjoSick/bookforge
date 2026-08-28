@@ -793,6 +793,10 @@ fn consume_dashboard_retry_guidance_on(
 
 /// Connection-scoped variant of [`JobStore::record_segment_findings`] so the
 /// per-segment checkpoint can write findings inside its own transaction.
+///
+/// Legacy error strings carry no block attribution, so these rows persist
+/// `block_id = NULL`; block-level findings arrive via
+/// [`record_segment_engine_findings_on`].
 pub(super) fn record_segment_findings_on(
     conn: &Connection,
     job_id: &str,
@@ -819,18 +823,64 @@ pub(super) fn record_segment_findings_on(
     for (index, finding) in findings.iter().enumerate() {
         let hash = stable_hash(&format!("{job_id}\u{1f}{segment_id}\u{1f}{index}"));
         let id = format!("qaf_{}", &hash[..24]);
-        conn.execute(
-            "INSERT OR REPLACE INTO qa_findings
-             (id, segment_id, job_id, severity, kind, message)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                id,
+        insert_qa_finding_row(
+            conn,
+            NewQaFindingRow {
+                id: &id,
                 segment_id,
                 job_id,
-                finding.severity.as_str(),
-                finding.kind.as_str(),
-                finding.message,
-            ],
+                severity: finding.severity.as_str(),
+                kind: finding.kind.as_str(),
+                message: &finding.message,
+                block_id: finding.block_id.as_deref(),
+            },
+        )?;
+    }
+    Ok(findings.len())
+}
+
+/// Connection-scoped variant of [`JobStore::record_segment_engine_findings`]
+/// so per-segment checkpoints can write the canonical structured findings —
+/// with block attribution and per-instance severity — inside their own
+/// transaction.
+pub(super) fn record_segment_engine_findings_on(
+    conn: &Connection,
+    job_id: &str,
+    segment_id: &str,
+    findings: &[EngineFinding],
+) -> Result<usize> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM segments WHERE job_id = ?1 AND id = ?2
+         )",
+        params![job_id, segment_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        return Ok(0);
+    }
+
+    conn.execute(
+        "DELETE FROM qa_findings
+         WHERE job_id = ?1 AND segment_id = ?2 AND kind NOT GLOB 'llm_*'",
+        params![job_id, segment_id],
+    )?;
+    for (index, finding) in findings.iter().enumerate() {
+        let hash = stable_hash(&format!(
+            "{job_id}\u{1f}engine\u{1f}{segment_id}\u{1f}{index}"
+        ));
+        let id = format!("qaf_{}", &hash[..24]);
+        insert_qa_finding_row(
+            conn,
+            NewQaFindingRow {
+                id: &id,
+                segment_id,
+                job_id,
+                severity: finding.severity.as_str(),
+                kind: finding.kind.as_str(),
+                message: &finding.message,
+                block_id: finding.block_id.as_deref(),
+            },
         )?;
     }
     Ok(findings.len())

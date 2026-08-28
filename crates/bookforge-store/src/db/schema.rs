@@ -364,6 +364,17 @@ impl JobStore {
         // pass. Gated like 0009 because it is a one-time table rebuild.
         self.apply_status_check_constraints(&mut conn);
 
+        // Version 11 (audit remediation) adds `qa_findings.block_id` so
+        // findings can be pinned to a single translated block. A nullable
+        // `ADD COLUMN` through the established ensure_* helper — no table
+        // rebuild, legacy rows read back NULL — but gated like 0009/0010 so
+        // reopened stores never take a write lock just to re-record the
+        // ledger row.
+        if !migration_applied(&conn, 11)? {
+            ensure_column(&conn, "qa_findings", "block_id", "TEXT")?;
+            record_migration(&conn, 11, "v3_0_qa_finding_block_attribution")?;
+        }
+
         Ok(())
     }
     /// STORE-12: enforce the canonical status vocabularies at the storage
@@ -907,7 +918,7 @@ fn deduplicate_global_scope_rows(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn backfill_qa_findings(conn: &Connection) -> rusqlite::Result<usize> {
+fn backfill_qa_findings(conn: &Connection) -> Result<usize> {
     let flagged_statuses =
         SegmentStatus::sql_set(&[SegmentStatus::NeedsReview, SegmentStatus::Failed]);
     let rows = {
@@ -939,18 +950,17 @@ fn backfill_qa_findings(conn: &Connection) -> rusqlite::Result<usize> {
         for (index, finding) in classify_segment_error(&error).into_iter().enumerate() {
             let hash = stable_hash(&format!("{job_id}\u{1f}{segment_id}\u{1f}{index}"));
             let id = format!("qaf_{}", &hash[..24]);
-            inserted += conn.execute(
-                "INSERT OR REPLACE INTO qa_findings
-                 (id, segment_id, job_id, severity, kind, message)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    id,
-                    segment_id,
-                    job_id,
-                    finding.severity.as_str(),
-                    finding.kind.as_str(),
-                    finding.message,
-                ],
+            inserted += insert_qa_finding_row(
+                conn,
+                NewQaFindingRow {
+                    id: &id,
+                    segment_id: &segment_id,
+                    job_id: &job_id,
+                    severity: finding.severity.as_str(),
+                    kind: finding.kind.as_str(),
+                    message: &finding.message,
+                    block_id: finding.block_id.as_deref(),
+                },
             )?;
         }
     }

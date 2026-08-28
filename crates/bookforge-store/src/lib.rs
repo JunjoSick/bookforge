@@ -1,7 +1,7 @@
 pub mod db;
 
 pub use db::{
-    CacheLookupRequest, CachedTranslation, CreateJob, GlossaryCandidateUpsertResult,
+    CacheLookupRequest, CachedTranslation, CreateJob, EngineFinding, GlossaryCandidateUpsertResult,
     GlossaryFilter, JobRecord, JobStatus, JobStore, JobSummary, NewEntity, NewGlossaryCandidate,
     NewSegmentFlag, NewStyleSheet, PruneJobDeletion, PruneJobsOptions, PruneJobsReport, QaFinding,
     QaFindingCount, QaFindingKind, QaFindingSeverity, RetryScope, SaveCachedTranslation,

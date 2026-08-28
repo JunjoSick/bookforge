@@ -34,11 +34,14 @@ mod translations;
 mod migrations_docs;
 
 // Internal cross-module helpers shared by the transactional checkpoint paths.
+use findings::{NewQaFindingRow, insert_qa_finding_row};
 use jobs::touch_job_unless_status_on;
-use translations::{clear_segment_findings_on, record_segment_findings_on};
+use translations::{
+    clear_segment_findings_on, record_segment_engine_findings_on, record_segment_findings_on,
+};
 
 pub use findings::{
-    QaFinding, QaFindingCount, QaFindingKind, QaFindingSeverity, StoredQaFinding,
+    EngineFinding, QaFinding, QaFindingCount, QaFindingKind, QaFindingSeverity, StoredQaFinding,
     aggregate_findings, classify_segment_error,
 };
 pub use flags::RetryScope;

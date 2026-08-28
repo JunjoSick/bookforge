@@ -1,6 +1,7 @@
 use super::translations::MODEL_TRANSLATION_UPSERT;
 use super::*;
 use bookforge_core::{
+    finding::EngineFinding,
     ir::{BlockId, SectionId},
     segment::{
         Segment, SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
@@ -4436,4 +4437,238 @@ fn file_hash_of_empty_input_is_the_canonical_sha256_digest() {
     );
 
     let _ = fs::remove_file(empty_input);
+}
+
+// ---------------------------------------------------------------------------
+// Audit remediation: block attribution + instance severity for qa_findings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn qa_findings_persist_block_attribution_and_read_null_for_legacy_rows() {
+    let (db_path, input_path, store, job) = setup_findings_store("qa_block_attribution.sqlite", 1);
+    let findings = vec![
+        EngineFinding::new(QaFindingKind::SourceCopyUnchanged, "title unchanged")
+            .with_block_id("b_000042"),
+        EngineFinding::new(QaFindingKind::BatchBlockMismatch, "missing=[\"b_000007\"]"),
+    ];
+    assert_eq!(
+        store
+            .record_segment_engine_findings(&job.id, "seg_0", &findings)
+            .expect("structured findings should record"),
+        2
+    );
+
+    // A row written the pre-11 way (no block_id column value at all) must
+    // read back as unattributed, never fail the load.
+    {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "INSERT INTO qa_findings
+             (id, segment_id, job_id, severity, kind, message)
+             VALUES ('qaf_legacy', 'seg_0', ?1, 'error', 'provider_error', 'legacy row')",
+            params![job.id],
+        )
+        .expect("legacy-shaped row should insert");
+    }
+
+    let stored = store
+        .segment_qa_findings(&job.id)
+        .expect("findings should load");
+    let attributed = stored
+        .iter()
+        .find(|finding| finding.kind == "source_copy_unchanged")
+        .expect("block-attributed finding stored");
+    assert_eq!(attributed.block_id.as_deref(), Some("b_000042"));
+    let segment_level = stored
+        .iter()
+        .find(|finding| finding.kind == "batch_block_mismatch")
+        .expect("segment-level finding stored");
+    assert_eq!(segment_level.block_id, None);
+    let legacy = stored
+        .iter()
+        .find(|finding| finding.id == "qaf_legacy")
+        .expect("legacy row loads");
+    assert_eq!(legacy.block_id, None, "legacy rows read NULL block ids");
+
+    // The legacy error-text path keeps writing NULL block ids.
+    store
+        .record_segment_findings(&job.id, "seg_0", "provider error: upstream unavailable")
+        .expect("text findings should record");
+    let text_rows = store
+        .segment_qa_findings(&job.id)
+        .expect("findings should reload");
+    assert!(
+        text_rows.iter().all(|finding| finding.block_id.is_none()),
+        "error-text classification stays segment-level: {text_rows:?}"
+    );
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn qa_finding_instance_severity_overrides_kind_default() {
+    let (db_path, input_path, store, job) = setup_findings_store("qa_instance_severity.sqlite", 1);
+    let findings = vec![
+        EngineFinding::new(QaFindingKind::SourceCopyUnchanged, "unchanged prose"),
+        EngineFinding::new(
+            QaFindingKind::SourceCopyUnchanged,
+            "unchanged section title",
+        )
+        .with_severity(QaFindingSeverity::Error),
+    ];
+    store
+        .record_segment_engine_findings(&job.id, "seg_0", &findings)
+        .expect("structured findings should record");
+
+    let stored = store
+        .segment_qa_findings(&job.id)
+        .expect("findings should load");
+    let default_row = stored
+        .iter()
+        .find(|finding| finding.message == "unchanged prose")
+        .expect("default-severity row stored");
+    assert_eq!(
+        default_row.severity, "warning",
+        "no override keeps the kind's default severity"
+    );
+    let override_row = stored
+        .iter()
+        .find(|finding| finding.message == "unchanged section title")
+        .expect("overridden row stored");
+    assert_eq!(
+        override_row.severity, "error",
+        "the per-instance override must win over the kind default"
+    );
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn unknown_qa_finding_kind_strings_decode_to_other_and_never_fail_loads() {
+    let (db_path, input_path, store, job) = setup_findings_store("qa_unknown_kind.sqlite", 1);
+    {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "INSERT INTO qa_findings
+             (id, segment_id, job_id, severity, kind, message, block_id)
+             VALUES ('qaf_mystery', 'seg_0', ?1, 'error', 'mystery_kind',
+                     'hand-edited row', NULL)",
+            params![job.id],
+        )
+        .expect("unknown-kind row should insert");
+    }
+
+    let stored = store
+        .segment_qa_findings(&job.id)
+        .expect("loads never fail on unknown kinds");
+    let mystery = stored
+        .iter()
+        .find(|finding| finding.id == "qaf_mystery")
+        .expect("unknown-kind row survives the read");
+    assert_eq!(
+        mystery.kind, "mystery_kind",
+        "raw text is preserved verbatim"
+    );
+    assert_eq!(
+        mystery.finding_kind(),
+        QaFindingKind::Other,
+        "typed decode maps unknown strings to Other"
+    );
+    assert_eq!(
+        QaFindingKind::from_db_str("source_copy_unchanged"),
+        QaFindingKind::SourceCopyUnchanged,
+        "known kinds round-trip through the same decode"
+    );
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn qa_finding_severity_guard_rejects_non_canonical_text() {
+    use super::findings::validated_finding_severity;
+
+    assert!(
+        matches!(
+            validated_finding_severity("critical"),
+            Err(StoreError::Serialization(_))
+        ),
+        "foreign severity text must be rejected at the insert boundary"
+    );
+    assert_eq!(
+        validated_finding_severity("error").expect("'error' is canonical"),
+        "error"
+    );
+    assert_eq!(
+        validated_finding_severity("warning").expect("'warning' is canonical"),
+        "warning"
+    );
+}
+
+#[test]
+fn migration_eleven_adds_block_id_once_and_reopen_takes_no_write_transaction() {
+    let db_path = temp_path("migration_eleven_gated.sqlite");
+    {
+        let store = JobStore::open(&db_path).expect("first open migrates");
+        assert!(
+            store.take_diagnostics().is_empty(),
+            "fresh stores carry no diagnostics"
+        );
+        {
+            let conn = store.conn.borrow();
+            let column: String = conn
+                .query_row(
+                    "SELECT name FROM pragma_table_info('qa_findings') WHERE name = 'block_id'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("block_id column exists after the first open");
+            assert_eq!(column, "block_id");
+            let applied: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM _migrations WHERE version = 11",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("migration ledger readable");
+            assert_eq!(applied, 1);
+        }
+    }
+
+    // Gated-once: with every migration recorded, a reopen must not attempt
+    // any write. Hold the writer lock on a second connection while
+    // reopening — the open only succeeds because it never takes a write
+    // transaction (same pattern as the freeze-check-inside-txn regression
+    // test above).
+    let conn_b = Connection::open(&db_path).expect("second connection");
+    conn_b
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("writer lock acquired");
+    let reopened = JobStore::open(&db_path).expect("reopen while the writer lock is held");
+    assert!(
+        reopened.take_diagnostics().is_empty(),
+        "an already-migrated reopen carries no diagnostics"
+    );
+    drop(reopened);
+    drop(conn_b);
+
+    {
+        let store = JobStore::open(&db_path).expect("third open");
+        let conn = store.conn.borrow();
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _migrations WHERE version = 11",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration ledger readable");
+        assert_eq!(applied, 1, "migration 11 is recorded exactly once");
+    }
+
+    let _ = fs::remove_file(db_path);
 }
