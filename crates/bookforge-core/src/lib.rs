@@ -3,6 +3,7 @@ pub mod control;
 pub mod entity;
 pub mod error;
 pub mod glossary;
+pub mod finding;
 pub mod ir;
 pub mod marker;
 pub mod math;
