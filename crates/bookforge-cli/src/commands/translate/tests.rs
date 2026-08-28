@@ -697,6 +697,7 @@ fn applied_double_check_corrections_update_matching_blocks() {
         input_cached_tokens: Some(0),
         output_tokens: Some(12),
         tokens_estimated: false,
+        findings: Vec::new(),
     }];
     let corrections = vec![
         bookforge_llm::CorrectionRecord {
@@ -811,6 +812,7 @@ fn translation_for(
         input_cached_tokens: Some(0),
         output_tokens: Some(1),
         tokens_estimated: false,
+        findings: Vec::new(),
     }
 }
 

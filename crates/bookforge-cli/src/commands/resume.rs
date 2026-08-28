@@ -1436,6 +1436,7 @@ fn rebuild_segment_translations(
                     input_cached_tokens: None,
                     output_tokens: None,
                     tokens_estimated: false,
+                    findings: Vec::new(),
                 });
             }
             continue;
@@ -1454,6 +1455,7 @@ fn rebuild_segment_translations(
             input_cached_tokens: None,
             output_tokens: None,
             tokens_estimated: false,
+            findings: Vec::new(),
         });
     }
 
@@ -2170,6 +2172,7 @@ mod tests {
             input_cached_tokens: None,
             output_tokens: None,
             tokens_estimated: false,
+            findings: Vec::new(),
         }];
 
         let rebuilt = rebuild_block_translations(&segments, &stored, &fresh);

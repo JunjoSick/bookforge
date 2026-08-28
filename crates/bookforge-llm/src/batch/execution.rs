@@ -1100,6 +1100,7 @@ where
                                     input_cached_tokens: None,
                                     output_tokens: None,
                                     tokens_estimated: false,
+                                    findings: Vec::new(),
                                 });
                             add_usage(entry, item);
                             if let Some(warning) = &item.warning {
@@ -1628,6 +1629,7 @@ where
                 input_cached_tokens,
                 output_tokens,
                 tokens_estimated,
+                findings: Vec::new(),
             }
         } else {
             SegmentTranslation {
@@ -1643,6 +1645,7 @@ where
                 input_cached_tokens,
                 output_tokens,
                 tokens_estimated,
+                findings: Vec::new(),
             }
         }
     };
@@ -1752,6 +1755,10 @@ where
                 )),
             };
             add_failure_usage(entry, failure);
+            // Carry the engine's structured, block-attributed findings onto
+            // the segment record so the checkpoint persists real attribution
+            // instead of re-parsing the legacy error string downstream.
+            entry.findings.extend(failure.findings.iter().cloned());
         }
     }
 
@@ -2292,6 +2299,14 @@ where
                             let retained_warnings =
                                 existing.error.as_deref().and_then(warning_findings_only);
                             existing.error = retained_warnings;
+                            // Same treatment as the error string above: the
+                            // repaired block's error findings are stale, but
+                            // warning-severity findings from the failed
+                            // attempt stay visible on the now-succeeded
+                            // segment.
+                            existing
+                                .findings
+                                .retain(|finding| finding.severity == QaFindingSeverity::Warning);
                             if let Some(warning) = &translation.warning {
                                 append_translation_error(existing, warning);
                             }
@@ -2399,6 +2414,12 @@ where
                 "batch translation block mismatch: missing={missing:?}, extra={extra:?}, duplicate={duplicate:?}",
             );
             append_translation_error(translation, &error);
+            // A whole-segment structural failure gets the same block-level
+            // vocabulary the per-item validation failures carry: one finding
+            // per affected block plus the unattributed summary line.
+            translation.findings.extend(block_mismatch_findings(
+                &missing, &extra, &duplicate, &error,
+            ));
         }
     }
 

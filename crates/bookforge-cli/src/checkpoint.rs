@@ -201,16 +201,6 @@ impl CheckpointWriter {
     }
 }
 
-/// Engine-provided structured findings for the checkpoint paths.
-///
-/// The engine workstream landed `BatchItemFailure.findings` (serde-default
-/// tolerant); until it also surfaces the structured findings on
-/// `SegmentTranslation` — the value the checkpoint writer receives — the CLI
-/// persists the legacy-parsed fallback below. When the field lands this
-/// placeholder becomes `&translation.findings` at the two call sites and the
-/// `findings_for_checkpoint` precedence turns it on with no other change.
-const ENGINE_FINDINGS_PLACEHOLDER: &[bookforge_core::finding::EngineFinding] = &[];
-
 fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
     let CheckpointCommand::SaveTranslation {
         job_id,
@@ -261,7 +251,7 @@ fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
                 store,
                 &job_id,
                 &translation.segment_id.0,
-                ENGINE_FINDINGS_PLACEHOLDER,
+                &translation.findings,
                 translation.error.as_deref(),
             );
         }
@@ -280,7 +270,7 @@ fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
                     store,
                     &job_id,
                     &translation.segment_id.0,
-                    ENGINE_FINDINGS_PLACEHOLDER,
+                    &translation.findings,
                     translation.error.as_deref(),
                 );
             }
@@ -293,7 +283,8 @@ fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
 /// Persist the structured QA findings for a needs-review/failed checkpoint.
 ///
 /// Structured engine findings win when the engine provided them
-/// (`BatchItemFailure.findings` — serde-default tolerant). Otherwise the
+/// (`SegmentTranslation.findings`, populated by the engine from
+/// `BatchItemFailure.findings` and block-mismatch aggregation). Otherwise the
 /// legacy concatenated error string is decomposed through the shared core
 /// parser (`findings_from_legacy_error_text`) so old-style errors still land
 /// in the block finding vocabulary with honest per-instance severity instead
@@ -391,6 +382,7 @@ mod tests {
             input_cached_tokens: Some(0),
             output_tokens: Some(5),
             tokens_estimated: false,
+            findings: Vec::new(),
         }
     }
 
@@ -902,13 +894,15 @@ mod tests {
         let _ = fs::remove_file(input_path);
     }
 
+    fn needs_review_error_text() -> String {
+        "error: translation is unchanged from the source-language prose; \
+         batch translation block mismatch: missing=[\"b_000026\"], extra=[], duplicate=[]"
+            .to_string()
+    }
+
     fn needs_review_fixture(job_id: &str) -> CheckpointCommand {
         let mut translation = test_translation("seg_findings", 0, SegmentStatus::NeedsReview);
-        translation.error = Some(
-            "error: translation is unchanged from the source-language prose; \
-             batch translation block mismatch: missing=[\"b_000026\"], extra=[], duplicate=[]"
-                .to_string(),
-        );
+        translation.error = Some(needs_review_error_text());
         CheckpointCommand::SaveTranslation {
             job_id: job_id.to_string(),
             translation: Box::new(translation),
@@ -1006,12 +1000,25 @@ mod tests {
             )
             .expect("segment inserted");
 
+        // First checkpoint without structured findings: the legacy error
+        // string decomposes into unattributed parsed rows.
         apply(&store, needs_review_fixture(&job.id)).expect("needs_review checkpoint applies");
+        let findings = store
+            .segment_qa_findings(&job.id)
+            .expect("legacy findings load back");
+        assert_eq!(findings.len(), 2);
+        assert!(
+            findings.iter().all(|finding| finding.block_id.is_none()),
+            "legacy-parsed rows carry no block attribution"
+        );
 
-        // Engine-provided structured findings (the path the checkpoint takes
-        // once `SegmentTranslation` carries the engine's `findings`): they
-        // replace the legacy-parsed rows and keep block attribution.
-        let engine_findings = vec![
+        // Second checkpoint of the same segment, this time with the engine's
+        // structured findings on the translation (the wire the engine now
+        // provides): they replace the legacy-parsed rows and keep block
+        // attribution.
+        let mut translation = test_translation("seg_findings", 0, SegmentStatus::NeedsReview);
+        translation.error = Some(needs_review_error_text());
+        translation.findings = vec![
             bookforge_core::finding::EngineFinding::new(
                 bookforge_core::finding::QaFindingKind::SourceCopyUnchanged,
                 "title block copied unchanged",
@@ -1023,7 +1030,17 @@ mod tests {
             )
             .with_block_id("b_000001"),
         ];
-        persist_checkpoint_findings(&store, &job.id, "seg_findings", &engine_findings, None);
+        apply(
+            &store,
+            CheckpointCommand::SaveTranslation {
+                job_id: job.id.clone(),
+                translation: Box::new(translation),
+                provider: "mock".to_string(),
+                model: "mock-model".to_string(),
+                prompt_version: "v1".to_string(),
+            },
+        )
+        .expect("needs_review checkpoint with engine findings applies");
 
         let findings = store
             .segment_qa_findings(&job.id)

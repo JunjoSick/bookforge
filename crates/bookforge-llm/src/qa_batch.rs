@@ -744,6 +744,7 @@ mod tests {
             input_cached_tokens: None,
             output_tokens: None,
             tokens_estimated: false,
+            findings: Vec::new(),
         }
     }
 

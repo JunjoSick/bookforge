@@ -3929,6 +3929,216 @@ fn block_mismatch_produces_per_block_findings_plus_summary() {
     assert_eq!(findings[4].block_id, None);
 }
 
+/// End-to-end: an item that fails deterministic validation carries its
+/// structured findings all the way onto the returned `SegmentTranslation`,
+/// with block attribution intact. The repair round re-fails the same item so
+/// it stays NeedsReview and the findings survive aggregation.
+#[tokio::test]
+async fn validation_failure_findings_reach_the_segment_record() {
+    fn marker_block(text: &str) -> SegmentBlock {
+        SegmentBlock {
+            block_id: bookforge_core::ir::BlockId(text.to_string()),
+            kind: "paragraph".to_string(),
+            text: text.to_string(),
+            text_runs: vec![SegmentTextRun {
+                id: "r0".to_string(),
+                text: text.to_string(),
+            }],
+            protected_spans: Vec::new(),
+        }
+    }
+
+    let seg = make_segment(
+        "seg_findings",
+        vec![marker_block("Before <m1>bold</m1> after")],
+        vec![],
+    );
+    let segments = vec![seg];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let item_id = batches[0].items[0].item_id.clone();
+    let broken_translation = "Prima e dopo il testo";
+    // Both the translation round and the repair round return text that drops
+    // the required marker, so the item ends NeedsReview.
+    let provider = SequenceProvider::new(vec![
+        serde_json::json!({
+            "items": [{"id": item_id, "translation": broken_translation}],
+        })
+        .to_string(),
+        serde_json::json!({
+            "items": [{"id": item_id, "translation": broken_translation}],
+        })
+        .to_string(),
+    ]);
+
+    let translations = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &test_run_config(),
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(bookforge_core::NullProgressSink),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("validation failure must not abort the run");
+
+    assert_eq!(translations.len(), 1);
+    let translation = &translations[0];
+    assert_eq!(translation.segment_id.0, "seg_findings");
+    assert_eq!(translation.status, SegmentStatus::NeedsReview);
+    // The legacy error string keeps flowing unchanged.
+    assert!(
+        translation
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("inline marker missing")),
+        "error string must be preserved, got: {:?}",
+        translation.error
+    );
+    // ...and the structured finding arrives with its block attribution.
+    assert_eq!(translation.findings.len(), 1);
+    let finding = &translation.findings[0];
+    assert_eq!(
+        finding.kind,
+        bookforge_core::finding::QaFindingKind::InlineMarkerMissing
+    );
+    assert_eq!(
+        finding.block_id.as_deref(),
+        Some("Before <m1>bold</m1> after"),
+        "the finding must be pinned to the failed item's block"
+    );
+    assert_eq!(
+        finding.severity,
+        bookforge_core::ir::QaFindingSeverity::Error
+    );
+}
+
+/// End-to-end: a segment that fails structurally (one of its blocks never
+/// arrives because the item failed twice) gets `block_mismatch_findings`
+/// merged into the segment record alongside the per-item findings.
+#[tokio::test]
+async fn structural_block_mismatch_findings_reach_the_segment_record() {
+    fn marker_block(text: &str) -> SegmentBlock {
+        SegmentBlock {
+            block_id: bookforge_core::ir::BlockId(text.to_string()),
+            kind: "paragraph".to_string(),
+            text: text.to_string(),
+            text_runs: vec![SegmentTextRun {
+                id: "r0".to_string(),
+                text: text.to_string(),
+            }],
+            protected_spans: Vec::new(),
+        }
+    }
+
+    let seg = make_segment(
+        "seg_mismatch",
+        vec![
+            plain_block("First paragraph"),
+            marker_block("Second <m1>marked</m1>"),
+        ],
+        vec![],
+    );
+    let segments = vec![seg];
+    // One item per batch so the two blocks arrive in separate requests, and
+    // serial dispatch so the scripted responses pair with their batches.
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1000,
+        max_items: 1,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    assert_eq!(batches.len(), 2, "two single-item batches");
+    let first_id = batches[0].items[0].item_id.clone();
+    let second_id = batches[1].items[0].item_id.clone();
+    let broken_translation = "Il secondo numero";
+    let provider = SequenceProvider::new(vec![
+        serde_json::json!({
+            "items": [{"id": first_id, "translation": "Primo paragrafo"}],
+        })
+        .to_string(),
+        serde_json::json!({
+            "items": [{"id": second_id, "translation": broken_translation}],
+        })
+        .to_string(),
+        serde_json::json!({
+            "items": [{"id": second_id, "translation": broken_translation}],
+        })
+        .to_string(),
+    ]);
+    let mut config = test_run_config();
+    config.scheduler.concurrency = 1;
+
+    let translations = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &config,
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(bookforge_core::NullProgressSink),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("partial segment failure must not abort the run");
+
+    assert_eq!(translations.len(), 1);
+    let translation = &translations[0];
+    assert_eq!(translation.status, SegmentStatus::NeedsReview);
+    assert!(
+        translation
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("batch translation block mismatch")),
+        "mismatch summary must stay in the error string, got: {:?}",
+        translation.error
+    );
+    // The missing block shows up both as the item's own validation finding
+    // and as a block-attributed mismatch finding, plus the unattributed
+    // summary line.
+    let mismatch_block = translation
+        .findings
+        .iter()
+        .find(|finding| {
+            finding.kind == bookforge_core::finding::QaFindingKind::BatchBlockMismatch
+                && finding.block_id.as_deref() == Some("Second <m1>marked</m1>")
+        })
+        .expect("mismatch finding pinned to the missing block");
+    assert_eq!(
+        mismatch_block.severity,
+        bookforge_core::ir::QaFindingSeverity::Error
+    );
+    assert!(
+        translation.findings.iter().any(|finding| {
+            finding.kind == bookforge_core::finding::QaFindingKind::InlineMarkerMissing
+        }),
+        "the item's own validation finding is present too"
+    );
+    assert!(
+        translation
+            .findings
+            .iter()
+            .any(|finding| finding.block_id.is_none()),
+        "the summary finding stays unattributed"
+    );
+}
+
 // ---- Latency-aware batch budgets (#3) --------------------------------------
 
 #[test]

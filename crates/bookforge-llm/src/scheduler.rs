@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use bookforge_core::{
     config::{BatchConfig, ContextScope, ResolvedRunSettings, TranslationProfile},
+    finding::EngineFinding,
     glossary::{GlossaryFormat, GlossaryPromptTerm},
     ir::{BlockId, ProtectedSpan},
     scheduler::SchedulerConfig,
@@ -451,6 +452,15 @@ pub struct SegmentTranslation {
     pub input_cached_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub tokens_estimated: bool,
+    /// Structured, block-attributed QA findings captured by the engine for
+    /// this segment. Populated from `BatchItemFailure.findings` when failed
+    /// items aggregate into the segment record, and from
+    /// `block_mismatch_findings` when a whole segment fails structurally.
+    /// Additive and backward compatible: the error string in `error` keeps
+    /// flowing unchanged, and consumers that ignore this field keep working.
+    /// `SegmentTranslation` itself has no serde contract (it crosses the CLI
+    /// boundary in memory), so no serde marker is needed here.
+    pub findings: Vec<EngineFinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1144,6 +1154,7 @@ where
         input_cached_tokens: response.input_cached_tokens,
         output_tokens: response.output_tokens,
         tokens_estimated: false,
+        findings: Vec::new(),
     })
 }
 
@@ -1883,6 +1894,7 @@ fn needs_review_translation_with_tokens(
         input_cached_tokens,
         output_tokens,
         tokens_estimated: false,
+        findings: Vec::new(),
     }
 }
 
@@ -1907,6 +1919,7 @@ fn failed_translation_with_tokens(
         input_cached_tokens,
         output_tokens,
         tokens_estimated: false,
+        findings: Vec::new(),
     }
 }
 
@@ -3059,6 +3072,7 @@ mod tests {
             input_cached_tokens: None,
             output_tokens: None,
             tokens_estimated: false,
+            findings: Vec::new(),
         }
     }
 
