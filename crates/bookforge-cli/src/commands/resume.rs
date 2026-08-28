@@ -78,6 +78,8 @@ pub struct ResumeArgs {
     #[arg(long)]
     pub output: Option<PathBuf>,
 
+    /// Ask DeepSeek-family endpoints to disable thinking mode (adds the
+    /// provider-appropriate suppression parameter; ignored elsewhere).
     #[arg(long, default_value_t = false)]
     pub no_thinking: bool,
 
@@ -854,6 +856,7 @@ async fn run_inner(
         segment_records: &segment_records,
         translations: &qa_inputs,
         qa_reviews: &qa_reviews,
+        qa_findings: store.segment_qa_findings(&job.id)?,
         performance: snapshot
             .events_path
             .as_ref()

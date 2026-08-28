@@ -8,7 +8,8 @@ use std::{
 
 use anyhow::Result;
 use bookforge_core::{
-    GlossaryTerm, RunConfigSnapshot, segment::build_segments, target_matches, term_matches,
+    GlossaryTerm, RunConfigSnapshot, finding::findings_from_legacy_error_text,
+    segment::build_segments, target_matches, term_matches,
 };
 use bookforge_epub::read_epub;
 use bookforge_store::{JobRecord, JobStore, QaFindingCount, StoredQaFinding};
@@ -270,16 +271,12 @@ fn build_review_document(
     finding_counts: &[QaFindingCount],
     stored_findings: &[StoredQaFinding],
 ) -> ReviewDocument {
-    let mut findings_by_segment: HashMap<&str, Vec<ReviewFinding>> = HashMap::new();
+    let mut findings_by_segment: HashMap<&str, Vec<&StoredQaFinding>> = HashMap::new();
     for finding in stored_findings {
         findings_by_segment
             .entry(finding.segment_id.as_str())
             .or_default()
-            .push(ReviewFinding {
-                kind: finding.kind.clone(),
-                severity: finding.severity.clone(),
-                message: finding.message.clone(),
-            });
+            .push(finding);
     }
 
     let records_by_id = records
@@ -341,10 +338,13 @@ fn build_review_document(
                 corrected_at: stored_translation
                     .and_then(|translation| translation.corrected_at.clone()),
                 flagged: flagged_segment_ids.contains(&segment.id.0),
-                findings: findings_by_segment
-                    .get(segment.id.0.as_str())
-                    .cloned()
-                    .unwrap_or_default(),
+                findings: review_findings_for_segment(
+                    record,
+                    findings_by_segment
+                        .get(segment.id.0.as_str())
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                ),
                 soft_warnings: soft_warnings(
                     record,
                     &segment.source.text,
@@ -409,6 +409,43 @@ fn review_finding_counts(counts: &[QaFindingCount]) -> Vec<ReviewFindingCount> {
             share_percent: count.share_percent(total),
         })
         .collect()
+}
+
+/// One review segment's structured QA findings.
+///
+/// Persisted rows from the store are the preferred source — they carry the
+/// block vocabulary and the per-instance severity recorded at checkpoint time
+/// (a source-copy hit on a title block stays a warning here instead of the
+/// legacy "error" display). Only a flagged segment with no structured rows
+/// falls back to decomposing its stored `segments.error` through the shared
+/// core parser — the same fallback the report and `status` use, so all three
+/// surfaces agree.
+fn review_findings_for_segment(
+    record: &bookforge_store::SegmentRecord,
+    stored: &[&StoredQaFinding],
+) -> Vec<ReviewFinding> {
+    let mut findings = stored
+        .iter()
+        .map(|finding| ReviewFinding {
+            kind: finding.kind.clone(),
+            severity: finding.severity.clone(),
+            message: finding.message.clone(),
+        })
+        .collect::<Vec<_>>();
+    if findings.is_empty()
+        && matches!(record.status.as_str(), "failed" | "needs_review")
+        && let Some(error) = record.error.as_deref()
+    {
+        findings = findings_from_legacy_error_text(error)
+            .iter()
+            .map(|finding| ReviewFinding {
+                kind: finding.kind.as_str().to_string(),
+                severity: finding.severity.as_str().to_string(),
+                message: finding.message.clone(),
+            })
+            .collect();
+    }
+    findings
 }
 
 fn soft_warnings(
@@ -1134,6 +1171,88 @@ mod tests {
             iso_timestamp(UNIX_EPOCH),
             "1970-01-01T00:00:00Z".to_string()
         );
+    }
+
+    fn segment_record(
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> bookforge_store::SegmentRecord {
+        bookforge_store::SegmentRecord {
+            id: id.to_string(),
+            status: status.to_string(),
+            attempts: 1,
+            error: error.map(ToString::to_string),
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            tokens_estimated: false,
+        }
+    }
+
+    fn stored_finding(segment_id: &str, kind: &str, severity: &str) -> StoredQaFinding {
+        StoredQaFinding {
+            id: format!("qaf_{segment_id}_{kind}"),
+            segment_id: segment_id.to_string(),
+            kind: kind.to_string(),
+            severity: severity.to_string(),
+            message: "stored message".to_string(),
+            block_id: Some("b_000001".to_string()),
+        }
+    }
+
+    #[test]
+    fn review_findings_prefer_structured_rows_over_legacy_strings() {
+        let record = segment_record(
+            "seg_0",
+            "needs_review",
+            Some("error: translation is unchanged from the source-language prose"),
+        );
+        let stored = [stored_finding("seg_0", "source_copy_unchanged", "warning")];
+        let stored_refs: Vec<&StoredQaFinding> = stored.iter().collect();
+
+        let findings = review_findings_for_segment(&record, &stored_refs);
+
+        assert_eq!(findings.len(), 1, "structured rows are never re-parsed");
+        assert_eq!(findings[0].kind, "source_copy_unchanged");
+        assert_eq!(
+            findings[0].severity, "warning",
+            "instance severity displayed"
+        );
+    }
+
+    #[test]
+    fn review_findings_fall_back_to_core_parser_for_flagged_segments() {
+        let record = segment_record(
+            "seg_1",
+            "failed",
+            Some(
+                "translation is unchanged from the source-language prose; \
+                 batch translation block mismatch: missing=[\"b_000026\"], extra=[], duplicate=[]",
+            ),
+        );
+
+        let findings = review_findings_for_segment(&record, &[]);
+
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].kind, "source_copy_unchanged");
+        assert_eq!(findings[0].severity, "warning", "honest instance severity");
+        assert_eq!(findings[1].kind, "batch_block_mismatch");
+        assert_eq!(findings[1].severity, "error");
+    }
+
+    #[test]
+    fn review_findings_stay_empty_for_clean_segments() {
+        let record = segment_record("seg_2", "succeeded", None);
+        assert!(review_findings_for_segment(&record, &[]).is_empty());
+    }
+
+    #[test]
+    fn review_findings_do_not_parse_strings_on_succeeded_segments() {
+        // A succeeded segment can carry a stale warning string; the legacy
+        // fallback exists only for flagged segments without structured rows.
+        let record = segment_record("seg_3", "succeeded", Some("protected span missing: x"));
+        assert!(review_findings_for_segment(&record, &[]).is_empty());
     }
 
     #[test]

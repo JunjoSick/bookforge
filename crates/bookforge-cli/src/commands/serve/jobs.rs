@@ -511,6 +511,11 @@ async fn resume_job(
         LaunchSlot::Acquired(slot) => slot,
         LaunchSlot::Exhausted => return Ok(launch_slot_exhausted()),
     };
+    // Claim handoff (retry-supervisor audit): the parent releases the launch
+    // claim before spawning a real child — the replacement worker acquires
+    // and holds its own claim until its control watcher clears it. The
+    // cfg(test) hook below is the only path that keeps it (no child spawns).
+    #[cfg_attr(not(test), allow(unused_mut))]
     let Some(mut launch_claim) = crate::control::RuntimeLaunchClaim::acquire(&id)? else {
         return Ok(Json(json!({
             "command": "resume",
@@ -555,6 +560,9 @@ async fn resume_job(
                 .map_err(|_| anyhow::anyhow!("resume environment recorder is unavailable"))?
                 .push(environment);
         }
+        // The hook path never spawns a real child, so the claim stays
+        // persisted: a second concurrent request must see "launching", which
+        // is how the exactly-once semantics stay testable without processes.
         launch_claim.persist_until_worker();
         return Ok(Json(json!({
             "command": "resume",
@@ -566,6 +574,13 @@ async fn resume_job(
     }
     let mut child = command.spawn().context("failed to launch resume worker")?;
     let pid = child.id();
+    // Claim handoff (retry-supervisor audit): the parent releases the launch
+    // claim here instead of persisting it. The replacement worker acquires
+    // and holds its own claim until its control watcher clears it; a parent
+    // that kept holding the claim across the spawn guaranteed every child
+    // died with "another bookforge process appears to be launching" — the
+    // silent respawn loop observed in the dogfooding run.
+    drop(launch_claim);
     if let Some(status) = child_exit_status_after(&mut child, CHILD_STARTUP_CHECK).await?
         && !status.success()
     {
@@ -573,7 +588,6 @@ async fn resume_job(
             "resume worker exited immediately with {status}"
         )));
     }
-    launch_claim.persist_until_worker();
     drop(slot);
     Ok(Json(json!({
         "command": "resume",

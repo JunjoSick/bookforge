@@ -239,6 +239,7 @@ async fn estimate_translate(
     }
     let model = field_value(&fields, "model");
     let target = field_value(&fields, "target").unwrap_or_else(|| "Italian".to_string());
+    let provider_for_passes = provider.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         let temp = PrivateTempDir::create().context("failed to create a private temp directory")?;
@@ -248,17 +249,33 @@ async fn estimate_translate(
     })
     .await?;
 
-    match result {
-        Ok(est) => Ok(Json(json!({
-            "segments": est.segments,
-            "input_tokens": est.input_tokens,
-            "output_tokens": est.output_tokens,
-            "model": est.model,
-            "cost_usd": est.cost_usd,
-        }))
-        .into_response()),
-        Err(err) => Ok(bad_request(&format!("could not estimate: {err}"))),
-    }
+    let est = match result {
+        Ok(est) => est,
+        Err(err) => return Ok(bad_request(&format!("could not estimate: {err}"))),
+    };
+    // Pass-cost planning surcharges (same heuristics and catalog as
+    // `estimate --pass-costs`): one JSON entry per pass plus a REAL total
+    // (primary + surcharges). Existing keys stay unchanged.
+    let (passes, surcharge_total) =
+        super::estimate::pass_cost_surcharges(&provider_for_passes, &est, None)?;
+    let est_cost_usd_passes = passes
+        .iter()
+        .map(|(label, usd)| ((*label).to_string(), serde_json::Value::from(*usd)))
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    let est_cost_usd_total = match (est.cost_usd, surcharge_total) {
+        (Some(primary), Some(surcharges)) => Some(primary + surcharges),
+        _ => None,
+    };
+    Ok(Json(json!({
+        "segments": est.segments,
+        "input_tokens": est.input_tokens,
+        "output_tokens": est.output_tokens,
+        "model": est.model,
+        "cost_usd": est.cost_usd,
+        "est_cost_usd_passes": est_cost_usd_passes,
+        "est_cost_usd_total": est_cost_usd_total,
+    }))
+    .into_response())
 }
 
 fn supported_provider(provider: &str) -> bool {

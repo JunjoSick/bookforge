@@ -61,7 +61,14 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     println!("  needs review: {}", summary.needs_review);
     println!("  failed:      {}", summary.failed);
     println!("  retry pending: {}", summary.retry_pending);
-    for line in format_finding_breakdown(&store.qa_finding_breakdown(&args.job_id)?) {
+    // Same counts the report prints: structured `qa_findings` rows win, and
+    // flagged segments without structured rows decompose through the shared
+    // core parser, so the two surfaces cannot drift apart.
+    let breakdown = crate::report::finding_breakdown_counts(
+        &store.segment_records(&args.job_id)?,
+        &store.segment_qa_findings(&args.job_id)?,
+    );
+    for line in format_finding_breakdown(&breakdown) {
         println!("{line}");
     }
     println!();

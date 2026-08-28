@@ -201,6 +201,16 @@ impl CheckpointWriter {
     }
 }
 
+/// Engine-provided structured findings for the checkpoint paths.
+///
+/// The engine workstream landed `BatchItemFailure.findings` (serde-default
+/// tolerant); until it also surfaces the structured findings on
+/// `SegmentTranslation` — the value the checkpoint writer receives — the CLI
+/// persists the legacy-parsed fallback below. When the field lands this
+/// placeholder becomes `&translation.findings` at the two call sites and the
+/// `findings_for_checkpoint` precedence turns it on with no other change.
+const ENGINE_FINDINGS_PLACEHOLDER: &[bookforge_core::finding::EngineFinding] = &[];
+
 fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
     let CheckpointCommand::SaveTranslation {
         job_id,
@@ -247,6 +257,13 @@ fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
                 output_tokens: translation.output_tokens,
                 tokens_estimated: translation.tokens_estimated,
             })?;
+            persist_checkpoint_findings(
+                store,
+                &job_id,
+                &translation.segment_id.0,
+                ENGINE_FINDINGS_PLACEHOLDER,
+                translation.error.as_deref(),
+            );
         }
         SegmentStatus::Failed => {
             store.mark_segment_failed_if_unfinished(
@@ -254,10 +271,69 @@ fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
                 &translation.segment_id.0,
                 translation.error.as_deref().unwrap_or("translation failed"),
             )?;
+            if store.segment_records(&job_id).is_ok_and(|records| {
+                records.iter().any(|record| {
+                    record.id == translation.segment_id.0 && record.status == "failed"
+                })
+            }) {
+                persist_checkpoint_findings(
+                    store,
+                    &job_id,
+                    &translation.segment_id.0,
+                    ENGINE_FINDINGS_PLACEHOLDER,
+                    translation.error.as_deref(),
+                );
+            }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Persist the structured QA findings for a needs-review/failed checkpoint.
+///
+/// Structured engine findings win when the engine provided them
+/// (`BatchItemFailure.findings` — serde-default tolerant). Otherwise the
+/// legacy concatenated error string is decomposed through the shared core
+/// parser (`findings_from_legacy_error_text`) so old-style errors still land
+/// in the block finding vocabulary with honest per-instance severity instead
+/// of a CLI-local re-parse. The legacy error string itself keeps flowing into
+/// `segments.error` as before — other surfaces still read it. Findings are
+/// instrumentation: a failed findings write must never fail the surrounding
+/// checkpoint.
+fn persist_checkpoint_findings(
+    store: &JobStore,
+    job_id: &str,
+    segment_id: &str,
+    engine_findings: &[bookforge_core::finding::EngineFinding],
+    legacy_error: Option<&str>,
+) {
+    let findings = findings_for_checkpoint(engine_findings, legacy_error);
+    if findings.is_empty() {
+        return;
+    }
+    if let Err(error) = store.record_segment_engine_findings(job_id, segment_id, &findings) {
+        tracing::warn!(
+            job_id,
+            segment_id,
+            "structured findings write failed: {error}; keeping the checkpoint"
+        );
+    }
+}
+
+/// Structured findings for one checkpoint. Non-empty engine findings win;
+/// otherwise the legacy error string decomposes through the core parser
+/// (empty/absent errors produce no findings).
+fn findings_for_checkpoint(
+    engine_findings: &[bookforge_core::finding::EngineFinding],
+    legacy_error: Option<&str>,
+) -> Vec<bookforge_core::finding::EngineFinding> {
+    if !engine_findings.is_empty() {
+        return engine_findings.to_vec();
+    }
+    legacy_error
+        .map(bookforge_core::finding::findings_from_legacy_error_text)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -824,5 +900,175 @@ mod tests {
 
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(input_path);
+    }
+
+    fn needs_review_fixture(job_id: &str) -> CheckpointCommand {
+        let mut translation = test_translation("seg_findings", 0, SegmentStatus::NeedsReview);
+        translation.error = Some(
+            "error: translation is unchanged from the source-language prose; \
+             batch translation block mismatch: missing=[\"b_000026\"], extra=[], duplicate=[]"
+                .to_string(),
+        );
+        CheckpointCommand::SaveTranslation {
+            job_id: job_id.to_string(),
+            translation: Box::new(translation),
+            provider: "mock".to_string(),
+            model: "mock-model".to_string(),
+            prompt_version: "v1".to_string(),
+        }
+    }
+
+    #[test]
+    fn needs_review_checkpoint_persists_legacy_parsed_findings() {
+        let db_path = temp_path("findings_legacy.sqlite");
+        let input_path = temp_path("findings_legacy.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture writable");
+
+        let store = JobStore::open(&db_path).expect("store open for setup");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("findings_legacy_out.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-model",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job created");
+        store
+            .insert_segments(
+                &job.id,
+                &[test_segment("seg_findings", 0)],
+                "v1",
+                "mock",
+                "mock-model",
+                "test_ns",
+            )
+            .expect("segment inserted");
+
+        apply(&store, needs_review_fixture(&job.id)).expect("needs_review checkpoint applies");
+
+        let findings = store
+            .segment_qa_findings(&job.id)
+            .expect("findings load back");
+        assert_eq!(findings.len(), 2, "legacy error decomposes into two rows");
+        let source_copy = findings
+            .iter()
+            .find(|finding| finding.kind == "source_copy_unchanged")
+            .expect("source copy finding");
+        // Instance severity, not the legacy "error: " prefix: a source-copy
+        // hit is a warning unless the instance overrides it.
+        assert_eq!(source_copy.severity, "warning");
+        let mismatch = findings
+            .iter()
+            .find(|finding| finding.kind == "batch_block_mismatch")
+            .expect("block mismatch finding");
+        assert_eq!(mismatch.severity, "error");
+
+        drop(store);
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn engine_findings_persist_with_block_id_and_instance_severity() {
+        let db_path = temp_path("findings_structured.sqlite");
+        let input_path = temp_path("findings_structured.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture writable");
+
+        let store = JobStore::open(&db_path).expect("store open for setup");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("findings_structured_out.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-model",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job created");
+        store
+            .insert_segments(
+                &job.id,
+                &[test_segment("seg_findings", 0)],
+                "v1",
+                "mock",
+                "mock-model",
+                "test_ns",
+            )
+            .expect("segment inserted");
+
+        apply(&store, needs_review_fixture(&job.id)).expect("needs_review checkpoint applies");
+
+        // Engine-provided structured findings (the path the checkpoint takes
+        // once `SegmentTranslation` carries the engine's `findings`): they
+        // replace the legacy-parsed rows and keep block attribution.
+        let engine_findings = vec![
+            bookforge_core::finding::EngineFinding::new(
+                bookforge_core::finding::QaFindingKind::SourceCopyUnchanged,
+                "title block copied unchanged",
+            )
+            .with_block_id("b_000000"),
+            bookforge_core::finding::EngineFinding::new(
+                bookforge_core::finding::QaFindingKind::BatchBlockMismatch,
+                "missing block translations",
+            )
+            .with_block_id("b_000001"),
+        ];
+        persist_checkpoint_findings(&store, &job.id, "seg_findings", &engine_findings, None);
+
+        let findings = store
+            .segment_qa_findings(&job.id)
+            .expect("structured findings load back");
+        assert_eq!(findings.len(), 2, "structured rows replace legacy rows");
+        let title = findings
+            .iter()
+            .find(|finding| finding.block_id.as_deref() == Some("b_000000"))
+            .expect("block-attributed title finding");
+        assert_eq!(title.kind, "source_copy_unchanged");
+        assert_eq!(title.severity, "warning", "instance severity is preserved");
+        assert_eq!(title.message, "title block copied unchanged");
+        let block = findings
+            .iter()
+            .find(|finding| finding.block_id.as_deref() == Some("b_000001"))
+            .expect("block-attributed mismatch finding");
+        assert_eq!(block.kind, "batch_block_mismatch");
+        assert_eq!(block.severity, "error");
+
+        drop(store);
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
+    }
+
+    #[test]
+    fn checkpoint_findings_prefer_engine_findings_over_legacy_parse() {
+        let structured = vec![bookforge_core::finding::EngineFinding::new(
+            bookforge_core::finding::QaFindingKind::Other,
+            "engine reported",
+        )];
+        assert_eq!(
+            findings_for_checkpoint(&structured, Some("legacy error text")),
+            structured,
+            "non-empty engine findings win unchanged"
+        );
+        let parsed = findings_for_checkpoint(
+            &[],
+            Some("error: translation is unchanged from the source-language prose"),
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].kind,
+            bookforge_core::finding::QaFindingKind::SourceCopyUnchanged
+        );
+        assert!(findings_for_checkpoint(&[], None).is_empty());
+        assert!(findings_for_checkpoint(&[], Some("   ")).is_empty());
     }
 }

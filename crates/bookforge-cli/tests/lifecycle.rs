@@ -1815,6 +1815,92 @@ fn cli_resume_reuses_checkpointed_segments() {
     );
 }
 
+// --- Supervised retry (deliverable: `retry --ui` + retry supervisor) -----
+//
+// `retry` marks segments and then launches a replacement worker
+// (`bookforge resume <job> --ui quiet`) that processes them, supervising it
+// with surfaced death events, exponential respawn backoff, and a bounded
+// failure budget. The mock provider runs the replacement worker for real
+// here; the death/backoff/bounds paths are covered by the supervisor unit
+// tests in `commands/retry.rs` (forced-exit hook).
+
+fn retry_supervised_run(temp: &TempDir, extra_args: &[&str]) -> assert_cmd::assert::Assert {
+    let run = translate_quiet(temp, "mock-prefix-target");
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store opens");
+    let retry_id = store
+        .segment_records(&run.job_id)
+        .expect("segments should load")
+        .into_iter()
+        .next()
+        .expect("fixture should produce segments")
+        .id;
+    store
+        .mark_segment_failed(&run.job_id, &retry_id, "force supervised retry")
+        .expect("segment should be marked failed");
+    drop(store);
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args(["retry", &run.job_id, "--only", "failed"])
+        .args(extra_args)
+        .assert()
+        .success();
+
+    // The supervised replacement worker retranslated the segment and the job
+    // reached a clean terminal state.
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).expect("store reopens");
+    let record = store
+        .segment_records(&run.job_id)
+        .expect("segments reload")
+        .into_iter()
+        .find(|record| record.id == retry_id)
+        .expect("retried segment still present");
+    assert_eq!(record.status, "succeeded", "worker must retranslate it");
+    assert_eq!(
+        store
+            .get_job(&run.job_id)
+            .expect("job")
+            .expect("exists")
+            .status,
+        "succeeded",
+        "the supervised retry must complete the job"
+    );
+    assert
+}
+
+#[test]
+fn cli_retry_default_mode_marks_and_supervises_replacement_worker() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let assert = retry_supervised_run(&temp, &[]);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(
+        stdout.contains("Marked retry_pending: 1"),
+        "default mode keeps the human marking output: {stdout}"
+    );
+}
+
+#[test]
+fn cli_retry_quiet_mode_suppresses_human_stdout_and_still_supervises() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let assert = retry_supervised_run(&temp, &["--ui", "quiet"]);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(
+        stdout.trim().is_empty(),
+        "quiet mode must not write human stdout: {stdout}"
+    );
+}
+
+#[test]
+fn cli_retry_progress_mode_supervises_replacement_worker() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let assert = retry_supervised_run(&temp, &["--ui", "progress"]);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(
+        stdout.contains("Marked retry_pending: 1"),
+        "progress mode keeps the human marking output: {stdout}"
+    );
+}
+
 #[test]
 fn cli_resume_force_relaunches_dead_paused_job() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -3291,7 +3377,20 @@ fn cli_review_generates_artifacts_and_ingest_flags_marks_retry() {
         .summary(&run.job_id)
         .expect("summary should load")
         .expect("job should exist");
-    assert_eq!(summary.retry_pending, 1);
+    // The retry marks the segment and then supervises a replacement worker
+    // that reprocesses it, so nothing stays pending afterwards.
+    assert_eq!(
+        summary.retry_pending, 0,
+        "the supervised replacement worker reprocesses the flagged segment"
+    );
+    assert_eq!(
+        summary.needs_review, 0,
+        "the flagged segment was retranslated"
+    );
+    assert_eq!(
+        summary.succeeded, summary.total_segments,
+        "the supervised retry completes the job"
+    );
 }
 
 struct TranslateRun {

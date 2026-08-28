@@ -42,9 +42,9 @@ pub struct EstimateArgs {
     pub pricing: Option<PathBuf>,
 
     /// Append an approximate pass-cost breakdown (QA review, double-check,
-    /// repair re-runs) beneath the primary estimate. The primary numbers and
-    /// every pre-existing line stay unchanged; breakdown values are planning
-    /// heuristics, never metered spend.
+    /// repair re-runs) beneath the primary estimate and print a real
+    /// estimated total (primary + pass surcharges). Breakdown values are
+    /// planning heuristics, never metered spend.
     #[arg(long)]
     pub pass_costs: bool,
 
@@ -198,7 +198,7 @@ pub async fn run(args: EstimateArgs) -> Result<()> {
     println!("Pricing: {}", result.pricing_label);
 
     match result.cost_usd {
-        Some(cost) => println!("Estimated cost: ${cost:.6}"),
+        Some(cost) => println!("Estimated cost: ${cost:.4}"),
         None => println!("Estimated cost: unavailable for this provider/model"),
     }
 
@@ -250,11 +250,14 @@ struct PassCostBreakdown {
     double_check_passes: u32,
     repair_share: f64,
     rows: Vec<PassCostRow>,
-    total_usd: Option<f64>,
+    /// Sum of the per-pass surcharges only. This is never a run total on its
+    /// own: the printed total adds it to the primary estimate.
+    surcharge_total_usd: Option<f64>,
 }
 
 /// Deterministic token sizing only; USD is attached per catalog afterwards so
-/// tests do not depend on bundled prices.
+/// tests do not depend on bundled prices. Rows with zero tokens are never
+/// emitted: an empty or degenerate input must not print zero-token rows.
 fn size_pass_tokens(
     base_input_tokens: u64,
     base_output_tokens: u64,
@@ -283,7 +286,7 @@ fn size_pass_tokens(
         let output =
             ((base_output_tokens as f64) * REPAIR_OUTPUT_MULTIPLIER * repair_share).round() as u64;
         if input > 0 || output > 0 {
-            rows.push(("repair re-runs", input, output));
+            rows.push(("repair share", input, output));
         }
     }
     rows
@@ -321,13 +324,49 @@ fn build_pass_cost_breakdown(
         });
     }
     let usd_rows = rows.iter().filter_map(|row| row.usd);
-    let total_usd = (!rows.is_empty()).then(|| usd_rows.sum());
+    // A surcharge total only exists when every pass itself priced: a row
+    // pricing as unavailable must not silently shrink the printed total.
+    let surcharge_total_usd =
+        (!rows.is_empty() && rows.iter().all(|row| row.usd.is_some())).then(|| usd_rows.sum());
     PassCostBreakdown {
         double_check_passes,
         repair_share,
         rows,
-        total_usd,
+        surcharge_total_usd,
     }
+}
+
+/// One pass label plus its planning surcharge (`None` when that pass priced
+/// as unavailable for the provider/model).
+pub(crate) type PassSurchargeList = Vec<(&'static str, Option<f64>)>;
+
+/// Per-pass planning surcharges for an already-computed primary estimate,
+/// plus the pass surcharge total. Shared by `estimate --pass-costs` (text)
+/// and the dashboard's `/api/estimate` JSON so both surfaces never drift.
+/// The surcharge total is `None` unless every pass priced.
+pub(crate) fn pass_cost_surcharges(
+    provider: &str,
+    result: &EstimateResult,
+    pricing_path: Option<&Path>,
+) -> Result<(PassSurchargeList, Option<f64>)> {
+    let pricing = load_pricing(pricing_path)?;
+    let breakdown = build_pass_cost_breakdown(
+        &pricing,
+        provider,
+        &result.model,
+        result.input_tokens,
+        result.output_tokens,
+        double_check_passes_for_profile(result.profile, None),
+        DEFAULT_REPAIR_SHARE,
+    );
+    Ok((
+        breakdown
+            .rows
+            .iter()
+            .map(|row| (row.label, row.usd))
+            .collect(),
+        breakdown.surcharge_total_usd,
+    ))
 }
 
 fn print_pass_cost_breakdown(args: &EstimateArgs, result: &EstimateResult) -> Result<()> {
@@ -351,7 +390,7 @@ fn print_pass_cost_breakdown(args: &EstimateArgs, result: &EstimateResult) -> Re
     );
 
     println!();
-    println!("Pass-cost estimates (approximate planning heuristics; not metered):");
+    println!("Pass-cost estimates (planning heuristics; not metered):");
     println!(
         "  assumptions: {} qa pass(es) @{:.2}x in/{:.2}x out | {:.0} double-check pass(es) @\
          {:.2}x in/{:.2}x out | repair share {:.2}",
@@ -364,23 +403,33 @@ fn print_pass_cost_breakdown(args: &EstimateArgs, result: &EstimateResult) -> Re
         breakdown.repair_share,
     );
     for row in &breakdown.rows {
-        match row.usd {
-            Some(usd) => println!(
-                "  {:<22} ~{} in / ~{} out tokens (~${:.6})",
-                row.label, row.input_tokens, row.output_tokens, usd
-            ),
-            None => println!(
-                "  {:<22} ~{} in / ~{} out tokens (cost unavailable for this provider/model)",
-                row.label, row.input_tokens, row.output_tokens
-            ),
+        println!("{}", format_pass_cost_row(row));
+    }
+    match (result.cost_usd, breakdown.surcharge_total_usd) {
+        (Some(primary), Some(surcharges)) => {
+            println!("Estimated total incl. passes: ${:.4}", primary + surcharges)
+        }
+        (Some(_), None) | (None, Some(_)) | (None, None) => {
+            println!("Estimated total incl. passes: unavailable for this provider/model");
         }
     }
-    match breakdown.total_usd {
-        Some(total) => println!("  Estimated cost incl. passes: ${total:.6}"),
-        None => println!("  Estimated cost incl. passes: unavailable for this provider/model"),
-    }
-    println!("  Cache discounts, failed-request billing, and provider rounding are not modeled.");
     Ok(())
+}
+
+/// One pass-cost line in the printed breakdown. The label column and token
+/// columns are padded so every per-pass surcharge lands in the same column:
+///
+/// ```text
+///   qa review    ~130337 in / ~23982 out  (+$0.0250)
+///   repair share ~5213 in / ~5996 out     (+$0.0024)
+/// ```
+fn format_pass_cost_row(row: &PassCostRow) -> String {
+    let tokens = format!("~{} in / ~{} out", row.input_tokens, row.output_tokens);
+    let surcharge = match row.usd {
+        Some(usd) => format!("(+${usd:.4})"),
+        None => "(+unavailable)".to_string(),
+    };
+    format!("  {:<12} {tokens:<23}  {surcharge}", row.label)
 }
 
 #[cfg(test)]
@@ -445,7 +494,7 @@ mod tests {
             rows,
             vec![
                 ("qa review", 1_250_000, 80_000),
-                ("repair re-runs", 50_000, 20_000)
+                ("repair share", 50_000, 20_000)
             ]
         );
     }
@@ -460,8 +509,118 @@ mod tests {
     }
 
     #[test]
-    fn empty_inputs_yield_no_pass_rows() {
+    fn empty_inputs_yield_no_pass_rows_for_every_pass_type() {
+        // The zero-token-row guard must hold no matter which passes are
+        // enabled: an empty input never prints a zero-token planning row.
         assert!(size_pass_tokens(0, 0, 0, 0.05).is_empty());
+        assert!(size_pass_tokens(0, 0, 3, 0.05).is_empty());
+        assert!(size_pass_tokens(0, 0, 0, 1.0).is_empty());
+    }
+
+    #[test]
+    fn pass_cost_rows_render_with_aligned_surcharges() {
+        let row = |label, input, output, usd| PassCostRow {
+            label,
+            input_tokens: input,
+            output_tokens: output,
+            usd,
+        };
+        let qa = format_pass_cost_row(&row("qa review", 130_337, 23_982, Some(0.025)));
+        let repair = format_pass_cost_row(&row("repair share", 5_213, 5_996, Some(0.002_4)));
+        let unavailable = format_pass_cost_row(&row("double-check", 1_234, 56, None));
+
+        assert_eq!(qa, "  qa review    ~130337 in / ~23982 out  (+$0.0250)");
+        assert_eq!(repair, "  repair share ~5213 in / ~5996 out     (+$0.0024)");
+        assert_eq!(
+            unavailable,
+            "  double-check ~1234 in / ~56 out       (+unavailable)"
+        );
+        // Every surcharge lands in the same column.
+        assert_eq!(qa.find("(+$"), repair.find("(+$"));
+    }
+
+    #[test]
+    fn pass_cost_surcharge_total_requires_every_pass_to_price() {
+        let pricing = load_pricing(None).expect("bundled pricing loads");
+        let priced = build_pass_cost_breakdown(&pricing, "mock", "mock", 1_000, 400, 0, 0.05);
+        assert!(priced.rows.iter().all(|row| row.usd == Some(0.0)));
+        assert_eq!(priced.surcharge_total_usd, Some(0.0));
+
+        // An unknown model prices no row, so no surcharge total exists and the
+        // printed total cannot pretend one was computed.
+        let unpriced = build_pass_cost_breakdown(&pricing, "mock", "mock", 1_000, 400, 0, 0.0);
+        let no_catalog = build_pass_cost_breakdown(
+            &pricing,
+            "unknown-provider",
+            "unknown-model",
+            1_000,
+            400,
+            0,
+            0.05,
+        );
+        assert!(no_catalog.rows.iter().all(|row| row.usd.is_none()));
+        assert_eq!(no_catalog.surcharge_total_usd, None);
+        assert_eq!(unpriced.rows.len(), 1, "qa review row still sizes tokens");
+        assert_eq!(unpriced.rows[0].usd, Some(0.0));
+        assert_eq!(unpriced.surcharge_total_usd, Some(0.0));
+    }
+
+    #[test]
+    fn pass_cost_total_pins_primary_plus_surcharges() {
+        // Fixed catalog so the pinned numbers do not move with bundled prices.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pricing_path = dir.path().join("pricing.json");
+        std::fs::write(
+            &pricing_path,
+            r#"{
+  "schema_version": 1,
+  "updated_at": "2026-08-28T00:00:00Z",
+  "providers": {
+    "testprov": {
+      "models": {
+        "testmodel": {
+          "input_per_million_usd": 2.0,
+          "output_per_million_usd": 8.0,
+          "input_cache_per_million_usd": null
+        }
+      }
+    }
+  }
+}"#,
+        )
+        .expect("pricing fixture writes");
+        let pricing = load_pricing(Some(&pricing_path)).expect("fixture pricing loads");
+
+        // Primary: 100k in / 40k out -> 100000/1e6*2 + 40000/1e6*8 = $0.52.
+        let primary =
+            estimate_cost_usd_with_pricing(&pricing, "testprov", "testmodel", 100_000, 0, 40_000);
+        assert_eq!(primary, Some(0.52));
+        let breakdown =
+            build_pass_cost_breakdown(&pricing, "testprov", "testmodel", 100_000, 40_000, 0, 0.05);
+
+        let qa = breakdown
+            .rows
+            .iter()
+            .find(|row| row.label == "qa review")
+            .expect("qa row");
+        // qa: 125000 in / 8000 out -> 0.25 + 0.064 = $0.314.
+        assert!((qa.usd.expect("qa priced") - 0.314).abs() < 1e-12);
+        let repair = breakdown
+            .rows
+            .iter()
+            .find(|row| row.label == "repair share")
+            .expect("repair row");
+        // repair: 5000 in / 2000 out -> 0.01 + 0.016 = $0.026.
+        assert!((repair.usd.expect("repair priced") - 0.026).abs() < 1e-12);
+
+        let surcharges = breakdown.surcharge_total_usd.expect("every pass priced");
+        assert!((surcharges - 0.34).abs() < 1e-9);
+        let total = primary.expect("primary priced") + surcharges;
+        // The printed total is a REAL total: primary + every surcharge.
+        assert!(
+            (total - 0.86).abs() < 1e-9,
+            "total {total} must equal primary + surcharges"
+        );
     }
 
     #[test]

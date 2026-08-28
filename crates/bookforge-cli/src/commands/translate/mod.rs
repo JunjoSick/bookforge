@@ -447,6 +447,7 @@ where
                 target_concurrency: 1,
                 runtime_config_revision: metadata.runtime_config_revision,
                 provider_max_attempts: metadata.provider_max_attempts,
+                effective_timeout_seconds: None,
                 timestamp_ms: bookforge_core::progress::now_ms(),
             });
 

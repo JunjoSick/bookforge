@@ -2903,6 +2903,18 @@ async fn estimate_endpoint_parses_upload_from_a_private_temp_dir_end_to_end() {
     // 36 under the canonical chars/4-style estimator (was 33 under the
     // retired 4.5-chars/token dominant-class formula).
     assert_eq!(payload["input_tokens"], json!(36));
+    // Pass-cost planning surcharges: one entry per pass plus a REAL total
+    // (primary + surcharges). The mock provider prices everything at $0, so
+    // both are exact zeros — but they must be present and coherent.
+    let passes = payload["est_cost_usd_passes"]
+        .as_object()
+        .expect("est_cost_usd_passes is an object keyed per pass");
+    assert_eq!(
+        passes.keys().collect::<Vec<_>>(),
+        vec!["qa review", "repair share"]
+    );
+    assert!(passes.values().all(|value| value.as_f64() == Some(0.0)));
+    assert_eq!(payload["est_cost_usd_total"], json!(0.0));
 }
 
 // -----------------------------------------------------------------------

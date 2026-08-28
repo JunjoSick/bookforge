@@ -217,25 +217,30 @@ bookforge estimate book.epub \
 
 The printed estimate prices the primary translation pass only. QA review,
 double-check, and repair re-runs are real extra passes during a run, so
-`--pass-costs` appends an approximate breakdown for them:
+`--pass-costs` appends an approximate breakdown for them, each pass with its
+own explicit surcharge, and a total that adds every surcharge to the primary
+cost:
 
 ```text
-Pass-cost estimates (approximate planning heuristics; not metered):
+Estimated cost: $0.0482
+Pass-cost estimates (planning heuristics; not metered):
   assumptions: 1 qa pass(es) @1.25x in/0.20x out | 0 double-check pass(es) @1.50x in/0.15x out | repair share 0.05
-  qa review              ~120998 in / ~22264 out tokens (~$0.023174)
-  repair re-runs         ~4840 in / ~5566 out tokens (~$0.002236)
-  Estimated cost incl. passes: $0.025410
+  qa review    ~130337 in / ~23982 out  (+$0.0250)
+  repair share ~5213 in / ~5996 out     (+$0.0024)
+Estimated total incl. passes: $0.0755
 ```
 
-Each row reuses the same estimator and pricing catalog as the primary line:
-input tokens are the primary estimate scaled by the pass's input multiplier,
-and output tokens by its output multiplier, with one QA pass per run and one
-double-check pass when the profile's double-check mode is enabled
-(`--double-check-passes` overrides it; `--repair-share`, default `0.05`,
-models the fraction of segments assumed to need a batch repair re-run). Every
-figure is deterministic but approximate: cache discounts, failed-request
-billing, provider rounding, and per-segment variability are not modeled, so
-treat totals as planning heuristics rather than expected spend.
+The `Estimated total incl. passes` line is primary + sum(surcharges) — a real
+total, never the surcharges alone. Each row reuses the same estimator and
+pricing catalog as the primary line: input tokens are the primary estimate
+scaled by the pass's input multiplier, and output tokens by its output
+multiplier, with one QA pass per run and one double-check pass when the
+profile's double-check mode is enabled (`--double-check-passes` overrides it;
+`--repair-share`, default `0.05`, models the fraction of segments assumed to
+need a batch repair re-run). Every figure is deterministic but approximate:
+cache discounts, failed-request billing, provider rounding, and per-segment
+variability are not modeled, so treat totals as planning heuristics rather
+than expected spend.
 
 Start the translation. Presets bundle a provider, model, endpoint, and suitable
 defaults; explicit provider flags remain available when you need them.
@@ -259,13 +264,14 @@ packing and avoids paying prompt overhead for extra requests. If a response
 body still fails to decode after a retry, BookForge bisects a multi-item batch;
 a single item remains the recovery floor.
 
-`--no-thinking` asks the selected endpoint to suppress reasoning. BookForge
-sends OpenRouter's `reasoning.enabled=false`, OpenAI Chat Completions'
-`reasoning_effort=none`, or DeepSeek's `thinking.type=disabled`, selected from
-the base URL or a known OpenRouter/DeepSeek preset credential identity. Other
-OpenAI-compatible endpoints receive no guessed suppression field and produce a
-warning. This includes the bundled local Ollama and llama.cpp endpoints until
-they expose a compatible, documented control.
+`--no-thinking` asks DeepSeek-family endpoints to disable thinking mode: BookForge
+adds the provider-appropriate suppression parameter — OpenRouter's
+`reasoning.enabled=false`, OpenAI Chat Completions' `reasoning_effort=none`, or
+DeepSeek's `thinking.type=disabled` — selected from the base URL or a known
+OpenRouter/DeepSeek preset credential identity. The flag is ignored elsewhere:
+other OpenAI-compatible endpoints receive no guessed suppression field and
+produce a warning. This includes the bundled local Ollama and llama.cpp
+endpoints until they expose a compatible, documented control.
 
 Provider-reported `completion_tokens` is the billable output aggregate and
 already includes any `completion_tokens_details.reasoning_tokens` breakdown.
@@ -353,14 +359,28 @@ completed checkpoints. `resume` first tries to wake a live worker and otherwise
 starts one replacement worker. Avoid `resume --force` unless a paused worker is
 known to be gone; forcing a second live worker can duplicate requests.
 
-`retry` changes segment state but does not itself run the provider. Mark the
-desired scope and then resume:
+`retry` marks the desired scope and then launches a supervised replacement
+worker that processes the marked segments:
 
 ```bash
 bookforge retry <job-id> --only failed
 bookforge retry <job-id> --only needs-review
-bookforge resume <job-id>
 ```
+
+The supervisor logs each spawn ("replacement worker starting (attempt N)"),
+surfaces every non-success child exit as a `replacement_worker_died` error
+event with the child's stderr tail, and backs off exponentially between
+respawns (1s, 2s, 4s, ... capped at 60s). After five consecutive dead workers
+it gives up honestly: a retry that never made any progress marks the job
+failed, otherwise the job is left exactly as the last worker left it — and the
+command exits non-zero with a clear message either way. When a live worker
+already holds the job (fresh runtime lease), or another process is mid-launch,
+`retry` only marks the segments and refuses to spawn a second worker; run
+`bookforge resume <job-id>` yourself in that case.
+
+`--ui` controls the supervision reporting (`--ui quiet` keeps stdout clean for
+machines; `--ui json` emits the versioned envelope). Omitted, the command
+behaves as before the flag existed.
 
 Completed compatible segments are loaded from checkpoints or cache rather than
 translated again. The input snapshot and run configuration recorded with the

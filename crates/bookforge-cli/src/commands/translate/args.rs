@@ -219,6 +219,8 @@ pub struct TranslateArgs {
     #[arg(long, value_enum, default_value_t = FallbackScope::Failed)]
     pub fallback_only: FallbackScope,
 
+    /// Ask DeepSeek-family endpoints to disable thinking mode (adds the
+    /// provider-appropriate suppression parameter; ignored elsewhere).
     #[arg(long, default_value_t = false)]
     pub no_thinking: bool,
 

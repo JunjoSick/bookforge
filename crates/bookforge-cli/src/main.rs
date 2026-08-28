@@ -192,7 +192,7 @@ async fn run_command(command: Command, cancel_token: CancellationToken) -> Resul
         Command::Review(args) => review::run(args).await,
         Command::IngestFlags(args) => ingest_flags::run(args).await,
         Command::Glossary(args) => glossary::run(args).await,
-        Command::Retry(args) => retry::run(args).await,
+        Command::Retry(args) => retry::run(args, cancel_token).await,
         Command::Validate(args) => validate::run(args).await,
         Command::Benchmark(args) => translate::run_benchmark(*args).await,
         Command::Doctor(args) => doctor::run(args).await,
@@ -410,18 +410,23 @@ struct LanguageArgs {
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ProviderArgs {
+    /// Translation provider (openai-compatible family preset).
     #[arg(long, default_value = "deepseek")]
     pub(crate) provider: String,
 
+    /// Model id the provider endpoint should serve.
     #[arg(long)]
     pub(crate) model: Option<String>,
 
+    /// OpenAI-compatible base URL override for the provider endpoint.
     #[arg(long)]
     pub(crate) base_url: Option<String>,
 
+    /// Name of the environment variable that holds the provider API key.
     #[arg(long)]
     pub(crate) api_key_env: Option<String>,
 
+    /// Per-request timeout in seconds.
     #[arg(long)]
     pub(crate) timeout_seconds: Option<u64>,
 }

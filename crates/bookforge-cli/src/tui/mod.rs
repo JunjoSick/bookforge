@@ -996,6 +996,7 @@ mod tests {
             target_concurrency: 2,
             runtime_config_revision: None,
             provider_max_attempts: None,
+            effective_timeout_seconds: None,
             timestamp_ms: 1,
         });
         state.fold(&ProgressEvent::Warning {
