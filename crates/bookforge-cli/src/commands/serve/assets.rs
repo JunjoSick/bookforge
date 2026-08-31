@@ -134,15 +134,15 @@ mod tests {
     /// embedded in HTML or JS.
     #[test]
     fn dashboard_assets_carry_no_token_or_session_placeholders() {
-        for secret_ish in [
+        for forbidden_marker in [
             "sessionStorage",
             "x-bookforge-csrf",
             "__BOOKFORGE_",
             "bookforge_session=",
         ] {
             assert!(
-                !DASHBOARD_HTML.contains(secret_ish),
-                "dashboard must not embed {secret_ish:?}"
+                !DASHBOARD_HTML.contains(forbidden_marker),
+                "dashboard contains a client-readable credential marker"
             );
         }
     }

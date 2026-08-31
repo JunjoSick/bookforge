@@ -1155,10 +1155,10 @@ fn dashboard_ships_runtime_editor_and_inline_retry_guidance() {
 fn dashboard_js_never_reads_or_injects_a_session_credential() {
     // Auth is a same-origin HttpOnly cookie: the browser JS must hold no
     // secret — no header literal, no sessionStorage, no placeholder.
-    for secret_ish in ["sessionStorage", "x-bookforge-csrf", "__BOOKFORGE_"] {
+    for forbidden_marker in ["sessionStorage", "x-bookforge-csrf", "__BOOKFORGE_"] {
         assert!(
-            !DASHBOARD_JS.contains(secret_ish),
-            "dashboard.js must not embed {secret_ish:?}"
+            !DASHBOARD_JS.contains(forbidden_marker),
+            "dashboard.js contains a client-readable credential marker"
         );
     }
     // Sign-out plumbing is present so the session can be ended from the UI.
