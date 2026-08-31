@@ -133,8 +133,9 @@ and — whenever the finding can be pinned to one block — a `block_id`. The ki
 vocabulary lives in `bookforge_core::finding::QaFindingKind`. Notable policy:
 a source-copy hit on a title/heading/short proper-noun block is a **warning**
 (leaving "Cannibal Capitalism" or an author line untranslated is editorially
-correct), while unchanged prose is an **error**. Pre-v3.0 rows without block
-attribution read `block_id = NULL`; segments whose error text predates
+correct), while unchanged prose is an **error**. Rows written before the
+(unreleased) v3.0.0-candidate migration 11 without block attribution read
+`block_id = NULL`; segments whose error text predates
 structured findings are decomposed by the documented legacy parser
 (`bookforge_core::finding::findings_from_legacy_error_text`) so reports render
 the same vocabulary for old data.

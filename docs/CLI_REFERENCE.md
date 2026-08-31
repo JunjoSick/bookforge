@@ -1,5 +1,14 @@
 # BookForge CLI guide
 
+> **Version note (2026-08-31):** this guide documents the working tree on the
+> **unreleased** v3.0.0 remediation branch (branch `remediation/audit-2026-08`
+> @ `aa90d94`; PR #112 open/blocked). Several behaviors described below — the
+> dashboard's default token auth, the exit-code taxonomy, the `--ui json`
+> versioned envelope, `--pass-costs` — ship **only** with v3.0.0 and are **not
+> present in the published v2.6.1** release. For current-published behavior,
+> install v2.6.1; for authoritative remediation status see
+> `docs/AUDIT-2026-08-31.md`.
+
 This guide explains how the commands fit together. Run `bookforge <command>
 --help` for the complete, version-specific option list.
 

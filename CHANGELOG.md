@@ -38,14 +38,22 @@ fixes for every issue the live run surfaced.
   categorized plain-language sentences instead, with raw detail in debug logs.
 - `--no-thinking` and the provider connection flags gained real help text.
 
-## v3.0.0 - 2026-08-27
+## v3.0.0 (unreleased — release candidate)
 
-Remediation campaign for the 2026-08 deep audit (`docs/report.md`, waves 0–4),
-shipped as v3.0.0: security hardening around the local dashboard, reliability
-repairs in the checkpoint/resume lifecycle, translation-quality work,
-audio/PDF fixes, breaking JSON/CLI surface changes, and corrections to two
-audit findings that turned out wrong. See `docs/HANDOFF-2026-08.md` for the
-wave-by-wave record.
+> **Version note (2026-08-31):** this section is a **release candidate**, not a
+> shipped release. The v3.0.0 campaign lives on branch
+> `remediation/audit-2026-08` (commit `aa90d94`), is **not merged to `main`**
+> (PR #112 open/blocked), and has **no tag or release**. The latest published
+> release remains **v2.6.1**. The content below describes what the v3.0.0
+> candidate contains once it ships; until then none of it is installable as v3.
+> Tracking: `docs/AUDIT-2026-08-31.md`.
+
+Remediation campaign for the 2026-08 deep audit (`docs/report.md`, waves 0–4):
+security hardening around the local dashboard, reliability repairs in the
+checkpoint/resume lifecycle, translation-quality work, audio/PDF fixes,
+breaking JSON/CLI surface changes, and corrections to two audit findings that
+turned out wrong. See `docs/HANDOFF-2026-08.md` (historical, release-candidate
+record) for the wave-by-wave detail.
 
 ### Security
 
