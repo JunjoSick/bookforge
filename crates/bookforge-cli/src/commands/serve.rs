@@ -59,8 +59,9 @@ mod translation;
 
 use super::{audiobook, correct, estimate, reconfigure, review, validate};
 use security::{
-    apply_security_headers, constant_time_eq, generate_csrf_token, reject_mutation,
-    require_loopback_bind, unauthorized, validate_dashboard_host,
+    AuthState, BootstrapOutcome, apply_security_headers, auth_logout, build_session_cookie,
+    is_cross_site_browser_request, reject_mutation, require_loopback_bind, session_cookie_from,
+    unauthorized, validate_dashboard_host,
 };
 use translation::{
     configure_dashboard_child_environment, provider_key_env, resolve_dashboard_provider_key,
@@ -153,8 +154,6 @@ const OPENROUTER_MODELS: &[&str] = &[
     "google/gemini-2.5-flash",
 ];
 const OPENAI_COMPATIBLE_MODELS: &[&str] = &["gpt-4o-mini", "gpt-4o"];
-const CSRF_HEADER: &str = "x-bookforge-csrf";
-const CSRF_TOKEN_PLACEHOLDER: &str = "__BOOKFORGE_CSRF_TOKEN__";
 const DASHBOARD_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; connect-src 'self'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; media-src 'self'; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'";
 
 /// Monotonic suffix for launch tags and estimate temp files, so two uploads
@@ -194,10 +193,9 @@ pub struct ServeArgs {
 #[derive(Clone)]
 struct AppState {
     refresh: Duration,
-    csrf_token: String,
-    /// Whether API routes require the session token. Default-on per H-5;
-    /// `--no-auth` restores the older unauthenticated behavior.
-    auth_enabled: bool,
+    /// Server-side authentication: bootstrap-token exchange, in-memory session
+    /// store, and the `--no-auth` escape hatch. Default-on per H-5.
+    auth: Arc<AuthState>,
     host_port: u16,
     /// Root for browser uploads and audiobook operation directories. Production
     /// uses [`UPLOAD_DIR`]; tests inject a temp directory so route coverage does
@@ -535,8 +533,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
     let local = listener.local_addr().unwrap_or(addr);
-    let csrf_token = generate_csrf_token()?;
     let auth_enabled = !args.no_auth;
+    let auth = AuthState::new(auth_enabled)?;
+    let bootstrap_url_token = auth.bootstrap_token();
     let state = AppState {
         // Same floor as `watch` (crate::commands::MIN_REFRESH_MS): one flag
         // value, one floor, whichever UI consumes it.
@@ -544,8 +543,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             args.refresh_ms
                 .clamp(crate::commands::MIN_REFRESH_MS, 5_000),
         ),
-        csrf_token: csrf_token.clone(),
-        auth_enabled,
+        auth: Arc::new(auth),
         host_port: local.port(),
         upload_dir: PathBuf::from(UPLOAD_DIR),
         keys: Arc::new(Mutex::new(HashMap::new())),
@@ -566,12 +564,12 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     };
 
     let app = dashboard_router(state);
-    // With token auth enabled, only this bootstrap URL — which embeds the
-    // session token as a query parameter — may enter the dashboard. It is the
-    // console equivalent of the CSRF token that used to be readable from
-    // `/` by any local process. Never echo it anywhere else.
+    // With auth enabled, only this bootstrap URL — which embeds the one-time
+    // bootstrap token as a query parameter — may enter the dashboard. The
+    // exchange mints an HttpOnly session cookie and redirects to the clean
+    // root. Never echo the bootstrap token anywhere else.
     let url = if auth_enabled {
-        format!("http://{local}/?token={csrf_token}")
+        format!("http://{local}/?token={bootstrap_url_token}")
     } else {
         format!("http://{local}/")
     };
@@ -596,6 +594,7 @@ fn dashboard_router(state: AppState) -> Router {
     let host_state = state.clone();
     let auth_state = state.clone();
     Router::new()
+        .route("/api/auth/logout", post(auth_logout))
         .merge(assets::routes())
         .merge(jobs::routes())
         .merge(options::routes())
@@ -605,8 +604,9 @@ fn dashboard_router(state: AppState) -> Router {
         .merge(styles::routes())
         .merge(entities::routes())
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
-        // H-5 / SERVE-1: every route outside the `/` bootstrap exchange must
-        // carry the session token; hardened headers are stamped onto every
+        // H-5 / SERVE-1: every route outside the `/` bootstrap exchange and
+        // the `/api/auth/logout` session-management endpoint requires a live
+        // in-memory session cookie; hardened headers are stamped onto every
         // response (SERVE-9). The host allowlist stays outermost so a forged
         // Host is still rejected before authentication is even attempted.
         .layer(middleware::from_fn_with_state(
@@ -622,23 +622,21 @@ fn dashboard_router(state: AppState) -> Router {
 
 /// Gate middleware for the whole dashboard.
 ///
-/// - Auth-on: everything except exactly `/` requires the session token in the
-///   `x-bookforge-csrf` header (the same header mutations already used, so
-///   browsers seeded via the printed URL and local scripts share one rule).
-///   Wrong/missing tokens get a bare 401 with no detail.
+/// - Auth-on: everything except the `/` bootstrap exchange (which issues the
+///   session cookie) and `/api/auth/logout` (which a stale browser must be
+///   able to reach) requires the HttpOnly session cookie. Wrong/missing
+///   cookies get a bare 401 with no detail.
 /// - Security headers ride along on every response, not just the index page.
 async fn enforce_dashboard_access(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    let mut response = if state.auth_enabled && request.uri().path() != "/" {
-        let authorized = request
-            .headers()
-            .get(CSRF_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|token| constant_time_eq(token.as_bytes(), state.csrf_token.as_bytes()));
-        if !authorized {
+    let mut response = if state.auth.enabled && !is_unauthenticated_dashboard_route(&request) {
+        if !state
+            .auth
+            .has_session(session_cookie_from(request.headers()))
+        {
             let mut response = unauthorized();
             apply_security_headers(&mut response);
             return response;
@@ -649,6 +647,13 @@ async fn enforce_dashboard_access(
     };
     apply_security_headers(&mut response);
     response
+}
+
+/// Routes reachable without an authenticated session: the `/` bootstrap
+/// exchange and the logout endpoint (which must be callable to clear a stale
+/// cookie even when the session is already gone).
+fn is_unauthenticated_dashboard_route(request: &Request) -> bool {
+    matches!(request.uri().path(), "/" | "/api/auth/logout")
 }
 
 // ---------------------------------------------------------------------------

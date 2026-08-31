@@ -1,4 +1,5 @@
 use super::*;
+use axum::http::HeaderValue;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/", get(index))
@@ -8,48 +9,60 @@ pub(super) fn routes() -> Router<AppState> {
 ///
 /// Browsers follow the console-printed URL `http://127.0.0.1:PORT/?token=…`:
 ///
-/// - a matching `?token=` gets this bootstrap page, which stores the token in
-///   `sessionStorage` under the CSRF header name and immediately redirects to
-///   the clean `/`. Every later API fetch sends it as the
-///   `x-bookforge-csrf` header, exactly mirroring how the embedded CSRF token
-///   used to be wired into `dashboard.js`.
-/// - no token (or a wrong one) gets [`LOGIN_HTML`], which points at the
-///   console URL and never echoes the session token itself.
-/// - an authenticated caller that already holds the header may load the full
-///   dashboard HTML directly.
+/// - a matching `?token=` inside its five-minute TTL gets a 302 to the clean
+///   `/` plus an HttpOnly `bookforge_session` cookie. The bootstrap token is
+///   never echoed and never stored in the cookie — the cookie carries a fresh
+///   session id minted by the exchange.
+/// - an expired token gets the expiry-guidance page; a wrong token (or a
+///   tripped failed-exchange limiter) gets a bare 401. Neither leaks anything.
+/// - a caller that already holds the session cookie may load the full
+///   dashboard HTML directly; everyone else gets the login page.
 async fn index(
     State(state): State<AppState>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    let query_token = query.as_deref().and_then(query_param_token);
-    if !state.auth_enabled {
-        // Old behavior restored by --no-auth: dashboard with the embedded
-        // session-CSRF token, protected by loopback bind + Host allowlist +
-        // per-mutation CSRF checks only.
-        return Html(DASHBOARD_HTML.replace(CSRF_TOKEN_PLACEHOLDER, &state.csrf_token))
-            .into_response();
+    if !state.auth.enabled {
+        // Old behavior restored by --no-auth: dashboard with no embedded token
+        // anywhere, protected by loopback bind + Host allowlist + per-mutation
+        // same-origin checks only.
+        return Html(DASHBOARD_HTML.clone()).into_response();
     }
 
-    if let Some(token) = query_token {
-        if constant_time_eq(token.as_bytes(), state.csrf_token.as_bytes()) {
-            return Html(BOOTSTRAP_HTML.replace("__BOOKFORGE_SESSION_TOKEN__", token))
-                .into_response();
+    // A caller that already holds a live session is already in: reusing the
+    // bootstrap link (or a stale copy of it) must neither re-run the one-time
+    // exchange nor feed the failed-exchange limiter, so serve the dashboard.
+    if state.auth.has_session(session_cookie_from(&headers)) {
+        return Html(DASHBOARD_HTML.clone()).into_response();
+    }
+
+    if let Some(candidate) = query.as_deref().and_then(query_param_token) {
+        // The exchange mints sessions and advances the failed-attempt limiter,
+        // so like every other state change it is same-origin gated: only a
+        // browser navigation (sec-fetch-site none/same-origin) or a same-origin
+        // fetch may attempt it. A cross-site page must not be able to burn the
+        // limiter or race the one-time token.
+        if is_cross_site_browser_request(&headers) {
+            return forbidden("cross-site dashboard request rejected");
         }
-        return unauthorized();
+        return match state.auth.exchange_bootstrap(candidate) {
+            BootstrapOutcome::Granted(session_id) => {
+                let mut response = Response::new(axum::body::Body::empty());
+                *response.status_mut() = StatusCode::FOUND;
+                response
+                    .headers_mut()
+                    .insert("location", HeaderValue::from_static("/"));
+                response
+                    .headers_mut()
+                    .insert("set-cookie", build_session_cookie(&session_id));
+                response
+            }
+            BootstrapOutcome::Expired => Html(LOGIN_EXPIRED_HTML).into_response(),
+            BootstrapOutcome::Rejected => unauthorized().into_response(),
+        };
     }
 
-    // Auth-on, no `?token=`: a caller already holding the header (scripts,
-    // or the dashboard after a reload inside the seeded tab) gets the full
-    // page; everyone else gets the pointer to the console-printed URL.
-    let authorized = headers
-        .get(CSRF_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|token| constant_time_eq(token.as_bytes(), state.csrf_token.as_bytes()));
-    if authorized {
-        return Html(DASHBOARD_HTML.replace(CSRF_TOKEN_PLACEHOLDER, &state.csrf_token))
-            .into_response();
-    }
+    // No `?token=`: everyone else gets the pointer to the console-printed link.
     Html(LOGIN_HTML).into_response()
 }
 
@@ -63,25 +76,6 @@ fn query_param_token(query: &str) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
-const BOOTSTRAP_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Signing in to BookForge…</title>
-</head>
-<body>
-<p style="font-family:system-ui,sans-serif">Signing in to the BookForge dashboard…</p>
-<script>
-(function () {
-  try { sessionStorage.setItem("x-bookforge-csrf", "__BOOKFORGE_SESSION_TOKEN__"); } finally {
-    location.replace("/");
-  }
-})();
-</script>
-<noscript><p>The BookForge dashboard requires JavaScript and the sign-in link printed in its console.</p></noscript>
-</body>
-</html>"#;
-
 const LOGIN_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -90,9 +84,26 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
 </head>
 <body style="font-family:system-ui,sans-serif;margin:4rem auto;max-width:36rem;line-height:1.5">
 <h1>BookForge dashboard</h1>
-<p>This dashboard is private. Open the <code>http://127.0.0.1:&lt;port&gt;/?token=…</code> link that
-<code>bookforge serve</code> printed in its terminal — it carries your one-time session link.</p>
+<p>This dashboard is private.</p>
+<p>Open the sign-in link that <code>bookforge serve</code> printed in its terminal — it starts with
+<code>http://127.0.0.1:&lt;port&gt;/?token=…</code> and carries your one-time session link.</p>
 <p>If you started the server elsewhere, run <code>bookforge serve</code> again in a terminal you can see.</p>
+</body>
+</html>"#;
+
+/// Shown when a sign-in link has outlived its five-minute bootstrap window.
+/// Helpful, but never exposes the token or a session id.
+const LOGIN_EXPIRED_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BookForge dashboard — sign-in link expired</title>
+</head>
+<body style="font-family:system-ui,sans-serif;margin:4rem auto;max-width:36rem;line-height:1.5">
+<h1>BookForge dashboard</h1>
+<p>That sign-in link has expired — the link <code>bookforge serve</code> prints is only valid for
+the first five minutes the server is running.</p>
+<p>Run <code>bookforge serve</code> again in a terminal you can see and open the fresh link it prints.</p>
 </body>
 </html>"#;
 
@@ -118,17 +129,33 @@ pub(super) static DASHBOARD_HTML: std::sync::LazyLock<String> = std::sync::LazyL
 mod tests {
     use super::*;
 
+    /// The dashboard must be served byte-stable with no token/session
+    /// placeholder left for the server to substitute — nothing secret is ever
+    /// embedded in HTML or JS.
     #[test]
-    fn bootstrap_page_wires_session_storage_with_csrf_header_name() {
-        assert!(BOOTSTRAP_HTML.contains(CSRF_HEADER));
-        assert!(BOOTSTRAP_HTML.contains("__BOOKFORGE_SESSION_TOKEN__"));
-        assert!(!BOOTSTRAP_HTML.contains("__BOOKFORGE_SESSION_TOKEN___never_left"));
+    fn dashboard_assets_carry_no_token_or_session_placeholders() {
+        for secret_ish in [
+            "sessionStorage",
+            "x-bookforge-csrf",
+            "__BOOKFORGE_",
+            "bookforge_session=",
+        ] {
+            assert!(
+                !DASHBOARD_HTML.contains(secret_ish),
+                "dashboard must not embed {secret_ish:?}"
+            );
+        }
     }
 
     #[test]
-    fn login_page_never_carries_a_token_placeholder() {
-        assert!(!LOGIN_HTML.contains("__BOOKFORGE_SESSION_TOKEN__"));
-        assert!(!LOGIN_HTML.contains(CSRF_TOKEN_PLACEHOLDER));
+    fn login_pages_never_carry_a_token_or_session_placeholder() {
+        for page in [LOGIN_HTML, LOGIN_EXPIRED_HTML] {
+            assert!(!page.contains("__BOOKFORGE_"));
+            assert!(!page.contains("bookforge_session="));
+            // The link text intentionally shows the URL shape (`?token=…`),
+            // but no concrete value and no substitute-able placeholder.
+            assert!(!page.contains("feedface"));
+        }
     }
 
     #[test]

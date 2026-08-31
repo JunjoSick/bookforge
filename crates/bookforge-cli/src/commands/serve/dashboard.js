@@ -1,34 +1,28 @@
-const CSRF_HEADER = "x-bookforge-csrf";
-// The server only substitutes this placeholder for callers that already hold
-// the session credential; regular browsers get it from sessionStorage, seeded
-// by the ?token= bootstrap link printed by `bookforge serve`.
-const CSRF_TOKEN = sessionStorage.getItem(CSRF_HEADER) || "__BOOKFORGE_CSRF_TOKEN__";
 /* ===== BFAPISEAM-BEGIN: the only raw fetch( calls live between these markers =====
- * F2 remediation: reads used to skip the x-bookforge-csrf session header that
- * mutation helpers carried, so under default-on auth (H-5) entire screens
- * (Library lists, Progress polling, Review, Glossary/Styles/Entities tables,
- * Audiobook voices/status polls, provider metadata) silently 401'd while the
- * user watched empty data. Every browser call — reads included — is routed
- * through apiGet/apiSend, which stamp the header unconditionally, so no new
- * call site can forget it. */
-function bfAuthHeaders(extra) { return Object.assign({}, { [CSRF_HEADER]: CSRF_TOKEN }, extra || {}); }
+ * Auth: the server authenticates every same-origin request through the
+ * HttpOnly `bookforge_session` cookie set by the ?token= bootstrap exchange.
+ * SameSite=Strict means the browser sends it automatically on same-origin
+ * fetch(), so the client never reads, stores, or injects any credential —
+ * nothing secret is ever kept or embedded client-side. */
 function bfFetch(path, options) {
-  const request = Object.assign({}, options || {});
-  request.headers = bfAuthHeaders(request.headers);
-  return fetch(path, request);
+  return fetch(path, options);
 }
 async function apiGet(path, init) { return bfFetch(path, init); }
 async function apiSend(path, options) { return bfFetch(path, options); }
 /* ===== BFAPISEAM-END ===== */
-function bfSessionSeeded() { return !!sessionStorage.getItem(CSRF_HEADER); }
 function bfSignedOut() {
-  try { sessionStorage.removeItem(CSRF_HEADER); } catch (e) {}
   const old = $("#auth-notice"); if (old) return;
   const banner = document.createElement("div");
   banner.id = "auth-notice";
   banner.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:9999;padding:12px 18px;background:#7a1f1f;color:#fff;font:500 13px system-ui,sans-serif;text-align:center";
-  banner.textContent = "Dashboard session expired or missing — reopen the http://127.0.0.1:?token=… link printed by bookforge serve in its terminal.";
+  banner.textContent = "Dashboard session expired or signed out — run `bookforge serve` again and open the sign-in link it prints.";
   document.body.appendChild(banner);
+}
+// Sign out: the server forgets this session and expires the cookie; the clean
+// reload then lands on the login screen.
+async function bfSignOut() {
+  try { await apiSend("/api/auth/logout", { method: "POST" }); } catch (e) {}
+  location.replace("/");
 }
 const $ = (sel, el) => (el || document).querySelector(sel);
 const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -762,8 +756,8 @@ async function pollAudiobook(id) {
   if (!terminal) setTimeout(()=>pollAudiobook(id), 800);
 }
 
-// Artifact playback/download need the session-token header, which plain
-// audio `src=` / anchor `href=` navigation cannot send. Fetch the bytes with
+// Artifact playback/download must go through the authenticated API, which
+// plain audio `src=` / anchor `href=` navigation cannot. Fetch the bytes with
 // the header and hand the DOM a one-off blob: URL instead.
 const artifactUrls = new Map();
 function cachedArtifactUrl(key) { const url = artifactUrls.get(key); return url ? url.url : null; }
@@ -1060,8 +1054,8 @@ function fmtEvent(ev) {
 }
 function openStream(id) {
   closeStream();
-  // Auth requires the session token as a header on every API call, and
-  // EventSource cannot set headers — so consume the SSE stream with fetch
+  // Auth is cookie-based (HttpOnly, SameSite=Strict) and EventSource cannot
+  // carry extra headers anyway — so consume the SSE stream with fetch
   // and parse the same wire format (event:/data: frames, blank-line
   // separated, `:`-prefixed keepalive comments ignored).
   const controller = new AbortController();

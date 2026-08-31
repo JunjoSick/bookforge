@@ -262,9 +262,13 @@ const RETRY_OVERRIDE_FALLBACK_MAX_AGE: std::time::Duration =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnerLiveness {
     Alive,
+    /// Only probes on Unix platforms can establish this; on Windows the enum
+    /// variant is cfg'd out so `-D warnings` never sees an unconstructed arm.
+    #[cfg(unix)]
     Gone,
     /// Platform cannot tell cheaply and safely (e.g. Windows fallback) — or
-    /// the probe itself failed on a non-Linux Unix box.
+    /// the probe itself failed on a non-Linux Unix box. On Linux the probe
+    /// always resolves to Alive/Gone, so the variant is dead there.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     Indeterminate,
 }
@@ -325,6 +329,7 @@ fn retry_override_dir_is_reapable(
 ) -> bool {
     match liveness {
         OwnerLiveness::Alive => false,
+        #[cfg(unix)]
         OwnerLiveness::Gone => true,
         OwnerLiveness::Indeterminate => idle_over_fallback_window,
     }
@@ -495,14 +500,20 @@ mod sweep_tests {
 
     #[test]
     fn reap_decision_never_touches_live_owners() {
-        use OwnerLiveness::{Alive, Gone, Indeterminate};
+        use OwnerLiveness::{Alive, Indeterminate};
         assert!(!retry_override_dir_is_reapable(Alive, false));
         assert!(!retry_override_dir_is_reapable(Alive, true));
-        assert!(retry_override_dir_is_reapable(Gone, false));
-        assert!(retry_override_dir_is_reapable(Gone, true));
         // Indeterminate platforms (Windows) demand the >=24h age window.
         assert!(!retry_override_dir_is_reapable(Indeterminate, false));
         assert!(retry_override_dir_is_reapable(Indeterminate, true));
+
+        // `Gone` only exists on platforms with a liveness probe.
+        #[cfg(unix)]
+        {
+            use OwnerLiveness::Gone;
+            assert!(retry_override_dir_is_reapable(Gone, false));
+            assert!(retry_override_dir_is_reapable(Gone, true));
+        }
     }
 
     #[test]
