@@ -2139,6 +2139,12 @@ impl RetryClaim {
     pub(super) fn release_as_nonce_for_test(&self, nonce: &str) {
         self.release_as_nonce(nonce);
     }
+
+    /// Inspect the published record through the owning handle. Opening the
+    /// locked byte range by path is expected to fail on Windows.
+    pub(super) fn is_published_for_test(&self) -> bool {
+        self.read_nonce().as_deref() == Some(self.nonce.as_str())
+    }
 }
 
 /// Result of trying to take the single-winner retry claim for `out_dir`.

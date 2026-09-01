@@ -4186,7 +4186,10 @@ async fn retry_failed_conflicts_while_another_retry_holds_the_claim() {
         Ok(RetryClaimAcquire::Owned(claim)) => claim,
         other => panic!("the test owner must win its own claim: {other:?}"),
     };
-    assert!(!retry_claim_released(&dir), "the owner holds a live claim");
+    assert!(
+        holder.is_published_for_test(),
+        "the owner holds a live claim"
+    );
 
     let loser = post_json(
         &router,
@@ -4201,7 +4204,7 @@ async fn retry_failed_conflicts_while_another_retry_holds_the_claim() {
         json!("retry already starting")
     );
     assert!(
-        !retry_claim_released(&dir),
+        holder.is_published_for_test(),
         "a live claim must survive a losing request untouched"
     );
     assert!(claim_path.exists(), "the live claim file must still exist");
@@ -4619,14 +4622,14 @@ fn retry_claim_release_is_guarded_by_its_ownership_nonce() {
         other => panic!("the test owner must win its own claim: {other:?}"),
     };
     assert!(
-        !retry_claim_released(&out_dir),
+        holder.is_published_for_test(),
         "the owner holds a live claim"
     );
 
     let foreign_nonce = format!("foreign-{}-{}", std::process::id(), now_ms());
     holder.release_as_nonce_for_test(&foreign_nonce);
     assert!(
-        !retry_claim_released(&out_dir),
+        holder.is_published_for_test(),
         "a nonce-mismatched release must leave the live claim in place"
     );
 
