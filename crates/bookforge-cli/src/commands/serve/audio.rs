@@ -1639,6 +1639,28 @@ fn audiobook_operation_out_dir(upload_dir: &Path, id: &str) -> PathBuf {
     upload_dir.join(format!("audiobook-{id}"))
 }
 
+/// Resolve an existing operation as a real, immediate child directory of the
+/// upload root. The request id is used only to select a directory entry; it is
+/// never interpolated into a filesystem access path.
+fn existing_audiobook_operation_out_dir(upload_dir: &Path, id: &str) -> Result<Option<PathBuf>> {
+    if !valid_audiobook_id(id) {
+        return Ok(None);
+    }
+    let expected = std::ffi::OsString::from(format!("audiobook-{id}"));
+    let entries = match std::fs::read_dir(upload_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name() == expected && entry.file_type()?.is_dir() {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
+}
+
 /// True while the operation still owns a live child; maintenance endpoints
 /// refuse to touch it until the builder exits.
 fn audiobook_process_is_running(process: &serde_json::Value) -> bool {
@@ -1939,7 +1961,6 @@ enum PrepareStep {
 pub(super) struct RetryClaim {
     nonce: String,
     claimed_at_ms: u64,
-    out_dir: PathBuf,
     /// The open, exclusively locked claim file. The claim is moved (never
     /// cloned) from acquisition through the handoff, so exactly one owner
     /// exists and the diagnostic record survives until the final release;
@@ -2028,7 +2049,7 @@ impl RetryClaim {
 
     /// Wrap a freshly locked file as this caller's claim and publish the
     /// diagnostic record through it (truncating any dead owner's bytes).
-    fn with_locked_file(out_dir: PathBuf, file: std::fs::File) -> Result<Self> {
+    fn with_locked_file(file: std::fs::File) -> Result<Self> {
         let mut randomness = [0u8; 16];
         getrandom::fill(&mut randomness).context("failed to generate retry claim nonce")?;
         let claim = RetryClaim {
@@ -2037,7 +2058,6 @@ impl RetryClaim {
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),
             claimed_at_ms: now_ms(),
-            out_dir,
             file: Some(file),
         };
         claim.write_record()?;
@@ -2068,8 +2088,13 @@ impl RetryClaim {
         .expect("retry claim record should serialize")
     }
 
-    fn read_nonce(claim_path: &Path) -> Option<String> {
-        let content = std::fs::read(claim_path).ok()?;
+    fn read_nonce(&self) -> Option<String> {
+        use std::io::{Read, Seek};
+
+        let mut file = self.file.as_ref()?;
+        file.seek(std::io::SeekFrom::Start(0)).ok()?;
+        let mut content = Vec::new();
+        file.read_to_end(&mut content).ok()?;
         parse_claim_record(&content).map(|record| record.nonce)
     }
 
@@ -2080,9 +2105,8 @@ impl RetryClaim {
     /// a newer claim exists and must never be touched. The file itself keeps
     /// its stable identity (it is not unlinked), so a concurrent acquirer that
     /// already opened it contends on the same lock.
-    pub(super) fn release(&self) {
-        let claim_path = Self::claim_file(&self.out_dir);
-        if Self::read_nonce(&claim_path).as_deref() != Some(self.nonce.as_str()) {
+    fn release_as_nonce(&self, nonce: &str) {
+        if self.read_nonce().as_deref() != Some(nonce) {
             return;
         }
         if let Some(file) = &self.file {
@@ -2092,6 +2116,10 @@ impl RetryClaim {
             let _ = file.seek(std::io::SeekFrom::Start(0));
             let _ = file.sync_all();
         }
+    }
+
+    pub(super) fn release(&self) {
+        self.release_as_nonce(&self.nonce);
     }
 }
 
@@ -2107,15 +2135,9 @@ impl Drop for RetryClaim {
 
 #[cfg(test)]
 impl RetryClaim {
-    /// Test-only claim bound to an explicit nonce and no lock, so unit tests
-    /// can prove a nonce-mismatched release leaves the lock untouched.
-    pub(super) fn with_nonce(out_dir: PathBuf, nonce: &str) -> RetryClaim {
-        RetryClaim {
-            nonce: nonce.to_string(),
-            claimed_at_ms: now_ms(),
-            out_dir,
-            file: None,
-        }
+    /// Exercise a foreign release through this claim's real locked handle.
+    pub(super) fn release_as_nonce_for_test(&self, nonce: &str) {
+        self.release_as_nonce(nonce);
     }
 }
 
@@ -2182,7 +2204,6 @@ pub(super) fn acquire_retry_claim(out_dir: &Path) -> Result<RetryClaimAcquire> {
     }
 
     Ok(RetryClaimAcquire::Owned(RetryClaim::with_locked_file(
-        out_dir.to_path_buf(),
         file,
     )?))
 }
@@ -2195,10 +2216,9 @@ fn options_string(options: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> {
-    let out_dir = audiobook_operation_out_dir(upload_dir, id);
-    if !out_dir.is_dir() {
+    let Some(out_dir) = existing_audiobook_operation_out_dir(upload_dir, id)? else {
         return Ok(PreparedOutcome::NotFound);
-    }
+    };
     let process_path = out_dir.join("process.json");
     let claim_path = out_dir.join(RETRY_CLAIM_FILE_NAME);
     let process = match std::fs::read(&process_path)
@@ -2250,7 +2270,14 @@ fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> 
     // through the whole handoff. [`RetryClaim`]'s `Drop` releases the lock —
     // a refusal, an early `?`, or a panic all unwind to a clean operation
     // directory with `process.json` untouched.
-    match finish_prepare_retry(upload_dir, id, &process, claim, prior_process_json)? {
+    match finish_prepare_retry(
+        upload_dir,
+        &out_dir,
+        id,
+        &process,
+        claim,
+        prior_process_json,
+    )? {
         PrepareStep::Ready(prepared) => Ok(PreparedOutcome::Ready(prepared)),
         PrepareStep::Refused(message) => Ok(PreparedOutcome::Client(message)),
     }
@@ -2262,13 +2289,13 @@ fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> 
 /// [`RetryClaim`]'s `Drop`.
 fn finish_prepare_retry(
     upload_dir: &Path,
+    out_dir: &Path,
     id: &str,
     process: &serde_json::Value,
     claim: RetryClaim,
     prior_process_json: Vec<u8>,
 ) -> Result<PrepareStep> {
     let refused = |message: &str| Ok(PrepareStep::Refused(message.to_string()));
-    let out_dir = audiobook_operation_out_dir(upload_dir, id);
     let Some(options) = process
         .get("options")
         .filter(|value| value.is_object())
@@ -2412,7 +2439,7 @@ fn finish_prepare_retry(
         .unwrap_or(false);
 
     Ok(PrepareStep::Ready(Box::new(PreparedRetry {
-        out_dir,
+        out_dir: out_dir.to_path_buf(),
         claim,
         input_path,
         model_opt: model_for_child.filter(|model| !model.is_empty()),

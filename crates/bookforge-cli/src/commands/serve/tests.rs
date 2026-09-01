@@ -4623,7 +4623,8 @@ fn retry_claim_release_is_guarded_by_its_ownership_nonce() {
         "the owner holds a live claim"
     );
 
-    RetryClaim::with_nonce(out_dir.clone(), "foreign-nonce").release();
+    let foreign_nonce = format!("foreign-{}-{}", std::process::id(), now_ms());
+    holder.release_as_nonce_for_test(&foreign_nonce);
     assert!(
         !retry_claim_released(&out_dir),
         "a nonce-mismatched release must leave the live claim in place"
