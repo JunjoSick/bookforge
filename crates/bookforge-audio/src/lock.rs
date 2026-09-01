@@ -145,15 +145,20 @@ mod kernel_lock {
 
     const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
     const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
-    // Lock the whole file range; the max length covers every record.
-    const LOCK_WHOLE_FILE: u32 = u32::MAX;
+    // Keep the ownership byte disjoint from the human-readable record at the
+    // start of the file. Windows byte-range locks are mandatory for I/O, so a
+    // whole-file lock would prevent contenders from reading the record for a
+    // useful "held by pid" diagnostic. LockFileEx permits ranges beyond EOF;
+    // byte 4 GiB is never materialized and remains a stable kernel lock key.
+    const LOCK_BYTE_OFFSET_HIGH: u32 = 1;
+    const LOCK_BYTE_LENGTH: u32 = 1;
 
     fn lock_region(file: &File, flags: u32) -> i32 {
         let mut overlapped = Overlapped {
             internal: 0,
             internal_high: 0,
             offset: 0,
-            offset_high: 0,
+            offset_high: LOCK_BYTE_OFFSET_HIGH,
             h_event: std::ptr::null_mut(),
         };
         unsafe {
@@ -161,8 +166,8 @@ mod kernel_lock {
                 file.as_raw_handle() as *mut _,
                 flags,
                 0,
-                LOCK_WHOLE_FILE,
-                LOCK_WHOLE_FILE,
+                LOCK_BYTE_LENGTH,
+                0,
                 &mut overlapped,
             )
         }
@@ -206,15 +211,15 @@ mod kernel_lock {
             internal: 0,
             internal_high: 0,
             offset: 0,
-            offset_high: 0,
+            offset_high: LOCK_BYTE_OFFSET_HIGH,
             h_event: std::ptr::null_mut(),
         };
         unsafe {
             UnlockFileEx(
                 file.as_raw_handle() as *mut _,
                 0,
-                LOCK_WHOLE_FILE,
-                LOCK_WHOLE_FILE,
+                LOCK_BYTE_LENGTH,
+                0,
                 &mut overlapped,
             );
         }
@@ -254,8 +259,9 @@ pub(crate) struct OutDirLock {
 impl OutDirLock {
     /// Read the owner record through the already-locked handle. Callers must
     /// hold the kernel lock so the record is stable; all I/O happens on
-    /// `self.file` because Windows byte-range locks reject overlapping I/O
-    /// performed through a second handle to the same file.
+    /// `self.file` so the record read and any following rewrite belong to the
+    /// same lock owner. The Windows ownership byte lives beyond EOF, leaving
+    /// the record range readable through another handle for diagnostics.
     pub(crate) fn record(&self) -> std::io::Result<OwnerRecord> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = &self.file;

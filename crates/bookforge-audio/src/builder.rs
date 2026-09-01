@@ -1692,11 +1692,10 @@ mod tests {
         );
     }
 
-    /// Owner-record reads and writes must round-trip through the held handle
-    /// (the same handle that carries the kernel lock), which is exactly what
-    /// Windows byte-range locking requires — a second handle to a locked file
-    /// can reject overlapping I/O, so while the lock is held we only touch the
-    /// record through the guard.
+    /// Owner-record reads and writes used for claim/adoption round-trip through
+    /// the held handle. On Windows the ownership byte is deliberately beyond
+    /// EOF, so diagnostic readers can still inspect the record through another
+    /// handle without weakening exclusive ownership.
     #[test]
     fn held_handle_round_trips_the_owner_record() {
         use crate::lock::{LOCK_FILE_NAME, read_lock_record};
@@ -1714,8 +1713,13 @@ mod tests {
         assert_eq!(via_held.pid, std::process::id());
         assert_eq!(via_held.nonce.as_deref(), Some("held-handle-nonce"));
 
-        // Only after the kernel lock is released may the path be opened by a
-        // second handle to verify the record persists for the child.
+        // Diagnostics use a second handle while ownership is held. This is the
+        // Windows regression: the lock byte must not overlap the record bytes.
+        let diagnostic = read_lock_record(&out_dir.join(LOCK_FILE_NAME))
+            .expect("record range remains readable while the lock is held");
+        assert_eq!(diagnostic, via_held);
+
+        // The record remains durable after release for the addressed child.
         drop(guard);
         let on_disk = read_lock_record(&out_dir.join(LOCK_FILE_NAME)).unwrap();
         assert_eq!(on_disk, via_held, "record persists for the child");
