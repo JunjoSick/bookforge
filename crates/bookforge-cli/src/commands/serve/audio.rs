@@ -1639,26 +1639,34 @@ fn audiobook_operation_out_dir(upload_dir: &Path, id: &str) -> PathBuf {
     upload_dir.join(format!("audiobook-{id}"))
 }
 
-/// Resolve an existing operation as a real, immediate child directory of the
-/// upload root. The request id is used only to select a directory entry; it is
-/// never interpolated into a filesystem access path.
-fn existing_audiobook_operation_out_dir(upload_dir: &Path, id: &str) -> Result<Option<PathBuf>> {
+/// Resolve an existing operation only when its canonical path remains a direct
+/// child of the canonical upload root. This rejects traversal and symlink
+/// escapes before the path reaches any read or write operation.
+pub(super) fn existing_audiobook_operation_out_dir(
+    upload_dir: &Path,
+    id: &str,
+) -> Result<Option<PathBuf>> {
     if !valid_audiobook_id(id) {
         return Ok(None);
     }
-    let expected = std::ffi::OsString::from(format!("audiobook-{id}"));
-    let entries = match std::fs::read_dir(upload_dir) {
-        Ok(entries) => entries,
+    let root = match std::fs::canonicalize(upload_dir) {
+        Ok(root) => root,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    for entry in entries {
-        let entry = entry?;
-        if entry.file_name() == expected && entry.file_type()?.is_dir() {
-            return Ok(Some(entry.path()));
-        }
+    let candidate = root.join(format!("audiobook-{id}"));
+    let resolved = match std::fs::canonicalize(&candidate) {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !resolved.starts_with(&root)
+        || resolved.parent() != Some(root.as_path())
+        || !resolved.is_dir()
+    {
+        return Ok(None);
     }
-    Ok(None)
+    Ok(Some(resolved))
 }
 
 /// True while the operation still owns a live child; maintenance endpoints

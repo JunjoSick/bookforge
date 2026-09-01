@@ -908,6 +908,41 @@ fn audiobook_operation_ids_cannot_escape_the_upload_directory() {
     }
 }
 
+#[test]
+fn existing_audiobook_operation_resolves_only_a_direct_child_directory() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let operation = temp.path().join("audiobook-safe_id");
+    std::fs::create_dir(&operation).expect("operation dir should be created");
+
+    let resolved = existing_audiobook_operation_out_dir(temp.path(), "safe_id")
+        .expect("operation lookup should succeed")
+        .expect("direct child should resolve");
+    assert_eq!(resolved, operation.canonicalize().unwrap());
+    assert!(
+        existing_audiobook_operation_out_dir(temp.path(), "missing")
+            .expect("missing lookup should succeed")
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_audiobook_operation_rejects_a_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let upload_root = tempfile::tempdir().expect("upload root should be created");
+    let outside = tempfile::tempdir().expect("outside dir should be created");
+    symlink(outside.path(), upload_root.path().join("audiobook-escape"))
+        .expect("escape symlink should be created");
+
+    assert!(
+        existing_audiobook_operation_out_dir(upload_root.path(), "escape")
+            .expect("symlink lookup should succeed")
+            .is_none(),
+        "a symlink outside the canonical upload root must be rejected"
+    );
+}
+
 #[tokio::test]
 async fn control_endpoints_reject_missing_dashboard_token() {
     use axum::{body::Body, http::Request};
