@@ -122,6 +122,45 @@ impl JobStore {
         Ok(())
     }
 
+    /// Persist the durable cache policy (strict-context and future
+    /// cache-affecting settings that are not part of the historical
+    /// [`RunConfigSnapshot`] surface). Jobs that never record a policy read
+    /// back the conservative default, which can never reuse cache written by
+    /// a run that states an explicit policy.
+    pub fn update_job_cache_policy(
+        &self,
+        job_id: &str,
+        policy: &CachePolicySnapshot,
+    ) -> Result<()> {
+        let json = serde_json::to_string(policy)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let conn = self.conn.borrow();
+        let updated = conn.execute(
+            "UPDATE jobs
+             SET cache_policy_json = ?1, updated_at = ?2
+             WHERE id = ?3",
+            params![json, timestamp_string(), job_id],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound(format!(
+                "job '{job_id}' was not found"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Load the persisted cache policy, defaulting to the conservative
+    /// unknown-strictness policy for jobs that never recorded one.
+    pub fn load_job_cache_policy(&self, job_id: &str) -> Result<CachePolicySnapshot> {
+        let conn = self.conn.borrow();
+        if !job_exists_on(&conn, job_id)? {
+            return Err(StoreError::NotFound(format!(
+                "job '{job_id}' was not found"
+            )));
+        }
+        super::translations::load_cache_policy_on(&conn, job_id)
+    }
+
     pub fn load_job_config_snapshot(&self, job_id: &str) -> Result<Option<RunConfigSnapshot>> {
         let conn = self.conn.borrow();
         let Some(json) = conn
