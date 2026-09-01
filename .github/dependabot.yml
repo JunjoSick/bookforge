@@ -41,10 +41,8 @@ updates:
       #
       # Tradeoff, deliberately accepted: dependabot will no longer announce new
       # versions of these four actions at all, so a major bump has to be noticed
-      # by hand. ci.yml and security.yml are unaffected — they track the floating
-      # `actions/checkout@v7` tag rather than a SHA, so they pick up patch and
-      # minor releases without dependabot's help and only need attention when the
-      # major moves.
+      # by hand. ci.yml and security.yml also use immutable SHAs; update their
+      # pins deliberately and keep the release/config pin table in sync.
       - dependency-name: actions/checkout
       - dependency-name: actions/upload-artifact
       - dependency-name: actions/download-artifact
