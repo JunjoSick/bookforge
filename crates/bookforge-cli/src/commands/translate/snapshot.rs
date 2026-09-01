@@ -6,7 +6,8 @@ use std::{
 
 use bookforge_core::{
     FallbackRunConfigSnapshot, FinalizeCheckpointSnapshot, GlossaryTerm, ResolvedRunSettings,
-    ResolvedRunSettingsSnapshot, RunConfigSnapshot, run_snapshot::AppliedPlanSnapshot,
+    ResolvedRunSettingsSnapshot, RunConfigSnapshot,
+    run_snapshot::{AppliedPlanSnapshot, CachePolicySnapshot},
 };
 use bookforge_store::{JobRecord, JobStore};
 use sha2::{Digest, Sha256};
@@ -14,6 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::{ProviderArgs as CliProviderArgs, report::report_paths};
 
 use super::args::TranslateArgs;
+use super::context_run_config_from_args;
 
 pub(crate) fn default_event_path(job_id: &str) -> PathBuf {
     PathBuf::from(".bookforge/runs")
@@ -97,6 +99,16 @@ pub(crate) fn persist_snapshot(
         settings: ResolvedRunSettingsSnapshot::from_settings(settings),
     };
     store.update_job_config_snapshot(&job.id, &snapshot)?;
+    // Persist the durable cache-policy record (strict-context choice) BEFORE
+    // segments are stamped, so the structured cache identity written at
+    // insert time and recomputed at lookup time both carry the exact policy
+    // the CLI resolved from `--context-strict`.
+    store.update_job_cache_policy(
+        &job.id,
+        &CachePolicySnapshot {
+            strict_context: Some(context_run_config_from_args(cli_args).strict),
+        },
+    )?;
     store.update_job_event_path(&job.id, &events_path)?;
     Ok(snapshot)
 }

@@ -3,6 +3,7 @@ use super::*;
 use bookforge_core::{
     finding::EngineFinding,
     ir::{BlockId, SectionId},
+    run_snapshot::CachePolicySnapshot,
     segment::{
         Segment, SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
         SegmentSource, SegmentTextRun,
@@ -202,6 +203,55 @@ fn temp_path(name: &str) -> PathBuf {
         unix_timestamp_nanos(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+/// Compute the caller-computed expected fingerprints for the given segments,
+/// mirroring how the CLI wires cache lookups. Keyed by the current segment id
+/// so duplicate source text in different contexts stays unambiguous. The
+/// identity is derived over the SAME slice passed here (the full ordered set
+/// and the eligible candidates coincide in these fixtures).
+fn expected_fingerprints_for(
+    store: &JobStore,
+    job_id: &str,
+    segments: &[Segment],
+    provider: &str,
+    model: &str,
+    prompt_version: &str,
+    cache_namespace: &str,
+) -> HashMap<String, String> {
+    store
+        .expected_cache_fingerprints(
+            job_id,
+            segments,
+            segments,
+            provider,
+            model,
+            prompt_version,
+            cache_namespace,
+        )
+        .expect("expected fingerprints should compute")
+}
+
+/// Build a [`CacheLookupRequest`] carrying the caller-computed expected
+/// fingerprints map (which must outlive the returned request).
+fn cache_lookup_request<'a>(
+    prompt_version: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    source_lang: Option<&'a str>,
+    target_lang: &'a str,
+    cache_namespace: &'a str,
+    expected_fingerprints: &'a HashMap<String, String>,
+) -> CacheLookupRequest<'a> {
+    CacheLookupRequest {
+        prompt_version,
+        provider,
+        model,
+        source_lang,
+        target_lang,
+        cache_namespace,
+        expected_fingerprints,
+    }
 }
 
 #[test]
@@ -942,12 +992,23 @@ fn cached_translation_requires_matching_cache_namespace() {
     let hit = store
         .find_cached_translation(
             &seg,
-            "v1",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "ns_one",
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_one",
+                &expected_fingerprints_for(
+                    &store,
+                    &_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "ns_one",
+                ),
+            ),
         )
         .expect("query ok");
     assert!(hit.is_some(), "matching namespace should hit");
@@ -955,12 +1016,23 @@ fn cached_translation_requires_matching_cache_namespace() {
     let miss = store
         .find_cached_translation(
             &seg,
-            "v1",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "ns_two",
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_two",
+                &expected_fingerprints_for(
+                    &store,
+                    &_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "ns_two",
+                ),
+            ),
         )
         .expect("query ok");
     assert!(miss.is_none(), "different namespace must not hit");
@@ -1033,12 +1105,23 @@ fn cached_translation_rejects_mismatched_prompt_version() {
     let hit_v2 = store
         .find_cached_translation(
             &seg,
-            "v2",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "ns_bump",
+            cache_lookup_request(
+                "v2",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_bump",
+                &expected_fingerprints_for(
+                    &store,
+                    &job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v2",
+                    "ns_bump",
+                ),
+            ),
         )
         .expect("query ok");
     assert!(
@@ -1049,12 +1132,23 @@ fn cached_translation_rejects_mismatched_prompt_version() {
     let miss_v3 = store
         .find_cached_translation(
             &seg,
-            "v3",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "ns_bump",
+            cache_lookup_request(
+                "v3",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_bump",
+                &expected_fingerprints_for(
+                    &store,
+                    &job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v3",
+                    "ns_bump",
+                ),
+            ),
         )
         .expect("query ok");
     assert!(
@@ -1062,28 +1156,54 @@ fn cached_translation_rejects_mismatched_prompt_version() {
         "row stored under v2 must not be served back for a v3 (retry_guidance) query"
     );
 
-    let batch_request_v3 = CacheLookupRequest {
-        prompt_version: "v3",
-        provider: "mock",
-        model: "mock-prefix",
-        source_lang: Some("English"),
-        target_lang: "Italian",
-        cache_namespace: "ns_bump",
-    };
     let batch_miss = store
-        .find_cached_translations_batch(std::slice::from_ref(&seg), batch_request_v3)
+        .find_cached_translations_batch(
+            std::slice::from_ref(&seg),
+            cache_lookup_request(
+                "v3",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_bump",
+                &expected_fingerprints_for(
+                    &store,
+                    &job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v3",
+                    "ns_bump",
+                ),
+            ),
+        )
         .expect("batch query ok");
     assert!(
         batch_miss.is_empty(),
         "batch lookup must not return v2-era rows for a v3 query"
     );
 
-    let batch_request_v2 = CacheLookupRequest {
-        prompt_version: "v2",
-        ..batch_request_v3
-    };
     let batch_hit = store
-        .find_cached_translations_batch(std::slice::from_ref(&seg), batch_request_v2)
+        .find_cached_translations_batch(
+            std::slice::from_ref(&seg),
+            cache_lookup_request(
+                "v2",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_bump",
+                &expected_fingerprints_for(
+                    &store,
+                    &job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v2",
+                    "ns_bump",
+                ),
+            ),
+        )
         .expect("batch query ok");
     assert!(
         batch_hit.contains_key(&seg.id.0),
@@ -1106,12 +1226,23 @@ fn cached_translation_rejects_mismatched_block_ids() {
     let miss = store
         .find_cached_translation(
             &seg,
-            "v1",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "ns_x",
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_x",
+                &expected_fingerprints_for(
+                    &store,
+                    &_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "ns_x",
+                ),
+            ),
         )
         .expect("query ok");
     assert!(
@@ -1214,28 +1345,50 @@ fn cached_translation_prefers_repaired_succeeded_rows_over_cached_clones() {
         })
         .expect("repaired translation should save");
 
-    let request = CacheLookupRequest {
-        prompt_version: "v1",
-        provider: "mock",
-        model: "mock-prefix",
-        source_lang: Some("English"),
-        target_lang: "Italian",
-        cache_namespace: "cache_ns",
-    };
     let single_hit = store
         .find_cached_translation(
             &seg,
-            request.prompt_version,
-            request.provider,
-            request.model,
-            request.source_lang,
-            request.target_lang,
-            request.cache_namespace,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "cache_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &repaired_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "cache_ns",
+                ),
+            ),
         )
         .expect("single lookup should succeed")
         .expect("single lookup should hit");
     let batch_hit = store
-        .find_cached_translations_batch(std::slice::from_ref(&seg), request)
+        .find_cached_translations_batch(
+            std::slice::from_ref(&seg),
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "cache_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &repaired_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "cache_ns",
+                ),
+            ),
+        )
         .expect("batch lookup should succeed")
         .remove(&seg.id.0)
         .expect("batch lookup should hit");
@@ -1259,12 +1412,23 @@ fn old_empty_cache_namespace_rows_do_not_match_new_runs() {
     let miss = store
         .find_cached_translation(
             &seg,
-            "v1",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "real_ns",
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "real_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "real_ns",
+                ),
+            ),
         )
         .expect("query ok");
     assert!(
@@ -1949,12 +2113,23 @@ fn manual_correction_is_auditable_frozen_and_not_cacheable() {
     let cached = store
         .find_cached_translation(
             &segment,
-            "v1",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "manual_ns",
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "manual_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &job.id,
+                    std::slice::from_ref(&segment),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "manual_ns",
+                ),
+            ),
         )
         .expect("cache lookup should succeed");
     assert!(cached.is_none(), "manual corrections must remain job-local");
@@ -4671,4 +4846,1726 @@ fn migration_eleven_adds_block_id_once_and_reopen_takes_no_write_transaction() {
     }
 
     let _ = fs::remove_file(db_path);
+}
+
+/// A snapshot whose settings fully match the CLI's `mock`/`mock-prefix` test
+/// jobs, so structured cache identities built from it are stable across tests.
+fn snapshot_fixture() -> RunConfigSnapshot {
+    let settings = bookforge_core::TranslationProfile::Balanced.resolve();
+    RunConfigSnapshot {
+        input_path: PathBuf::from("input.epub"),
+        input_snapshot_path: None,
+        input_sha256: Some("abc123".to_string()),
+        output_path: PathBuf::from("output.epub"),
+        events_path: None,
+        report_json_path: None,
+        report_markdown_path: None,
+        source_language: Some("English".to_string()),
+        target_language: "Italian".to_string(),
+        creator: None,
+        provider: "mock".to_string(),
+        model: "mock-prefix".to_string(),
+        base_url: None,
+        api_key_env: None,
+        profile: settings.profile,
+        provider_preset: None,
+        prompt_version: "v1".to_string(),
+        cache_namespace: "identity_ns".to_string(),
+        book_id: None,
+        series_id: None,
+        glossary_budget_tokens: 800,
+        glossary_format: bookforge_core::GlossaryFormat::Json,
+        prompt_extra: None,
+        glossary_fingerprint: String::new(),
+        glossary_terms: Vec::new(),
+        context_window: 4,
+        context_budget_tokens: 400,
+        context_scope: bookforge_core::config::ContextScope::Chapter,
+        style_fingerprint: String::new(),
+        style_rendered_block: String::new(),
+        entities_fingerprint: String::new(),
+        entities_rendered_block: String::new(),
+        bilingual_mode: bookforge_core::BilingualMode::Replace,
+        bilingual_separator: " / ".to_string(),
+        bilingual_style: bookforge_core::BilingualStyle::Minimal,
+        bilingual_css: None,
+        fallback: None,
+        finalize: bookforge_core::run_snapshot::FinalizeCheckpointSnapshot::default(),
+        qa_mode: "off".to_string(),
+        validate_output: false,
+        settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
+    }
+}
+
+/// Create a job with a persisted run snapshot + cache policy, stamp one
+/// segment, and return both. `provider`/`model` must be `"mock"`/`"mock-prefix"`
+/// (the CLI primary for fixtures) unless a fallback provenance test overrides
+/// them via `save_translation`.
+fn seed_job_with_policy(
+    store: &JobStore,
+    cache_namespace: &str,
+    strict: bool,
+) -> (JobRecord, Segment) {
+    let input_path = temp_path("policy-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("policy-output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let mut snapshot = snapshot_fixture();
+    snapshot.cache_namespace = cache_namespace.to_string();
+    store
+        .update_job_config_snapshot(&job.id, &snapshot)
+        .expect("snapshot should persist");
+    store
+        .update_job_cache_policy(
+            &job.id,
+            &CachePolicySnapshot {
+                strict_context: Some(strict),
+            },
+        )
+        .expect("policy should persist");
+
+    let mut seg = segment("seg_identity", 0);
+    seg.block_ids = vec![BlockId("b_000000".to_string())];
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "mock-prefix",
+            cache_namespace,
+        )
+        .expect("segments should insert");
+    let _ = fs::remove_file(input_path);
+    (job, seg)
+}
+
+fn save_segment_translation(
+    store: &JobStore,
+    job_id: &str,
+    segment_id: &str,
+    provider: &str,
+    model: &str,
+    translated_text: &str,
+    prompt_version: &str,
+) {
+    store
+        .save_translation(SaveTranslation {
+            job_id,
+            segment_id,
+            translated_text,
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: translated_text.to_string(),
+            }],
+            provider,
+            model,
+            prompt_version,
+            input_tokens: Some(11),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(7),
+            tokens_estimated: false,
+        })
+        .expect("translation should save");
+}
+
+#[test]
+fn cache_lookup_isolates_strict_context_across_jobs() {
+    let db_path = temp_path("cache_strict.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    let (strict_job, seg) = seed_job_with_policy(&store, "strict_ns", true);
+    save_segment_translation(
+        &store,
+        &strict_job.id,
+        "seg_identity",
+        "mock",
+        "mock-prefix",
+        "Strict output",
+        "v1",
+    );
+
+    let (loose_job, _) = seed_job_with_policy(&store, "strict_ns", false);
+
+    // The loose job's expected identity is computed from ITS persisted policy
+    // (strict=false), so the strict-stamped cross-job row must never be
+    // reused — strict true vs false must differ.
+    let miss = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "strict_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &loose_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "strict_ns",
+                ),
+            ),
+        )
+        .expect("query ok");
+    assert!(
+        miss.is_none(),
+        "strict and loose contexts must not share cache"
+    );
+
+    // And the strict job's own row IS visible to a strict lookup.
+    let hit = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "strict_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &strict_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "strict_ns",
+                ),
+            ),
+        )
+        .expect("query ok")
+        .expect("strict lookup should hit its own row");
+    assert_eq!(hit.translated_text, "Strict output");
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn cache_lookup_never_serves_fallback_provenance_as_primary() {
+    let db_path = temp_path("cache_fallback.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    // Two jobs with identical primary config stamp the same fingerprint; the
+    // second's output was produced by a fallback provider/model.
+    let (primary_job, _) = seed_job_with_policy(&store, "fallback_ns", false);
+    save_segment_translation(
+        &store,
+        &primary_job.id,
+        "seg_identity",
+        "mock",
+        "mock-prefix",
+        "Primary output",
+        "v1",
+    );
+    let (fallback_job, seg) = seed_job_with_policy(&store, "fallback_ns", false);
+    save_segment_translation(
+        &store,
+        &fallback_job.id,
+        "seg_identity",
+        "deepseek",
+        "deepseek-v4-flash",
+        "Fallback output",
+        "v1",
+    );
+
+    // A fresh lookup context (no own translation) requesting the primary
+    // provider must only see the primary-produced row: the fallback row's
+    // real provenance (t.provider/t.model) excludes it.
+    let (lookup_job, _) = seed_job_with_policy(&store, "fallback_ns", false);
+    let hit = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "fallback_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "fallback_ns",
+                ),
+            ),
+        )
+        .expect("query ok")
+        .expect("primary lookup should hit the primary-produced row");
+    assert_eq!(hit.translated_text, "Primary output");
+
+    // Requesting the fallback provenance never surfaces it either: the
+    // expected identity (computed with the fallback provider/model) does not
+    // match the primary-stamped segment, so the fallback output stays
+    // job-local.
+    let fallback_miss = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "deepseek",
+                "deepseek-v4-flash",
+                Some("English"),
+                "Italian",
+                "fallback_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg),
+                    "deepseek",
+                    "deepseek-v4-flash",
+                    "v1",
+                    "fallback_ns",
+                ),
+            ),
+        )
+        .expect("query ok");
+    assert!(
+        fallback_miss.is_none(),
+        "fallback-produced output must remain job-local"
+    );
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn cache_lookup_isolates_different_provider_contexts() {
+    let db_path = temp_path("cache_provider.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    // Job A translates with openrouter/gemini; job B with deepseek — same
+    // source hash and namespace otherwise. Neither may reuse the other.
+    let (job_a, seg_a) = seed_job_with_policy(&store, "prov_ns", false);
+    store
+        .insert_segments(
+            &job_a.id,
+            std::slice::from_ref(&seg_a),
+            "v1",
+            "openrouter",
+            "google/gemini-2.5-flash",
+            "prov_ns",
+        )
+        .expect("job A segment should insert");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job_a.id,
+            segment_id: "seg_identity",
+            translated_text: "gemini output",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "gemini output".to_string(),
+            }],
+            provider: "openrouter",
+            model: "google/gemini-2.5-flash",
+            prompt_version: "v1",
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            tokens_estimated: false,
+        })
+        .expect("job A translation should save");
+
+    let (job_b, seg_b) = seed_job_with_policy(&store, "prov_ns", false);
+    store
+        .insert_segments(
+            &job_b.id,
+            std::slice::from_ref(&seg_b),
+            "v1",
+            "deepseek",
+            "deepseek-v4-flash",
+            "prov_ns",
+        )
+        .expect("job B segment should insert");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job_b.id,
+            segment_id: "seg_identity",
+            translated_text: "deepseek output",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "deepseek output".to_string(),
+            }],
+            provider: "deepseek",
+            model: "deepseek-v4-flash",
+            prompt_version: "v1",
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            tokens_estimated: false,
+        })
+        .expect("job B translation should save");
+
+    let (lookup_job, seg) = seed_job_with_policy(&store, "prov_ns", false);
+    let hit = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "deepseek",
+                "deepseek-v4-flash",
+                Some("English"),
+                "Italian",
+                "prov_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg),
+                    "deepseek",
+                    "deepseek-v4-flash",
+                    "v1",
+                    "prov_ns",
+                ),
+            ),
+        )
+        .expect("query ok")
+        .expect("deepseek lookup should hit job B");
+    assert_eq!(hit.translated_text, "deepseek output");
+
+    // A gemini context reuses the gemini-produced row (same effective
+    // provider/model) and never the deepseek output.
+    let gemini_hit = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "openrouter",
+                "google/gemini-2.5-flash",
+                Some("English"),
+                "Italian",
+                "prov_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg),
+                    "openrouter",
+                    "google/gemini-2.5-flash",
+                    "v1",
+                    "prov_ns",
+                ),
+            ),
+        )
+        .expect("query ok")
+        .expect("gemini context should hit job A");
+    assert_eq!(gemini_hit.translated_text, "gemini output");
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn cache_policy_mutation_apis_return_not_found_for_missing_rows() {
+    let db_path = temp_path("missing_rows.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    let policy = CachePolicySnapshot {
+        strict_context: Some(true),
+    };
+    let update_missing_job = store.update_job_cache_policy("job_missing", &policy);
+    assert!(
+        matches!(update_missing_job, Err(StoreError::NotFound(_))),
+        "update_job_cache_policy must reject a missing job"
+    );
+    let load_missing_job = store.load_job_cache_policy("job_missing");
+    assert!(
+        matches!(load_missing_job, Err(StoreError::NotFound(_))),
+        "load_job_cache_policy must reject a missing job"
+    );
+
+    let input_path = temp_path("missing-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("missing-output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+
+    let insert_into_missing_job = store.insert_segments(
+        "job_missing",
+        &[],
+        "v1",
+        "mock",
+        "mock-prefix",
+        "missing_ns",
+    );
+    assert!(
+        matches!(insert_into_missing_job, Err(StoreError::NotFound(_))),
+        "insert_segments must reject a missing job even with empty segments"
+    );
+
+    let save_missing = store.save_translation(SaveTranslation {
+        job_id: &job.id,
+        segment_id: "seg_missing",
+        translated_text: "x",
+        blocks: &[BlockTranslation {
+            block_id: BlockId("b_000000".to_string()),
+            text: "x".to_string(),
+        }],
+        provider: "mock",
+        model: "mock-prefix",
+        prompt_version: "v1",
+        input_tokens: None,
+        input_cached_tokens: None,
+        output_tokens: None,
+        tokens_estimated: false,
+    });
+    assert!(
+        matches!(save_missing, Err(StoreError::NotFound(_))),
+        "save_translation must reject a missing segment"
+    );
+
+    let record_missing = store.record_translation_attempt(RecordTranslationAttempt {
+        job_id: &job.id,
+        segment_id: "seg_missing",
+        batch_id: None,
+        phase: None,
+        provider: "mock",
+        model: "mock-prefix",
+        outcome: TranslationAttemptOutcome::Failure,
+        error: Some("boom"),
+        input_tokens: None,
+        input_cached_tokens: None,
+        output_tokens: None,
+        cost_estimate: None,
+    });
+    assert!(
+        matches!(record_missing, Err(StoreError::NotFound(_))),
+        "record_translation_attempt must reject a missing segment"
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn translation_attempt_ledger_aggregates_tokens_and_costs_monotonically() {
+    let db_path = temp_path("attempt_ledger.sqlite");
+    let input_path = temp_path("ledger-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("ledger-output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let mut seg = segment("seg_ledger", 0);
+    seg.block_ids = vec![BlockId("b_000000".to_string())];
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "mock-prefix",
+            "ledger_ns",
+        )
+        .expect("segments should insert");
+
+    store
+        .record_translation_attempt(RecordTranslationAttempt {
+            job_id: &job.id,
+            segment_id: "seg_ledger",
+            batch_id: None,
+            phase: None,
+            provider: "mock",
+            model: "mock-prefix",
+            outcome: TranslationAttemptOutcome::Failure,
+            error: Some("timeout"),
+            input_tokens: Some(100),
+            input_cached_tokens: Some(5),
+            output_tokens: Some(0),
+            cost_estimate: Some(1.0),
+        })
+        .expect("first attempt should record");
+    store
+        .record_translation_attempt(RecordTranslationAttempt {
+            job_id: &job.id,
+            segment_id: "seg_ledger",
+            batch_id: Some("batch_1"),
+            phase: Some(TranslationAttemptPhase::Repair),
+            provider: "mock",
+            model: "mock-prefix",
+            outcome: TranslationAttemptOutcome::Success,
+            error: None,
+            input_tokens: Some(40),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(60),
+            cost_estimate: Some(0.7),
+        })
+        .expect("second attempt should record");
+
+    let rows = store
+        .translation_attempts(&job.id, None, None)
+        .expect("attempts should load");
+    assert_eq!(rows.len(), 2, "both attempts persist");
+    assert_eq!(rows[0].attempt_ordinal, 1, "ordinals start at one");
+    assert_eq!(rows[1].attempt_ordinal, 2, "ordinals are monotonic");
+    assert_eq!(
+        rows[0].phase, "primary",
+        "phase inferred from provider/model"
+    );
+    assert_eq!(rows[1].phase, "repair", "explicit phase preserved");
+    assert_eq!(
+        rows[1].batch_id.as_deref(),
+        Some("batch_1"),
+        "batch id preserved"
+    );
+
+    let summary = store
+        .translation_attempt_summary(&job.id)
+        .expect("summary should aggregate");
+    assert_eq!(summary.attempts, 2);
+    assert_eq!(summary.input_tokens, 140, "input tokens aggregate");
+    assert_eq!(summary.input_cached_tokens, 5, "cached tokens aggregate");
+    assert_eq!(summary.output_tokens, 60, "output tokens aggregate");
+    assert!(
+        (summary.cost_estimate - 1.7).abs() < f64::EPSILON,
+        "cost aggregates"
+    );
+
+    // The job-level summary prefers the ledger once it has rows.
+    let job_summary = store
+        .summary(&job.id)
+        .expect("job summary should load")
+        .expect("job should exist");
+    assert_eq!(job_summary.input_tokens, 140);
+    assert_eq!(job_summary.output_tokens, 60);
+
+    // The ledger is immutable at the schema level: in-place edits are rejected.
+    let conn = store.conn.borrow();
+    let update_rejected = conn.execute(
+        "UPDATE translation_attempts SET outcome = 'success' WHERE job_id = ?1",
+        params![job.id],
+    );
+    assert!(
+        update_rejected.is_err(),
+        "append-only ledger must reject in-place updates"
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn translation_attempt_ledger_rejects_duplicate_ordinals() {
+    let db_path = temp_path("attempt_ordinal.sqlite");
+    let input_path = temp_path("ordinal-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("ordinal-output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let mut seg = segment("seg_ordinal", 0);
+    seg.block_ids = vec![BlockId("b_000000".to_string())];
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "mock-prefix",
+            "ordinal_ns",
+        )
+        .expect("segments should insert");
+
+    let request = RecordTranslationAttempt {
+        job_id: &job.id,
+        segment_id: "seg_ordinal",
+        batch_id: None,
+        phase: None,
+        provider: "mock",
+        model: "mock-prefix",
+        outcome: TranslationAttemptOutcome::Failure,
+        error: Some("boom"),
+        input_tokens: None,
+        input_cached_tokens: None,
+        output_tokens: None,
+        cost_estimate: None,
+    };
+    let _ = store
+        .record_translation_attempt(request)
+        .expect("first attempt");
+
+    // A manual attempt to force a duplicate ordinal violates the unique
+    // (job, segment, attempt_ordinal) constraint even though the store's
+    // own API always assigns the next ordinal.
+    let conn = store.conn.borrow();
+    let duplicate = conn.execute(
+        "INSERT INTO translation_attempts
+         (job_id, segment_id, batch_id, phase, attempt_ordinal, provider, model, outcome, error,
+          input_tokens, input_cached_tokens, output_tokens, cost_estimate, created_at)
+         VALUES (?1, ?2, NULL, 'primary', 1, 'mock', 'mock-prefix', 'failure', NULL,
+                 NULL, NULL, NULL, NULL, ?3)",
+        params![job.id, "seg_ordinal", timestamp_string()],
+    );
+    assert!(
+        duplicate.is_err(),
+        "duplicate attempt ordinals must be rejected"
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+/// Create a job with a persisted run snapshot but NO cache policy record, so
+/// lookups compute the conservative unknown-strictness identity.
+fn seed_job_with_snapshot_only(store: &JobStore, cache_namespace: &str) -> (JobRecord, Segment) {
+    let input_path = temp_path("snapshot-only-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("snapshot-only-output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let mut snapshot = snapshot_fixture();
+    snapshot.cache_namespace = cache_namespace.to_string();
+    store
+        .update_job_config_snapshot(&job.id, &snapshot)
+        .expect("snapshot should persist");
+    let mut seg = segment("seg_identity", 0);
+    seg.block_ids = vec![BlockId("b_000000".to_string())];
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "mock-prefix",
+            cache_namespace,
+        )
+        .expect("segments should insert");
+    let _ = fs::remove_file(input_path);
+    (job, seg)
+}
+
+/// A segment whose source text/checksum is shared across clones while the
+/// ordered neighbor/context content differs — the duplicate-text /
+/// different-context cache-collision scenario.
+fn segment_with_neighbors(
+    id: &str,
+    source_text: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Segment {
+    let mut seg = segment(id, 0);
+    seg.checksum = "identical_source_checksum".to_string();
+    seg.source.text = source_text.to_string();
+    seg.source.blocks[0].text = source_text.to_string();
+    seg.source.blocks[0].text_runs[0].text = source_text.to_string();
+    seg.context = SegmentContext {
+        before: before.map(str::to_string),
+        after: after.map(str::to_string),
+    };
+    seg
+}
+
+#[test]
+fn duplicate_source_text_in_different_contexts_never_collides() {
+    let db_path = temp_path("cache_dup_ctx.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    let seg_a =
+        segment_with_neighbors("seg_a", "identical text", Some("before A"), Some("after A"));
+    let seg_b =
+        segment_with_neighbors("seg_b", "identical text", Some("before B"), Some("after B"));
+    assert_eq!(
+        seg_a.checksum, seg_b.checksum,
+        "both segments share the identical source checksum"
+    );
+
+    let (job_a, _) = seed_job_with_policy(&store, "dup_ctx_ns", false);
+    store
+        .insert_segments(
+            &job_a.id,
+            std::slice::from_ref(&seg_a),
+            "v1",
+            "mock",
+            "mock-prefix",
+            "dup_ctx_ns",
+        )
+        .expect("job A segment should insert");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job_a.id,
+            segment_id: "seg_a",
+            translated_text: "A output",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "A output".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            tokens_estimated: false,
+        })
+        .expect("job A translation should save");
+
+    let (job_b, _) = seed_job_with_policy(&store, "dup_ctx_ns", false);
+    store
+        .insert_segments(
+            &job_b.id,
+            std::slice::from_ref(&seg_b),
+            "v1",
+            "mock",
+            "mock-prefix",
+            "dup_ctx_ns",
+        )
+        .expect("job B segment should insert");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job_b.id,
+            segment_id: "seg_b",
+            translated_text: "B output",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "B output".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            tokens_estimated: false,
+        })
+        .expect("job B translation should save");
+
+    let (lookup_job, _) = seed_job_with_policy(&store, "dup_ctx_ns", false);
+
+    // The expected fingerprint is keyed by the CURRENT segment id; identical
+    // checksums in different contexts resolve to distinct expectations.
+    let expected_b = expected_fingerprints_for(
+        &store,
+        &lookup_job.id,
+        std::slice::from_ref(&seg_b),
+        "mock",
+        "mock-prefix",
+        "v1",
+        "dup_ctx_ns",
+    );
+    let hit_b = store
+        .find_cached_translation(
+            &seg_b,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "dup_ctx_ns",
+                &expected_b,
+            ),
+        )
+        .expect("query ok")
+        .expect("seg_b contract must hit job B");
+    assert_eq!(hit_b.translated_text, "B output", "never job A's row");
+
+    let hit_a = store
+        .find_cached_translation(
+            &seg_a,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "dup_ctx_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg_a),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "dup_ctx_ns",
+                ),
+            ),
+        )
+        .expect("query ok")
+        .expect("seg_a contract must hit job A");
+    assert_eq!(hit_a.translated_text, "A output");
+
+    // The batch path must also keep the two identical-source rows apart.
+    let both = &[seg_a.clone(), seg_b.clone()];
+    let hits = store
+        .find_cached_translations_batch(
+            both,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "dup_ctx_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    both,
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "dup_ctx_ns",
+                ),
+            ),
+        )
+        .expect("batch query ok");
+    assert_eq!(hits["seg_a"].translated_text, "A output");
+    assert_eq!(hits["seg_b"].translated_text, "B output");
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn fallback_attempts_carry_effective_provenance_and_phase() {
+    let db_path = temp_path("fallback_provenance.sqlite");
+    let input_path = temp_path("fallback_prov_input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("fallback_prov_output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let mut seg = segment("seg_fb", 0);
+    seg.block_ids = vec![BlockId("b_000000".to_string())];
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "mock-prefix",
+            "fb_ns",
+        )
+        .expect("segment should insert");
+
+    // The output was produced by the fallback provider/model: the
+    // translations row must preserve that effective provenance.
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_fb",
+            translated_text: "fallback output",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "fallback output".to_string(),
+            }],
+            provider: "deepseek",
+            model: "deepseek-v4-flash",
+            prompt_version: "v1",
+            input_tokens: Some(9),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(6),
+            tokens_estimated: false,
+        })
+        .expect("fallback translation should save");
+
+    // The real wire attempt records the same effective provider/model and the
+    // phase inference labels it a fallback attempt against the job primary.
+    let ordinal = store
+        .record_translation_attempt(RecordTranslationAttempt {
+            job_id: &job.id,
+            segment_id: "seg_fb",
+            batch_id: None,
+            phase: None,
+            provider: "deepseek",
+            model: "deepseek-v4-flash",
+            outcome: TranslationAttemptOutcome::Success,
+            error: None,
+            input_tokens: Some(9),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(6),
+            cost_estimate: Some(0.5),
+        })
+        .expect("attempt should record");
+    assert_eq!(ordinal, 1);
+
+    let attempts = store
+        .translation_attempts(&job.id, Some("seg_fb"), None)
+        .expect("attempts should load");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].phase, "fallback",
+        "effective provider infers fallback"
+    );
+    assert_eq!(attempts[0].provider, "deepseek");
+    assert_eq!(attempts[0].model, "deepseek-v4-flash");
+    assert_eq!(attempts[0].outcome, "success");
+
+    let stored = store
+        .load_terminal_segment_translations(&job.id)
+        .expect("terminal translations should load");
+    let record = stored
+        .iter()
+        .find(|record| record.segment_id == "seg_fb")
+        .expect("fallback segment translation");
+    assert_eq!(record.provider, "deepseek");
+    assert_eq!(record.model, "deepseek-v4-flash");
+
+    // A primary-context lookup never serves the fallback-produced row.
+    let (lookup_job, _) = seed_job_with_policy(&store, "fb_ns", false);
+    let miss = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "fb_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "fb_ns",
+                ),
+            ),
+        )
+        .expect("query ok");
+    assert!(
+        miss.is_none(),
+        "fallback provenance must never be served to a primary context"
+    );
+
+    // The segment's stamped cache fingerprint was computed with the job's
+    // PRIMARY provider/model at insert time (the fallback was not known yet),
+    // while the output's real provenance is the fallback provider/model. The
+    // write-time identity and a fallback-context expected identity therefore
+    // disagree, so even a fallback-context lookup cannot match this row: the
+    // fallback-produced output stays job-local and is never reused under a
+    // fabricated effective provider/model fingerprint. This is conservative
+    // (a missed cache opportunity, never a wrong reuse).
+    let fallback_miss = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "deepseek",
+                "deepseek-v4-flash",
+                Some("English"),
+                "Italian",
+                "fb_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg),
+                    "deepseek",
+                    "deepseek-v4-flash",
+                    "v1",
+                    "fb_ns",
+                ),
+            ),
+        )
+        .expect("query ok");
+    assert!(
+        fallback_miss.is_none(),
+        "a fallback-produced row must stay job-local (never served under the effective provider)"
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn summary_mixes_ledger_and_legacy_segment_tokens_without_double_counting() {
+    let db_path = temp_path("mixed_ledger.sqlite");
+    let input_path = temp_path("mixed_ledger_input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("mixed_ledger_output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let seg_a = segment("seg_a", 0);
+    let seg_b = segment("seg_b", 1);
+    store
+        .insert_segments(
+            &job.id,
+            &[seg_a.clone(), seg_b.clone()],
+            "v1",
+            "mock",
+            "mock-prefix",
+            "mixed_ns",
+        )
+        .expect("segments should insert");
+
+    // seg_a completes with only legacy token columns (pre-ledger style: no
+    // wire attempt is recorded on the checkpoint path).
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            translated_text: "A",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "A".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(10),
+            input_cached_tokens: Some(1),
+            output_tokens: Some(5),
+            tokens_estimated: false,
+        })
+        .expect("seg_a translation should save");
+
+    // seg_b has BOTH a legacy token record AND a real wire-attempt ledger row
+    // for the same attempt; the summary must use the ledger, not both.
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_b",
+            translated_text: "B",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000001".to_string()),
+                text: "B".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(20),
+            input_cached_tokens: Some(2),
+            output_tokens: Some(7),
+            tokens_estimated: false,
+        })
+        .expect("seg_b translation should save");
+    store
+        .record_translation_attempt(RecordTranslationAttempt {
+            job_id: &job.id,
+            segment_id: "seg_b",
+            batch_id: None,
+            phase: Some(TranslationAttemptPhase::Primary),
+            provider: "mock",
+            model: "mock-prefix",
+            outcome: TranslationAttemptOutcome::Success,
+            error: None,
+            input_tokens: Some(20),
+            input_cached_tokens: Some(2),
+            output_tokens: Some(7),
+            cost_estimate: None,
+        })
+        .expect("seg_b wire attempt should record");
+
+    let summary = store
+        .summary(&job.id)
+        .expect("summary query")
+        .expect("job exists");
+    assert_eq!(
+        summary.input_tokens, 30,
+        "seg_a legacy 10 + seg_b ledger 20 (not 50: seg_b must not double count)"
+    );
+    assert_eq!(summary.input_cached_tokens, 3);
+    assert_eq!(summary.output_tokens, 12);
+
+    let listed = store
+        .list_job_summaries()
+        .expect("list summaries")
+        .into_iter()
+        .find(|(record, _)| record.id == job.id)
+        .expect("job listed");
+    assert_eq!(listed.1.input_tokens, 30);
+    assert_eq!(listed.1.input_cached_tokens, 3);
+    assert_eq!(listed.1.output_tokens, 12);
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn concurrent_attempt_ordinals_are_monotonic_and_unique() {
+    let db_path = temp_path("concurrent_ordinals.sqlite");
+    let input_path = temp_path("concurrent_ord_input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+    let job_id = {
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("concurrent_ord_output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job should be created");
+        let mut seg = segment("seg_conc", 0);
+        seg.block_ids = vec![BlockId("b_000000".to_string())];
+        store
+            .insert_segments(
+                &job.id,
+                std::slice::from_ref(&seg),
+                "v1",
+                "mock",
+                "mock-prefix",
+                "conc_ns",
+            )
+            .expect("segments should insert");
+        job.id
+    };
+
+    // Each thread opens its OWN connection and records a wire attempt for the
+    // same (job, segment). The IMMEDIATE transaction + atomic ordinal
+    // allocation serializes the writers; every attempt must succeed with a
+    // unique monotonic ordinal.
+    const THREADS: usize = 6;
+    let mut ordinals: Vec<i64> = Vec::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let db_path = db_path.clone();
+                let job_id = job_id.clone();
+                scope.spawn(move || {
+                    let store = JobStore::open(&db_path).expect("thread store opens");
+                    store
+                        .record_translation_attempt(RecordTranslationAttempt {
+                            job_id: &job_id,
+                            segment_id: "seg_conc",
+                            batch_id: None,
+                            phase: Some(TranslationAttemptPhase::Primary),
+                            provider: "mock",
+                            model: "mock-prefix",
+                            outcome: TranslationAttemptOutcome::Failure,
+                            error: Some("concurrent"),
+                            input_tokens: Some(1),
+                            input_cached_tokens: Some(0),
+                            output_tokens: Some(0),
+                            cost_estimate: None,
+                        })
+                        .expect("concurrent attempt should record")
+                })
+            })
+            .collect();
+        for handle in handles {
+            ordinals.push(handle.join().expect("thread should not panic"));
+        }
+    });
+
+    ordinals.sort_unstable();
+    let expected: Vec<i64> = (1..=THREADS as i64).collect();
+    assert_eq!(
+        ordinals, expected,
+        "ordinals must be a unique monotonic 1..=N sequence"
+    );
+
+    let store = JobStore::open(&db_path).expect("store reopens");
+    let rows = store
+        .translation_attempts(&job_id, Some("seg_conc"), None)
+        .expect("attempts should load");
+    assert_eq!(rows.len(), THREADS);
+    let mut loaded: Vec<usize> = rows.iter().map(|row| row.attempt_ordinal).collect();
+    loaded.sort_unstable();
+    assert_eq!(
+        loaded,
+        expected
+            .iter()
+            .map(|value| *value as usize)
+            .collect::<Vec<_>>()
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn migration_twelve_upgrades_legacy_schema_and_composite_fk_holds() {
+    let db_path = temp_path("migration12_legacy.sqlite");
+    // Hand-build a pre-v12 database: migrations 1..=7 recorded, the legacy
+    // jobs/segments tables WITHOUT the cache identity columns, and no
+    // translation_attempts table yet.
+    {
+        let conn = Connection::open(&db_path).expect("legacy connection opens");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE _migrations (
+              version INTEGER PRIMARY KEY,
+              name TEXT NOT NULL,
+              applied_at TEXT NOT NULL
+            );
+            INSERT INTO _migrations (version, name, applied_at) VALUES
+              (1, 'initial', '0'),
+              (2, 'v1_0_1_input_snapshot', '0'),
+              (3, 'v1_1_segment_flags', '0'),
+              (4, 'v1_2_glossary_terms', '0'),
+              (5, 'v1_2_1_nullable_glossary_candidate_targets', '0'),
+              (6, 'v1_3_context_styles_entities', '0'),
+              (7, 'v2_4_human_corrections', '0');
+            CREATE TABLE jobs (
+              id TEXT PRIMARY KEY,
+              input_path TEXT NOT NULL DEFAULT '',
+              input_snapshot_path TEXT,
+              input_sha256 TEXT,
+              output_path TEXT NOT NULL DEFAULT '',
+              input_hash TEXT NOT NULL,
+              source_lang TEXT,
+              target_lang TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              base_url TEXT,
+              api_key_env TEXT,
+              status TEXT NOT NULL,
+              config_json TEXT,
+              events_path TEXT,
+              report_json_path TEXT,
+              report_markdown_path TEXT,
+              book_id TEXT,
+              series_id TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE segments (
+              id TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              section_id TEXT NOT NULL,
+              ordinal INTEGER NOT NULL,
+              source_hash TEXT NOT NULL,
+              prompt_version TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              status TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              input_tokens INTEGER,
+              output_tokens INTEGER,
+              tokens_input INTEGER,
+              tokens_input_cached INTEGER,
+              tokens_output INTEGER,
+              tokens_estimated INTEGER NOT NULL DEFAULT 0,
+              cost_estimate REAL,
+              error TEXT,
+              translated_hash TEXT,
+              PRIMARY KEY (job_id, id),
+              FOREIGN KEY(job_id) REFERENCES jobs(id)
+            );
+            "#,
+        )
+        .expect("legacy schema should build");
+    }
+
+    let input_path = temp_path("migration12_legacy_input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let store = JobStore::open(&db_path).expect("migration should upgrade the legacy database");
+
+    // Migration 12 added the cache identity columns and the ledger table:
+    // they are usable immediately.
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("migration12_legacy_output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let mut seg = segment("seg_m12", 0);
+    seg.block_ids = vec![BlockId("b_000000".to_string())];
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "mock-prefix",
+            "m12_ns",
+        )
+        .expect("segments should insert");
+    let ordinal = store
+        .record_translation_attempt(RecordTranslationAttempt {
+            job_id: &job.id,
+            segment_id: "seg_m12",
+            batch_id: None,
+            phase: Some(TranslationAttemptPhase::Primary),
+            provider: "mock",
+            model: "mock-prefix",
+            outcome: TranslationAttemptOutcome::Failure,
+            error: None,
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            cost_estimate: None,
+        })
+        .expect("attempt should record");
+    assert_eq!(ordinal, 1);
+
+    // The composite FK pins attempts to the segment row: a raw row for a
+    // missing (job, segment) pair is rejected at the SQL layer.
+    let conn = store.conn.borrow();
+    let fk_error = conn.execute(
+        "INSERT INTO translation_attempts
+         (job_id, segment_id, batch_id, phase, attempt_ordinal, provider, model, outcome, error,
+          input_tokens, input_cached_tokens, output_tokens, cost_estimate, created_at)
+         VALUES ('phantom_job', 'phantom_seg', NULL, 'primary', 1, 'mock', 'mock-prefix', 'failure',
+                 NULL, NULL, NULL, NULL, NULL, ?1)",
+        params![timestamp_string()],
+    );
+    assert!(
+        fk_error.is_err(),
+        "the composite foreign key must reject attempts for a missing segment"
+    );
+    drop(conn);
+
+    // Reopen is clean: data persists and the schema stays intact.
+    drop(store);
+    let store = JobStore::open(&db_path).expect("store reopens cleanly");
+    let attempts = store
+        .translation_attempts(&job.id, None, None)
+        .expect("attempts should load after reopen");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].attempt_ordinal, 1);
+    let conn = store.conn.borrow();
+    let has_fingerprint = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('segments') WHERE name = 'cache_fingerprint')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .expect("column check");
+    assert!(
+        has_fingerprint,
+        "segments.cache_fingerprint must exist after migration"
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn unknown_cache_policy_fails_closed_against_explicit_choices() {
+    let db_path = temp_path("cache_unknown_policy.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    let (strict_job, seg) = seed_job_with_policy(&store, "unknown_ns", true);
+    save_segment_translation(
+        &store,
+        &strict_job.id,
+        "seg_identity",
+        "mock",
+        "mock-prefix",
+        "Strict output",
+        "v1",
+    );
+    let (loose_job, _) = seed_job_with_policy(&store, "unknown_ns", false);
+    save_segment_translation(
+        &store,
+        &loose_job.id,
+        "seg_identity",
+        "mock",
+        "mock-prefix",
+        "Loose output",
+        "v1",
+    );
+
+    // A lookup job that NEVER recorded a policy must not reuse either row: the
+    // unknown (conservative) expected fingerprint is hashed distinctly from
+    // both explicit choices, so it fails closed.
+    let (unknown_job, _) = seed_job_with_snapshot_only(&store, "unknown_ns");
+    let miss = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "unknown_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &unknown_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "unknown_ns",
+                ),
+            ),
+        )
+        .expect("query ok");
+    assert!(
+        miss.is_none(),
+        "an unknown cache policy must never reuse an explicit strict or loose row"
+    );
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn resume_identity_uses_full_ordered_neighborhood_for_glossary_selection() {
+    let db_path = temp_path("resume_window_glossary.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    // Six segments in ONE section. The glossary term "anchor" appears only in
+    // segment 0; segment 5 picks it up through the recently-active window
+    // (previous 5 segments), so the per-segment selection is order/window
+    // sensitive: computing it over ONLY segment 5 would select nothing.
+    let anchor = bookforge_core::glossary::GlossaryTerm {
+        id: Some(1),
+        scope_kind: bookforge_core::GlossaryScopeKind::Global,
+        scope_id: None,
+        source_text: "anchor".to_string(),
+        target_text: "ancora".to_string(),
+        category: bookforge_core::GlossaryCategory::Other,
+        notes: None,
+        case_sensitive: false,
+        always_active: false,
+        status: bookforge_core::GlossaryStatus::UserSeeded,
+        source_language: "English".to_string(),
+        target_language: "Italian".to_string(),
+        source_count: 1,
+    };
+    let windowed = (0..6)
+        .map(|index| {
+            let mut seg = segment(&format!("seg_w{index}"), index);
+            let text = if index == 0 {
+                "anchor term".to_string()
+            } else {
+                format!("other text {index}")
+            };
+            seg.source.text = text.clone();
+            seg.source.blocks[0].text = text.clone();
+            seg.source.blocks[0].text_runs[0].text = text;
+            seg
+        })
+        .collect::<Vec<_>>();
+    let seg_5 = windowed[5].clone();
+
+    // Original run: snapshot carries the glossary term, all six segments are
+    // inserted together, and the last segment is translated.
+    let input_path = temp_path("resume_window_input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let original = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("resume_window_output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("original job should be created");
+    let mut snapshot = snapshot_fixture();
+    snapshot.cache_namespace = "window_ns".to_string();
+    snapshot.glossary_terms = vec![anchor];
+    store
+        .update_job_config_snapshot(&original.id, &snapshot)
+        .expect("snapshot should persist");
+    store
+        .insert_segments(
+            &original.id,
+            &windowed,
+            "v1",
+            "mock",
+            "mock-prefix",
+            "window_ns",
+        )
+        .expect("full segment set should insert");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &original.id,
+            segment_id: "seg_w5",
+            translated_text: "translated w5",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000005".to_string()),
+                text: "translated w5".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            tokens_estimated: false,
+        })
+        .expect("original translation should save");
+
+    // Resume run: the segment set rebuilds identically, but the lookup is
+    // restricted to the eligible pending candidate (segment 5 alone). The
+    // identity MUST still be computed over the FULL ordered set so the
+    // per-segment glossary selection (and therefore the fingerprint) matches
+    // what the original run stamped.
+    let resume_job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("resume_window_output2.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("resume job should be created");
+    store
+        .update_job_config_snapshot(&resume_job.id, &snapshot)
+        .expect("resume snapshot should persist");
+
+    let full_set = std::slice::from_ref(&windowed[5]);
+
+    // Correct behavior (full ordered set for identity, candidate restricted):
+    // the resume reuses the original run's segment-5 row.
+    let expected_full = store
+        .expected_cache_fingerprints(
+            &resume_job.id,
+            &windowed,
+            full_set,
+            "mock",
+            "mock-prefix",
+            "v1",
+            "window_ns",
+        )
+        .expect("expected fingerprints should compute");
+    let hit = store
+        .find_cached_translation(
+            &seg_5,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "window_ns",
+                &expected_full,
+            ),
+        )
+        .expect("query ok")
+        .expect("full-set identity must hit the original row");
+    assert_eq!(hit.translated_text, "translated w5");
+
+    // Regression guard: computing the identity over ONLY the pending candidate
+    // (the sparse slice the pre-fix code passed on resume) selects no
+    // recently-active glossary term, so it must NOT match the stamped row.
+    let expected_sparse = store
+        .expected_cache_fingerprints(
+            &resume_job.id,
+            full_set,
+            full_set,
+            "mock",
+            "mock-prefix",
+            "v1",
+            "window_ns",
+        )
+        .expect("sparse expected fingerprints should compute");
+    assert_ne!(
+        expected_sparse["seg_w5"], expected_full["seg_w5"],
+        "sparse-set identity must differ from full-set identity"
+    );
+    let sparse_miss = store
+        .find_cached_translation(
+            &seg_5,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "window_ns",
+                &expected_sparse,
+            ),
+        )
+        .expect("query ok");
+    assert!(
+        sparse_miss.is_none(),
+        "a sparse window must never reuse the original prompt's cache row"
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
 }

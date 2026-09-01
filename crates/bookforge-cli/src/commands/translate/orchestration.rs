@@ -528,6 +528,7 @@ where
     };
     let mut translations = apply_cached_translations(
         &segments,
+        &segments,
         CacheContext {
             store: &store,
             job_id: &job.id,
