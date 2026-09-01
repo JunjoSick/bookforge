@@ -15,6 +15,64 @@ fn bookforge() -> Command {
     Command::cargo_bin("bookforge").expect("bookforge binary should be built")
 }
 
+/// End-to-end child-spawn regression for the output-lock handoff: the
+/// dashboard parent holds the kernel lock and pre-addresses the child with a
+/// nonce; the launched CLI child must wait on the kernel lock and adopt it
+/// after the parent releases, rather than fail on (or race) the live parent.
+/// Under the old create_new design the child hit `Held` immediately and the
+/// launch died with "locked by another audiobook run".
+#[test]
+fn dashboard_parent_lock_handoff_is_adopted_by_the_launched_child() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    let out = temp.path().join("audio-handoff");
+
+    // The dashboard parent acquires the output lock, pre-addresses the child,
+    // and spawns it while still holding the kernel lock.
+    let parent_lock =
+        bookforge_audio::acquire_audiobook_output_lock(&out).expect("parent acquires the lock");
+    let handoff = bookforge_audio::new_lock_handoff_nonce();
+    parent_lock
+        .handoff_nonce(&handoff)
+        .expect("parent pre-addresses the child");
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("bookforge"))
+        .current_dir(temp.path())
+        .arg("audiobook")
+        .arg(&input)
+        .arg("--provider")
+        .arg("mock")
+        .arg("--out")
+        .arg(&out)
+        .arg("--format")
+        .arg("wav")
+        .env("BOOKFORGE_AUDIO_OUT_LOCK_HANDOFF", &handoff)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("audiobook child should spawn");
+
+    // The child must wait on the kernel lock, not fail, while the parent
+    // still holds it.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(
+        child.try_wait().ok().flatten().is_none(),
+        "a dashboard-launched child must wait for the handoff, not fail while the parent holds the lock"
+    );
+
+    // The parent releases the kernel lock; the child adopts and completes.
+    drop(parent_lock);
+    let status = child.wait().expect("audiobook child should be reaped");
+    assert!(
+        status.success(),
+        "a dashboard-launched mock audiobook must adopt the handoff and succeed: {status}"
+    );
+    assert!(
+        out.join("manifest.json").is_file(),
+        "the child must durably publish its manifest"
+    );
+}
+
 const CONTAINER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
   <rootfiles>
@@ -169,6 +227,39 @@ fn audiobook_dry_run_writes_nothing() {
         "should announce dry run: {stdout}"
     );
     assert!(!out.exists(), "dry run must not create the output dir");
+}
+
+#[test]
+fn live_retry_failed_takes_the_output_lock_before_reading_the_manifest() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    let out = temp.path().join("audio-retry-locked");
+    let _holder =
+        bookforge_audio::acquire_audiobook_output_lock(&out).expect("holder acquires lock");
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "mock",
+            "--out",
+            out.to_str().unwrap(),
+            "--retry-failed",
+        ])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("could not acquire audiobook output lock"),
+        "live retry must fail on ownership before reading shared cache state: {stderr}"
+    );
+    assert!(
+        !stderr.contains("requires a readable prior manifest"),
+        "manifest must not be read before output ownership is established: {stderr}"
+    );
 }
 
 #[test]

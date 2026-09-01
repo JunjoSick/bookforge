@@ -864,16 +864,16 @@ mod process_signals {
     /// Kill a whole process group by negated pid. Best effort: failure falls
     /// back to the caller's direct-child kill.
     pub fn kill_process_group(pid: u32) -> bool {
-        unsafe { kill(pid.negated_i32(), SIGKILL) == 0 }
-    }
-
-    trait NegateI32 {
-        fn negated_i32(self) -> i32;
-    }
-    impl NegateI32 for u32 {
-        fn negated_i32(self) -> i32 {
-            (self.min(i32::MAX as u32)) as i32
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
         }
+        // POSIX uses a negative PID to address the process group whose ID is
+        // the corresponding positive PID. Do the negation only after the
+        // checked conversion so an invalid platform PID cannot wrap.
+        unsafe { kill(-pid, SIGKILL) == 0 }
     }
 }
 
@@ -959,13 +959,12 @@ fn bounded_stderr_tail<R: Read>(mut reader: R) -> std::io::Result<(Vec<u8>, bool
 
 /// Publish a staged output by renaming over any previous file.
 ///
-/// `fs::rename` replaces existing destinations on every supported platform
-/// (Windows included), so — matching the AUDIO-1 simplification in the
-/// builder — the legacy backup/rename choreography and its
-/// pid-colliding `.replace.bak` names are gone; `--prune` sweeps still clean
-/// up those legacy remnants when found.
+/// [`crate::atomic::replace_file`] replaces existing destinations atomically
+/// on every supported platform. The helper keeps the prior destination when
+/// publication fails; `--prune` sweeps still clean up legacy `.replace.bak`
+/// remnants from older runs.
 fn publish_staged_file(staged: &Path, final_path: &Path) -> std::result::Result<(), String> {
-    std::fs::rename(staged, final_path)
+    crate::atomic::replace_file(staged, final_path)
         .map_err(|error| format!("publishing ffmpeg output {}: {error}", final_path.display()))
 }
 
@@ -1608,6 +1607,28 @@ mod tests {
     }
 
     #[test]
+    fn successful_publication_replaces_prior_output_repeatedly() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("audiobook.m4b");
+        std::fs::write(&final_path, b"first-output").unwrap();
+
+        for (index, bytes) in [b"second-output".as_slice(), b"third-output"]
+            .iter()
+            .enumerate()
+        {
+            let staged = staged_output_path(&final_path);
+            std::fs::write(&staged, bytes).unwrap();
+            publish_staged_file(&staged, &final_path).unwrap();
+            assert_eq!(
+                std::fs::read(&final_path).unwrap(),
+                *bytes,
+                "iteration {index}"
+            );
+            assert!(!staged.exists());
+        }
+    }
+
+    #[test]
     fn failed_duration_probe_skips_unchaptered_m4b_with_warning_text() {
         let dir = tempfile::tempdir().unwrap();
         let options = StitchOptions {
@@ -1800,6 +1821,39 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(outcome.is_err(), "sleeping child must fail");
         assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"prior-output");
+        assert!(!staged.exists(), "staged output must be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_wrapper_kills_grandchild_holding_stderr_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("out.wav");
+        std::fs::write(&final_path, b"prior-output").unwrap();
+        let staged = staged_output_path(&final_path);
+
+        // The background sleep inherits stderr. Killing only the shell leaves
+        // that pipe open until the sleep exits; killing the process group
+        // closes it immediately and lets timeout cleanup join the drainer.
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 2 >&2 & wait"]);
+
+        let started = Instant::now();
+        let outcome = run_ffmpeg_transactional_with_timeout(
+            &mut command,
+            &staged,
+            &final_path,
+            "test wrapper timeout",
+            Duration::from_millis(100),
+        );
+
+        assert!(outcome.is_err(), "wrapper must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "grandchild kept the pipe open: {:?}",
+            started.elapsed()
+        );
         assert_eq!(std::fs::read(&final_path).unwrap(), b"prior-output");
         assert!(!staged.exists(), "staged output must be removed");
     }

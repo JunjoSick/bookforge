@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::lock::{OutDirLock, acquire_out_dir_lock};
+use crate::lock::acquire_out_dir_lock;
 use crate::provider::{AudioFormat, SpeechRequest, TextNormalization, TtsProvider};
 use crate::text::{ChunkKind, chapters_from_book_with_options, chunk_blocks};
 
@@ -410,18 +410,128 @@ where
         return Err(BuildError::NoText);
     }
 
-    std::fs::create_dir_all(&options.out_dir).map_err(|source| BuildError::Io {
-        path: options.out_dir.clone(),
+    let lock = acquire_audiobook_output_lock(&options.out_dir)?;
+    build_audiobook_locked(book, provider, options, cancel, on_progress, plan, &lock).await
+}
+
+/// Ownership of one audiobook output directory.
+///
+/// Keep this guard alive while any operation may read or mutate the cache,
+/// manifest, stitched artifacts, or prune candidates. The CLI uses it to
+/// extend the builder's lock through post-processing; dashboard prune uses it
+/// to serialize its scan-and-delete transaction with child runs.
+#[derive(Debug)]
+pub struct AudiobookOutputLock {
+    out_dir: PathBuf,
+    inner: crate::lock::OutDirLock,
+}
+
+impl AudiobookOutputLock {
+    /// Read the owner record currently written by the holder of the kernel
+    /// lock. Terminal writers use this to confirm the child they are closing
+    /// out still owns the operation before touching durable state.
+    pub fn record(&self) -> Result<crate::lock::OwnerRecord> {
+        self.inner.record().map_err(|source| BuildError::Io {
+            path: self.inner.path.clone(),
+            source,
+        })
+    }
+
+    /// Pre-address this held lock to the child that will adopt it: rewrite
+    /// the owner record with a fresh handoff `nonce` while keeping the pid.
+    /// The child waits on the kernel lock, acquires it after this process
+    /// releases, and adopts only when the record still carries `nonce`.
+    /// Callers must abort the spawn if this fails so the child never adopts a
+    /// record that was not written.
+    pub fn handoff_nonce(&self, nonce: &str) -> Result<()> {
+        self.inner
+            .write_record(std::process::id(), nonce)
+            .map_err(|source| BuildError::Io {
+                path: self.inner.path.clone(),
+                source,
+            })
+    }
+}
+
+/// Generate a fresh nonce for an [`AudiobookOutputLock::handoff_nonce`]
+/// handoff. The dashboard passes the same value to the child it is about to
+/// spawn (via the child environment) so the child can adopt the pre-addressed
+/// lock instead of racing the parent's release.
+pub fn new_lock_handoff_nonce() -> String {
+    crate::lock::generate_nonce()
+}
+
+/// Acquire the cross-process ownership lock for an audiobook output directory.
+pub fn acquire_audiobook_output_lock(out_dir: &Path) -> Result<AudiobookOutputLock> {
+    std::fs::create_dir_all(out_dir).map_err(|source| BuildError::Io {
+        path: out_dir.to_path_buf(),
         source,
     })?;
+    let inner = acquire_out_dir_lock(out_dir)?;
+    Ok(AudiobookOutputLock {
+        out_dir: out_dir.to_path_buf(),
+        inner,
+    })
+}
 
-    // AUDIO-2: one exclusive cross-process owner per out_dir for the whole
-    // build. Concurrent runs would otherwise interleave manifest checkpoints
-    // and let --prune delete the other run's freshly paid chunks. The lock is
-    // advisory-by-convention; --prune sweeps recognize it and never delete a
-    // live build's lock file. Held via RAII so cancellation, errors, and
-    // panics all release it.
-    let lock = acquire_out_dir_lock(&options.out_dir)?;
+/// Acquire a lock that a dashboard parent handed off to this process: wait on
+/// the kernel lock, then adopt only if the record still carries
+/// `handoff_nonce`. A record with any other nonce is refused.
+pub fn acquire_audiobook_output_lock_with_handoff(
+    out_dir: &Path,
+    handoff_nonce: &str,
+) -> Result<AudiobookOutputLock> {
+    std::fs::create_dir_all(out_dir).map_err(|source| BuildError::Io {
+        path: out_dir.to_path_buf(),
+        source,
+    })?;
+    let inner = crate::lock::acquire_out_dir_lock_with_handoff(out_dir, handoff_nonce)?;
+    Ok(AudiobookOutputLock {
+        out_dir: out_dir.to_path_buf(),
+        inner,
+    })
+}
+
+/// Take the kernel lock without claiming the owner record, for terminal
+/// writers (the dashboard watcher and restart cancellation) that must first
+/// inspect who currently owns the lock before writing durable state. Fails
+/// with [`BuildError::OutputLocked`] while another live run holds it.
+pub fn acquire_audiobook_output_lock_peek(out_dir: &Path) -> Result<AudiobookOutputLock> {
+    std::fs::create_dir_all(out_dir).map_err(|source| BuildError::Io {
+        path: out_dir.to_path_buf(),
+        source,
+    })?;
+    let inner = crate::lock::acquire_out_dir_lock_peek(out_dir)?;
+    Ok(AudiobookOutputLock {
+        out_dir: out_dir.to_path_buf(),
+        inner,
+    })
+}
+
+/// Build while the caller retains ownership of `lock` for later post-process
+/// and prune decisions. The lock must belong to `options.out_dir`.
+pub async fn build_audiobook_with_lock<P, F>(
+    book: &Book,
+    provider: Arc<P>,
+    options: &AudiobookOptions,
+    cancel: CancellationToken,
+    on_progress: F,
+    lock: &AudiobookOutputLock,
+) -> Result<AudiobookReport>
+where
+    P: TtsProvider + 'static,
+    F: Fn(Progress) + Send + Sync + 'static,
+{
+    validate_options(options)?;
+    let plan = build_plan(book, options);
+    if plan.is_empty() {
+        return Err(BuildError::NoText);
+    }
+    if lock.out_dir != options.out_dir {
+        return Err(BuildError::InvalidOptions(
+            "audiobook output lock belongs to a different directory".to_string(),
+        ));
+    }
     build_audiobook_locked(book, provider, options, cancel, on_progress, plan, lock).await
 }
 
@@ -432,7 +542,7 @@ async fn build_audiobook_locked<P, F>(
     cancel: CancellationToken,
     on_progress: F,
     plan: Vec<PlannedChunk>,
-    _lock: OutDirLock,
+    _lock: &AudiobookOutputLock,
 ) -> Result<AudiobookReport>
 where
     P: TtsProvider + 'static,
@@ -1008,10 +1118,8 @@ fn temp_random_component() -> u64 {
 /// into place, so an interrupted write never leaves a half-file that a
 /// resume would mistake for done and never clobbers another writer's temp.
 ///
-/// `fs::rename` replaces the destination on every platform BookForge ships,
-/// Windows included (the historical backup/rename dance guarded against a
-/// false premise while widening the crash window it claimed to close), so a
-/// single rename into place is the whole protocol. The unique suffix
+/// [`crate::atomic::replace_file`] preserves that atomic replacement contract
+/// on Windows as well as Unix. The unique suffix
 /// (`pid` + process-lifetime counter + per-process random) makes concurrent
 /// writers to one directory impossible only because the out_dir lock
 /// serializes them — the suffix is defense in depth for stale debris from
@@ -1028,7 +1136,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Err(source) = std::fs::write(&tmp, bytes) {
         return Err(BuildError::Io { path: tmp, source });
     }
-    match std::fs::rename(&tmp, path) {
+    match crate::atomic::replace_file(&tmp, path) {
         Ok(()) => Ok(()),
         Err(source) => {
             let _ = std::fs::remove_file(&tmp);
@@ -1543,24 +1651,214 @@ mod tests {
         drop(reacquired);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn provably_dead_owner_is_reclaimed_and_guard_removes_own_record() {
-        use crate::lock::{LOCK_FILE_NAME, acquire_out_dir_lock};
+    fn kernel_lock_fails_closed_for_a_held_out_dir_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+        let first = acquire_audiobook_output_lock(&out_dir).expect("first holder acquires");
+
+        let contended = acquire_audiobook_output_lock(&out_dir)
+            .expect_err("a second holder must be refused while the lock is held");
+        assert!(
+            matches!(contended, BuildError::OutputLocked(_)),
+            "expected OutputLocked, got {contended:?}"
+        );
+
+        drop(first);
+        let reacquired = acquire_audiobook_output_lock(&out_dir).expect("reacquirable after drop");
+        drop(reacquired);
+    }
+
+    /// A stale owner record never blocks a fresh acquisition: the kernel
+    /// released the lock when the previous holder exited, so the record is
+    /// informational only and is simply overwritten.
+    #[test]
+    fn stale_record_from_a_dead_owner_does_not_block_acquisition() {
+        use crate::lock::{LOCK_FILE_NAME, read_lock_record};
 
         let dir = tempfile::tempdir().unwrap();
         let out_dir = dir.path();
         std::fs::create_dir_all(out_dir).unwrap();
-        let stolen_pid_file = out_dir.join(LOCK_FILE_NAME);
-        std::fs::write(&stolen_pid_file, "pid=4194304\nstarted_at_ms=1\n").unwrap();
+        let lock_file = out_dir.join(LOCK_FILE_NAME);
+        std::fs::write(&lock_file, "pid=4194304\nstarted_at_ms=1\n").unwrap();
 
-        let guard = acquire_out_dir_lock(out_dir).expect("dead owner reclaimed");
-        assert_eq!(guard.pid, std::process::id());
+        let guard = acquire_audiobook_output_lock(out_dir).expect("kernel lock is free");
+        let record = read_lock_record(&lock_file).unwrap();
+        assert_eq!(record.pid, std::process::id(), "record is overwritten");
         drop(guard);
         assert!(
-            !stolen_pid_file.exists(),
-            "own record must be removed on drop"
+            lock_file.exists(),
+            "the lock file persists so the kernel lock is never split across inodes"
         );
+    }
+
+    /// Owner-record reads and writes must round-trip through the held handle
+    /// (the same handle that carries the kernel lock), which is exactly what
+    /// Windows byte-range locking requires — a second handle to a locked file
+    /// can reject overlapping I/O, so while the lock is held we only touch the
+    /// record through the guard.
+    #[test]
+    fn held_handle_round_trips_the_owner_record() {
+        use crate::lock::{LOCK_FILE_NAME, read_lock_record};
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        let guard = acquire_audiobook_output_lock(out_dir).expect("acquire");
+
+        // Write through the held handle (the handoff rewrite and the adopting
+        // child both do this), then read it back through the same held handle.
+        guard
+            .handoff_nonce("held-handle-nonce")
+            .expect("record write");
+        let via_held = guard.record().expect("record read");
+        assert_eq!(via_held.pid, std::process::id());
+        assert_eq!(via_held.nonce.as_deref(), Some("held-handle-nonce"));
+
+        // Only after the kernel lock is released may the path be opened by a
+        // second handle to verify the record persists for the child.
+        drop(guard);
+        let on_disk = read_lock_record(&out_dir.join(LOCK_FILE_NAME)).unwrap();
+        assert_eq!(on_disk, via_held, "record persists for the child");
+    }
+
+    /// A handoff written for child A must never let child B adopt the lock:
+    /// once the parent releases, an unrelated waiter acquires the kernel
+    /// lock, sees it is not the addressed child, and fails closed without
+    /// overwriting the record.
+    #[test]
+    fn handoff_nonce_is_adopted_only_by_the_child_it_was_addressed_to() {
+        use crate::lock::{LOCK_FILE_NAME, read_lock_record};
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        std::fs::create_dir_all(out_dir).unwrap();
+        let lock_file = out_dir.join(LOCK_FILE_NAME);
+
+        // Dashboard parent acquires, pre-addresses the child, and releases.
+        let parent = acquire_audiobook_output_lock(out_dir).expect("parent acquires");
+        let handoff = "handoff-nonce-for-the-real-child";
+        parent.handoff_nonce(handoff).expect("parent pre-addresses");
+        drop(parent);
+
+        // A child holding a different nonce must be refused and must leave the
+        // record untouched.
+        let error = acquire_audiobook_output_lock_with_handoff(out_dir, "wrong-nonce")
+            .expect_err("a lock addressed elsewhere is never adopted");
+        assert!(
+            matches!(error, BuildError::OutputLocked(_)),
+            "expected OutputLocked, got {error:?}"
+        );
+        assert_eq!(
+            read_lock_record(&lock_file).unwrap().nonce.as_deref(),
+            Some(handoff),
+            "the record must survive the failed adoption"
+        );
+
+        // The addressed child adopts the lock and owns the record.
+        let child = acquire_audiobook_output_lock_with_handoff(out_dir, handoff)
+            .expect("addressed child adopts the lock");
+        let record = read_lock_record(&lock_file).unwrap();
+        assert_eq!(record.pid, std::process::id(), "child now owns the record");
+        assert_eq!(record.nonce.as_deref(), Some(handoff));
+        drop(child);
+    }
+
+    /// The kernel-serialized handoff: the parent holds the kernel lock while
+    /// the child's acquire waits; the child must not race or fail, and it
+    /// adopts only after the parent releases.
+    #[test]
+    fn handoff_child_waits_on_the_kernel_lock_and_adopts_after_parent_release() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        let handoff = "kernel-gated-handoff";
+
+        // Parent holds the kernel lock across the "spawn".
+        let parent = acquire_audiobook_output_lock(out_dir).expect("parent acquires");
+        parent.handoff_nonce(handoff).expect("parent pre-addresses");
+
+        // Child starts its acquire while the parent still holds the kernel
+        // lock; it must block, not fail.
+        let (child_lock_tx, child_lock_rx) = mpsc::channel::<AudiobookOutputLock>();
+        let out_dir_child = out_dir.to_path_buf();
+        let handoff_child = handoff.to_string();
+        let child_thread = std::thread::spawn(move || {
+            let child = acquire_audiobook_output_lock_with_handoff(&out_dir_child, &handoff_child)
+                .expect("child adopts after the parent releases");
+            let _ = child_lock_tx.send(child);
+        });
+
+        // While the parent still holds the kernel lock, the child must still
+        // be waiting — no completion, no failure.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            child_lock_rx.try_recv().is_err(),
+            "child must still be waiting on the kernel lock while the parent holds it"
+        );
+
+        // Release the parent; the child then acquires and adopts promptly.
+        drop(parent);
+        let child = child_lock_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("child must adopt promptly once the parent releases");
+        child_thread.join().expect("child thread joins");
+        assert_eq!(child.record().unwrap().nonce.as_deref(), Some(handoff));
+        drop(child);
+    }
+
+    /// The child's handoff acquire must fail closed when it is not the
+    /// addressed owner and the parent has already released.
+    #[test]
+    fn handoff_child_is_refused_when_the_record_names_a_different_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        let parent = acquire_audiobook_output_lock(out_dir).expect("parent acquires");
+        parent
+            .handoff_nonce("nonce-for-someone-else")
+            .expect("parent pre-addresses");
+        drop(parent);
+
+        let error = acquire_audiobook_output_lock_with_handoff(out_dir, "my-nonce")
+            .expect_err("a mismatched record is never adopted");
+        assert!(
+            matches!(error, BuildError::OutputLocked(_)),
+            "expected OutputLocked, got {error:?}"
+        );
+    }
+
+    /// A terminal writer that only peeks must see the current owner and must
+    /// not claim the record.
+    #[test]
+    fn peek_acquire_observes_the_owner_without_claiming() {
+        use crate::lock::{LOCK_FILE_NAME, read_lock_record};
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        let holder = acquire_audiobook_output_lock(out_dir).expect("holder acquires");
+
+        assert!(
+            matches!(
+                acquire_audiobook_output_lock_peek(out_dir),
+                Err(BuildError::OutputLocked(_))
+            ),
+            "peek must defer while a live builder holds the kernel lock"
+        );
+
+        drop(holder);
+        let peeked = acquire_audiobook_output_lock_peek(out_dir).expect("peek after release");
+        let record = peeked.record().expect("record readable while held");
+        assert_eq!(
+            record.pid,
+            std::process::id(),
+            "record names the last holder"
+        );
+        // Peek must not claim a fresh record.
+        assert_eq!(
+            read_lock_record(&out_dir.join(LOCK_FILE_NAME)).unwrap(),
+            record
+        );
+        drop(peeked);
     }
 
     #[test]

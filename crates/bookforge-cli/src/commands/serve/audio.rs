@@ -1,4 +1,10 @@
 use super::*;
+use std::io::Write;
+
+/// Environment variable through which a launch/retry parent hands the output
+/// lock to its audiobook child. The parent pre-addresses the lock record with
+/// this nonce and the child adopts it instead of racing the parent's release.
+const AUDIO_LOCK_HANDOFF_ENV: &str = "BOOKFORGE_AUDIO_OUT_LOCK_HANDOFF";
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
@@ -561,6 +567,17 @@ async fn launch_audiobook(
         let _ = std::fs::remove_file(&input_path);
         return Ok(bad_request(&format!("could not read EPUB: {error}")));
     }
+    // Keep the operation owned across the spawn handoff. The child acquires
+    // the same lock before touching the cache; holding it here closes the
+    // starting-to-running gap where prune or retry could otherwise intervene.
+    // Taking the kernel lock involves file I/O, so keep it off the async
+    // worker like the retry endpoint does.
+    let output_lock = tokio::task::spawn_blocking({
+        let out_dir = out_dir.clone();
+        move || bookforge_audio::acquire_audiobook_output_lock(&out_dir)
+    })
+    .await?
+    .map_err(anyhow::Error::from)?;
     // Relaunchable launch-shaping settings persisted next to the run so the
     // retry-failed endpoint can reproduce the exact command later without
     // browser cooperation (and without secrets: env names only).
@@ -584,16 +601,31 @@ async fn launch_audiobook(
         "text_normalization": advanced.text_normalization.clone(),
         "timeout_seconds": advanced.timeout_seconds,
     });
-    write_audio_process_state(
+    if let Err(error) = write_audio_process_state(
         &out_dir,
         "starting",
         None,
         None,
         auto_model,
         Some(&launch_options),
-    )?;
+    ) {
+        drop(output_lock);
+        let _ = std::fs::remove_file(&input_path);
+        let _ = std::fs::remove_dir_all(&out_dir);
+        return Err(error.into());
+    }
 
-    let exe = std::env::current_exe()?;
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            drop(output_lock);
+            let _ = std::fs::remove_file(&input_path);
+            let _ = std::fs::remove_dir_all(&out_dir);
+            return Err(anyhow::Error::from(error)
+                .context("failed to locate audiobook executable")
+                .into());
+        }
+    };
     let mut command = tokio::process::Command::new(exe);
     let api_key_env = (provider != "mock" && key.is_some())
         .then(|| audio_provider_key_env(&provider).expect("audio provider was validated"));
@@ -615,12 +647,29 @@ async fn launch_audiobook(
         &advanced,
     ));
     configure_dashboard_child_environment(&mut command, api_key_env.zip(key.as_deref()));
+    configure_audio_child_process_group(&mut command);
+    // Hand the output lock to the child before it can exist: rewrite the
+    // record with a fresh nonce the child will find in its environment, so
+    // its acquisition waits on the kernel lock and adopts it instead of
+    // failing on (or racing) this live parent. If the record rewrite fails
+    // the launch is aborted before any child exists; the kernel lock is then
+    // simply released on return.
+    let handoff_nonce = bookforge_audio::new_lock_handoff_nonce();
+    if let Err(error) = output_lock.handoff_nonce(&handoff_nonce) {
+        let detail = format!("could not hand off the audiobook output lock: {error:#}");
+        drop(output_lock);
+        let _ = std::fs::remove_file(&input_path);
+        let _ = std::fs::remove_dir_all(&out_dir);
+        return Err(anyhow::anyhow!(detail).into());
+    }
+    command.env(AUDIO_LOCK_HANDOFF_ENV, &handoff_nonce);
 
     // On spawn failure the freshly written upload (and empty operation dir)
     // must not linger as orphans; remove them before surfacing the error.
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
+            drop(output_lock);
             let _ = std::fs::remove_file(&input_path);
             let _ = std::fs::remove_dir_all(&out_dir);
             return Err(anyhow::Error::from(error)
@@ -629,16 +678,42 @@ async fn launch_audiobook(
         }
     };
     let pid = child.id();
-    write_audio_process_state(
+    if let Err(error) = write_audio_process_state(
         &out_dir,
         "running",
         pid,
         None,
         auto_model,
         Some(&launch_options),
-    )?;
-    register_audio_cancellation(&state, id.clone(), child, out_dir.clone(), pid, auto_model);
+    ) {
+        let detail = error.to_string();
+        settle_running_state_write_failure(
+            &mut child,
+            &out_dir,
+            pid,
+            &detail,
+            auto_model,
+            Some(&launch_options),
+        )
+        .await;
+        // The parent's own output lock is dropped on return, releasing the
+        // kernel lock; the child can never have adopted it because the parent
+        // has not released it, so there is nothing to wait on or reclaim.
+        return Err(error.into());
+    }
+    register_audio_cancellation(
+        &state,
+        id.clone(),
+        child,
+        out_dir.clone(),
+        pid,
+        auto_model,
+        Some(handoff_nonce),
+    );
     // The child now owns the operation's lifetime; the launch slot is free.
+    // Release the handoff lock only after the child has been handed a running
+    // state and registered for cancellation.
+    drop(output_lock);
     drop(slot);
 
     Ok(Json(json!({
@@ -1060,127 +1135,103 @@ async fn cancel_audiobook(
         )
             .into_response());
     };
-    // SERVE-3: this PID came from disk and may belong to a different process
-    // than when it was written — a server restart plus PID reuse would turn a
-    // blind kill into killing someone else's process tree (the same reason
-    // translation resumes gate on fresh runtime leases). Verify the PID is
-    // alive *and* plausibly one of ours before signalling anything.
-    if !live_process_is_bookforge(pid) {
-        return Ok((
-            StatusCode::CONFLICT,
-            Json(json!({"error": "could not verify the recorded audiobook process; nothing was signalled"})),
-        )
-            .into_response());
-    }
-    if let Err(error) = terminate_restarted_audiobook(&state, pid).await {
-        return Ok((
-            StatusCode::CONFLICT,
-            Json(json!({"error": format!("could not cancel audiobook process: {error}")})),
-        )
-            .into_response());
-    }
     let auto_model = process
         .get("auto_model")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    write_audio_process_state(&out_dir, "cancelled", Some(pid), None, auto_model, None)?;
+    // SERVE-3: this PID came from disk and a server restart means the live
+    // child cannot be reaped or identified with certainty — pid + executable
+    // name alone would let PID reuse kill a different BookForge process. The
+    // only identity we trust is the owned `Child` handle, which is gone after
+    // a restart, so we NEVER signal a post-restart process. Instead the kernel
+    // lock decides: if a live run still holds it, exact identity cannot be
+    // proven and cancel refuses; if it is free, the recorded worker is gone
+    // and the durable state is reconciled to cancelled without signalling.
+    let output_lock = match bookforge_audio::acquire_audiobook_output_lock_peek(&out_dir) {
+        Ok(lock) => lock,
+        Err(bookforge_audio::BuildError::OutputLocked(_)) => {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "a live audiobook run still owns this operation and its exact identity cannot be verified after a server restart; nothing was signalled or changed"})),
+            )
+                .into_response());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let wrote = write_audio_process_state_if_owner(
+        &out_dir,
+        "cancelled",
+        pid,
+        None,
+        auto_model,
+        None,
+        &output_lock,
+    )?;
+    drop(output_lock);
+    if !wrote {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "audiobook operation was restarted by another request; nothing was changed"})),
+        )
+            .into_response());
+    }
     Ok(Json(json!({"ok": true, "status": "cancelled"})).into_response())
 }
 
-/// True when `pid` names a live process whose executable plausibly belongs to
-/// BookForge (SERVE-3). Verification is best-effort but *fail-closed*: any
-/// platform where identity cannot be established refuses to signal.
-///
-/// - Linux: resolve `/proc/<pid>/exe` and compare with our own executable.
-/// - Other Unix: `ps -p <pid> -o comm=` must report our executable name.
-/// - Windows: `tasklist` image name must match our executable file name.
-pub(super) fn live_process_is_bookforge(pid: u32) -> bool {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(_) => return false,
-    };
-
-    #[cfg(target_os = "linux")]
+fn configure_audio_child_process_group(command: &mut tokio::process::Command) {
+    #[cfg(unix)]
     {
-        let ours = std::fs::canonicalize(&exe);
-        let theirs = std::fs::read_link(format!("/proc/{pid}/exe")).and_then(std::fs::canonicalize);
-        matches!((ours, theirs), (Ok(ours), Ok(theirs)) if ours == theirs)
+        // The dashboard owns the child handle, but ffmpeg is launched by that
+        // child. Isolating the child lets cancellation address the complete
+        // audiobook process tree with one negative-PGID signal.
+        command.process_group(0);
     }
-
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(not(unix))]
     {
-        let Some(expected) = exe.file_name().and_then(|name| name.to_str()) else {
-            return false;
-        };
-        let Ok(output) = Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
-            .output()
-        else {
-            return false;
-        };
-        let actual = String::from_utf8_lossy(&output.stdout);
-        let actual = actual.trim();
-        // `comm=` may carry a full path; only the final component is stable.
-        let name = actual.rsplit('/').next().unwrap_or(actual);
-        !name.is_empty() && name == expected
-    }
-
-    #[cfg(windows)]
-    {
-        let Some(expected) = exe
-            .file_name()
-            .map(|name| name.to_string_lossy().to_ascii_lowercase())
-        else {
-            return false;
-        };
-        let Ok(output) = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output()
-        else {
-            return false;
-        };
-        let line = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-        line.contains(&expected)
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = exe;
-        false
+        let _ = command;
     }
 }
 
-async fn terminate_restarted_audiobook(state: &AppState, pid: u32) -> Result<()> {
-    #[cfg(test)]
-    if let Some(cancelled) = &state.audio_restart_cancels {
-        cancelled
-            .lock()
-            .map_err(|_| anyhow::anyhow!("test cancellation recorder is unavailable"))?
-            .push(pid);
-        return Ok(());
-    }
-    #[cfg(not(test))]
-    let _ = state;
-
+async fn terminate_audio_child_tree(child: &mut tokio::process::Child) {
+    let pid = child.id();
     #[cfg(windows)]
-    let status = tokio::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .status()
-        .await
-        .context("failed to run taskkill")?;
-    #[cfg(unix)]
-    let status = tokio::process::Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status()
-        .await
-        .context("failed to run kill")?;
-    #[cfg(not(any(windows, unix)))]
-    anyhow::bail!("process cancellation is unsupported on this platform");
-
-    if !status.success() {
-        anyhow::bail!("process signalling exited with {status}");
+    if let Some(pid) = pid {
+        let _ = tokio::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()
+            .await;
     }
-    Ok(())
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        let group = format!("-{pid}");
+        let _ = tokio::process::Command::new("kill")
+            .args(["-KILL", &group])
+            .status()
+            .await;
+    }
+    // A direct kill is harmless when the tree signal already succeeded and
+    // covers children spawned before process-group setup was introduced.
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+/// Fold a launch/retry failure whose `running` state write failed: the child
+/// is killed and reaped and the durable state is marked failed. The caller's
+/// own output lock is dropped on return, which releases the kernel lock. This
+/// helper never acquires or waits on the kernel lock: the child can never
+/// have adopted it because the parent has not released it, so adopting it back
+/// here would block for the 30-second handoff wait on the parent's own lock.
+/// Returns promptly by construction.
+async fn settle_running_state_write_failure(
+    child: &mut tokio::process::Child,
+    out_dir: &std::path::Path,
+    pid: Option<u32>,
+    detail: &str,
+    auto_model: bool,
+    options: Option<&serde_json::Value>,
+) {
+    terminate_audio_child_tree(child).await;
+    let _ = write_audio_process_state(out_dir, "failed", pid, Some(detail), auto_model, options);
 }
 
 #[derive(Deserialize)]
@@ -1394,6 +1445,7 @@ fn register_audio_cancellation(
     out_dir: PathBuf,
     pid: Option<u32>,
     auto_model: bool,
+    handoff_nonce: Option<String>,
 ) {
     let cancel = tokio_util::sync::CancellationToken::new();
     if let Ok(mut registry) = state.audio_cancels.lock() {
@@ -1408,19 +1460,55 @@ fn register_audio_cancellation(
                 Err(error) => ("failed", Some(format!("could not wait for audiobook process: {error}"))),
             },
             _ = cancel.cancelled() => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                terminate_audio_child_tree(&mut child).await;
                 ("cancelled", None)
             }
         };
-        let _ = write_audio_process_state(
-            &out_dir,
-            operation_state.0,
-            pid,
-            operation_state.1.as_deref(),
-            auto_model,
-            None,
-        );
+        let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+            if let Some(expected_pid) = pid {
+                // The child releases its own output lock before wait() reports
+                // exit. Reacquire the kernel lock non-blockingly — a newer run
+                // (retry) holds it and defers this writer — then confirm the
+                // record still carries the exact handoff nonce we gave the
+                // child, so a late watcher can never overwrite or clean up a
+                // replacement run.
+                let lock = match bookforge_audio::acquire_audiobook_output_lock_peek(&out_dir) {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        eprintln!("[serve] audiobook terminal state deferred: {error}");
+                        return Ok(());
+                    }
+                };
+                let addressed = match (handoff_nonce.as_deref(), lock.record().ok()) {
+                    (Some(expected), Some(record)) => record.nonce.as_deref() == Some(expected),
+                    (None, Some(record)) => record.pid == expected_pid,
+                    _ => false,
+                };
+                if addressed {
+                    let _ = write_audio_process_state_if_owner(
+                        &out_dir,
+                        operation_state.0,
+                        expected_pid,
+                        operation_state.1.as_deref(),
+                        auto_model,
+                        None,
+                        &lock,
+                    )?;
+                }
+                drop(lock);
+            } else {
+                write_audio_process_state(
+                    &out_dir,
+                    operation_state.0,
+                    pid,
+                    operation_state.1.as_deref(),
+                    auto_model,
+                    None,
+                )?;
+            }
+            Ok(())
+        })
+        .await;
         if let Ok(mut registry) = cancel_registry.lock() {
             registry.remove(&id);
         }
@@ -1436,7 +1524,12 @@ fn write_audio_process_state(
     options: Option<&serde_json::Value>,
 ) -> Result<()> {
     let path = out_dir.join("process.json");
-    let temp = out_dir.join("process.part.tmp");
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = out_dir.join(format!(
+        ".process-{}-{sequence}.part.tmp",
+        std::process::id()
+    ));
     let previous = std::fs::read(&path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
@@ -1470,12 +1563,58 @@ fn write_audio_process_state(
         object.insert("options".to_string(), options);
     }
     let bytes = serde_json::to_vec_pretty(&process)?;
-    std::fs::write(&temp, bytes)?;
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
     }
-    std::fs::rename(temp, path)?;
+    drop(file);
+    if let Err(error) = bookforge_audio::replace_file(&temp, &path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    #[cfg(unix)]
+    std::fs::File::open(out_dir)?.sync_all()?;
     Ok(())
+}
+
+fn write_audio_process_state_if_owner(
+    out_dir: &std::path::Path,
+    status: &str,
+    expected_pid: u32,
+    error: Option<&str>,
+    auto_model: bool,
+    options: Option<&serde_json::Value>,
+    _lock: &bookforge_audio::AudiobookOutputLock,
+) -> Result<bool> {
+    let path = out_dir.join("process.json");
+    let process = match std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    {
+        Some(process) => process,
+        None => return Ok(false),
+    };
+    let current_pid = process
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok());
+    if current_pid != Some(expected_pid) {
+        return Ok(false);
+    }
+    write_audio_process_state(
+        out_dir,
+        status,
+        Some(expected_pid),
+        error,
+        auto_model,
+        options,
+    )?;
+    Ok(true)
 }
 
 #[derive(Deserialize)]
@@ -1747,8 +1886,21 @@ async fn audiobook_prune_preview(
         return Ok(bad_request("invalid audiobook operation id"));
     }
     let upload_dir = state.upload_dir.clone();
-    let scan =
-        tokio::task::spawn_blocking(move || scan_audiobook_debris(&upload_dir, &id)).await??;
+    let scan = tokio::task::spawn_blocking(move || -> Result<DebrisScan> {
+        let out_dir = audiobook_operation_out_dir(&upload_dir, &id);
+        if !out_dir.is_dir() {
+            return Ok(DebrisScan::NotFound);
+        }
+        let _lock = match bookforge_audio::acquire_audiobook_output_lock(&out_dir) {
+            Ok(lock) => lock,
+            Err(bookforge_audio::BuildError::OutputLocked(_)) => {
+                return Ok(DebrisScan::Running);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        scan_audiobook_debris(&upload_dir, &id)
+    })
+    .await??;
     Ok(match scan {
         DebrisScan::NotFound => debris_not_found_response(),
         DebrisScan::Running => debris_running_response(),
@@ -1777,6 +1929,17 @@ async fn prune_audiobook(
     }
     let upload_dir = state.upload_dir.clone();
     let outcome = tokio::task::spawn_blocking(move || -> Result<PruneOutcome> {
+        let out_dir = audiobook_operation_out_dir(&upload_dir, &id);
+        if !out_dir.is_dir() {
+            return Ok(PruneOutcome::NotFound);
+        }
+        let _lock = match bookforge_audio::acquire_audiobook_output_lock(&out_dir) {
+            Ok(lock) => lock,
+            Err(bookforge_audio::BuildError::OutputLocked(_)) => {
+                return Ok(PruneOutcome::Running);
+            }
+            Err(error) => return Err(error.into()),
+        };
         match scan_audiobook_debris(&upload_dir, &id)? {
             DebrisScan::NotFound => Ok(PruneOutcome::NotFound),
             DebrisScan::Running => Ok(PruneOutcome::Running),
@@ -2162,6 +2325,25 @@ async fn retry_failed_chunks(
 
     let upload_dir = state.upload_dir.clone();
     let retry_id = id.clone();
+    let retry_out_dir = audiobook_operation_out_dir(&upload_dir, &id);
+    if !retry_out_dir.is_dir() {
+        return Ok(debris_not_found_response());
+    }
+    // Serialize claim validation and the spawn handoff with the old child's
+    // terminal writer. The newly spawned child takes this same lock after the
+    // parent publishes its running state.
+    let output_lock_result = tokio::task::spawn_blocking({
+        let retry_out_dir = retry_out_dir.clone();
+        move || bookforge_audio::acquire_audiobook_output_lock(&retry_out_dir)
+    })
+    .await?;
+    let output_lock = match output_lock_result {
+        Ok(lock) => lock,
+        Err(bookforge_audio::BuildError::OutputLocked(_)) => {
+            return Ok(debris_running_response());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let prepared =
         tokio::task::spawn_blocking(move || prepare_retry_failed(&upload_dir, &retry_id)).await??;
     let prepared = match prepared {
@@ -2233,6 +2415,7 @@ async fn retry_failed_chunks(
     ));
     command.arg("--retry-failed");
     configure_dashboard_child_environment(&mut command, api_key_env.zip(key.as_deref()));
+    configure_audio_child_process_group(&mut command);
 
     // Test parity with the resume hook (state.resume_launches): installs a
     // deterministic spawn boundary so endpoint tests can drive the full
@@ -2264,7 +2447,26 @@ async fn retry_failed_chunks(
         .into_response());
     }
 
-    let child = match command.spawn() {
+    // Hand the output lock to the retry child before it can exist, so its
+    // acquisition adopts the lock instead of failing on this live parent. If
+    // the record rewrite fails the launch is aborted before any child exists;
+    // the parent's kernel lock is then simply released on return.
+    let handoff_nonce = bookforge_audio::new_lock_handoff_nonce();
+    if let Err(error) = output_lock.handoff_nonce(&handoff_nonce) {
+        let detail = format!("could not hand off the audiobook output lock: {error:#}");
+        let _ = write_audio_process_state(
+            &prepared.out_dir,
+            "failed",
+            None,
+            Some(&detail),
+            prepared.auto_model,
+            Some(&prepared.options_snapshot),
+        );
+        return Err(anyhow::anyhow!(detail).into());
+    }
+    command.env(AUDIO_LOCK_HANDOFF_ENV, &handoff_nonce);
+
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             return Err(anyhow::Error::from(error)
@@ -2273,14 +2475,29 @@ async fn retry_failed_chunks(
         }
     };
     let pid = child.id();
-    write_audio_process_state(
+    if let Err(error) = write_audio_process_state(
         &prepared.out_dir,
         "running",
         pid,
         None,
         prepared.auto_model,
         Some(&prepared.options_snapshot),
-    )?;
+    ) {
+        let detail = error.to_string();
+        settle_running_state_write_failure(
+            &mut child,
+            &prepared.out_dir,
+            pid,
+            &detail,
+            prepared.auto_model,
+            Some(&prepared.options_snapshot),
+        )
+        .await;
+        // The parent's own output lock is dropped on return, releasing the
+        // kernel lock; the child can never have adopted it because the parent
+        // has not released it, so there is nothing to wait on or reclaim.
+        return Err(error.into());
+    }
     register_audio_cancellation(
         &state,
         id.clone(),
@@ -2288,7 +2505,11 @@ async fn retry_failed_chunks(
         prepared.out_dir.clone(),
         pid,
         prepared.auto_model,
+        Some(handoff_nonce),
     );
+    // The child now owns the operation's lifetime and will acquire this same
+    // lock before touching the cache.
+    drop(output_lock);
     // F7 audit trail: relaunches spend provider credits on retry, so record
     // the operation, pid and chunk count on the serve console.
     eprintln!(
@@ -2305,4 +2526,167 @@ async fn retry_failed_chunks(
         "pid": pid,
     }))
     .into_response())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_dashboard_child_kills_and_reaps_its_process_group() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "sleep 2 & wait"]);
+        configure_audio_child_process_group(&mut command);
+        let mut child = command.spawn().expect("shell should spawn");
+
+        let started = Instant::now();
+        terminate_audio_child_tree(&mut child).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "descendant survived tree termination: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            child
+                .try_wait()
+                .expect("child status should be readable")
+                .is_some(),
+            "dashboard child must be reaped"
+        );
+    }
+
+    /// A launch/retry whose `running` state write failed must fold the failure
+    /// promptly, never waiting on the parent's own kernel lock (an adopt-back
+    /// there would block for the 30-second handoff wait). The parent's lock is
+    /// then released on return and the operation is immediately re-acquirable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn running_state_write_failure_returns_promptly_and_frees_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        // The failed launch's parent still holds the kernel lock.
+        let parent = bookforge_audio::acquire_audiobook_output_lock(&out_dir).unwrap();
+        let handoff = bookforge_audio::new_lock_handoff_nonce();
+        parent.handoff_nonce(&handoff).unwrap();
+        write_audio_process_state(&out_dir, "starting", None, None, false, None).unwrap();
+
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 2"])
+            .spawn()
+            .expect("child spawns");
+        let pid = child.id();
+
+        let started = Instant::now();
+        settle_running_state_write_failure(
+            &mut child,
+            &out_dir,
+            pid,
+            "injected running-state write failure",
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the failure path must return promptly, never waiting on the parent's own kernel lock: {:?}",
+            started.elapsed()
+        );
+
+        let process: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(out_dir.join("process.json")).expect("failed state written"),
+        )
+        .expect("failed state is JSON");
+        assert_eq!(process["status"], "failed");
+
+        // The parent releases the kernel lock on return; a fresh acquire
+        // succeeds immediately — no orphan, no 30-second wait.
+        drop(parent);
+        let reacquired =
+            bookforge_audio::acquire_audiobook_output_lock(&out_dir).expect("re-acquirable");
+        drop(reacquired);
+    }
+
+    #[test]
+    fn terminal_writer_does_not_overwrite_a_newer_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = bookforge_audio::acquire_audiobook_output_lock(dir.path()).unwrap();
+        write_audio_process_state(dir.path(), "running", Some(111), None, false, None).unwrap();
+        let before = std::fs::read(dir.path().join("process.json")).unwrap();
+
+        assert!(
+            !write_audio_process_state_if_owner(
+                dir.path(),
+                "succeeded",
+                222,
+                None,
+                false,
+                None,
+                &lock,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("process.json")).unwrap(),
+            before
+        );
+    }
+
+    /// A late watcher must defer to a replacement run twice over: while the
+    /// replacement child holds the kernel lock the watcher's non-blocking
+    /// acquisition fails, and even after the replacement finishes, the record
+    /// carries a fresh nonce so the stale watcher's nonce check refuses to
+    /// touch the state.
+    #[test]
+    fn terminal_watcher_defers_to_a_replacement_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        let stale_nonce = "stale-handoff-nonce-of-the-previous-child";
+        write_audio_process_state(out_dir, "running", Some(111), None, false, None).unwrap();
+
+        // A replacement run (retry) now owns the operation: the parent hands
+        // a fresh nonce, releases the kernel lock, and the child adopts.
+        let retry_parent = bookforge_audio::acquire_audiobook_output_lock(out_dir).unwrap();
+        let retry_nonce = bookforge_audio::new_lock_handoff_nonce();
+        retry_parent.handoff_nonce(&retry_nonce).unwrap();
+        drop(retry_parent);
+        let retry_child =
+            bookforge_audio::acquire_audiobook_output_lock_with_handoff(out_dir, &retry_nonce)
+                .unwrap();
+
+        // The old watcher's non-blocking acquire must defer (held).
+        assert!(
+            matches!(
+                bookforge_audio::acquire_audiobook_output_lock_peek(out_dir),
+                Err(bookforge_audio::BuildError::OutputLocked(_))
+            ),
+            "a late watcher must defer while a replacement run holds the lock"
+        );
+
+        // The replacement finishes; now the watcher's peek succeeds but the
+        // record carries the replacement's nonce, so it must not write.
+        drop(retry_child);
+        let peeked = bookforge_audio::acquire_audiobook_output_lock_peek(out_dir)
+            .expect("peek succeeds once the replacement is gone");
+        let addressed = peeked
+            .record()
+            .ok()
+            .and_then(|record| record.nonce)
+            .as_deref()
+            == Some(stale_nonce);
+        assert!(
+            !addressed,
+            "a stale nonce must never be considered addressed"
+        );
+        let before = std::fs::read(out_dir.join("process.json")).unwrap();
+        assert_eq!(
+            std::fs::read(out_dir.join("process.json")).unwrap(),
+            before,
+            "the terminal state must stay untouched by a stale watcher"
+        );
+        drop(peeked);
+    }
 }

@@ -245,8 +245,6 @@ struct AppState {
     /// count instead of exec'ing this binary as a child.
     #[cfg(test)]
     retry_launches: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    #[cfg(test)]
-    audio_restart_cancels: Option<Arc<Mutex<Vec<u32>>>>,
 }
 
 #[cfg(test)]
@@ -561,8 +559,6 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         resume_child_environments: None,
         #[cfg(test)]
         retry_launches: None,
-        #[cfg(test)]
-        audio_restart_cancels: None,
     };
 
     let app = dashboard_router(state);
