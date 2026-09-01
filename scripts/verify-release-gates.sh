@@ -126,7 +126,7 @@ cargo metadata --no-deps --format-version 1 --manifest-path "${ROOT_DIR}/Cargo.t
   || fail "tag version ${version} must equal every workspace crate version and the workspace must contain at least one package"
 
 changelog="${CHANGELOG_FILE:-${ROOT_DIR}/CHANGELOG.md}"
-top_release="$(rg -m1 -n '^## v[0-9]' "$changelog")" \
+top_release="$(grep -m1 -n -E '^## v[0-9]' "$changelog")" \
   || fail "no '## vX.Y.Z' release heading found in ${changelog}"
 top_version="$(sed -E 's/^[0-9]+:## v([^[:space:]]+).*/\1/' <<<"$top_release")"
 echo "- CHANGELOG top release heading: ${top_version}"

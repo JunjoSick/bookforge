@@ -25,7 +25,7 @@ GATES="${ROOT_DIR}/scripts/verify-release-gates.sh"
 # crate version, so pass-cases use the currently released version.
 TAG_SHA="1111111111111111111111111111111111111111"
 OTHER_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-TAG_VERSION="$(rg -m1 -o '^## v[0-9][^[:space:]]*' "${ROOT_DIR}/CHANGELOG.md" | sed 's/^## v//')"
+TAG_VERSION="$(grep -m1 -o -E '^## v[0-9][^[:space:]]*' "${ROOT_DIR}/CHANGELOG.md" | sed 's/^## v//')"
 GITHUB_REF_NAME="v${TAG_VERSION}"
 
 tmp="$(mktemp -d)"
