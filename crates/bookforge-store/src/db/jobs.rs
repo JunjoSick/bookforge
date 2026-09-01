@@ -63,6 +63,7 @@ impl JobStore {
         let json = serde_json::to_string(snapshot)
             .map_err(|e| StoreError::Serialization(e.to_string()))?;
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         conn.execute(
             "UPDATE jobs
              SET config_json = ?1,
@@ -106,6 +107,7 @@ impl JobStore {
         input_sha256: &str,
     ) -> Result<()> {
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         conn.execute(
             "UPDATE jobs
              SET input_snapshot_path = ?1,
@@ -143,6 +145,7 @@ impl JobStore {
 
     pub fn update_job_event_path(&self, job_id: &str, path: &Path) -> Result<()> {
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         conn.execute(
             "UPDATE jobs SET events_path = ?1, updated_at = ?2 WHERE id = ?3",
             params![path.to_string_lossy(), timestamp_string(), job_id],
@@ -157,6 +160,7 @@ impl JobStore {
         markdown_path: &Path,
     ) -> Result<()> {
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         conn.execute(
             "UPDATE jobs
              SET report_json_path = ?1, report_markdown_path = ?2, updated_at = ?3
@@ -173,6 +177,7 @@ impl JobStore {
 
     pub fn update_job_output_path(&self, job_id: &str, path: &Path) -> Result<()> {
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         conn.execute(
             "UPDATE jobs SET output_path = ?1, updated_at = ?2 WHERE id = ?3",
             params![path.to_string_lossy(), timestamp_string(), job_id],
@@ -244,14 +249,20 @@ impl JobStore {
     /// already persisted. Keep this twin only where overwriting is the point
     /// (fixtures, deliberate state repair).
     pub fn mark_segment_failed(&self, job_id: &str, segment_id: &str, error: &str) -> Result<()> {
-        {
+        let updated = {
             let conn = self.conn.borrow();
+            ensure_job_exists(&conn, job_id)?;
             let sql = format!(
                 "UPDATE segments SET status = '{}', attempts = attempts + 1, error = ?1
                  WHERE job_id = ?2 AND id = ?3",
                 SegmentStatus::Failed.as_db_text()
             );
-            conn.execute(&sql, params![error, job_id, segment_id])?;
+            conn.execute(&sql, params![error, job_id, segment_id])?
+        };
+        if updated == 0 {
+            return Err(StoreError::NotFound(format!(
+                "segment '{segment_id}' was not found in job '{job_id}'"
+            )));
         }
         // Findings are instrumentation, so a failed findings write must never
         // fail the surrounding translation checkpoint.
@@ -268,6 +279,7 @@ impl JobStore {
     ) -> Result<()> {
         let updated = {
             let conn = self.conn.borrow();
+            ensure_job_exists(&conn, job_id)?;
             let sql = format!(
                 "UPDATE segments
                  SET status = '{}', attempts = attempts + 1, error = ?1
@@ -279,6 +291,14 @@ impl JobStore {
             );
             conn.execute(&sql, params![error, job_id, segment_id])?
         };
+        if updated == 0 && !segment_exists(&self.conn.borrow(), job_id, segment_id)? {
+            // Zero rows can legitimately mean "the segment already reached a
+            // terminal-with-translation state" (an intentional no-op); a
+            // segment that does not EXIST at all must surface as NotFound.
+            return Err(StoreError::NotFound(format!(
+                "segment '{segment_id}' was not found in job '{job_id}'"
+            )));
+        }
         if updated > 0 {
             // Findings are instrumentation, so a failed findings write must
             // never fail the surrounding translation checkpoint.
@@ -294,6 +314,7 @@ impl JobStore {
         candidate_segment_ids: &[String],
         error: &str,
     ) -> Result<usize> {
+        ensure_job_exists(&self.conn.borrow(), job_id)?;
         const SQLITE_IN_CHUNK_SIZE: usize = 900;
         let mut updated = 0;
         let failed_status = SegmentStatus::Failed.as_db_text();
@@ -549,6 +570,7 @@ impl JobStore {
 
     pub(super) fn touch_job(&self, job_id: &str, status: JobStatus) -> Result<()> {
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         conn.execute(
             "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![status.as_db_text(), timestamp_string(), job_id],
@@ -563,8 +585,35 @@ impl JobStore {
         protected_statuses: &[JobStatus],
     ) -> Result<()> {
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         touch_job_unless_status_on(&conn, job_id, status, protected_statuses)
     }
+}
+
+/// Fail closed when a mutation targets a job row that does not exist: a
+/// silent zero-row UPDATE would otherwise let a typo'd or already-pruned job
+/// be "mutated" without ever surfacing (STORE lifecycle audit).
+pub(super) fn ensure_job_exists(conn: &Connection, job_id: &str) -> Result<()> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = ?1)",
+        params![job_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if exists {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound(format!(
+            "job '{job_id}' was not found"
+        )))
+    }
+}
+
+pub(super) fn segment_exists(conn: &Connection, job_id: &str, segment_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM segments WHERE job_id = ?1 AND id = ?2)",
+        params![job_id, segment_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
 }
 
 /// Connection-scoped variant of [`JobStore::touch_job_unless_status`] so the

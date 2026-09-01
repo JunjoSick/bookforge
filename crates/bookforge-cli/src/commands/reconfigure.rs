@@ -1,10 +1,7 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    thread,
-    time::{Duration, Instant, SystemTime},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -109,8 +106,6 @@ pub struct ReconfigureArgs {
 
 const OVERRIDES_SCHEMA_VERSION: u32 = 1;
 const OVERRIDES_LOCK_WAIT: Duration = Duration::from_secs(5);
-const OVERRIDES_STALE_LOCK_AGE: Duration = Duration::from_secs(30);
-static OVERRIDES_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -484,7 +479,15 @@ fn write_merged_overrides_at_path(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let _lock = OverridesFileLock::acquire(path)?;
+    // Kernel-backed exclusive lock on the overrides document (see
+    // `control::ProcessFileLock`): ownership lives in the OS, is released on
+    // process death, and is never stolen by age or a removable lock file. The
+    // lock is held across the read-merge-write below, so every revision is
+    // computed and published serially.
+    let _lock = crate::control::ProcessFileLock::acquire(
+        &path.with_extension("lock"),
+        OVERRIDES_LOCK_WAIT,
+    )?;
     // A reader must retain its last valid in-memory snapshot when the durable
     // document is corrupt. A writer, however, is the recovery mechanism: once
     // it owns the cross-process lock it may replace an unreadable document with
@@ -516,93 +519,16 @@ fn write_overrides_atomically(path: &Path, loaded: &LoadedOverrides) -> Result<(
         overrides: loaded.overrides.clone(),
     };
     let json = serde_json::to_string_pretty(&envelope)?;
-    let suffix = OVERRIDES_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("overrides.json");
-    let staged = path.with_file_name(format!(
-        ".{file_name}.staged-{}-{suffix}",
-        std::process::id()
-    ));
-    let write_result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&staged)
-            .with_context(|| format!("failed to create {}", staged.display()))?;
-        file.write_all(format!("{json}\n").as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&staged, path).with_context(|| {
-            format!(
-                "failed to atomically replace {} with {}",
-                path.display(),
-                staged.display()
-            )
-        })?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&staged);
-    }
-    write_result
-}
-
-struct OverridesFileLock {
-    path: PathBuf,
-    _file: File,
-}
-
-impl OverridesFileLock {
-    fn acquire(overrides_path: &Path) -> Result<Self> {
-        let path = overrides_path.with_extension("lock");
-        let deadline = Instant::now() + OVERRIDES_LOCK_WAIT;
-        loop {
-            match OpenOptions::new().create_new(true).write(true).open(&path) {
-                Ok(mut file) => {
-                    writeln!(
-                        file,
-                        "pid={} acquired_at_ms={}",
-                        std::process::id(),
-                        now_ms()
-                    )?;
-                    file.sync_all()?;
-                    return Ok(Self { path, _file: file });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(&path) {
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    if Instant::now() >= deadline {
-                        anyhow::bail!(
-                            "timed out waiting for runtime override lock {}",
-                            path.display()
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(25));
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to acquire {}", path.display()));
-                }
-            }
-        }
-    }
-}
-
-impl Drop for OverridesFileLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn lock_is_stale(path: &Path) -> bool {
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age >= OVERRIDES_STALE_LOCK_AGE)
+    // The shared atomic writer: staged temp + atomic install. On Windows this
+    // is `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` — never a remove/rename-aside
+    // dance — so the previous revision survives any crash/power loss until the
+    // new one is durably published.
+    crate::control::atomic_replace(
+        path,
+        format!("{json}\n").as_bytes(),
+        crate::control::ReplaceMode::Replace,
+    )?;
+    Ok(())
 }
 
 fn reject_immutable_changes(args: &ReconfigureArgs) -> Result<()> {
@@ -803,7 +729,11 @@ mod tests {
         assert_eq!(second.overrides.concurrency, Some(2));
         assert_eq!(second.overrides.batch_max_items, Some(4));
         assert_eq!(load_overrides_from_path(&path).unwrap().unwrap(), second);
-        assert!(!path.with_extension("lock").exists());
+        assert!(
+            path.with_extension("lock").exists(),
+            "the kernel-backed lock file persists across acquire/release and is \
+             never unlinked (release must not affect a successor)"
+        );
         let leftovers = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -850,5 +780,66 @@ mod tests {
         assert_eq!(recovered.revision, 1);
         assert_eq!(recovered.overrides.concurrency, Some(3));
         assert_eq!(load_overrides_from_path(&path).unwrap(), Some(recovered));
+    }
+
+    /// Two concurrent writers must be serialized by the kernel-backed lock:
+    /// each revision is read-merged-published in order, so BOTH updates survive
+    /// and the final revision reflects exactly two commits. A lost update (the
+    /// old removable-lock failure mode) would drop one field and leave the
+    /// revision at 1.
+    #[test]
+    fn concurrent_overrides_writers_preserve_both_updates_and_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overrides.json");
+
+        let writer_a = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                write_merged_overrides_at_path(
+                    &path,
+                    RunConfigOverrides {
+                        batch_max_output_tokens: Some(12_000),
+                        ..RunConfigOverrides::default()
+                    },
+                )
+            })
+        };
+        let writer_b = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                write_merged_overrides_at_path(
+                    &path,
+                    RunConfigOverrides {
+                        batch_max_items: Some(3),
+                        ..RunConfigOverrides::default()
+                    },
+                )
+            })
+        };
+
+        let a = writer_a.join().expect("writer A joins").expect("A writes");
+        let b = writer_b.join().expect("writer B joins").expect("B writes");
+        let mut revisions = [a.revision, b.revision];
+        revisions.sort_unstable();
+        assert_eq!(
+            revisions,
+            [1, 2],
+            "both writers committed one revision each"
+        );
+
+        let final_doc = load_overrides_from_path(&path)
+            .expect("final document reads")
+            .expect("final document exists");
+        assert_eq!(final_doc.revision, 2, "both writes were serialized");
+        assert_eq!(
+            final_doc.overrides.batch_max_output_tokens,
+            Some(12_000),
+            "writer A's update survives"
+        );
+        assert_eq!(
+            final_doc.overrides.batch_max_items,
+            Some(3),
+            "writer B's update survives"
+        );
     }
 }

@@ -4254,6 +4254,7 @@ fn prune_skips_job_flipped_to_running_after_selection() {
         dry_run: false,
         candidate_count: selection.candidate_count,
         protected_running_jobs: selection.protected_running_jobs,
+        protected_paused_jobs: selection.protected_paused_jobs,
         retained_by_keep_last_n: selection.retained_by_keep_last_n,
         deletions: Vec::new(),
     };
@@ -4295,6 +4296,79 @@ fn prune_skips_job_flipped_to_running_after_selection() {
     store.mark_job_stopped(&victim.id).expect("stopped again");
     let second = store.prune_jobs(options).expect("normal prune resumes");
     assert_eq!(second.pruned_job_count(), 1);
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(artifacts_dir);
+}
+
+#[test]
+fn prune_skips_job_flipped_to_paused_after_selection() {
+    // Lifecycle audit: a paused status generally means a LIVE paused worker
+    // holds a runtime lease. The paused guard must be enforced a second time
+    // inside the per-job deletion transaction, exactly like the running guard,
+    // so a job that turns `paused` between selection and deletion is never
+    // pruned underneath a live parked process.
+    let db_path = temp_path("prune_toctou_paused.sqlite");
+    let artifacts_dir = temp_path("prune-toctou-paused-artifacts");
+    let store = JobStore::open(&db_path).expect("store opens (conn A)");
+
+    let victim = prune_fixture_job(&store, "victim");
+    populate_full_job_tree(&store, &victim, &artifacts_dir);
+    store.mark_job_stopped(&victim.id).expect("job stopped");
+
+    // Phase 1 — select candidates on connection A. The job is stopped here.
+    let selection = store
+        .select_prune_candidates(None, None)
+        .expect("selection runs");
+    assert_eq!(selection.candidate_count, 1);
+    assert_eq!(selection.to_delete, vec![victim.id.clone()]);
+    assert_eq!(selection.protected_paused_jobs, 0);
+
+    // Phase 2 — connection B flips the selected job to `paused` after A's
+    // selection transaction has already committed.
+    {
+        let conn_b = Connection::open(&db_path).expect("second connection");
+        let flipped = conn_b
+            .execute(
+                "UPDATE jobs SET status = 'paused' WHERE id = ?1",
+                params![victim.id],
+            )
+            .expect("concurrent flip applies");
+        assert_eq!(flipped, 1);
+    }
+
+    // Phase 3 — drive A's deletion path for the stale candidate list.
+    let options = PruneJobsOptions::default();
+    let mut report = PruneJobsReport {
+        dry_run: false,
+        candidate_count: selection.candidate_count,
+        protected_running_jobs: selection.protected_running_jobs,
+        protected_paused_jobs: selection.protected_paused_jobs,
+        retained_by_keep_last_n: selection.retained_by_keep_last_n,
+        deletions: Vec::new(),
+    };
+    store
+        .execute_prune_selection(&selection.to_delete, &options, &mut report)
+        .expect("execution runs");
+
+    assert!(
+        report.deletions.is_empty(),
+        "the re-check inside the deletion txn must skip a job flipped to paused"
+    );
+    assert_eq!(report.protected_running_jobs, 0);
+    assert_eq!(
+        report.protected_paused_jobs, 1,
+        "the late flip is reported as a protected paused job"
+    );
+    assert_eq!(
+        report.candidate_count, 0,
+        "a paused job is no longer an honest prune candidate"
+    );
+    assert!(
+        store.get_job(&victim.id).expect("lookup").is_some(),
+        "flipped-to-paused job row survives"
+    );
 
     drop(store);
     let _ = fs::remove_file(db_path);
@@ -4671,4 +4745,222 @@ fn migration_eleven_adds_block_id_once_and_reopen_takes_no_write_transaction() {
     }
 
     let _ = fs::remove_file(db_path);
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle audit: prune must never delete live paused jobs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prune_never_deletes_paused_jobs() {
+    let db_path = temp_path("prune_paused.sqlite");
+    let artifacts_dir = temp_path("prune-paused-artifacts");
+    let store = JobStore::open(&db_path).expect("store opens");
+
+    let finished = prune_fixture_job(&store, "finished");
+    populate_full_job_tree(&store, &finished, &artifacts_dir);
+    store
+        .mark_job_stopped(&finished.id)
+        .expect("finished job stopped");
+
+    // A paused job: either a live worker parked on a runtime lease, or the
+    // leftover of one that died mid-pause. The store cannot tell which, so
+    // prune must protect it exactly like a running job (fail-closed).
+    let paused = prune_fixture_job(&store, "paused");
+    store.mark_job_paused(&paused.id).expect("job paused");
+
+    let report = store
+        .prune_jobs(PruneJobsOptions::default())
+        .expect("prune runs");
+
+    assert_eq!(
+        report.pruned_job_count(),
+        1,
+        "only the stopped job is pruned"
+    );
+    assert_eq!(
+        report.protected_paused_jobs, 1,
+        "the paused job is reported as protected"
+    );
+    assert!(
+        store.get_job(&paused.id).expect("lookup").is_some(),
+        "a paused job's row must survive pruning"
+    );
+    assert_eq!(
+        count_rows(&store, "segments", &paused.id),
+        0,
+        "a paused job has no segments yet (never ran)"
+    );
+    assert!(
+        store.get_job(&finished.id).expect("lookup").is_none(),
+        "the stopped job is pruned as before"
+    );
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(artifacts_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle audit: store mutation APIs fail closed with NotFound
+// ---------------------------------------------------------------------------
+
+#[test]
+fn store_status_mutations_return_not_found_for_missing_jobs() {
+    let db_path = temp_path("notfound_jobs.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+
+    let results = [
+        store.mark_job_running("job_missing"),
+        store.mark_job_paused("job_missing"),
+        store.mark_job_failed("job_missing"),
+        store.mark_job_stopped("job_missing"),
+        store.mark_job_running_for_resume("job_missing"),
+    ];
+    for error in results {
+        match error {
+            Err(StoreError::NotFound(message)) => {
+                assert!(
+                    message.contains("job_missing"),
+                    "NotFound names the row: {message}"
+                );
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn store_update_mutations_return_not_found_for_missing_jobs() {
+    let db_path = temp_path("notfound_updates.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+    let path = temp_path("out.epub");
+
+    let errors = [
+        store.update_job_output_path("job_missing", &path),
+        store.update_job_event_path("job_missing", &path),
+        store.update_job_report_paths("job_missing", &path, &path),
+        store.update_job_input_snapshot("job_missing", &path, "sha"),
+        store
+            .retry_segments("job_missing", RetryScope::Failed)
+            .map(|_| ()),
+        store
+            .mark_segments_needs_review("job_missing", &["seg_a".to_string()], "reason")
+            .map(|_| ()),
+        store
+            .mark_unfinished_segments_failed("job_missing", &["seg_a".to_string()], "reason")
+            .map(|_| ()),
+    ];
+    for error in errors {
+        assert!(
+            matches!(error, Err(StoreError::NotFound(_))),
+            "a missing job must surface NotFound, got: {error:?}"
+        );
+    }
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn store_segment_mutations_return_not_found_for_missing_segments() {
+    let db_path = temp_path("notfound_segments.sqlite");
+    let input_path = temp_path("notfound-segments-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture writes");
+    let store = JobStore::open(&db_path).expect("store opens");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("notfound-segments-out.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job creates");
+    // A running job would reject a retry with a policy error before the
+    // existence check; stop it so the retry reaches the segment lookup.
+    store.mark_job_stopped(&job.id).expect("job stopped");
+
+    let results = [
+        store.mark_segment_failed(&job.id, "seg_phantom", "boom"),
+        store.mark_segment_failed_if_unfinished(&job.id, "seg_phantom", "boom"),
+        store.request_segment_retry(&job.id, "seg_phantom", None),
+    ];
+    for error in results {
+        assert!(
+            matches!(error, Err(StoreError::NotFound(_))),
+            "expected NotFound, got {error:?}"
+        );
+    }
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+/// Bulk retry must be all-or-nothing: if anything inside the IMMEDIATE
+/// transaction fails, the segments must NOT be left half-flipped under a stale
+/// job status. Here the job row is missing, so the segment update inside the
+/// transaction never commits.
+#[test]
+fn retry_segments_is_atomic_and_rejects_missing_jobs_without_partial_mutation() {
+    let db_path = temp_path("retry_atomic.sqlite");
+    let input_path = temp_path("retry-atomic-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture writes");
+    let store = JobStore::open(&db_path).expect("store opens");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("retry-atomic-out.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job creates");
+    store
+        .insert_segments(
+            &job.id,
+            &[segment("seg_fail", 0)],
+            "v1",
+            "mock",
+            "mock-prefix",
+            "retry_ns",
+        )
+        .expect("segments insert");
+    store
+        .mark_segment_failed(&job.id, "seg_fail", "retryable")
+        .expect("segment failed");
+
+    // A normal bulk retry flips the failed segment and rolls the job up to
+    // retry_pending together.
+    let count = store
+        .retry_segments(&job.id, RetryScope::Failed)
+        .expect("bulk retry succeeds");
+    assert_eq!(count, 1);
+    assert_eq!(
+        store.get_job(&job.id).expect("job").expect("exists").status,
+        "retry_pending"
+    );
+
+    // A missing job refuses without touching anything (there is nothing to
+    // touch, but the transaction boundary is what keeps it all-or-nothing).
+    let error = store
+        .retry_segments("job_phantom", RetryScope::Failed)
+        .expect_err("missing job must fail closed");
+    assert!(matches!(error, StoreError::NotFound(_)));
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
 }

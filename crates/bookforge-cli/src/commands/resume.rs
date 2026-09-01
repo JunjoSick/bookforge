@@ -176,23 +176,32 @@ pub async fn run(
     if job.status == "paused" && !args.force {
         return live_fast_resume_paused_job(&store, &args).await;
     }
+    // Finding (lifecycle audit): validate the run configuration snapshot,
+    // overrides, paths, and flags BEFORE acquiring the launch claim or
+    // touching the job's status/control state. A failed validation leaves the
+    // prior status and control file exactly as they were.
+    let mut snapshot = load_resume_snapshot(&store, &args.job_id)?;
+    let overrides = load_resume_overrides_for_status(&args.job_id, &job.status)?;
+    validate_resume_snapshot(&args.job_id, &snapshot)?;
+    let _validated_input = resolve_resume_input(&job, &snapshot)?;
+    let _validated_output = resume_output_path(&args, &snapshot)?;
+    // Flag validation is cheap and IO-free; run it up front so a bad flag
+    // combination (e.g. --fallback-provider without --fallback-model) never
+    // reaches a mutated job.
+    resolve_resume_fallback_config(&args, snapshot.fallback.as_ref())?;
+
     // Cross-process liveness for plain resume (CLI-8): reuse the same launch
     // claim machinery the dashboard uses so concurrent resumes cannot
-    // double-spend provider budget. The claim is handed off to the run's
-    // control watcher once it spawns; early exits release it on drop.
-    let Some(mut launch_claim) = crate::control::RuntimeLaunchClaim::acquire(&args.job_id)? else {
-        anyhow::bail!(
-            "another bookforge process appears to be launching or resuming job '{}'; \
-             refusing to double-run the job",
-            args.job_id
-        );
-    };
+    // double-spend provider budget. A retry supervisor hands its claim to the
+    // replacement worker via environment variables; a plain resume acquires a
+    // fresh one. The claim is cleared by run_inner once the worker's control
+    // watcher has established its runtime lease; every other exit path
+    // releases it on drop.
+    let mut launch_claim = acquire_or_adopt_launch_claim(&args.job_id)?;
     crate::control::clear_job_control(&args.job_id)?;
     if (job.status == "paused" && args.force) || job.status == "stopped" {
         store.mark_job_running_for_resume(&args.job_id)?;
     }
-    let mut snapshot = load_resume_snapshot(&store, &args.job_id)?;
-    let overrides = load_resume_overrides_for_status(&args.job_id, &job.status)?;
 
     let progress_jsonl = args
         .progress_jsonl
@@ -209,7 +218,6 @@ pub async fn run(
     );
     let progress = reporter.sink();
 
-    launch_claim.persist_until_worker();
     let run_result = run_inner(
         &args,
         &store,
@@ -218,6 +226,7 @@ pub async fn run(
         overrides,
         progress,
         cancel_token.clone(),
+        Some(&mut launch_claim),
     )
     .await;
     if let Err(error) = &run_result {
@@ -333,6 +342,74 @@ fn load_resume_snapshot(store: &JobStore, job_id: &str) -> Result<RunConfigSnaps
     Ok(snapshot)
 }
 
+/// Complete-but-compatible snapshot guard: resume requires the fields that
+/// make a deterministic re-run possible. Called before any status/control
+/// mutation so an incomplete snapshot can never leave a half-resumed job.
+fn validate_resume_snapshot(job_id: &str, snapshot: &RunConfigSnapshot) -> Result<()> {
+    let mut missing = Vec::new();
+    if snapshot.target_language.trim().is_empty() {
+        missing.push("target language");
+    }
+    if snapshot.provider.trim().is_empty() {
+        missing.push("provider");
+    }
+    if snapshot.model.trim().is_empty() {
+        missing.push("model");
+    }
+    if snapshot.prompt_version.trim().is_empty() {
+        missing.push("prompt version");
+    }
+    if snapshot.cache_namespace.trim().is_empty() {
+        missing.push("cache namespace");
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "job '{job_id}' has an incomplete run configuration snapshot; missing: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Resolve and sanity-check the output path before any mutation. Creates the
+/// parent directory (idempotent) so a later rebuild cannot fail on a missing
+/// parent after the job was already marked running.
+fn resume_output_path(args: &ResumeArgs, snapshot: &RunConfigSnapshot) -> Result<PathBuf> {
+    let output = args
+        .output
+        .clone()
+        .unwrap_or_else(|| snapshot.output_path.clone());
+    if output.is_dir() {
+        anyhow::bail!("output path '{}' is a directory", output.display());
+    }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot create output directory '{}': {error}",
+                parent.display()
+            )
+        })?;
+    }
+    Ok(output)
+}
+
+/// Acquire the cross-process launch claim, adopting a parent's handoff when a
+/// retry supervisor spawned this worker (closes the parent-to-child gap).
+fn acquire_or_adopt_launch_claim(job_id: &str) -> Result<crate::control::RuntimeLaunchClaim> {
+    if let Some(claim) = crate::control::RuntimeLaunchClaim::adopt_from_env(job_id)? {
+        return Ok(claim);
+    }
+    let Some(claim) = crate::control::RuntimeLaunchClaim::acquire(job_id)? else {
+        anyhow::bail!(
+            "another bookforge process appears to be launching or resuming job '{job_id}'; \
+             refusing to double-run the job"
+        );
+    };
+    Ok(claim)
+}
+
 async fn finalize_reporter<T>(
     result: Result<T, anyhow::Error>,
     reporter: crate::progress::ProgressReporter,
@@ -357,6 +434,7 @@ async fn run_inner(
     overrides: Option<reconfigure::RunConfigOverrides>,
     progress: Arc<dyn ProgressSink>,
     cancel_token: tokio_util::sync::CancellationToken,
+    launch_claim: Option<&mut crate::control::RuntimeLaunchClaim>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     progress.emit(ProgressEvent::StageStarted {
@@ -524,7 +602,13 @@ async fn run_inner(
             qa: qa_mode,
             validate_output,
         },
-    );
+    )?;
+    // The worker's runtime lease now guards this job (the watcher wrote it
+    // before starting), so the launch claim is no longer needed; clear it so a
+    // stale claim can never block a later resume.
+    if let Some(claim) = launch_claim {
+        claim.clear();
+    }
     let job_runtime_settings = control_watcher.job_runtime_settings();
     let run_config = TranslationRunConfig {
         source_language: snapshot.source_language.clone(),
@@ -2381,6 +2465,7 @@ mod tests {
             overrides,
             sink,
             tokio_util::sync::CancellationToken::new(),
+            None,
         )
         .await?;
 

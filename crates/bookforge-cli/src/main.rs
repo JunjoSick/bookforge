@@ -35,7 +35,6 @@ use std::{
     fs,
     io::{self, ErrorKind},
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -246,28 +245,20 @@ fn is_broken_pipe(err: &io::Error) -> bool {
 // owner process dies between creating and clearing one, an empty directory
 // lingers forever. A previous audit counted 51 of them. The sweep only ever
 // deletes directories that are (a) named after a parseable pid, (b) provably
-// empty, and (c) provably not owned by a live process — or, where liveness
-// cannot be determined (Windows), older than RETRY_OVERRIDE_FALLBACK_MAX_AGE.
-// Directories with any content are never touched, because they may hold a
-// live worker's pending override sidecar.
+// empty, and (c) POSITIVELY not owned by a live process. An owner whose
+// liveness cannot be established is NEVER reaped: age alone must never
+// authorize deleting a directory a live process may still be writing into
+// (this lane's invariant is fail closed). Directories with any content are
+// never touched, because they may hold a live worker's pending override
+// sidecar. Liveness comes from the shared robust probe in `control.rs`
+// (`/proc` on Linux, `ps` on other Unixes, `OpenProcess`/`GetExitCodeProcess`
+// on Windows) — no mtime/age heuristic is consulted.
 // ---------------------------------------------------------------------------
+
+use crate::control::{OwnerLiveness, pid_liveness};
 
 const RETRY_OVERRIDE_DIR_PREFIX: &str = "retry_pending_overrides_";
 const RETRY_OVERRIDES_RUNS_ROOT: &str = ".bookforge/runs";
-/// Windows-safe fallback window (INFRA-10): without a portable liveness probe,
-/// only treat a dir as stale once it has sat untouched for at least this long.
-const RETRY_OVERRIDE_FALLBACK_MAX_AGE: std::time::Duration =
-    std::time::Duration::from_secs(24 * 60 * 60);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OwnerLiveness {
-    Alive,
-    Gone,
-    /// Platform cannot tell cheaply and safely (e.g. Windows fallback) — or
-    /// the probe itself failed on a non-Linux Unix box.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
-    Indeterminate,
-}
 
 fn sweep_stale_retry_override_dirs_at_startup() {
     let reaped = sweep_stale_retry_override_dirs(Path::new(RETRY_OVERRIDES_RUNS_ROOT));
@@ -308,10 +299,7 @@ fn sweep_stale_retry_override_dirs(runs_root: &Path) -> usize {
             continue;
         }
 
-        let stale_since_fallback_window =
-            dir_idle_for_at_least(&entry.path(), RETRY_OVERRIDE_FALLBACK_MAX_AGE);
-        if retry_override_dir_is_reapable(owner_liveness(pid), stale_since_fallback_window)
-            && fs::remove_dir(entry.path()).is_ok()
+        if retry_override_dir_is_reapable(pid_liveness(pid)) && fs::remove_dir(entry.path()).is_ok()
         {
             removed += 1;
         }
@@ -319,61 +307,14 @@ fn sweep_stale_retry_override_dirs(runs_root: &Path) -> usize {
     removed
 }
 
-fn retry_override_dir_is_reapable(
-    liveness: OwnerLiveness,
-    idle_over_fallback_window: bool,
-) -> bool {
+fn retry_override_dir_is_reapable(liveness: OwnerLiveness) -> bool {
     match liveness {
         OwnerLiveness::Alive => false,
         OwnerLiveness::Gone => true,
-        OwnerLiveness::Indeterminate => idle_over_fallback_window,
-    }
-}
-
-fn dir_idle_for_at_least(path: &Path, min_age: std::time::Duration) -> bool {
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age >= min_age)
-}
-
-/// Liveness of the pid encoded in a `retry_pending_overrides_<pid>` name.
-///
-/// Fail-closed like the SERVE-3 signal path (`serve/audio.rs`): when identity
-/// cannot be established we return [`OwnerLiveness::Indeterminate`] instead of
-/// guessing, and the caller falls back to the conservative age rule.
-fn owner_liveness(pid: u32) -> OwnerLiveness {
-    if pid == std::process::id() {
-        return OwnerLiveness::Alive;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if PathBuf::from(format!("/proc/{pid}")).exists() {
-            OwnerLiveness::Alive
-        } else {
-            OwnerLiveness::Gone
-        }
-    }
-
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        match std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
-            .output()
-        {
-            Ok(output) if output.status.success() && !output.stdout.trim().is_empty() => {
-                OwnerLiveness::Alive
-            }
-            Ok(_) => OwnerLiveness::Gone,
-            Err(_) => OwnerLiveness::Indeterminate,
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        OwnerLiveness::Indeterminate
+        // Fail-closed: an owner whose death is not positively established is
+        // never reaped, at any directory age. No mtime/age heuristic exists
+        // here — takeover is authorized only by a positively established death.
+        OwnerLiveness::Indeterminate => false,
     }
 }
 
@@ -474,11 +415,7 @@ fn default_output_path(input: &std::path::Path, target: &str) -> PathBuf {
 #[cfg(test)]
 mod sweep_tests {
     use super::*;
-    use std::{
-        fs,
-        path::PathBuf,
-        time::{Duration, SystemTime},
-    };
+    use std::{fs, path::PathBuf, time::SystemTime};
 
     fn temp_runs_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -494,15 +431,14 @@ mod sweep_tests {
     }
 
     #[test]
-    fn reap_decision_never_touches_live_owners() {
-        use OwnerLiveness::{Alive, Gone, Indeterminate};
-        assert!(!retry_override_dir_is_reapable(Alive, false));
-        assert!(!retry_override_dir_is_reapable(Alive, true));
-        assert!(retry_override_dir_is_reapable(Gone, false));
-        assert!(retry_override_dir_is_reapable(Gone, true));
-        // Indeterminate platforms (Windows) demand the >=24h age window.
-        assert!(!retry_override_dir_is_reapable(Indeterminate, false));
-        assert!(retry_override_dir_is_reapable(Indeterminate, true));
+    fn reap_decision_never_touches_live_or_indeterminate_owners() {
+        use crate::control::OwnerLiveness::{Alive, Gone, Indeterminate};
+        assert!(!retry_override_dir_is_reapable(Alive));
+        assert!(retry_override_dir_is_reapable(Gone));
+        // Fail-closed: an owner whose liveness is indeterminate is NEVER
+        // reaped, regardless of how old its directory is — the decision takes
+        // no age input at all, so no mtime window can ever authorize deletion.
+        assert!(!retry_override_dir_is_reapable(Indeterminate));
     }
 
     #[test]
@@ -557,19 +493,18 @@ mod sweep_tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// The sweep consults no age/mtime window at all: an indeterminate owner's
+    /// empty directory is never reaped even when it has sat untouched for a
+    /// very long time. This is structurally enforced (there is no age input to
+    /// the reap decision), so an old, stale-looking directory cannot be deleted
+    /// underneath a live suspended/future-version owner.
     #[test]
-    fn fallback_age_window_boundary_logic_is_exclusive_to_old_dirs() {
-        let root = temp_runs_root("age");
-        let dir = root.join(format!("{RETRY_OVERRIDE_DIR_PREFIX}{}", u32::MAX - 3));
-        fs::create_dir(&dir).expect("fresh dir");
-        // Fresh mtime: age is ~0, so any positive window rejects it...
-        assert!(!dir_idle_for_at_least(
-            &dir,
-            Duration::from_secs(24 * 60 * 60)
-        ));
-        // ...while a zero window accepts it (proves the comparison runs).
-        assert!(dir_idle_for_at_least(&dir, Duration::ZERO));
-        let _ = fs::remove_dir_all(root);
+    fn indeterminate_owner_is_never_reaped_even_when_old() {
+        use crate::control::OwnerLiveness::Indeterminate;
+        assert!(
+            !retry_override_dir_is_reapable(Indeterminate),
+            "an indeterminate owner must never be reaped at any age"
+        );
     }
 }
 

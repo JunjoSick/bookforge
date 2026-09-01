@@ -39,6 +39,29 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 zip.workspace = true
 
+# Windows-only lifecycle primitives:
+# - `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` for the atomic sidecar replace:
+#   std's `rename` refuses to overwrite an existing file on Windows, so without
+#   this the shared atomic writer would have to delete the previous good state
+#   before publishing the new one (crash/power-loss unsafe).
+# - `OpenProcess`/`GetExitCodeProcess` for a robust owner-liveness probe: a pid
+#   that fails `OpenProcess(ERROR_INVALID_PARAMETER)` is positively dead, which
+#   is the only condition under which a stale claim/lease may be reclaimed on
+#   Windows (liveness is never inferred from age alone).
+# - `LockFileEx`/`OVERLAPPED` for the kernel-backed advisory lock that guards
+#   the overrides document (no removable-lock-file protocol).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+] }
+
+# `flock(2)` for the same kernel-backed advisory lock on Unix.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["tui", "serve"]
 # Terminal UI (`--ui tui` and the `watch` command). Default-on; build with

@@ -503,7 +503,7 @@ where
             qa: cli_args.qa,
             validate_output: cli_args.validate_output,
         },
-    );
+    )?;
     let job_runtime_settings = control_watcher.job_runtime_settings();
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
