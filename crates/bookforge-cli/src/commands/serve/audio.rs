@@ -1470,11 +1470,34 @@ fn write_audio_process_state(
         object.insert("options".to_string(), options);
     }
     let bytes = serde_json::to_vec_pretty(&process)?;
-    std::fs::write(&temp, bytes)?;
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
+    // Durability contract: a concurrent reader (e.g. another dashboard
+    // process deciding whether this run is finished) must never observe a
+    // missing or partial process.json. Stage to a temp file, fsync it, then
+    // atomically rename over the target — `std::fs::rename` replaces on both
+    // Unix and Windows — so the published file is always a complete state
+    // snapshot whose bytes are already on disk before the retry claim is
+    // released.
+    let staged = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, &path)?;
+        Ok(())
+    })();
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
-    std::fs::rename(temp, path)?;
+    staged?;
+    // Make the rename itself durable once it has happened (Unix directory
+    // fsync). Windows has no std directory-sync primitive; the rename is
+    // already atomic there.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -1812,11 +1835,25 @@ async fn prune_audiobook(
 // which two requests could both pass validation and both spawn -- double
 // provider spend. Two independent guards close it:
 //
-// (a) an atomic filesystem claim: after the status recheck the winner renames
-//     `process.json` to [`RETRY_CLAIM_FILE_NAME`] -- a single rename admits
-//     exactly one worker; every loser reports 409 "retry already starting".
-//     Validation-refusals rename the original back, so durable state is never
-//     destroyed;
+// (a) an atomic filesystem claim: after the status recheck the winner takes an
+//     OS advisory lock (`flock` on Unix, `LockFileEx` on Windows) on
+//     [`RETRY_CLAIM_FILE_NAME`], which admits exactly one worker on every
+//     platform. A rename-based claim was NOT Windows-safe: MoveFileExW opens
+//     the source by path first, so a racing loser can hold a handle to the
+//     file the winner has just moved away and its rename then "succeeds" too,
+//     producing two 200s. An age heuristic is not safe either: a live owner
+//     that is merely suspended or slow must never be preempted, or the next
+//     winner double-spends on the provider. The lock is the liveness verdict
+//     — the kernel drops it exactly when the owning process dies, never before
+//     — so a live owner is always refused and a dead owner's leftover claim is
+//     always reclaimable. The lock file keeps a stable identity (it is never
+//     unlinked by the protocol), so every contender contends on the same lock.
+//     It records an ownership nonce plus a claimed-at timestamp for
+//     diagnostics and a defensive release check; losers report 409 "retry
+//     already starting". The winner additionally publishes durable `running`
+//     state BEFORE releasing the lock, and a late arrival re-verifies that
+//     durable state after acquiring the lock, so once the winner finishes its
+//     handoff no second job can start;
 // (b) a SERVE-6 launch slot held around preparation + spawn (released on
 //     every failure path by dropping [`RetryClaimLaunch`] alongside its
 //     sibling slot guard).
@@ -1832,6 +1869,7 @@ struct RetryFailedRequest {
 
 struct PreparedRetry {
     out_dir: PathBuf,
+    claim: RetryClaim,
     input_path: PathBuf,
     provider: String,
     model_opt: Option<String>,
@@ -1848,13 +1886,20 @@ struct PreparedRetry {
     auto_model: bool,
     options_snapshot: serde_json::Value,
     failed_count: usize,
+    /// The durable process.json bytes as read before this retry claimed the
+    /// operation, so a failed spawn can restore the truthful prior state
+    /// instead of leaving a phantom "running" marker behind.
+    prior_process_json: Vec<u8>,
 }
 
 enum PreparedOutcome {
     NotFound,
     Running,
-    /// A concurrent retry won the atomic claim rename; this caller loses.
+    /// A concurrent retry won the atomic claim; this caller loses.
     RetryStarting,
+    /// A leftover claim file cannot be proven safe to reclaim; fail closed
+    /// and point the operator at the file.
+    ClaimBlocked(PathBuf),
     /// A deliberate refusal with its user-facing reason.
     Client(String),
     Ready(Box<PreparedRetry>),
@@ -1865,6 +1910,281 @@ enum PreparedOutcome {
 enum PrepareStep {
     Refused(String),
     Ready(Box<PreparedRetry>),
+}
+
+/// A single-winner filesystem claim guarding the retry-failed relaunch.
+///
+/// Ownership is an OS advisory lock held open on [`RETRY_CLAIM_FILE_NAME`]
+/// for the whole handoff, not a rename and not a timestamped file:
+///
+/// - atomic mutual exclusion across tasks *and* independent dashboard
+///   processes on Unix and Windows alike;
+/// - the kernel releases the lock the instant the owner dies, so reclaiming a
+///   stale claim requires acquiring the lock — positive proof the previous
+///   owner is gone. A live owner (even one suspended for minutes) can never
+///   be preempted, so there is no age heuristic to get wrong;
+/// - the lock file keeps a stable identity: it is created once and never
+///   unlinked by the protocol, so every contender contends on the same lock.
+///   An unlink-then-recreate on release would let a racer that opened the old
+///   file lock a dead inode while another locks a fresh one — two "winners";
+/// - releasing removes/empties the claim only while the lock is still held,
+///   so a late release can never affect a claim a newer owner created (no
+///   check-then-delete TOCTOU).
+///
+/// The file also carries a diagnostic record (nonce, pid, claimed-at). The
+/// record is advisory — the lock is the source of truth — but the nonce makes
+/// a release idempotent and gives an operator something to read when a claim
+/// stalls.
+#[derive(Debug)]
+pub(super) struct RetryClaim {
+    nonce: String,
+    claimed_at_ms: u64,
+    out_dir: PathBuf,
+    /// The open, exclusively locked claim file. The claim is moved (never
+    /// cloned) from acquisition through the handoff, so exactly one owner
+    /// exists and the diagnostic record survives until the final release;
+    /// dropping this handle closes it and releases the OS lock.
+    file: Option<std::fs::File>,
+}
+
+/// Take a non-blocking exclusive advisory lock on `file`.
+///
+/// Returns `Ok(true)` when this caller now holds the lock, `Ok(false)` when a
+/// live owner holds it. Both `flock` (Unix) and `LockFileEx` (Windows) are
+/// advisory locks tied to the open handle: the kernel releases them the
+/// moment the owning process dies, so `Ok(false)` is a liveness verdict that
+/// can never go stale — no procfs probe, no PID-reuse guessing, no clock.
+#[cfg(unix)]
+pub(super) fn try_lock_claim(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+/// Windows counterpart of [`try_lock_claim`]: `LockFileEx` on a one-byte
+/// range at the front of the file. Byte-range locks (like `flock`) are
+/// released when the owning handle/process goes away.
+#[cfg(windows)]
+pub(super) fn try_lock_claim(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    // Lock one byte at the front. A range past the current end of file is
+    // lockable, so the record does not need to exist yet.
+    let acquired = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if acquired != 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+/// Advisory ownership payload written inside the claim file. `pid` and
+/// `claimed_at_ms` are never consulted by the protocol (the OS lock is the
+/// liveness verdict); they exist so an operator can `cat` a stuck claim file
+/// and see who wrote it and when.
+#[derive(Deserialize)]
+struct RetryClaimRecord {
+    nonce: String,
+    #[allow(dead_code)]
+    pid: u32,
+    #[allow(dead_code)]
+    claimed_at_ms: u64,
+}
+
+fn parse_claim_record(bytes: &[u8]) -> Option<RetryClaimRecord> {
+    let record: RetryClaimRecord = serde_json::from_slice(bytes).ok()?;
+    (!record.nonce.is_empty()).then_some(record)
+}
+
+impl RetryClaim {
+    fn claim_file(out_dir: &Path) -> PathBuf {
+        out_dir.join(RETRY_CLAIM_FILE_NAME)
+    }
+
+    /// Wrap a freshly locked file as this caller's claim and publish the
+    /// diagnostic record through it (truncating any dead owner's bytes).
+    fn with_locked_file(out_dir: PathBuf, file: std::fs::File) -> Result<Self> {
+        let mut randomness = [0u8; 16];
+        getrandom::fill(&mut randomness).context("failed to generate retry claim nonce")?;
+        let claim = RetryClaim {
+            nonce: randomness
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            claimed_at_ms: now_ms(),
+            out_dir,
+            file: Some(file),
+        };
+        claim.write_record()?;
+        Ok(claim)
+    }
+
+    /// Truncate and write the diagnostic record through the locked handle,
+    /// then sync it so a reader can never observe a partial record.
+    fn write_record(&self) -> Result<()> {
+        use std::io::{Seek, Write};
+        let mut file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("retry claim is not locked"))?;
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.write_all(self.record().as_bytes())?;
+        file.sync_all()
+            .context("retry claim record could not be synced")
+    }
+
+    fn record(&self) -> String {
+        serde_json::to_string(&json!({
+            "nonce": self.nonce,
+            "pid": std::process::id(),
+            "claimed_at_ms": self.claimed_at_ms,
+        }))
+        .expect("retry claim record should serialize")
+    }
+
+    fn read_nonce(claim_path: &Path) -> Option<String> {
+        let content = std::fs::read(claim_path).ok()?;
+        parse_claim_record(&content).map(|record| record.nonce)
+    }
+
+    /// Release this caller's claim: empty and unlock the claim file, but only
+    /// while this caller still owns it. The OS lock makes the ownership check
+    /// sound: while it is held nobody can replace the file, so the nonce
+    /// cannot change between the read and the action. Losing the check means
+    /// a newer claim exists and must never be touched. The file itself keeps
+    /// its stable identity (it is not unlinked), so a concurrent acquirer that
+    /// already opened it contends on the same lock.
+    pub(super) fn release(&self) {
+        let claim_path = Self::claim_file(&self.out_dir);
+        if Self::read_nonce(&claim_path).as_deref() != Some(self.nonce.as_str()) {
+            return;
+        }
+        if let Some(file) = &self.file {
+            use std::io::Seek;
+            let mut file = file;
+            let _ = file.set_len(0);
+            let _ = file.seek(std::io::SeekFrom::Start(0));
+            let _ = file.sync_all();
+        }
+    }
+}
+
+impl Drop for RetryClaim {
+    fn drop(&mut self) {
+        // Runs while the locked file is still alive (the `file` field is
+        // dropped only after this body), so the release is atomic under the
+        // lock. The claim is single-owned, so this runs exactly once — the
+        // diagnostic record stays valid for the whole handoff.
+        self.release();
+    }
+}
+
+#[cfg(test)]
+impl RetryClaim {
+    /// Test-only claim bound to an explicit nonce and no lock, so unit tests
+    /// can prove a nonce-mismatched release leaves the lock untouched.
+    pub(super) fn with_nonce(out_dir: PathBuf, nonce: &str) -> RetryClaim {
+        RetryClaim {
+            nonce: nonce.to_string(),
+            claimed_at_ms: now_ms(),
+            out_dir,
+            file: None,
+        }
+    }
+}
+
+/// Result of trying to take the single-winner retry claim for `out_dir`.
+#[derive(Debug)]
+pub(super) enum RetryClaimAcquire {
+    /// This caller holds the OS lock and owns the relaunch.
+    Owned(RetryClaim),
+    /// A live owner holds the lock; this caller must lose with 409.
+    HeldByLiveOwner,
+    /// A leftover claim file cannot be proven safe to reclaim (unreadable
+    /// record); fail closed and point the operator at the file.
+    ClaimBlocked(PathBuf),
+}
+
+/// Try to take the single-winner retry claim for `out_dir`.
+///
+/// The OS lock is the liveness verdict: `Ok(false)` means the owner process
+/// is alive (or suspended — the lock is only dropped on death), so this
+/// caller loses; acquiring the lock is positive proof the previous owner is
+/// gone, so the leftover claim is reclaimed by reusing the same file (stable
+/// identity) and overwriting its record — never by unlink-then-recreate,
+/// which would split the lock across inodes. A claim whose bytes cannot be
+/// read as a record is left untouched (fail closed) for an operator to review
+/// rather than destroyed blindly.
+pub(super) fn acquire_retry_claim(out_dir: &Path) -> Result<RetryClaimAcquire> {
+    let claim_path = RetryClaim::claim_file(out_dir);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        // Deliberately not truncating on open: the existing bytes must be read
+        // (and proven to be a claim record) before they may be overwritten.
+        .truncate(false)
+        .open(&claim_path)
+        .with_context(|| {
+            format!(
+                "retry claim could not be opened at {}",
+                claim_path.display()
+            )
+        })?;
+    if !try_lock_claim(&file)? {
+        drop(file);
+        return Ok(RetryClaimAcquire::HeldByLiveOwner);
+    }
+
+    // The lock is ours: either we just created the file, or the previous
+    // owner is provably dead. Read the existing bytes through the same locked
+    // handle (never a fresh path-open, whose failure must not be mistaken for
+    // an empty file). An empty file is our own create-before-write debris; a
+    // readable record is a dead owner's claim. Anything else — including a
+    // read error, which is never treated as "empty and safe to reclaim" — is
+    // unknown bytes at our reserved name and is left untouched (fail closed)
+    // rather than destroyed.
+    use std::io::Read;
+    let mut existing = Vec::new();
+    if let Err(_error) = (&file).read_to_end(&mut existing) {
+        drop(file); // release the lock without touching the bytes
+        return Ok(RetryClaimAcquire::ClaimBlocked(claim_path));
+    }
+    if !existing.is_empty() && parse_claim_record(&existing).is_none() {
+        drop(file); // release the lock without touching the bytes
+        return Ok(RetryClaimAcquire::ClaimBlocked(claim_path));
+    }
+
+    Ok(RetryClaimAcquire::Owned(RetryClaim::with_locked_file(
+        out_dir.to_path_buf(),
+        file,
+    )?))
 }
 
 fn options_string(options: &serde_json::Value, key: &str) -> Option<String> {
@@ -1887,7 +2207,7 @@ fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> 
     {
         Some(process) => process,
         // A missing/unreadable state file alongside a live claim temp means a
-        // concurrent retry has already won the rename race.
+        // concurrent retry already holds the claim.
         None if claim_path.exists() => return Ok(PreparedOutcome::RetryStarting),
         None => json!({}),
     };
@@ -1896,33 +2216,56 @@ fn prepare_retry_failed(upload_dir: &Path, id: &str) -> Result<PreparedOutcome> 
     }
 
     // F3(a): atomic single-winner claim AFTER the status recheck. Exactly one
-    // concurrent caller's rename can succeed; every loser sees NotFound and
-    // reports "already starting" without touching anything.
-    if let Err(error) = std::fs::rename(&process_path, &claim_path) {
-        return Ok(match error.kind() {
-            std::io::ErrorKind::NotFound => PreparedOutcome::RetryStarting,
-            _ => PreparedOutcome::Client(format!("retry could not be started ({error})")),
-        });
+    // concurrent caller can take the OS lock; every loser reports "already
+    // starting" without touching anything.
+    let claim = match acquire_retry_claim(&out_dir)? {
+        RetryClaimAcquire::Owned(claim) => claim,
+        RetryClaimAcquire::HeldByLiveOwner => return Ok(PreparedOutcome::RetryStarting),
+        RetryClaimAcquire::ClaimBlocked(claim_path) => {
+            return Ok(PreparedOutcome::ClaimBlocked(claim_path));
+        }
+    };
+
+    // Re-verify the durable state now that the claim is held. A concurrent
+    // winner that finished its whole handoff only releases the lock AFTER
+    // publishing durable `running` state (see the spawn ordering in
+    // `retry_failed_chunks`), so a claim acquired here guarantees `running` is
+    // visible — and means that winner already spent provider credits. Without
+    // this recheck a late arrival could take the now-free lock and spawn a
+    // duplicate run.
+    let recheck = std::fs::read(&process_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    if audiobook_process_is_running(&recheck) {
+        // The claim drops on return, releasing the lock.
+        return Ok(PreparedOutcome::Running);
     }
 
-    match finish_prepare_retry(upload_dir, id, &process)? {
+    let prior_process_json = std::fs::read(&process_path).unwrap_or_default();
+
+    // The claim is moved into `finish_prepare_retry`: on a refusal or an
+    // error it is dropped (and released) inside, and on success it is moved
+    // into the `PreparedRetry` so exactly one owner carries the locked handle
+    // through the whole handoff. [`RetryClaim`]'s `Drop` releases the lock —
+    // a refusal, an early `?`, or a panic all unwind to a clean operation
+    // directory with `process.json` untouched.
+    match finish_prepare_retry(upload_dir, id, &process, claim, prior_process_json)? {
         PrepareStep::Ready(prepared) => Ok(PreparedOutcome::Ready(prepared)),
-        PrepareStep::Refused(message) => {
-            // Refusals must not destroy the durable state file (or strand the
-            // operation in claimed limbo): put the original bytes back.
-            settle_retry_claim(&out_dir);
-            Ok(PreparedOutcome::Client(message))
-        }
+        PrepareStep::Refused(message) => Ok(PreparedOutcome::Client(message)),
     }
 }
 
 /// Validation tail of [`prepare_retry_failed`], run only once the atomic
-/// claim is held. Every refusal becomes [`PrepareStep::Refused`] so the
-/// caller can restore the claim uniformly.
+/// claim is held (moved in by value). Every refusal becomes
+/// [`PrepareStep::Refused`], dropping the claim so it unwinds uniformly via
+/// [`RetryClaim`]'s `Drop`.
 fn finish_prepare_retry(
     upload_dir: &Path,
     id: &str,
     process: &serde_json::Value,
+    claim: RetryClaim,
+    prior_process_json: Vec<u8>,
 ) -> Result<PrepareStep> {
     let refused = |message: &str| Ok(PrepareStep::Refused(message.to_string()));
     let out_dir = audiobook_operation_out_dir(upload_dir, id);
@@ -2070,6 +2413,7 @@ fn finish_prepare_retry(
 
     Ok(PrepareStep::Ready(Box::new(PreparedRetry {
         out_dir,
+        claim,
         input_path,
         model_opt: model_for_child.filter(|model| !model.is_empty()),
         provider,
@@ -2086,6 +2430,7 @@ fn finish_prepare_retry(
         auto_model,
         options_snapshot: options,
         failed_count,
+        prior_process_json,
     })))
 }
 
@@ -2095,42 +2440,19 @@ fn u32_checked(value: Option<&serde_json::Value>) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
-/// Resolve the atomic retry claim one way or the other:
-/// - when the fresh `running` state already exists, the claim file is debris
-///   and is removed;
-/// - otherwise the original `process.json` bytes are renamed back, so a
-///   refusal or a crash below the claim can never strand the operation in
-///   claimed limbo or destroy its durable state.
-fn settle_retry_claim(out_dir: &Path) {
-    let claim_path = out_dir.join(RETRY_CLAIM_FILE_NAME);
-    if !claim_path.exists() {
-        return;
-    }
-    if out_dir.join("process.json").exists() {
-        let _ = std::fs::remove_file(&claim_path);
-    } else {
-        let _ = std::fs::rename(&claim_path, out_dir.join("process.json"));
-    }
-}
-
 /// Guard pair held for the whole spawn handoff of [`retry_failed_chunks`].
-/// Dropping it releases the SERVE-6 launch slot *and* settles the atomic
-/// claim per [`settle_retry_claim`], so every failure path — early `?`, panic
-/// unwind, refused key, failed spawn — unwinds to a consistent operation
-/// directory.
+/// Dropping it releases the SERVE-6 launch slot (via the slot guard's own
+/// `Drop`) and the atomic claim (via [`RetryClaim`]'s `Drop`), so every
+/// failure path — early `?`, panic unwind, refused key, failed spawn —
+/// unwinds to a consistent operation directory with no live claim left
+/// behind.
 struct RetryClaimLaunch {
     /// Held (never read) purely so its Drop releases the launch slot.
     #[allow(dead_code)]
     slot: LaunchSlotGuard,
-    out_dir: PathBuf,
-}
-
-impl Drop for RetryClaimLaunch {
-    fn drop(&mut self) {
-        // LaunchSlotGuard's own Drop frees the slot first (field order); the
-        // claim settlement follows before this struct is fully gone.
-        settle_retry_claim(&self.out_dir);
-    }
+    /// Held (never read) purely so its Drop releases the atomic claim.
+    #[allow(dead_code)]
+    claim: RetryClaim,
 }
 
 fn options_u64(value: Option<&serde_json::Value>) -> Option<u64> {
@@ -2167,7 +2489,7 @@ async fn retry_failed_chunks(
     let prepared = match prepared {
         PreparedOutcome::NotFound => return Ok(debris_not_found_response()),
         PreparedOutcome::Running => return Ok(debris_running_response()),
-        // F3(a): a concurrent double-click lost the atomic rename race.
+        // F3(a): a concurrent double-click lost the atomic claim race.
         PreparedOutcome::RetryStarting => {
             return Ok((
                 StatusCode::CONFLICT,
@@ -2175,14 +2497,32 @@ async fn retry_failed_chunks(
             )
                 .into_response());
         }
+        // Fail closed with an operator recovery path: the leftover claim's
+        // bytes are unknown, so we will not destroy them blindly.
+        PreparedOutcome::ClaimBlocked(claim_path) => {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!(
+                        "a previous retry left an unreadable claim at {}; it cannot \
+                         be proven safe to remove automatically. If no retry is \
+                         currently starting, delete that file and try again",
+                        claim_path.display()
+                    )
+                })),
+            )
+                .into_response());
+        }
         PreparedOutcome::Client(message) => return Ok(bad_request(&message)),
         PreparedOutcome::Ready(prepared) => prepared,
     };
-    // From here on the claim must be settled no matter which way control
-    // leaves this handler; the guard pairs that with the launch slot.
+    // From here on the claim must be released no matter which way control
+    // leaves this handler; the guard pairs that with the launch slot. The
+    // durable `running` state is published below BEFORE this guard drops, so
+    // once the lock is released no second job can start behind this one.
     let _guard = RetryClaimLaunch {
         slot,
-        out_dir: prepared.out_dir.clone(),
+        claim: prepared.claim,
     };
 
     // Key handling mirrors launch_audiobook exactly: a supplied key replaces
@@ -2237,7 +2577,15 @@ async fn retry_failed_chunks(
     // Test parity with the resume hook (state.resume_launches): installs a
     // deterministic spawn boundary so endpoint tests can drive the full
     // claim/slot/state machinery without exec'ing the test binary as an
-    // audiobook child.
+    // audiobook child. The spawn-failure variant proves the claim and the
+    // slot are released when `command.spawn()` would fail, and that durable
+    // state is not left as a phantom "running" marker.
+    #[cfg(test)]
+    if let Some(should_fail) = &state.retry_fail_spawns
+        && should_fail.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(anyhow::anyhow!("simulated audiobook spawn failure").into());
+    }
     #[cfg(test)]
     if let Some(launches) = &state.retry_launches {
         launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2264,9 +2612,23 @@ async fn retry_failed_chunks(
         .into_response());
     }
 
+    // Durability transition: publish `running` (pid unknown yet) BEFORE the
+    // child exists, so a crash anywhere past this point can never leave the
+    // operation looking idle while a concurrent retry starts a second job. If
+    // the spawn then fails, the prior durable bytes are restored so the
+    // operation stays truthful and retryable.
+    write_audio_process_state(
+        &prepared.out_dir,
+        "running",
+        None,
+        None,
+        prepared.auto_model,
+        Some(&prepared.options_snapshot),
+    )?;
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
+            let _ = restore_audio_process_state(&prepared.out_dir, &prepared.prior_process_json);
             return Err(anyhow::Error::from(error)
                 .context("failed to spawn audiobook retry process")
                 .into());
@@ -2305,4 +2667,23 @@ async fn retry_failed_chunks(
         "pid": pid,
     }))
     .into_response())
+}
+
+/// Restore `process.json` to exact prior bytes, durably and atomically, after
+/// a failed spawn unwound the pre-spawn "running" marker.
+fn restore_audio_process_state(out_dir: &std::path::Path, prior: &[u8]) -> Result<()> {
+    let path = out_dir.join("process.json");
+    let temp = out_dir.join("process.part.tmp");
+    let staged = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        std::io::Write::write_all(&mut file, prior)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, &path)?;
+        Ok(())
+    })();
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    staged
 }

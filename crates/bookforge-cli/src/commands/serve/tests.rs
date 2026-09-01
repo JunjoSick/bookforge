@@ -30,6 +30,7 @@ fn test_state_opt(session: &str, auth_enabled: bool) -> AppState {
         resume_launches: None,
         resume_child_environments: None,
         retry_launches: None,
+        retry_fail_spawns: None,
         audio_restart_cancels: None,
     }
 }
@@ -4136,6 +4137,39 @@ fn write_retryable_fixture(temp: &std::path::Path, id: &str) -> PathBuf {
 // F3: retry-failed double-click protection (atomic claim + launch slot)
 // -----------------------------------------------------------------------
 
+/// Materialize a retry claim file the way the production owner would — a
+/// readable ownership record with no OS lock held. Without the lock, the file
+/// models a claim whose owner is dead (the kernel dropped the lock), which is
+/// the exact state a next retry may reclaim.
+fn write_retry_claim(claim_path: &Path) {
+    std::fs::write(
+        claim_path,
+        serde_json::to_vec(&json!({
+            "nonce": "test-nonce",
+            "pid": 0,
+            "claimed_at_ms": now_ms(),
+        }))
+        .expect("claim should serialize"),
+    )
+    .expect("claim written");
+}
+
+/// True when the retry claim file is not held by a live owner: either absent
+/// or emptied by its last owner's release. The claim file keeps a stable
+/// identity and is never unlinked, so "released" means empty-and-unlocked.
+fn retry_claim_released(out_dir: &std::path::Path) -> bool {
+    match std::fs::read(out_dir.join("process.retry-claim.tmp")) {
+        Ok(bytes) => bytes.is_empty(),
+        Err(_) => true,
+    }
+}
+
+/// A live owner holds the OS lock on the retry claim: the loser is refused
+/// with 409 "retry already starting", must not steal the lock, mutate durable
+/// state, or spend a launch slot, and the live claim survives untouched. The
+/// lock is held exactly the way a real owner holds it — not simulated by an
+/// old timestamp, which is precisely what used to let one retry steal a live
+/// but slow owner's claim.
 #[tokio::test]
 async fn retry_failed_conflicts_while_another_retry_holds_the_claim() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -4144,14 +4178,15 @@ async fn retry_failed_conflicts_while_another_retry_holds_the_claim() {
         temp.path().to_path_buf(),
     ));
     let dir = write_retryable_fixture(temp.path(), "claimedop");
+    let claim_path = dir.join("process.retry-claim.tmp");
 
-    // Simulate a first retry sitting between its atomic rename and its spawn:
-    // process.json has been claimed away and the claim temp exists.
-    std::fs::rename(
-        dir.join("process.json"),
-        dir.join("process.retry-claim.tmp"),
-    )
-    .expect("claim simulated");
+    // A concurrent retry is mid-handoff: it owns the claim and keeps the OS
+    // lock until its handler returns.
+    let holder = match acquire_retry_claim(&dir) {
+        Ok(RetryClaimAcquire::Owned(claim)) => claim,
+        other => panic!("the test owner must win its own claim: {other:?}"),
+    };
+    assert!(!retry_claim_released(&dir), "the owner holds a live claim");
 
     let loser = post_json(
         &router,
@@ -4165,14 +4200,30 @@ async fn retry_failed_conflicts_while_another_retry_holds_the_claim() {
         response_json(loser).await["error"],
         json!("retry already starting")
     );
+    assert!(
+        !retry_claim_released(&dir),
+        "a live claim must survive a losing request untouched"
+    );
+    assert!(claim_path.exists(), "the live claim file must still exist");
+    let process: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("process.json")).expect("state read"))
+            .expect("state parse");
+    assert_eq!(
+        process["status"],
+        json!("succeeded"),
+        "the loser must not mutate durable state"
+    );
+
+    // The owner finishes its handoff: dropping the claim empties it and
+    // releases the lock, leaving nothing a future retry could trip over.
+    drop(holder);
+    assert!(
+        retry_claim_released(&dir),
+        "the owner's release must leave the claim empty and unlocked"
+    );
 
     // The settled (`running`) branch keeps its distinct refusal so operators
     // can tell "in flight" from "starting up".
-    std::fs::rename(
-        dir.join("process.retry-claim.tmp"),
-        dir.join("process.json"),
-    )
-    .expect("restore original state");
     let mut process: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("process.json")).expect("state read"))
             .expect("state parse");
@@ -4193,75 +4244,401 @@ async fn retry_failed_conflicts_while_another_retry_holds_the_claim() {
     );
 }
 
-/// Concurrent handler calls against one shared AppState (the harness shape
-/// used by the SERVE-6 slot-cap tests): exactly one of the two simultaneous
+/// A live owner is refused even when its claim bytes never parsed (a crash
+/// mid-write can leave exactly that shape). Fail-closed must follow the OS
+/// lock, never the readability of the file.
+#[tokio::test]
+async fn retry_failed_refuses_live_owner_even_with_unreadable_claim() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let _ = write_retryable_fixture(temp.path(), "garbageop");
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        temp.path().to_path_buf(),
+    ));
+    let claim_path = temp
+        .path()
+        .join("audiobook-garbageop/process.retry-claim.tmp");
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&claim_path)
+        .expect("claim opened");
+    assert!(
+        try_lock_claim(&file).expect("lock attempt should succeed"),
+        "the test owner must hold the claim lock"
+    );
+    std::io::Write::write_all(&mut file, b"{\"status\":\"succeeded\",\"options\":{}}")
+        .expect("unreadable bytes written");
+
+    let loser = post_json(
+        &router,
+        "/api/audiobooks/garbageop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(loser.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(loser).await["error"],
+        json!("retry already starting")
+    );
+    assert!(
+        claim_path.exists(),
+        "a live owner's file must be untouched even if its bytes are foreign"
+    );
+    drop(file);
+}
+
+/// Two independent dashboard routers (separate AppState, one shared upload
+/// directory) racing one operation: exactly one of the two simultaneous
 /// "double clicks" may spawn; the other must be refused without spending.
+/// The OS lock arbitrates across processes, so the routers share no in-memory
+/// state. Replayed across fresh fixtures so the claim seam is stressed — a
+/// single pass is what the pre-fix Windows race broke, where a rename-based
+/// claim let both callers "win".
 #[tokio::test]
 async fn retry_failed_double_click_starts_exactly_one_operation() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let temp = tempfile::tempdir().expect("temp dir");
-    let _ = write_retryable_fixture(temp.path(), "racecase");
-
-    let launches = Arc::new(AtomicUsize::new(0));
-    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    let launches_a = Arc::new(AtomicUsize::new(0));
+    let launches_b = Arc::new(AtomicUsize::new(0));
+    let mut state_a = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
     // Test hook (parity with resume_launches): records the relaunch instead
     // of exec'ing this binary as an audiobook child.
-    state.retry_launches = Some(launches.clone());
-    let router = dashboard_router(state);
+    state_a.retry_launches = Some(launches_a.clone());
+    let mut state_b = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    state_b.retry_launches = Some(launches_b.clone());
+    let router_a = dashboard_router(state_a);
+    let router_b = dashboard_router(state_b);
 
-    let (winner, loser) = tokio::join!(
-        post_json(
-            &router,
-            "/api/audiobooks/racecase/retry-failed",
-            Some("token-123"),
-            json!({}),
-        ),
-        post_json(
-            &router,
-            "/api/audiobooks/racecase/retry-failed",
-            Some("token-123"),
-            json!({}),
-        ),
-    );
+    const ROUNDS: usize = 3;
+    for round in 0..ROUNDS {
+        let id = format!("racecase{round}");
+        let _ = write_retryable_fixture(temp.path(), &id);
+        let uri = format!("/api/audiobooks/{id}/retry-failed");
 
-    let statuses = [
-        (winner.status(), response_json(winner).await),
-        (loser.status(), response_json(loser).await),
-    ];
-    let successes = statuses
-        .iter()
-        .filter(|(status, _)| *status == StatusCode::OK)
-        .count();
-    let conflicts = statuses
-        .iter()
-        .filter(|(status, _)| *status == StatusCode::CONFLICT)
-        .count();
-    assert_eq!(successes, 1, "exactly one click wins: {statuses:?}");
-    assert_eq!(conflicts, 1, "the losing click is refused: {statuses:?}");
+        let (winner, loser) = tokio::join!(
+            post_json(&router_a, &uri, Some("token-123"), json!({})),
+            post_json(&router_b, &uri, Some("token-123"), json!({})),
+        );
+
+        let statuses = [
+            (winner.status(), response_json(winner).await),
+            (loser.status(), response_json(loser).await),
+        ];
+        let successes = statuses
+            .iter()
+            .filter(|(status, _)| *status == StatusCode::OK)
+            .count();
+        let conflicts = statuses
+            .iter()
+            .filter(|(status, _)| *status == StatusCode::CONFLICT)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "round {round} must have exactly one winner: {statuses:?}"
+        );
+        assert_eq!(
+            conflicts, 1,
+            "round {round} the losing click is refused: {statuses:?}"
+        );
+
+        // The winner leaves durable `running` state and no live claim behind:
+        // a concurrent retry after the release sees the transition and must
+        // refuse rather than launch a second job.
+        let out_dir = temp.path().join(format!("audiobook-{id}"));
+        let process: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(out_dir.join("process.json")).expect("state read"),
+        )
+        .expect("state parse");
+        assert_eq!(process["status"], json!("running"), "round {round}");
+        assert!(
+            retry_claim_released(&out_dir),
+            "round {round}: no live claim may survive the successful relaunch"
+        );
+
+        // A retry arriving after the winner released must be refused by the
+        // durable transition, never spawn a second job.
+        let late = post_json(&router_a, &uri, Some("token-123"), json!({})).await;
+        assert_eq!(
+            late.status(),
+            StatusCode::CONFLICT,
+            "round {round}: a late retry must be refused: {late:?}"
+        );
+    }
+
     assert_eq!(
-        launches.load(Ordering::SeqCst),
-        1,
-        "only one child may start regardless of interleaving"
-    );
-
-    // The winner leaves durable `running` state; no stray claim temp survives.
-    let process: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(temp.path().join("audiobook-racecase/process.json")).expect("state read"),
-    )
-    .expect("state parse");
-    assert_eq!(process["status"], json!("running"));
-    assert!(
-        !temp
-            .path()
-            .join("audiobook-racecase/process.retry-claim.tmp")
-            .exists(),
-        "the atomic claim must be consumed by the successful relaunch"
+        launches_a.load(Ordering::SeqCst) + launches_b.load(Ordering::SeqCst),
+        ROUNDS,
+        "only one child may start per round regardless of interleaving"
     );
 }
 
-/// Failure paths below the claim restore the durable state file and release
-/// the launch slot, so a refused retry costs nothing and blocks nobody.
+/// A heavier mob of simultaneous clicks against one operation, up to the
+/// SERVE-6 launch-slot cap: exactly one request may spawn, every other must
+/// be refused, and the losing requests must leave no live claim or slot
+/// behind.
+#[tokio::test]
+async fn retry_failed_many_simultaneous_clicks_spawn_exactly_one() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let _ = write_retryable_fixture(temp.path(), "mobclick");
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    state.retry_launches = Some(launches.clone());
+    let router = dashboard_router(state);
+
+    // At most this many requests may hold a launch slot simultaneously; any
+    // more would be refused with 429 before reaching the claim, so sizing the
+    // mob at the cap makes every click fight for the claim.
+    const CONCURRENT: usize = MAX_CONCURRENT_DASHBOARD_LAUNCHES;
+    let mut clicks = Vec::new();
+    for _ in 0..CONCURRENT {
+        let router = router.clone();
+        clicks.push(tokio::spawn(async move {
+            post_json(
+                &router,
+                "/api/audiobooks/mobclick/retry-failed",
+                Some("token-123"),
+                json!({}),
+            )
+            .await
+        }));
+    }
+
+    let mut ok = 0;
+    let mut conflict = 0;
+    for click in clicks {
+        let response = click.await.expect("click task should join");
+        match response.status() {
+            StatusCode::OK => ok += 1,
+            StatusCode::CONFLICT => conflict += 1,
+            other => panic!("unexpected retry status {other}"),
+        }
+    }
+    assert_eq!(ok, 1, "exactly one of {CONCURRENT} clicks may spawn");
+    assert_eq!(conflict, CONCURRENT - 1, "every other click is refused");
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    let out_dir = temp.path().join("audiobook-mobclick");
+    assert!(
+        retry_claim_released(&out_dir),
+        "no live claim may survive the mob"
+    );
+    let process: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out_dir.join("process.json")).expect("state read"))
+            .expect("state parse");
+    assert_eq!(process["status"], json!("running"));
+}
+
+/// A claim whose owner died mid-handoff is a file with a readable record but
+/// no OS lock (the kernel dropped the lock on death). The next retry takes
+/// the lock, reclaims the claim, relaunches, and leaves no live claim behind —
+/// dead owners are recovered without any age guess.
+#[tokio::test]
+async fn retry_failed_reclaims_claim_left_by_crashed_owner() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = write_retryable_fixture(temp.path(), "crashop");
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    state.retry_launches = Some(launches.clone());
+    let router = dashboard_router(state);
+
+    write_retry_claim(&dir.join("process.retry-claim.tmp"));
+
+    let retried = post_json(
+        &router,
+        "/api/audiobooks/crashop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::OK, "{retried:?}");
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        1,
+        "the dead owner's claim must be reclaimed and the relaunch proceeds"
+    );
+    assert!(
+        retry_claim_released(&dir),
+        "the reclaimed claim must be released by its new owner"
+    );
+    let process: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("process.json")).expect("state read"))
+            .expect("state parse");
+    assert_eq!(process["status"], json!("running"));
+}
+
+/// A claim file truncated by a crash between `open` and the record write is
+/// empty and unlocked; like any dead-owner debris it is reclaimed rather than
+/// allowed to block retries forever.
+#[tokio::test]
+async fn retry_failed_reclaims_an_empty_claim_left_by_a_crash() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = write_retryable_fixture(temp.path(), "emptyop");
+    let claim_path = dir.join("process.retry-claim.tmp");
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    state.retry_launches = Some(launches.clone());
+    let router = dashboard_router(state);
+
+    std::fs::write(&claim_path, b"").expect("empty claim written");
+
+    let retried = post_json(
+        &router,
+        "/api/audiobooks/emptyop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::OK, "{retried:?}");
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert!(
+        retry_claim_released(&dir),
+        "the reclaimed claim must be released"
+    );
+    let process: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("process.json")).expect("state read"))
+            .expect("state parse");
+    assert_eq!(process["status"], json!("running"));
+}
+
+/// A non-empty claim file whose bytes are not a readable ownership record
+/// (the legacy rename-era layout carried process.json itself; a partial write
+/// carries garbage) is never destroyed: the retry fails closed with a
+/// distinct error naming the file and the operator's recovery step.
+#[tokio::test]
+async fn retry_failed_never_steals_unreadable_or_legacy_claims() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let _ = write_retryable_fixture(temp.path(), "weirdop");
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        temp.path().to_path_buf(),
+    ));
+    let claim_path = temp
+        .path()
+        .join("audiobook-weirdop/process.retry-claim.tmp");
+
+    std::fs::write(&claim_path, b"{\"status\":\"succeeded\",\"options\":{}}")
+        .expect("legacy claim written");
+
+    let loser = post_json(
+        &router,
+        "/api/audiobooks/weirdop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(loser.status(), StatusCode::CONFLICT);
+    let error = response_json(loser).await["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("unreadable claim"),
+        "the failure must name the unreadable claim: {error}"
+    );
+    assert!(
+        error.contains("delete that file"),
+        "the failure must carry the operator recovery step: {error}"
+    );
+    assert!(
+        claim_path.exists(),
+        "unreadable claims must never be stolen"
+    );
+}
+
+/// A claim file the process cannot read must fail closed, never be treated as
+/// an empty "safe to reclaim" claim, and never be overwritten. This is the
+/// regression for treating a read error as empty: an unverifiable file must
+/// not be destroyed. (Permissions-ext on Unix; Windows surfaces the same
+/// fail-closed through its read-only/deny sharing semantics.)
+#[cfg(unix)]
+#[tokio::test]
+async fn retry_failed_unreadable_claim_is_never_overwritten() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let _ = write_retryable_fixture(temp.path(), "chmodop");
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        temp.path().to_path_buf(),
+    ));
+    let claim_path = temp
+        .path()
+        .join("audiobook-chmodop/process.retry-claim.tmp");
+    let original = b"unknown bytes that must survive".to_vec();
+    std::fs::write(&claim_path, &original).expect("claim written");
+    std::fs::set_permissions(&claim_path, std::fs::Permissions::from_mode(0o000))
+        .expect("claim made unreadable");
+
+    let response = post_json(
+        &router,
+        "/api/audiobooks/chmodop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "an unreadable claim must never be reclaimed and spawn a retry"
+    );
+
+    std::fs::set_permissions(&claim_path, std::fs::Permissions::from_mode(0o600))
+        .expect("claim made readable again");
+    assert_eq!(
+        std::fs::read(&claim_path).expect("claim readable"),
+        original,
+        "an unreadable claim file must survive byte-for-byte"
+    );
+}
+
+/// The ownership nonce is the last line of defense for a late release: a
+/// claim released by a foreign nonce (an owner that was pre-empted, or a
+/// stale handle to the same directory) must not affect the current lock. In
+/// production the OS lock makes the check un-staleable; this pins the nonce
+/// guard itself.
+#[test]
+fn retry_claim_release_is_guarded_by_its_ownership_nonce() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let out_dir = temp.path().to_path_buf();
+    let holder = match acquire_retry_claim(&out_dir) {
+        Ok(RetryClaimAcquire::Owned(claim)) => claim,
+        other => panic!("the test owner must win its own claim: {other:?}"),
+    };
+    assert!(
+        !retry_claim_released(&out_dir),
+        "the owner holds a live claim"
+    );
+
+    RetryClaim::with_nonce(out_dir.clone(), "foreign-nonce").release();
+    assert!(
+        !retry_claim_released(&out_dir),
+        "a nonce-mismatched release must leave the live claim in place"
+    );
+
+    drop(holder);
+    assert!(
+        retry_claim_released(&out_dir),
+        "the owning release must empty the claim"
+    );
+}
+
+/// Failure paths below the claim release the claim (leaving durable state
+/// byte-for-byte intact) and release the launch slot, so a refused retry
+/// costs nothing and blocks nobody.
 #[tokio::test]
 async fn retry_failed_refusals_restore_state_and_release_the_launch_slot() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -4291,8 +4668,8 @@ async fn retry_failed_refusals_restore_state_and_release_the_launch_slot() {
     );
 
     assert!(
-        !dir.join("process.retry-claim.tmp").exists(),
-        "the claim must be rolled back after a refusal"
+        retry_claim_released(&dir),
+        "the claim must be released after a refusal"
     );
     assert_eq!(
         std::fs::read(dir.join("process.json")).expect("restored state"),
@@ -4303,4 +4680,49 @@ async fn retry_failed_refusals_restore_state_and_release_the_launch_slot() {
     // Launch-slot bookkeeping: nothing leaked from the refused request; four
     // more launches must still fit under the cap afterwards.
     assert_eq!(*launch_slots.lock().unwrap(), 0, "slot released");
+}
+
+/// A failed spawn unwinds through the same RAII guard: the atomic claim and
+/// the launch slot are both released, the phantom "running" marker is
+/// restored to the truthful prior state, and nothing is left behind for a
+/// retry to trip over.
+#[tokio::test]
+async fn retry_failed_spawn_failure_releases_claim_and_launch_slot() {
+    use std::sync::atomic::AtomicBool;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = write_retryable_fixture(temp.path(), "spawnfail");
+    let before = std::fs::read(dir.join("process.json")).expect("original state");
+
+    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    let launch_slots = Arc::clone(&state.launch_slots);
+    state.retry_fail_spawns = Some(Arc::new(AtomicBool::new(true)));
+    let router = dashboard_router(state);
+
+    let response = post_json(
+        &router,
+        "/api/audiobooks/spawnfail/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{response:?}"
+    );
+    assert!(
+        retry_claim_released(&dir),
+        "the atomic claim must be released when the spawn fails"
+    );
+    assert_eq!(
+        *launch_slots.lock().unwrap(),
+        0,
+        "the slot must be released"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("process.json")).expect("state read"),
+        before,
+        "the pre-retry process.json must survive a failed spawn byte-for-byte"
+    );
 }
