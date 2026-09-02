@@ -7,6 +7,7 @@ pub mod glossary;
 pub mod ir;
 pub mod marker;
 pub mod math;
+pub mod path;
 pub mod progress;
 pub mod providers;
 pub mod run_snapshot;

@@ -9,9 +9,14 @@
 //! same epoch constant as fallback — wall-clock time never enters the
 //! output.
 
-use std::{fs::File, io::Write, path::Path};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use zip::{CompressionMethod, DateTime, ZipWriter, write::SimpleFileOptions};
+use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
     Result,
@@ -102,7 +107,30 @@ pub fn write_epub(
     source_id: &str,
     modified: &str,
 ) -> Result<()> {
-    let file = File::create(output)?;
+    let (staged, file) = create_sibling_file(output, "pdf-epub")?;
+    let result = write_epub_file(file, blocks, title, language, source_id, modified)
+        .and_then(|()| validate_written_epub(&staged));
+    if let Err(error) = result {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    match publish_staged(&staged, output) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&staged);
+            Err(error)
+        }
+    }
+}
+
+fn write_epub_file(
+    file: File,
+    blocks: &[DocBlock],
+    title: &str,
+    language: &str,
+    source_id: &str,
+    modified: &str,
+) -> Result<()> {
     let mut zip = ZipWriter::new(file);
     let stored = pinned_zip_options(CompressionMethod::Stored);
     let deflated = pinned_zip_options(CompressionMethod::Deflated);
@@ -219,7 +247,32 @@ fn write_multi_chapter_epub(
     source_id: &str,
     modified: &str,
 ) -> Result<()> {
-    let file = File::create(output)?;
+    let (staged, file) = create_sibling_file(output, "pdf-epub")?;
+    let result =
+        write_multi_chapter_epub_file(file, blocks, chapters, title, language, source_id, modified)
+            .and_then(|()| validate_written_epub(&staged));
+    if let Err(error) = result {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    match publish_staged(&staged, output) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&staged);
+            Err(error)
+        }
+    }
+}
+
+fn write_multi_chapter_epub_file(
+    file: File,
+    blocks: &[DocBlock],
+    chapters: &[EpubChapter<'_>],
+    title: &str,
+    language: &str,
+    source_id: &str,
+    modified: &str,
+) -> Result<()> {
     let mut zip = ZipWriter::new(file);
     let stored = pinned_zip_options(CompressionMethod::Stored);
     let deflated = pinned_zip_options(CompressionMethod::Deflated);
@@ -251,6 +304,90 @@ fn write_multi_chapter_epub(
         zip.write_all(&asset.bytes)?;
     }
     zip.finish()?;
+    Ok(())
+}
+
+fn create_sibling_file(output: &Path, label: &str) -> Result<(PathBuf, File)> {
+    let name = output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("book.epub");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0..128u32 {
+        let path = output.with_file_name(format!(
+            ".{name}.bookforge-{label}-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(crate::PdfError::InvalidInput(format!(
+        "could not reserve a unique temporary EPUB path beside {}",
+        output.display()
+    )))
+}
+
+#[cfg(unix)]
+fn publish_staged(staged: &Path, output: &Path) -> Result<()> {
+    // On Unix, rename replaces the destination as one directory transaction.
+    // The old artifact is untouched until the staged EPUB has been completely
+    // written and validated above.
+    fs::rename(staged, output)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn publish_staged(staged: &Path, output: &Path) -> Result<()> {
+    // Windows cannot atomically rename over an existing file. Move the old
+    // good artifact aside only after the replacement is complete, restoring it
+    // if the second rename fails.
+    if !output.exists() {
+        fs::rename(staged, output)?;
+        return Ok(());
+    }
+
+    let backup = output.with_file_name(format!(
+        ".{}.bookforge-backup-{}",
+        output
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("book.epub"),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::rename(output, &backup)?;
+    match fs::rename(staged, output) {
+        Ok(()) => {
+            let _ = fs::remove_file(backup);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::rename(&backup, output);
+            Err(error.into())
+        }
+    }
+}
+
+fn validate_written_epub(path: &Path) -> Result<()> {
+    let mut archive = ZipArchive::new(File::open(path)?)?;
+    let mut mimetype = Vec::new();
+    archive.by_name("mimetype")?.read_to_end(&mut mimetype)?;
+    if mimetype != b"application/epub+zip" {
+        return Err(crate::PdfError::InvalidInput(
+            "generated EPUB has an invalid mimetype entry".to_string(),
+        ));
+    }
+    for name in ["META-INF/container.xml", "content.opf", "nav.xhtml"] {
+        archive.by_name(name)?;
+    }
     Ok(())
 }
 
@@ -725,6 +862,22 @@ mod tests {
             .expect("content reads");
         assert!(content.contains("<h1 id=\"head-0000\">"), "{content}");
         assert!(content.contains("<h3 id=\"head-0002\">"), "{content}");
+    }
+
+    #[test]
+    fn failed_publication_restores_existing_epub() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let output = dir.path().join("existing.epub");
+        let staged = dir.path().join("missing-stage.epub");
+        std::fs::write(&output, b"known-good").expect("existing EPUB writes");
+
+        let error = publish_staged(&staged, &output).expect_err("missing stage must fail");
+
+        assert!(!error.to_string().is_empty());
+        assert_eq!(
+            std::fs::read(&output).expect("existing EPUB remains"),
+            b"known-good"
+        );
     }
 
     #[test]

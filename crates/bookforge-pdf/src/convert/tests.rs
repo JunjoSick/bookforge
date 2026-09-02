@@ -389,6 +389,57 @@ fn remove_blocks_in_region_requires_horizontal_overlap() {
 }
 
 #[test]
+fn convert_rejects_input_output_alias_before_poppler_work() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = write_input_pdf(dir.path());
+    let fake = FakePoppler::new(TEXT_ONLY_XML, TEXT_ONLY_BASELINE);
+
+    let error =
+        match convert_pdf_with_tools(&input, &input, &ConvertOptions::default(), &fake, None) {
+            Ok(_) => panic!("input/output aliases must be rejected"),
+            Err(error) => error,
+        };
+    assert!(error.to_string().contains("must be different"));
+    assert_eq!(fake.call_count("pdf_to_xml"), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn convert_rejects_symlinked_input_output_alias() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = write_input_pdf(dir.path());
+    let output = dir.path().join("alias.epub");
+    std::os::unix::fs::symlink(&input, &output).expect("alias creates");
+    let fake = FakePoppler::new(TEXT_ONLY_XML, TEXT_ONLY_BASELINE);
+
+    let error =
+        match convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &fake, None) {
+            Ok(_) => panic!("symlink aliases must be rejected"),
+            Err(error) => error,
+        };
+    assert!(error.to_string().contains("must be different"));
+    assert_eq!(fake.call_count("pdf_to_xml"), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn convert_rejects_hardlinked_input_output_alias() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = write_input_pdf(dir.path());
+    let output = dir.path().join("hardlink.epub");
+    fs::hard_link(&input, &output).expect("hardlink creates");
+    let fake = FakePoppler::new(TEXT_ONLY_XML, TEXT_ONLY_BASELINE);
+
+    let error =
+        match convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &fake, None) {
+            Ok(_) => panic!("hardlink aliases must be rejected"),
+            Err(error) => error,
+        };
+    assert!(error.to_string().contains("must be different"));
+    assert_eq!(fake.call_count("pdf_to_xml"), 0);
+}
+
+#[test]
 fn remove_blocks_in_region_keeps_prose_like_blocks_as_text() {
     let mut blocks = vec![AnchoredBlock {
         block: DocBlock::Paragraph {
