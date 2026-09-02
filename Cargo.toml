@@ -44,6 +44,10 @@ zip = { version = "8.6", default-features = false, features = ["deflate-flate2-z
 rusqlite = { version = "0.39", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip", "brotli"], default-features = false }
 base64 = "0.23"
+# Advisory OS file locks (`flock` on Unix) for the retry-failed single-winner
+# claim. Tied to the process lifetime: the kernel drops the lock the instant
+# the owner dies, which is the only liveness verdict that can never be stale.
+libc = "0.2"
 
 # The profile that 'dist' will build with
 [profile.dist]
