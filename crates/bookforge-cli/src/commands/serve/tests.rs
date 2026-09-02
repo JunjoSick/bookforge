@@ -5,11 +5,19 @@ use axum::http::HeaderValue;
 const TEST_HOST: &str = "127.0.0.1:8765";
 const TEST_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn test_state(token: &str) -> AppState {
+/// An auth-on test state that has pre-established a session with the given id
+/// (so router tests authenticate by sending that value as the session cookie,
+/// without waiting for a real bootstrap exchange).
+fn test_state(session: &str) -> AppState {
+    test_state_opt(session, true)
+}
+
+fn test_state_opt(session: &str, auth_enabled: bool) -> AppState {
+    let auth = AuthState::new(auth_enabled).expect("auth state should build");
+    auth.seed_session(session);
     AppState {
         refresh: Duration::from_millis(250),
-        csrf_token: token.to_string(),
-        auth_enabled: true,
+        auth: Arc::new(auth),
         host_port: 8765,
         upload_dir: PathBuf::from(UPLOAD_DIR),
         keys: Arc::new(Mutex::new(HashMap::new())),
@@ -22,6 +30,7 @@ fn test_state(token: &str) -> AppState {
         resume_launches: None,
         resume_child_environments: None,
         retry_launches: None,
+        retry_fail_spawns: None,
         audio_restart_cancels: None,
     }
 }
@@ -31,17 +40,17 @@ fn test_state(token: &str) -> AppState {
 /// mutation endpoints against a temp-dir database without chdir'ing the
 /// (shared, per-process) current directory, which would race across
 /// parallel test threads.
-fn test_state_with_store(token: &str, store_path: PathBuf) -> AppState {
+fn test_state_with_store(session: &str, store_path: PathBuf) -> AppState {
     AppState {
         store_path,
-        ..test_state(token)
+        ..test_state(session)
     }
 }
 
-fn test_state_with_upload_dir(token: &str, upload_dir: PathBuf) -> AppState {
+fn test_state_with_upload_dir(session: &str, upload_dir: PathBuf) -> AppState {
     AppState {
         upload_dir,
-        ..test_state(token)
+        ..test_state(session)
     }
 }
 
@@ -263,13 +272,16 @@ async fn child_startup_check_reports_immediate_success_exit() -> Result<()> {
 }
 
 #[test]
-fn mutating_routes_require_dashboard_token() {
+fn mutating_routes_require_an_authenticated_session() {
     let state = test_state("token-123");
     let headers = HeaderMap::new();
     assert!(reject_mutation(&headers, &state).is_some());
 
     let mut headers = HeaderMap::new();
-    headers.insert(CSRF_HEADER, HeaderValue::from_static("token-123"));
+    headers.insert(
+        "cookie",
+        HeaderValue::from_static("bookforge_session=token-123"),
+    );
     assert!(reject_mutation(&headers, &state).is_none());
 }
 
@@ -277,7 +289,10 @@ fn mutating_routes_require_dashboard_token() {
 fn mutating_routes_reject_cross_site_browser_requests() {
     let state = test_state("token-123");
     let mut headers = HeaderMap::new();
-    headers.insert(CSRF_HEADER, HeaderValue::from_static("token-123"));
+    headers.insert(
+        "cookie",
+        HeaderValue::from_static("bookforge_session=token-123"),
+    );
     headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
 
     assert!(reject_mutation(&headers, &state).is_some());
@@ -566,7 +581,7 @@ async fn audiobook_launch_rejects_seed_before_spawning_a_doomed_child() {
             .method("POST")
             .uri("/api/audiobook")
             .header("host", TEST_HOST)
-            .header(CSRF_HEADER, "token-123")
+            .header("cookie", session_cookie_value("token-123"))
             .header("content-type", "multipart/form-data; boundary=B")
             .body(Body::from(body))
             .expect("request should build"),
@@ -651,7 +666,7 @@ async fn audiobook_estimate_matches_the_shared_launcher_chunk_plan() {
                 .method("POST")
                 .uri("/api/audiobook/estimate")
                 .header("host", TEST_HOST)
-                .header(CSRF_HEADER, "token-123")
+                .header("cookie", session_cookie_value("token-123"))
                 .header("content-type", "multipart/form-data; boundary=B")
                 .body(Body::from(body))
                 .expect("request should build"),
@@ -845,7 +860,7 @@ async fn audiobook_artifact_supports_ranges_and_rejects_unsatisfiable_ranges() {
             Request::builder()
                 .uri("/api/audiobooks/range-test/artifact")
                 .header("host", TEST_HOST)
-                .header(CSRF_HEADER, "token-123")
+                .header("cookie", session_cookie_value("token-123"))
                 .header("range", "bytes=2-5")
                 .body(Body::empty())
                 .expect("request should build"),
@@ -871,7 +886,7 @@ async fn audiobook_artifact_supports_ranges_and_rejects_unsatisfiable_ranges() {
             Request::builder()
                 .uri("/api/audiobooks/range-test/artifact")
                 .header("host", TEST_HOST)
-                .header(CSRF_HEADER, "token-123")
+                .header("cookie", session_cookie_value("token-123"))
                 .header("range", "bytes=20-")
                 .body(Body::empty())
                 .expect("request should build"),
@@ -891,6 +906,41 @@ fn audiobook_operation_ids_cannot_escape_the_upload_directory() {
     for invalid in ["", "../escape", "with/slash", "with.dot", "with space"] {
         assert!(!valid_audiobook_id(invalid), "accepted {invalid:?}");
     }
+}
+
+#[test]
+fn existing_audiobook_operation_resolves_only_a_direct_child_directory() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let operation = temp.path().join("audiobook-safe_id");
+    std::fs::create_dir(&operation).expect("operation dir should be created");
+
+    let resolved = existing_audiobook_operation_out_dir(temp.path(), "safe_id")
+        .expect("operation lookup should succeed")
+        .expect("direct child should resolve");
+    assert_eq!(resolved, operation.canonicalize().unwrap());
+    assert!(
+        existing_audiobook_operation_out_dir(temp.path(), "missing")
+            .expect("missing lookup should succeed")
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_audiobook_operation_rejects_a_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let upload_root = tempfile::tempdir().expect("upload root should be created");
+    let outside = tempfile::tempdir().expect("outside dir should be created");
+    symlink(outside.path(), upload_root.path().join("audiobook-escape"))
+        .expect("escape symlink should be created");
+
+    assert!(
+        existing_audiobook_operation_out_dir(upload_root.path(), "escape")
+            .expect("symlink lookup should succeed")
+            .is_none(),
+        "a symlink outside the canonical upload root must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -1010,7 +1060,7 @@ async fn translate_rejects_non_https_openai_compatible_base_url() {
                 .method("POST")
                 .uri("/api/translate")
                 .header("host", TEST_HOST)
-                .header(CSRF_HEADER, "token-123")
+                .header("cookie", session_cookie_value("token-123"))
                 .header("content-type", "multipart/form-data; boundary=B")
                 .body(Body::from(body))
                 .expect("request should build"),
@@ -1096,14 +1146,14 @@ fn dashboard_ships_store_curation_screens_and_audio_parity_controls() {
 fn dashboard_assets_reassemble_byte_stably() {
     use sha2::{Digest, Sha256};
 
-    assert_eq!(DASHBOARD_HTML.len(), 140_401);
+    assert_eq!(DASHBOARD_HTML.len(), 139_947);
     assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
     assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
     let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
     let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
         digest_hex,
-        "2ac98484cf857f01263d309f35bbce24768f9bd018e64c12b84c532d6e0cc2e3"
+        "b7acaffc1faebe59b8838d69c41a180875c29a289368f068303e6e9cf4c66c8d"
     );
 
     let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");
@@ -1138,25 +1188,31 @@ fn dashboard_ships_runtime_editor_and_inline_retry_guidance() {
 }
 
 #[test]
-fn dashboard_posts_include_csrf_header() {
-    assert!(DASHBOARD_HTML.contains(CSRF_TOKEN_PLACEHOLDER));
-    // The header literal lives inside the API-seam helpers now (see the
-    // fetch-seam test below); every browser call inherits it from there.
-    assert!(DASHBOARD_JS.contains("function bfAuthHeaders(extra)"));
+fn dashboard_js_never_reads_or_injects_a_session_credential() {
+    // Auth is a same-origin HttpOnly cookie: the browser JS must hold no
+    // secret — no header literal, no sessionStorage, no placeholder.
+    for forbidden_marker in ["sessionStorage", "x-bookforge-csrf", "__BOOKFORGE_"] {
+        assert!(
+            !DASHBOARD_JS.contains(forbidden_marker),
+            "dashboard.js contains a client-readable credential marker"
+        );
+    }
+    // Sign-out plumbing is present so the session can be ended from the UI.
+    assert!(DASHBOARD_JS.contains("async function bfSignOut"));
+    assert!(DASHBOARD_HTML.contains("onclick=\"bfSignOut()\""));
 }
 
-/// F2 regression net: reads used to bypass the session-CSRF header mutations
-/// carried, silently 401-ing entire screens once auth became default-on.
-/// Structural guarantee, not spot checks:
+/// Fetch-seam audit: the browser authenticates purely via the cookie, and
+/// every network call still routes through the single seam:
 ///
 /// 1. exactly one raw `fetch(` may exist, and only between the
-///    `BFAPISEAM-BEGIN`/`BFAPISEAM-END` markers where the header is stamped;
+///    `BFAPISEAM-BEGIN`/`BFAPISEAM-END` markers where `bfFetch` lives;
 /// 2. every screen's endpoints are asserted to reach the server through
 ///    `apiGet`/`apiSend`, covering Library, Progress polling, Review,
 ///    Glossary, Styles/Entities lists, Audiobook wizard/voices/status/
 ///    artifact hydration and the provider/options metadata bootstraps.
 #[test]
-fn dashboard_fetches_all_route_through_the_csrf_api_seam() {
+fn dashboard_fetches_all_route_through_the_cookie_api_seam() {
     const SEAM_BEGIN: &str = "BFAPISEAM-BEGIN";
     const SEAM_END: &str = "BFAPISEAM-END";
 
@@ -1171,7 +1227,7 @@ fn dashboard_fetches_all_route_through_the_csrf_api_seam() {
     assert_eq!(
         outside_seam, 0,
         "every raw fetch( must live between {SEAM_BEGIN}/{SEAM_END} \
-         and go through bfAuthHeaders/apiGet/apiSend"
+         and go through bfFetch/apiGet/apiSend"
     );
     assert!(
         total_fetch_calls >= 1,
@@ -1179,10 +1235,13 @@ fn dashboard_fetches_all_route_through_the_csrf_api_seam() {
     );
 
     for marker in [
-        // Header injection helper stamps the header name unconditionally.
-        "[CSRF_HEADER]: CSRF_TOKEN",
+        // The seam is a thin pass-through now: the HttpOnly session cookie
+        // rides along on the same-origin request automatically.
+        "function bfFetch(path, options)",
         "async function apiGet(",
         "async function apiSend(",
+        // Sign-out reuses the seam.
+        "await apiSend(\"/api/auth/logout\", { method: \"POST\" })",
         // Library: job list + audiobook list poll through the seam.
         "Promise.all([apiGet(\"/api/jobs\"), apiGet(\"/api/audiobooks\")])",
         // Narrate-from-library job hydration.
@@ -1220,8 +1279,8 @@ fn dashboard_fetches_all_route_through_the_csrf_api_seam() {
         assert!(js.contains(marker), "missing api-seam usage: {marker}");
     }
 
-    // Mutations with bodies keep their explicit content-type while the seam
-    // adds the session token on top.
+    // Mutations with bodies keep their explicit content-type; nothing else is
+    // added by the seam.
     for marker in [
         "\"content-type\": \"application/json\"",
         "{ method: \"DELETE\" }",
@@ -1346,7 +1405,7 @@ struct MutationFixture {
     job_id: String,
     segment_a: String,
     segment_b: String,
-    csrf: String,
+    session: String,
 }
 
 fn build_mutation_fixture() -> MutationFixture {
@@ -1492,17 +1551,17 @@ fn build_mutation_fixture_for_provider(
         job_id: job.id,
         segment_a: chapter_segments[0].id.0.clone(),
         segment_b: chapter_segments[1].id.0.clone(),
-        csrf: "fixture-csrf-token".to_string(),
+        session: "fixture-session-id".to_string(),
         _temp: temp,
     }
 }
 
-/// Sends `body` to `uri` with the given CSRF header value (or none), and
+/// Sends `body` to `uri` with the given session cookie value (or none), and
 /// returns the response.
 async fn post_json(
     router: &Router,
     uri: &str,
-    csrf: Option<&str>,
+    session: Option<&str>,
     body: serde_json::Value,
 ) -> Response {
     use axum::{body::Body, http::Request};
@@ -1513,8 +1572,8 @@ async fn post_json(
         .uri(uri)
         .header("host", TEST_HOST)
         .header("content-type", "application/json");
-    if let Some(token) = csrf {
-        builder = builder.header(CSRF_HEADER, token);
+    if let Some(session) = session {
+        builder = builder.header("cookie", session_cookie_value(session));
     }
     router
         .clone()
@@ -1531,7 +1590,7 @@ async fn post_json(
 async fn axum_put_json(
     router: &Router,
     uri: &str,
-    csrf: Option<&str>,
+    session: Option<&str>,
     body: serde_json::Value,
 ) -> Response {
     use axum::{body::Body, http::Request};
@@ -1542,8 +1601,8 @@ async fn axum_put_json(
         .uri(uri)
         .header("host", TEST_HOST)
         .header("content-type", "application/json");
-    if let Some(token) = csrf {
-        builder = builder.header(CSRF_HEADER, token);
+    if let Some(session) = session {
+        builder = builder.header("cookie", session_cookie_value(session));
     }
     router
         .clone()
@@ -1556,8 +1615,8 @@ async fn axum_put_json(
         .expect("route should respond")
 }
 
-/// DELETE with the given CSRF header value (or none).
-async fn axum_delete(router: &Router, uri: &str, csrf: Option<&str>) -> Response {
+/// DELETE with the given session cookie value (or none).
+async fn axum_delete(router: &Router, uri: &str, session: Option<&str>) -> Response {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
@@ -1565,8 +1624,8 @@ async fn axum_delete(router: &Router, uri: &str, csrf: Option<&str>) -> Response
         .method("DELETE")
         .uri(uri)
         .header("host", TEST_HOST);
-    if let Some(token) = csrf {
-        builder = builder.header(CSRF_HEADER, token);
+    if let Some(session) = session {
+        builder = builder.header("cookie", session_cookie_value(session));
     }
     router
         .clone()
@@ -1576,22 +1635,32 @@ async fn axum_delete(router: &Router, uri: &str, csrf: Option<&str>) -> Response
 }
 
 async fn get_route(router: &Router, uri: &str) -> Response {
-    get_route_with_token(router, uri, Some("token-123")).await
+    get_route_with_session(router, uri, Some("token-123")).await
 }
 
 async fn get_route_with_token(router: &Router, uri: &str, token: Option<&str>) -> Response {
+    get_route_with_session(router, uri, token).await
+}
+
+async fn get_route_with_session(router: &Router, uri: &str, session: Option<&str>) -> Response {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
     let mut builder = Request::builder().uri(uri).header("host", TEST_HOST);
-    if let Some(token) = token {
-        builder = builder.header(CSRF_HEADER, token);
+    if let Some(session) = session {
+        builder = builder.header("cookie", session_cookie_value(session));
     }
     router
         .clone()
         .oneshot(builder.body(Body::empty()).expect("request should build"))
         .await
         .expect("route should respond")
+}
+
+/// A `Cookie` header value carrying the given session id.
+fn session_cookie_value(session: &str) -> HeaderValue {
+    HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session}"))
+        .expect("session cookie header should parse")
 }
 
 async fn response_json(response: Response) -> serde_json::Value {
@@ -1621,12 +1690,12 @@ async fn dashboard_reconfigure_is_typed_revisioned_and_csrf_protected() {
     make_stopped_fixture_resumable(&fixture);
     clean_runtime_files(&fixture.job_id);
     let router = dashboard_router(test_state_with_store(
-        &fixture.csrf,
+        &fixture.session,
         fixture.store_path.clone(),
     ));
     let uri = format!("/api/jobs/{}/reconfigure", fixture.job_id);
 
-    let initial = get_route_with_token(&router, &uri, Some(&fixture.csrf)).await;
+    let initial = get_route_with_token(&router, &uri, Some(&fixture.session)).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let initial = response_json(initial).await;
     assert_eq!(initial["revision"], 0);
@@ -1652,7 +1721,7 @@ async fn dashboard_reconfigure_is_typed_revisioned_and_csrf_protected() {
     let unknown = post_json(
         &router,
         &uri,
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         json!({ "model": "immutable-model" }),
     )
     .await;
@@ -1665,7 +1734,7 @@ async fn dashboard_reconfigure_is_typed_revisioned_and_csrf_protected() {
     let first = post_json(
         &router,
         &uri,
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         json!({
             "batch_max_output_tokens": 12000,
             "batch_max_items": 2,
@@ -1703,7 +1772,7 @@ async fn dashboard_reconfigure_is_typed_revisioned_and_csrf_protected() {
     let second = post_json(
         &router,
         &uri,
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         json!({ "concurrency": 3 }),
     )
     .await;
@@ -1714,7 +1783,7 @@ async fn dashboard_reconfigure_is_typed_revisioned_and_csrf_protected() {
     assert_eq!(second["effective"]["batch_max_items"], 2);
 
     let replayed =
-        response_json(get_route_with_token(&router, &uri, Some(&fixture.csrf)).await).await;
+        response_json(get_route_with_token(&router, &uri, Some(&fixture.session)).await).await;
     assert_eq!(replayed["revision"], 2);
     assert_eq!(replayed["effective"]["concurrency"], 3);
 
@@ -1726,7 +1795,7 @@ async fn dashboard_controls_require_a_fresh_lease_and_signal_one_when_present() 
     let fixture = build_mutation_fixture();
     make_stopped_fixture_resumable(&fixture);
     clean_runtime_files(&fixture.job_id);
-    let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+    let mut state = test_state_with_store(&fixture.session, fixture.store_path.clone());
     state.runtime_lease_stale_after = Duration::from_millis(u64::MAX);
     let router = dashboard_router(state);
 
@@ -1734,7 +1803,7 @@ async fn dashboard_controls_require_a_fresh_lease_and_signal_one_when_present() 
         let response = post_json(
             &router,
             &format!("/api/jobs/{}/{}", fixture.job_id, command),
-            Some(&fixture.csrf),
+            Some(&fixture.session),
             json!({}),
         )
         .await;
@@ -1770,7 +1839,7 @@ async fn dashboard_controls_require_a_fresh_lease_and_signal_one_when_present() 
         get_route_with_token(
             &router,
             &format!("/api/jobs/{}/reconfigure", fixture.job_id),
-            Some(&fixture.csrf),
+            Some(&fixture.session),
         )
         .await,
     )
@@ -1782,7 +1851,7 @@ async fn dashboard_controls_require_a_fresh_lease_and_signal_one_when_present() 
     let resume = post_json(
         &router,
         &format!("/api/jobs/{}/resume", fixture.job_id),
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         json!({}),
     )
     .await;
@@ -1811,7 +1880,7 @@ async fn dashboard_resume_uses_remembered_key_in_scrubbed_child_environment() {
 
     let launches = Arc::new(AtomicUsize::new(0));
     let environments = Arc::new(Mutex::new(Vec::new()));
-    let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+    let mut state = test_state_with_store(&fixture.session, fixture.store_path.clone());
     lock_keys(&state).expect("key store should lock").extend([
         ("deepseek".to_string(), SESSION_KEY.to_string()),
         (
@@ -1826,7 +1895,7 @@ async fn dashboard_resume_uses_remembered_key_in_scrubbed_child_environment() {
     let response = post_json(
         &router,
         &format!("/api/jobs/{}/resume", fixture.job_id),
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         json!({}),
     )
     .await;
@@ -1867,14 +1936,14 @@ async fn dashboard_resume_without_required_key_returns_actionable_error() {
     clean_runtime_files(&fixture.job_id);
 
     let launches = Arc::new(AtomicUsize::new(0));
-    let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+    let mut state = test_state_with_store(&fixture.session, fixture.store_path.clone());
     state.resume_launches = Some(launches.clone());
     let router = dashboard_router(state);
 
     let response = post_json(
         &router,
         &format!("/api/jobs/{}/resume", fixture.job_id),
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         json!({}),
     )
     .await;
@@ -1908,7 +1977,7 @@ async fn dashboard_resume_accepts_and_remembers_replacement_key() {
 
     let launches = Arc::new(AtomicUsize::new(0));
     let environments = Arc::new(Mutex::new(Vec::new()));
-    let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+    let mut state = test_state_with_store(&fixture.session, fixture.store_path.clone());
     let keys = state.keys.clone();
     state.resume_launches = Some(launches.clone());
     state.resume_child_environments = Some(environments.clone());
@@ -1917,7 +1986,7 @@ async fn dashboard_resume_accepts_and_remembers_replacement_key() {
     let response = post_json(
         &router,
         &format!("/api/jobs/{}/resume", fixture.job_id),
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         json!({ "api_key": REPLACEMENT_KEY }),
     )
     .await;
@@ -1954,14 +2023,14 @@ async fn dashboard_missing_worker_resume_launches_exactly_once() {
     make_stopped_fixture_resumable(&fixture);
     clean_runtime_files(&fixture.job_id);
     let launches = Arc::new(AtomicUsize::new(0));
-    let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+    let mut state = test_state_with_store(&fixture.session, fixture.store_path.clone());
     state.resume_launches = Some(launches.clone());
     let router = dashboard_router(state);
     let uri = format!("/api/jobs/{}/resume", fixture.job_id);
 
     let (first, second) = tokio::join!(
-        post_json(&router, &uri, Some(&fixture.csrf), json!({})),
-        post_json(&router, &uri, Some(&fixture.csrf), json!({}))
+        post_json(&router, &uri, Some(&fixture.session), json!({})),
+        post_json(&router, &uri, Some(&fixture.session), json!({}))
     );
     assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(second.status(), StatusCode::OK);
@@ -2001,7 +2070,7 @@ async fn dashboard_resume_recognizes_finalize_only_work() {
     clean_runtime_files(&fixture.job_id);
 
     let launches = Arc::new(AtomicUsize::new(0));
-    let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+    let mut state = test_state_with_store(&fixture.session, fixture.store_path.clone());
     state.resume_launches = Some(launches.clone());
     let router = dashboard_router(state);
 
@@ -2009,7 +2078,7 @@ async fn dashboard_resume_recognizes_finalize_only_work() {
         get_route_with_token(
             &router,
             &format!("/api/jobs/{}/reconfigure", fixture.job_id),
-            Some(&fixture.csrf),
+            Some(&fixture.session),
         )
         .await,
     )
@@ -2020,7 +2089,7 @@ async fn dashboard_resume_recognizes_finalize_only_work() {
     let response = post_json(
         &router,
         &format!("/api/jobs/{}/resume", fixture.job_id),
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         json!({}),
     )
     .await;
@@ -2045,13 +2114,13 @@ async fn dashboard_resume_forces_relaunch_of_a_dead_paused_worker() {
     clean_runtime_files(&fixture.job_id);
 
     let launches = Arc::new(AtomicUsize::new(0));
-    let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+    let mut state = test_state_with_store(&fixture.session, fixture.store_path.clone());
     state.resume_launches = Some(launches.clone());
     let router = dashboard_router(state);
     let response = post_json(
         &router,
         &format!("/api/jobs/{}/resume", fixture.job_id),
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         json!({}),
     )
     .await;
@@ -2071,7 +2140,7 @@ async fn dashboard_resume_rejects_a_completed_job_without_work() {
     let fixture = build_mutation_fixture();
     clean_runtime_files(&fixture.job_id);
     let launches = Arc::new(AtomicUsize::new(0));
-    let mut state = test_state_with_store(&fixture.csrf, fixture.store_path.clone());
+    let mut state = test_state_with_store(&fixture.session, fixture.store_path.clone());
     state.resume_launches = Some(launches.clone());
     let router = dashboard_router(state);
 
@@ -2079,7 +2148,7 @@ async fn dashboard_resume_rejects_a_completed_job_without_work() {
         get_route_with_token(
             &router,
             &format!("/api/jobs/{}/reconfigure", fixture.job_id),
-            Some(&fixture.csrf),
+            Some(&fixture.session),
         )
         .await,
     )
@@ -2090,7 +2159,7 @@ async fn dashboard_resume_rejects_a_completed_job_without_work() {
     let response = post_json(
         &router,
         &format!("/api/jobs/{}/resume", fixture.job_id),
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         json!({}),
     )
     .await;
@@ -2159,7 +2228,7 @@ async fn correction_locks_serialize_one_job_and_not_two() {
 async fn save_manual_translation_rejects_missing_or_wrong_csrf_without_mutating_store() {
     let fixture = build_mutation_fixture();
     let router = dashboard_router(test_state_with_store(
-        &fixture.csrf,
+        &fixture.session,
         fixture.store_path.clone(),
     ));
     let uri = format!(
@@ -2187,7 +2256,7 @@ async fn save_manual_translation_rejects_missing_or_wrong_csrf_without_mutating_
 async fn set_segment_flag_rejects_missing_or_wrong_csrf_without_mutating_store() {
     let fixture = build_mutation_fixture();
     let router = dashboard_router(test_state_with_store(
-        &fixture.csrf,
+        &fixture.session,
         fixture.store_path.clone(),
     ));
     let uri = format!(
@@ -2216,7 +2285,7 @@ async fn set_segment_flag_rejects_missing_or_wrong_csrf_without_mutating_store()
 async fn retry_segment_rejects_missing_or_wrong_csrf_without_mutating_store() {
     let fixture = build_mutation_fixture();
     let router = dashboard_router(test_state_with_store(
-        &fixture.csrf,
+        &fixture.session,
         fixture.store_path.clone(),
     ));
     let uri = format!(
@@ -2259,7 +2328,7 @@ async fn dashboard_review_and_mutation_endpoints_end_to_end() {
 
     let fixture = build_mutation_fixture();
     let router = dashboard_router(test_state_with_store(
-        &fixture.csrf,
+        &fixture.session,
         fixture.store_path.clone(),
     ));
 
@@ -2271,7 +2340,7 @@ async fn dashboard_review_and_mutation_endpoints_end_to_end() {
             Request::builder()
                 .uri(&review_uri)
                 .header("host", TEST_HOST)
-                .header(CSRF_HEADER, &fixture.csrf)
+                .header("cookie", session_cookie_value(&fixture.session))
                 .body(Body::empty())
                 .expect("request should build"),
         )
@@ -2326,7 +2395,7 @@ async fn dashboard_review_and_mutation_endpoints_end_to_end() {
     let response = post_json(
         &router,
         &translation_uri,
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         correction_body,
     )
     .await;
@@ -2353,7 +2422,7 @@ async fn dashboard_review_and_mutation_endpoints_end_to_end() {
         let response = post_json(
             &router,
             &flag_uri,
-            Some(&fixture.csrf),
+            Some(&fixture.session),
             json!({ "flagged": flagged }),
         )
         .await;
@@ -2372,7 +2441,7 @@ async fn dashboard_review_and_mutation_endpoints_end_to_end() {
     let response = post_json(
         &router,
         &retry_uri,
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         json!({ "guidance": "Please redo more literally." }),
     )
     .await;
@@ -2403,7 +2472,7 @@ async fn dashboard_review_and_mutation_endpoints_end_to_end() {
     let response = post_json(
         &router,
         &retry_a_uri,
-        Some(&fixture.csrf),
+        Some(&fixture.session),
         json!({ "guidance": "try again" }),
     )
     .await;
@@ -2488,12 +2557,13 @@ async fn auth_on_requires_session_tokens_on_representative_api_routes() {
 }
 
 #[tokio::test]
-async fn root_exchange_bootstraps_browsers_without_leaking_the_token() {
+async fn root_exchange_mints_a_session_cookie_and_redirects_without_leaking() {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
-    let secret = "feedface-feedface-feedface";
-    let router = dashboard_router(test_state(secret));
+    let state = test_state("session-1");
+    let secret = state.auth.bootstrap_token();
+    let router = dashboard_router(state);
 
     // Anonymous GET / gets guidance only.
     let anonymous = router
@@ -2516,39 +2586,380 @@ async fn root_exchange_bootstraps_browsers_without_leaking_the_token() {
         login_page.contains("bookforge serve"),
         "points at the console link"
     );
-    assert!(!login_page.contains(secret));
-    assert!(!login_page.contains(CSRF_TOKEN_PLACEHOLDER));
+    assert!(!login_page.contains(&secret));
+    assert!(!login_page.contains("bookforge_session="));
 
     // Wrong ?token= is rejected without echoing the expected value.
     let rejected = get_route_with_token(&router, "/?token=deadbeef", None).await;
     assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
 
-    // Right ?token= gets the bootstrap page that seeds sessionStorage under
-    // the same header name every API fetch sends, mirroring the old CSRF
-    // wiring, then redirects to the clean root.
+    // Right ?token= exchanges for a 302 to the clean root plus an HttpOnly
+    // browser-session cookie. The bootstrap token is never echoed and never
+    // stored in the cookie — the cookie carries a fresh session id.
     let bootstrapped = get_route_with_token(&router, &format!("/?token={secret}"), None).await;
-    assert_eq!(bootstrapped.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(bootstrapped.into_body(), usize::MAX)
-        .await
-        .expect("bootstrap body should read");
-    let bootstrap = String::from_utf8(body.to_vec()).expect("page is utf-8");
-    assert!(bootstrap.contains(CSRF_HEADER));
-    assert!(bootstrap.contains(&format!(
-        "sessionStorage.setItem(\"{CSRF_HEADER}\", \"{secret}\")"
-    )));
-    assert!(bootstrap.contains("location.replace(\"/\")"));
-    assert!(!bootstrap.is_empty(), "bootstrap page served");
+    assert_eq!(bootstrapped.status(), StatusCode::FOUND);
+    assert_eq!(
+        bootstrapped.headers().get("location"),
+        Some(&HeaderValue::from_static("/")),
+        "redirect must land on the clean root, never echoing the token"
+    );
+    let set_cookie = bootstrapped
+        .headers()
+        .get("set-cookie")
+        .expect("session cookie issued")
+        .to_str()
+        .expect("cookie is ascii");
+    for attribute in [
+        "bookforge_session=",
+        "HttpOnly",
+        "SameSite=Strict",
+        "Path=/",
+    ] {
+        assert!(
+            set_cookie.contains(attribute),
+            "session cookie must carry {attribute:?}"
+        );
+    }
+    assert!(
+        !set_cookie.contains("Max-Age"),
+        "session cookie must be browser-session lifetime"
+    );
+    assert!(
+        !set_cookie.contains("Secure"),
+        "loopback HTTP must not require the Secure flag"
+    );
+    let session_id = set_cookie
+        .split(';')
+        .next()
+        .and_then(|pair| pair.strip_prefix("bookforge_session="))
+        .expect("cookie value");
+    assert_ne!(
+        session_id, secret,
+        "session id must not be the bootstrap token"
+    );
+    assert_eq!(
+        session_id.len(),
+        32,
+        "session ids are fresh 128-bit hex values"
+    );
+    assert!(session_id.chars().all(|ch| ch.is_ascii_hexdigit()));
 
-    // A caller already holding the header may load the dashboard directly.
-    let direct = get_route_with_token(&router, "/", Some(secret)).await;
+    // A caller holding the freshly minted session cookie loads the dashboard.
+    let direct = get_route_with_token(&router, "/", Some(session_id)).await;
     assert_eq!(direct.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(direct.into_body(), usize::MAX)
+    // ...while the bootstrap token alone is not a session credential.
+    let token_not_a_session = get_route_with_token(&router, "/", Some(&secret)).await;
+    let body = axum::body::to_bytes(token_not_a_session.into_body(), usize::MAX)
         .await
-        .expect("dashboard body should read");
-    let page = String::from_utf8(body.to_vec()).expect("dashboard is utf-8");
-    assert!(page.contains(&format!(
-        "const CSRF_TOKEN = sessionStorage.getItem(CSRF_HEADER) || \"{secret}\""
-    )));
+        .expect("login body should read");
+    let page = String::from_utf8(body.to_vec()).expect("page is utf-8");
+    assert!(
+        page.contains("bookforge serve"),
+        "bootstrap token alone logs nobody in"
+    );
+    assert!(!page.contains(&secret));
+}
+
+#[tokio::test]
+async fn bootstrap_token_is_single_use_and_replays_cannot_mint_a_second_session() {
+    let state = test_state("session-1");
+    let secret = state.auth.bootstrap_token();
+    let router = dashboard_router(state);
+
+    // First exchange succeeds and issues a session cookie.
+    let first = get_route_with_token(&router, &format!("/?token={secret}"), None).await;
+    assert_eq!(first.status(), StatusCode::FOUND);
+    assert!(
+        first.headers().get("set-cookie").is_some(),
+        "first exchange mints a session cookie"
+    );
+
+    // Replaying the exact console token is refused: no redirect, no cookie,
+    // and no second session is minted for the replayed link.
+    let replay = get_route_with_token(&router, &format!("/?token={secret}"), None).await;
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(replay.headers().get("set-cookie"), None);
+
+    // The consumed token is not a session credential either.
+    let as_session = get_route_with_token(&router, "/api/jobs", Some(&secret)).await;
+    assert_eq!(as_session.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn bootstrap_exchange_rejects_cross_site_browser_requests() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let state = test_state("session-1");
+    let secret = state.auth.bootstrap_token();
+    let router = dashboard_router(state);
+
+    // A cross-site browser request carrying ?token= is refused outright, so it
+    // can neither mint a session nor burn the failed-exchange limiter.
+    let cross_site = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/?token={secret}"))
+                .header("host", TEST_HOST)
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(cross_site.status(), StatusCode::FORBIDDEN);
+    assert_eq!(cross_site.headers().get("set-cookie"), None);
+
+    // The token is untouched: a normal top-level navigation still exchanges.
+    let nav = get_route_with_token(&router, &format!("/?token={secret}"), None).await;
+    assert_eq!(nav.status(), StatusCode::FOUND);
+    assert!(
+        nav.headers().get("set-cookie").is_some(),
+        "a non-cross-site navigation still exchanges the token"
+    );
+}
+
+#[tokio::test]
+async fn expired_bootstrap_token_gets_guidance_and_no_session() {
+    let state = test_state("session-1");
+    let secret = state.auth.bootstrap_token();
+    state.auth.expire_bootstrap_for_test();
+    let router = dashboard_router(state);
+
+    // The correct token past its TTL gets the helpful expiry page (200), not
+    // an authenticated dashboard and not a session cookie.
+    let expired = get_route_with_token(&router, &format!("/?token={secret}"), None).await;
+    assert_eq!(expired.status(), StatusCode::OK);
+    assert_eq!(expired.headers().get("set-cookie"), None);
+    let body = axum::body::to_bytes(expired.into_body(), usize::MAX)
+        .await
+        .expect("expiry body should read");
+    let page = String::from_utf8(body.to_vec()).expect("page is utf-8");
+    assert!(
+        page.contains("expired"),
+        "expiry screen gives actionable guidance"
+    );
+    assert!(
+        !page.contains(&secret),
+        "expiry screen never echoes the token"
+    );
+
+    // API routes remain unauthenticated.
+    let rejected = get_route_with_token(&router, "/api/jobs", None).await;
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn failed_bootstrap_exchanges_are_bounded_by_the_limiter() {
+    let state = test_state("session-1");
+    let secret = state.auth.bootstrap_token();
+    let router = dashboard_router(state);
+
+    // Wrong guesses are all refused (401, no leak), then the limiter trips and
+    // even the correct token is refused within the same window.
+    for _ in 0..8 {
+        let rejected = get_route_with_token(&router, "/?token=deadbeef", None).await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+    let locked_out = get_route_with_token(&router, &format!("/?token={secret}"), None).await;
+    assert_eq!(locked_out.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(locked_out.into_body(), usize::MAX)
+        .await
+        .expect("rejection body should read");
+    let body = String::from_utf8(body.to_vec()).expect("body is utf-8");
+    assert!(!body.contains(&secret), "rejections never echo the token");
+}
+
+#[tokio::test]
+async fn logout_invalidates_the_session_and_expires_the_cookie() {
+    let state = test_state("token-123");
+    let router = dashboard_router(state);
+
+    // Authenticated first.
+    let jobs = get_route_with_token(&router, "/api/jobs", Some("token-123")).await;
+    assert_eq!(jobs.status(), StatusCode::OK);
+
+    // POST /api/auth/logout with the session cookie: 204 + expiring cookie.
+    let logout = post_json(&router, "/api/auth/logout", Some("token-123"), json!({})).await;
+    assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    let set_cookie = logout
+        .headers()
+        .get("set-cookie")
+        .expect("logout sends an expiring cookie")
+        .to_str()
+        .expect("cookie is ascii");
+    assert!(set_cookie.contains("Max-Age=0"), "cookie must be expired");
+    assert!(set_cookie.contains("HttpOnly"));
+
+    // The invalidated session no longer authenticates any protected route.
+    let after = get_route_with_token(&router, "/api/jobs", Some("token-123")).await;
+    assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(after.into_body(), usize::MAX)
+        .await
+        .expect("rejection body should read");
+    let body = String::from_utf8(body.to_vec()).expect("body is utf-8");
+    assert!(
+        !body.contains("token-123"),
+        "rejections never echo the session"
+    );
+
+    // Logout is idempotent: clearing an already-dead session is still 204.
+    let again = post_json(&router, "/api/auth/logout", Some("token-123"), json!({})).await;
+    assert_eq!(again.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn unauthenticated_api_routes_are_rejected_with_a_bare_401() {
+    let state = test_state("token-123");
+    let router = dashboard_router(state);
+
+    for uri in ["/api/jobs", "/api/options", "/api/audiobooks"] {
+        let response = get_route_with_token(&router, uri, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("rejection body should read");
+        let body = String::from_utf8(body.to_vec()).expect("body is utf-8");
+        assert!(
+            !body.contains("token-123"),
+            "401 bodies must not echo the expected credential ({uri})"
+        );
+    }
+
+    // A wrong cookie is as opaque as a missing one.
+    let wrong = get_route_with_token(&router, "/api/jobs", Some("wrong-session")).await;
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mutations_are_gated_by_authenticated_session_and_same_origin() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let state = test_state_with_store("token-123", temp.path().join("jobs.sqlite"));
+    let router = dashboard_router(state);
+
+    // Valid session cookie but a cross-site fetch-metadata marker: refused.
+    let cross_site = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/jobs/not-real/retry")
+                .header("host", TEST_HOST)
+                .header("cookie", session_cookie_value("token-123"))
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(cross_site.status(), StatusCode::FORBIDDEN);
+
+    // Same-origin with a valid session passes both gates and reaches the
+    // handler (an unknown job on an empty store -> "retried": 0).
+    let same_origin = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/jobs/not-real/retry")
+                .header("host", TEST_HOST)
+                .header("cookie", session_cookie_value("token-123"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+    assert_ne!(same_origin.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(same_origin.status(), StatusCode::FORBIDDEN);
+    assert_eq!(same_origin.status(), StatusCode::OK);
+}
+
+/// No token or session id may appear in any response a browser can read:
+/// the dashboard HTML, the login pages, and the API JSON.
+#[tokio::test]
+async fn no_secret_ever_reaches_dashboard_bytes_or_api_responses() {
+    let state = test_state("session-1");
+    let secret = state.auth.bootstrap_token();
+    let router = dashboard_router(state);
+
+    // Authenticated dashboard HTML.
+    let index = get_route_with_token(&router, "/", Some("session-1")).await;
+    assert_eq!(index.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(index.into_body(), usize::MAX)
+        .await
+        .expect("index body should read");
+    let page = String::from_utf8(body.to_vec()).expect("index is utf-8");
+    assert!(
+        !page.contains(&secret),
+        "bootstrap token must not appear in HTML"
+    );
+    assert!(
+        !page.contains("session-1"),
+        "session id must not appear in HTML"
+    );
+
+    // Authenticated API JSON.
+    let options = get_route_with_token(&router, "/api/options", Some("session-1")).await;
+    assert_eq!(options.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(options.into_body(), usize::MAX)
+        .await
+        .expect("options body should read");
+    let options = String::from_utf8(body.to_vec()).expect("options is utf-8");
+    assert!(
+        !options.contains(&secret),
+        "API JSON must not leak the bootstrap token"
+    );
+    assert!(
+        !options.contains("session-1"),
+        "API JSON must not leak the session id"
+    );
+
+    // Login page.
+    let login = get_route_with_token(&router, "/", None).await;
+    let body = axum::body::to_bytes(login.into_body(), usize::MAX)
+        .await
+        .expect("login body should read");
+    let login = String::from_utf8(body.to_vec()).expect("login is utf-8");
+    assert!(!login.contains(&secret));
+    assert!(!login.contains("session-1"));
+}
+
+#[tokio::test]
+async fn no_auth_restores_the_previous_unauthenticated_behavior() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let state = AppState {
+        store_path: temp.path().join("jobs.sqlite"),
+        ..test_state_opt("quiet-token", false)
+    };
+    let router = dashboard_router(state);
+
+    // Reads reach handlers without any session credential...
+    let jobs = get_route_with_token(&router, "/api/jobs", None).await;
+    assert_eq!(jobs.status(), StatusCode::OK);
+    // ...and / serves the full dashboard with no token or session id embedded
+    // anywhere in the bytes.
+    let index = get_route_with_token(&router, "/", None).await;
+    assert_eq!(index.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(index.into_body(), usize::MAX)
+        .await
+        .expect("index body should read");
+    let page = String::from_utf8(body.to_vec()).expect("page is utf-8");
+    assert!(
+        !page.contains("quiet-token"),
+        "--no-auth must never embed a session id"
+    );
+    assert!(!page.contains("bookforge_session="));
+    assert!(!page.contains("sessionStorage"));
+
+    // Mutations skip the session gate entirely (only same-origin checks apply):
+    // with no cookie this reaches the handler rather than 401/403.
+    let retry = post_json(&router, "/api/jobs/not-real/retry", None, json!({})).await;
+    assert_ne!(retry.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(retry.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -2584,33 +2995,6 @@ async fn hardened_headers_stamp_every_response_not_just_the_index() {
     }
 }
 
-#[tokio::test]
-async fn no_auth_restores_the_previous_unauthenticated_behavior() {
-    let temp = tempfile::tempdir().expect("temp dir should be created");
-    let mut state = test_state_with_store("quiet-token", temp.path().join("jobs.sqlite"));
-    state.auth_enabled = false;
-    let router = dashboard_router(state);
-
-    // Reads reach handlers without any session credential...
-    let jobs = get_route_with_token(&router, "/api/jobs", None).await;
-    assert_eq!(jobs.status(), StatusCode::OK);
-    // ...and / once again serves the full dashboard with its embedded CSRF
-    // token (still CSRF-guarded per mutation by the legacy checks).
-    let index = get_route_with_token(&router, "/", None).await;
-    assert_eq!(index.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(index.into_body(), usize::MAX)
-        .await
-        .expect("index body should read");
-    let page = String::from_utf8(body.to_vec()).expect("page is utf-8");
-    assert!(
-        page.contains("quiet-token"),
-        "--no-auth embeds the CSRF token again"
-    );
-    // Mutations keep the legacy cross-site/CSRF rejection shape (403).
-    let retry = post_json(&router, "/api/jobs/not-real/retry", None, json!({})).await;
-    assert_eq!(retry.status(), StatusCode::FORBIDDEN);
-}
-
 #[test]
 fn valid_job_id_mirrors_audiobook_id_strictness() {
     for valid in ["job_1750000000000000000_deadbeef1234", "a", "x-9_Z"] {
@@ -2635,7 +3019,7 @@ fn valid_job_id_mirrors_audiobook_id_strictness() {
 async fn traversal_job_ids_are_refused_before_touching_the_filesystem() {
     let fixture = build_mutation_fixture();
     let router = dashboard_router(test_state_with_store(
-        &fixture.csrf,
+        &fixture.session,
         fixture.store_path.clone(),
     ));
 
@@ -2647,7 +3031,7 @@ async fn traversal_job_ids_are_refused_before_touching_the_filesystem() {
         let response = get_route_with_token(
             &router,
             &format!("/api/jobs/{encoded}/review"),
-            Some(&fixture.csrf),
+            Some(&fixture.session),
         )
         .await;
         assert!(
@@ -2887,7 +3271,7 @@ async fn estimate_endpoint_parses_upload_from_a_private_temp_dir_end_to_end() {
             .method("POST")
             .uri("/api/estimate")
             .header("host", TEST_HOST)
-            .header(CSRF_HEADER, "token-123")
+            .header("cookie", session_cookie_value("token-123"))
             .header("content-type", "multipart/form-data; boundary=B")
             .body(Body::from(body))
             .expect("request should build"),
@@ -3788,6 +4172,39 @@ fn write_retryable_fixture(temp: &std::path::Path, id: &str) -> PathBuf {
 // F3: retry-failed double-click protection (atomic claim + launch slot)
 // -----------------------------------------------------------------------
 
+/// Materialize a retry claim file the way the production owner would — a
+/// readable ownership record with no OS lock held. Without the lock, the file
+/// models a claim whose owner is dead (the kernel dropped the lock), which is
+/// the exact state a next retry may reclaim.
+fn write_retry_claim(claim_path: &Path) {
+    std::fs::write(
+        claim_path,
+        serde_json::to_vec(&json!({
+            "nonce": "test-nonce",
+            "pid": 0,
+            "claimed_at_ms": now_ms(),
+        }))
+        .expect("claim should serialize"),
+    )
+    .expect("claim written");
+}
+
+/// True when the retry claim file is not held by a live owner: either absent
+/// or emptied by its last owner's release. The claim file keeps a stable
+/// identity and is never unlinked, so "released" means empty-and-unlocked.
+fn retry_claim_released(out_dir: &std::path::Path) -> bool {
+    match std::fs::read(out_dir.join("process.retry-claim.tmp")) {
+        Ok(bytes) => bytes.is_empty(),
+        Err(_) => true,
+    }
+}
+
+/// A live owner holds the OS lock on the retry claim: the loser is refused
+/// with 409 "retry already starting", must not steal the lock, mutate durable
+/// state, or spend a launch slot, and the live claim survives untouched. The
+/// lock is held exactly the way a real owner holds it — not simulated by an
+/// old timestamp, which is precisely what used to let one retry steal a live
+/// but slow owner's claim.
 #[tokio::test]
 async fn retry_failed_conflicts_while_another_retry_holds_the_claim() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -3796,14 +4213,18 @@ async fn retry_failed_conflicts_while_another_retry_holds_the_claim() {
         temp.path().to_path_buf(),
     ));
     let dir = write_retryable_fixture(temp.path(), "claimedop");
+    let claim_path = dir.join("process.retry-claim.tmp");
 
-    // Simulate a first retry sitting between its atomic rename and its spawn:
-    // process.json has been claimed away and the claim temp exists.
-    std::fs::rename(
-        dir.join("process.json"),
-        dir.join("process.retry-claim.tmp"),
-    )
-    .expect("claim simulated");
+    // A concurrent retry is mid-handoff: it owns the claim and keeps the OS
+    // lock until its handler returns.
+    let holder = match acquire_retry_claim(&dir) {
+        Ok(RetryClaimAcquire::Owned(claim)) => claim,
+        other => panic!("the test owner must win its own claim: {other:?}"),
+    };
+    assert!(
+        holder.is_published_for_test(),
+        "the owner holds a live claim"
+    );
 
     let loser = post_json(
         &router,
@@ -3817,14 +4238,30 @@ async fn retry_failed_conflicts_while_another_retry_holds_the_claim() {
         response_json(loser).await["error"],
         json!("retry already starting")
     );
+    assert!(
+        holder.is_published_for_test(),
+        "a live claim must survive a losing request untouched"
+    );
+    assert!(claim_path.exists(), "the live claim file must still exist");
+    let process: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("process.json")).expect("state read"))
+            .expect("state parse");
+    assert_eq!(
+        process["status"],
+        json!("succeeded"),
+        "the loser must not mutate durable state"
+    );
+
+    // The owner finishes its handoff: dropping the claim empties it and
+    // releases the lock, leaving nothing a future retry could trip over.
+    drop(holder);
+    assert!(
+        retry_claim_released(&dir),
+        "the owner's release must leave the claim empty and unlocked"
+    );
 
     // The settled (`running`) branch keeps its distinct refusal so operators
     // can tell "in flight" from "starting up".
-    std::fs::rename(
-        dir.join("process.retry-claim.tmp"),
-        dir.join("process.json"),
-    )
-    .expect("restore original state");
     let mut process: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("process.json")).expect("state read"))
             .expect("state parse");
@@ -3845,75 +4282,402 @@ async fn retry_failed_conflicts_while_another_retry_holds_the_claim() {
     );
 }
 
-/// Concurrent handler calls against one shared AppState (the harness shape
-/// used by the SERVE-6 slot-cap tests): exactly one of the two simultaneous
+/// A live owner is refused even when its claim bytes never parsed (a crash
+/// mid-write can leave exactly that shape). Fail-closed must follow the OS
+/// lock, never the readability of the file.
+#[tokio::test]
+async fn retry_failed_refuses_live_owner_even_with_unreadable_claim() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let _ = write_retryable_fixture(temp.path(), "garbageop");
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        temp.path().to_path_buf(),
+    ));
+    let claim_path = temp
+        .path()
+        .join("audiobook-garbageop/process.retry-claim.tmp");
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&claim_path)
+        .expect("claim opened");
+    assert!(
+        try_lock_claim(&file).expect("lock attempt should succeed"),
+        "the test owner must hold the claim lock"
+    );
+    std::io::Write::write_all(&mut file, b"{\"status\":\"succeeded\",\"options\":{}}")
+        .expect("unreadable bytes written");
+
+    let loser = post_json(
+        &router,
+        "/api/audiobooks/garbageop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(loser.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(loser).await["error"],
+        json!("retry already starting")
+    );
+    assert!(
+        claim_path.exists(),
+        "a live owner's file must be untouched even if its bytes are foreign"
+    );
+    drop(file);
+}
+
+/// Two independent dashboard routers (separate AppState, one shared upload
+/// directory) racing one operation: exactly one of the two simultaneous
 /// "double clicks" may spawn; the other must be refused without spending.
+/// The OS lock arbitrates across processes, so the routers share no in-memory
+/// state. Replayed across fresh fixtures so the claim seam is stressed — a
+/// single pass is what the pre-fix Windows race broke, where a rename-based
+/// claim let both callers "win".
 #[tokio::test]
 async fn retry_failed_double_click_starts_exactly_one_operation() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let temp = tempfile::tempdir().expect("temp dir");
-    let _ = write_retryable_fixture(temp.path(), "racecase");
-
-    let launches = Arc::new(AtomicUsize::new(0));
-    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    let launches_a = Arc::new(AtomicUsize::new(0));
+    let launches_b = Arc::new(AtomicUsize::new(0));
+    let mut state_a = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
     // Test hook (parity with resume_launches): records the relaunch instead
     // of exec'ing this binary as an audiobook child.
-    state.retry_launches = Some(launches.clone());
-    let router = dashboard_router(state);
+    state_a.retry_launches = Some(launches_a.clone());
+    let mut state_b = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    state_b.retry_launches = Some(launches_b.clone());
+    let router_a = dashboard_router(state_a);
+    let router_b = dashboard_router(state_b);
 
-    let (winner, loser) = tokio::join!(
-        post_json(
-            &router,
-            "/api/audiobooks/racecase/retry-failed",
-            Some("token-123"),
-            json!({}),
-        ),
-        post_json(
-            &router,
-            "/api/audiobooks/racecase/retry-failed",
-            Some("token-123"),
-            json!({}),
-        ),
-    );
+    const ROUNDS: usize = 3;
+    for round in 0..ROUNDS {
+        let id = format!("racecase{round}");
+        let _ = write_retryable_fixture(temp.path(), &id);
+        let uri = format!("/api/audiobooks/{id}/retry-failed");
 
-    let statuses = [
-        (winner.status(), response_json(winner).await),
-        (loser.status(), response_json(loser).await),
-    ];
-    let successes = statuses
-        .iter()
-        .filter(|(status, _)| *status == StatusCode::OK)
-        .count();
-    let conflicts = statuses
-        .iter()
-        .filter(|(status, _)| *status == StatusCode::CONFLICT)
-        .count();
-    assert_eq!(successes, 1, "exactly one click wins: {statuses:?}");
-    assert_eq!(conflicts, 1, "the losing click is refused: {statuses:?}");
+        let (winner, loser) = tokio::join!(
+            post_json(&router_a, &uri, Some("token-123"), json!({})),
+            post_json(&router_b, &uri, Some("token-123"), json!({})),
+        );
+
+        let statuses = [
+            (winner.status(), response_json(winner).await),
+            (loser.status(), response_json(loser).await),
+        ];
+        let successes = statuses
+            .iter()
+            .filter(|(status, _)| *status == StatusCode::OK)
+            .count();
+        let conflicts = statuses
+            .iter()
+            .filter(|(status, _)| *status == StatusCode::CONFLICT)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "round {round} must have exactly one winner: {statuses:?}"
+        );
+        assert_eq!(
+            conflicts, 1,
+            "round {round} the losing click is refused: {statuses:?}"
+        );
+
+        // The winner leaves durable `running` state and no live claim behind:
+        // a concurrent retry after the release sees the transition and must
+        // refuse rather than launch a second job.
+        let out_dir = temp.path().join(format!("audiobook-{id}"));
+        let process: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(out_dir.join("process.json")).expect("state read"),
+        )
+        .expect("state parse");
+        assert_eq!(process["status"], json!("running"), "round {round}");
+        assert!(
+            retry_claim_released(&out_dir),
+            "round {round}: no live claim may survive the successful relaunch"
+        );
+
+        // A retry arriving after the winner released must be refused by the
+        // durable transition, never spawn a second job.
+        let late = post_json(&router_a, &uri, Some("token-123"), json!({})).await;
+        assert_eq!(
+            late.status(),
+            StatusCode::CONFLICT,
+            "round {round}: a late retry must be refused: {late:?}"
+        );
+    }
+
     assert_eq!(
-        launches.load(Ordering::SeqCst),
-        1,
-        "only one child may start regardless of interleaving"
-    );
-
-    // The winner leaves durable `running` state; no stray claim temp survives.
-    let process: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(temp.path().join("audiobook-racecase/process.json")).expect("state read"),
-    )
-    .expect("state parse");
-    assert_eq!(process["status"], json!("running"));
-    assert!(
-        !temp
-            .path()
-            .join("audiobook-racecase/process.retry-claim.tmp")
-            .exists(),
-        "the atomic claim must be consumed by the successful relaunch"
+        launches_a.load(Ordering::SeqCst) + launches_b.load(Ordering::SeqCst),
+        ROUNDS,
+        "only one child may start per round regardless of interleaving"
     );
 }
 
-/// Failure paths below the claim restore the durable state file and release
-/// the launch slot, so a refused retry costs nothing and blocks nobody.
+/// A heavier mob of simultaneous clicks against one operation, up to the
+/// SERVE-6 launch-slot cap: exactly one request may spawn, every other must
+/// be refused, and the losing requests must leave no live claim or slot
+/// behind.
+#[tokio::test]
+async fn retry_failed_many_simultaneous_clicks_spawn_exactly_one() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let _ = write_retryable_fixture(temp.path(), "mobclick");
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    state.retry_launches = Some(launches.clone());
+    let router = dashboard_router(state);
+
+    // At most this many requests may hold a launch slot simultaneously; any
+    // more would be refused with 429 before reaching the claim, so sizing the
+    // mob at the cap makes every click fight for the claim.
+    const CONCURRENT: usize = MAX_CONCURRENT_DASHBOARD_LAUNCHES;
+    let mut clicks = Vec::new();
+    for _ in 0..CONCURRENT {
+        let router = router.clone();
+        clicks.push(tokio::spawn(async move {
+            post_json(
+                &router,
+                "/api/audiobooks/mobclick/retry-failed",
+                Some("token-123"),
+                json!({}),
+            )
+            .await
+        }));
+    }
+
+    let mut ok = 0;
+    let mut conflict = 0;
+    for click in clicks {
+        let response = click.await.expect("click task should join");
+        match response.status() {
+            StatusCode::OK => ok += 1,
+            StatusCode::CONFLICT => conflict += 1,
+            other => panic!("unexpected retry status {other}"),
+        }
+    }
+    assert_eq!(ok, 1, "exactly one of {CONCURRENT} clicks may spawn");
+    assert_eq!(conflict, CONCURRENT - 1, "every other click is refused");
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    let out_dir = temp.path().join("audiobook-mobclick");
+    assert!(
+        retry_claim_released(&out_dir),
+        "no live claim may survive the mob"
+    );
+    let process: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out_dir.join("process.json")).expect("state read"))
+            .expect("state parse");
+    assert_eq!(process["status"], json!("running"));
+}
+
+/// A claim whose owner died mid-handoff is a file with a readable record but
+/// no OS lock (the kernel dropped the lock on death). The next retry takes
+/// the lock, reclaims the claim, relaunches, and leaves no live claim behind —
+/// dead owners are recovered without any age guess.
+#[tokio::test]
+async fn retry_failed_reclaims_claim_left_by_crashed_owner() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = write_retryable_fixture(temp.path(), "crashop");
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    state.retry_launches = Some(launches.clone());
+    let router = dashboard_router(state);
+
+    write_retry_claim(&dir.join("process.retry-claim.tmp"));
+
+    let retried = post_json(
+        &router,
+        "/api/audiobooks/crashop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::OK, "{retried:?}");
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        1,
+        "the dead owner's claim must be reclaimed and the relaunch proceeds"
+    );
+    assert!(
+        retry_claim_released(&dir),
+        "the reclaimed claim must be released by its new owner"
+    );
+    let process: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("process.json")).expect("state read"))
+            .expect("state parse");
+    assert_eq!(process["status"], json!("running"));
+}
+
+/// A claim file truncated by a crash between `open` and the record write is
+/// empty and unlocked; like any dead-owner debris it is reclaimed rather than
+/// allowed to block retries forever.
+#[tokio::test]
+async fn retry_failed_reclaims_an_empty_claim_left_by_a_crash() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = write_retryable_fixture(temp.path(), "emptyop");
+    let claim_path = dir.join("process.retry-claim.tmp");
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    state.retry_launches = Some(launches.clone());
+    let router = dashboard_router(state);
+
+    std::fs::write(&claim_path, b"").expect("empty claim written");
+
+    let retried = post_json(
+        &router,
+        "/api/audiobooks/emptyop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::OK, "{retried:?}");
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert!(
+        retry_claim_released(&dir),
+        "the reclaimed claim must be released"
+    );
+    let process: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("process.json")).expect("state read"))
+            .expect("state parse");
+    assert_eq!(process["status"], json!("running"));
+}
+
+/// A non-empty claim file whose bytes are not a readable ownership record
+/// (the legacy rename-era layout carried process.json itself; a partial write
+/// carries garbage) is never destroyed: the retry fails closed with a
+/// distinct error naming the file and the operator's recovery step.
+#[tokio::test]
+async fn retry_failed_never_steals_unreadable_or_legacy_claims() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let _ = write_retryable_fixture(temp.path(), "weirdop");
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        temp.path().to_path_buf(),
+    ));
+    let claim_path = temp
+        .path()
+        .join("audiobook-weirdop/process.retry-claim.tmp");
+
+    std::fs::write(&claim_path, b"{\"status\":\"succeeded\",\"options\":{}}")
+        .expect("legacy claim written");
+
+    let loser = post_json(
+        &router,
+        "/api/audiobooks/weirdop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(loser.status(), StatusCode::CONFLICT);
+    let error = response_json(loser).await["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("unreadable claim"),
+        "the failure must name the unreadable claim: {error}"
+    );
+    assert!(
+        error.contains("delete that file"),
+        "the failure must carry the operator recovery step: {error}"
+    );
+    assert!(
+        claim_path.exists(),
+        "unreadable claims must never be stolen"
+    );
+}
+
+/// A claim file the process cannot read must fail closed, never be treated as
+/// an empty "safe to reclaim" claim, and never be overwritten. This is the
+/// regression for treating a read error as empty: an unverifiable file must
+/// not be destroyed. (Permissions-ext on Unix; Windows surfaces the same
+/// fail-closed through its read-only/deny sharing semantics.)
+#[cfg(unix)]
+#[tokio::test]
+async fn retry_failed_unreadable_claim_is_never_overwritten() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let _ = write_retryable_fixture(temp.path(), "chmodop");
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        temp.path().to_path_buf(),
+    ));
+    let claim_path = temp
+        .path()
+        .join("audiobook-chmodop/process.retry-claim.tmp");
+    let original = b"unknown bytes that must survive".to_vec();
+    std::fs::write(&claim_path, &original).expect("claim written");
+    std::fs::set_permissions(&claim_path, std::fs::Permissions::from_mode(0o000))
+        .expect("claim made unreadable");
+
+    let response = post_json(
+        &router,
+        "/api/audiobooks/chmodop/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "an unreadable claim must never be reclaimed and spawn a retry"
+    );
+
+    std::fs::set_permissions(&claim_path, std::fs::Permissions::from_mode(0o600))
+        .expect("claim made readable again");
+    assert_eq!(
+        std::fs::read(&claim_path).expect("claim readable"),
+        original,
+        "an unreadable claim file must survive byte-for-byte"
+    );
+}
+
+/// The ownership nonce is the last line of defense for a late release: a
+/// claim released by a foreign nonce (an owner that was pre-empted, or a
+/// stale handle to the same directory) must not affect the current lock. In
+/// production the OS lock makes the check un-staleable; this pins the nonce
+/// guard itself.
+#[test]
+fn retry_claim_release_is_guarded_by_its_ownership_nonce() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let out_dir = temp.path().to_path_buf();
+    let holder = match acquire_retry_claim(&out_dir) {
+        Ok(RetryClaimAcquire::Owned(claim)) => claim,
+        other => panic!("the test owner must win its own claim: {other:?}"),
+    };
+    assert!(
+        holder.is_published_for_test(),
+        "the owner holds a live claim"
+    );
+
+    let foreign_nonce = format!("foreign-{}-{}", std::process::id(), now_ms());
+    holder.release_as_nonce_for_test(&foreign_nonce);
+    assert!(
+        holder.is_published_for_test(),
+        "a nonce-mismatched release must leave the live claim in place"
+    );
+
+    drop(holder);
+    assert!(
+        retry_claim_released(&out_dir),
+        "the owning release must empty the claim"
+    );
+}
+
+/// Failure paths below the claim release the claim (leaving durable state
+/// byte-for-byte intact) and release the launch slot, so a refused retry
+/// costs nothing and blocks nobody.
 #[tokio::test]
 async fn retry_failed_refusals_restore_state_and_release_the_launch_slot() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -3943,8 +4707,8 @@ async fn retry_failed_refusals_restore_state_and_release_the_launch_slot() {
     );
 
     assert!(
-        !dir.join("process.retry-claim.tmp").exists(),
-        "the claim must be rolled back after a refusal"
+        retry_claim_released(&dir),
+        "the claim must be released after a refusal"
     );
     assert_eq!(
         std::fs::read(dir.join("process.json")).expect("restored state"),
@@ -3955,4 +4719,49 @@ async fn retry_failed_refusals_restore_state_and_release_the_launch_slot() {
     // Launch-slot bookkeeping: nothing leaked from the refused request; four
     // more launches must still fit under the cap afterwards.
     assert_eq!(*launch_slots.lock().unwrap(), 0, "slot released");
+}
+
+/// A failed spawn unwinds through the same RAII guard: the atomic claim and
+/// the launch slot are both released, the phantom "running" marker is
+/// restored to the truthful prior state, and nothing is left behind for a
+/// retry to trip over.
+#[tokio::test]
+async fn retry_failed_spawn_failure_releases_claim_and_launch_slot() {
+    use std::sync::atomic::AtomicBool;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = write_retryable_fixture(temp.path(), "spawnfail");
+    let before = std::fs::read(dir.join("process.json")).expect("original state");
+
+    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
+    let launch_slots = Arc::clone(&state.launch_slots);
+    state.retry_fail_spawns = Some(Arc::new(AtomicBool::new(true)));
+    let router = dashboard_router(state);
+
+    let response = post_json(
+        &router,
+        "/api/audiobooks/spawnfail/retry-failed",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{response:?}"
+    );
+    assert!(
+        retry_claim_released(&dir),
+        "the atomic claim must be released when the spawn fails"
+    );
+    assert_eq!(
+        *launch_slots.lock().unwrap(),
+        0,
+        "the slot must be released"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("process.json")).expect("state read"),
+        before,
+        "the pre-retry process.json must survive a failed spawn byte-for-byte"
+    );
 }
