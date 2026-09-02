@@ -858,6 +858,8 @@ fn isolate_process_group(_command: &mut Command) {}
 mod process_signals {
     unsafe extern "C" {
         pub fn kill(pid: i32, sig: i32) -> i32;
+        pub fn getpgid(pid: i32) -> i32;
+        pub fn getpgrp() -> i32;
     }
     pub const SIGKILL: i32 = 9;
 
@@ -870,10 +872,18 @@ mod process_signals {
         if pid <= 0 {
             return false;
         }
+        // Never trust process-group setup implicitly. If setpgid was skipped or
+        // behaved differently in a host environment, the child may still be in
+        // BookForge's (or a CI runner's) group. In that case the caller falls
+        // back to killing only the direct child.
+        let group = unsafe { getpgid(pid) };
+        if group != pid || group == unsafe { getpgrp() } {
+            return false;
+        }
         // POSIX uses a negative PID to address the process group whose ID is
-        // the corresponding positive PID. Do the negation only after the
-        // checked conversion so an invalid platform PID cannot wrap.
-        unsafe { kill(-pid, SIGKILL) == 0 }
+        // the corresponding positive PID. The equality check above also makes
+        // the negation safe and ensures we only address the child's own group.
+        unsafe { kill(-group, SIGKILL) == 0 }
     }
 }
 
@@ -1823,6 +1833,12 @@ mod tests {
         assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
         assert_eq!(std::fs::read(&final_path).unwrap(), b"prior-output");
         assert!(!staged.exists(), "staged output must be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_kill_refuses_the_callers_group() {
+        assert!(!process_signals::kill_process_group(std::process::id()));
     }
 
     #[cfg(unix)]

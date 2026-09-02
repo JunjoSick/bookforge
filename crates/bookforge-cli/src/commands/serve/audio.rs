@@ -1199,6 +1199,31 @@ fn configure_audio_child_process_group(command: &mut tokio::process::Command) {
     }
 }
 
+#[cfg(unix)]
+mod audio_process_signals {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+        fn getpgid(pid: i32) -> i32;
+        fn getpgrp() -> i32;
+    }
+
+    const SIGKILL: i32 = 9;
+
+    pub(super) fn kill_isolated_group(pid: u32) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        let group = unsafe { getpgid(pid) };
+        if group != pid || group == unsafe { getpgrp() } {
+            return false;
+        }
+        unsafe { kill(-group, SIGKILL) == 0 }
+    }
+}
+
 async fn terminate_audio_child_tree(child: &mut tokio::process::Child) {
     let pid = child.id();
     #[cfg(windows)]
@@ -1210,11 +1235,10 @@ async fn terminate_audio_child_tree(child: &mut tokio::process::Child) {
     }
     #[cfg(unix)]
     if let Some(pid) = pid {
-        let group = format!("-{pid}");
-        let _ = tokio::process::Command::new("kill")
-            .args(["-KILL", &group])
-            .status()
-            .await;
+        // Signal descendants only after proving that process-group isolation
+        // succeeded and the group is not our own. Otherwise the direct-child
+        // fallback below contains the failure to the spawned BookForge child.
+        let _ = audio_process_signals::kill_isolated_group(pid);
     }
     // A direct kill is harmless when the tree signal already succeeded and
     // covers children spawned before process-group setup was introduced.
@@ -2904,6 +2928,26 @@ mod lifecycle_tests {
                 .expect("child status should be readable")
                 .is_some(),
             "dashboard child must be reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_falls_back_when_child_inherits_the_parent_group() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .expect("sleep should spawn");
+        let pid = child.id().expect("child has a pid");
+        assert!(!audio_process_signals::kill_isolated_group(pid));
+
+        terminate_audio_child_tree(&mut child).await;
+        assert!(
+            child
+                .try_wait()
+                .expect("child status should be readable")
+                .is_some(),
+            "direct-child fallback must reap the child"
         );
     }
 
