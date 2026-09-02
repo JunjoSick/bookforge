@@ -310,7 +310,6 @@ fn sweep_stale_retry_override_dirs(runs_root: &Path) -> usize {
 fn retry_override_dir_is_reapable(liveness: OwnerLiveness) -> bool {
     match liveness {
         OwnerLiveness::Alive => false,
-        #[cfg(unix)]
         OwnerLiveness::Gone => true,
         // Fail-closed: an owner whose death is not positively established is
         // never reaped, at any directory age. No mtime/age heuristic exists
