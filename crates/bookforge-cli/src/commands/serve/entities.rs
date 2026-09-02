@@ -132,7 +132,7 @@ fn validated_entity_fields(
     Ok(gender)
 }
 
-fn new_entity<'a>(
+struct NewEntityInput<'a> {
     scope_kind: GlossaryScopeKind,
     scope_id: Option<&'a str>,
     source_name: &'a str,
@@ -142,17 +142,19 @@ fn new_entity<'a>(
     notes: Option<&'a str>,
     source_language: &'a str,
     target_language: &'a str,
-) -> NewEntity<'a> {
+}
+
+fn new_entity(input: NewEntityInput<'_>) -> NewEntity<'_> {
     NewEntity {
-        scope_kind,
-        scope_id,
-        source_name,
-        target_name,
-        gender_target,
-        role,
-        notes,
-        source_language,
-        target_language,
+        scope_kind: input.scope_kind,
+        scope_id: input.scope_id,
+        source_name: input.source_name,
+        target_name: input.target_name,
+        gender_target: input.gender_target,
+        role: input.role,
+        notes: input.notes,
+        source_language: input.source_language,
+        target_language: input.target_language,
     }
 }
 
@@ -238,17 +240,17 @@ async fn add_entity(
     let target_language = req.target_language.trim().to_string();
     let created = tokio::task::spawn_blocking(move || -> Result<i64> {
         let store = JobStore::open(store_path)?;
-        let row = new_entity(
-            requested_scope.0,
-            requested_scope.1.as_deref(),
-            &source_name,
-            &target_name,
-            gender,
-            role.as_deref(),
-            notes.as_deref(),
-            &source_language,
-            &target_language,
-        );
+        let row = new_entity(NewEntityInput {
+            scope_kind: requested_scope.0,
+            scope_id: requested_scope.1.as_deref(),
+            source_name: &source_name,
+            target_name: &target_name,
+            gender_target: gender,
+            role: role.as_deref(),
+            notes: notes.as_deref(),
+            source_language: &source_language,
+            target_language: &target_language,
+        });
         store.upsert_entities(std::slice::from_ref(&row))?;
         Ok(store
             .list_entities(None, None, None, None)?
@@ -351,17 +353,17 @@ async fn update_entity(
     let scope_id = existing.scope_id;
     tokio::task::spawn_blocking(move || -> Result<()> {
         let store = JobStore::open(store_path)?;
-        store.upsert_entities(&[new_entity(
+        store.upsert_entities(&[new_entity(NewEntityInput {
             scope_kind,
-            scope_id.as_deref(),
-            &source_name,
-            &target_name,
-            gender,
-            role.as_deref(),
-            notes.as_deref(),
-            &source_language,
-            &target_language,
-        )])?;
+            scope_id: scope_id.as_deref(),
+            source_name: &source_name,
+            target_name: &target_name,
+            gender_target: gender,
+            role: role.as_deref(),
+            notes: notes.as_deref(),
+            source_language: &source_language,
+            target_language: &target_language,
+        })])?;
         Ok(())
     })
     .await??;

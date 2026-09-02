@@ -13,7 +13,7 @@ use crate::{
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Environment:\n  BOOKFORGE_PRICING_PATH  Override the bundled provider pricing table with a TOML file."
+    after_help = "Environment:\n  BOOKFORGE_PRICING_PATH  Override the bundled provider pricing table with a JSON file."
 )]
 pub struct EstimateArgs {
     pub input: PathBuf,
@@ -36,7 +36,7 @@ pub struct EstimateArgs {
     #[arg(long)]
     pub context_tokens: Option<usize>,
 
-    /// Override the bundled pricing catalog. BOOKFORGE_PRICING_PATH is
+    /// Override the bundled JSON pricing catalog. BOOKFORGE_PRICING_PATH is
     /// used when this flag is omitted.
     #[arg(long)]
     pub pricing: Option<PathBuf>,

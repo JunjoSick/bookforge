@@ -630,7 +630,7 @@ export OPENROUTER_API_KEY=...
 ```bash
 cargo fmt --all --check
 cargo test --workspace
-cargo clippy --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for what's expected in issues
