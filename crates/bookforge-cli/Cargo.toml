@@ -60,8 +60,7 @@ windows-sys = { version = "0.61", features = [
 
 # `flock(2)` for the same kernel-backed advisory lock on Unix.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
+libc.workspace = true
 [features]
 default = ["tui", "serve"]
 # Terminal UI (`--ui tui` and the `watch` command). Default-on; build with

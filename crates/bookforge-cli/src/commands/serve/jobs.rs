@@ -416,12 +416,20 @@ async fn retry_job(
         return Ok(response);
     }
     let store_path = state.store_path.clone();
-    let retried = tokio::task::spawn_blocking(move || -> Result<usize> {
+    let retried = tokio::task::spawn_blocking(move || {
         let store = JobStore::open(store_path)?;
-        Ok(store.retry_segments(&id, RetryScope::All)?)
+        store.retry_segments(&id, RetryScope::All)
     })
-    .await??;
-    Ok(Json(json!({ "retried": retried })).into_response())
+    .await?;
+    match retried {
+        Ok(retried) => Ok(Json(json!({ "retried": retried })).into_response()),
+        Err(bookforge_store::StoreError::NotFound(_)) => Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such job" })),
+        )
+            .into_response()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn pause_job(
