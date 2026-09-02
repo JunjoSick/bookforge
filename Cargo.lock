@@ -363,11 +363,9 @@ version = "3.0.0"
 dependencies = [
  "bookforge-core",
  "rusqlite",
- "serde",
  "serde_json",
  "sha2",
  "thiserror",
- "toml",
 ]
 
 [[package]]
