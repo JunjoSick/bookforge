@@ -52,9 +52,10 @@ struct Comparison {
     identity: Option<FileIdentity>,
 }
 
-fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+fn file_identity(path: &Path, metadata: &fs::Metadata) -> Option<FileIdentity> {
     #[cfg(unix)]
     {
+        let _ = path;
         use std::os::unix::fs::MetadataExt;
         Some(FileIdentity {
             volume: metadata.dev(),
@@ -63,18 +64,33 @@ fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
+        let _ = metadata;
+        use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
         // Some Windows filesystems cannot provide a stable file identity.
         // Preserve that absence: synthesizing zeroes would make every pair of
         // such files compare as the same hardlink.
+        let file = fs::File::open(path).ok()?;
+        let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        // SAFETY: `file` owns a valid handle for the duration of the call and
+        // `info` points to writable storage of the exact Win32 result type.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, info.as_mut_ptr()) } == 0
+        {
+            return None;
+        }
+        // SAFETY: a nonzero return initializes the complete information value.
+        let info = unsafe { info.assume_init() };
         Some(FileIdentity {
-            volume: u64::from(metadata.volume_serial_number()?),
-            index: metadata.file_index()?,
+            volume: u64::from(info.dwVolumeSerialNumber),
+            index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         })
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = metadata;
+        let _ = (path, metadata);
         None
     }
 }
@@ -98,7 +114,8 @@ fn comparison_path(path: &Path) -> io::Result<Comparison> {
             }
             Ok(_) => {
                 let canonical = fs::canonicalize(&current)?;
-                let identity = file_identity(&fs::metadata(&canonical)?);
+                let metadata = fs::metadata(&canonical)?;
+                let identity = file_identity(&canonical, &metadata);
                 return Ok(Comparison {
                     canonical,
                     identity,
