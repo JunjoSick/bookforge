@@ -261,19 +261,22 @@ fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
                 &translation.segment_id.0,
                 translation.error.as_deref().unwrap_or("translation failed"),
             )?;
-            if store.segment_records(&job_id).is_ok_and(|records| {
-                records.iter().any(|record| {
-                    record.id == translation.segment_id.0 && record.status == "failed"
-                })
-            }) {
-                persist_checkpoint_findings(
-                    store,
-                    &job_id,
-                    &translation.segment_id.0,
-                    &translation.findings,
-                    translation.error.as_deref(),
-                );
-            }
+            // NO ledger row is derived here: a checkpoint failure is a
+            // synthetic segment-state outcome, not a provider wire attempt.
+            // Batch/retry aggregation also makes the checkpoint's token and
+            // provenance semantics false (a failed batch item carries no
+            // honest per-attempt tokens). The append-only ledger is written
+            // only by the attempt-recording lane that instruments real
+            // provider calls (see `JobStore::record_translation_attempt`);
+            // until that lane exists the ledger stays empty rather than
+            // fabricate rows.
+            persist_checkpoint_findings(
+                store,
+                &job_id,
+                &translation.segment_id.0,
+                &translation.findings,
+                translation.error.as_deref(),
+            );
         }
         _ => {}
     }
@@ -910,6 +913,103 @@ mod tests {
             model: "mock-model".to_string(),
             prompt_version: "v1".to_string(),
         }
+    }
+
+    #[test]
+    fn checkpoints_never_fabricate_provider_wire_attempt_rows() {
+        let db_path = temp_path("no_synthetic_attempts.sqlite");
+        let input_path = temp_path("no_synthetic_input.epub");
+        fs::write(&input_path, b"epub bytes").expect("input fixture writable");
+
+        let store = JobStore::open(&db_path).expect("store open for setup");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("no_synthetic_output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-model",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job created");
+        store
+            .insert_segments(
+                &job.id,
+                &[
+                    test_segment("seg_ok", 0),
+                    test_segment("seg_review", 1),
+                    test_segment("seg_failed", 2),
+                ],
+                "v1",
+                "mock",
+                "mock-model",
+                "test_ns",
+            )
+            .expect("segments inserted");
+
+        apply(
+            &store,
+            CheckpointCommand::SaveTranslation {
+                job_id: job.id.clone(),
+                translation: Box::new(test_translation("seg_ok", 0, SegmentStatus::Succeeded)),
+                provider: "mock".to_string(),
+                model: "mock-model".to_string(),
+                prompt_version: "v1".to_string(),
+            },
+        )
+        .expect("succeeded checkpoint applies");
+        let mut review = test_translation("seg_review", 1, SegmentStatus::NeedsReview);
+        review.error = Some(needs_review_error_text());
+        apply(
+            &store,
+            CheckpointCommand::SaveTranslation {
+                job_id: job.id.clone(),
+                translation: Box::new(review),
+                provider: "mock".to_string(),
+                model: "mock-model".to_string(),
+                prompt_version: "v1".to_string(),
+            },
+        )
+        .expect("needs_review checkpoint applies");
+        apply(
+            &store,
+            CheckpointCommand::SaveTranslation {
+                job_id: job.id.clone(),
+                translation: Box::new(test_translation("seg_failed", 2, SegmentStatus::Failed)),
+                provider: "mock".to_string(),
+                model: "mock-model".to_string(),
+                prompt_version: "v1".to_string(),
+            },
+        )
+        .expect("failed checkpoint applies");
+
+        // Checkpoints record segment STATE; none of them are provider wire
+        // attempts, so the append-only ledger must stay empty here. Real wire
+        // attempts are recorded explicitly by the attempt-recording lane.
+        let attempts = store
+            .translation_attempts(&job.id, None, None)
+            .expect("attempts should load");
+        assert!(
+            attempts.is_empty(),
+            "success/needs-review/failure checkpoints must not fabricate wire-attempt rows"
+        );
+
+        // Segment state is still persisted honestly for later aggregation.
+        let summary = store
+            .summary(&job.id)
+            .expect("summary query")
+            .expect("job exists");
+        assert_eq!(summary.total_segments, 3);
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(summary.needs_review, 1);
+        assert_eq!(summary.failed, 1);
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(input_path);
     }
 
     #[test]

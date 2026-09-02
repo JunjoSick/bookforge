@@ -211,6 +211,42 @@ impl JobStore {
               FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
 
+            -- Append-only translation provenance ledger (migration 12). Rows
+            -- are inserted once per attempt and never updated or deleted, so
+            -- earlier attempts are preserved verbatim and cost/usage can be
+            -- aggregated per job/segment/phase. Referential integrity is
+            -- pinned to the segment row that owns each attempt (composite
+            -- FK); the unique (job, segment, attempt_ordinal) makes the
+            -- ordinal sequence immutable and monotonic; triggers forbid
+            -- in-place edits (deletion is reserved for job retention/prune).
+            CREATE TABLE IF NOT EXISTS translation_attempts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              job_id TEXT NOT NULL,
+              segment_id TEXT NOT NULL,
+              batch_id TEXT,
+              phase TEXT NOT NULL CHECK(phase IN
+                ('primary', 'fallback', 'repair', 'qa', 'double_check')),
+              attempt_ordinal INTEGER NOT NULL,
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              outcome TEXT NOT NULL CHECK(outcome IN
+                ('success', 'failure', 'partial', 'skipped')),
+              error TEXT,
+              input_tokens INTEGER,
+              input_cached_tokens INTEGER,
+              output_tokens INTEGER,
+              cost_estimate REAL,
+              created_at TEXT NOT NULL,
+              UNIQUE(job_id, segment_id, attempt_ordinal),
+              FOREIGN KEY(job_id, segment_id) REFERENCES segments(job_id, id)
+            );
+
+            CREATE TRIGGER IF NOT EXISTS translation_attempts_immutable_update
+            BEFORE UPDATE ON translation_attempts
+            BEGIN
+              SELECT RAISE(ABORT, 'translation_attempts is append-only');
+            END;
+
             CREATE TABLE IF NOT EXISTS glossary_terms (
               id INTEGER PRIMARY KEY,
               scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global', 'series', 'book')),
@@ -276,10 +312,20 @@ impl JobStore {
         ensure_column(&conn, "jobs", "report_markdown_path", "TEXT")?;
         ensure_column(&conn, "jobs", "book_id", "TEXT")?;
         ensure_column(&conn, "jobs", "series_id", "TEXT")?;
+        // Serialized CachePolicySnapshot (strict-context and future
+        // cache-affecting policies). NULL/absent means the job never recorded
+        // a policy: reads fall back to CachePolicySnapshot::conservative().
+        ensure_column(&conn, "jobs", "cache_policy_json", "TEXT")?;
         ensure_column(
             &conn,
             "segments",
             "cache_namespace",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "segments",
+            "cache_fingerprint",
             "TEXT NOT NULL DEFAULT ''",
         )?;
         ensure_column(&conn, "segments", "tokens_input", "INTEGER")?;
@@ -326,6 +372,10 @@ impl JobStore {
              ON qa_findings(job_id, kind);
              CREATE INDEX IF NOT EXISTS idx_qa_findings_segment
              ON qa_findings(job_id, segment_id);
+             CREATE INDEX IF NOT EXISTS idx_translation_attempts_segment
+             ON translation_attempts(job_id, segment_id);
+             CREATE INDEX IF NOT EXISTS idx_translation_attempts_job
+             ON translation_attempts(job_id);
              CREATE INDEX IF NOT EXISTS idx_jobs_created_at
              ON jobs(created_at);",
         )?;
@@ -373,6 +423,14 @@ impl JobStore {
         if !migration_applied(&conn, 11)? {
             ensure_column(&conn, "qa_findings", "block_id", "TEXT")?;
             record_migration(&conn, 11, "v3_0_qa_finding_block_attribution")?;
+        }
+
+        // Version 12 (translation-state audit) introduces the append-only
+        // translation provenance ledger plus the structured cache identity
+        // column. The DDL above is idempotent, but recording the migration
+        // is gated so reopened stores never take a write lock to re-record it.
+        if !migration_applied(&conn, 12)? {
+            record_migration(&conn, 12, "v3_0_translation_attempts_cache_identity")?;
         }
 
         Ok(())
@@ -638,6 +696,7 @@ const JOB_COLUMNS_ALL: &[&str] = &[
     "series_id",
     "created_at",
     "updated_at",
+    "cache_policy_json",
 ];
 
 const SEGMENT_COLUMNS_ALL: &[&str] = &[
@@ -661,6 +720,7 @@ const SEGMENT_COLUMNS_ALL: &[&str] = &[
     "error",
     "translated_hash",
     "cache_namespace",
+    "cache_fingerprint",
 ];
 
 fn job_status_column_definition() -> String {
@@ -707,6 +767,7 @@ fn harden_status_tables_with_check_constraints(conn: &mut Connection) -> Result<
           report_markdown_path TEXT,
           book_id TEXT,
           series_id TEXT,
+          cache_policy_json TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );"
@@ -733,6 +794,7 @@ fn harden_status_tables_with_check_constraints(conn: &mut Connection) -> Result<
           error TEXT,
           translated_hash TEXT,
           cache_namespace TEXT NOT NULL DEFAULT '',
+          cache_fingerprint TEXT NOT NULL DEFAULT '',
           PRIMARY KEY (job_id, id),
           FOREIGN KEY(job_id) REFERENCES jobs(id)
         );"

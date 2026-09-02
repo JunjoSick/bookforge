@@ -2,13 +2,12 @@ use super::*;
 
 use crate::convert::fake_backend::{FakePoppler, FixtureImage};
 
-// pdftohtml documents shared verbatim by BOTH tool paths below: the
-// Unix-only path ships them through /bin/sh poppler stand-ins, while the
-// in-process fake (`FakePoppler`) feeds the same strings through
-// [`PopplerBackend`] without spawning anything. Keeping them in shared
-// constants is what makes the two paths exercise identical conversions.
+// pdftohtml fixture documents. The shell-backed cases are Unix-only; the
+// portable in-process cases below use `FakePoppler`.
+#[cfg(unix)]
 const BERT_FIGURE1_CAPTION_BOUNDARY_XML: &str =
     include_str!("../../fixtures/bert_figure1_caption_boundary.xml");
+#[cfg(unix)]
 const BERT_FIGURE4_MULTIPANEL_XML: &str =
     include_str!("../../fixtures/bert_figure4_multipanel.xml");
 const BERT_FIGURE5_VECTOR_CHART_XML: &str =
@@ -17,6 +16,7 @@ const BERT_PAGE16_VECTOR_CHART_TWOCOL_XML: &str =
     include_str!("../../fixtures/bert_page16_vector_chart_twocol.xml");
 const BERT_FIGURE1_TOKEN_STRIP_XML: &str =
     include_str!("../../fixtures/bert_figure1_token_strip.xml");
+#[cfg(unix)]
 const BERT_MODEL_PARAMETER_FALSE_POSITIVE_XML: &str =
     include_str!("../../fixtures/bert_model_parameter_false_positive.xml");
 
