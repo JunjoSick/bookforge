@@ -181,6 +181,7 @@ mod tests {
     /// A missing log is the normal pre-launch state, but ANY other open
     /// failure (permission denied, a non-directory parent) must surface as an
     /// error instead of being silently treated as "no events".
+    #[cfg(unix)]
     #[test]
     fn open_failures_other_than_not_found_surface_as_errors() {
         let dir = tempfile::tempdir().unwrap();
