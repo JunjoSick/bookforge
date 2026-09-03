@@ -207,8 +207,6 @@ impl BatchModeSizing {
         let mut state = Self {
             target_tokens: initial_target_tokens,
             max_items: initial_max_items,
-            initial_target_tokens,
-            initial_max_items,
             // Explicit user/runtime limits below the adaptive defaults are
             // still authoritative. They become the floor for this sizing
             // epoch; adaptation may grow from them but must not silently

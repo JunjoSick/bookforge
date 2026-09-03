@@ -1,5 +1,15 @@
 use super::*;
 
+/// Whether a `jobs` row exists. Mutation APIs use this to surface
+/// [`StoreError::NotFound`] instead of silently succeeding on a missing job.
+pub(super) fn job_exists_on(conn: &Connection, job_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = ?1)",
+        params![job_id],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
 impl JobStore {
     pub fn create_job(&self, request: CreateJob<'_>) -> Result<JobRecord> {
         let input_hash = file_hash(request.input)?;
@@ -122,6 +132,45 @@ impl JobStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Persist the durable cache policy (strict-context and future
+    /// cache-affecting settings that are not part of the historical
+    /// [`RunConfigSnapshot`] surface). Jobs that never record a policy read
+    /// back the conservative default, which can never reuse cache written by
+    /// a run that states an explicit policy.
+    pub fn update_job_cache_policy(
+        &self,
+        job_id: &str,
+        policy: &CachePolicySnapshot,
+    ) -> Result<()> {
+        let json = serde_json::to_string(policy)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let conn = self.conn.borrow();
+        let updated = conn.execute(
+            "UPDATE jobs
+             SET cache_policy_json = ?1, updated_at = ?2
+             WHERE id = ?3",
+            params![json, timestamp_string(), job_id],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound(format!(
+                "job '{job_id}' was not found"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Load the persisted cache policy, defaulting to the conservative
+    /// unknown-strictness policy for jobs that never recorded one.
+    pub fn load_job_cache_policy(&self, job_id: &str) -> Result<CachePolicySnapshot> {
+        let conn = self.conn.borrow();
+        if !job_exists_on(&conn, job_id)? {
+            return Err(StoreError::NotFound(format!(
+                "job '{job_id}' was not found"
+            )));
+        }
+        super::translations::load_cache_policy_on(&conn, job_id)
     }
 
     pub fn load_job_config_snapshot(&self, job_id: &str) -> Result<Option<RunConfigSnapshot>> {
@@ -424,20 +473,40 @@ impl JobStore {
         let Some(job) = self.get_job(job_id)? else {
             return Ok(None);
         };
-        let conn = self.conn.borrow();
+        // Aggregation is per-segment, mixing the append-only attempt ledger
+        // with legacy token columns (STORE-A): a segment that has any ledger
+        // row is aggregated from the ledger (its authoritative attempt record);
+        // a segment with NO ledger rows — a pre-ledger completion, a cache hit,
+        // or a state-only record — keeps its legacy token columns. Summing
+        // both for the same segment would double count; dropping the legacy
+        // columns for ledger-less segments would undercount.
+        let ledger = self.translation_attempt_summary(job_id)?;
         let mut summary = JobSummary {
             id: job.id,
             status: job.status,
             ..JobSummary::default()
         };
+        summary.input_tokens = ledger.input_tokens;
+        summary.input_cached_tokens = ledger.input_cached_tokens;
+        summary.output_tokens = ledger.output_tokens;
 
+        let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
             "SELECT status,
                     COUNT(*),
-                    COALESCE(SUM(COALESCE(tokens_input, input_tokens)), 0),
-                    COALESCE(SUM(tokens_input_cached), 0),
-                    COALESCE(SUM(COALESCE(tokens_output, output_tokens)), 0)
-             FROM segments WHERE job_id = ?1 GROUP BY status",
+                    COALESCE(SUM(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM translation_attempts a
+                        WHERE a.job_id = s.job_id AND a.segment_id = s.id
+                    ) THEN COALESCE(s.tokens_input, s.input_tokens) ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM translation_attempts a
+                        WHERE a.job_id = s.job_id AND a.segment_id = s.id
+                    ) THEN s.tokens_input_cached ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM translation_attempts a
+                        WHERE a.job_id = s.job_id AND a.segment_id = s.id
+                    ) THEN COALESCE(s.tokens_output, s.output_tokens) ELSE 0 END), 0)
+             FROM segments s WHERE s.job_id = ?1 GROUP BY status",
         )?;
         let rows = stmt.query_map(params![job_id], |row| {
             Ok((
@@ -506,15 +575,29 @@ impl JobStore {
             .query_map([], Self::job_record_from_row)?
             .collect::<rusqlite::Result<Vec<JobRecord>>>()?;
 
-        // One pass over the segments table, aggregated per (job, status).
+        // One pass over the segments table, aggregated per (job, status). The
+        // token columns only count for segments with NO ledger rows: a segment
+        // covered by the append-only ledger aggregates from the ledger (its
+        // authoritative attempt record), while a segment without ledger rows
+        // (pre-ledger completion, cache hit) keeps its legacy columns. This
+        // keeps mixed legacy/new jobs accurate without double counting.
         let mut aggregates: HashMap<String, JobSummary> = HashMap::new();
         let mut seg_stmt = conn.prepare(
             "SELECT job_id, status,
                     COUNT(*),
-                    COALESCE(SUM(COALESCE(tokens_input, input_tokens)), 0),
-                    COALESCE(SUM(tokens_input_cached), 0),
-                    COALESCE(SUM(COALESCE(tokens_output, output_tokens)), 0)
-             FROM segments GROUP BY job_id, status",
+                    COALESCE(SUM(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM translation_attempts a
+                        WHERE a.job_id = s.job_id AND a.segment_id = s.id
+                    ) THEN COALESCE(s.tokens_input, s.input_tokens) ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM translation_attempts a
+                        WHERE a.job_id = s.job_id AND a.segment_id = s.id
+                    ) THEN s.tokens_input_cached ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM translation_attempts a
+                        WHERE a.job_id = s.job_id AND a.segment_id = s.id
+                    ) THEN COALESCE(s.tokens_output, s.output_tokens) ELSE 0 END), 0)
+             FROM segments s GROUP BY job_id, status",
         )?;
         let seg_rows = seg_stmt.query_map([], |row| {
             Ok((
@@ -555,6 +638,36 @@ impl JobStore {
         for row in retried_rows {
             let (job_id, retried) = row?;
             aggregates.entry(job_id).or_default().retried = retried as usize;
+        }
+
+        // Append the attempt ledger for jobs that have one, ADDING it to the
+        // legacy-column contribution above (which already excluded segments
+        // covered by the ledger), so mixed legacy/new jobs stay accurate.
+        let mut ledger_stmt = conn.prepare(
+            "SELECT job_id,
+                    COUNT(*),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(input_cached_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0)
+             FROM translation_attempts GROUP BY job_id",
+        )?;
+        let ledger_rows = ledger_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in ledger_rows {
+            let (job_id, attempts, input_tokens, input_cached_tokens, output_tokens) = row?;
+            if attempts > 0 {
+                let summary = aggregates.entry(job_id).or_default();
+                summary.input_tokens += input_tokens as u64;
+                summary.input_cached_tokens += input_cached_tokens as u64;
+                summary.output_tokens += output_tokens as u64;
+            }
         }
 
         Ok(jobs

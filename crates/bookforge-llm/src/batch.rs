@@ -224,10 +224,6 @@ pub struct BatchSizer {
 pub struct BatchModeSizing {
     target_tokens: usize,
     max_items: usize,
-    #[allow(dead_code)]
-    initial_target_tokens: usize,
-    #[allow(dead_code)]
-    initial_max_items: usize,
     min_tokens: usize,
     max_tokens: usize,
     min_items: usize,

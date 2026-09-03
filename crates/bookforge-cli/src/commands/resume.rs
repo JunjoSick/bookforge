@@ -680,6 +680,7 @@ async fn run_inner(
         .cloned()
         .collect::<Vec<_>>();
     let cached_translations = apply_cached_translations(
+        &segments,
         &cacheable_pending_segments,
         CacheContext {
             store,
@@ -1146,9 +1147,11 @@ fn snapshot_context_run_config(snapshot: &RunConfigSnapshot) -> ContextRunConfig
         window: snapshot.context_window,
         budget_tokens: snapshot.context_budget_tokens,
         scope: snapshot.context_scope,
-        // Strictness is a scheduling choice, not part of the cached
-        // translation contract, so it is not persisted in the snapshot.
-        // Resumed jobs use the best-effort default.
+        // Strictness is a scheduling choice for the resumed run's own
+        // translation pass, so it is not rehydrated from the snapshot here.
+        // The persisted CachePolicySnapshot (jobs.cache_policy_json) carries
+        // the original strict-context choice and feeds the cache identity
+        // used by lookups on resume.
         strict: false,
     }
 }

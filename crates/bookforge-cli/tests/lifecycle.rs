@@ -35,6 +35,27 @@ fn fixture_input() -> PathBuf {
     path
 }
 
+fn write_pricing_catalog(path: &Path, input_rate: f64, output_rate: f64) {
+    let catalog = format!(
+        r#"{{
+  "schema_version": 1,
+  "updated_at": "2026-08-31",
+  "providers": {{
+    "test-provider": {{
+      "models": {{
+        "test-model": {{
+          "input_per_million_usd": {input_rate},
+          "output_per_million_usd": {output_rate},
+          "input_cache_per_million_usd": null
+        }}
+      }}
+    }}
+  }}
+}}"#
+    );
+    fs::write(path, catalog).expect("pricing fixture should be writable");
+}
+
 fn build_lifecycle_epub(path: &Path) {
     let file = fs::File::create(path).expect("fixture EPUB should be creatable");
     let mut zip = ZipWriter::new(file);
@@ -197,6 +218,105 @@ fn cli_translate_unsupported_provider_exits_failure() {
     assert!(
         stderr.contains("unsupported translation provider 'not-a-provider'"),
         "stderr should explain unsupported provider, got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_estimate_explicit_pricing_path_wins_over_environment() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = fixture_input();
+    let environment_pricing = temp.path().join("environment.json");
+    let explicit_pricing = temp.path().join("explicit.json");
+    write_pricing_catalog(&environment_pricing, 1.0, 1.0);
+    write_pricing_catalog(&explicit_pricing, 2.0, 2.0);
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .env_remove("BOOKFORGE_PRICING_PATH")
+        .env("BOOKFORGE_PRICING_PATH", &environment_pricing)
+        .args([
+            "estimate",
+            input.to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "test-provider",
+            "--model",
+            "test-model",
+            "--pricing",
+            explicit_pricing.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.contains(&format!("Pricing: {}", explicit_pricing.display())),
+        "explicit pricing source should be reported: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&environment_pricing.display().to_string()),
+        "environment pricing must not win over --pricing: {stdout}"
+    );
+}
+
+#[test]
+fn cli_estimate_uses_pricing_environment_when_flag_is_omitted() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = fixture_input();
+    let environment_pricing = temp.path().join("environment.json");
+    write_pricing_catalog(&environment_pricing, 3.0, 4.0);
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .env_remove("BOOKFORGE_PRICING_PATH")
+        .env("BOOKFORGE_PRICING_PATH", &environment_pricing)
+        .args([
+            "estimate",
+            input.to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "test-provider",
+            "--model",
+            "test-model",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.contains(&format!("Pricing: {}", environment_pricing.display())),
+        "environment pricing should be reported when --pricing is absent: {stdout}"
+    );
+}
+
+#[test]
+fn cli_estimate_reports_json_error_for_invalid_pricing_override() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = fixture_input();
+    let invalid_pricing = temp.path().join("pricing.toml");
+    fs::write(&invalid_pricing, "schema_version = 1\n").expect("invalid fixture should write");
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .env_remove("BOOKFORGE_PRICING_PATH")
+        .args([
+            "estimate",
+            input.to_str().unwrap(),
+            "--target",
+            "Italian",
+            "--provider",
+            "test-provider",
+            "--model",
+            "test-model",
+            "--pricing",
+            invalid_pricing.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("parsing pricing JSON"),
+        "invalid pricing should identify JSON, not TOML: {stderr}"
     );
 }
 

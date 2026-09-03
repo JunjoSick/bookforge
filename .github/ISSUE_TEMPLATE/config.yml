@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/JunjoSick/bookforge/security/advisories/new
+    about: Do not disclose keys, book contents, or exploit details in a public issue.
   - name: Roadmap and planned milestones
     url: https://github.com/JunjoSick/bookforge/blob/main/docs/ROADMAP.md
     about: Most "when will you add X?" questions are answered here.

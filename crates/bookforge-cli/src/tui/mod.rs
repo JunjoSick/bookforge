@@ -485,29 +485,32 @@ impl TuiApp {
         terminal.draw(|frame| {
             render_dashboard(
                 frame,
-                &view.state,
-                mode,
-                per_min,
-                eta,
-                ratio,
-                log_scroll,
-                status,
+                DashboardRenderContext {
+                    state: &view.state,
+                    mode,
+                    segments_per_minute: per_min,
+                    eta_secs: eta,
+                    ratio,
+                    scroll: log_scroll,
+                    status,
+                },
             )
         })?;
         Ok(())
     }
 }
 
-fn render_dashboard(
-    frame: &mut Frame,
-    state: &RunState,
+struct DashboardRenderContext<'a> {
+    state: &'a RunState,
     mode: TuiMode,
     segments_per_minute: f64,
     eta_secs: f64,
     ratio: f64,
-    scroll: &mut LogScroll,
-    status: Option<&str>,
-) {
+    scroll: &'a mut LogScroll,
+    status: Option<&'a str>,
+}
+
+fn render_dashboard(frame: &mut Frame, context: DashboardRenderContext<'_>) {
     let chunks = Layout::vertical([
         Constraint::Length(5), // header
         Constraint::Length(3), // progress gauge
@@ -517,12 +520,24 @@ fn render_dashboard(
     ])
     .split(frame.area());
 
-    render_header(frame, chunks[0], state, mode);
+    render_header(frame, chunks[0], context.state, context.mode);
     // Gauge ratio comes from the canonical epoch-aware view (UI-31).
-    render_gauge(frame, chunks[1], state, ratio);
-    render_stats(frame, chunks[2], state, segments_per_minute, eta_secs);
-    render_log(frame, chunks[3], state, scroll);
-    render_footer(frame, chunks[4], state, mode, status);
+    render_gauge(frame, chunks[1], context.state, context.ratio);
+    render_stats(
+        frame,
+        chunks[2],
+        context.state,
+        context.segments_per_minute,
+        context.eta_secs,
+    );
+    render_log(frame, chunks[3], context.state, context.scroll);
+    render_footer(
+        frame,
+        chunks[4],
+        context.state,
+        context.mode,
+        context.status,
+    );
 }
 
 fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunState, mode: TuiMode) {
@@ -835,13 +850,15 @@ mod tests {
             .draw(|frame| {
                 render_dashboard(
                     frame,
-                    &state,
-                    TuiMode::Watch,
-                    0.0,
-                    0.0,
-                    0.0,
-                    &mut scroll,
-                    None,
+                    DashboardRenderContext {
+                        state: &state,
+                        mode: TuiMode::Watch,
+                        segments_per_minute: 0.0,
+                        eta_secs: 0.0,
+                        ratio: 0.0,
+                        scroll: &mut scroll,
+                        status: None,
+                    },
                 );
             })
             .unwrap();
@@ -881,13 +898,15 @@ mod tests {
             .draw(|frame| {
                 render_dashboard(
                     frame,
-                    &state,
-                    TuiMode::Attached,
-                    0.0,
-                    0.0,
-                    0.0,
-                    &mut scroll,
-                    None,
+                    DashboardRenderContext {
+                        state: &state,
+                        mode: TuiMode::Attached,
+                        segments_per_minute: 0.0,
+                        eta_secs: 0.0,
+                        ratio: 0.0,
+                        scroll: &mut scroll,
+                        status: None,
+                    },
                 );
             })
             .unwrap();
@@ -923,13 +942,15 @@ mod tests {
             .draw(|frame| {
                 render_dashboard(
                     frame,
-                    &state,
-                    TuiMode::Attached,
-                    0.0,
-                    0.0,
-                    0.0,
-                    &mut scroll,
-                    None,
+                    DashboardRenderContext {
+                        state: &state,
+                        mode: TuiMode::Attached,
+                        segments_per_minute: 0.0,
+                        eta_secs: 0.0,
+                        ratio: 0.0,
+                        scroll: &mut scroll,
+                        status: None,
+                    },
                 );
             })
             .unwrap();
@@ -1011,13 +1032,15 @@ mod tests {
             .draw(|frame| {
                 render_dashboard(
                     frame,
-                    &state,
-                    TuiMode::Watch,
-                    0.0,
-                    0.0,
-                    0.0,
-                    &mut scroll,
-                    None,
+                    DashboardRenderContext {
+                        state: &state,
+                        mode: TuiMode::Watch,
+                        segments_per_minute: 0.0,
+                        eta_secs: 0.0,
+                        ratio: 0.0,
+                        scroll: &mut scroll,
+                        status: None,
+                    },
                 );
             })
             .unwrap();

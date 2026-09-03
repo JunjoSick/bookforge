@@ -35,6 +35,7 @@ pub struct PruneJobDeletion {
     pub translation_blocks: usize,
     pub qa_findings: usize,
     pub segment_flags: usize,
+    pub translation_attempts: usize,
     /// Artifact files successfully unlinked: events log, JSON report,
     /// markdown report.
     pub artifacts_removed: Vec<PathBuf>,
@@ -50,6 +51,7 @@ impl PruneJobDeletion {
             + self.translation_blocks
             + self.qa_findings
             + self.segment_flags
+            + self.translation_attempts
     }
 }
 
@@ -255,6 +257,7 @@ impl JobStore {
             translation_blocks: count("translation_blocks")?,
             qa_findings: count("qa_findings")?,
             segment_flags: count("segment_flags")?,
+            translation_attempts: count("translation_attempts")?,
             artifacts_removed: Vec::new(),
             artifacts_missing: 0,
         })
@@ -281,8 +284,10 @@ impl JobStore {
     /// the exact protected status without deleting anything.
     fn prune_job_now(&self, job_id: &str) -> Result<PruneAttempt> {
         // Child-before-parent inside one IMMEDIATE transaction; only plain FKs
-        // point at segments/translations/blocks/findings, so explicit deletes
-        // keep this correct even where ON DELETE CASCADE is absent.
+        // point at segments/translations/blocks/findings/attempts, so explicit
+        // deletes keep this correct even where ON DELETE CASCADE is absent.
+        // The append-only attempt ledger references segments, so it must go
+        // before both segments and jobs.
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(status) = job_live_status(&tx, job_id)? {
@@ -292,6 +297,7 @@ impl JobStore {
         let qa_findings = delete_job_rows(&tx, "qa_findings", job_id)?;
         let translation_blocks = delete_job_rows(&tx, "translation_blocks", job_id)?;
         let translations = delete_job_rows(&tx, "translations", job_id)?;
+        let translation_attempts = delete_job_rows(&tx, "translation_attempts", job_id)?;
         let segments = delete_job_rows(&tx, "segments", job_id)?;
         let segment_flags = delete_job_rows(&tx, "segment_flags", job_id)?;
         // Read referenced artifacts while the job row still exists.
@@ -324,6 +330,7 @@ impl JobStore {
             translation_blocks,
             qa_findings,
             segment_flags,
+            translation_attempts,
             artifacts_removed: removed_files,
             artifacts_missing: missing,
         }))

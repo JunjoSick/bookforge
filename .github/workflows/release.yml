@@ -15,7 +15,9 @@
 
 name: Release
 permissions:
-  "contents": "write"
+  # Only the host job below receives write-capable permissions. Build and
+  # planning jobs handle repository contents as read-only and cannot publish.
+  "contents": "read"
 
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
@@ -45,26 +47,57 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  # A tag may be pushed while its branch checks are still pending or failing.
+  # Query the exact tagged SHA before cargo-dist gets a chance to publish.
+  verify-release-gates:
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    name: verify exact release checks
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 10
+    permissions:
+      "actions": "read"
+      "checks": "read"
+      "contents": "read"
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify CI and security checks for tagged commit
+        run: bash scripts/verify-release-gates.sh
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    needs:
+      - verify-release-gates
+    # The gate is intentionally skipped on pull requests, but a skipped
+    # prerequisite would otherwise skip the plan job too.
+    if: ${{ always() && (github.event_name == 'pull_request' || needs.verify-release-gates.result == 'success') }}
     runs-on: "ubuntu-22.04"
+    permissions:
+      "actions": "write"
+      "contents": "read"
+    env:
+      # cargo-dist's host-planning phase may query GitHub metadata. This token
+      # is limited by the job permissions above and cannot write repository
+      # contents.
+      GH_TOKEN: ${{ github.token }}
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
       tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
       publishing: ${{ !github.event.pull_request }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
-        shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+        # Cargo verifies the crates.io package checksum and --locked verifies
+        # cargo-dist's own dependency lockfile. Do not pipe a remote script to
+        # a shell in a token-bearing release workflow.
+        run: cargo install cargo-dist --version 0.32.0 --locked
       - name: Cache dist
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -101,7 +134,8 @@ jobs:
       #
       # - runner: the github runner
       # - dist-args: cli flags to pass to dist
-      # - install-dist: expression to run to install dist on the runner
+      # cargo-dist is installed from its pinned crates.io package below on each
+      # runner, rather than executing a generated remote installer expression.
       #
       # Typically there will be:
       # - 1 "global" task that builds universal installers
@@ -109,8 +143,10 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
+    permissions:
+      "actions": "write"
+      "contents": "read"
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
       - name: enable windows longpaths
@@ -128,7 +164,10 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+        # Install the pinned crate instead of executing the generated remote
+        # installer command. Cargo is present on hosted runners and is added
+        # for container jobs by the step above.
+        run: cargo install cargo-dist --version 0.32.0 --locked
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -171,8 +210,10 @@ jobs:
       - plan
       - build-local-artifacts
     runs-on: "ubuntu-22.04"
+    permissions:
+      "actions": "write"
+      "contents": "read"
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -225,6 +266,7 @@ jobs:
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     permissions:
+      "actions": "write"
       "attestations": "write"
       "contents": "write"
       "id-token": "write"
@@ -286,20 +328,3 @@ jobs:
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
-
-  announce:
-    needs:
-      - plan
-      - host
-    # use "always() && ..." to allow us to wait for all publish jobs while
-    # still allowing individual publish jobs to skip themselves (for prereleases).
-    # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' }}
-    runs-on: "ubuntu-22.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-          submodules: recursive
