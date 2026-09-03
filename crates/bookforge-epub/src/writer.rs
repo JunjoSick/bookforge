@@ -20,12 +20,13 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
     archive_limits::{
-        ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, read_archive_text, validate_archive_metadata,
+        ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, preflight_archive_path, read_archive_text,
+        validate_archive_metadata,
     },
     util::{
-        MAX_MARKER_DEPTH, attr_value_unescaped, commit_staged_output, deterministic_zip_time,
-        is_xhtml_resource_name, join_epub_path, local_name, marker_id, never_translate_element,
-        normalize_translation_entities, package_base_dir, sibling_work_path, validate_xml,
+        MAX_MARKER_DEPTH, attr_value_unescaped, commit_staged_output, create_sibling_work_file,
+        deterministic_zip_time, is_xhtml_resource_name, join_epub_path, local_name, marker_id,
+        never_translate_element, normalize_translation_entities, package_base_dir, validate_xml,
     },
 };
 
@@ -77,8 +78,8 @@ pub fn rebuild_epub_with_options(
     output: &Path,
     options: &RebuildOptions,
 ) -> Result<()> {
-    let staged = sibling_work_path(output, "tmp");
-    let result = write_rebuilt_epub(book, translations, &staged, options);
+    let (staged, staged_file) = create_sibling_work_file(output, "tmp")?;
+    let result = write_rebuilt_epub(book, translations, staged_file, options);
     let skipped = match result {
         Ok(skipped) => skipped,
         Err(error) => {
@@ -104,16 +105,16 @@ pub fn rebuild_epub_with_options(
 fn write_rebuilt_epub(
     book: &Book,
     translations: &[BlockTranslation],
-    output: &Path,
+    output_file: File,
     options: &RebuildOptions,
 ) -> Result<usize> {
     let source_path = book.source_path.as_deref().ok_or_else(|| {
         BookforgeError::InvalidInput("book IR does not include a source EPUB path".to_string())
     })?;
     let source = File::open(source_path)?;
+    preflight_archive_path(source_path)?;
     let mut archive = ZipArchive::new(source)?;
     let mut read_budget = validate_archive_metadata(&mut archive, DEFAULT_ARCHIVE_LIMITS)?;
-    let output_file = File::create(output)?;
     let mut writer = ZipWriter::new(output_file);
 
     let translations_by_block = translations

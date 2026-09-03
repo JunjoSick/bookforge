@@ -7,6 +7,8 @@ use anyhow::{Context, Result, bail};
 use bookforge_epub::{ReflowOptions, ReflowReport, reflow_epub};
 use clap::Args;
 
+use super::output;
+
 #[derive(Debug, Args)]
 pub struct ReflowArgs {
     /// Input source EPUB.
@@ -42,6 +44,13 @@ pub async fn run(args: ReflowArgs) -> Result<()> {
         .report
         .clone()
         .unwrap_or_else(|| default_report_path(&args.output));
+    // A dry run writes nothing, so an in-place input/output spelling is safe
+    // and the alias rule (mirroring `reflow_epub`) only bites real runs.
+    if !args.dry_run {
+        output::ensure_distinct_paths("EPUB input/output", &args.input, &args.output)?;
+    }
+    output::ensure_distinct_paths("EPUB output/report", &args.output, &report_path)?;
+    output::ensure_distinct_paths("EPUB input/report", &args.input, &report_path)?;
     let outcome = reflow_epub(
         &args.input,
         &args.output,
@@ -83,7 +92,7 @@ fn write_report(path: &Path, report: &ReflowReport) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating report directory {}", parent.display()))?;
     }
-    fs::write(path, serde_json::to_string_pretty(report)?)
+    output::write_atomic(path, serde_json::to_string_pretty(report)?.as_bytes())
         .with_context(|| format!("writing report {}", path.display()))?;
     Ok(())
 }

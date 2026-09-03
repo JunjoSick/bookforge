@@ -18,6 +18,14 @@ use std::{
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 
 pub const PDF_RENDER_DPI: u32 = 150;
+/// Bound every non-OCR raster, including figure crops and preserved pages.
+pub const MAX_RENDER_PIXELS: u64 = 32_000_000;
+const MAX_RENDER_EDGE: u32 = 4096;
+const MAX_EXTRACTED_IMAGES: usize = 4096;
+const MAX_IMAGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_IMAGE_AGGREGATE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_SCRATCH_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PNG_DECOMPRESSED_BYTES: u64 = MAX_RENDER_PIXELS * 4 + MAX_RENDER_PIXELS;
 const PDF_XML_ZOOM: &str = "1.5";
 pub(crate) const PDF_XML_ZOOM_NUM: i64 = 3;
 pub(crate) const PDF_XML_ZOOM_DEN: i64 = 2;
@@ -102,8 +110,8 @@ impl PageCrop {
             page: self.page,
             left: scale_xml_to_render_px(self.left).max(0),
             top: scale_xml_to_render_px(self.top).max(0),
-            width: scale_xml_to_render_px(self.width).max(1),
-            height: scale_xml_to_render_px(self.height).max(1),
+            width: scale_xml_to_render_px(self.width).clamp(1, MAX_RENDER_EDGE as i32),
+            height: scale_xml_to_render_px(self.height).clamp(1, MAX_RENDER_EDGE as i32),
         }
     }
 }
@@ -233,6 +241,7 @@ impl PopplerTools {
         if listed.is_empty() {
             return Ok(Vec::new());
         }
+        validate_listed_image_limits(&listed)?;
 
         let root = output_dir.join("image");
         let mut command = poppler_command(self.pdfimages_path()?);
@@ -257,6 +266,8 @@ impl PopplerTools {
         if paths.is_empty() {
             paths = extracted_image_paths(output_dir)?;
         }
+        validate_extracted_image_paths(output_dir, &paths)?;
+        validate_scratch_directory(output_dir)?;
         paths.sort();
         pair_extracted_images_with_list_rows(paths, &listed)
     }
@@ -311,6 +322,8 @@ impl PopplerTools {
                 "-png",
                 "-r",
                 &dpi_arg,
+                "-scale-to",
+                &MAX_RENDER_EDGE.to_string(),
             ])
             .arg(pdf)
             .arg(&root);
@@ -322,7 +335,10 @@ impl PopplerTools {
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             });
         }
-        Ok(root.with_extension("png"))
+        let output = root.with_extension("png");
+        validate_png_file(&output)?;
+        validate_scratch_directory(output_dir)?;
+        Ok(output)
     }
 
     pub fn render_page_crop_png(
@@ -383,7 +399,10 @@ impl PopplerTools {
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             });
         }
-        Ok(root.with_extension("png"))
+        let output = root.with_extension("png");
+        validate_png_file(&output)?;
+        validate_scratch_directory(output_dir)?;
+        Ok(output)
     }
 
     fn list_images(&self, pdf: &Path, timeout: Duration) -> Result<Vec<ListedImage>, ToolError> {
@@ -755,7 +774,7 @@ impl Drop for ChildGuard {
 fn scale_xml_to_render_px(value: i32) -> i32 {
     let numerator = value as i64 * PDF_RENDER_DPI as i64 * PDF_XML_ZOOM_DEN;
     let denominator = PDF_POINTS_PER_INCH * PDF_XML_ZOOM_NUM;
-    ((numerator + denominator / 2) / denominator) as i32
+    ((numerator + denominator / 2) / denominator).clamp(0, i32::MAX as i64) as i32
 }
 
 #[derive(Debug)]
@@ -766,6 +785,151 @@ struct PngImage {
     bit_depth: u8,
     bytes_per_pixel: usize,
     pixels: Vec<u8>,
+}
+
+fn validate_listed_image_limits(images: &[ListedImage]) -> Result<(), ToolError> {
+    if images.len() > MAX_EXTRACTED_IMAGES {
+        return Err(ToolError::UnsupportedPng(format!(
+            "pdf contains {} embedded images, exceeding the {MAX_EXTRACTED_IMAGES}-image limit",
+            images.len()
+        )));
+    }
+    for image in images {
+        if let (Some(width), Some(height)) = (image.width, image.height) {
+            let pixels = u64::from(width).saturating_mul(u64::from(height));
+            if pixels > MAX_RENDER_PIXELS {
+                return Err(ToolError::UnsupportedPng(format!(
+                    "embedded image {} on page {} has {pixels} pixels, exceeding the {MAX_RENDER_PIXELS}-pixel limit",
+                    image.num, image.page
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_extracted_image_paths(
+    output_dir: &Path,
+    paths: &[PathBuf],
+) -> Result<(), ToolError> {
+    if paths.len() > MAX_EXTRACTED_IMAGES {
+        return Err(ToolError::UnsupportedPng(format!(
+            "pdfimages produced {} files, exceeding the {MAX_EXTRACTED_IMAGES}-image limit",
+            paths.len()
+        )));
+    }
+    let root = fs::canonicalize(output_dir)?;
+    let mut total = 0u64;
+    for path in paths {
+        // Keep a missing path visible to the downstream figure pass. That
+        // preserves its error/reporting behavior while still bounding every
+        // artifact that the external tool actually materialized.
+        if !path.exists() {
+            continue;
+        }
+        let canonical = fs::canonicalize(path)?;
+        if !canonical.starts_with(&root) {
+            return Err(ToolError::UnsupportedPng(format!(
+                "pdfimages produced a path outside its scratch directory: {}",
+                path.display()
+            )));
+        }
+        let metadata = fs::metadata(&canonical)?;
+        if !metadata.is_file() {
+            return Err(ToolError::UnsupportedPng(format!(
+                "pdfimages output is not a regular file: {}",
+                path.display()
+            )));
+        }
+        if metadata.len() > MAX_IMAGE_FILE_BYTES {
+            return Err(ToolError::UnsupportedPng(format!(
+                "extracted image {} is {} bytes, exceeding the {MAX_IMAGE_FILE_BYTES}-byte limit",
+                path.display(),
+                metadata.len()
+            )));
+        }
+        total = total
+            .checked_add(metadata.len())
+            .ok_or_else(|| ToolError::UnsupportedPng("image byte total overflowed".to_string()))?;
+        if total > MAX_IMAGE_AGGREGATE_BYTES {
+            return Err(ToolError::UnsupportedPng(format!(
+                "extracted images total {total} bytes, exceeding the {MAX_IMAGE_AGGREGATE_BYTES}-byte limit"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_scratch_directory(path: &Path) -> Result<(), ToolError> {
+    validate_scratch_directories(&[path])
+}
+
+pub(crate) fn validate_scratch_directories(paths: &[&Path]) -> Result<(), ToolError> {
+    let mut total = 0u64;
+    for path in paths {
+        let mut stack = vec![(*path).to_path_buf()];
+        while let Some(current) = stack.pop() {
+            for entry in fs::read_dir(current)? {
+                let entry = entry?;
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.file_type().is_symlink() {
+                    return Err(ToolError::UnsupportedPng(format!(
+                        "scratch directory contains a symlink: {}",
+                        entry.path().display()
+                    )));
+                }
+                if metadata.is_dir() {
+                    stack.push(entry.path());
+                } else if metadata.is_file() {
+                    total = total.checked_add(metadata.len()).ok_or_else(|| {
+                        ToolError::UnsupportedPng("scratch byte total overflowed".to_string())
+                    })?;
+                    if total > MAX_SCRATCH_BYTES {
+                        return Err(ToolError::UnsupportedPng(format!(
+                            "combined scratch output exceeds the {MAX_SCRATCH_BYTES}-byte limit"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_png_file(path: &Path) -> Result<(), ToolError> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_IMAGE_FILE_BYTES {
+        return Err(ToolError::UnsupportedPng(format!(
+            "PNG {} is {} bytes, exceeding the {MAX_IMAGE_FILE_BYTES}-byte limit",
+            path.display(),
+            metadata.len()
+        )));
+    }
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 33];
+    file.read_exact(&mut header)?;
+    if &header[..8] != b"\x89PNG\r\n\x1a\n" || &header[12..16] != b"IHDR" {
+        return Err(ToolError::UnsupportedPng(format!(
+            "{} is not a PNG with an IHDR header",
+            path.display()
+        )));
+    }
+    let width = u32::from_be_bytes(header[16..20].try_into().expect("PNG width"));
+    let height = u32::from_be_bytes(header[20..24].try_into().expect("PNG height"));
+    if width == 0 || height == 0 {
+        return Err(ToolError::UnsupportedPng(format!(
+            "{} has zero PNG dimensions",
+            path.display()
+        )));
+    }
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if pixels > MAX_RENDER_PIXELS {
+        return Err(ToolError::UnsupportedPng(format!(
+            "PNG {} has {pixels} pixels, exceeding the {MAX_RENDER_PIXELS}-pixel limit",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn crop_png_to_file(
@@ -801,7 +965,11 @@ pub(crate) fn crop_png_to_file(
         image.bit_depth,
         image.bytes_per_pixel,
         &pixels,
-    )
+    )?;
+    if let Some(parent) = output.parent() {
+        validate_scratch_directory(parent)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -819,6 +987,14 @@ pub(crate) fn write_solid_rgb_png(
 }
 
 fn read_png(path: &Path) -> Result<PngImage, ToolError> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_IMAGE_FILE_BYTES {
+        return Err(ToolError::UnsupportedPng(format!(
+            "PNG {} is {} bytes, exceeding the {MAX_IMAGE_FILE_BYTES}-byte limit",
+            path.display(),
+            metadata.len()
+        )));
+    }
     let bytes = fs::read(path)?;
     if bytes.len() < 8 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
         return Err(ToolError::UnsupportedPng(format!(
@@ -877,6 +1053,11 @@ fn read_png(path: &Path) -> Result<PngImage, ToolError> {
 
     let width = width.ok_or_else(|| ToolError::UnsupportedPng("missing IHDR".to_string()))?;
     let height = height.ok_or_else(|| ToolError::UnsupportedPng("missing IHDR".to_string()))?;
+    if width == 0 || height == 0 {
+        return Err(ToolError::UnsupportedPng(
+            "PNG dimensions must be non-zero".to_string(),
+        ));
+    }
     let bit_depth = bit_depth.unwrap_or_default();
     let color_type = color_type.unwrap_or_default();
     if bit_depth != 8 {
@@ -895,11 +1076,31 @@ fn read_png(path: &Path) -> Result<PngImage, ToolError> {
             )));
         }
     };
-    let mut decoder = ZlibDecoder::new(idat.as_slice());
-    let mut inflated = Vec::new();
-    decoder.read_to_end(&mut inflated)?;
-    let row_stride = width as usize * bytes_per_pixel;
-    let expected = (row_stride + 1) * height as usize;
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG pixel count overflowed".to_string()))?;
+    if pixels > MAX_RENDER_PIXELS {
+        return Err(ToolError::UnsupportedPng(format!(
+            "PNG has {pixels} pixels, exceeding the {MAX_RENDER_PIXELS}-pixel limit"
+        )));
+    }
+    let row_stride = (width as usize)
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG row size overflowed".to_string()))?;
+    let expected = row_stride
+        .checked_add(1)
+        .and_then(|stride| stride.checked_mul(height as usize))
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG decompressed size overflowed".to_string()))?;
+    if expected as u64 > MAX_PNG_DECOMPRESSED_BYTES {
+        return Err(ToolError::UnsupportedPng(format!(
+            "PNG decompressed data exceeds the {MAX_PNG_DECOMPRESSED_BYTES}-byte limit"
+        )));
+    }
+    let decoder = ZlibDecoder::new(idat.as_slice());
+    let mut inflated = Vec::with_capacity(expected.min(64 * 1024));
+    decoder
+        .take(expected as u64 + 1)
+        .read_to_end(&mut inflated)?;
     if inflated.len() != expected {
         return Err(ToolError::UnsupportedPng(format!(
             "inflated data length {} did not match expected {expected}",
@@ -907,7 +1108,10 @@ fn read_png(path: &Path) -> Result<PngImage, ToolError> {
         )));
     }
 
-    let mut pixels = vec![0; row_stride * height as usize];
+    let pixel_bytes = row_stride
+        .checked_mul(height as usize)
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG pixel buffer size overflowed".to_string()))?;
+    let mut pixels = vec![0; pixel_bytes];
     for row in 0..height as usize {
         let raw_offset = row * (row_stride + 1);
         let filter = inflated[raw_offset];
@@ -967,13 +1171,30 @@ fn write_png(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let row_stride = width as usize * bytes_per_pixel;
-    if pixels.len() != row_stride * height as usize {
+    let row_stride = (width as usize)
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG row size overflowed".to_string()))?;
+    let expected_pixels = row_stride
+        .checked_mul(height as usize)
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG pixel buffer size overflowed".to_string()))?;
+    let pixel_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG pixel count overflowed".to_string()))?;
+    if pixel_count > MAX_RENDER_PIXELS || expected_pixels as u64 > MAX_PNG_DECOMPRESSED_BYTES {
+        return Err(ToolError::UnsupportedPng(
+            "PNG dimensions exceed the raster safety limits".to_string(),
+        ));
+    }
+    if pixels.len() != expected_pixels {
         return Err(ToolError::UnsupportedPng(
             "pixel buffer length did not match PNG dimensions".to_string(),
         ));
     }
-    let mut filtered = Vec::with_capacity((row_stride + 1) * height as usize);
+    let filtered_len = row_stride
+        .checked_add(1)
+        .and_then(|stride| stride.checked_mul(height as usize))
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG filtered size overflowed".to_string()))?;
+    let mut filtered = Vec::with_capacity(filtered_len);
     for row in 0..height as usize {
         filtered.push(0);
         let start = row * row_stride;
@@ -1575,5 +1796,56 @@ mod tests {
         assert_eq!(image.width, 7);
         assert_eq!(image.height, 8);
         assert_eq!(image.pixels[..3], [12, 34, 56]);
+    }
+
+    #[test]
+    fn rejects_png_dimensions_before_inflating_data() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("oversized.png");
+        let mut header = [0u8; 33];
+        header[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        header[8..12].copy_from_slice(&13u32.to_be_bytes());
+        header[12..16].copy_from_slice(b"IHDR");
+        header[16..20].copy_from_slice(&(MAX_RENDER_PIXELS as u32).to_be_bytes());
+        header[20..24].copy_from_slice(&2u32.to_be_bytes());
+        header[24] = 8;
+        header[25] = 2;
+        fs::write(&path, header).expect("fixture writes");
+
+        let error = read_png(&path).expect_err("oversized dimensions must be rejected");
+        assert!(error.to_string().contains("pixel"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_directory_with_a_symlink_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let outside = dir.path().join("outside.png");
+        fs::write(&outside, b"data").expect("outside writes");
+        let scratch = dir.path().join("scratch");
+        fs::create_dir(&scratch).expect("scratch creates");
+        fs::write(scratch.join("page-0001.png"), b"png").expect("png writes");
+        std::os::unix::fs::symlink(&outside, scratch.join("escape.png")).expect("symlink creates");
+
+        let error = validate_scratch_directory(&scratch)
+            .expect_err("a scratch directory must not contain symlinks");
+        assert!(error.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn render_crop_dimensions_are_clamped_to_the_render_edge() {
+        let crop = PageCrop {
+            page: 1,
+            left: -5000,
+            top: -1,
+            width: i32::MAX,
+            height: i32::MAX,
+        }
+        .to_render_pixels();
+
+        assert_eq!(crop.left, 0);
+        assert_eq!(crop.top, 0);
+        assert_eq!(crop.width, MAX_RENDER_EDGE as i32);
+        assert_eq!(crop.height, MAX_RENDER_EDGE as i32);
     }
 }

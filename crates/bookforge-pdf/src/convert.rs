@@ -26,6 +26,7 @@ use crate::{
     tools::{
         ExtractedImage, PDF_RENDER_DPI, PDF_XML_ZOOM_DEN, PDF_XML_ZOOM_NUM, PageCrop,
         PopplerBackend, PopplerTools, ScopedTempDir, crop_png_to_file,
+        validate_extracted_image_paths, validate_scratch_directories,
     },
 };
 
@@ -102,6 +103,7 @@ pub fn convert_pdf_with_ocr(
     options: &ConvertOptions,
     ocr: Option<&dyn OcrEngine>,
 ) -> Result<ConvertOutcome> {
+    ensure_distinct_paths(input, output)?;
     let tools = PopplerTools::discover()?;
     convert_pdf_with_tools(input, output, options, &tools, ocr)
 }
@@ -113,6 +115,7 @@ fn convert_pdf_with_tools(
     tools: &dyn PopplerBackend,
     ocr: Option<&dyn OcrEngine>,
 ) -> Result<ConvertOutcome> {
+    ensure_distinct_paths(input, output)?;
     let xml = tools.pdf_to_xml(input)?;
     let pages = parse_pdf2xml(&xml)?;
     let reconstruction =
@@ -143,6 +146,12 @@ fn convert_pdf_with_tools(
             Vec::new()
         }
     };
+    let extracted_image_paths = extracted_images
+        .iter()
+        .map(|image| image.path.clone())
+        .collect::<Vec<_>>();
+    validate_extracted_image_paths(image_dir.path(), &extracted_image_paths)?;
+    validate_scratch_directories(&[media_dir.path(), image_dir.path(), page_render_dir.path()])?;
     let mut crop_renderer = PageCropRenderer::new(input, tools, page_render_dir.path());
     let figure_result = figure_blocks_from_images(
         &pages,
@@ -171,6 +180,7 @@ fn convert_pdf_with_tools(
     )?;
     layout_warnings.extend(media_figures.warnings);
     figure_blocks.extend(media_figures.figures);
+    validate_scratch_directories(&[media_dir.path(), image_dir.path(), page_render_dir.path()])?;
     drop(media_dir);
     drop(image_dir);
     drop(page_render_dir);
@@ -278,6 +288,17 @@ fn convert_pdf_with_tools(
         chapters: blocks_per_chapter.len(),
         blocks_per_chapter,
     })
+}
+
+fn ensure_distinct_paths(input: &Path, output: &Path) -> Result<()> {
+    if bookforge_core::path::paths_are_aliases(input, output)? {
+        return Err(crate::PdfError::InvalidInput(format!(
+            "PDF input and EPUB output must be different files: {} / {}",
+            input.display(),
+            output.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Render one page PNG for OCR, downscaling extreme MediaBoxes so that
