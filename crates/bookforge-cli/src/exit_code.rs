@@ -20,10 +20,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 pub(crate) const SUCCESS: i32 = 0;
 pub(crate) const FAILURE: i32 = 1;
-/// clap already exits with this for parse errors; defined here so the
-/// taxonomy is documented in one place and referenced by tests.
-#[allow(dead_code)]
-pub(crate) const USAGE: i32 = 2;
 /// The run completed but some segments remain failed/needs-review.
 pub(crate) const COMPLETED_WITH_FAILURES: i32 = 3;
 /// Graceful SIGINT/Ctrl+C interruption (128 + SIGINT), matching POSIX shells.
@@ -95,7 +91,6 @@ mod tests {
     fn taxonomy_values_are_the_documented_constants() {
         assert_eq!(SUCCESS, 0);
         assert_eq!(FAILURE, 1);
-        assert_eq!(USAGE, 2);
         assert_eq!(COMPLETED_WITH_FAILURES, 3);
         // POSIX convention: 128 + SIGINT(2).
         assert_eq!(INTERRUPTED, 130);

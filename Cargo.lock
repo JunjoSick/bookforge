@@ -280,6 +280,7 @@ dependencies = [
  "futures-core",
  "getrandom 0.4.3",
  "indicatif",
+ "libc",
  "predicates",
  "quick-xml",
  "ratatui",
@@ -294,6 +295,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.52.0",
  "zip",
 ]
 
@@ -306,7 +308,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
+ "windows-sys 0.52.0",
  "zip",
 ]
 
@@ -361,11 +365,9 @@ version = "3.0.0"
 dependencies = [
  "bookforge-core",
  "rusqlite",
- "serde",
  "serde_json",
  "sha2",
  "thiserror",
- "toml",
 ]
 
 [[package]]

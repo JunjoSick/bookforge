@@ -11,6 +11,8 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::output;
+
 const VALIDATION_REPORT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Args)]
@@ -112,15 +114,13 @@ pub(crate) fn validate_and_write(
     report_path: &Path,
     strict_epubcheck: bool,
 ) -> Result<ValidationOutcome> {
+    output::ensure_distinct_paths("EPUB input/report", input, report_path)?;
     let outcome = validate_path(input, strict_epubcheck);
-    if let Some(parent) = report_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating report directory {}", parent.display()))?;
-    }
-    fs::write(report_path, serde_json::to_string_pretty(&outcome.report)?)
-        .with_context(|| format!("writing validation report {}", report_path.display()))?;
+    output::write_atomic(
+        report_path,
+        serde_json::to_string_pretty(&outcome.report)?.as_bytes(),
+    )
+    .with_context(|| format!("writing validation report {}", report_path.display()))?;
     Ok(outcome)
 }
 

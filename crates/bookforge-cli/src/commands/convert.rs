@@ -7,6 +7,8 @@ use bookforge_pdf::{
 };
 use clap::Args;
 
+use super::output;
+
 #[derive(Debug, Args)]
 pub struct ConvertArgs {
     /// Input PDF.
@@ -148,6 +150,9 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
         .report
         .clone()
         .unwrap_or_else(|| output.with_extension("convert.json"));
+    output::ensure_distinct_paths("PDF input/output", &args.input, &output)?;
+    output::ensure_distinct_paths("PDF output/report", &output, &report_path)?;
+    output::ensure_distinct_paths("PDF input/report", &args.input, &report_path)?;
 
     let options = ConvertOptions {
         columns: args.columns.into(),
@@ -212,7 +217,7 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
     .context("PDF conversion worker failed")??;
 
     let json = serde_json::to_string_pretty(&outcome.report)?;
-    std::fs::write(&report_path, json)
+    output::write_atomic(&report_path, json.as_bytes())
         .with_context(|| format!("writing report {}", report_path.display()))?;
 
     println!("Input: {}", input.display());

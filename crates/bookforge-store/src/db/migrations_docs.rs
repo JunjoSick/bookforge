@@ -77,6 +77,11 @@ const MIGRATION_DOCS: &[(i64, &str, &str)] = &[
         "v3_0_qa_finding_block_attribution",
         include_str!("../../migrations/0011_v3_0_qa_finding_block_attribution.sql"),
     ),
+    (
+        12,
+        "v3_0_translation_attempts_cache_identity",
+        include_str!("../../migrations/0012_v3_0_translation_attempts_cache_identity.sql"),
+    ),
 ];
 
 /// Historical applied-name → canonical-doc-name mapping for versions whose
@@ -85,7 +90,7 @@ const MIGRATION_DOCS: &[(i64, &str, &str)] = &[
 /// canonical naming starts with this mapping instead.
 const LEGACY_ALIASES: &[(i64, &str)] = &[(3, "v1_1_segment_flags")];
 
-/// Canonical applied ledger expected after a fresh open through migration 11.
+/// Canonical applied ledger expected after a fresh open through migration 12.
 const APPLIED_LEDGER: &[(&str, i64, &str)] = &[
     ("file", 1, "initial"),
     ("file", 2, "v1_0_1_input_snapshot"),
@@ -98,6 +103,7 @@ const APPLIED_LEDGER: &[(&str, i64, &str)] = &[
     ("file", 8, "v2_7_qa_findings"),
     ("file", 9, "v2_7_1_global_scope_unique_indexes"),
     ("file", 11, "v3_0_qa_finding_block_attribution"),
+    ("file", 12, "v3_0_translation_attempts_cache_identity"),
 ];
 
 #[derive(Default)]
@@ -406,7 +412,7 @@ fn applied_ledger_names_match_doc_files_under_recorded_aliases() {
         }
     }
 
-    // Versions 1..=11 are all accounted for; 10 is gated cleanup whose
+    // Versions 1..=12 are all accounted for; 10 is gated cleanup whose
     // presence depends on conforming data (asserted in the hardening tests).
     // Version 10 is gated cleanup: recorded whenever data conforms (fresh
     // stores and repaired legacy ones), legitimately absent otherwise.

@@ -15,6 +15,7 @@
 //! - `stitch` optionally joins the files per chapter and into an `.m4b`
 //!   via `ffmpeg`, degrading gracefully when it is absent.
 
+pub(crate) mod atomic;
 pub mod builder;
 pub mod capabilities;
 pub mod cleanup;
@@ -24,10 +25,14 @@ pub mod source;
 pub mod stitch;
 pub(crate) mod text;
 
+pub use atomic::replace_file;
 pub use builder::{
-    AudiobookManifest, AudiobookOptions, AudiobookReport, AudiobookStatus, BuildError,
-    ChunkFailure, ChunkRecord, ChunkStatus, GapSettings, Progress, build_audiobook,
-    failed_chunk_files, plan_chunks, plan_chunks_for_prune, validate_options,
+    AudiobookManifest, AudiobookOptions, AudiobookOutputLock, AudiobookReport, AudiobookStatus,
+    BuildError, ChunkFailure, ChunkRecord, ChunkStatus, GapSettings, Progress,
+    acquire_audiobook_output_lock, acquire_audiobook_output_lock_peek,
+    acquire_audiobook_output_lock_with_handoff, build_audiobook, build_audiobook_with_lock,
+    failed_chunk_files, new_lock_handoff_nonce, plan_chunks, plan_chunks_for_prune,
+    validate_options,
 };
 pub use capabilities::{ProviderFeatureSet, feature_set, feature_set_for_id};
 pub use cleanup::{StaleChunk, find_stale_chunks, remove_stale_chunks};

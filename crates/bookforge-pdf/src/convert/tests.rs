@@ -2,13 +2,12 @@ use super::*;
 
 use crate::convert::fake_backend::{FakePoppler, FixtureImage};
 
-// pdftohtml documents shared verbatim by BOTH tool paths below: the
-// Unix-only path ships them through /bin/sh poppler stand-ins, while the
-// in-process fake (`FakePoppler`) feeds the same strings through
-// [`PopplerBackend`] without spawning anything. Keeping them in shared
-// constants is what makes the two paths exercise identical conversions.
+// pdftohtml fixture documents. The shell-backed cases are Unix-only; the
+// portable in-process cases below use `FakePoppler`.
+#[cfg(unix)]
 const BERT_FIGURE1_CAPTION_BOUNDARY_XML: &str =
     include_str!("../../fixtures/bert_figure1_caption_boundary.xml");
+#[cfg(unix)]
 const BERT_FIGURE4_MULTIPANEL_XML: &str =
     include_str!("../../fixtures/bert_figure4_multipanel.xml");
 const BERT_FIGURE5_VECTOR_CHART_XML: &str =
@@ -17,6 +16,7 @@ const BERT_PAGE16_VECTOR_CHART_TWOCOL_XML: &str =
     include_str!("../../fixtures/bert_page16_vector_chart_twocol.xml");
 const BERT_FIGURE1_TOKEN_STRIP_XML: &str =
     include_str!("../../fixtures/bert_figure1_token_strip.xml");
+#[cfg(unix)]
 const BERT_MODEL_PARAMETER_FALSE_POSITIVE_XML: &str =
     include_str!("../../fixtures/bert_model_parameter_false_positive.xml");
 
@@ -386,6 +386,57 @@ fn remove_blocks_in_region_requires_horizontal_overlap() {
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].block.text(), "right column prose must remain");
     assert!(warnings[0].contains("left table text"));
+}
+
+#[test]
+fn convert_rejects_input_output_alias_before_poppler_work() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = write_input_pdf(dir.path());
+    let fake = FakePoppler::new(TEXT_ONLY_XML, TEXT_ONLY_BASELINE);
+
+    let error =
+        match convert_pdf_with_tools(&input, &input, &ConvertOptions::default(), &fake, None) {
+            Ok(_) => panic!("input/output aliases must be rejected"),
+            Err(error) => error,
+        };
+    assert!(error.to_string().contains("must be different"));
+    assert_eq!(fake.call_count("pdf_to_xml"), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn convert_rejects_symlinked_input_output_alias() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = write_input_pdf(dir.path());
+    let output = dir.path().join("alias.epub");
+    std::os::unix::fs::symlink(&input, &output).expect("alias creates");
+    let fake = FakePoppler::new(TEXT_ONLY_XML, TEXT_ONLY_BASELINE);
+
+    let error =
+        match convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &fake, None) {
+            Ok(_) => panic!("symlink aliases must be rejected"),
+            Err(error) => error,
+        };
+    assert!(error.to_string().contains("must be different"));
+    assert_eq!(fake.call_count("pdf_to_xml"), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn convert_rejects_hardlinked_input_output_alias() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = write_input_pdf(dir.path());
+    let output = dir.path().join("hardlink.epub");
+    fs::hard_link(&input, &output).expect("hardlink creates");
+    let fake = FakePoppler::new(TEXT_ONLY_XML, TEXT_ONLY_BASELINE);
+
+    let error =
+        match convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &fake, None) {
+            Ok(_) => panic!("hardlink aliases must be rejected"),
+            Err(error) => error,
+        };
+    assert!(error.to_string().contains("must be different"));
+    assert_eq!(fake.call_count("pdf_to_xml"), 0);
 }
 
 #[test]

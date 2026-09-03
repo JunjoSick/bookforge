@@ -13,10 +13,14 @@ use serde::Serialize;
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
-    archive_limits::{ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, validate_archive_metadata},
+    archive_limits::{
+        ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, preflight_archive_path,
+        validate_archive_metadata,
+    },
     util::{
-        attr_value_unescaped, commit_staged_output, deterministic_zip_time, is_xhtml_resource_name,
-        local_name, normalize_space, resolve_general_ref, sibling_work_path, validate_xml,
+        attr_value_unescaped, commit_staged_output, create_sibling_work_file,
+        deterministic_zip_time, ensure_distinct_paths, is_xhtml_resource_name, local_name,
+        normalize_space, resolve_general_ref, validate_xml,
     },
 };
 
@@ -78,8 +82,8 @@ fn reflow_epub_staged(
     output: &Path,
     options: &ReflowOptions,
 ) -> Result<ReflowReport> {
-    let staged = sibling_work_path(output, "reflow");
-    let result = with_output_writer(input, output, options, &staged);
+    let (staged, staged_file) = create_sibling_work_file(output, "reflow")?;
+    let result = with_output_writer(input, output, options, staged_file);
     match result {
         Ok(report) => {
             if let Err(error) = commit_staged_output("reflowed", &staged, output) {
@@ -96,6 +100,9 @@ fn reflow_epub_staged(
 }
 
 pub fn reflow_epub(input: &Path, output: &Path, options: &ReflowOptions) -> Result<ReflowOutcome> {
+    if !options.dry_run {
+        ensure_distinct_paths("EPUB input/output", input, output)?;
+    }
     let result = if options.dry_run {
         write_reflowed_epub(input, output, options, None)
     } else {
@@ -112,9 +119,8 @@ fn with_output_writer(
     input: &Path,
     output: &Path,
     options: &ReflowOptions,
-    staged: &Path,
+    output_file: File,
 ) -> Result<ReflowReport> {
-    let output_file = File::create(staged)?;
     let writer = ZipWriter::new(output_file);
     write_reflowed_epub(input, output, options, Some(writer))
 }
@@ -126,6 +132,7 @@ fn write_reflowed_epub(
     writer: Option<ZipWriter<File>>,
 ) -> Result<ReflowReport> {
     let source = File::open(input)?;
+    preflight_archive_path(input)?;
     let mut archive = ZipArchive::new(source)?;
     // Central-directory validation plus a per-entry read budget bound every
     // decompression below, so `bookforge reflow` inherits the same

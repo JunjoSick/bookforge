@@ -5,7 +5,9 @@ use bookforge_core::{
     segment::{BlockTranslation, Segment},
 };
 
-use crate::archive_limits::{DEFAULT_ARCHIVE_LIMITS, validate_archive_metadata};
+use crate::archive_limits::{
+    DEFAULT_ARCHIVE_LIMITS, preflight_archive_path, validate_archive_metadata,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpubValidationReport {
@@ -52,6 +54,18 @@ pub fn validate_translated_epub(
         report.xml_valid = false;
         return report;
     };
+
+    if let Err(error) = preflight_archive_path(epub_path) {
+        report.xml_valid = false;
+        report.issues.push(EpubValidationIssue {
+            severity: ValidationSeverity::Error,
+            kind: "decompression_limit".to_string(),
+            href: None,
+            block_id: None,
+            message: error.to_string(),
+        });
+        return report;
+    }
 
     match zip::ZipArchive::new(file) {
         Ok(mut archive) => {
