@@ -415,8 +415,10 @@ fn default_output_path(input: &std::path::Path, target: &str) -> PathBuf {
 #[cfg(test)]
 mod sweep_tests {
     use super::*;
+    #[cfg(unix)]
     use std::{fs, path::PathBuf, time::SystemTime};
 
+    #[cfg(unix)]
     fn temp_runs_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
