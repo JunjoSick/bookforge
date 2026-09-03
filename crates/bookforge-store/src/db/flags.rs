@@ -10,6 +10,12 @@ pub enum RetryScope {
 }
 
 impl JobStore {
+    /// Bulk-retry the segments matching `scope` for one job.
+    ///
+    /// The segment flip AND the job status roll-up commit in ONE `IMMEDIATE`
+    /// transaction so a crash between the two can never leave segments
+    /// `retry_pending` under a stale job status (atomic bulk retry). A missing
+    /// job row is an explicit [`StoreError::NotFound`], never a silent no-op.
     pub fn retry_segments(&self, job_id: &str, scope: RetryScope) -> Result<usize> {
         let wanted: &[SegmentStatus] = match scope {
             RetryScope::Failed => &[SegmentStatus::Failed],
@@ -17,18 +23,27 @@ impl JobStore {
             RetryScope::All => &[SegmentStatus::Failed, SegmentStatus::NeedsReview],
         };
         let where_status = format!("status IN ({})", SegmentStatus::sql_set(wanted));
-        let sql = format!(
-            "UPDATE segments SET status = '{}', error = NULL WHERE job_id = ?1 AND {where_status}",
-            SegmentStatus::RetryPending.as_db_text()
-        );
         let count = {
-            let conn = self.conn.borrow();
-            conn.execute(&sql, params![job_id])?
+            let mut conn = self.conn.borrow_mut();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            ensure_job_exists(&tx, job_id)?;
+            let sql = format!(
+                "UPDATE segments SET status = '{}', error = NULL WHERE job_id = ?1 AND {where_status}",
+                SegmentStatus::RetryPending.as_db_text()
+            );
+            let count = tx.execute(&sql, params![job_id])?;
+            touch_job_unless_status_on(
+                &tx,
+                job_id,
+                JobStatus::RetryPending,
+                &[JobStatus::Stopped],
+            )?;
+            tx.commit()?;
+            count
         };
         // Findings are instrumentation, so a failed findings write must never
         // fail the surrounding translation checkpoint.
         let _ = self.prune_stale_findings(job_id);
-        self.touch_job_unless_status(job_id, JobStatus::RetryPending, &[JobStatus::Stopped])?;
         Ok(count)
     }
 
@@ -200,6 +215,7 @@ impl JobStore {
         segment_ids: &[String],
         reason: &str,
     ) -> Result<usize> {
+        ensure_job_exists(&self.conn.borrow(), job_id)?;
         const SQLITE_IN_CHUNK_SIZE: usize = 900;
         let mut updated = 0usize;
         for chunk in segment_ids.chunks(SQLITE_IN_CHUNK_SIZE) {

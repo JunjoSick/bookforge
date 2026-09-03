@@ -39,6 +39,11 @@ fn requested() -> i32 {
     REQUESTED.load(Ordering::SeqCst)
 }
 
+#[cfg(test)]
+pub(crate) fn requested_code() -> i32 {
+    requested()
+}
+
 /// Combine the command result with any explicit request into a final code.
 pub(crate) fn resolve(run_failed: bool) -> i32 {
     let requested = requested();

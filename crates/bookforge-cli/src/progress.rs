@@ -420,7 +420,9 @@ impl JsonlFileWriter {
             return Ok(());
         };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|err| {
+                anyhow::anyhow!("cannot create JSONL progress log {}: {err}", path.display())
+            })?;
         }
         let file_result = std::fs::OpenOptions::new()
             .create(true)
@@ -432,16 +434,20 @@ impl JsonlFileWriter {
             Ok(file) => {
                 self.writer = Some(BufWriter::new(file));
                 self.last_flush = Instant::now();
+                Ok(())
             }
             Err(err) => {
+                // A failed log open must FAIL the run, not degrade into a
+                // silent warn-and-continue that drops every subsequent event.
+                // The reporter surfaces the original error and stops; replay
+                // consumers then see an honest failure instead of a gap.
                 self.failed = true;
-                eprintln!(
-                    "warn: cannot create JSONL progress log {}: {err}",
+                Err(anyhow::anyhow!(
+                    "cannot create JSONL progress log {}: {err}",
                     path.display()
-                );
+                ))
             }
         }
-        Ok(())
     }
 
     fn write_event(&mut self, event: &ProgressEvent) -> Result<()> {
@@ -1005,6 +1011,45 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("Warning"));
+    }
+
+    /// A JSONL open failure (unwritable location) must surface as an error
+    /// from the reporter, not be silently absorbed into a warn-and-continue
+    /// that drops every event from the durable log.
+    #[tokio::test]
+    async fn jsonl_open_failure_surfaces_as_an_error() {
+        let blocker = std::env::temp_dir().join(format!(
+            "bookforge-test-blocker-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&blocker, b"a plain file").expect("blocker writes");
+        let bad_path = blocker.join("events.jsonl");
+
+        let (tx, rx) = mpsc::channel::<ProgressEvent>(16);
+        let handle = tokio::spawn(render_loop(
+            rx,
+            UiMode::Quiet,
+            Some(bad_path),
+            false,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        ));
+
+        tx.send(ProgressEvent::StageStarted {
+            stage: "boom".to_string(),
+            timestamp_ms: 0,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let result = handle.await.expect("render loop should not panic");
+        let error = result.expect_err("JSONL open failure must surface");
+        assert!(
+            error.to_string().contains("JSONL progress log"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_file(&blocker);
     }
 
     /// UI-10: queue overflow must be reported with honest accounting. The
