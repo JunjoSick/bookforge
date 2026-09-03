@@ -5,67 +5,303 @@
 //! freshly paid chunks. The builder therefore holds one advisory lock for
 //! the entire lifetime of a build.
 //!
-//! The repo has no flock/fs2-style dependency available in-tree, so this is
-//! a std-only exclusive-create protocol with explicit ownership metadata:
+//! The gate is a kernel-backed advisory lock held for the whole build:
+//! `flock(2)` on Unix and `LockFileEx` on Windows, both exclusive, taken on a
+//! `.bookforge-audio.lock` file that also carries a human-readable owner
+//! record (pid + start time + nonce) for diagnostics and for the dashboard's
+//! spawn handoff. Because the kernel releases the lock automatically when the
+//! holder exits, there is no stale-owner reclaim and no unlink race: a
+//! crashed build never leaves a permanently held lock, and nothing ever
+//! deletes or recreates the lock file, so the kernel lock cannot be split
+//! across inodes.
 //!
-//! - Acquire: atomically `create_new` `.bookforge-audio.lock` inside the
-//!   output directory, then write the owner record (pid + start time). If
-//!   creation loses to an existing lock, the file is read and, on Linux,
-//!   a provably dead owner pid is reclaimed; otherwise acquisition fails
-//!   with a [`LockError::Held`] naming the owning run.
-//! - Hold: the returned guard keeps the protocol stateless afterward — any
-//!   second acquirer sees `AlreadyExists` while the first run lives.
-//! - Release: dropping the guard removes the file *only after re-reading it
-//!   and confirming its recorded pid is ours*, so a lock reclaimed or
-//!   replaced by another process is never deleted on our behalf.
+//! # Ownership handoff across a spawn
 //!
-//! PID liveness is checked through procfs where it exists (Linux); on other
-//! platforms every existing owner counts as live and stale locks must be
-//! removed manually — the error message says exactly which file to check.
-//! This favors safety over convenience: a false "dead" verdict would let a
-//! second run corrupt the first one's manifest.
+//! The dashboard parent holds the kernel lock, records a fresh nonce for the
+//! child it is about to launch, spawns the child (passing the nonce in the
+//! child's environment), then releases the kernel lock. The child waits on
+//! the same kernel lock (bounded), acquires it, and — only after verifying
+//! the record still carries that nonce — adopts the lock by rewriting the
+//! record to name itself. An unrelated waiter that acquires the lock but is
+//! not the addressed child releases it and fails closed. No builder ever
+//! works without holding the kernel lock, so two processes can never
+//! double-spend or prune each other.
+//!
+//! Terminal writers (the dashboard watcher and restart cancellation) also
+//! acquire the kernel lock before touching state, compare the recorded
+//! nonce/PID against the child they are closing out, and release without
+//! writing if a newer owner took over.
 
 use std::fmt;
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Lock file convention inside every audiobook out_dir. Prune sweeps treat
-/// the name as protected: a live build's lock file is never deleted.
+/// the name as protected: it is never deleted or recreated so the kernel lock
+/// cannot be split across inodes.
 pub(crate) const LOCK_FILE_NAME: &str = ".bookforge-audio.lock";
 
-const ACQUIRE_ATTEMPTS: usize = 3;
-const RETRY_DELAY: Duration = Duration::from_millis(50);
+/// Bounded wait for a handoff child on a contended kernel lock. The parent
+/// holds it only across a spawn handoff, so 30s is generous even under load.
+const HANDOFF_WAIT: Duration = Duration::from_secs(30);
+const LOCK_POLL: Duration = Duration::from_millis(25);
+static RECORD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Kernel advisory-lock primitives: exclusive `flock` on Unix and exclusive
+/// `LockFileEx` on Windows, with a non-blocking variant for fail-fast
+/// acquisitions and a bounded waiting variant for handoff children.
+#[cfg(unix)]
+mod kernel_lock {
+    use std::fs::File;
+    use std::io;
+    use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    use super::LOCK_POLL;
+
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    const LOCK_UN: i32 = 8;
+
+    pub fn try_lock(file: &File) -> io::Result<()> {
+        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub fn lock_waiting(file: &File, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match try_lock(file) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "timed out waiting for the audiobook output lock",
+                        ));
+                    }
+                    std::thread::sleep(LOCK_POLL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub fn unlock(file: &File) {
+        unsafe {
+            flock(file.as_raw_fd(), LOCK_UN);
+        }
+    }
+}
+
+#[cfg(windows)]
+mod kernel_lock {
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+    use std::time::{Duration, Instant};
+
+    use super::LOCK_POLL;
+
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        h_event: *mut std::ffi::c_void,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LockFileEx(
+            file: *mut std::ffi::c_void,
+            flags: u32,
+            reserved: u32,
+            bytes_low: u32,
+            bytes_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        fn UnlockFileEx(
+            file: *mut std::ffi::c_void,
+            reserved: u32,
+            bytes_low: u32,
+            bytes_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
+    // Keep the ownership byte disjoint from the human-readable record at the
+    // start of the file. Windows byte-range locks are mandatory for I/O, so a
+    // whole-file lock would prevent contenders from reading the record for a
+    // useful "held by pid" diagnostic. LockFileEx permits ranges beyond EOF;
+    // byte 4 GiB is never materialized and remains a stable kernel lock key.
+    const LOCK_BYTE_OFFSET_HIGH: u32 = 1;
+    const LOCK_BYTE_LENGTH: u32 = 1;
+
+    fn lock_region(file: &File, flags: u32) -> i32 {
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: LOCK_BYTE_OFFSET_HIGH,
+            h_event: std::ptr::null_mut(),
+        };
+        unsafe {
+            LockFileEx(
+                file.as_raw_handle() as *mut _,
+                flags,
+                0,
+                LOCK_BYTE_LENGTH,
+                0,
+                &mut overlapped,
+            )
+        }
+    }
+
+    pub fn try_lock(file: &File) -> io::Result<()> {
+        if lock_region(file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY) != 0 {
+            Ok(())
+        } else {
+            let error = io::Error::last_os_error();
+            // With valid parameters the only realistic failure is contention.
+            if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            } else {
+                Err(error)
+            }
+        }
+    }
+
+    pub fn lock_waiting(file: &File, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match try_lock(file) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "timed out waiting for the audiobook output lock",
+                        ));
+                    }
+                    std::thread::sleep(LOCK_POLL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub fn unlock(file: &File) {
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: LOCK_BYTE_OFFSET_HIGH,
+            h_event: std::ptr::null_mut(),
+        };
+        unsafe {
+            UnlockFileEx(
+                file.as_raw_handle() as *mut _,
+                0,
+                LOCK_BYTE_LENGTH,
+                0,
+                &mut overlapped,
+            );
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod kernel_lock {
+    use std::fs::File;
+    use std::io;
+    use std::time::Duration;
+
+    pub fn try_lock(_file: &File) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "kernel file locking is unsupported on this platform",
+        ))
+    }
+
+    pub fn lock_waiting(_file: &File, _timeout: Duration) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "kernel file locking is unsupported on this platform",
+        ))
+    }
+
+    pub fn unlock(_file: &File) {}
+}
 
 #[derive(Debug)]
 pub(crate) struct OutDirLock {
-    path: PathBuf,
-    /// Process that wrote the record; exposed for tests and diagnostics.
-    pub(crate) pid: u32,
+    /// Held open for the whole build; its kernel lock is the ownership gate.
+    file: File,
+    pub(crate) path: PathBuf,
 }
 
-impl fmt::Display for OutDirLock {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} held by pid {}",
-            self.path.display(),
-            self.pid
-        )
+impl OutDirLock {
+    /// Read the owner record through the already-locked handle. Callers must
+    /// hold the kernel lock so the record is stable; all I/O happens on
+    /// `self.file` so the record read and any following rewrite belong to the
+    /// same lock owner. The Windows ownership byte lives beyond EOF, leaving
+    /// the record range readable through another handle for diagnostics.
+    pub(crate) fn record(&self) -> std::io::Result<OwnerRecord> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(0))?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        Ok(parse_owner_record(&contents).unwrap_or(OwnerRecord {
+            pid: 0,
+            started_at_ms: 0,
+            nonce: None,
+        }))
+    }
+
+    /// Overwrite the owner record through the already-locked handle. Callers
+    /// must hold the kernel lock, so the write is exclusive and the read-verify
+    /// then rewrite performed by an adopting child is serialized by the kernel
+    /// gate (never a read-then-unconditional-replace race). Used to claim a
+    /// fresh record, to hand a nonce to a child, and by an adopting child to
+    /// name itself.
+    pub(crate) fn write_record(&self, pid: u32, nonce: &str) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(0))?;
+        file.set_len(0)?;
+        file.write_all(owner_record_string(pid, now_ms(), nonce).as_bytes())?;
+        file.sync_all()
     }
 }
 
 impl Drop for OutDirLock {
     fn drop(&mut self) {
-        // Verify ownership before removing: another process may have
-        // reclaimed our lock after proving us dead, and deleting its file
-        // would defeat the whole protocol.
-        if let Ok(record) = read_lock_record(&self.path)
-            && record.pid == self.pid
-        {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        kernel_lock::unlock(&self.file);
+        // The file handle closes immediately after, releasing the lock again
+        // and leaving the record in place for the next acquirer.
+    }
+}
+
+impl fmt::Display for OutDirLock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.path.display())
     }
 }
 
@@ -96,7 +332,7 @@ impl fmt::Display for HeldDetail {
             Some(holder) => write!(
                 formatter,
                 "'{}' is locked by another audiobook run (pid {}, started {} ms since epoch). \
-                 Wait for that run to finish, or verify it is dead and remove the lock file",
+                 Wait for that run to finish",
                 self.lock_path.display(),
                 holder.pid,
                 holder.started_at_ms
@@ -104,8 +340,7 @@ impl fmt::Display for HeldDetail {
             None => write!(
                 formatter,
                 "'{}' is locked, but its owner record could not be read. \
-                 No live BookForge audiobook run can be identified; verify no build \
-                 is active and remove the lock file to continue",
+                 Wait for the active run to finish and retry",
                 self.lock_path.display()
             ),
         }
@@ -113,16 +348,20 @@ impl fmt::Display for HeldDetail {
 }
 
 /// Serialized owner payload. Text, not JSON, so an operator can inspect a
-/// stuck lock with plain `cat`.
+/// lock with plain `cat`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerRecord {
     pub pid: u32,
     pub started_at_ms: u64,
+    /// Ownership token for the dashboard handoff. `None` for records written
+    /// by direct CLI runs or before the nonce existed.
+    pub nonce: Option<String>,
 }
 
 fn parse_owner_record(contents: &str) -> Option<OwnerRecord> {
     let mut pid = None;
     let mut started_at_ms = None;
+    let mut nonce = None;
     for line in contents.lines() {
         if let Some(value) = line.strip_prefix("pid=")
             && let Ok(parsed) = value.trim().parse()
@@ -134,35 +373,26 @@ fn parse_owner_record(contents: &str) -> Option<OwnerRecord> {
         {
             started_at_ms = Some(parsed);
         }
+        if let Some(value) = line.strip_prefix("nonce=") {
+            nonce = Some(value.trim().to_string());
+        }
     }
     Some(OwnerRecord {
         pid: pid?,
         started_at_ms: started_at_ms.unwrap_or(0),
+        nonce,
     })
 }
 
-fn read_lock_record(path: &Path) -> std::io::Result<OwnerRecord> {
+pub(crate) fn read_lock_record(path: &Path) -> std::io::Result<OwnerRecord> {
     let mut file = std::fs::File::open(path)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
     Ok(parse_owner_record(&contents).unwrap_or(OwnerRecord {
         pid: 0,
         started_at_ms: 0,
+        nonce: None,
     }))
-}
-
-/// Best-effort liveness probe. Linux reads procfs; everywhere else the
-/// conservative answer "alive" keeps reclaim disabled.
-fn process_is_live(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        Path::new("/proc").join(pid.to_string()).exists()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        true
-    }
 }
 
 fn now_ms() -> u64 {
@@ -171,66 +401,139 @@ fn now_ms() -> u64 {
         .map_or(0, |duration| duration.as_millis() as u64)
 }
 
-/// Try once to take the lock via exclusive creation, then claim it.
-fn try_acquire(path: &Path) -> std::io::Result<std::fs::File> {
-    OpenOptions::new().write(true).create_new(true).open(path)
+/// A fresh, unguessable-per-process ownership token for a lock record.
+pub(crate) fn generate_nonce() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(std::process::id() as u64);
+    hasher.write_u64(now_ms());
+    hasher.write_u64(RECORD_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    format!("{:016x}{:016x}", hasher.finish(), now_ms())
 }
 
-/// Acquire the process-lifetime build lock for `out_dir`, retrying briefly
-/// around a reclaimed dead-owner race so two simultaneous reclaimers do not
-/// spuriously fail each other.
-pub(crate) fn acquire_out_dir_lock(out_dir: &Path) -> Result<OutDirLock, LockError> {
-    let path = out_dir.join(LOCK_FILE_NAME);
-    let mut last_seen_holder = None;
-    for _attempt in 0..ACQUIRE_ATTEMPTS {
-        match try_acquire(&path) {
-            Ok(mut file) => {
-                let record = format!("pid={}\nstarted_at_ms={}\n", std::process::id(), now_ms());
-                // Claim failure still leaves an empty lock behind whose
-                // unreadable record tells the next contender nobody owns it;
-                // surface the error rather than pretending we hold nothing.
-                if let Err(source) = file
-                    .write_all(record.as_bytes())
-                    .and_then(|()| file.flush())
-                {
-                    return Err(LockError::Io { path, source });
-                }
-                return Ok(OutDirLock {
-                    path,
-                    pid: std::process::id(),
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let holder = read_lock_record(&path).ok();
-                let reclaimable = holder
-                    .as_ref()
-                    .is_some_and(|record| record.pid != 0 && !process_is_live(record.pid));
-                if reclaimable && std::fs::remove_file(&path).is_ok() {
-                    // Loop immediately: whichever contender recreates first
-                    // wins; the other sees a live owner or an empty record.
-                    continue;
-                }
-                if !reclaimable {
-                    return Err(LockError::Held {
-                        detail: HeldDetail {
-                            lock_path: path.clone(),
-                            holder,
-                        },
-                    });
-                }
-                // Reclaim lost the recreate race; bounded backoff, retry.
-                last_seen_holder = read_lock_record(&path).ok();
-                std::thread::sleep(RETRY_DELAY);
-            }
-            Err(source) => {
-                return Err(LockError::Io { path, source });
-            }
-        }
-    }
-    Err(LockError::Held {
+fn owner_record_string(pid: u32, started_at_ms: u64, nonce: &str) -> String {
+    format!("pid={pid}\nstarted_at_ms={started_at_ms}\nnonce={nonce}\n")
+}
+
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    // Never truncate on open: the owner record must persist across the
+    // parent/child handoff and across the whole life of the out_dir.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+fn held(path: PathBuf) -> LockError {
+    LockError::Held {
         detail: HeldDetail {
             lock_path: path.clone(),
-            holder: last_seen_holder.or_else(|| read_lock_record(&path).ok()),
+            holder: read_lock_record(&path).ok(),
         },
-    })
+    }
+}
+
+/// Acquire the process-lifetime build lock for `out_dir`, taking the kernel
+/// lock non-blockingly and claiming the owner record. Fails immediately with
+/// [`LockError::Held`] when another live run holds it; there is no stale
+/// reclaim because the kernel releases the lock when a holder dies.
+pub(crate) fn acquire_out_dir_lock(out_dir: &Path) -> Result<OutDirLock, LockError> {
+    let path = out_dir.join(LOCK_FILE_NAME);
+    let file = open_lock_file(&path).map_err(|source| LockError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if let Err(source) = kernel_lock::try_lock(&file) {
+        if source.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(held(path));
+        }
+        return Err(LockError::Io { path, source });
+    }
+    let lock = OutDirLock {
+        file,
+        path: path.clone(),
+    };
+    let nonce = generate_nonce();
+    if let Err(source) = lock.write_record(std::process::id(), &nonce) {
+        drop(lock);
+        return Err(LockError::Io { path, source });
+    }
+    Ok(lock)
+}
+
+/// Acquire the kernel lock waiting for a dashboard parent to release it after
+/// spawning this child (bounded by [`HANDOFF_WAIT`]), then adopt the lock only
+/// if the record still carries `handoff_nonce`. An unrelated waiter that wins
+/// the lock but is not the addressed child releases it and fails closed.
+pub(crate) fn acquire_out_dir_lock_with_handoff(
+    out_dir: &Path,
+    handoff_nonce: &str,
+) -> Result<OutDirLock, LockError> {
+    let path = out_dir.join(LOCK_FILE_NAME);
+    let file = open_lock_file(&path).map_err(|source| LockError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if let Err(source) = kernel_lock::lock_waiting(&file, HANDOFF_WAIT) {
+        return Err(if source.kind() == std::io::ErrorKind::WouldBlock {
+            held(path)
+        } else {
+            LockError::Io { path, source }
+        });
+    }
+    let lock = OutDirLock {
+        file,
+        path: path.clone(),
+    };
+    let record = match lock.record() {
+        Ok(record) => record,
+        Err(source) => {
+            drop(lock);
+            return Err(LockError::Io {
+                path: path.clone(),
+                source,
+            });
+        }
+    };
+    if record.nonce.as_deref() != Some(handoff_nonce) {
+        // Not the addressed child (a newer owner took over or the parent's
+        // record is gone): release the kernel lock and fail closed rather
+        // than overwrite the record.
+        drop(lock);
+        return Err(LockError::Held {
+            detail: HeldDetail {
+                lock_path: path.clone(),
+                holder: Some(record),
+            },
+        });
+    }
+    if let Err(source) = lock.write_record(std::process::id(), handoff_nonce) {
+        drop(lock);
+        return Err(LockError::Io {
+            path: path.clone(),
+            source,
+        });
+    }
+    Ok(lock)
+}
+
+/// Take the kernel lock non-blockingly WITHOUT claiming the owner record, for
+/// terminal writers that must first inspect who currently owns the lock. Fails
+/// with [`LockError::Held`] when another live run holds it.
+pub(crate) fn acquire_out_dir_lock_peek(out_dir: &Path) -> Result<OutDirLock, LockError> {
+    let path = out_dir.join(LOCK_FILE_NAME);
+    let file = open_lock_file(&path).map_err(|source| LockError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if let Err(source) = kernel_lock::try_lock(&file) {
+        if source.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(held(path));
+        }
+        return Err(LockError::Io { path, source });
+    }
+    Ok(OutDirLock { file, path })
 }

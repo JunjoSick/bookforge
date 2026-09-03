@@ -31,7 +31,6 @@ fn test_state_opt(session: &str, auth_enabled: bool) -> AppState {
         resume_child_environments: None,
         retry_launches: None,
         retry_fail_spawns: None,
-        audio_restart_cancels: None,
     }
 }
 
@@ -779,7 +778,7 @@ async fn audiobook_index_scans_durable_operations_newest_first() {
 }
 
 #[tokio::test]
-async fn audiobook_cancel_uses_persisted_pid_after_server_restart() {
+async fn audiobook_cancel_after_restart_reconciles_a_worker_that_is_gone() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let out_dir = write_test_audiobook_operation(
         temp.path(),
@@ -787,17 +786,16 @@ async fn audiobook_cancel_uses_persisted_pid_after_server_restart() {
         json!({"status": "running", "chunks": []}),
         json!({
             "status": "running",
-            // The recorded process must be verifiably ours before cancel will
-            // signal it; the test binary itself is a real BookForge executable.
+            // The kernel lock is free: the recorded worker is gone, so the
+            // post-restart cancel reconciles the durable state without ever
+            // signalling a pid+exe guess.
             "pid": std::process::id(),
             "auto_model": true,
             "warnings": ["stitch fallback"],
             "updated_at_ms": 10,
         }),
     );
-    let cancelled = Arc::new(Mutex::new(Vec::new()));
-    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
-    state.audio_restart_cancels = Some(cancelled.clone());
+    let state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
     assert!(state.audio_cancels.lock().unwrap().is_empty());
     let router = dashboard_router(state);
 
@@ -809,7 +807,6 @@ async fn audiobook_cancel_uses_persisted_pid_after_server_restart() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(*cancelled.lock().unwrap(), vec![std::process::id()]);
     let process: serde_json::Value = serde_json::from_slice(
         &std::fs::read(out_dir.join("process.json")).expect("process state should remain"),
     )
@@ -817,6 +814,57 @@ async fn audiobook_cancel_uses_persisted_pid_after_server_restart() {
     assert_eq!(process["status"], "cancelled");
     assert_eq!(process["auto_model"], true);
     assert_eq!(process["warnings"][0], "stitch fallback");
+}
+
+/// The terminal writer must never reconcile over a live run. After a server
+/// restart exact identity cannot be proven, so when the recorded operation's
+/// kernel lock is still held by a live worker, cancel refuses without
+/// signalling anything — the state and the lock stay untouched.
+#[tokio::test]
+async fn audiobook_cancel_after_restart_refuses_while_a_live_worker_holds_the_lock() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let recorded = std::process::id();
+    let out_dir = write_test_audiobook_operation(
+        temp.path(),
+        "stillholding",
+        json!({"status": "running", "chunks": []}),
+        json!({
+            "status": "running",
+            "pid": recorded,
+            "auto_model": false,
+            "warnings": ["stitch fallback"],
+            "updated_at_ms": 10,
+        }),
+    );
+    // The recorded worker (this process) genuinely holds the kernel lock.
+    let _held = bookforge_audio::acquire_audiobook_output_lock(&out_dir)
+        .expect("live worker holds the lock");
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        temp.path().to_path_buf(),
+    ));
+
+    let response = post_json(
+        &router,
+        "/api/audiobooks/stillholding/cancel",
+        Some("token-123"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        response_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot be verified after a server restart"),
+        "refusal must explain itself"
+    );
+    let process: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(out_dir.join("process.json")).expect("process state should remain"),
+    )
+    .expect("process state should be JSON");
+    assert_eq!(process["status"], "running", "state stays untouched");
+    drop(_held);
 }
 
 #[tokio::test]
@@ -3048,13 +3096,17 @@ async fn traversal_job_ids_are_refused_before_touching_the_filesystem() {
 }
 
 // -----------------------------------------------------------------------
-// SERVE-3: cancel verifies PID liveness + BookForge ownership before kill
+// SERVE-3: post-restart cancel never signals a pid+exe guess; it reconciles
+// only when the kernel lock proves no live worker is running
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn audiobook_cancel_refuses_pid_that_cannot_be_verified_as_bookforge() {
+async fn audiobook_cancel_after_restart_reconciles_even_a_stale_recorded_pid() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let pid_slot = u32::MAX - 11; // effectively never a live BookForge process
+    // The recorded pid is not a live BookForge process, and the kernel lock
+    // is free — so the worker is gone and the state is reconciled without
+    // ever signalling anything.
+    let pid_slot = u32::MAX - 11;
     let out_dir = write_test_audiobook_operation(
         temp.path(),
         "unverifiable",
@@ -3062,13 +3114,14 @@ async fn audiobook_cancel_refuses_pid_that_cannot_be_verified_as_bookforge() {
         json!({
             "status": "running",
             "pid": pid_slot,
+            "auto_model": false,
             "updated_at_ms": 10,
         }),
     );
-    let cancelled = Arc::new(Mutex::new(Vec::new()));
-    let mut state = test_state_with_upload_dir("token-123", temp.path().to_path_buf());
-    state.audio_restart_cancels = Some(cancelled.clone());
-    let router = dashboard_router(state);
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        temp.path().to_path_buf(),
+    ));
 
     let response = post_json(
         &router,
@@ -3077,28 +3130,15 @@ async fn audiobook_cancel_refuses_pid_that_cannot_be_verified_as_bookforge() {
         json!({}),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let payload = response_json(response).await;
-    assert!(
-        payload["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("nothing was signalled"),
-        "refusal explains itself: {payload}"
-    );
-    assert!(cancelled.lock().unwrap().is_empty(), "no signal may fire");
+    assert_eq!(response.status(), StatusCode::OK);
     let process: serde_json::Value = serde_json::from_slice(
         &std::fs::read(out_dir.join("process.json")).expect("process state remains"),
     )
     .expect("process state is JSON");
-    assert_eq!(process["status"], "running", "state stays untouched");
-}
-
-#[test]
-fn liveness_identity_check_accepts_our_own_live_process() {
-    // The test binary IS the current bookforge executable, so the recorded
-    // self-pid is exactly what a genuine restart scenario would produce.
-    assert!(live_process_is_bookforge(std::process::id()));
+    assert_eq!(
+        process["status"], "cancelled",
+        "the gone worker is reconciled"
+    );
 }
 
 // -----------------------------------------------------------------------
