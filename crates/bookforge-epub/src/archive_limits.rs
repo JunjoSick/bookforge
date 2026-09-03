@@ -384,7 +384,10 @@ fn limit_error(message: String) -> BookforgeError {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Write};
+    use std::{
+        io::{Cursor, Write},
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
@@ -466,15 +469,7 @@ mod tests {
                 .map(|(name, size)| (name.as_str(), *size))
                 .collect::<Vec<_>>(),
         );
-        let path = std::env::temp_dir().join(format!(
-            "bookforge-archive-preflight-{}-{}.epub",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::write(&path, bytes).expect("fixture should write");
+        let path = write_temp_archive(&bytes);
         let error = preflight_archive_path(&path).expect_err("entry count must be rejected");
         let _ = std::fs::remove_file(&path);
         assert!(error.to_string().contains("entry count limit exceeded"));
@@ -526,10 +521,14 @@ mod tests {
         assert!(error.to_string().contains("central directory"));
     }
 
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn write_temp_archive(bytes: &[u8]) -> std::path::PathBuf {
+        let counter = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "bookforge-archive-fixture-{}-{}.epub",
+            "bookforge-archive-fixture-{}-{}-{}.epub",
             std::process::id(),
+            counter,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")

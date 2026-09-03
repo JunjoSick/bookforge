@@ -61,9 +61,8 @@ pub struct PruneJobsReport {
     /// Mirrors [`PruneJobsOptions::dry_run`] so callers can tell whether any
     /// of this actually happened.
     pub dry_run: bool,
-    /// Non-running jobs matched by the age filter (before keep_last_n).
-    /// A selected job later re-checked as `running` inside its own deletion
-    /// transaction stops being a candidate and is subtracted from this count.
+    /// Live jobs (running OR paused) that matched nothing because the live
+    /// guard already excluded them at selection time.
     pub candidate_count: usize,
     /// Jobs withheld by `keep_last_n`.
     pub retained_by_keep_last_n: usize,
@@ -71,6 +70,12 @@ pub struct PruneJobsReport {
     /// flipped to `running` before their deletion transaction re-checked
     /// them; always protected, never counted as candidates.
     pub protected_running_jobs: usize,
+    /// Paused jobs found in the store at selection time. A paused status
+    /// generally means a LIVE paused worker holds a runtime lease; the store
+    /// cannot cheaply tell a live paused process from a dead one, so paused
+    /// jobs are protected exactly like running jobs (fail-closed: prune must
+    /// never delete a live paused job's tree).
+    pub protected_paused_jobs: usize,
     pub deletions: Vec<PruneJobDeletion>,
 }
 
@@ -102,20 +107,29 @@ pub(super) struct PruneSelection {
     pub(super) to_delete: Vec<String>,
     pub(super) candidate_count: usize,
     pub(super) protected_running_jobs: usize,
+    pub(super) protected_paused_jobs: usize,
     pub(super) retained_by_keep_last_n: usize,
+}
+
+enum PruneAttempt {
+    Deleted(PruneJobDeletion),
+    Protected(JobStatus),
 }
 
 impl JobStore {
     /// Delete finished jobs and every row/file they own per the given filter.
     ///
     /// Rules:
-    /// - Jobs with status `running` are NEVER touched (`PruneJobsReport::
-    ///   protected_running_jobs` reports how many were skipped for this
-    ///   reason).
-    /// - The running guard is enforced twice: once during selection and again
+    /// - Jobs with status `running` OR `paused` are NEVER touched. A paused
+    ///   status means a live worker may be parked on a runtime lease; the
+    ///   store cannot distinguish a live paused process from a dead one, so it
+    ///   protects both (fail-closed: prune must never delete a live paused
+    ///   job). `PruneJobsReport::protected_running_jobs` /
+    ///   `protected_paused_jobs` report how many were skipped for each reason.
+    /// - The live guard is enforced twice: once during selection and again
     ///   as the first statement inside every per-job deletion transaction, so
-    ///   a job that turns `running` after selection is skipped instead of
-    ///   being deleted underneath a live checkpointing process.
+    ///   a job that turns `running`/`paused` after selection is skipped
+    ///   instead of being deleted underneath a live process.
     /// - Selection order: `older_than` cutoff on `created_at`, newest-first;
     ///   `keep_last_n` spares the N newest survivors; both compose.
     /// - DB rows go atomically per job inside an IMMEDIATE transaction, in
@@ -136,6 +150,7 @@ impl JobStore {
             dry_run: options.dry_run,
             candidate_count: selection.candidate_count,
             protected_running_jobs: selection.protected_running_jobs,
+            protected_paused_jobs: selection.protected_paused_jobs,
             retained_by_keep_last_n: selection.retained_by_keep_last_n,
             deletions: Vec::new(),
         };
@@ -151,17 +166,18 @@ impl JobStore {
         keep_last_n: Option<usize>,
     ) -> Result<PruneSelection> {
         let running_guard = JobStatus::Running.as_db_text();
+        let paused_guard = JobStatus::Paused.as_db_text();
         let mut conn = self.conn.borrow_mut();
         // Single consistent snapshot for selection: read candidates and the
-        // running-job guard count together before deleting anything.
+        // live-job guard counts together before deleting anything.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let select_sql = "SELECT id FROM jobs
-             WHERE status <> ?1
-               AND (?2 IS NULL OR CAST(created_at AS INTEGER) < ?2)
+             WHERE status NOT IN (?1, ?2)
+               AND (?3 IS NULL OR CAST(created_at AS INTEGER) < ?3)
              ORDER BY CAST(created_at AS INTEGER) DESC, rowid DESC";
         let mut stmt = tx.prepare(select_sql)?;
         let candidate_ids = stmt
-            .query_map(params![running_guard, cutoff_secs], |row| {
+            .query_map(params![running_guard, paused_guard, cutoff_secs], |row| {
                 row.get::<_, String>(0)
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -170,6 +186,11 @@ impl JobStore {
         let protected_running_jobs = tx.query_row(
             "SELECT COUNT(*) FROM jobs WHERE status = ?1",
             params![running_guard],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        let protected_paused_jobs = tx.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE status = ?1",
+            params![paused_guard],
             |row| row.get::<_, i64>(0),
         )? as usize;
         let candidate_count = candidate_ids.len();
@@ -183,6 +204,7 @@ impl JobStore {
             to_delete,
             candidate_count,
             protected_running_jobs,
+            protected_paused_jobs,
             retained_by_keep_last_n,
         })
     }
@@ -203,11 +225,16 @@ impl JobStore {
                 self.prune_job_now(job_id)?
             };
             match deletion {
-                Some(deletion) => report.deletions.push(deletion),
-                None => {
-                    // Re-check under the write lock found `running`: skip
-                    // without deleting anything and keep the report honest.
-                    report.protected_running_jobs += 1;
+                PruneAttempt::Deleted(deletion) => report.deletions.push(deletion),
+                PruneAttempt::Protected(status) => {
+                    // Re-check under the write lock found a live job
+                    // (`running` or `paused`): skip without deleting anything
+                    // and keep the report honest.
+                    match status {
+                        JobStatus::Running => report.protected_running_jobs += 1,
+                        JobStatus::Paused => report.protected_paused_jobs += 1,
+                        _ => unreachable!("only live statuses produce Protected"),
+                    }
                     report.candidate_count = report.candidate_count.saturating_sub(1);
                 }
             }
@@ -236,26 +263,26 @@ impl JobStore {
         })
     }
 
-    /// Dry-run: re-checks the running guard (same rule as a real deletion
-    /// would apply) and returns `None` when the job must be skipped.
-    fn prune_job_dry_run(&self, job_id: &str) -> Result<Option<PruneJobDeletion>> {
+    /// Dry-run: re-checks the live guard (same rule as a real deletion would
+    /// apply) and reports the exact protected status when the job is skipped.
+    fn prune_job_dry_run(&self, job_id: &str) -> Result<PruneAttempt> {
         let conn = self.conn.borrow();
-        if job_status_is_running(&conn, job_id)? {
-            return Ok(None);
+        if let Some(status) = job_live_status(&conn, job_id)? {
+            return Ok(PruneAttempt::Protected(status));
         }
         let mut deletion = Self::prune_job_deletion_columns(&conn, job_id)?;
         deletion.artifacts_missing = artifact_paths(&conn, job_id)?
             .into_iter()
             .filter(|path| !path.exists())
             .count();
-        Ok(Some(deletion))
+        Ok(PruneAttempt::Deleted(deletion))
     }
 
     /// Real deletion. The FIRST statement inside the IMMEDIATE transaction
-    /// re-reads the job status so a job flipped to `running` after selection
-    /// is never deleted underneath its checkpointing process; that case
-    /// returns `None` without deleting anything.
-    fn prune_job_now(&self, job_id: &str) -> Result<Option<PruneJobDeletion>> {
+    /// re-reads the job status so a job flipped to `running` or `paused` after
+    /// selection is never deleted underneath its worker; that case reports
+    /// the exact protected status without deleting anything.
+    fn prune_job_now(&self, job_id: &str) -> Result<PruneAttempt> {
         // Child-before-parent inside one IMMEDIATE transaction; only plain FKs
         // point at segments/translations/blocks/findings/attempts, so explicit
         // deletes keep this correct even where ON DELETE CASCADE is absent.
@@ -263,9 +290,9 @@ impl JobStore {
         // before both segments and jobs.
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if job_status_is_running(&tx, job_id)? {
+        if let Some(status) = job_live_status(&tx, job_id)? {
             // No writes happened yet, so rolling back is a pure no-op.
-            return Ok(None);
+            return Ok(PruneAttempt::Protected(status));
         }
         let qa_findings = delete_job_rows(&tx, "qa_findings", job_id)?;
         let translation_blocks = delete_job_rows(&tx, "translation_blocks", job_id)?;
@@ -281,7 +308,7 @@ impl JobStore {
         if removed_jobs == 0 {
             // Raced with another process pruning the same job: its tree is
             // already gone, report a no-op.
-            return Ok(Some(PruneJobDeletion {
+            return Ok(PruneAttempt::Deleted(PruneJobDeletion {
                 job_id: job_id.to_string(),
                 ..PruneJobDeletion::default()
             }));
@@ -296,7 +323,7 @@ impl JobStore {
                 Err(_) => {}
             }
         }
-        Ok(Some(PruneJobDeletion {
+        Ok(PruneAttempt::Deleted(PruneJobDeletion {
             job_id: job_id.to_string(),
             segments,
             translations,
@@ -310,10 +337,12 @@ impl JobStore {
     }
 }
 
-/// Running-guard read scoped to whichever connection/transaction is in scope.
-/// `row is NULL` (job vanished between phases) reads as not-running so the
+/// Live-job guard read scoped to whichever connection/transaction is in scope.
+/// `running` OR `paused` counts as live: a paused job may be a live worker
+/// parked on a runtime lease, so it must never be pruned underneath it.
+/// `row is NULL` (job vanished between phases) reads as not-live so the
 /// existing deleted-under-us no-op accounting still applies.
-fn job_status_is_running(conn: &Connection, job_id: &str) -> Result<bool> {
+fn job_live_status(conn: &Connection, job_id: &str) -> Result<Option<JobStatus>> {
     let status: Option<String> = conn
         .query_row(
             "SELECT status FROM jobs WHERE id = ?1",
@@ -321,7 +350,12 @@ fn job_status_is_running(conn: &Connection, job_id: &str) -> Result<bool> {
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    Ok(status.is_some_and(|status| status == JobStatus::Running.as_db_text()))
+    Ok(
+        status.and_then(|status| match JobStatus::from_db_text(&status) {
+            status @ (JobStatus::Running | JobStatus::Paused) => Some(status),
+            _ => None,
+        }),
+    )
 }
 
 /// Delete all rows of `table` scoped to one job.

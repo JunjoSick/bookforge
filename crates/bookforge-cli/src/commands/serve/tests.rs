@@ -1973,6 +1973,64 @@ async fn dashboard_resume_uses_remembered_key_in_scrubbed_child_environment() {
     clean_runtime_files(&fixture.job_id);
 }
 
+/// Parent-to-child claim handoff (lifecycle audit): the dashboard's resume
+/// launcher must pass the launch-claim identity (job, nonce, owner pid) to the
+/// replacement worker via the environment so the child ADOPTS the same claim
+/// instead of racing for a fresh one — closing the release gap that would let a
+/// concurrent resume double-run the job.
+#[tokio::test]
+async fn dashboard_resume_hands_launch_claim_identity_to_the_child() {
+    use std::sync::atomic::AtomicUsize;
+
+    let fixture = build_mutation_fixture();
+    make_stopped_fixture_resumable(&fixture);
+    clean_runtime_files(&fixture.job_id);
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let environments = Arc::new(Mutex::new(Vec::new()));
+    let mut state = test_state_with_store(&fixture.session, fixture.store_path.clone());
+    state.resume_launches = Some(launches.clone());
+    state.resume_child_environments = Some(environments.clone());
+    let router = dashboard_router(state);
+
+    let response = post_json(
+        &router,
+        &format!("/api/jobs/{}/resume", fixture.job_id),
+        Some(&fixture.session),
+        json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["mode"], "spawned");
+
+    let environments = environments.lock().expect("environments should lock");
+    let environment = environments
+        .first()
+        .expect("one resume environment should be captured");
+    assert_eq!(
+        environment
+            .get(std::ffi::OsStr::new(crate::control::LAUNCH_CLAIM_ENV_JOB))
+            .and_then(|value| value.as_deref()),
+        Some(std::ffi::OsStr::new(&fixture.job_id)),
+        "the child must be told which job's claim it is adopting"
+    );
+    let nonce = environment
+        .get(std::ffi::OsStr::new(crate::control::LAUNCH_CLAIM_ENV_NONCE))
+        .and_then(|value| value.as_deref())
+        .and_then(|value| value.to_str())
+        .expect("a non-empty nonce must be handed to the child");
+    assert!(!nonce.is_empty(), "the claim nonce must be present");
+    let pid = environment
+        .get(std::ffi::OsStr::new(crate::control::LAUNCH_CLAIM_ENV_PID))
+        .and_then(|value| value.as_deref())
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect("an owner pid must be handed to the child");
+    assert!(pid > 0, "the owner pid must be numeric and nonzero");
+
+    clean_runtime_files(&fixture.job_id);
+}
+
 #[tokio::test]
 async fn dashboard_resume_without_required_key_returns_actionable_error() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2907,7 +2965,7 @@ async fn mutations_are_gated_by_authenticated_session_and_same_origin() {
     assert_eq!(cross_site.status(), StatusCode::FORBIDDEN);
 
     // Same-origin with a valid session passes both gates and reaches the
-    // handler (an unknown job on an empty store -> "retried": 0).
+    // handler, which reports the unknown job without turning it into a 500.
     let same_origin = router
         .clone()
         .oneshot(
@@ -2923,7 +2981,7 @@ async fn mutations_are_gated_by_authenticated_session_and_same_origin() {
         .expect("route should respond");
     assert_ne!(same_origin.status(), StatusCode::UNAUTHORIZED);
     assert_ne!(same_origin.status(), StatusCode::FORBIDDEN);
-    assert_eq!(same_origin.status(), StatusCode::OK);
+    assert_eq!(same_origin.status(), StatusCode::NOT_FOUND);
 }
 
 /// No token or session id may appear in any response a browser can read:
