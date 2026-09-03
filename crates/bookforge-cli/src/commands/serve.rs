@@ -243,13 +243,9 @@ struct AppState {
     /// count instead of exec'ing this binary as a child.
     #[cfg(test)]
     retry_launches: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    /// Test hook: when set and true, the retry-failed handoff fails at its
-    /// spawn seam so tests can prove the atomic claim and the launch slot are
-    /// released on that error path.
+    /// Test hook for proving spawn-failure cleanup without executing a child.
     #[cfg(test)]
     retry_fail_spawns: Option<Arc<std::sync::atomic::AtomicBool>>,
-    #[cfg(test)]
-    audio_restart_cancels: Option<Arc<Mutex<Vec<u32>>>>,
 }
 
 #[cfg(test)]
@@ -566,8 +562,6 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         retry_launches: None,
         #[cfg(test)]
         retry_fail_spawns: None,
-        #[cfg(test)]
-        audio_restart_cancels: None,
     };
 
     let app = dashboard_router(state);

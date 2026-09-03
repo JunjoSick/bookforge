@@ -4,7 +4,7 @@
 //! consistent, so every module routes through this one copy.
 
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -15,6 +15,21 @@ use quick_xml::{
     events::{BytesStart, Event},
 };
 use zip::DateTime;
+
+/// Reject input/output pairs that resolve to the same filesystem destination
+/// (identical path, symlink, hardlink, or lexical alias) before any staged
+/// output can rename over the source. Shared by reflow and rebuild, the two
+/// entry points that read from one path and publish to another.
+pub(crate) fn ensure_distinct_paths(label: &str, input: &Path, output: &Path) -> Result<()> {
+    if bookforge_core::path::paths_are_aliases(input, output)? {
+        return Err(BookforgeError::InvalidInput(format!(
+            "{label} paths must be different: {} / {}",
+            input.display(),
+            output.display()
+        )));
+    }
+    Ok(())
+}
 
 /// Translation-marker ids are generated as the prefix followed by a
 /// 1-based ordinal; reader and writer must agree on the spelling.
@@ -106,6 +121,24 @@ pub(crate) fn sibling_work_path(output: &Path, label: &str) -> PathBuf {
         ".{name}.bookforge-{label}-{}-{nonce}",
         std::process::id()
     ))
+}
+
+/// Atomically reserve a sibling staging file. The caller can safely write to
+/// the returned handle: a pre-existing symlink or concurrent writer cannot be
+/// followed, and collisions are retried with a distinct suffix.
+pub(crate) fn create_sibling_work_file(output: &Path, label: &str) -> Result<(PathBuf, File)> {
+    for attempt in 0..128u32 {
+        let path = sibling_work_path(output, &format!("{label}-{attempt}"));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(BookforgeError::InvalidInput(format!(
+        "could not reserve a unique temporary path beside {}",
+        output.display()
+    )))
 }
 
 pub(crate) fn commit_staged_output(what: &str, staged: &Path, output: &Path) -> Result<()> {

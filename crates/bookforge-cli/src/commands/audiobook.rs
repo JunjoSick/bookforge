@@ -1,15 +1,16 @@
 use std::collections::BTreeSet;
 #[cfg(feature = "tui")]
 use std::io::IsTerminal;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bookforge_audio::{
-    AudioFormat, AudiobookOptions, ElevenLabsTtsConfig, ElevenLabsTtsProvider, GeminiTtsConfig,
-    GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider, Progress,
-    StitchOptions, TextNormalization, TtsProviderKind, build_audiobook,
+    AudioFormat, AudiobookOptions, AudiobookOutputLock, ElevenLabsTtsConfig, ElevenLabsTtsProvider,
+    GeminiTtsConfig, GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider,
+    Progress, StitchOptions, TextNormalization, TtsProviderKind, acquire_audiobook_output_lock,
+    acquire_audiobook_output_lock_with_handoff, build_audiobook_with_lock,
     elevenlabs_model_max_input_chars, feature_set, fetch_elevenlabs_subscription,
     list_elevenlabs_voices, plan_chunks, plan_chunks_for_prune,
     resolve_preferred_elevenlabs_model_reported_with_cancel, stitch, validate_options,
@@ -492,6 +493,30 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         );
     }
     let full_prune_plan = args.prune.then(|| plan_chunks_for_prune(&book, &options));
+    // Live runs take ownership before the first cache read (`--retry-failed`)
+    // and retain it through synthesis, stitching, warnings, and prune. Dry
+    // runs deliberately skip the lock so inspecting a plan never creates the
+    // output directory or any lock file.
+    let output_lock = if args.dry_run {
+        None
+    } else {
+        Some(match std::env::var("BOOKFORGE_AUDIO_OUT_LOCK_HANDOFF") {
+            Ok(nonce) if !nonce.is_empty() => {
+                acquire_audiobook_output_lock_with_handoff(&out_dir, &nonce).with_context(|| {
+                    format!(
+                        "could not adopt the dashboard output lock in {}",
+                        out_dir.display()
+                    )
+                })?
+            }
+            _ => acquire_audiobook_output_lock(&out_dir).with_context(|| {
+                format!(
+                    "could not acquire audiobook output lock in {}",
+                    out_dir.display()
+                )
+            })?,
+        })
+    };
     if args.retry_failed {
         let failed = bookforge_audio::failed_chunk_files(&out_dir.join("manifest.json"))
             .with_context(|| {
@@ -626,6 +651,8 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         return Ok(());
     }
 
+    let output_lock = output_lock.expect("non-dry audiobook run must hold its output lock");
+
     if json_out.enabled() {
         json_out.emit(serde_json::json!({
             "event": "audiobook_plan",
@@ -682,6 +709,7 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             &book,
             &options,
             &model,
+            &output_lock,
             cancel.clone(),
             callback,
         ));
@@ -718,12 +746,30 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         outcome?
     } else {
         let callback = progress_callback(args.ui, plan.len());
-        synthesize(&args, &book, &options, &model, cancel.clone(), callback).await?
+        synthesize(
+            &args,
+            &book,
+            &options,
+            &model,
+            &output_lock,
+            cancel.clone(),
+            callback,
+        )
+        .await?
     };
     #[cfg(not(feature = "tui"))]
     let report = {
         let callback = progress_callback(args.ui, plan.len());
-        synthesize(&args, &book, &options, &model, cancel.clone(), callback).await?
+        synthesize(
+            &args,
+            &book,
+            &options,
+            &model,
+            &output_lock,
+            cancel.clone(),
+            callback,
+        )
+        .await?
     };
 
     let fallback_tui_output = args.ui == UiMode::Tui && !use_tui;
@@ -1286,18 +1332,20 @@ async fn synthesize(
     book: &bookforge_core::ir::Book,
     options: &AudiobookOptions,
     model: &str,
+    output_lock: &AudiobookOutputLock,
     cancel: CancellationToken,
     on_progress: Arc<dyn Fn(Progress) + Send + Sync>,
 ) -> Result<bookforge_audio::AudiobookReport> {
     let report = match args.provider {
         AudioProviderKind::Mock => {
             let callback = on_progress.clone();
-            build_audiobook(
+            build_audiobook_with_lock(
                 book,
                 Arc::new(MockTtsProvider::new()),
                 options,
                 cancel.clone(),
                 move |event| callback(event),
+                output_lock,
             )
             .await?
         }
@@ -1313,12 +1361,13 @@ async fn synthesize(
             let provider = OpenAiTtsProvider::new_with_cancel(config, cancel.clone())
                 .context("failed to build TTS provider")?;
             let callback = on_progress.clone();
-            build_audiobook(
+            build_audiobook_with_lock(
                 book,
                 Arc::new(provider),
                 options,
                 cancel.clone(),
                 move |event| callback(event),
+                output_lock,
             )
             .await?
         }
@@ -1334,12 +1383,13 @@ async fn synthesize(
             let provider = GeminiTtsProvider::new_with_cancel(config, cancel.clone())
                 .context("failed to build Gemini TTS provider")?;
             let callback = on_progress.clone();
-            build_audiobook(
+            build_audiobook_with_lock(
                 book,
                 Arc::new(provider),
                 options,
                 cancel.clone(),
                 move |event| callback(event),
+                output_lock,
             )
             .await?
         }
@@ -1355,12 +1405,13 @@ async fn synthesize(
             let provider = ElevenLabsTtsProvider::new_with_cancel(config, cancel.clone())
                 .context("failed to build ElevenLabs TTS provider")?;
             let callback = on_progress;
-            build_audiobook(
+            build_audiobook_with_lock(
                 book,
                 Arc::new(provider),
                 options,
                 cancel.clone(),
                 move |event| callback(event),
+                output_lock,
             )
             .await?
         }
@@ -1630,6 +1681,7 @@ fn missing_requested_deliverables(
 }
 
 fn write_stitch_warnings_to_process(out_dir: &std::path::Path, warnings: &[String]) -> Result<()> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = out_dir.join("process.json");
     if !path.is_file() {
         return Ok(());
@@ -1644,24 +1696,42 @@ fn write_stitch_warnings_to_process(out_dir: &std::path::Path, warnings: &[Strin
         .context("audiobook process state must be a JSON object")?;
     object.insert("warnings".to_string(), serde_json::json!(warnings));
 
-    let staged = out_dir.join("process.warnings.part.tmp");
-    std::fs::write(&staged, serde_json::to_vec_pretty(&process)?)
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staged = out_dir.join(format!(
+        ".process-warnings-{}-{sequence}.part.tmp",
+        std::process::id()
+    ));
+    let bytes = serde_json::to_vec_pretty(&process)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
         .with_context(|| format!("failed to stage process state {}", staged.display()))?;
-    let backup = out_dir.join("process.warnings.replace.bak");
-    let _ = std::fs::remove_file(&backup);
-    std::fs::rename(&path, &backup)
-        .with_context(|| format!("failed to preserve process state {}", path.display()))?;
-    match std::fs::rename(&staged, &path) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(backup);
-            Ok(())
-        }
-        Err(error) => {
-            let _ = std::fs::rename(&backup, &path);
-            let _ = std::fs::remove_file(staged);
-            Err(error)
-                .with_context(|| format!("failed to publish process state {}", path.display()))
-        }
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&staged);
+        return Err(error)
+            .with_context(|| format!("failed to flush process state {}", staged.display()));
+    }
+    drop(file);
+    if let Err(error) = bookforge_audio::replace_file(&staged, &path) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error)
+            .with_context(|| format!("failed to publish process state {}", path.display()));
+    }
+    sync_audio_directory(out_dir)
+        .with_context(|| format!("failed to durable-sync process state {}", path.display()))
+}
+
+fn sync_audio_directory(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 

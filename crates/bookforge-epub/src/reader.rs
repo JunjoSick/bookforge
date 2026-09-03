@@ -24,7 +24,8 @@ use zip::ZipArchive;
 
 use crate::{
     archive_limits::{
-        ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, read_archive_text, validate_archive_metadata,
+        ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, preflight_archive_path, read_archive_text,
+        validate_archive_metadata,
     },
     util::{
         join_epub_path, local_name, marker_id, never_translate_element, normalize_space,
@@ -452,6 +453,7 @@ fn non_whitespace_chars(text: &str) -> usize {
 }
 
 fn open_archive(path: &Path) -> Result<(ZipArchive<File>, ArchiveReadBudget)> {
+    preflight_archive_path(path)?;
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
     let read_budget = validate_archive_metadata(&mut archive, DEFAULT_ARCHIVE_LIMITS)?;
@@ -668,10 +670,14 @@ fn attr_value(
 #[derive(Debug)]
 struct ElementFrame {
     name: Vec<u8>,
-    path: Vec<usize>,
     child_count: usize,
     text_count: usize,
 }
+
+/// Keep the event-stream reader below the recursion depth used by downstream
+/// DOM/path consumers. A normal XHTML document is only a few dozen levels
+/// deep; this bound prevents a hostile ladder from growing unbounded state.
+const MAX_READER_NESTING_DEPTH: usize = 1024;
 
 struct TextCapture {
     depth: usize,
@@ -707,6 +713,7 @@ fn extract_xml_text_element_blocks(
     reader.config_mut().trim_text(false);
 
     let mut element_stack = Vec::<ElementFrame>::new();
+    let mut current_path = Vec::<usize>::new();
     let mut active_capture: Option<TextCapture> = None;
     let mut blocks = Vec::new();
 
@@ -714,17 +721,22 @@ fn extract_xml_text_element_blocks(
         match reader.read_event()? {
             Event::Start(element) => {
                 let name = local_name(element.name().as_ref()).to_vec();
-                let path = enter_element(&mut element_stack, &name);
+                if element_stack.len() >= MAX_READER_NESTING_DEPTH {
+                    return Err(BookforgeError::InvalidInput(format!(
+                        "EPUB XML nesting exceeds the supported depth of {MAX_READER_NESTING_DEPTH}"
+                    )));
+                }
+                enter_element(&mut element_stack, &mut current_path, &name);
                 if active_capture.is_none() && should_capture(&name) {
                     active_capture = Some(TextCapture {
                         depth: element_stack.len(),
-                        path,
+                        path: current_path.clone(),
                         text: String::new(),
                     });
                 }
             }
             Event::Empty(_) => {
-                next_child_path(&mut element_stack);
+                next_child_index(&mut element_stack);
             }
             Event::Text(text) => {
                 if let Some(capture) = active_capture.as_mut() {
@@ -767,6 +779,7 @@ fn extract_xml_text_element_blocks(
                     }
                 }
                 element_stack.pop();
+                current_path.pop();
             }
             Event::Eof => break,
             _ => {}
@@ -917,6 +930,7 @@ fn extract_blocks(
     reader.config_mut().trim_text(false);
 
     let mut element_stack = Vec::<ElementFrame>::new();
+    let mut current_path = Vec::<usize>::new();
     let mut active_block: Option<BlockBuilder> = None;
     let mut blocks = Vec::new();
     // Depth of never-translate ancestors (script/style/head/svg/...).
@@ -927,7 +941,12 @@ fn extract_blocks(
         match reader.read_event()? {
             Event::Start(element) => {
                 let name = local_name(element.name().as_ref()).to_vec();
-                let path = enter_element(&mut element_stack, &name);
+                if element_stack.len() >= MAX_READER_NESTING_DEPTH {
+                    return Err(BookforgeError::InvalidInput(format!(
+                        "EPUB XML nesting exceeds the supported depth of {MAX_READER_NESTING_DEPTH}"
+                    )));
+                }
+                enter_element(&mut element_stack, &mut current_path, &name);
 
                 // EPUB navigation list items have a constrained content
                 // model: the label must remain inside the child <a> or
@@ -957,7 +976,7 @@ fn extract_blocks(
                     active_block = Some(BlockBuilder::new(
                         element_stack.len(),
                         kind,
-                        DomPath(path),
+                        DomPath(current_path.clone()),
                         initial_block_count + blocks.len(),
                     ));
                 } else if suppress_depth == 0
@@ -972,7 +991,7 @@ fn extract_blocks(
                 // block elements (<p/>, <td/>) carry no text and therefore
                 // produce no block — emitting one would send an empty
                 // source to the model and invite hallucinated output.
-                next_child_path(&mut element_stack);
+                next_child_index(&mut element_stack);
 
                 if suppress_depth == 0
                     && let Some(block) = active_block.as_mut()
@@ -988,6 +1007,7 @@ fn extract_blocks(
                     &value,
                     &mut active_block,
                     &mut element_stack,
+                    &current_path,
                     &mut blocks,
                     section_id,
                     initial_block_count,
@@ -1003,6 +1023,7 @@ fn extract_blocks(
                     &value,
                     &mut active_block,
                     &mut element_stack,
+                    &current_path,
                     &mut blocks,
                     section_id,
                     initial_block_count,
@@ -1022,6 +1043,7 @@ fn extract_blocks(
                     &value,
                     &mut active_block,
                     &mut element_stack,
+                    &current_path,
                     &mut blocks,
                     section_id,
                     initial_block_count,
@@ -1059,6 +1081,7 @@ fn extract_blocks(
                 {
                     suppress_depth = suppress_depth.saturating_sub(1);
                 }
+                current_path.pop();
             }
             Event::Eof => break,
             _ => {}
@@ -1081,6 +1104,7 @@ fn handle_text(
     value: &str,
     active_block: &mut Option<BlockBuilder>,
     element_stack: &mut [ElementFrame],
+    current_path: &[usize],
     blocks: &mut Vec<Block>,
     section_id: &SectionId,
     initial_block_count: usize,
@@ -1105,7 +1129,7 @@ fn handle_text(
         let mut block = BlockBuilder::new(
             depth,
             BlockKind::Paragraph,
-            DomPath(frame.path.clone()),
+            DomPath(current_path.to_vec()),
             initial_block_count + blocks.len(),
         );
         block.push_text(value);
@@ -1119,7 +1143,7 @@ fn handle_text(
     // make whole-element patching unsafe, so the text node itself
     // becomes the patch target. The writer counts non-whitespace text
     // nodes per frame with the same rule.
-    let mut path = frame.path.clone();
+    let mut path = current_path.to_vec();
     path.push(bookforge_core::ir::TEXT_NODE_PATH_BASE + frame.text_count);
     frame.text_count += 1;
     let visible = normalize_space(value);
@@ -1166,26 +1190,23 @@ fn anchors_text_block(name: &[u8]) -> bool {
     )
 }
 
-fn enter_element(stack: &mut Vec<ElementFrame>, name: &[u8]) -> Vec<usize> {
-    let path = next_child_path(stack);
+fn enter_element(stack: &mut Vec<ElementFrame>, current_path: &mut Vec<usize>, name: &[u8]) {
+    let child_index = next_child_index(stack);
+    current_path.push(child_index);
     stack.push(ElementFrame {
         name: name.to_vec(),
-        path: path.clone(),
         child_count: 0,
         text_count: 0,
     });
-    path
 }
 
-fn next_child_path(stack: &mut [ElementFrame]) -> Vec<usize> {
+fn next_child_index(stack: &mut [ElementFrame]) -> usize {
     let Some(parent) = stack.last_mut() else {
-        return vec![0];
+        return 0;
     };
     let child_index = parent.child_count;
     parent.child_count += 1;
-    let mut path = parent.path.clone();
-    path.push(child_index);
-    path
+    child_index
 }
 
 fn block_kind(name: &[u8], element: &BytesStart<'_>) -> Result<Option<BlockKind>> {
@@ -1627,6 +1648,28 @@ fn is_nav_item(item: &Resource) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_rejects_excessive_nesting_before_path_growth() {
+        let mut xhtml = String::from("<html><body>");
+        for _ in 0..(MAX_READER_NESTING_DEPTH + 1) {
+            xhtml.push_str("<div>");
+        }
+        xhtml.push_str("text");
+        for _ in 0..(MAX_READER_NESTING_DEPTH + 1) {
+            xhtml.push_str("</div>");
+        }
+        xhtml.push_str("</body></html>");
+
+        let error = extract_blocks(
+            &xhtml,
+            "chapter.xhtml",
+            &SectionId("section".to_string()),
+            0,
+        )
+        .expect_err("reader must reject an excessive element ladder");
+        assert!(error.to_string().contains("nesting exceeds"));
+    }
 
     #[test]
     fn opf_manifest_items_can_use_start_end_tags() {

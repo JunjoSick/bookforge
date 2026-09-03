@@ -8,6 +8,7 @@ pub mod estimate;
 pub mod glossary;
 pub mod ingest_flags;
 pub mod inspect;
+pub(crate) mod output;
 pub mod plan;
 pub mod reconfigure;
 pub mod reflow;
