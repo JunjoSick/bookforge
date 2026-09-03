@@ -991,6 +991,150 @@ fn existing_audiobook_operation_rejects_a_symlink_escape() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn existing_audiobook_operation_rejects_a_symlink_alias_inside_the_root() {
+    use std::os::unix::fs::symlink;
+
+    let upload_root = tempfile::tempdir().expect("upload root should be created");
+    let real = upload_root.path().join("audiobook-real");
+    std::fs::create_dir(&real).expect("real operation dir should be created");
+    std::fs::write(real.join("process.json"), br#"{"status":"succeeded"}"#)
+        .expect("process record should be written");
+    symlink(&real, upload_root.path().join("audiobook-alias"))
+        .expect("alias symlink should be created");
+
+    assert!(
+        existing_audiobook_operation_out_dir(upload_root.path(), "alias")
+            .expect("symlink lookup should succeed")
+            .is_none(),
+        "a symlinked operation directory must be refused even when it points inside the root"
+    );
+    assert!(
+        existing_audiobook_operation_out_dir(upload_root.path(), "real")
+            .expect("real lookup should succeed")
+            .is_some(),
+        "the real directory must still resolve"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn audiobook_read_routes_refuse_a_symlinked_operation_directory() {
+    use axum::{body::Body, http::Request};
+    use std::os::unix::fs::symlink;
+    use tower::ServiceExt;
+
+    let upload_root = tempfile::tempdir().expect("upload root should be created");
+    let outside = tempfile::tempdir().expect("outside dir should be created");
+    let fake_operation = outside.path().join("operation");
+    std::fs::create_dir(&fake_operation).expect("fake operation dir should be created");
+    std::fs::write(
+        fake_operation.join("process.json"),
+        br#"{"status":"succeeded"}"#,
+    )
+    .expect("process record should be written");
+    std::fs::write(fake_operation.join("audiobook.m4b"), b"audio")
+        .expect("artifact should be written");
+    symlink(
+        &fake_operation,
+        upload_root.path().join("audiobook-symlink"),
+    )
+    .expect("operation symlink should be created");
+
+    let legit = upload_root.path().join("audiobook-legit");
+    std::fs::create_dir(&legit).expect("legit operation dir should be created");
+    std::fs::write(legit.join("process.json"), br#"{"status":"succeeded"}"#)
+        .expect("legit process record should be written");
+    std::fs::write(legit.join("manifest.json"), b"{}").expect("legit manifest should be written");
+
+    let router = dashboard_router(test_state_with_upload_dir(
+        "token-123",
+        upload_root.path().to_path_buf(),
+    ));
+    let cookie = session_cookie_value("token-123");
+
+    let status = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/audiobooks/symlink")
+                .header("host", TEST_HOST)
+                .header("cookie", cookie.clone())
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(
+        status.status(),
+        StatusCode::NOT_FOUND,
+        "a symlinked operation must not be readable through the status route"
+    );
+
+    let artifact = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/audiobooks/symlink/artifact")
+                .header("host", TEST_HOST)
+                .header("cookie", cookie.clone())
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(
+        artifact.status(),
+        StatusCode::NOT_FOUND,
+        "a symlinked operation must not be readable through the artifact route"
+    );
+
+    let cancel = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/audiobooks/symlink/cancel")
+                .header("host", TEST_HOST)
+                .header("cookie", cookie.clone())
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(
+        cancel.status(),
+        StatusCode::CONFLICT,
+        "a symlinked operation must not be cancellable through the cancel route"
+    );
+
+    let list = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/audiobooks")
+                .header("host", TEST_HOST)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(list.into_body(), usize::MAX)
+        .await
+        .expect("list body should read");
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("legit"),
+        "read_dir-derived entries must keep listing: {body}"
+    );
+    assert!(
+        !body.contains("symlink"),
+        "a symlinked operation must not be surfaced by the list route: {body}"
+    );
+}
+
 #[tokio::test]
 async fn control_endpoints_reject_missing_dashboard_token() {
     use axum::{body::Body, http::Request};

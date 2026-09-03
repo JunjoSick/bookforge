@@ -59,6 +59,13 @@ impl OcrConfig {
             max_attempts: 3,
         }
     }
+
+    /// Reject a base URL whose transport is unsafe for OCR page data before
+    /// any request is sent or API key is read: only HTTPS, or plain HTTP to a
+    /// loopback host (`localhost`, `127.0.0.1`, `[::1]`), is permitted.
+    pub fn validate_base_url(&self) -> Result<(), OcrError> {
+        validate_ocr_base_url(&self.base_url)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +81,9 @@ pub enum OcrError {
 
     #[error("invalid OCR response: {0}")]
     InvalidResponse(String),
+
+    #[error("unsafe OCR base URL: {0}")]
+    UnsafeBaseUrl(String),
 }
 
 pub trait OcrEngine: Send + Sync {
@@ -93,6 +103,10 @@ pub struct HttpOcrClient {
 
 impl HttpOcrClient {
     pub fn new(config: OcrConfig) -> Result<Self, OcrError> {
+        // Transport validation happens before the client is built, so a
+        // remote plain-HTTP endpoint can never reach a request or trigger a
+        // key lookup.
+        config.validate_base_url()?;
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(config.timeout_seconds))
@@ -146,6 +160,34 @@ fn api_key_for_request(config: &OcrConfig) -> Result<Option<String>, OcrError> {
     }
 }
 
+/// Validate that an OCR base URL uses an allowed transport: HTTPS anywhere,
+/// or plain HTTP only to a loopback host. Remote plain HTTP (and any other
+/// scheme) is rejected because page content and credentials would otherwise
+/// traverse an unauthenticated network path.
+pub fn validate_ocr_base_url(base_url: &str) -> Result<(), OcrError> {
+    let url = Url::parse(base_url).map_err(|error| {
+        OcrError::UnsafeBaseUrl(format!("{base_url:?} is not a valid absolute URL: {error}"))
+    })?;
+    let host_loopback = url.host_str().is_some_and(is_loopback_host);
+    let allowed = match url.scheme() {
+        "https" => url.host_str().is_some(),
+        "http" => host_loopback,
+        _ => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(OcrError::UnsafeBaseUrl(format!(
+            "{base_url:?} is not allowed: OCR endpoints must use HTTPS, or plain HTTP only to a loopback host (localhost, 127.0.0.1, [::1])"
+        )))
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
 fn base_url_is_loopback(base_url: &str) -> bool {
     Url::parse(base_url)
         .ok()
@@ -153,12 +195,7 @@ fn base_url_is_loopback(base_url: &str) -> bool {
         // IPv6 hosts serialize with square brackets ("[::1]"); strip them
         // so the documented no-key loopback exemption also applies to
         // bracketed literals.
-        .map(|host| {
-            host.trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_owned()
-        })
-        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+        .is_some_and(|host| is_loopback_host(&host))
 }
 
 fn ocr_request_body(config: &OcrConfig, image_png: &[u8]) -> Value {
@@ -531,6 +568,75 @@ mod tests {
                 .and_then(|url| url.host_str().map(str::to_owned))
                 .is_some_and(|host| host == "[::1]")
         );
+    }
+
+    #[test]
+    fn https_and_http_loopback_ocr_base_urls_are_accepted() {
+        for base_url in [
+            "https://api.example.com/v1",
+            "https://ocr.internal.example/v1/",
+            "https://localhost:8443/v1",
+            "https://127.0.0.1/v1",
+            "https://[::1]/v1",
+            "http://localhost/v1",
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://[::1]:9000/v1",
+        ] {
+            assert!(
+                validate_ocr_base_url(base_url).is_ok(),
+                "expected {base_url:?} to be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_plain_http_ocr_base_urls_are_rejected_before_request_or_key_use() {
+        for base_url in [
+            "http://example.com/v1",
+            "http://api.openai.com/v1",
+            "http://10.0.0.8:8000/v1",
+            "http://192.168.1.10:9000/v1",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[fe80::1]/v1",
+            "ftp://example.com/v1",
+            "file:///etc/passwd",
+            "not a url",
+            "localhost:8000/v1",
+        ] {
+            let error = validate_ocr_base_url(base_url)
+                .expect_err(&format!("expected {base_url:?} to be rejected"));
+            assert!(
+                matches!(error, OcrError::UnsafeBaseUrl(_)),
+                "expected UnsafeBaseUrl for {base_url:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_construction_rejects_remote_plain_http_even_without_a_key() {
+        let mut config = OcrConfig::new("http://example.com/v1");
+        config.api_key_env = "BOOKFORGE_OCR_TEST_REMOTE_HTTP_KEY".to_string();
+        // No API key is set (and validation runs before any key lookup), so
+        // refusal must come from the transport gate alone.
+        let error = match HttpOcrClient::new(config) {
+            Ok(_) => panic!("remote http client construction must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, OcrError::UnsafeBaseUrl(_)),
+            "refusal must happen before any key lookup or request: {error}"
+        );
+    }
+
+    #[test]
+    fn client_construction_still_accepts_loopback_http() {
+        let mut config = OcrConfig::new("http://127.0.0.1:1/v1");
+        config.api_key_env = "BOOKFORGE_OCR_TEST_CLIENT_LOOPBACK_KEY".to_string();
+        // No server is listening; the point is only that construction (the
+        // transport gate) succeeds for loopback HTTP and no connection is
+        // attempted during it.
+        assert!(HttpOcrClient::new(config).is_ok());
     }
 
     #[test]

@@ -180,6 +180,14 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
         config.image_mode = args.ocr_image_mode.as_str().to_string();
         config
     });
+    // Reject remote plain-HTTP OCR endpoints up front: page content and keys
+    // must never traverse an unauthenticated network path. HTTPS and HTTP
+    // loopback remain allowed.
+    if let Some(config) = &ocr_config {
+        config
+            .validate_base_url()
+            .with_context(|| "invalid OCR endpoint")?;
+    }
     if let Some(path) = &args.ocr_logit_processor {
         let processor = tokio::fs::read_to_string(path)
             .await
