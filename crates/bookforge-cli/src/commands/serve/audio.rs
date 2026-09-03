@@ -1789,8 +1789,9 @@ fn truthy_field(fields: &HashMap<String, String>, key: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Resolve an existing operation only when its canonical path remains a direct
-/// child of the canonical upload root. This rejects traversal and symlink
-/// escapes before the path reaches any read or write operation.
+/// child of the canonical upload root. This rejects traversal, symlink
+/// escapes, and any operation directory that is itself a symlink (whatever
+/// its target) before the path reaches any read or write operation.
 pub(super) fn existing_audiobook_operation_out_dir(
     upload_dir: &Path,
     id: &str,
@@ -1804,15 +1805,22 @@ pub(super) fn existing_audiobook_operation_out_dir(
         Err(error) => return Err(error.into()),
     };
     let candidate = root.join(format!("audiobook-{id}"));
+    let metadata = match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    // A symlinked operation directory is refused outright: even a link that
+    // resolves back inside the root aliases one operation under another id.
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(None);
+    }
     let resolved = match std::fs::canonicalize(&candidate) {
         Ok(resolved) => resolved,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    if !resolved.starts_with(&root)
-        || resolved.parent() != Some(root.as_path())
-        || !resolved.is_dir()
-    {
+    if !resolved.starts_with(&root) || resolved.parent() != Some(root.as_path()) {
         return Ok(None);
     }
     Ok(Some(resolved))

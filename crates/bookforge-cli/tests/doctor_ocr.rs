@@ -66,3 +66,16 @@ fn doctor_lists_models_from_loopback_ocr_endpoint() {
         .expect("doctor request captured");
     assert!(request.starts_with("GET /v1/models HTTP/1.1"));
 }
+
+#[test]
+fn doctor_rejects_remote_plain_http_ocr_endpoint_without_connecting() {
+    // Remote plain HTTP must be refused before any connection attempt or key
+    // lookup, so this stays offline-deterministic even if the endpoint were
+    // reachable.
+    bookforge()
+        .args(["doctor", "--ocr-endpoint", "http://example.com/v1"])
+        .assert()
+        .failure()
+        .stdout(contains("Reachable: no"))
+        .stdout(contains("unsafe OCR base URL"));
+}

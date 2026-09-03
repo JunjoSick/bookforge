@@ -138,6 +138,14 @@ async fn run_ocr_doctor(
     println!("  Base URL: {display_endpoint}");
     println!("  Model: {display_model}");
 
+    // Reject remote plain-HTTP endpoints before any request or key use;
+    // HTTPS and HTTP loopback remain allowed.
+    if let Err(error) = config.validate_base_url() {
+        println!("  Reachable: no");
+        println!("  Error: {}", sanitize_terminal(&error.to_string()));
+        return Ok(false);
+    }
+
     let result = tokio::task::spawn_blocking(move || {
         HttpOcrClient::new(config).and_then(|client| client.health_check())
     })

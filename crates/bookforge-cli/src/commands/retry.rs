@@ -102,10 +102,13 @@ pub async fn run(args: RetryArgs, cancel_token: CancellationToken) -> Result<()>
 
     // Preflight before any supervision: without a run snapshot the
     // replacement worker can only die repeatedly; a live worker or a
-    // mid-launch rival means spawning would double-run the job.
-    if let Some(reason) = retry_launch_blocker(&store, &args.job_id)? {
-        anyhow::bail!("{reason}");
-    }
+    // mid-launch rival means spawning would double-run the job. When the
+    // preflight is clear it HANDS OVER the acquired launch claim so the
+    // supervisor can pass it to each replacement worker via the environment.
+    let launch_claim = match retry_launch_blocker(&store, &args.job_id)? {
+        RetryPreflight::Blocked(reason) => anyhow::bail!("{reason}"),
+        RetryPreflight::Ready(claim) => Some(claim),
+    };
 
     let reporter = ProgressReporter::spawn_with_options(
         args.ui.unwrap_or(UiMode::Auto),
@@ -119,6 +122,7 @@ pub async fn run(args: RetryArgs, cancel_token: CancellationToken) -> Result<()>
             job_id: args.job_id.clone(),
             progress,
             cancel: Some(cancel_token),
+            launch_claim,
             ..RetrySupervisor::production()
         },
         &store,
@@ -194,6 +198,9 @@ struct WorkerOutcome {
     /// 3: finished with failed/needs-review segments — an honest terminal
     /// state, not a dead worker). Everything else counts as a death.
     success: bool,
+    /// The raw process exit code, so a code-3 completion can be propagated
+    /// distinctly by the supervisor instead of collapsing into success.
+    exit_code: Option<i32>,
     /// Human-readable status for the death report ("exit status: 1", ...).
     description: String,
     /// Bounded tail of the worker's stderr, for post-mortem context.
@@ -204,6 +211,12 @@ pub(crate) struct RetrySupervisor {
     job_id: String,
     progress: Arc<dyn ProgressSink>,
     cancel: Option<CancellationToken>,
+    /// The cross-process launch claim held by this launcher. Each replacement
+    /// worker adopts it via the environment; between respawns the supervisor
+    /// clears and re-acquires it so no child can ever race another launcher
+    /// into a double-run. `None` when the preflight did not hand one over
+    /// (test-only supervisors).
+    launch_claim: Option<crate::control::RuntimeLaunchClaim>,
     max_consecutive_failures: u32,
     respawn_backoff_base: Duration,
     respawn_backoff_cap: Duration,
@@ -223,6 +236,7 @@ impl RetrySupervisor {
             job_id: String::new(),
             progress: Arc::new(bookforge_core::NullProgressSink),
             cancel: None,
+            launch_claim: None,
             max_consecutive_failures: MAX_CONSECUTIVE_FAILURES,
             respawn_backoff_base: RESPAWN_BACKOFF_BASE,
             respawn_backoff_cap: RESPAWN_BACKOFF_CAP,
@@ -243,12 +257,14 @@ pub(crate) async fn supervise_replacement_worker(
         job_id,
         progress,
         cancel,
+        launch_claim,
         max_consecutive_failures,
         respawn_backoff_base,
         respawn_backoff_cap,
         #[cfg(test)]
         forced_child_exit,
     } = supervisor;
+    let mut launch_claim = launch_claim;
     // Snapshot the segment counts before the first spawn so the give-up path
     // can tell "the retry never started" from "progress was made and then a
     // later worker died" — the two demand different honest final states.
@@ -269,22 +285,58 @@ pub(crate) async fn supervise_replacement_worker(
             "replacement worker starting (attempt {attempt})"
         );
 
+        // Re-arm the launch claim for every attempt after the first: the
+        // previous handoff left it stale (its heartbeat stopped and the child
+        // that adopted it is gone). Clearing the old nonce and acquiring fresh
+        // closes the respawn gap the same way the initial preflight did.
+        if attempt > 1
+            && let Some(claim) = launch_claim.as_mut()
+        {
+            claim.clear();
+            match crate::control::RuntimeLaunchClaim::acquire(&job_id)? {
+                Some(fresh) => *claim = fresh,
+                None => {
+                    break Err(anyhow::anyhow!(
+                        "another bookforge process took over the launch claim for job \
+                         '{job_id}' while its replacement worker was down; refusing to \
+                         double-run the job"
+                    ));
+                }
+            }
+        }
+
+        // Verified parent-to-child handoff: stop our heartbeat, declare the
+        // claim identity (job, nonce, owner pid) in the child's environment,
+        // and let the child adopt — not re-acquire — the very same claim.
+        if let Some(claim) = launch_claim.as_mut() {
+            claim.handoff_to_child();
+        }
         let outcome = {
             #[cfg(test)]
             if let Some(code) = forced_child_exit {
                 spawn_forced_outcome(code)
             } else {
-                spawn_and_wait_replacement_worker(&job_id).await
+                spawn_and_wait_replacement_worker(&job_id, launch_claim.as_ref()).await
             }
             #[cfg(not(test))]
             {
-                spawn_and_wait_replacement_worker(&job_id).await
+                spawn_and_wait_replacement_worker(&job_id, launch_claim.as_ref()).await
             }
         };
         if outcome.success {
+            if outcome.exit_code == Some(crate::exit_code::COMPLETED_WITH_FAILURES) {
+                // The worker ran to completion but left unresolved segments:
+                // propagate its distinct exit code (UI-21) so a script calling
+                // `bookforge retry` can tell "finished cleanly" from "finished
+                // with failures", exactly like a plain `resume`.
+                crate::exit_code::request(crate::exit_code::COMPLETED_WITH_FAILURES);
+            }
             break Ok(());
         }
         if cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
+            if let Some(claim) = launch_claim.as_mut() {
+                claim.clear();
+            }
             progress.emit(ProgressEvent::Warning {
                 kind: "retry_supervision_cancelled".to_string(),
                 message: "retry supervision cancelled; replacement worker left as-is".to_string(),
@@ -328,6 +380,9 @@ pub(crate) async fn supervise_replacement_worker(
                     None => std::future::pending().await,
                 }
             } => {
+                if let Some(claim) = launch_claim.as_mut() {
+                    claim.clear();
+                }
                 progress.emit(ProgressEvent::Warning {
                     kind: "retry_supervision_cancelled".to_string(),
                     message: "retry supervision cancelled during respawn backoff".to_string(),
@@ -337,6 +392,13 @@ pub(crate) async fn supervise_replacement_worker(
             }
         }
     };
+
+    // No launcher path may leave a stale claim that would block an immediate
+    // follow-up resume/retry from this still-live process (the pid guard would
+    // otherwise hold it hostage until the hard-stale window passes).
+    if let Some(claim) = launch_claim.as_mut() {
+        claim.clear();
+    }
 
     match final_result {
         Err(last_death) => honest_give_up(
@@ -392,13 +454,25 @@ fn honest_give_up(
     );
 }
 
+/// Result of the preflight checks that must pass before the first replacement
+/// worker is spawned.
+enum RetryPreflight {
+    /// Supervision cannot (or must not) start; carry the human reason.
+    Blocked(String),
+    /// Launch is clear: the caller now OWNS the cross-process launch claim and
+    /// passes it to the supervisor, which hands it to each child via the
+    /// environment.
+    Ready(crate::control::RuntimeLaunchClaim),
+}
+
 /// Checks that must pass before the first replacement worker is spawned.
-/// Returns a human reason when the supervision cannot (or must not) start.
-/// The launch claim acquired here is released again before returning: the
-/// child acquires and holds its own claim, so the parent must not keep it.
-fn retry_launch_blocker(store: &JobStore, job_id: &str) -> Result<Option<String>> {
+/// On success the acquired launch claim is returned (not dropped): a parent
+/// that released it here would open a window for a concurrent resume to grab
+/// it before the supervisor's first spawn — exactly the parent-to-child gap
+/// the verified environment handoff exists to close.
+fn retry_launch_blocker(store: &JobStore, job_id: &str) -> Result<RetryPreflight> {
     if store.load_job_config_snapshot(job_id)?.is_none() {
-        return Ok(Some(format!(
+        return Ok(RetryPreflight::Blocked(format!(
             "job '{job_id}' has no run configuration snapshot and cannot be resumed by a \
              replacement worker"
         )));
@@ -407,7 +481,7 @@ fn retry_launch_blocker(store: &JobStore, job_id: &str) -> Result<Option<String>
         crate::control::runtime_lease_state(job_id, crate::control::RUNTIME_LEASE_STALE_AFTER),
         crate::control::RuntimeLeaseState::Fresh(_)
     ) {
-        return Ok(Some(format!(
+        return Ok(RetryPreflight::Blocked(format!(
             "a live worker is already processing job '{job_id}'; not launching a replacement \
              (signal or stop that worker instead)"
         )));
@@ -415,31 +489,37 @@ fn retry_launch_blocker(store: &JobStore, job_id: &str) -> Result<Option<String>
     // Cross-process dedupe (CLI-8): a held launch claim means another
     // resume/retry parent is mid-launch. Spawning on top of that hands the
     // two children a claim fight — the silent respawn loop observed while
-    // dogfooding.
-    if crate::control::RuntimeLaunchClaim::acquire(job_id)?.is_none() {
-        return Ok(Some(format!(
+    // dogfooding. Acquiring here (rather than merely peeking) also reclaims
+    // any stale leftover claim and hands the fresh one to the supervisor.
+    match crate::control::RuntimeLaunchClaim::acquire(job_id)? {
+        Some(claim) => Ok(RetryPreflight::Ready(claim)),
+        None => Ok(RetryPreflight::Blocked(format!(
             "another bookforge process appears to be launching or resuming job '{job_id}'; \
              refusing to double-run the job"
-        )));
+        ))),
     }
-    Ok(None)
 }
 
 /// The launch protocol for one replacement worker.
 ///
-/// Claim handoff (the audit's root-cause suspect): the parent releases the
-/// `resume.launch` claim BEFORE spawning, and the child acquires and holds
-/// the claim itself until its control watcher clears it. A parent that kept
-/// holding the claim across the spawn would guarantee every child dies with
-/// "another bookforge process appears to be launching" — exactly the silent
-/// respawn loop observed while dogfooding. The same fix was applied to the
-/// dashboard's resume launcher.
-async fn spawn_and_wait_replacement_worker(job_id: &str) -> WorkerOutcome {
+/// Claim handoff (the audit's root-cause suspect): instead of releasing the
+/// `resume.launch` claim before spawning and letting the child race for a
+/// fresh one, the parent DECLARES its claim identity (job, nonce, owner pid)
+/// in the child's environment. The child's resume entrypoint adopts that exact
+/// claim — verified against the on-disk file — and holds it until its control
+/// watcher establishes the runtime lease. A child therefore never fights the
+/// parent (or a concurrent launcher) for the claim, and no other process can
+/// slip into the parent-drop/child-acquire window.
+async fn spawn_and_wait_replacement_worker(
+    job_id: &str,
+    claim: Option<&crate::control::RuntimeLaunchClaim>,
+) -> WorkerOutcome {
     let executable = match std::env::current_exe() {
         Ok(executable) => executable,
         Err(error) => {
             return WorkerOutcome {
                 success: false,
+                exit_code: None,
                 description: "spawn failed".to_string(),
                 stderr_tail: format!("failed to locate the BookForge executable: {error}"),
             };
@@ -454,11 +534,17 @@ async fn spawn_and_wait_replacement_worker(job_id: &str) -> WorkerOutcome {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    if let Some(claim) = claim {
+        for (name, value) in claim.handoff_to_child_env() {
+            command.env(name, value);
+        }
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             return WorkerOutcome {
                 success: false,
+                exit_code: None,
                 description: "spawn failed".to_string(),
                 stderr_tail: format!("failed to launch replacement worker: {error}"),
             };
@@ -478,6 +564,7 @@ async fn spawn_and_wait_replacement_worker(job_id: &str) -> WorkerOutcome {
             let _ = child.wait();
             return WorkerOutcome {
                 success: false,
+                exit_code: None,
                 description: "spawn failed".to_string(),
                 stderr_tail: "failed to start the stderr drain thread".to_string(),
             };
@@ -500,17 +587,20 @@ async fn spawn_and_wait_replacement_worker(job_id: &str) -> WorkerOutcome {
             let stderr = tail.lock().map(|tail| tail.clone()).unwrap_or_default();
             WorkerOutcome {
                 success,
+                exit_code: status.code(),
                 description: format!("{status}"),
                 stderr_tail: stderr,
             }
         }
         Ok((Err(error), _)) => WorkerOutcome {
             success: false,
+            exit_code: None,
             description: "wait failed".to_string(),
             stderr_tail: format!("failed to wait for the replacement worker: {error}"),
         },
         Err(error) => WorkerOutcome {
             success: false,
+            exit_code: None,
             description: "wait failed".to_string(),
             stderr_tail: format!("replacement worker wait task failed: {error}"),
         },
@@ -545,6 +635,7 @@ fn drain_stderr_tail(mut stderr: impl Read, tail: Arc<Mutex<String>>) {
 fn spawn_forced_outcome(code: i32) -> WorkerOutcome {
     WorkerOutcome {
         success: code == 0 || code == crate::exit_code::COMPLETED_WITH_FAILURES,
+        exit_code: Some(code),
         description: format!("forced test exit status: {code}"),
         stderr_tail: format!("simulated child death (forced test exit {code})"),
     }
@@ -642,6 +733,7 @@ mod supervisor_tests {
             job_id: job_id.to_string(),
             progress,
             cancel: None,
+            launch_claim: None,
             max_consecutive_failures: MAX_CONSECUTIVE_FAILURES,
             respawn_backoff_base: Duration::from_millis(5),
             respawn_backoff_cap: Duration::from_millis(1000),
@@ -734,12 +826,17 @@ mod supervisor_tests {
 
         let blocker = retry_launch_blocker(&store, &job_id).expect("blocker reads cleanly");
 
-        assert!(
-            blocker
-                .expect("a job without a snapshot must be blocked")
-                .contains("run configuration snapshot"),
-            "blocker reason should name the missing snapshot"
-        );
+        match blocker {
+            RetryPreflight::Blocked(reason) => {
+                assert!(
+                    reason.contains("run configuration snapshot"),
+                    "blocker reason should name the missing snapshot: {reason}"
+                );
+            }
+            RetryPreflight::Ready(_) => {
+                panic!("a job without a snapshot must be blocked");
+            }
+        }
         let _ = std::fs::remove_file(db_path);
     }
 
@@ -795,5 +892,176 @@ mod supervisor_tests {
         assert_eq!(respawn_backoff(4), Duration::from_secs(8));
         assert_eq!(respawn_backoff(7), RESPAWN_BACKOFF_CAP);
         assert_eq!(respawn_backoff(50), RESPAWN_BACKOFF_CAP);
+    }
+
+    /// UI-21: a child that exits 3 (completed but with unresolved segments) is
+    /// an honest terminal state — no respawn, no death event — but the retry
+    /// command must propagate the distinct code so scripts can tell it apart
+    /// from a clean 0.
+    #[tokio::test]
+    async fn supervisor_propagates_child_exit_code_3_distinctly() {
+        crate::exit_code::request(crate::exit_code::SUCCESS);
+        let (store, db_path, job_id) = temp_store("exit3");
+        let sink = Arc::new(RecordingSink::default());
+
+        let result =
+            supervise_replacement_worker(supervisor(&job_id, sink.clone(), Some(3)), &store).await;
+
+        assert!(
+            result.is_ok(),
+            "a code-3 completion must not fail the retry"
+        );
+        assert!(
+            death_events(&sink.events()).is_empty(),
+            "a code-3 completion is not a death"
+        );
+        assert_eq!(
+            crate::exit_code::requested_code(),
+            crate::exit_code::COMPLETED_WITH_FAILURES,
+            "the child's distinct exit code 3 must propagate"
+        );
+        crate::exit_code::request(crate::exit_code::SUCCESS);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_dir_all(bookforge_core::run_dir_for_job(&job_id));
+    }
+
+    /// The preflight hands the acquired launch claim to the supervisor so the
+    /// parent-to-child handoff can use it; a clean preflight for a retryable
+    /// job must produce a live claim, and the claim's handoff env must carry
+    /// the job id plus a non-empty nonce and owner pid.
+    #[tokio::test]
+    async fn launch_blocker_hands_over_a_claim_with_handoff_identity() {
+        let (store, db_path, job_id) = temp_store("handoff");
+        store
+            .update_job_config_snapshot(
+                &job_id,
+                &bookforge_core::RunConfigSnapshot {
+                    input_path: std::path::PathBuf::from("input.epub"),
+                    input_snapshot_path: None,
+                    input_sha256: None,
+                    output_path: std::path::PathBuf::from("out.epub"),
+                    events_path: None,
+                    report_json_path: None,
+                    report_markdown_path: None,
+                    source_language: Some("English".to_string()),
+                    target_language: "Italian".to_string(),
+                    creator: None,
+                    provider: "mock".to_string(),
+                    model: "mock-model".to_string(),
+                    base_url: None,
+                    api_key_env: None,
+                    profile: bookforge_core::TranslationProfile::V1Fast,
+                    provider_preset: None,
+                    prompt_version: "v1".to_string(),
+                    cache_namespace: "ns".to_string(),
+                    book_id: None,
+                    series_id: None,
+                    glossary_budget_tokens: 800,
+                    glossary_format: bookforge_core::GlossaryFormat::Json,
+                    prompt_extra: None,
+                    glossary_fingerprint: String::new(),
+                    glossary_terms: Vec::new(),
+                    context_window: 0,
+                    context_budget_tokens: 1200,
+                    context_scope: bookforge_core::config::ContextScope::Chapter,
+                    style_fingerprint: String::new(),
+                    style_rendered_block: String::new(),
+                    entities_fingerprint: String::new(),
+                    entities_rendered_block: String::new(),
+                    bilingual_mode: bookforge_core::BilingualMode::Replace,
+                    bilingual_separator: " / ".to_string(),
+                    bilingual_style: bookforge_core::BilingualStyle::Minimal,
+                    bilingual_css: None,
+                    fallback: None,
+                    finalize: bookforge_core::FinalizeCheckpointSnapshot::default(),
+                    qa_mode: "off".to_string(),
+                    validate_output: false,
+                    settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(
+                        &bookforge_core::TranslationProfile::V1Fast.resolve(),
+                    ),
+                },
+            )
+            .expect("snapshot should write");
+
+        let claim = match retry_launch_blocker(&store, &job_id).expect("preflight reads cleanly") {
+            RetryPreflight::Ready(claim) => claim,
+            RetryPreflight::Blocked(reason) => {
+                panic!("retryable job must not be blocked: {reason}")
+            }
+        };
+        let env = claim.handoff_to_child_env();
+        let lookup = env
+            .iter()
+            .map(|(name, value)| (*name, value.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            lookup
+                .get(crate::control::LAUNCH_CLAIM_ENV_JOB)
+                .expect("job var"),
+            &job_id
+        );
+        assert!(
+            !lookup
+                .get(crate::control::LAUNCH_CLAIM_ENV_NONCE)
+                .expect("nonce var")
+                .is_empty(),
+            "nonce must not be empty"
+        );
+        assert!(
+            lookup
+                .get(crate::control::LAUNCH_CLAIM_ENV_PID)
+                .expect("pid var")
+                .parse::<u32>()
+                .expect("pid is numeric")
+                > 0,
+            "owner pid must be present"
+        );
+
+        drop(claim);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_dir_all(bookforge_core::run_dir_for_job(&job_id));
+    }
+
+    /// The supervisor's launch-claim lifecycle (lifecycle audit): the claim the
+    /// preflight hands over is cleared and re-acquired between respawns (so no
+    /// child can race a rival into a double-run through a stale parent claim),
+    /// and a give-up leaves NO stale claim behind that would block an immediate
+    /// follow-up resume/retry from this still-live process.
+    #[tokio::test]
+    async fn supervisor_clears_its_launch_claim_through_the_respawn_loop() {
+        let (store, db_path, job_id) = temp_store("claim-loop");
+        let claim_path = bookforge_core::run_dir_for_job(&job_id).join("resume.launch");
+
+        let claim = crate::control::RuntimeLaunchClaim::acquire(&job_id)
+            .expect("acquire reads cleanly")
+            .expect("the preflight owns the claim");
+        let sink = Arc::new(RecordingSink::default());
+        let mut supervisor = supervisor(&job_id, sink.clone(), Some(1));
+        supervisor.launch_claim = Some(claim);
+
+        let result = supervise_replacement_worker(supervisor, &store).await;
+        assert!(result.is_err(), "give-up must exit non-zero");
+
+        assert!(
+            !claim_path.exists(),
+            "a given-up supervisor must clear its launch claim so a follow-up \
+             resume/retry is never blocked by its own stale claim"
+        );
+        // The claim path must also not be littered with parked/remove debris.
+        let run_dir = bookforge_core::run_dir_for_job(&job_id);
+        let debris = std::fs::read_dir(&run_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("resume.launch")
+            })
+            .count();
+        assert_eq!(debris, 0, "no claim debris may accumulate across respawns");
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_dir_all(run_dir);
     }
 }

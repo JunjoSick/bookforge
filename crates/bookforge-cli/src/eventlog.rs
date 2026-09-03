@@ -70,7 +70,14 @@ impl EventLogTailer {
         if self.file.is_none() {
             match File::open(&self.path) {
                 Ok(opened) => self.file = Some(opened),
-                Err(_) => return Ok(events),
+                // A not-yet-created log is the normal pre-launch state and is
+                // retried on the next poll. ANY other open failure (permission,
+                // path-not-a-directory, ...) is a real error that must surface
+                // instead of being silently swallowed as "no events".
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(events);
+                }
+                Err(error) => return Err(error.into()),
             }
         }
         if self.file.is_none() {
@@ -169,6 +176,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut tailer = EventLogTailer::new(dir.path().join("events.jsonl"));
         assert!(tailer.poll().unwrap().is_empty());
+    }
+
+    /// A missing log is the normal pre-launch state, but ANY other open
+    /// failure (permission denied, a non-directory parent) must surface as an
+    /// error instead of being silently treated as "no events".
+    #[cfg(unix)]
+    #[test]
+    fn open_failures_other_than_not_found_surface_as_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"a plain file").unwrap();
+
+        let mut tailer = EventLogTailer::new(blocker.join("events.jsonl"));
+        let error = tailer
+            .poll()
+            .expect_err("a non-directory parent must surface as an error");
+        assert!(
+            !error.to_string().is_empty(),
+            "the underlying open error must propagate"
+        );
     }
 
     #[test]

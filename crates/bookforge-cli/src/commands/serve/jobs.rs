@@ -416,12 +416,20 @@ async fn retry_job(
         return Ok(response);
     }
     let store_path = state.store_path.clone();
-    let retried = tokio::task::spawn_blocking(move || -> Result<usize> {
+    let retried = tokio::task::spawn_blocking(move || {
         let store = JobStore::open(store_path)?;
-        Ok(store.retry_segments(&id, RetryScope::All)?)
+        store.retry_segments(&id, RetryScope::All)
     })
-    .await??;
-    Ok(Json(json!({ "retried": retried })).into_response())
+    .await?;
+    match retried {
+        Ok(retried) => Ok(Json(json!({ "retried": retried })).into_response()),
+        Err(bookforge_store::StoreError::NotFound(_)) => Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such job" })),
+        )
+            .into_response()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn pause_job(
@@ -511,11 +519,13 @@ async fn resume_job(
         LaunchSlot::Acquired(slot) => slot,
         LaunchSlot::Exhausted => return Ok(launch_slot_exhausted()),
     };
-    // Claim handoff (retry-supervisor audit): the parent releases the launch
-    // claim before spawning a real child — the replacement worker acquires
-    // and holds its own claim until its control watcher clears it. The
-    // cfg(test) hook below is the only path that keeps it (no child spawns).
-    #[cfg_attr(not(test), allow(unused_mut))]
+    // Claim handoff (retry-supervisor audit): the parent ACQUIRES the launch
+    // claim and hands its identity (job, nonce, owner pid) to the child via the
+    // environment, and the child ADOPTS the very same claim instead of racing
+    // for a fresh one. A parent that released the claim before the child
+    // acquired it would open a window for a concurrent resume to slip in and
+    // double-run the job. The cfg(test) hook below never spawns a child, so it
+    // persists the claim instead (exactly-once dedupe without processes).
     let Some(mut launch_claim) = crate::control::RuntimeLaunchClaim::acquire(&id)? else {
         return Ok(Json(json!({
             "command": "resume",
@@ -534,6 +544,9 @@ async fn resume_job(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    for (name, value) in launch_claim.handoff_to_child_env() {
+        command.env(name, value);
+    }
     if action.force {
         // A paused job normally expects to signal its original process. A
         // missing/stale lease proves that process is unavailable, so the
@@ -546,6 +559,11 @@ async fn resume_job(
         command.as_std_mut().creation_flags(0x0800_0000);
     }
     configure_dashboard_child_environment(&mut command, api_key_env.as_deref().zip(key.as_deref()));
+    // The scrubber above clears the child's environment, so the claim identity
+    // is declared AFTER it: the child must adopt — not re-acquire — our claim.
+    for (name, value) in launch_claim.handoff_to_child_env() {
+        command.env(name, value);
+    }
     #[cfg(test)]
     if let Some(launches) = &state.resume_launches {
         launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -572,18 +590,31 @@ async fn resume_job(
         }))
         .into_response());
     }
-    let mut child = command.spawn().context("failed to launch resume worker")?;
+    // Hand the claim to the child BEFORE spawning: the child adopts the very
+    // same claim from its environment (verified against the on-disk file) and
+    // clears it once its control watcher establishes the runtime lease. The
+    // parent must never remove or overwrite it afterwards. Stopping our own
+    // heartbeat first guarantees the child's adoption rewrite (claim pid ->
+    // child) cannot race our heartbeat back onto our pid.
+    launch_claim.handoff_to_child();
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            // No child exists to adopt the claim; reclaim it so the job is
+            // not blocked by an orphaned claim whose owner pid (ours) is
+            // still alive.
+            launch_claim.clear();
+            return Err(anyhow::anyhow!("failed to launch resume worker: {error}").into());
+        }
+    };
     let pid = child.id();
-    // Claim handoff (retry-supervisor audit): the parent releases the launch
-    // claim here instead of persisting it. The replacement worker acquires
-    // and holds its own claim until its control watcher clears it; a parent
-    // that kept holding the claim across the spawn guaranteed every child
-    // died with "another bookforge process appears to be launching" — the
-    // silent respawn loop observed in the dogfooding run.
-    drop(launch_claim);
     if let Some(status) = child_exit_status_after(&mut child, CHILD_STARTUP_CHECK).await?
         && !status.success()
     {
+        // The child died before it could adopt/clear the claim. Reclaim it so
+        // the job is not permanently blocked by a claim whose owner pid (ours)
+        // is still alive — the late-Drop safety net for the handoff.
+        launch_claim.clear();
         return Ok(bad_request(&format!(
             "resume worker exited immediately with {status}"
         )));
