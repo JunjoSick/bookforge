@@ -1,6 +1,16 @@
 # BookForge Deep Audit Report
 
-> **Remediation campaign COMPLETE (2026-08-27).** Progress tracking: `docs/HANDOFF-2026-08.md` on branch `remediation/audit-2026-08`, released as v3.0.0. Wave 0: test deflake, INFRA-3/4/5, gitignore intent rules, zip codec trim, rustdoc fix. Wave 1: all P1 scopes + PR #108 merged. Wave 2: P2-llm/audio/pdf/ui-clap; PDF-4 refuted with poppler evidence. Wave 3: DOC stream, unified token estimator (cache bumped), dead-code sweep, store hardening. Wave 4: EPUB-18 property/hostile harness (caught a real bug), PDF bidi/CJK + OS-parity seam, pricing/provider registry, JSON envelope v2 + presentation consolidation + dashboard CRUD parity. Pre-merge professional review pass (6 specialist reviewers) closed with fixes for every BLOCKER/MAJOR finding; PDF-1 and PDF-4 stand refuted.
+> **Status (2026-08-31).** This report is the **historical audit record** for
+> the 2026-08 deep audit (state as of v2.6.1, audit date 2026-08-25). The
+> remediation described below is **NOT complete and NOT released**: the
+> campaign branch `remediation/audit-2026-08` at commit `aa90d94` is not merged
+> to `main` (PR #112 open/blocked; PR #108 folded in), there is **no v3.0.0
+> tag/release**, and the latest published release is **v2.6.1**. Wave history
+> (0–4), the six-reviewer pre-merge pass, and dogfooding are release-candidate
+> work on that branch. For authoritative per-item status, see
+> **`docs/AUDIT-2026-08-31.md`**; entries there close only as Fixed, Removed, or
+> Refuted with evidence and tests. The wave summaries below are historical
+> record, not a claim that the campaign shipped.
 
 **Date:** 2026-08-25 · **Version audited:** v2.6.1 (workspace @ `JunjoSick/bookforge`, 427 commits)
 **Method:** 14 specialized audit agents dispatched in sequential waves over the full repo (~80k LOC Rust, 7 crates + CI/docs/scripts/artifacts). Later waves received earlier findings to verify or refute. Builds and tests were actually executed. ~250 raw findings were deduplicated into the consolidated items below.

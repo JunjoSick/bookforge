@@ -1,7 +1,19 @@
 # BookForge Audit Remediation — Agent Handoff (2026-08-25)
 
 You are resuming a multi-wave remediation campaign. This file is your complete context.
-The tracking base is `docs/report.md` (the full audit report; finding IDs are stable references).
+
+> **STATUS CORRECTION (2026-08-31):** the claims below that v3.0.0 shipped, that
+> the campaign is complete, or that work is "post-release" are **false**. The
+> branch `remediation/audit-2026-08` at commit `aa90d94` is **not released** and
+> **not merged to `main`** (PR #112 is open/blocked; PR #108 is folded into it).
+> GitHub has no v3.0.0 tag/release; the latest published release is **v2.6.1**.
+> Treat the wave/fix record below as **historical + release-candidate/dogfood**,
+> not as shipped. The authoritative, current ledger is
+> **`docs/AUDIT-2026-08-31.md`** — read it first and update it, not this file,
+> when statuses change.
+
+The historical tracking base is `docs/report.md` (the full audit report;
+finding IDs are stable references).
 
 **Branch:** `remediation/audit-2026-08` (integration branch, based on `main` @ fe953c4c).
 Push it if absent: `git fetch origin && git checkout remediation/audit-2026-08`.
@@ -15,7 +27,7 @@ Push it if absent: `git fetch origin && git checkout remediation/audit-2026-08`.
 3. **Serve auth (H-5):** token auth DEFAULT-ON (auto-generated session token, printed URL bootstraps browser, all API routes require it) with a `--no-auth` opt-out escape hatch.
 4. **Semver:** minor-breaking changes acceptable → final version bump likely **v3.0.0** (status enums replace magic strings, unified estimator changes cache keys, JSON envelope versioning).
 
-## 2. Current state — Waves 0–4 COMPLETE ✅ · Review round COMPLETE ✅ · v3.0.0 released (2026-08-27) · Dogfooding round 1 complete (2026-08-28)
+## 2. Current state — Waves 0–4 COMPLETE on the branch ✅ · Review round COMPLETE on the branch ✅ · v3.0.0 NOT released (candidate on `remediation/audit-2026-08` @ `aa90d94`) · Dogfooding round 1 done (2026-08-28) · Branch NOT merged to `main` (PR #112 open/blocked)
 
 **Dogfooding round 1** (real book: Cannibal Capitalism EN→IT, deepseek-v4-flash, ~$0.14 real spend, final EPUB EPUBCheck-valid with all chapters Italian; log: `test/DOGFOOD-2026-08-27.md`):
 
@@ -25,15 +37,40 @@ Push it if absent: `git fetch origin && git checkout remediation/audit-2026-08`.
   3. Avoid touching paths outside the repo (e.g. `/tmp`) in unattended sessions — harness confirmations stall everything.
   4. A frozen `events.jsonl` does NOT mean a hung engine — first verify the worker process is still alive.
 - **Product fixes landed for every dogfood finding** (see CHANGELOG `Unreleased`): latency-aware batch budgets + slow-trickle timeout proof, `RequestProgress` heartbeats + `effective_timeout_seconds`, structured block-attributed findings (migration 11, title/author blocks = warnings), honest `--pass-costs` totals, supervised retries with surfaced deaths + bounded give-up, root cause of the silent respawn loop fixed (dashboard resume held the launch claim across spawn), friendly validation errors, `--no-thinking`/connection-flag help text, `retry --ui`.
-- **Known residual (ticketed):** engine `BatchItemFailure.findings` are produced and persisted via the legacy-parse fallback; threading them through `SegmentTranslation` end-to-end (instead of the `ENGINE_FINDINGS_PLACEHOLDER`) is the last wiring step. Mixed-script bidi fixtures and the property-harness grammar extensions from the review round remain on the fast-follow list.
+- **Known residual — addressed on the branch by commit `aa90d94`** (`feat:
+  thread engine findings through SegmentTranslation end-to-end`): engine
+  `BatchItemFailure.findings` are now threaded through `SegmentTranslation`
+  instead of the `ENGINE_FINDINGS_PLACEHOLDER`. Verify the end-to-end path and
+  its tests on release before closing (ledger TRANS-2). Mixed-script bidi
+  fixtures and the property-harness grammar extensions from the review round
+  remain open items (ledger PDF-7 / EPUB-18).
+- **Release status:** the entire record below shipped **nowhere** — it exists
+  on the unreleased branch only. See the ledger (`docs/AUDIT-2026-08-31.md`)
+  for authoritative Open/Fixed-on-branch status per category.
 
-All five audit waves executed to completion plus a professional pre-merge review round (six specialist reviewers: store integrity, serve security, llm engine, cli lifecycle, epub+pdf protocol, release readiness). Every BLOCKER/MAJOR finding from the review round was fixed and mutation/red-green verified before merge; P2/P3 leftovers are recorded as fast-follow tickets below.
+All five audit waves executed to completion on this branch plus a professional
+pre-merge review round (six specialist reviewers: store integrity, serve
+security, llm engine, cli lifecycle, epub+pdf protocol, release readiness).
+Every BLOCKER/MAJOR finding from the review round was fixed and
+mutation/red-green verified on the branch; P2/P3 leftovers are recorded as
+fast-follow tickets below. **Merging to `main` and releasing v3.0.0 are still
+pending (PR #112 open/blocked); the campaign is not complete until they are.**
 
 **Wave 4 highlights:** EPUB-18 seeded property harness (200 seeds, byte-stability + ordinal-protocol invariants) + 15-case hostile corpus + EPUB2 parity — the harness caught a real bug (unattributable zip-open errors, fixed); PDF gained a line-level bidi pass (Arabic/Hebrew logical order), justified-CJK kinsoku merging, tri-tier caption detection, and an in-process FakePoppler driving 15 conversion tests dual-path on any OS; pricing loaders + provider defaults collapsed into `bookforge_core::providers` (single package-owned JSON, anti-duplication guard test); `--pass-costs` estimate breakdown; `--ui json` stdout now carries a versioned envelope (`--ui json-v1` preserves legacy streams); one RunView presentation layer feeds all four dashboards; styles/entities CRUD + audiobook parity controls on the dashboard; entities export; atomic single-row store deletes.
 
 **Review-round fixes (commit `17176a4`):** FK-restore on failed hardening, prune running-protection TOCTOU (mutation-proven test), retry freeze-check inside txn, diagnostics drained at all canonical opens, dashboard auth-header seam across all 40 fetch sites (static-analysis guarded), atomic styles/entities delete primitives, retry-failed claim+slot race, paused-repair in-flight drain, escalation user-cap, prompt-overhead estimates, max_tokens=0 floor+warning, HTTP-date year bound, reflow 10k depth cap (pre-fix SIGABRT proven), Arabic/Hebrew continuation support.
 
-**Fast-follow tickets (intentionally post-release):** SERVE-7 child isolation (needs audiobook plan-mode flags), CSP nonce work to drop `unsafe-inline`, `doctor`/CLI surface for `JobStore::prune_jobs` retention, batch upsert paths routing partial-index collisions to update arms (STORE-13 tail), mixed-script street-address bidi regression fixtures + configurable poppler logical-order escape hatch, prompt-fencing extension to item payloads (LLM-15 tail vs current context-block scope), lease-heartbeat error dedup, fallback-pass progress sink visibility, `LogPersistenceFailed` warning event, property-harness grammar extensions (suppression-nesting, marker omission/reorder stress).
+**Fast-follow tickets (Open in `docs/AUDIT-2026-08-31.md`; intentionally after
+the branch merges, NOT post-release — nothing has been released):** SERVE-7
+child isolation (needs audiobook plan-mode flags), CSP nonce work to drop
+`unsafe-inline`, `doctor`/CLI surface for `JobStore::prune_jobs` retention,
+batch upsert paths routing partial-index collisions to update arms (STORE-13
+tail), mixed-script street-address bidi regression fixtures + configurable
+poppler logical-order escape hatch, prompt-fencing extension to item payloads
+(LLM-15 tail vs current context-block scope), lease-heartbeat error dedup,
+fallback-pass progress sink visibility, `LogPersistenceFailed` warning event,
+property-harness grammar extensions (suppression-nesting, marker
+omission/reorder stress).
 
 ## 2.a Historical — Wave 3 COMPLETE ✅ (2026-08-26)
 

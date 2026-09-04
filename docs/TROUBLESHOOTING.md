@@ -1,5 +1,12 @@
 # Troubleshooting BookForge
 
+> **Version note (2026-08-31):** this document describes the working tree on the
+> **unreleased** v3.0.0 remediation branch (branch `remediation/audit-2026-08`
+> @ `aa90d94`; PR #112 open/blocked). The dashboard token-auth behavior in the
+> "dashboard does not open" section ships **only** with v3.0.0; the published
+> **v2.6.1** dashboard is unauthenticated. For current-published behavior,
+> install v2.6.1; remediation status is tracked in `docs/AUDIT-2026-08-31.md`.
+
 Start with these three checks:
 
 ```bash

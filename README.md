@@ -18,8 +18,17 @@ of translation quality.
 
 ## Status
 
-BookForge v3.0.0 is usable for EPUB translation, PDF-to-EPUB ingestion, and
-local browser-based translation runs:
+> **Version note (2026-08-31):** the **latest published release is v2.6.1**. The
+> v3.0.0 remediation campaign is a **release candidate** on branch
+> `remediation/audit-2026-08` (commit `aa90d94`) and is **not published**: there
+> is no v3.0.0 tag/release and no v3 binaries to install. Some features in this
+> README — dashboard token auth, the exit-code taxonomy, the `--ui json`
+> versioned envelope, `--pass-costs`, and the audit remediations — are **not yet
+> in any release**; install v2.6.1 for current published behavior, or build from
+> source to try the candidate. Tracking: `docs/AUDIT-2026-08-31.md`.
+
+BookForge v2.6.1 (latest published release) is usable for EPUB translation,
+PDF-to-EPUB ingestion, and local browser-based translation runs:
 
 - EPUB inspect, parse, segment, and rebuild
 - EPUBCheck-backed standalone and post-translation validation
@@ -98,6 +107,11 @@ local browser-based translation runs:
 
 ### For non-technical users
 
+The installers below install the **latest published release, currently
+BookForge v2.6.1**. There is no published v3.0.0 yet; until a v3.0.0 release
+exists, these links never install v3 binaries — they resolve to v2.6.1. To try
+the v3.0.0 candidate, build from source (`cargo build --release` below).
+
 BookForge v2 ships prebuilt installers for macOS, Linux, and Windows. You do
 not need Rust, Cargo, Git, Python, Node, or a source-code checkout.
 
@@ -142,9 +156,10 @@ bookforge
 ```
 
 Running `bookforge` with no extra words opens the local web app. If the browser
-does not open automatically, open the link the terminal prints — it contains
-your one-time session token (the dashboard authenticates every request by
-default; `--no-auth` opts out):
+does not open automatically, open the link the terminal prints — in the
+unreleased v3.0.0 candidate the link contains your one-time session token (the
+dashboard authenticates every request by default; `--no-auth` opts out). The
+published v2.6.1 release does **not** have dashboard token auth yet:
 
 ```txt
 http://127.0.0.1:8765/?token=…
@@ -582,6 +597,11 @@ Scripts can rely on a small taxonomy (full table in
 stop, `1` runtime failure, `2` usage error, `3` the job finished but segments
 remain failed/needs-review, and `130` interrupted by Ctrl+C with progress saved
 for `resume`.
+
+> Version note: this exit-code taxonomy landed with the **unreleased v3.0.0
+> candidate** (audit UI-21). The published v2.6.1 release does not guarantee
+> these codes; the previous undefined/surprising behavior (Ctrl+C → 0, errors →
+> 1, `doctor` failures → 0) applies until v3 ships.
 
 Known limitations: terminal commands read provider API keys from environment
 variables, while the browser dashboard can also accept a session-only pasted

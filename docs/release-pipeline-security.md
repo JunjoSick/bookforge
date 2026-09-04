@@ -16,6 +16,11 @@ release commits are configured and reflected in `release.yml`:
 - `actions/download-artifact` v8.0.1: `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c`
 - `actions/attest` v4.2.0: `f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6`
 
+> **Pin reconciliation (2026-08-31):** the four SHAs above were re-verified
+> against `dist-workspace.toml [dist.github-action-commits]` and the generated
+> `release.yml`; the checkout pin is v7.0.1 (`3d3c42e5…`), not the v6.0.2 SHA
+> previously listed here.
+
 This closes the mutable-action-reference item. Updating an action now requires
 an intentional config change and workflow regeneration.
 
@@ -99,10 +104,16 @@ and the official action release pages for [checkout](https://github.com/actions/
 
 ## Dashboard authentication residuals
 
-**Status:** the default-on session-token mitigation landed in audit wave 1.
-The dashboard mints a random token at startup, includes it only in the printed
-bootstrap URL, and requires it on every route outside the bootstrap page.
-`--no-auth` is an explicit unauthenticated escape hatch for consoles-only use.
+**Status:** deliberately deferred, owner decision 2026-07-21. **Update
+2026-08-26 (release-candidate only):** the primary intended mitigation is
+implemented on the **unreleased** remediation branch (audit wave 1, H-5) — the
+dashboard mints a random session token at startup, includes it only in the
+printed bootstrap URL, and requires it on every route outside that page;
+`--no-auth` restores unauthenticated serving explicitly. It ships only when the
+branch merges and is released (v3.0.0 candidate; PR #112 open/blocked), so it
+is **not present in the published v2.6.1**. The analysis below is preserved as
+written when the risk was accepted; concurrent-launch caps also landed on the
+candidate branch, while cookie exchange and spend limits remain open ideas.
 
 The remaining accepted risks are deliberately narrower: the token is not
 exchanged for an `HttpOnly; SameSite=Strict` cookie, remembered-provider-key
