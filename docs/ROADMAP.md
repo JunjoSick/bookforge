@@ -12,6 +12,12 @@ the milestones below.
 > endpoint foundations. v2.6.1 was prepared and merged to `main` on 2026-07-21
 > with security-audit remediation and two ElevenLabs fixes, and was tagged and
 > released on 2026-07-22.
+> **Status note (2026-08-31):** the v3.0.0 remediation candidate (2026-08 deep
+> audit, branch `remediation/audit-2026-08` @ `aa90d94`) is **unreleased** — no
+> tag/release exists and the branch is not merged (PR #112 open/blocked). The
+> latest published release remains **v2.6.1**. See
+> `docs/AUDIT-2026-08-31.md` for the authoritative remediation ledger; §17
+> remains proposal, not a shipping commitment.
 > This document is kept for architectural invariants, shipped-milestone
 > context, and deferred follow-up work. For current user behavior, start
 > with `README.md`, `CHANGELOG.md`, and `docs/v2-web-dashboard-plan.md`;
@@ -128,7 +134,7 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v1.8 | Structural credibility (EPUBCheck + corpus; was the planned v1.5 scope, §8) | 10–14 days | README final rewrite citing corpus | **shipped 2026-06-20** |
 | v2.0 | Monitoring UI (`RunState`, `watch`, `--ui tui`, local `serve`) | shipped scope | release notes | shipped; patch line completed at v2.0.3 (2026-07-02) |
 | v2.6.0 | Audiobook narration quality & UI parity (§16) | 8–12 days | release notes and updated audiobook guide | **shipped 2026-07-21 as release v2.6.0** |
-| v2.6.1 | Security-audit remediation + ElevenLabs fixes | patch release | release notes | **merged 2026-07-21; tag pending** |
+| v2.6.1 | Security-audit remediation + ElevenLabs fixes | patch release | release notes | **released 2026-07-22 as v2.6.1** |
 
 Priority note (2026-06): the owner needs PDF translation more than
 bilingual output — scientific papers (figures/tables must survive) and
@@ -845,11 +851,14 @@ this machinery further, add counters (per rule: entries injected /
 entries honored in output) to a real translation run and check the data;
 if rules 3–4 contribute nothing measurable, simplify rather than extend.
 
-**Token estimator.** v1.2 uses a conservative `chars / 3` heuristic
-(rounded up) instead of a real BPE tokenizer. The heuristic over-counts
-slightly on Latin scripts and under-counts on Asian scripts; both
-directions stay safely inside the budget for our purposes. A real
-tokenizer (`tiktoken-rs` or per-provider equivalent) is deferred to v1.3
+**Token estimator.** v1.2 used a conservative `chars / 3` heuristic
+(rounded up) instead of a real BPE tokenizer, and later a dominant-class
+case weighting; both are retired. The audit-2026-08 wave replaced every
+estimate site with one script-aware proportional weighting in
+`bookforge_core::token_estimate` (unspaced CJK scripts ≈ 1 char/token,
+everything else ≈ 4 chars/token). A real tokenizer (`tiktoken-rs` or
+per-provider equivalent) remains deferred until measurements show the
+heuristic misses materially on real books.
 once style sheets land and per-segment token accounting becomes a more
 load-bearing concern. Code carries a `// TODO(v1.3): real tokenizer`
 marker.

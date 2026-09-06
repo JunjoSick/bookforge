@@ -2,19 +2,24 @@ pub mod config;
 pub mod control;
 pub mod entity;
 pub mod error;
+pub mod finding;
 pub mod glossary;
 pub mod ir;
 pub mod marker;
 pub mod math;
+pub mod path;
 pub mod progress;
+pub mod providers;
 pub mod run_snapshot;
 pub mod scheduler;
+pub mod script;
 pub mod segment;
 pub mod style;
+pub mod token_estimate;
 
 pub use config::{
     BatchConfig, BilingualMode, BilingualStyle, DoubleCheckConfig, DoubleCheckMode, FallbackScope,
-    JsonMode, ModelEndpoint, ModelRouteConfig, PromptVersion, ProviderErrorKind, ProviderPreset,
+    JsonMode, ModelEndpoint, PromptVersion, ProviderErrorKind, ProviderPreset,
     ProviderPresetResolved, ProviderPresetRuntimeOverrides, ProviderRequestMetric,
     ProviderRuntimeConfig, QaRunConfig, ResolvedRunSettings, RetryAfterPolicy, SegmentationConfig,
     TranslationConfig, TranslationProfile, cap_output_tokens,
@@ -41,6 +46,7 @@ pub use run_snapshot::{
     RunConfigSnapshot,
 };
 pub use scheduler::SchedulerConfig;
+pub use script::{ScriptClass, is_space_delimited, script_class, script_counts};
 pub use style::{
     DoNotFields, RegisterFields, StyleSheet, VoiceFields, merge_style_sheets, render_style_block,
     style_fingerprint,

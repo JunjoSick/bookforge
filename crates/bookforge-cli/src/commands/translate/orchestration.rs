@@ -120,14 +120,10 @@ pub(super) fn resolve_settings_and_plan(
 }
 
 pub(super) fn human_stdout_enabled(ui: crate::progress::UiMode) -> bool {
-    // The TUI owns the screen, so suppress plain stdout/stderr prints that would
-    // corrupt it; the dashboard surfaces the same information.
-    !matches!(
-        ui,
-        crate::progress::UiMode::Json
-            | crate::progress::UiMode::Quiet
-            | crate::progress::UiMode::Tui
-    )
+    // The TUI owns the screen, and machine-JSON modes own the stdout stream,
+    // so suppress plain stdout/stderr prints that would corrupt them
+    // (UI-22; single source of truth in `UiMode` so `json-v1` cannot drift).
+    ui.human_stdout()
 }
 
 async fn finalize_reporter<T>(
@@ -185,7 +181,7 @@ pub(super) async fn run_mock_translation_with_store(
     let model = config
         .model
         .clone()
-        .unwrap_or_else(|| "mock-prefix-target".to_string());
+        .unwrap_or_else(|| bookforge_core::providers::MOCK_DEFAULT_MODEL.to_string());
     let provider = MockProvider::new(mock_mode(&model), &config.target_language);
     run_translation_with_store(
         input,
@@ -380,6 +376,12 @@ where
         Some(store) => store,
         None => JobStore::open_default()?,
     };
+    // Canonical open point: drain warn-on-open storage diagnostics once so
+    // legacy unknown statuses / skipped hardening surface here, not just in
+    // tests (taking clears the queue; re-draining later stays idempotent).
+    for diagnostic in store.take_diagnostics() {
+        tracing::warn!(surface = "translate", "{diagnostic}");
+    }
     let glossary = prepare_glossary_run_config(
         &store,
         &cli_args.glossary,
@@ -501,7 +503,7 @@ where
             qa: cli_args.qa,
             validate_output: cli_args.validate_output,
         },
-    );
+    )?;
     let job_runtime_settings = control_watcher.job_runtime_settings();
     let run_config = TranslationRunConfig {
         source_language: config.source_language.clone(),
@@ -525,6 +527,7 @@ where
         runtime_settings: Some(control_watcher.runtime_settings()),
     };
     let mut translations = apply_cached_translations(
+        &segments,
         &segments,
         CacheContext {
             store: &store,
@@ -591,7 +594,13 @@ where
         telemetry.as_ref(),
         &glossary_rules,
     )
-    .await?;
+    .await
+    .inspect_err(|error| {
+        // Hard finalize failures (rebuild, validation, fallback
+        // misconfiguration) must not leave the job stuck in "running"
+        // forever; only doctor/dashboard would otherwise hint at the truth.
+        mark_run_failed_on_error(&store, &job.id, error);
+    })?;
 
     if telemetry.has_glossary_entries() {
         let summary = telemetry.glossary_summary();
@@ -603,12 +612,17 @@ where
 
     if provider_run.cancel_token.is_cancelled() && !job_was_stopped(&store, &job.id)? {
         let _ = store.mark_job_interrupted(&job.id);
-        eprintln!();
-        eprintln!("Interrupted by user.");
-        eprintln!("Your progress has been saved to job: {}", job.id);
-        eprintln!();
-        eprintln!("Resume with:");
-        eprintln!("  bookforge resume {}", job.id);
+        if human_stdout_enabled(cli_args.ui) {
+            eprintln!();
+            eprintln!("Interrupted by user.");
+            eprintln!("Your progress has been saved to job: {}", job.id);
+            eprintln!();
+            eprintln!("Resume with:");
+            eprintln!("  bookforge resume {}", job.id);
+        }
+        // UI-21: a user interruption is reported as 130 (128+SIGINT), not a
+        // silent success — progress is saved, but the run did not finish.
+        crate::exit_code::request(crate::exit_code::INTERRUPTED);
         return Ok(());
     }
 

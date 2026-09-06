@@ -51,7 +51,7 @@ Before submitting:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace --locked
 ```
 

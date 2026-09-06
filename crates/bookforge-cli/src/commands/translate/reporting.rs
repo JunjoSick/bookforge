@@ -22,6 +22,41 @@ pub fn block_translations(translations: &[SegmentTranslation]) -> Vec<BlockTrans
         .collect()
 }
 
+/// End-of-run stdout summary shared by `translate` and `resume` (UI-31).
+/// The two commands used to print this block verbatim-duplicated and had
+/// already drifted once; now it exists exactly once.
+pub(crate) fn print_run_summary(
+    summary: &bookforge_store::JobSummary,
+    provider: &str,
+    model: &str,
+    output: &std::path::Path,
+    report_markdown: &std::path::Path,
+    review_job_id: &str,
+) {
+    println!(
+        "Translated: {}/{} segments",
+        summary.succeeded, summary.total_segments
+    );
+    println!("Cached: {}", summary.cached);
+    println!("Retried: {}", summary.retried);
+    println!("Needs review: {}", summary.needs_review);
+    println!("Failed: {}", summary.failed);
+    println!("Input tokens: {}", summary.input_tokens);
+    println!("Output tokens: {}", summary.output_tokens);
+    if let Some(cost) = estimate_cost_usd_with_cached(
+        provider,
+        model,
+        summary.input_tokens,
+        summary.input_cached_tokens,
+        summary.output_tokens,
+    ) {
+        println!("Estimated cost: ${cost:.6}");
+    }
+    println!("Output: {}", output.display());
+    println!("Report: {}", report_markdown.display());
+    println!("Review: bookforge review {review_job_id} --open");
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn print_summary_rebuild_and_report(
     store: &JobStore,
@@ -88,6 +123,7 @@ pub fn print_summary_rebuild_and_report(
         segment_records: &segment_records,
         translations: &qa_inputs,
         qa_reviews,
+        qa_findings: store.segment_qa_findings(&job.id)?,
         performance,
         output: &config.output,
         corrected_segments,
@@ -102,28 +138,14 @@ pub fn print_summary_rebuild_and_report(
     }
 
     if print_stdout {
-        println!(
-            "Translated: {}/{} segments",
-            summary.succeeded, summary.total_segments
-        );
-        println!("Cached: {}", summary.cached);
-        println!("Retried: {}", summary.retried);
-        println!("Needs review: {}", summary.needs_review);
-        println!("Failed: {}", summary.failed);
-        println!("Input tokens: {}", summary.input_tokens);
-        println!("Output tokens: {}", summary.output_tokens);
-        if let Some(cost) = estimate_cost_usd_with_cached(
+        print_run_summary(
+            &summary,
             &job.provider,
             &job.model,
-            summary.input_tokens,
-            summary.input_cached_tokens,
-            summary.output_tokens,
-        ) {
-            println!("Estimated cost: ${cost:.6}");
-        }
-        println!("Output: {}", config.output.display());
-        println!("Report: {}", report.markdown.display());
-        println!("Review: bookforge review {} --open", job.id);
+            &config.output,
+            &report.markdown,
+            &job.id,
+        );
     }
 
     Ok(())
@@ -181,6 +203,7 @@ pub(crate) fn regenerate_report_after_correction(
         segment_records: &segment_records,
         translations: &qa_inputs,
         qa_reviews: &[],
+        qa_findings: store.segment_qa_findings(&job.id)?,
         performance,
         output: &report_job.output_path,
         corrected_segments,

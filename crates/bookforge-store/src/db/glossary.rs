@@ -78,22 +78,46 @@ impl JobStore {
         Ok(changed)
     }
 
+    /// Insert or update a single glossary term and return its row id. The
+    /// upsert and the id read are one statement, so a concurrent writer
+    /// cannot make the returned id point at a different row than the one
+    /// this call wrote (the former re-select after a separate transaction).
+    /// The conflict target is omitted so whichever uniqueness constraint
+    /// fires — the table constraint for scoped rows or the partial unique
+    /// index for global rows — routes into the same DO UPDATE arm.
     pub fn add_glossary_term(&self, term: &GlossaryTerm) -> Result<i64> {
-        self.upsert_glossary_terms(std::slice::from_ref(term))?;
         let conn = self.conn.borrow();
+        let now = timestamp_string();
         let id = conn.query_row(
-            "SELECT id FROM glossary_terms
-             WHERE scope_kind = ?1
-               AND ((?2 IS NULL AND scope_id IS NULL) OR scope_id = ?2)
-               AND source_text = ?3
-               AND source_language = ?4
-               AND target_language = ?5",
+            "INSERT INTO glossary_terms
+             (scope_kind, scope_id, source_text, target_text, category, notes,
+              case_sensitive, always_active, status, source_language, target_language,
+              source_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+             ON CONFLICT DO UPDATE SET
+               target_text = excluded.target_text,
+               category = excluded.category,
+               notes = excluded.notes,
+               case_sensitive = excluded.case_sensitive,
+               always_active = excluded.always_active,
+               status = excluded.status,
+               source_count = excluded.source_count,
+               updated_at = excluded.updated_at
+             RETURNING id",
             params![
                 term.scope_kind.as_str(),
                 term.scope_id.as_deref(),
                 term.source_text,
+                term.target_text,
+                term.category.as_str(),
+                term.notes.as_deref(),
+                if term.case_sensitive { 1_i64 } else { 0_i64 },
+                if term.always_active { 1_i64 } else { 0_i64 },
+                term.status.as_str(),
                 term.source_language,
                 term.target_language,
+                term.source_count as i64,
+                now,
             ],
             |row| row.get::<_, i64>(0),
         )?;
@@ -529,11 +553,12 @@ impl JobStore {
         if entities.is_empty() {
             return Ok(0);
         }
-        let conn = self.conn.borrow();
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
         let now = timestamp_string();
         let mut changed = 0usize;
         for entity in entities {
-            let updated = conn.execute(
+            let updated = tx.execute(
                 "UPDATE entities
                  SET target_name = ?1,
                      gender_target = ?2,
@@ -559,7 +584,7 @@ impl JobStore {
                 ],
             )?;
             if updated == 0 {
-                conn.execute(
+                tx.execute(
                     "INSERT INTO entities
                         (scope_kind, scope_id, source_name, target_name, gender_target,
                          role, notes, source_language, target_language, created_at, updated_at)
@@ -587,6 +612,7 @@ impl JobStore {
             }
             changed += 1;
         }
+        tx.commit()?;
         Ok(changed)
     }
 

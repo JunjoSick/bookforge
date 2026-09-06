@@ -1,6 +1,6 @@
 [package]
 name = "bookforge-core"
-version = "2.6.1"
+version = "3.0.0"
 description = "Core IR, segmentation, configuration, and progress types for BookForge."
 edition.workspace = true
 license.workspace = true
@@ -16,5 +16,14 @@ sha2.workspace = true
 zip.workspace = true
 clap = { workspace = true, optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [features]
 cli = ["dep:clap"]
+
+[dev-dependencies]
+tempfile = "3"

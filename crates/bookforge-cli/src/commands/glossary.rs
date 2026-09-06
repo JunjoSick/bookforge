@@ -104,6 +104,11 @@ struct ClearArgs {
 
     #[arg(long)]
     scope_id: Option<String>,
+
+    /// Confirm the deletion. Required so a stray Enter cannot wipe stored
+    /// terminology; nothing is removed without this flag.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -627,27 +632,29 @@ where
 }
 
 fn glossary_proposal_provider_config(args: &ProposeArgs) -> Result<OpenAiCompatibleConfig> {
-    let (default_url, default_key_env) = match args.qa_provider.as_str() {
-        "deepseek" => ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
-        "openrouter" => ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
-        "openai-compatible" => (
-            args.qa_base_url.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("--qa-base-url is required for --qa-provider openai-compatible")
-            })?,
-            "OPENAI_API_KEY",
+    let defaults =
+        bookforge_core::providers::provider_defaults(&args.qa_provider).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unsupported glossary proposal provider '{}'",
+                args.qa_provider
+            )
+        })?;
+    let resolved_base_url = match (args.qa_base_url.as_deref(), defaults.base_url) {
+        (Some(url), _) => url.to_string(),
+        // openai-compatible has no registry URL; the caller must supply one.
+        (None, None) => anyhow::bail!(
+            "--qa-base-url is required for --qa-provider {}",
+            args.qa_provider
         ),
-        provider => anyhow::bail!("unsupported glossary proposal provider '{provider}'"),
+        (None, Some(default_url)) => default_url.to_string(),
     };
 
     Ok(OpenAiCompatibleConfig {
-        base_url: args
-            .qa_base_url
-            .clone()
-            .unwrap_or_else(|| default_url.to_string()),
+        base_url: resolved_base_url,
         api_key_env: args
             .qa_api_key_env
             .clone()
-            .unwrap_or_else(|| default_key_env.to_string()),
+            .unwrap_or_else(|| defaults.api_key_env.to_string()),
         model: args.qa_model.clone(),
         timeout_seconds: 180,
         provider_max_attempts: 2,
@@ -1042,9 +1049,21 @@ fn remove_term(store: &JobStore, args: RemoveArgs) -> Result<()> {
 
 fn clear_terms(store: &JobStore, args: ClearArgs) -> Result<()> {
     validate_scope(args.scope, args.scope_id.as_deref())?;
+    confirm_destructive_clear(args.yes)?;
     let removed = store.clear_glossary_scope(args.scope, args.scope_id.as_deref())?;
     println!("Removed {removed} glossary terms.");
     Ok(())
+}
+
+/// Shared guard for destructive `clear` subcommands: refuse to delete stored
+/// terminology unless the caller passed an explicit `--yes`.
+fn confirm_destructive_clear(confirmed: bool) -> Result<()> {
+    if confirmed {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to clear glossary without --yes; re-run with --yes to delete the selected scope"
+    )
 }
 
 fn glossary_toml_to_terms(parsed: GlossaryToml) -> Result<Vec<GlossaryTerm>> {
@@ -1140,7 +1159,9 @@ fn normalized_scope_id(scope: GlossaryScopeKind, scope_id: Option<String>) -> Op
     }
 }
 
-fn parse_language_pair(value: &str) -> Result<(String, String)> {
+/// Parse a `SOURCE->TARGET` language pair (also accepts `:` or `/`),
+/// shared with sibling commands so filter syntax cannot drift.
+pub(crate) fn parse_language_pair(value: &str) -> Result<(String, String)> {
     for delimiter in ["->", ":", "/"] {
         if let Some((source, target)) = value.split_once(delimiter) {
             let source = source.trim();

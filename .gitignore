@@ -12,6 +12,11 @@
 *.env
 *.key
 key.txt
+
+# Local-only credentials and agent scratch state (never commit).
+/tests/*KEY*
+__pycache__/
+.agents/
 bookforge_fixes*.md
 merged_bookforge.txt
 

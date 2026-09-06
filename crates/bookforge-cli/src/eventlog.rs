@@ -40,6 +40,10 @@ pub struct EventLogTailer {
     file: Option<File>,
     buf: Vec<u8>,
     discarding_oversized_line: bool,
+    /// Complete lines that existed in the log but failed to parse as events.
+    /// Corrupt lines must not disappear silently: consumers surface this
+    /// counter so replay logs cannot hide gaps (UI-28/30).
+    skipped_invalid_lines: usize,
 }
 
 impl EventLogTailer {
@@ -49,7 +53,14 @@ impl EventLogTailer {
             file: None,
             buf: Vec::new(),
             discarding_oversized_line: false,
+            skipped_invalid_lines: 0,
         }
+    }
+
+    /// How many complete, non-empty lines were skipped because they were not
+    /// parseable `ProgressEvent` JSON.
+    pub fn invalid_lines_skipped(&self) -> usize {
+        self.skipped_invalid_lines
     }
 
     /// Read appended bytes and parse each complete JSONL line into an event.
@@ -59,7 +70,14 @@ impl EventLogTailer {
         if self.file.is_none() {
             match File::open(&self.path) {
                 Ok(opened) => self.file = Some(opened),
-                Err(_) => return Ok(events),
+                // A not-yet-created log is the normal pre-launch state and is
+                // retried on the next poll. ANY other open failure (permission,
+                // path-not-a-directory, ...) is a real error that must surface
+                // instead of being silently swallowed as "no events".
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(events);
+                }
+                Err(error) => return Err(error.into()),
             }
         }
         if self.file.is_none() {
@@ -102,10 +120,19 @@ impl EventLogTailer {
                     self.report_oversized_line();
                 } else {
                     self.buf.extend_from_slice(fragment);
-                    if !self.buf.is_empty()
-                        && let Ok(event) = serde_json::from_slice::<ProgressEvent>(&self.buf)
-                    {
-                        events.push(event);
+                    if !self.buf.is_empty() {
+                        if let Ok(event) = serde_json::from_slice::<ProgressEvent>(&self.buf) {
+                            events.push(event);
+                        } else if !self.buf.iter().all(|b| b.is_ascii_whitespace()) {
+                            // A complete line that is not valid JSON must be
+                            // counted, never silently dropped (UI-28/30).
+                            self.skipped_invalid_lines += 1;
+                            warn!(
+                                path = %self.path.display(),
+                                skipped = self.skipped_invalid_lines,
+                                "event log line is not a parseable event; skipping"
+                            );
+                        }
                     }
                     self.buf.clear();
                 }
@@ -149,6 +176,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut tailer = EventLogTailer::new(dir.path().join("events.jsonl"));
         assert!(tailer.poll().unwrap().is_empty());
+    }
+
+    /// A missing log is the normal pre-launch state, but ANY other open
+    /// failure (permission denied, a non-directory parent) must surface as an
+    /// error instead of being silently treated as "no events".
+    #[cfg(unix)]
+    #[test]
+    fn open_failures_other_than_not_found_surface_as_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"a plain file").unwrap();
+
+        let mut tailer = EventLogTailer::new(blocker.join("events.jsonl"));
+        let error = tailer
+            .poll()
+            .expect_err("a non-directory parent must surface as an error");
+        assert!(
+            !error.to_string().is_empty(),
+            "the underlying open error must propagate"
+        );
+    }
+
+    #[test]
+    fn corrupt_lines_are_counted_not_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        {
+            let mut file = File::create(&path).unwrap();
+            writeln!(file, "{{definitely not json").unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&stage_started("ok", 1)).unwrap()
+            )
+            .unwrap();
+            writeln!(file, "42").unwrap(); // valid JSON, wrong shape
+        }
+
+        let mut tailer = EventLogTailer::new(path);
+        let events = tailer.poll().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(tailer.invalid_lines_skipped(), 2);
+        assert!(tailer.poll().unwrap().is_empty());
+        assert_eq!(tailer.invalid_lines_skipped(), 2, "counter is cumulative");
     }
 
     #[test]

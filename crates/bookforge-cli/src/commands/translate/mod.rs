@@ -65,13 +65,16 @@ use engine::{record_glossary_telemetry, run_checkpointed_translation_instrumente
 use finalization::suspicious_qa_candidates;
 pub(crate) use finalization::{
     apply_double_check_corrections, job_was_stopped, mark_job_finished,
-    persist_corrected_translations, print_stopped_resume_hint, qa_reviews_for_mode,
+    persist_corrected_translations, print_stopped_resume_hint,
+    qa_reviews_for_mode_with_max_output_tokens,
 };
 use finalization::{finish_translation_pipeline, mark_unfinished_segments_failed};
 use orchestration::human_stdout_enabled;
 pub use orchestration::run;
 use reporting::print_summary_rebuild_and_report;
-pub(crate) use reporting::{rebuild_options_from_snapshot, regenerate_report_after_correction};
+pub(crate) use reporting::{
+    print_run_summary, rebuild_options_from_snapshot, regenerate_report_after_correction,
+};
 use settings::{
     apply_plan_recommendations, apply_provider_preset, resolve_settings,
     retry_amplification_warning,
@@ -80,11 +83,11 @@ use snapshot::persist_snapshot;
 
 #[derive(Debug, Clone)]
 pub(crate) struct FallbackPassConfig {
-    provider: String,
-    model: String,
-    base_url: Option<String>,
-    api_key_env: Option<String>,
-    scope: FallbackScope,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key_env: Option<String>,
+    pub(crate) scope: FallbackScope,
 }
 
 impl FallbackPassConfig {
@@ -352,7 +355,14 @@ pub(crate) fn glossary_fingerprint(
             .then_with(|| a.target_text.cmp(&b.target_text))
     });
     let payload = serde_json::json!({
-        "schema": 1,
+        // v2: glossary budget packing switched from the chars-div-3
+        // heuristic to the canonical script-aware token estimator
+        // (`bookforge_core::token_estimate`), changing which entries fit a
+        // given budget — and therefore the rendered prompt — even when the
+        // term list itself is unchanged. Bumping the payload schema keys
+        // such runs into fresh cache namespaces instead of reusing
+        // translations produced with differently-packed glossaries.
+        "schema": 2,
         "format": format.as_str(),
         "budget_tokens": budget_tokens,
         "prompt_extra": prompt_extra.unwrap_or(""),
@@ -437,6 +447,7 @@ where
                 target_concurrency: 1,
                 runtime_config_revision: metadata.runtime_config_revision,
                 provider_max_attempts: metadata.provider_max_attempts,
+                effective_timeout_seconds: None,
                 timestamp_ms: bookforge_core::progress::now_ms(),
             });
 
@@ -508,44 +519,44 @@ fn provider_config(
     max_idle_per_host: usize,
     json_mode: bookforge_core::JsonMode,
 ) -> Result<OpenAiCompatibleConfig> {
-    let (default_url, default_key_env, default_model) = match provider {
-        "deepseek" => (
-            "https://api.deepseek.com/v1",
-            "DEEPSEEK_API_KEY",
-            "deepseek-v4-flash",
-        ),
-        "openrouter" => (
-            "https://openrouter.ai/api/v1",
-            "OPENROUTER_API_KEY",
-            "openrouter/auto",
-        ),
-        "openai-compatible" => (
-            base_url.ok_or_else(|| {
-                anyhow::anyhow!("--base-url is required for --provider openai-compatible")
-            })?,
-            "OPENAI_API_KEY",
-            model.ok_or_else(|| {
-                anyhow::anyhow!("--model is required for --provider openai-compatible")
-            })?,
-        ),
+    let defaults_for_named = match provider {
+        "deepseek" | "openrouter" | "openai-compatible" => {
+            bookforge_core::providers::provider_defaults(provider)
+                .expect("allow-list above matches registry entries")
+        }
         _ => {
             return Err(anyhow::anyhow!(
                 "unsupported translation provider '{provider}'"
             ));
         }
     };
-
-    Ok(OpenAiCompatibleConfig {
-        base_url: base_url
+    let resolved_base_url = match defaults_for_named.base_url {
+        Some(default_url) => base_url
             .map(String::from)
             .unwrap_or_else(|| default_url.to_string()),
+        None => base_url
+            .ok_or_else(|| {
+                anyhow::anyhow!("--base-url is required for --provider openai-compatible")
+            })?
+            .to_string(),
+    };
+    let resolved_model = match (model, defaults_for_named.default_model) {
+        (Some(model), _) => model.to_string(),
+        (None, Some(default)) => default.to_string(),
+        // Registry models this as None; mirror the historic strictness.
+        (None, None) => {
+            return Err(anyhow::anyhow!(
+                "--model is required for --provider openai-compatible"
+            ));
+        }
+    };
+
+    Ok(OpenAiCompatibleConfig {
+        base_url: resolved_base_url,
         api_key_env: api_key_env
             .map(String::from)
-            .unwrap_or_else(|| default_key_env.to_string()),
-        model: model
-            .or(Some(default_model))
-            .map(String::from)
-            .unwrap_or_else(|| default_model.to_string()),
+            .unwrap_or_else(|| defaults_for_named.api_key_env.to_string()),
+        model: resolved_model,
         timeout_seconds,
         provider_max_attempts: provider_max_attempts.max(1),
         thinking_disabled,
@@ -766,6 +777,7 @@ pub(crate) async fn run_fallback_pass(
     primary_run_config: &TranslationRunConfig,
     control: Option<&mut crate::control::ControlFilePoller<'_>>,
     progress: Arc<dyn bookforge_core::ProgressSink>,
+    print_stdout: bool,
 ) -> Result<Vec<SegmentTranslation>> {
     let telemetry = TelemetryLog::new();
     let glossary_rules = std::collections::HashMap::new();
@@ -783,6 +795,7 @@ pub(crate) async fn run_fallback_pass(
         progress,
         &telemetry,
         &glossary_rules,
+        print_stdout,
     )
     .await
 }
@@ -805,6 +818,7 @@ pub(crate) async fn run_fallback_pass_instrumented(
         String,
         Vec<bookforge_core::glossary::GlossarySelectionRule>,
     >,
+    print_stdout: bool,
 ) -> Result<Vec<SegmentTranslation>> {
     let Some(fallback_config) = fallback_config else {
         return Ok(translations);
@@ -820,28 +834,32 @@ pub(crate) async fn run_fallback_pass_instrumented(
         .into_iter()
         .map(|record| (record.id, record.status))
         .collect::<std::collections::HashMap<_, _>>();
+    // Index the translation statuses once so the candidate scan stays O(n)
+    // over segments instead of O(segments × translations) on large books
+    // (CLI-10).
+    let status_by_segment_id = translations
+        .iter()
+        .map(|translation| (translation.segment_id.0.as_str(), translation.status))
+        .collect::<std::collections::HashMap<&str, SegmentStatus>>();
     let candidates: Vec<Segment> = segments
         .iter()
-        .filter(|s| {
-            let t = translations.iter().find(|t| t.segment_id.0 == s.id.0);
-            match t {
-                Some(t) => match fallback_scope {
-                    FallbackScope::Failed => t.status == SegmentStatus::Failed,
-                    FallbackScope::NeedsReview => t.status == SegmentStatus::NeedsReview,
+        .filter(|s| match status_by_segment_id.get(s.id.0.as_str()) {
+            Some(&status) => match fallback_scope {
+                FallbackScope::Failed => status == SegmentStatus::Failed,
+                FallbackScope::NeedsReview => status == SegmentStatus::NeedsReview,
+                FallbackScope::FailedAndNeedsReview => {
+                    status == SegmentStatus::Failed || status == SegmentStatus::NeedsReview
+                }
+            },
+            None => {
+                let Some(status) = fallback_status_by_segment.get(&s.id.0) else {
+                    return false;
+                };
+                match fallback_scope {
+                    FallbackScope::Failed => status == "failed",
+                    FallbackScope::NeedsReview => status == "needs_review",
                     FallbackScope::FailedAndNeedsReview => {
-                        t.status == SegmentStatus::Failed || t.status == SegmentStatus::NeedsReview
-                    }
-                },
-                None => {
-                    let Some(status) = fallback_status_by_segment.get(&s.id.0) else {
-                        return false;
-                    };
-                    match fallback_scope {
-                        FallbackScope::Failed => status == "failed",
-                        FallbackScope::NeedsReview => status == "needs_review",
-                        FallbackScope::FailedAndNeedsReview => {
-                            status == "failed" || status == "needs_review"
-                        }
+                        status == "failed" || status == "needs_review"
                     }
                 }
             }
@@ -853,12 +871,17 @@ pub(crate) async fn run_fallback_pass_instrumented(
         return Ok(translations);
     }
 
-    println!(
-        "Fallback: retrying {} segments with {}/{}",
-        candidates.len(),
-        provider_str,
-        model_str
-    );
+    // UI-22: human-only stdout must stay quiet in `--ui json`/quiet/TUI modes
+    // so automation sees a parseable event stream; the same information is
+    // available via fallback-prefixed request events on the progress sink.
+    if print_stdout {
+        println!(
+            "Fallback: retrying {} segments with {}/{}",
+            candidates.len(),
+            provider_str,
+            model_str
+        );
+    }
 
     let run_config = TranslationRunConfig {
         source_language: primary_run_config.source_language.clone(),
@@ -1124,35 +1147,29 @@ pub struct BenchmarkArgs {
 
 pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
     let pigeon = "Sunt piger, et volare nequeunt. Sed cum cibus apparet, mirabiliter currunt.";
-    let provider_config = OpenAiCompatibleConfig {
-        base_url: args
-            .provider
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
-        api_key_env: args
-            .provider
-            .api_key_env
-            .clone()
-            .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string()),
-        model: args
-            .provider
-            .model
-            .clone()
-            .unwrap_or_else(|| "openrouter/auto".to_string()),
-        timeout_seconds: args.provider.timeout_seconds.unwrap_or(120),
-        provider_max_attempts: 6,
-        thinking_disabled: false,
-        retry_after_policy: bookforge_core::RetryAfterPolicy::JitteredExponential,
-        max_backoff_seconds: 30,
-        max_idle_per_host: 32,
-        json_mode: bookforge_core::JsonMode::Auto,
-    }; // benchmark
+    // Build the endpoint from the --provider flag so the defaults match the
+    // advertised provider (deepseek previously benchmarked against hardcoded
+    // OpenRouter defaults, CLI-13).
+    let provider_config = provider_config(
+        &args.provider.provider,
+        args.provider.model.as_deref(),
+        args.provider.base_url.as_deref(),
+        args.provider.api_key_env.as_deref(),
+        args.provider.timeout_seconds.unwrap_or(120),
+        6,
+        false,
+        bookforge_core::RetryAfterPolicy::JitteredExponential,
+        30,
+        32,
+        bookforge_core::JsonMode::Auto,
+    )?;
 
     let provider = OpenAiCompatibleProvider::new(provider_config.clone())?;
     let model = provider.model().to_string();
 
     println!("Benchmarking {} / {}", provider_config.base_url, model);
+    // --concurrency was previously parsed and printed but ignored (every
+    // sample ran sequentially); it now actually bounds parallel samples.
     println!(
         "Samples: {}, Tokens: {}, Concurrency: {}",
         args.samples, args.tokens, args.concurrency
@@ -1165,25 +1182,49 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
     let mut ratelimit_count = 0usize;
     let mut timeout_count = 0usize;
     let mut total_output_tokens = 0u64;
-    let mut _total_input_tokens = 0u64;
 
-    for i in 0..args.samples {
-        let request = bookforge_llm::CompletionRequest {
-            system: "You are a translator. Return JSON only: {\"translation\":\"...\"}".to_string(),
-            user: format!("Translate: {{\"text\":\"{}\"}} Return JSON.", pigeon),
-            response_format: bookforge_llm::ResponseFormat::Json,
-            temperature: 0.2,
-            max_output_tokens: Some(args.tokens as u32),
-            metadata: Default::default(),
+    let make_request = || bookforge_llm::CompletionRequest {
+        system: "You are a translator. Return JSON only: {\"translation\":\"...\"}".to_string(),
+        user: format!("Translate: {{\"text\":\"{pigeon}\"}} Return JSON."),
+        response_format: bookforge_llm::ResponseFormat::Json,
+        temperature: 0.2,
+        max_output_tokens: Some(args.tokens as u32),
+        metadata: Default::default(),
+    };
+
+    // Bounded-concurrency sample loop: up to `--concurrency` requests are in
+    // flight at once; `concurrency == 1` degenerates to the old sequential
+    // behavior. Results are reported in completion order.
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut next_sample = 0usize;
+    let mut reported_samples = 0usize;
+    while next_sample < args.samples.min(args.concurrency.max(1)) {
+        let provider_clone = provider.clone();
+        let request = make_request();
+        let index = next_sample;
+        join_set.spawn(async move { (index, provider_clone.complete(request).await) });
+        next_sample += 1;
+    }
+
+    while let Some(join_result) = join_set.join_next().await {
+        reported_samples += 1;
+        let (index, result) = match join_result {
+            Ok(pair) => pair,
+            Err(join_err) => {
+                failure_count += 1;
+                println!(
+                    "  [{}/{}] FAIL [join] {join_err}",
+                    reported_samples, args.samples
+                );
+                continue;
+            }
         };
-
-        print!("  [{}/{}] ", i + 1, args.samples);
-        match provider.complete(request).await {
+        print!("  [{}/{}] ", index + 1, args.samples);
+        match result {
             Ok(resp) => {
                 latencies.push(resp.provider_latency_ms);
                 success_count += 1;
                 total_output_tokens += resp.output_tokens.unwrap_or(0);
-                _total_input_tokens += resp.input_tokens.unwrap_or(0);
                 let tok_sec = if resp.provider_latency_ms > 0 {
                     resp.output_tokens.unwrap_or(0) as f64
                         / (resp.provider_latency_ms as f64 / 1000.0)
@@ -1208,6 +1249,13 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
                 }
                 println!("FAIL [{kind}] {e}");
             }
+        }
+        if next_sample < args.samples {
+            let provider_clone = provider.clone();
+            let request = make_request();
+            let index = next_sample;
+            join_set.spawn(async move { (index, provider_clone.complete(request).await) });
+            next_sample += 1;
         }
     }
 
@@ -1253,6 +1301,23 @@ pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Record an honest terminal failure for a run-level hard error (CLI-5) —
+/// but never rewrite an outcome the job has already reached (CLI-4).
+pub(crate) fn mark_run_failed_on_error(store: &JobStore, job_id: &str, error: &anyhow::Error) {
+    let already_final = match store.get_job(job_id) {
+        Ok(Some(record)) => matches!(
+            record.status.as_str(),
+            "succeeded" | "needs_review" | "failed" | "stopped"
+        ),
+        _ => false,
+    };
+    if already_final {
+        return;
+    }
+    tracing::warn!(job_id = %job_id, error = %error, "run failed; marking job failed");
+    let _ = store.mark_job_failed(job_id);
 }
 
 fn classify_error(e: &LlmError) -> &'static str {

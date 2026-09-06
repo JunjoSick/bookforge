@@ -9,7 +9,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{ColumnMode, DocBlock, Fragment, Line, Page, Span, normalize_text_key};
+use crate::bidi;
+use crate::model::{
+    ColumnMode, DocBlock, Fragment, Line, Page, Span, normalize_text_key, spans_text,
+};
 
 /// Per-page reconstruction diagnostics for the conversion report.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -18,7 +21,20 @@ pub struct PageStats {
     pub lines: usize,
     pub chars: usize,
     pub baseline_chars: usize,
+    /// Non-whitespace characters removed as repeated running
+    /// headers/footers. The low-confidence coverage threshold is judged
+    /// against `chars + running_header_chars` (the pre-removal view) so
+    /// legitimate pages with recurring headers are not rasterized into
+    /// OCR just because the header text dominates the deficit
+    /// (docs/report.md §4.5 PDF-6).
+    #[serde(default)]
+    pub running_header_chars: usize,
     pub two_column: bool,
+    /// The page's strong-script evidence leans right-to-left (PDF-7).
+    /// Reported so consumers can attribute extraction quirks to script
+    /// rather than conversion quality; it never gates coverage itself.
+    #[serde(default)]
+    pub rtl_dominant: bool,
     pub low_confidence: bool,
     pub low_confidence_action: Option<String>,
 }
@@ -26,6 +42,9 @@ pub struct PageStats {
 pub struct Reconstruction {
     pub blocks: Vec<AnchoredBlock>,
     pub pages: Vec<PageStats>,
+    /// Rotated/zero-width fragments excluded from the reading flow,
+    /// reported (not silenced) per docs/report.md §4.5.
+    pub rotated_dropped_fragments: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,14 +70,29 @@ struct PendingBlock {
 }
 
 pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
+    reconstruct_with_chapter_guard(pages, columns, None)
+}
+
+/// [`reconstruct`] with the chapter-prefix guard active (PDF-9): the
+/// cross-page paragraph merge must never join a paragraph into a block
+/// that itself opens a new chapter group, because chapter splitting
+/// (epub.rs) matches block text against this same prefix and would
+/// otherwise swallow the boundary line into the previous chapter.
+pub fn reconstruct_with_chapter_guard(
+    pages: &[Page],
+    columns: ColumnMode,
+    chapter_prefix: Option<&str>,
+) -> Reconstruction {
     let body_size = body_font_size(pages);
     let heading_levels = heading_levels(pages, body_size);
     let running_margin_texts = running_margin_texts(pages, body_size);
 
     let mut blocks: Vec<AnchoredBlock> = Vec::new();
     let mut stats = Vec::new();
+    let mut rotated_dropped_fragments = 0usize;
 
     for page in pages {
+        rotated_dropped_fragments += rotated_fragment_count(page);
         let lines = merge_fragments_into_lines(page);
         let two_column = match columns {
             ColumnMode::Single => false,
@@ -72,27 +106,71 @@ pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
             ordered.sort_by_key(|line| (line.top, line.left));
             ordered
         };
-        ordered
-            .retain(|line| !is_running_margin_line(page, line, body_size, &running_margin_texts));
+        let mut running_header_chars = 0usize;
+        ordered.retain(|line| {
+            if is_running_margin_line(page, line, body_size, &running_margin_texts) {
+                running_header_chars += line.char_count();
+                return false;
+            }
+            true
+        });
+
+        // PDF-7: poppler emits each RTL fragment's characters in logical
+        // order but reconstruction concatenates fragments visually left
+        // to right, so dominant-RTL lines read backwards. Repair runs
+        // per line; LTR-dominant lines pass through untouched.
+        for line in &mut ordered {
+            if let Some(spans) = bidi::reorder_line_spans(&line.spans) {
+                line.spans = spans;
+            }
+        }
+        let rtl_dominant = page_is_rtl_dominant(&ordered);
 
         stats.push(PageStats {
             page: page.number,
             lines: ordered.len(),
             chars: ordered.iter().map(Line::char_count).sum(),
             baseline_chars: 0,
+            running_header_chars,
             two_column,
+            rtl_dominant,
             low_confidence: false,
             low_confidence_action: None,
         });
 
         let page_blocks = cluster_paragraphs(&ordered, body_size, &heading_levels);
-        append_with_continuation(&mut blocks, page.number, page_blocks);
+        append_with_continuation(&mut blocks, page.number, page_blocks, chapter_prefix);
     }
 
     Reconstruction {
         blocks,
         pages: stats,
+        rotated_dropped_fragments,
     }
+}
+
+/// A page votes RTL when its strong-letter evidence leans Arabic/
+/// Hebrew-class and carries enough volume to mean it (PDF-7).
+fn page_is_rtl_dominant(lines: &[Line]) -> bool {
+    let mut rtl = 0usize;
+    let mut other = 0usize;
+    for line in lines {
+        let (line_rtl, line_other) = bidi::rtl_letter_counts(&line.text());
+        rtl += line_rtl;
+        other += line_other;
+    }
+    rtl > other && rtl >= 4
+}
+
+/// Rotated text (watermarks, vertical labels) is reported with
+/// zero width by poppler and excluded from line merging; count it so
+/// the conversion report can say what was skipped instead of dropping
+/// it silently.
+fn rotated_fragment_count(page: &Page) -> usize {
+    page.fragments
+        .iter()
+        .filter(|fragment| fragment.width <= 0 && !spans_text(&fragment.spans).trim().is_empty())
+        .count()
 }
 
 fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<String> {
@@ -321,10 +399,22 @@ fn body_font_size(pages: &[Page]) -> u32 {
 
 /// Distinct font sizes clearly larger than body text, ranked largest
 /// first, mapped to heading levels h1..h3.
+///
+/// Only sizes actually used by fragments qualify: a `<fontspec>` can be
+/// declared for every page while never being referenced by any `<text>`
+/// element, and mapping such a phantom size to a heading level would
+/// shift real headings down a rank (docs/report.md §4.5 PDF-8).
 fn heading_levels(pages: &[Page], body_size: u32) -> HashMap<u32, u8> {
     let mut sizes: Vec<u32> = pages
         .iter()
-        .flat_map(|page| page.font_sizes.values().copied())
+        .flat_map(|page| {
+            page.fragments.iter().map(move |fragment| {
+                page.font_sizes
+                    .get(&fragment.font)
+                    .copied()
+                    .unwrap_or_else(|| fragment.height.unsigned_abs())
+            })
+        })
         .filter(|size| *size as f32 >= body_size as f32 * 1.15 && *size >= body_size + 2)
         .collect();
     sizes.sort_unstable_by(|a, b| b.cmp(a));
@@ -425,6 +515,169 @@ fn cluster_paragraphs(
     blocks
 }
 
+/// Classic line-end dehyphenation rules (docs/report.md §4.5 PDF-8):
+/// a trailing hyphen is only fused away when it directly follows a
+/// lowercase letter (not an em/en dash, numeric range or compound
+/// marker) and the continuation starts with a lowercase letter. Any
+/// other intra-line hyphen is left exactly as printed.
+fn fuses_line_end_hyphen(tail_text: &str, head_text: &str) -> bool {
+    let trimmed_tail = tail_text.trim_end();
+    let mut chars = trimmed_tail.chars().rev();
+    if chars.next() != Some('-') {
+        return false;
+    }
+    if !chars.next().is_some_and(|ch| ch.is_lowercase()) {
+        return false;
+    }
+    head_text
+        .chars()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|ch| ch.is_lowercase())
+}
+
+/// CJK ideographs, kana, hangul syllables, Arabic and Hebrew have no
+/// letter case; treat them as eligible continuations for the mechanical
+/// cross-page paragraph merge when the previous text does not end in any
+/// sentence terminal.
+fn starts_caseless_script(head_text: &str) -> bool {
+    head_text
+        .chars()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|first| {
+            matches!(first as u32,
+                0x3040..=0x30FF          // hiragana + katakana
+                | 0x3400..=0x4DBF        // CJK extension A
+                | 0x4E00..=0x9FFF        // CJK unified ideographs
+                | 0xAC00..=0xD7A3        // hangul syllables
+                | 0xF900..=0xFAFF        // CJK compatibility ideographs
+                | 0x0600..=0x06FF        // Arabic block (PDF F-2)
+                | 0xFB50..=0xFEFF        // Arabic presentation forms A/B —
+                                         // shaper-emitted ligature glyphs (PDF F-2)
+                | 0x0590..=0x05FF        // Hebrew block (PDF F-2)
+            )
+        })
+}
+
+/// Whether a character sits anywhere in the CJK sphere (ideographs,
+/// kana, hangul, full-width forms), used for adjacency decisions.
+fn is_cjk_family_char(ch: char) -> bool {
+    matches!(ch as u32,
+        0x2E80..=0x9FFF   // radicals, kana, ideographs (incl. 3000-303F punct)
+        | 0xAC00..=0xD7A3 // hangul
+        | 0xF900..=0xFAFF // compatibility ideographs
+        | 0xFF00..=0xFFEF // full-width forms  ，！？
+    )
+}
+
+/// Whether `text`'s last visible character is CJK-family.
+fn ends_with_cjk_family(text: &str) -> bool {
+    text.chars()
+        .rev()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(is_cjk_family_char)
+}
+
+/// Whether joining tail+head needs an interposed space. CJK prose has
+/// none of English's word boundaries, and its punctuation already acts
+/// as a separator, so two adjacent CJK runs concatenate directly.
+///
+/// Kinsoku wrapping (PDF-9) can push an attached closing mark onto the
+/// START of the next line; following a CJK-family tail that mark reopens
+/// no word boundary and glues on directly.
+fn needs_joining_space(tail_text: &str, head_text: &str) -> bool {
+    if starts_wrapped_cjk_punctuation(head_text) && ends_with_cjk_family(tail_text) {
+        return false;
+    }
+    let head_is_cjk = head_text
+        .chars()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(is_cjk_family_char);
+    if !head_is_cjk {
+        return true;
+    }
+    match tail_text.chars().rev().find(|ch| !ch.is_whitespace()) {
+        None => true,
+        Some(last) => !is_cjk_family_char(last),
+    }
+}
+
+/// Sentence terminals include the full-width/CJK repertoire so a CJK
+/// sentence ending in 。！？； is never merged into the next page, plus
+/// the Arabic full stop ۔ and Arabic question mark ؟ (PDF F-2).
+///
+/// Deliberately excluded (PDF F-2): the Arabic comma ، (U+060C) and the
+/// Hebrew maqaf ‎־‎ (U+05BE). The Arabic comma separates clauses inside a
+/// single sentence — treating it as a terminal would fragment legitimate
+/// paragraphs at every page break — and the maqaf is an intra-word
+/// hyphen-like separator inside Hebrew compounds (אב־הטיפוס), not a
+/// sentence boundary. Both must let the cross-page merge continue.
+fn ends_sentence_terminal(tail_text: &str) -> bool {
+    tail_text.trim_end().ends_with([
+        '.', '!', '?', ':', ';', '"', '\u{201d}', '\u{2019}', '\u{3002}', // 。
+        '\u{ff01}', // ！
+        '\u{ff1f}', // ？
+        '\u{ff1a}', // ：
+        '\u{ff1b}', // ；
+        '\u{2026}', // …
+        '\u{300d}', // 」
+        '\u{300f}', // 』
+        '\u{ff09}', // ）
+        '\u{061f}', // ؟ Arabic question mark (PDF F-2)
+        '\u{06d4}', // ۔ Arabic full stop (PDF F-2)
+    ])
+}
+
+/// Punctuation that justification or kinsoku wrapping pushes onto the
+/// start of a wrapped CJK line (PDF-9): attached closing marks, half of
+/// a paired enclosure, or an ASCII fallback. Such a head belongs to the
+/// sentence before it and must not terminate the paragraph even though
+/// it is neither lowercase nor caseless-script alphabetic.
+const WRAPPED_CJK_CONTINUATION_HEADS: &[char] = &[
+    '\u{3001}', // 、
+    '\u{3002}', // 。
+    '\u{FF0C}', // ，
+    '\u{FF0E}', // ．
+    '\u{FF1A}', // ：
+    '\u{FF1B}', // ；
+    '\u{FF01}', // ！
+    '\u{FF1F}', // ？
+    '\u{300D}', // 」
+    '\u{300F}', // 』
+    '\u{3009}', // 〉
+    '\u{300B}', // 》
+    '\u{FF09}', // ）
+    '\u{FF5D}', // ｝
+    '\u{FF3D}', // ］
+    '\u{3011}', // 】
+    ',', '.', '!', '?', ':', ';', ')', ']', '}',
+];
+
+/// Whether a wrapped line opens with one of those attached marks.
+fn starts_wrapped_cjk_punctuation(head_text: &str) -> bool {
+    head_text
+        .chars()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|first| WRAPPED_CJK_CONTINUATION_HEADS.contains(&first))
+}
+
+/// Whether `head`'s normalized text opens with the chapter-group prefix,
+/// using exactly epub.rs's matching (`normalize_visible_text` +
+/// lowercase + starts_with). Only textual chapter starts need this
+/// guard: when the next page opens with a real heading block no merge
+/// can happen because only Paragraph↔Paragraph continuations exist.
+fn begins_chapter_group(head_text: &str, chapter_prefix: Option<&str>) -> bool {
+    let Some(prefix) = chapter_prefix.map(str::trim).filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    let normalize = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    normalize(head_text).starts_with(&normalize(prefix))
+}
+
 /// Append a line's spans to a paragraph buffer, repairing soft hyphens
 /// at the join.
 fn join_line_into(buffer: &mut Vec<Span>, line: &Line) {
@@ -433,23 +686,33 @@ fn join_line_into(buffer: &mut Vec<Span>, line: &Line) {
         return;
     }
 
-    let next_starts_lower = line
-        .text()
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_lowercase());
-    let hyphenated = buffer
+    let last_ends_hyphen = buffer
         .last()
         .is_some_and(|span| span.text.trim_end().ends_with('-'));
+    let head_starts_lower = line
+        .text()
+        .chars()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(char::is_lowercase);
 
-    if hyphenated && next_starts_lower {
-        if let Some(last) = buffer.last_mut() {
-            let trimmed = last.text.trim_end();
-            let without = trimmed[..trimmed.len() - 1].to_string();
-            last.text = without;
+    if last_ends_hyphen && head_starts_lower {
+        let buffer_text: String = buffer.iter().map(|span| span.text.as_str()).collect();
+        if fuses_line_end_hyphen(&buffer_text, &line.text()) {
+            if let Some(last) = buffer.last_mut() {
+                let trimmed = last.text.trim_end().to_string();
+                last.text = trimmed[..trimmed.len() - 1].to_string();
+            }
+        } else if !buffer.last().is_some_and(|span| span.text.ends_with(' ')) {
+            push_joined(buffer, " ", false, false);
         }
     } else if !buffer.last().is_some_and(|span| span.text.ends_with(' ')) {
-        push_joined(buffer, " ", false, false);
+        let tail_is_cjk_run = {
+            let text: String = buffer.iter().map(|span| span.text.as_str()).collect();
+            !needs_joining_space(&text, &line.text())
+        };
+        if !tail_is_cjk_run {
+            push_joined(buffer, " ", false, false);
+        }
     }
     for span in &line.spans {
         push_joined(buffer, &span.text, span.bold, span.italic);
@@ -480,11 +743,16 @@ fn median_line_gap(lines: &[Line]) -> i32 {
 
 /// Cross-page paragraph continuation: a page's first paragraph continues
 /// the previous page's last one when the earlier text does not end a
-/// sentence and the new text starts lowercase.
+/// sentence and the new text starts lowercase, in an uncased script
+/// (so CJK prose keeps flowing across page breaks), or — justified-CJK
+/// wrapping (PDF-9) — with attached closing punctuation that kinsoku
+/// pushed onto the wrapped line. Merging never crosses a chapter-group
+/// boundary opened by the configured prefix.
 fn append_with_continuation(
     blocks: &mut Vec<AnchoredBlock>,
     page: u32,
     mut incoming: Vec<PendingBlock>,
+    chapter_prefix: Option<&str>,
 ) {
     if let (
         Some(AnchoredBlock {
@@ -499,18 +767,20 @@ fn append_with_continuation(
     {
         let tail_text: String = tail.iter().map(|span| span.text.as_str()).collect();
         let head_text: String = head.iter().map(|span| span.text.as_str()).collect();
-        let continues = !tail_text
-            .trim_end()
-            .ends_with(['.', '!', '?', ':', ';', '"', '\u{201d}', '\u{2019}'])
-            && head_text.chars().next().is_some_and(|ch| ch.is_lowercase());
+        let continues = !ends_sentence_terminal(&tail_text)
+            && !begins_chapter_group(&head_text, chapter_prefix)
+            && (head_text.chars().next().is_some_and(|ch| ch.is_lowercase())
+                || starts_caseless_script(&head_text)
+                || starts_wrapped_cjk_punctuation(&head_text));
         if continues {
-            let hyphenated = tail_text.trim_end().ends_with('-');
-            if hyphenated {
+            if fuses_line_end_hyphen(&tail_text, &head_text) {
                 if let Some(last) = tail.last_mut() {
-                    let trimmed = last.text.trim_end();
+                    let trimmed = last.text.trim_end().to_string();
                     last.text = trimmed[..trimmed.len() - 1].to_string();
                 }
-            } else if !tail.last().is_some_and(|span| span.text.ends_with(' ')) {
+            } else if needs_joining_space(&tail_text, &head_text)
+                && !tail.last().is_some_and(|span| span.text.ends_with(' '))
+            {
                 push_joined(tail, " ", false, false);
             }
             for span in head.drain(..) {
@@ -708,6 +978,428 @@ mod tests {
         assert_eq!(
             texts,
             vec!["This sentence does not end until the following page.".to_string()]
+        );
+    }
+
+    #[test]
+    fn running_header_chars_are_tracked_for_the_coverage_threshold() {
+        // PDF-6: pages whose deficit is exactly the removed running
+        // header must expose `running_header_chars` so the low-
+        // confidence threshold can judge pre-removal coverage instead
+        // of rasterizing/spending OCR on legitimate pages.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="40" left="80" width="180" height="12" font="0">WEEKLY GAZETTE</text>
+<text top="120" left="80" width="440" height="12" font="0">First page prose starts here.</text>
+</page>
+<page number="2" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="40" left="80" width="180" height="12" font="0">WEEKLY GAZETTE</text>
+<text top="120" left="80" width="440" height="12" font="0">Second page body continues.</text>
+</page>
+</pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        for stats in &result.pages {
+            let header_chars = "WEEKLY GAZETTE"
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .count();
+            assert_eq!(
+                stats.running_header_chars, header_chars,
+                "header removal must be tracked per page: {:?}",
+                result.pages
+            );
+        }
+    }
+
+    #[test]
+    fn unused_fontspec_sizes_do_not_claim_heading_levels() {
+        // PDF-8: a declared-but-unused fontspec size must not shift real
+        // headings down the h1..h3 ranking.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<fontspec id="1" size="30" family="T"/>
+<fontspec id="2" size="16" family="T"/>
+<text top="100" left="80" width="440" height="16" font="2">A Real Section Heading</text>
+<text top="150" left="80" width="440" height="12" font="0">Body prose follows the heading.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        let DocBlock::Heading { level, .. } = &result.blocks[0].block else {
+            panic!("heading expected, got {:?}", result.blocks[0].block);
+        };
+        assert_eq!(*level, 1, "the largest USED size ranks first, got {level}");
+    }
+
+    #[test]
+    fn hyphen_fusion_stays_classic_line_end_dehyphenation() {
+        // PDF-8: fuse lowercase word-end hyphens with lowercase
+        // continuations ("prepro-"+"cessing"), but never uppercase,
+        // symbol or numeric-range hyphen ends like "X-"+"ray".
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="100" left="80" width="440" height="12" font="0">The image was prepro-</text>
+<text top="116" left="80" width="440" height="12" font="0">cessed before inspection.</text>
+<text top="170" left="80" width="440" height="12" font="0">Signals in the X-</text>
+<text top="186" left="80" width="440" height="12" font="0">ray band were examined.</text>
+<text top="220" left="80" width="440" height="12" font="0">Coverage spans 1990-</text>
+<text top="236" left="80" width="440" height="12" font="0">2001 in the tables.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
+        let joined = texts.join("\n---\n");
+        assert!(
+            texts.iter().any(|t| t.contains("preprocessed")),
+            "lowercase word-end hyphen fuses: {joined}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Xray")),
+            "uppercase hyphen end must not fuse: {joined}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("19902001")),
+            "numeric ranges must never fuse: {joined}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("X- ray")),
+            "kept intact with spacing preserved: {joined}"
+        );
+    }
+
+    #[test]
+    fn cjk_paragraphs_merge_across_pages_and_terminals_block() {
+        // PDF-8 mechanical half: uncased scripts continue paragraphs
+        // across page breaks without inventing spaces; CJK sentence
+        // terminals stop the merge.
+        let flowing = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="760" left="80" width="440" height="12" font="0">山间的清晨安静而清冷，雾气</text>
+</page>
+<page number="2" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="80" left="80" width="440" height="12" font="0">缓缓地从谷底升起，漫过石阶。</text>
+</page>
+</pdf2xml>"#;
+        let pages = parse_pdf2xml(flowing).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(
+            texts[0].contains("雾气缓缓地"),
+            "CJK continuation merges with no invented space: {texts:?}"
+        );
+
+        let terminated = flowing.replace("雾气", "雾气。");
+        let pages = parse_pdf2xml(&terminated).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
+        assert_eq!(
+            texts.len(),
+            2,
+            "terminal 。 must block the merge: {texts:?}"
+        );
+        assert!(
+            !result.blocks[0].block.text().ends_with("升起，"),
+            "first paragraph must end at its own terminal"
+        );
+    }
+
+    #[test]
+    fn arabic_and_hebrew_terminal_punctuation_classifies_correctly() {
+        // PDF F-2: genuine Arabic sentence terminals end a sentence...
+        assert!(ends_sentence_terminal("وأخيرًا انتهى الأمر۔"));
+        assert!(ends_sentence_terminal("ماذا حدث؟"));
+        // ...while the Arabic comma and the Hebrew maqaf are separators
+        // inside a sentence / inside a word and must never end one.
+        assert!(!ends_sentence_terminal("قال الخبير، ثم ذهب"));
+        assert!(!ends_sentence_terminal("أبو الكلام"));
+        assert!(!ends_sentence_terminal("אב־הטיפוס"));
+    }
+
+    #[test]
+    fn arabic_paragraphs_merge_across_pages_and_terminals_block() {
+        // PDF F-2: an Arabic book spanning two pages continues its
+        // paragraph (not fragmenting) — after the PDF-7 logical-order
+        // repair the page-1 tail ends in an Arabic comma (U+060C), a
+        // clause separator that is NOT a sentence terminal. Fixture text
+        // is in poppler's visual word order (logical reversed), mirroring
+        // what the repair step consumes.
+        let flowing = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="760" left="80" width="440" height="12" font="0">كانت الضجيج، عن بعيد وادٍ في</text>
+</page>
+<page number="2" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="80" left="80" width="440" height="12" font="0">توقف. بلا تُروى الحكايات</text>
+</page>
+</pdf2xml>"#;
+        let pages = parse_pdf2xml(flowing).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
+        assert_eq!(texts.len(), 1, "Arabic comma tail must merge: {texts:?}");
+        assert!(
+            texts[0].contains("كانت الحكايات"),
+            "the repaired logical sentence must continue across the page join: {texts:?}"
+        );
+
+        // Genuine sentence breaks hold: the Arabic full stop and the
+        // Arabic question mark both block the merge (they land on the
+        // repaired tail's end, exactly where the check looks).
+        for terminal in ["۔", "؟"] {
+            let terminated = flowing.replace("كانت الضجيج", &format!("كانت{terminal} الضجيج"));
+            let pages = parse_pdf2xml(&terminated).expect("fixture parses");
+            let result = reconstruct(&pages, ColumnMode::Auto);
+            assert_eq!(
+                result.blocks.len(),
+                2,
+                "terminal {terminal} must block the Arabic merge: {:?}",
+                result
+                    .blocks
+                    .iter()
+                    .map(|b| b.block.text())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn hebrew_paragraphs_merge_across_pages_and_maqaf_is_not_terminal() {
+        // PDF F-2: a Hebrew book spanning two pages continues its
+        // paragraph even when the repaired tail ends with a maqaf
+        // (U+05BE) — an intra-word hyphen-like separator, not a sentence
+        // end. A real sentence stop still holds the paragraphs apart.
+        // Fixture text is in poppler's visual word order.
+        let flowing = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="760" left="80" width="440" height="12" font="0">אב־ה־ עבר אל המסע</text>
+</page>
+<page number="2" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="80" left="80" width="440" height="12" font="0">בזריחה. החל ההרים</text>
+</page>
+</pdf2xml>"#;
+        let pages = parse_pdf2xml(flowing).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
+        assert_eq!(
+            texts.len(),
+            1,
+            "a maqaf tail must not end the sentence: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("אב־ה־ ההרים"),
+            "the repaired logical sentence must continue across the page join: {texts:?}"
+        );
+
+        let terminated = flowing.replace("אב־ה־ עבר אל המסע", "ההרים. עבר אל המסע");
+        let pages = parse_pdf2xml(&terminated).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+        assert_eq!(
+            result.blocks.len(),
+            2,
+            "a real sentence stop still blocks the Hebrew merge: {:?}",
+            result
+                .blocks
+                .iter()
+                .map(|b| b.block.text())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn justified_cjk_wrapped_punctuation_heads_continue_paragraphs() {
+        // PDF-9 justified half: kinsoku wraps push attached closing marks
+        // onto the START of a wrapped line. Such a head belongs to the
+        // previous sentence even though it opens with punctuation.
+        let justified = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="750" left="80" width="440" height="12" font="0">山道の途中で、桜並木が視界を</text>
+</page>
+<page number="2" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="80" left="80" width="440" height="12" font="0">、いっさい遮るものなく広がる。</text>
+</page>
+</pdf2xml>"#;
+        let pages = parse_pdf2xml(justified).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
+        assert_eq!(
+            texts.len(),
+            1,
+            "a wrapped 、 head must continue the paragraph: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("視界を、いっさい"),
+            "the mark glues onto the CJK tail with no invented space: {texts:?}"
+        );
+        assert!(
+            !texts[0].contains("視界を 、"),
+            "kinsoku marks must not be space-separated from their sentence: {texts:?}"
+        );
+
+        // A fullwidth comma head behaves identically (simplified-Chinese
+        // justification shape).
+        let comma_head = justified.replace(
+            "<text top=\"80\" left=\"80\" width=\"440\" height=\"12\" font=\"0\">、いっさい遮るものなく広がる。</text>",
+            "<text top=\"80\" left=\"80\" width=\"440\" height=\"12\" font=\"0\">，游人渐次多了起来。</text>",
+        );
+        let pages = parse_pdf2xml(&comma_head).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+        let texts: Vec<String> = result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect();
+        assert_eq!(texts.len(), 1, "， head must continue too: {texts:?}");
+        assert!(texts[0].contains("，游人"));
+    }
+
+    #[test]
+    fn chapter_group_boundary_blocks_the_cross_page_merge() {
+        // PDF-9 guard: even when the merge conditions hold (non-terminal
+        // tail, caseless head), a configured chapter prefix must never be
+        // crossed — chapter splitting matches the same prefix and would
+        // otherwise swallow the boundary line.
+        let boundary = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="750" left="80" width="440" height="12" font="0">昨夜の雨が止んだころ</text>
+</page>
+<page number="2" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="80" left="80" width="440" height="12" font="0">第二章　観測日誌の続きから</text>
+</page>
+</pdf2xml>"#;
+
+        // Without a prefix the mechanical rules DO join them (proves the
+        // head text satisfies continuation).
+        let pages = parse_pdf2xml(boundary).expect("fixture parses");
+        let unguarded = reconstruct(&pages, ColumnMode::Auto);
+        assert_eq!(unguarded.blocks.len(), 1, "{:?}", unguarded.blocks.len());
+
+        // With the guard the boundary stays intact.
+        let pages = parse_pdf2xml(boundary).expect("fixture parses");
+        let guarded = reconstruct_with_chapter_guard(&pages, ColumnMode::Auto, Some("第二章"));
+        assert_eq!(
+            guarded.blocks.len(),
+            2,
+            "chapter prefix must block the merge: {:?}",
+            guarded
+                .blocks
+                .iter()
+                .map(|b| b.block.text())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rtl_lines_emerge_in_logical_reading_order_and_flag_the_page() {
+        // PDF-7 wiring test at reconstruction level: poppler emits each
+        // fragment's characters logically, visual assembly scrambles
+        // dominant-RTL lines wordwise, and the repair step restores them.
+        // Expected values mirror the algorithmic units proven in
+        // crate::bidi's own tests; this checks their integration point,
+        // the rtl_dominant page flag, and that LTR lines pass untouched.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="12" family="T"/>
+<text top="100" left="80" width="440" height="14" font="0">السنوي تقريره 2024 عام في المعهد أصدر</text>
+<text top="124" left="80" width="440" height="14" font="0">חמישי רביעי שלישי Tesseract OCR שני ראשון</text>
+<text top="148" left="80" width="440" height="14" font="0">Plain English narrative continues below.</text>
+</page>
+</pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        let text: String = result
+            .blocks
+            .iter()
+            .map(|b| b.block.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("أصدر المعهد في عام 2024 تقريره السنوي"),
+            "Arabic tokens restore logical order with the number inline: {text}"
+        );
+        assert!(
+            text.contains("ראשון שני Tesseract OCR שלישי רביעי חמישי"),
+            "embedded LTR clusters keep internal order: {text}"
+        );
+        assert!(
+            text.contains("Plain English narrative continues below."),
+            "LTR line untouched"
+        );
+        assert!(
+            result.pages[0].rtl_dominant,
+            "the page reports its RTL dominance for report attribution"
+        );
+
+        // Control: an LTR-only document never flips anything and never
+        // claims RTL dominance, so coverage/OCR decisions stay script-
+        // blind apart from real character counts.
+        let ltr_xml = xml
+            .replace(
+                "السنوي تقريره 2024 عام في المعهد أصدر",
+                "The institute issued its annual report",
+            )
+            .replace(
+                "חמישי רביעי שלישי Tesseract OCR שני ראשון",
+                "fourth third second Tesseract OCR two one",
+            );
+        let pages = parse_pdf2xml(&ltr_xml).expect("control fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+        assert!(!result.pages[0].rtl_dominant);
+        assert_eq!(
+            result.blocks[0].block.text(),
+            "The institute issued its annual report fourth third second Tesseract OCR two one Plain English narrative continues below."
         );
     }
 

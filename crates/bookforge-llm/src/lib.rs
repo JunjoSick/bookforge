@@ -2,6 +2,7 @@ pub mod batch;
 pub mod concurrency;
 pub mod double_check;
 pub mod glossary_proposal;
+pub mod latency;
 pub mod prompt;
 pub mod provider;
 pub mod qa_batch;
@@ -13,8 +14,8 @@ mod validation;
 pub use batch::{
     BatchItemFailure, BatchItemTranslation, BatchKind, BatchMode, BatchSizer,
     BatchTranslationResult, TranslationBatch, TranslationBatchItem,
-    account_for_batch_prompt_overhead, build_translation_batches, collect_repair_items,
-    parse_batch_response, split_batch, translate_batches_with_callback,
+    account_for_batch_prompt_overhead, block_mismatch_findings, build_translation_batches,
+    collect_repair_items, parse_batch_response, split_batch, translate_batches_with_callback,
     translate_batches_with_control,
 };
 pub use concurrency::{AdaptiveLimiter, PauseSignal, PauseState};

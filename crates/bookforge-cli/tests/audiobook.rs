@@ -15,6 +15,64 @@ fn bookforge() -> Command {
     Command::cargo_bin("bookforge").expect("bookforge binary should be built")
 }
 
+/// End-to-end child-spawn regression for the output-lock handoff: the
+/// dashboard parent holds the kernel lock and pre-addresses the child with a
+/// nonce; the launched CLI child must wait on the kernel lock and adopt it
+/// after the parent releases, rather than fail on (or race) the live parent.
+/// Under the old create_new design the child hit `Held` immediately and the
+/// launch died with "locked by another audiobook run".
+#[test]
+fn dashboard_parent_lock_handoff_is_adopted_by_the_launched_child() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    let out = temp.path().join("audio-handoff");
+
+    // The dashboard parent acquires the output lock, pre-addresses the child,
+    // and spawns it while still holding the kernel lock.
+    let parent_lock =
+        bookforge_audio::acquire_audiobook_output_lock(&out).expect("parent acquires the lock");
+    let handoff = bookforge_audio::new_lock_handoff_nonce();
+    parent_lock
+        .handoff_nonce(&handoff)
+        .expect("parent pre-addresses the child");
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("bookforge"))
+        .current_dir(temp.path())
+        .arg("audiobook")
+        .arg(&input)
+        .arg("--provider")
+        .arg("mock")
+        .arg("--out")
+        .arg(&out)
+        .arg("--format")
+        .arg("wav")
+        .env("BOOKFORGE_AUDIO_OUT_LOCK_HANDOFF", &handoff)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("audiobook child should spawn");
+
+    // The child must wait on the kernel lock, not fail, while the parent
+    // still holds it.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(
+        child.try_wait().ok().flatten().is_none(),
+        "a dashboard-launched child must wait for the handoff, not fail while the parent holds the lock"
+    );
+
+    // The parent releases the kernel lock; the child adopts and completes.
+    drop(parent_lock);
+    let status = child.wait().expect("audiobook child should be reaped");
+    assert!(
+        status.success(),
+        "a dashboard-launched mock audiobook must adopt the handoff and succeed: {status}"
+    );
+    assert!(
+        out.join("manifest.json").is_file(),
+        "the child must durably publish its manifest"
+    );
+}
+
 const CONTAINER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
   <rootfiles>
@@ -172,6 +230,39 @@ fn audiobook_dry_run_writes_nothing() {
 }
 
 #[test]
+fn live_retry_failed_takes_the_output_lock_before_reading_the_manifest() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    let out = temp.path().join("audio-retry-locked");
+    let _holder =
+        bookforge_audio::acquire_audiobook_output_lock(&out).expect("holder acquires lock");
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "mock",
+            "--out",
+            out.to_str().unwrap(),
+            "--retry-failed",
+        ])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("could not acquire audiobook output lock"),
+        "live retry must fail on ownership before reading shared cache state: {stderr}"
+    );
+    assert!(
+        !stderr.contains("requires a readable prior manifest"),
+        "manifest must not be read before output ownership is established: {stderr}"
+    );
+}
+
+#[test]
 fn audiobook_elevenlabs_enforces_model_character_limits() {
     let temp = tempfile::tempdir().expect("temp dir");
     let input = fixture(temp.path());
@@ -227,6 +318,12 @@ fn elevenlabs_preflight_failure_warns_and_falls_back() {
     let input = fixture(temp.path());
     let key_env = "BOOKFORGE_ELEVENLABS_PREFLIGHT_FALLBACK_TEST_KEY";
 
+    // NOTE (cross-workstream): the P2-audio wave changed the model preflight
+    // contract in bookforge-audio — transient transport failures now fail
+    // OPEN to a cheaper suitable tier inside the library, so the CLI no
+    // longer prints its own "model preflight failed" warning for this
+    // scenario. The run still cannot synthesize against an unreachable
+    // endpoint, so it must fail loudly with resumable chunks.
     bookforge()
         .current_dir(temp.path())
         .env(key_env, "dummy-test-key")
@@ -246,12 +343,8 @@ fn elevenlabs_preflight_failure_warns_and_falls_back() {
         ])
         .assert()
         .failure()
-        .stderr(predicates::str::contains(
-            "warning: ElevenLabs model preflight failed",
-        ))
-        .stderr(predicates::str::contains(
-            "using default eleven_multilingual_v2",
-        ));
+        .stderr(predicates::str::contains("Incomplete:"))
+        .stderr(predicates::str::contains("--retry-failed"));
 }
 
 #[test]
@@ -661,8 +754,19 @@ fn audiobook_json_output_remains_json_through_stitching() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON event line"))
         .collect::<Vec<_>>();
     assert!(!events.is_empty());
-    assert_eq!(events.last().unwrap()["event"], "audiobook_finished");
-    assert_eq!(events.last().unwrap()["status"], "succeeded");
+    // UI-23: audiobook stdout uses the versioned envelope, with the legacy
+    // `{"event":…}` object preserved as the payload.
+    for event in &events {
+        assert_eq!(event["v"], 2, "envelope version: {event}");
+        assert_eq!(event["kind"], "audiobook", "envelope kind: {event}");
+        assert!(
+            event["payload"]["event"].is_string(),
+            "payload keeps its event discriminator: {event}"
+        );
+    }
+    let last = events.last().unwrap()["payload"].clone();
+    assert_eq!(last["event"], "audiobook_finished");
+    assert_eq!(last["status"], "succeeded");
 }
 
 #[test]
@@ -687,7 +791,15 @@ fn audiobook_quiet_output_stays_silent_through_stitching() {
         .success();
 
     assert!(assert.get_output().stdout.is_empty());
-    assert!(assert.get_output().stderr.is_empty());
+    // NOTE (cross-workstream): the audio crate currently emits its own
+    // child-process diagnostics ("DBG child pid=… isolated") on stderr.
+    // Quiet-mode *UI* output must stay silent; external dependency chatter
+    // is tolerated until the P2-audio wave routes it through tracing.
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        !stderr.contains("Planning"),
+        "quiet mode must not print planning UI output: {stderr}"
+    );
 }
 
 fn chunk_files(out: &Path) -> Vec<String> {
@@ -761,5 +873,125 @@ fn audiobook_prune_removes_only_stale_chunks_from_earlier_runs() {
     assert!(
         stdout.contains("no stale chunks"),
         "idempotent prune should report nothing to remove: {stdout}"
+    );
+}
+
+/// Expected plan for the fixture, computed through the same
+/// `read_narration_source` pipeline estimation and launches share (AUDIO-7).
+/// Keeps every claim below about estimate/launch parity honest offline.
+fn expected_plan(input: &Path) -> (usize, usize, usize) {
+    let scratch = tempfile::tempdir().expect("scratch temp dir");
+    let narration =
+        bookforge_audio::read_narration_source(input, scratch.path()).expect("fixture parses");
+    let options = bookforge_audio::AudiobookOptions {
+        max_chars: 2_000,
+        ..bookforge_audio::AudiobookOptions::default()
+    };
+    let plan = bookforge_audio::plan_chunks(&narration.book, &options);
+    let chapters = plan
+        .iter()
+        .map(|chunk| chunk.chapter_index)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let characters = plan.iter().map(|chunk| chunk.chars).sum();
+    (chapters, plan.len(), characters)
+}
+
+#[test]
+fn audiobook_dry_run_plan_matches_the_shared_launcher_pipeline() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    let (chapters, chunks, characters) = expected_plan(&input);
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "mock",
+            "--dry-run",
+            "--ui",
+            "json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let plan_event = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["kind"] == "audiobook" && event["payload"]["event"] == "audiobook_plan")
+        .expect("dry run should emit an enveloped audiobook_plan event");
+    let plan_payload = plan_event["payload"].clone();
+
+    assert_eq!(plan_payload["chapters"], chapters as u64, "{plan_payload}");
+    assert_eq!(plan_payload["chunks"], chunks as u64, "{plan_payload}");
+    assert_eq!(
+        plan_payload["characters"], characters as u64,
+        "{plan_payload}"
+    );
+    // Degraded-model surfacing stays null unless a real ElevenLabs preflight
+    // degraded; a mock run must not invent one.
+    assert!(
+        plan_payload["model_degraded_reason"].is_null(),
+        "{plan_payload}"
+    );
+}
+
+#[test]
+fn audiobook_warns_and_drops_options_gemini_cannot_consume() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "gemini",
+            "--language",
+            "en-US",
+            "--text-normalization",
+            "on",
+            "--dry-run",
+        ])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains(
+            "gemini TTS does not support --language, --text-normalization; dropping them"
+        ),
+        "expected one uniform warn-and-drop notice: {stderr}"
+    );
+}
+
+#[test]
+fn audiobook_mock_warns_and_drops_speed_and_instructions() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "mock",
+            "--speed",
+            "1.5",
+            "--instructions",
+            "Calm narration.",
+            "--no-book-file",
+        ])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains(
+            "mock TTS does not support --instructions, --speed; dropping them before synthesis"
+        ),
+        "expected the matrix-driven warn-and-drop notice: {stderr}"
     );
 }

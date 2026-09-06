@@ -6,7 +6,27 @@ use crate::{
     SegmentationConfig, TranslationProfile,
     config::ContextScope,
     glossary::{GlossaryFormat, GlossaryTerm},
+    segment::{CacheIdentity, Segment},
 };
+
+/// The actual per-segment prompt ingredients that shape the rendered request.
+///
+/// The cache identity hashes these strings (not just the configuration that
+/// produced them): two runs whose config fingerprints agree but whose rendered
+/// content differs — different neighbor text, a different per-segment glossary
+/// selection, an edited style/entity block — must never reuse a cache row.
+/// [`RunConfigSnapshot::cache_identity`] combines them with the segment's own
+/// neighbor context and the provider/runtime settings into one fingerprint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CachePromptInputs {
+    /// Canonical rendering of the actual per-segment glossary terms selected
+    /// for this segment (ordered, budget-bounded; empty when no glossary).
+    pub glossary_rendered: String,
+    /// The actual rendered style-guide block substituted into the prompt.
+    pub style_rendered: String,
+    /// The actual rendered entity-agreement block substituted into the prompt.
+    pub entities_rendered: String,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RunConfigSnapshot {
@@ -108,6 +128,106 @@ fn default_glossary_format() -> GlossaryFormat {
 
 fn default_bilingual_separator() -> String {
     " / ".to_string()
+}
+
+/// Durable cache-policy fields that are not part of [`RunConfigSnapshot`]'s
+/// historical surface and therefore live in their own persisted record
+/// (`jobs.cache_policy_json`). Old jobs that never recorded a policy read
+/// back the conservative default, which prevents their cache entries from
+/// being reused by runs that state an explicit policy.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CachePolicySnapshot {
+    /// The strict-context completion fence (`ContextRunConfig::strict`).
+    /// `None` means the run never recorded its choice — hashed distinctly
+    /// from both explicit values so legacy cache rows can never be reused by
+    /// a run that pins strictness (and vice versa).
+    #[serde(default)]
+    pub strict_context: Option<bool>,
+}
+
+impl CachePolicySnapshot {
+    /// Conservative fallback for rows that predate the policy record: no
+    /// explicit strictness. Fingerprints built with this value are
+    /// incompatible with any run that states `Some(true)` or `Some(false)`.
+    pub fn conservative() -> Self {
+        Self {
+            strict_context: None,
+        }
+    }
+}
+
+impl RunConfigSnapshot {
+    /// Build the structured [`CacheIdentity`] for one segment from this
+    /// snapshot's full output-affecting settings plus the ACTUAL rendered
+    /// prompt ingredients (`request.prompt_inputs`) and the segment's own
+    /// neighbor context. `request.strict_context` comes from the separately
+    /// persisted [`CachePolicySnapshot`]; pass `None` when the job never
+    /// recorded a policy (conservative).
+    pub fn cache_identity(&self, request: CacheIdentityRequest<'_>) -> CacheIdentity {
+        let CacheIdentityRequest {
+            segment,
+            provider,
+            model,
+            prompt_version,
+            cache_namespace,
+            strict_context,
+            prompt_inputs,
+        } = request;
+        CacheIdentity {
+            schema_version: crate::segment::CACHE_IDENTITY_SCHEMA_VERSION,
+            source_hash: segment.checksum.clone(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            source_lang: self.source_language.clone(),
+            target_lang: self.target_language.clone(),
+            prompt_version: prompt_version.to_string(),
+            cache_namespace: cache_namespace.to_string(),
+            prompt_extra: self.prompt_extra.clone(),
+            max_segment_tokens: self.settings.segmentation.max_segment_tokens,
+            context_tokens: self.settings.segmentation.context_tokens,
+            context_window: self.context_window,
+            context_budget_tokens: self.context_budget_tokens,
+            context_scope: self.context_scope,
+            strict_context,
+            profile: self.profile,
+            batch_enabled: self.settings.batch.enabled,
+            batch_target_tokens: self.settings.batch.target_tokens,
+            batch_max_items: self.settings.batch.max_items,
+            batch_adaptive_sizing: self.settings.batch.adaptive_sizing,
+            batch_split_on_json_failure: self.settings.batch.split_on_json_failure,
+            batch_repair_invalid_items: self.settings.batch.repair_invalid_items,
+            compact_prompts: self.settings.compact_prompts,
+            glossary_fingerprint: self.glossary_fingerprint.clone(),
+            style_fingerprint: self.style_fingerprint.clone(),
+            entities_fingerprint: self.entities_fingerprint.clone(),
+            context_before: segment.context.before.clone().unwrap_or_default(),
+            context_after: segment.context.after.clone().unwrap_or_default(),
+            glossary_rendered: prompt_inputs.glossary_rendered.clone(),
+            style_rendered: prompt_inputs.style_rendered.clone(),
+            entities_rendered: prompt_inputs.entities_rendered.clone(),
+            bilingual_mode: self.bilingual_mode,
+            bilingual_separator: self.bilingual_separator.clone(),
+            bilingual_style: self.bilingual_style,
+            thinking_disabled: self.settings.provider.thinking_disabled,
+            max_output_tokens: self.settings.provider.max_output_tokens,
+            batch_max_output_tokens: self.settings.provider.batch_max_output_tokens,
+            json_mode: self.settings.provider.json_mode,
+        }
+    }
+}
+
+/// Inputs for [`RunConfigSnapshot::cache_identity`]: the request-visible
+/// fields plus the actual rendered prompt ingredients. Bundling them keeps the
+/// identity construction signature stable as more request fields are added.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheIdentityRequest<'a> {
+    pub segment: &'a Segment,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub prompt_version: &'a str,
+    pub cache_namespace: &'a str,
+    pub strict_context: Option<bool>,
+    pub prompt_inputs: &'a CachePromptInputs,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -329,5 +449,277 @@ impl ResolvedRunSettingsSnapshot {
                 correction_rounds: self.double_check.correction_rounds,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_policy_conservative_is_unknown_strictness() {
+        assert_eq!(CachePolicySnapshot::conservative().strict_context, None);
+        let serialized =
+            serde_json::to_string(&CachePolicySnapshot::conservative()).expect("policy serializes");
+        let round_trip: CachePolicySnapshot =
+            serde_json::from_str(&serialized).expect("policy deserializes");
+        assert_eq!(round_trip, CachePolicySnapshot::conservative());
+    }
+
+    #[test]
+    fn cache_policy_missing_field_deserializes_to_conservative_default() {
+        let empty = CachePolicySnapshot::conservative();
+        let from_partial: CachePolicySnapshot = serde_json::from_str("{}").expect("empty policy");
+        assert_eq!(from_partial, empty);
+        assert_eq!(from_partial.strict_context, None);
+    }
+
+    #[test]
+    fn cache_identity_carries_snapshot_settings_and_strict_context() {
+        let mut snapshot = RunConfigSnapshot {
+            input_path: PathBuf::from("input.epub"),
+            input_snapshot_path: None,
+            input_sha256: None,
+            output_path: PathBuf::from("output.epub"),
+            events_path: None,
+            report_json_path: None,
+            report_markdown_path: None,
+            source_language: Some("English".to_string()),
+            target_language: "Italian".to_string(),
+            creator: None,
+            provider: "openrouter".to_string(),
+            model: "google/gemini-2.5-flash".to_string(),
+            base_url: None,
+            api_key_env: None,
+            profile: TranslationProfile::Balanced,
+            provider_preset: None,
+            prompt_version: "batch_v3".to_string(),
+            cache_namespace: "legacy_namespace".to_string(),
+            book_id: None,
+            series_id: None,
+            glossary_budget_tokens: 800,
+            glossary_format: GlossaryFormat::Json,
+            prompt_extra: None,
+            glossary_fingerprint: "glossary:a".to_string(),
+            glossary_terms: Vec::new(),
+            context_window: 4,
+            context_budget_tokens: 400,
+            context_scope: ContextScope::Chapter,
+            style_fingerprint: String::new(),
+            style_rendered_block: String::new(),
+            entities_fingerprint: String::new(),
+            entities_rendered_block: String::new(),
+            bilingual_mode: BilingualMode::Replace,
+            bilingual_separator: " / ".to_string(),
+            bilingual_style: BilingualStyle::Minimal,
+            bilingual_css: None,
+            fallback: None,
+            finalize: FinalizeCheckpointSnapshot::default(),
+            qa_mode: "off".to_string(),
+            validate_output: false,
+            settings: ResolvedRunSettingsSnapshot {
+                profile: TranslationProfile::Balanced,
+                segmentation: SegmentationConfigSnapshot {
+                    max_segment_tokens: 2_500,
+                    context_tokens: 80,
+                },
+                batch: BatchConfigSnapshot {
+                    enabled: true,
+                    target_tokens: 8_000,
+                    max_items: 64,
+                    adaptive_sizing: false,
+                    split_on_json_failure: true,
+                    repair_invalid_items: true,
+                },
+                scheduler: SchedulerConfigSnapshot {
+                    concurrency: 16,
+                    max_attempts: 2,
+                },
+                provider: ProviderRuntimeConfigSnapshot {
+                    timeout_seconds: 120,
+                    provider_max_attempts: 2,
+                    validation_max_attempts: 1,
+                    retry_after_policy: RetryAfterPolicy::JitteredExponential,
+                    max_backoff_seconds: 30,
+                    thinking_disabled: false,
+                    model_context_tokens: None,
+                    max_output_tokens: None,
+                    batch_max_output_tokens: None,
+                    json_mode: JsonMode::Auto,
+                    max_idle_per_host: 32,
+                },
+                compact_prompts: true,
+                retry_failed_only: true,
+                adaptive_concurrency: true,
+                qa: QaRunConfigSnapshot {
+                    concurrency: 8,
+                    batch_target_tokens: 8_000,
+                    model: None,
+                    provider: None,
+                    base_url: None,
+                    api_key_env: None,
+                },
+                double_check: DoubleCheckConfigSnapshot {
+                    mode: crate::DoubleCheckMode::Off,
+                    model: None,
+                    provider: None,
+                    base_url: None,
+                    api_key_env: None,
+                    concurrency: 4,
+                    batch_target_tokens: 8_000,
+                    auto_correct: false,
+                    correction_rounds: 1,
+                },
+            },
+        };
+        snapshot.settings.segmentation.max_segment_tokens = 2_500;
+
+        let segment = crate::segment::Segment {
+            id: crate::segment::SegmentId("seg_a".to_string()),
+            section_id: crate::ir::SectionId("sec_0".to_string()),
+            ordinal: 0,
+            block_ids: Vec::new(),
+            source: crate::segment::SegmentSource {
+                text: "source".to_string(),
+                blocks: Vec::new(),
+                token_estimate: 2,
+            },
+            context: crate::segment::SegmentContext::default(),
+            metadata: crate::segment::SegmentMetadata::default(),
+            constraints: crate::segment::SegmentConstraints::default(),
+            checksum: "checksum_a".to_string(),
+        };
+
+        let default_inputs = CachePromptInputs::default();
+        let request = |strict_context| CacheIdentityRequest {
+            segment: &segment,
+            provider: "openrouter",
+            model: "google/gemini-2.5-flash",
+            prompt_version: "batch_v3",
+            cache_namespace: "legacy_namespace",
+            strict_context,
+            prompt_inputs: &default_inputs,
+        };
+
+        let loose = snapshot.cache_identity(request(Some(false)));
+        let strict = snapshot.cache_identity(request(Some(true)));
+        let unknown = snapshot.cache_identity(request(None));
+
+        assert_ne!(loose.fingerprint(), strict.fingerprint());
+        assert_ne!(unknown.fingerprint(), loose.fingerprint());
+        assert_ne!(unknown.fingerprint(), strict.fingerprint());
+        assert_eq!(snapshot.settings.segmentation.max_segment_tokens, 2_500);
+        assert_eq!(
+            snapshot.cache_identity(request(Some(false))),
+            loose,
+            "identity construction is deterministic"
+        );
+    }
+
+    #[test]
+    fn cache_identity_hashes_actual_rendered_prompt_inputs() {
+        let snapshot = RunConfigSnapshot {
+            input_path: PathBuf::from("input.epub"),
+            input_snapshot_path: None,
+            input_sha256: None,
+            output_path: PathBuf::from("output.epub"),
+            events_path: None,
+            report_json_path: None,
+            report_markdown_path: None,
+            source_language: Some("English".to_string()),
+            target_language: "Italian".to_string(),
+            creator: None,
+            provider: "openrouter".to_string(),
+            model: "google/gemini-2.5-flash".to_string(),
+            base_url: None,
+            api_key_env: None,
+            profile: TranslationProfile::Balanced,
+            provider_preset: None,
+            prompt_version: "batch_v3".to_string(),
+            cache_namespace: "legacy_namespace".to_string(),
+            book_id: None,
+            series_id: None,
+            glossary_budget_tokens: 800,
+            glossary_format: GlossaryFormat::Json,
+            prompt_extra: None,
+            glossary_fingerprint: "same_config_fp".to_string(),
+            glossary_terms: Vec::new(),
+            context_window: 4,
+            context_budget_tokens: 400,
+            context_scope: ContextScope::Chapter,
+            style_fingerprint: String::new(),
+            style_rendered_block: String::new(),
+            entities_fingerprint: String::new(),
+            entities_rendered_block: String::new(),
+            bilingual_mode: BilingualMode::Replace,
+            bilingual_separator: " / ".to_string(),
+            bilingual_style: BilingualStyle::Minimal,
+            bilingual_css: None,
+            fallback: None,
+            finalize: FinalizeCheckpointSnapshot::default(),
+            qa_mode: "off".to_string(),
+            validate_output: false,
+            settings: snapshot_fixture_settings(),
+        };
+
+        let segment = crate::segment::Segment {
+            id: crate::segment::SegmentId("seg_a".to_string()),
+            section_id: crate::ir::SectionId("sec_0".to_string()),
+            ordinal: 0,
+            block_ids: Vec::new(),
+            source: crate::segment::SegmentSource {
+                text: "identical text".to_string(),
+                blocks: Vec::new(),
+                token_estimate: 2,
+            },
+            context: crate::segment::SegmentContext {
+                before: Some("before A".to_string()),
+                after: Some("after A".to_string()),
+            },
+            metadata: crate::segment::SegmentMetadata::default(),
+            constraints: crate::segment::SegmentConstraints::default(),
+            checksum: "checksum_identical".to_string(),
+        };
+        let mut segment_b = segment.clone();
+        segment_b.context.before = Some("before B".to_string());
+        segment_b.context.after = Some("after B".to_string());
+
+        let inputs_a = CachePromptInputs {
+            glossary_rendered: "[{\"source\":\"hello\",\"target\":\"ciao\"}]".to_string(),
+            style_rendered: "Style block A".to_string(),
+            entities_rendered: "Entity block A".to_string(),
+        };
+        let inputs_b = CachePromptInputs {
+            glossary_rendered: "[{\"source\":\"world\",\"target\":\"mondo\"}]".to_string(),
+            style_rendered: "Style block B".to_string(),
+            entities_rendered: "Entity block B".to_string(),
+        };
+
+        let identity = |segment: &crate::segment::Segment, inputs: &CachePromptInputs| {
+            snapshot.cache_identity(CacheIdentityRequest {
+                segment,
+                provider: "openrouter",
+                model: "google/gemini-2.5-flash",
+                prompt_version: "batch_v3",
+                cache_namespace: "legacy_namespace",
+                strict_context: Some(false),
+                prompt_inputs: inputs,
+            })
+        };
+
+        let a = identity(&segment, &inputs_a);
+        let b = identity(&segment_b, &inputs_b);
+        assert_eq!(a.source_hash, b.source_hash);
+        assert_ne!(a.fingerprint(), b.fingerprint());
+
+        // Identical config fingerprint but different actual rendered blocks
+        // must still differ (same snapshot, different prompt inputs).
+        let rendered_difference = identity(&segment, &inputs_b);
+        assert_ne!(a.fingerprint(), rendered_difference.fingerprint());
+    }
+
+    fn snapshot_fixture_settings() -> ResolvedRunSettingsSnapshot {
+        let settings = crate::TranslationProfile::Balanced.resolve();
+        ResolvedRunSettingsSnapshot::from_settings(&settings)
     }
 }

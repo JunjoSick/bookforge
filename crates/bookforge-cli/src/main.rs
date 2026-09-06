@@ -3,11 +3,16 @@ mod checkpoint;
 mod commands;
 mod control;
 mod cost;
+mod envelope;
+mod epoch;
 #[cfg(any(feature = "tui", feature = "serve"))]
 mod eventlog;
+mod exit_code;
 mod performance;
+mod presentation;
 mod progress;
 mod report;
+pub(crate) mod sanitize;
 #[cfg(feature = "tui")]
 mod tui;
 
@@ -27,8 +32,9 @@ use commands::{
 #[cfg(any(test, not(feature = "serve")))]
 use std::io::Write;
 use std::{
+    fs,
     io::{self, ErrorKind},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -37,15 +43,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[command(
     name = "bookforge",
     version,
-    about = "EPUB-first AI book translation tool"
-)]
-#[cfg_attr(
-    feature = "serve",
-    command(after_help = "Run `bookforge` without a command to open the local browser dashboard.")
-)]
-#[cfg_attr(
-    not(feature = "serve"),
-    command(after_help = "This build was compiled without the local browser dashboard.")
+    about = "EPUB-first AI book translation tool",
+    after_help = exit_codes_help_text()
 )]
 struct Cli {
     #[command(subcommand)]
@@ -108,10 +107,32 @@ enum Command {
     Serve(serve::ServeArgs),
 }
 
+fn exit_codes_help_text() -> &'static str {
+    #[cfg(feature = "serve")]
+    {
+        concat!(
+            "Exit codes: 0 success or intentional stop · 1 runtime failure · ",
+            "2 usage error · 3 job finished with failed/needs-review segments · ",
+            "130 interrupted by Ctrl+C (progress saved)\n",
+            "Run `bookforge` without a command to open the local browser dashboard."
+        )
+    }
+    #[cfg(not(feature = "serve"))]
+    {
+        concat!(
+            "Exit codes: 0 success or intentional stop · 1 runtime failure · ",
+            "2 usage error · 3 job finished with failed/needs-review segments · ",
+            "130 interrupted by Ctrl+C (progress saved)\n",
+            "This build was compiled without the local browser dashboard."
+        )
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     init_tracing();
     install_panic_hook();
+    sweep_stale_retry_override_dirs_at_startup();
 
     let cancel_token = CancellationToken::new();
     let cancel = cancel_token.clone();
@@ -120,21 +141,33 @@ async fn main() -> Result<()> {
         cancel.cancel();
     });
 
-    match parse_cli()?.command {
+    let result = match parse_cli().command {
         Some(command) => run_command(command, cancel_token).await,
         None => run_default().await,
-    }
+    };
+    std::process::exit(match result {
+        Ok(()) => exit_code::resolve(false),
+        // Preserve the `Error: …` diagnostic that Rust's Termination impl used
+        // to print for `async fn main() -> anyhow::Result<()>`.
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            exit_code::resolve(true)
+        }
+    });
 }
 
-fn parse_cli() -> Result<Cli> {
+/// Parse the CLI. On a parse error the error is printed and the process exits
+/// with clap's usage code (2), so this never returns `Err` to `main`.
+fn parse_cli() -> Cli {
     match Cli::try_parse() {
-        Ok(cli) => Ok(cli),
+        Ok(cli) => cli,
         Err(err) => {
             let exit_code = err.exit_code();
             if let Err(print_err) = err.print()
                 && !is_broken_pipe(&print_err)
             {
-                return Err(print_err.into());
+                eprintln!("Error: {print_err}");
+                std::process::exit(exit_code::FAILURE);
             }
             std::process::exit(exit_code);
         }
@@ -152,13 +185,13 @@ async fn run_command(command: Command, cancel_token: CancellationToken) -> Resul
         Command::Translate(args) => translate::run(*args, cancel_token).await,
         Command::Pause(args) => control_commands::pause(args).await,
         Command::Reconfigure(args) => reconfigure::run(args).await,
-        Command::Resume(args) => resume::run(args).await,
+        Command::Resume(args) => resume::run(args, cancel_token).await,
         Command::Stop(args) => control_commands::stop(args).await,
         Command::Correct(args) => correct::run(args).await,
         Command::Review(args) => review::run(args).await,
         Command::IngestFlags(args) => ingest_flags::run(args).await,
         Command::Glossary(args) => glossary::run(args).await,
-        Command::Retry(args) => retry::run(args).await,
+        Command::Retry(args) => retry::run(args, cancel_token).await,
         Command::Validate(args) => validate::run(args).await,
         Command::Benchmark(args) => translate::run_benchmark(*args).await,
         Command::Doctor(args) => doctor::run(args).await,
@@ -178,6 +211,7 @@ async fn run_default() -> Result<()> {
     serve::run(serve::ServeArgs {
         bind: "127.0.0.1:8765".to_string(),
         open: true,
+        no_auth: false,
         refresh_ms: 250,
     })
     .await
@@ -201,6 +235,87 @@ fn write_default_help(mut writer: impl Write) -> io::Result<()> {
 
 fn is_broken_pipe(err: &io::Error) -> bool {
     err.kind() == ErrorKind::BrokenPipe
+}
+
+// ---------------------------------------------------------------------------
+// INFRA-10: startup sweep for abandoned `retry_pending_overrides_<pid>` run
+// directories under `.bookforge/runs`.
+//
+// These directories are created for retry-pending override sidecars; when the
+// owner process dies between creating and clearing one, an empty directory
+// lingers forever. A previous audit counted 51 of them. The sweep only ever
+// deletes directories that are (a) named after a parseable pid, (b) provably
+// empty, and (c) POSITIVELY not owned by a live process. An owner whose
+// liveness cannot be established is NEVER reaped: age alone must never
+// authorize deleting a directory a live process may still be writing into
+// (this lane's invariant is fail closed). Directories with any content are
+// never touched, because they may hold a live worker's pending override
+// sidecar. Liveness comes from the shared robust probe in `control.rs`
+// (`/proc` on Linux, `ps` on other Unixes, `OpenProcess`/`GetExitCodeProcess`
+// on Windows) — no mtime/age heuristic is consulted.
+// ---------------------------------------------------------------------------
+
+use crate::control::{OwnerLiveness, pid_liveness};
+
+const RETRY_OVERRIDE_DIR_PREFIX: &str = "retry_pending_overrides_";
+const RETRY_OVERRIDES_RUNS_ROOT: &str = ".bookforge/runs";
+
+fn sweep_stale_retry_override_dirs_at_startup() {
+    let reaped = sweep_stale_retry_override_dirs(Path::new(RETRY_OVERRIDES_RUNS_ROOT));
+    if reaped > 0 {
+        tracing::info!("reaped {reaped} empty retry_pending_overrides directories");
+    }
+}
+
+fn sweep_stale_retry_override_dirs(runs_root: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(runs_root) else {
+        // No runs root (or unreadable): nothing to sweep, never fail startup.
+        return 0;
+    };
+
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_text) = name.to_str() else {
+            continue;
+        };
+        let Some(pid_text) = name_text.strip_prefix(RETRY_OVERRIDE_DIR_PREFIX) else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+        if !entry
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let is_empty = fs::read_dir(entry.path())
+            .map(|mut contents| contents.next().is_none())
+            .unwrap_or(false);
+        if !is_empty {
+            continue;
+        }
+
+        if retry_override_dir_is_reapable(pid_liveness(pid)) && fs::remove_dir(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn retry_override_dir_is_reapable(liveness: OwnerLiveness) -> bool {
+    match liveness {
+        OwnerLiveness::Alive => false,
+        OwnerLiveness::Gone => true,
+        // Fail-closed: an owner whose death is not positively established is
+        // never reaped, at any directory age. No mtime/age heuristic exists
+        // here — takeover is authorized only by a positively established death.
+        OwnerLiveness::Indeterminate => false,
+    }
 }
 
 fn init_tracing() {
@@ -236,18 +351,23 @@ struct LanguageArgs {
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ProviderArgs {
+    /// Translation provider (openai-compatible family preset).
     #[arg(long, default_value = "deepseek")]
     pub(crate) provider: String,
 
+    /// Model id the provider endpoint should serve.
     #[arg(long)]
     pub(crate) model: Option<String>,
 
+    /// OpenAI-compatible base URL override for the provider endpoint.
     #[arg(long)]
     pub(crate) base_url: Option<String>,
 
+    /// Name of the environment variable that holds the provider API key.
     #[arg(long)]
     pub(crate) api_key_env: Option<String>,
 
+    /// Per-request timeout in seconds.
     #[arg(long)]
     pub(crate) timeout_seconds: Option<u64>,
 }
@@ -290,6 +410,104 @@ fn default_output_path(input: &std::path::Path, target: &str) -> PathBuf {
         .collect::<String>();
     let target = target.trim_matches('-');
     input.with_file_name(format!("{stem}.{target}.epub"))
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::{fs, path::PathBuf, time::SystemTime};
+
+    #[cfg(unix)]
+    fn temp_runs_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "bookforge-sweep-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("runs root creates");
+        dir
+    }
+
+    #[test]
+    fn reap_decision_never_touches_live_or_indeterminate_owners() {
+        use crate::control::OwnerLiveness::{Alive, Gone, Indeterminate};
+        assert!(!retry_override_dir_is_reapable(Alive));
+        assert!(retry_override_dir_is_reapable(Gone));
+        // Fail-closed: an owner whose liveness is indeterminate is NEVER
+        // reaped, regardless of how old its directory is — the decision takes
+        // no age input at all, so no mtime window can ever authorize deletion.
+        assert!(!retry_override_dir_is_reapable(Indeterminate));
+    }
+
+    #[test]
+    fn missing_runs_root_is_a_no_op() {
+        assert_eq!(
+            sweep_stale_retry_override_dirs(Path::new("/nonexistent/bookforge-runs")),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_dir_of_dead_owner_is_swept_alive_owner_and_content_survive() {
+        let root = temp_runs_root("unix");
+        // A pid beyond any plausible pid_max on linux/BSDs/macOS.
+        let dead_pid = u32::MAX - 1;
+        let dead_empty = root.join(format!("{RETRY_OVERRIDE_DIR_PREFIX}{dead_pid}"));
+        fs::create_dir(&dead_empty).expect("empty dead-owner dir");
+        let live_dir = root.join(format!("{RETRY_OVERRIDE_DIR_PREFIX}{}", std::process::id()));
+        fs::create_dir(&live_dir).expect("self-owned (alive) dir");
+        let busy_dead = root.join(format!("{RETRY_OVERRIDE_DIR_PREFIX}{}", u32::MAX - 2));
+        fs::create_dir(&busy_dead).expect("dead-owner with content");
+        fs::write(busy_dead.join("overrides.json"), "{}").expect("sidecar content");
+        fs::create_dir(root.join("something_else")).expect("unrelated dir");
+
+        let removed = sweep_stale_retry_override_dirs(&root);
+        assert_eq!(removed, 1, "exactly the empty dead-owner dir is swept");
+        assert!(!dead_empty.exists());
+        assert!(live_dir.exists(), "dirs of live pids are NEVER deleted");
+        assert!(busy_dead.exists(), "non-empty dirs are never deleted");
+        assert!(root.join("something_else").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_names_are_ignored_entirely() {
+        let root = temp_runs_root("junk");
+        for junk in [
+            format!("{RETRY_OVERRIDE_DIR_PREFIX}notanumber"),
+            format!("{RETRY_OVERRIDE_DIR_PREFIX}-1"),
+            RETRY_OVERRIDE_DIR_PREFIX.to_string(),
+        ] {
+            fs::create_dir(root.join(junk)).expect("junk dir");
+        }
+        assert_eq!(
+            sweep_stale_retry_override_dirs(&root),
+            0,
+            "no parseable pid means no sweep"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The sweep consults no age/mtime window at all: an indeterminate owner's
+    /// empty directory is never reaped even when it has sat untouched for a
+    /// very long time. This is structurally enforced (there is no age input to
+    /// the reap decision), so an old, stale-looking directory cannot be deleted
+    /// underneath a live suspended/future-version owner.
+    #[test]
+    fn indeterminate_owner_is_never_reaped_even_when_old() {
+        use crate::control::OwnerLiveness::Indeterminate;
+        assert!(
+            !retry_override_dir_is_reapable(Indeterminate),
+            "an indeterminate owner must never be reaped at any age"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -390,5 +608,70 @@ mod tests {
             "top-level commands without help text: {}",
             missing.join(", ")
         );
+    }
+
+    #[test]
+    fn top_level_help_documents_the_exit_code_taxonomy() {
+        let mut help = Vec::new();
+        Cli::command()
+            .write_long_help(&mut help)
+            .expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf-8");
+
+        assert!(help.contains("Exit codes"));
+        // Each documented bucket is named with its number.
+        for needle in [
+            "0 success",
+            "1 runtime failure",
+            "2 usage error",
+            "3 job finished",
+            "130 interrupted",
+        ] {
+            assert!(help.contains(needle), "help must mention `{needle}`");
+        }
+    }
+
+    /// UI-13: tri-state bool flags accept the bare form (flag alone = true)
+    /// and an explicit value (`=false` / ` false`) — the same syntax
+    /// `reconfigure` uses, instead of translate-only "value required".
+    #[test]
+    fn tri_state_flags_accept_bare_and_explicit_forms() {
+        let bare = Cli::parse_from([
+            "bookforge",
+            "translate",
+            "book.epub",
+            "--target",
+            "Italian",
+            "--compact-prompts",
+            "--retry-failed-only",
+            "--adaptive-concurrency",
+        ]);
+        match bare.command {
+            Some(Command::Translate(args)) => {
+                assert_eq!(args.compact_prompts, Some(true));
+                assert_eq!(args.retry_failed_only, Some(true));
+                assert_eq!(args.adaptive_concurrency, Some(true));
+            }
+            _ => panic!("expected translate command"),
+        }
+
+        let explicit = Cli::parse_from([
+            "bookforge",
+            "translate",
+            "book.epub",
+            "--target",
+            "Italian",
+            "--compact-prompts=false",
+            "--retry-failed-only=false",
+            "--adaptive-concurrency=false",
+        ]);
+        match explicit.command {
+            Some(Command::Translate(args)) => {
+                assert_eq!(args.compact_prompts, Some(false));
+                assert_eq!(args.retry_failed_only, Some(false));
+                assert_eq!(args.adaptive_concurrency, Some(false));
+            }
+            _ => panic!("expected translate command"),
+        }
     }
 }

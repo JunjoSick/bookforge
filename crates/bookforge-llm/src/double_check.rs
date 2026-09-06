@@ -6,6 +6,8 @@ use bookforge_core::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
+use tokio::{sync::Semaphore, task::JoinSet};
 
 use crate::{
     CompletionRequest, LlmError, LlmProvider, PromptLibrary, RequestMetadata, ResponseFormat,
@@ -195,12 +197,34 @@ where
     let chunk_size = double_check_config.batch_target_tokens.max(1);
     let chunks = chunk_double_check_items(&items, chunk_size);
 
+    // Audit LLM-9: `DoubleCheckConfig.concurrency` is now honored — chunks
+    // run as bounded concurrent tasks instead of one strictly sequential
+    // pipeline, which previously made the configured concurrency a no-op.
+    let shared_provider: Arc<P> = Arc::new(provider);
+    let shared_config: Arc<TranslationRunConfig> = Arc::new(config.clone());
+    let shared_double_check: Arc<DoubleCheckConfig> = Arc::new(double_check_config.clone());
+    let in_flight = Arc::new(Semaphore::new(double_check_config.concurrency.max(1)));
+    let mut audit_tasks = JoinSet::new();
+    for chunk in chunks {
+        let provider = shared_provider.clone();
+        let config = shared_config.clone();
+        let double_check_config = shared_double_check.clone();
+        let in_flight = in_flight.clone();
+        audit_tasks.spawn(async move {
+            let _permit = in_flight.acquire_owned().await.ok();
+            run_audit_chunk_resilient(&*provider, library, &chunk, &config, &double_check_config)
+                .await
+        });
+    }
     let mut all_issues = deterministic_issues;
-    for chunk in &chunks {
-        let audit_result =
-            run_audit_chunk_resilient(&provider, library, chunk, config, double_check_config)
-                .await?;
-        all_issues.extend(audit_result);
+    while let Some(joined) = audit_tasks.join_next().await {
+        // Stop-aware join boundary: abort before anything is persisted once
+        // the run has been told to stop.
+        ensure_not_stopped(config, "audit")?;
+        let chunk_issues = joined.map_err(|err| {
+            LlmError::Provider(format!("double-check audit task failed: {err}"))
+        })??;
+        all_issues.extend(chunk_issues);
     }
 
     if !double_check_config.auto_correct {
@@ -242,21 +266,80 @@ where
     // responses. Keep substantial prose blocks isolated even when the audit
     // itself uses a large token budget.
     let correction_chunk_size = chunk_size.min(800);
-    for corr_chunk in chunk_correction_items(&correction_items, correction_chunk_size) {
-        let original_by_id: HashMap<&str, &CorrectionItem> = corr_chunk
-            .iter()
-            .map(|item| (item.item_id.as_str(), item))
-            .collect();
-        let corr_results =
-            run_correction_chunk_resilient(&provider, library, &corr_chunk, config).await?;
-        let mut returned_ids = BTreeSet::new();
+    // Audit LLM-9: `correction_rounds` is honored for real instead of being
+    // silently ignored. Round 1 corrects everything the audit flagged; items
+    // whose correction failed validation or was omitted entirely are
+    // re-sampled against their latest text on later rounds and become
+    // unresolved records only once every round is spent.
+    let rounds = double_check_config.correction_rounds.max(1);
+    let mut pending = correction_items;
+    for round in 1..=rounds {
+        if pending.is_empty() {
+            break;
+        }
+        // Stop-aware boundary before each correction round.
+        ensure_not_stopped(config, "correction")?;
+        let final_round = round == rounds;
+        let mut correction_tasks = JoinSet::new();
+        for corr_chunk in chunk_correction_items(&pending, correction_chunk_size) {
+            let provider = shared_provider.clone();
+            let config = shared_config.clone();
+            let in_flight = in_flight.clone();
+            correction_tasks.spawn(async move {
+                let _permit = in_flight.acquire_owned().await.ok();
+                let results: Vec<CorrectionItem> =
+                    run_correction_chunk_resilient(&*provider, library, &corr_chunk, &config)
+                        .await?;
+                Ok::<_, LlmError>((corr_chunk, results))
+            });
+        }
+        let mut carry_over: Vec<CorrectionItem> = Vec::new();
+        while let Some(joined) = correction_tasks.join_next().await {
+            let (corr_chunk, corr_results) = joined.map_err(|err| {
+                LlmError::Provider(format!("double-check correction task failed: {err}"))
+            })??;
+            resolve_correction_chunk(
+                corr_chunk,
+                corr_results,
+                final_round,
+                &mut records,
+                &mut carry_over,
+            );
+        }
+        pending = std::mem::take(&mut carry_over);
+    }
 
-        for result in corr_results {
-            returned_ids.insert(result.item_id.clone());
-            let Some(original) = original_by_id.get(result.item_id.as_str()) else {
-                continue;
-            };
-            let valid = validate_correction(&result);
+    // Final boundary: never report success for a pass whose run was stopped
+    // somewhere between its begin and here.
+    ensure_not_stopped(config, "pass end")?;
+
+    Ok(records)
+}
+
+/// Fold one corrected chunk into the record list. Items that resolved leave
+/// the pipeline; failures either land as terminal records (`final_round`) or
+/// ride along for another sampling round with their newest text attached.
+fn resolve_correction_chunk(
+    corr_chunk: Vec<CorrectionItem>,
+    corr_results: Vec<CorrectionItem>,
+    final_round: bool,
+    records: &mut Vec<CorrectionRecord>,
+    carry_over: &mut Vec<CorrectionItem>,
+) {
+    let original_by_id: HashMap<&str, &CorrectionItem> = corr_chunk
+        .iter()
+        .map(|item| (item.item_id.as_str(), item))
+        .collect();
+    let mut returned_ids = BTreeSet::new();
+
+    for result in corr_results {
+        returned_ids.insert(result.item_id.clone());
+        let Some(original) = original_by_id.get(result.item_id.as_str()) else {
+            continue;
+        };
+        let valid = validate_correction(&result);
+        let resolved = matches!(valid, CorrectionStatus::Applied) || final_round;
+        if resolved {
             records.push(CorrectionRecord {
                 item_id: result.item_id.clone(),
                 segment_id: result.segment_id.clone(),
@@ -266,10 +349,16 @@ where
                 status: valid,
                 issues: result.issues.clone(),
             });
+        } else {
+            // Keep trying: retain the model's latest attempt so the next
+            // round starts from it rather than from the pre-correction text.
+            carry_over.push(result);
         }
+    }
 
-        for original in &corr_chunk {
-            if !returned_ids.contains(&original.item_id) {
+    for original in &corr_chunk {
+        if !returned_ids.contains(&original.item_id) {
+            if final_round {
                 records.push(CorrectionRecord {
                     item_id: original.item_id.clone(),
                     segment_id: original.segment_id.clone(),
@@ -279,11 +368,11 @@ where
                     status: CorrectionStatus::Unresolved,
                     issues: original.issues.clone(),
                 });
+            } else {
+                carry_over.push(original.clone());
             }
         }
     }
-
-    Ok(records)
 }
 
 fn chunk_double_check_items(
@@ -375,8 +464,11 @@ fn estimate_correction_item_tokens(item: &CorrectionItem) -> usize {
             .sum::<usize>()
 }
 
+/// Per-field text counting for double-check prompts: the canonical
+/// script-aware estimator with the historical one-token floor so tiny
+/// fields (ids, markers, spans) still reserve space in the chunk budget.
 fn estimate_text_tokens(text: &str) -> usize {
-    (text.chars().count() / 4).max(1)
+    bookforge_core::segment::estimate_tokens(text).max(1)
 }
 
 fn is_json_shape_error(error: &LlmError) -> bool {
@@ -385,6 +477,21 @@ fn is_json_shape_error(error: &LlmError) -> bool {
 
 const AUDIT_UNRESOLVED_KIND: &str = "audit_unavailable";
 const AUDIT_OMITTED_KIND: &str = "audit_omitted";
+
+/// Cooperative stop check for double-check stage boundaries
+/// (audit LLM-3/LLM-9 follow-up): a run whose control file recorded Stop at
+/// any point up to pass end must not return successful corrections and let
+/// the caller record success afterwards. The CLI's existing
+/// `Err(_) + pause_signal.is_stopped()` branch converts this into its
+/// graceful stopped path.
+fn ensure_not_stopped(config: &TranslationRunConfig, stage: &str) -> Result<(), LlmError> {
+    if let Some(signal) = config.pause_signal.as_ref()
+        && signal.is_stopped()
+    {
+        return Err(LlmError::Provider(format!("double-check {stage} stopped")));
+    }
+    Ok(())
+}
 
 fn audit_unresolved_issue(error: &LlmError) -> DoubleCheckIssue {
     DoubleCheckIssue {
@@ -515,7 +622,11 @@ where
         if !seen_ids.insert(result.id.clone()) {
             continue;
         }
-        if result.verdict == "pass" && result.issues.is_empty() {
+        // Verdicts are compared case-insensitively after validation; an
+        // unrecognized verdict already fails the `pass` short-circuit below
+        // and is therefore preserved with its issues (conservative).
+        let verdict_passes = result.verdict.trim().eq_ignore_ascii_case("pass");
+        if verdict_passes && result.issues.is_empty() {
             continue;
         }
         corrections.push(CorrectionItem {
@@ -765,7 +876,10 @@ fn double_check_mode_str(mode: bookforge_core::config::DoubleCheckMode) -> &'sta
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicIsize, Ordering},
+    };
 
     use super::{CorrectionStatus, DoubleCheckItem, chunk_double_check_items, run_double_check};
     use bookforge_core::{
@@ -873,6 +987,7 @@ mod tests {
             input_cached_tokens: Some(0),
             output_tokens: Some(6),
             tokens_estimated: false,
+            findings: Vec::new(),
         }
     }
 
@@ -1348,5 +1463,157 @@ mod tests {
         assert_eq!(chunks[0][0].id, "a");
         assert_eq!(chunks[1][0].id, "b");
         assert_eq!(chunks[2][0].id, "c");
+    }
+
+    /// Measures how many audit requests were in flight simultaneously.
+    #[derive(Clone, Default)]
+    struct ConcurrencyProbeProvider {
+        active: Arc<AtomicIsize>,
+        peak: Arc<AtomicIsize>,
+    }
+
+    impl ConcurrencyProbeProvider {
+        async fn enter(&self) {
+            let current = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.peak.fetch_max(current, Ordering::AcqRel);
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            self.active.fetch_sub(1, Ordering::AcqRel);
+        }
+
+        fn peak(&self) -> isize {
+            self.peak.load(Ordering::Acquire)
+        }
+    }
+
+    impl LlmProvider for ConcurrencyProbeProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> crate::provider::Result<CompletionResponse> {
+            self.enter().await;
+            Ok(CompletionResponse {
+                content: r#"{"items":[]}"#.to_string(),
+                input_tokens: Some(1),
+                input_cached_tokens: Some(0),
+                output_tokens: Some(0),
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 40,
+                raw: json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    fn probe_config_with_concurrency(
+        concurrency: usize,
+    ) -> (TranslationRunConfig, DoubleCheckConfig) {
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency,
+            batch_target_tokens: 1,
+            auto_correct: false,
+            correction_rounds: 1,
+        };
+        (run_config(), double_check)
+    }
+
+    fn two_probe_segments() -> Vec<Segment> {
+        vec![segment_with_id("seg_a", "a"), segment_with_id("seg_b", "b")]
+    }
+
+    #[tokio::test]
+    async fn double_check_concurrency_is_honored_not_serialized() {
+        let segments = two_probe_segments();
+        let translations = [
+            translation_with_id("seg_a", "a", "corretto a"),
+            translation_with_id("seg_b", "b", "corretto b"),
+        ];
+        // batch_target_tokens=1 forces one chunk per item: with two items and
+        // a configured concurrency of 2 the requests must overlap.
+        let (run, double_check) = probe_config_with_concurrency(2);
+        let provider = ConcurrencyProbeProvider::default();
+
+        // The stub returns an empty item list, so every id lands as
+        // audit_omitted/unresolved — irrelevant here; what matters is that
+        // both audit requests were in flight at once.
+        let records = run_double_check(
+            provider.clone(),
+            &segments,
+            &translations,
+            &run,
+            &double_check,
+        )
+        .await
+        .expect("audit should complete");
+
+        assert_eq!(records.len(), 2);
+        assert!(
+            provider.peak() >= 2,
+            "configured concurrency must produce overlapped audit requests, peak={}",
+            provider.peak()
+        );
+    }
+
+    #[tokio::test]
+    async fn second_correction_round_can_rescue_a_rejected_correction() {
+        // A copied-source translation is deterministically flagged for
+        // correction without any audit call, so the provider sequence here
+        // is purely correction rounds: first attempt echoes the source back
+        // (rejected as unchanged), the second round's re-sample succeeds.
+        let prose = "This deliberately long English paragraph remains identical so the \
+            deterministic untranslated-prose guard must route it to correction in \
+            both rounds of this fixture before it finally resolves properly.";
+        let mut source_segment = segment();
+        source_segment.source.text = prose.to_string();
+        source_segment.source.blocks[0].text = prose.to_string();
+        let copied = translation_with_id("seg", "b", prose);
+        let corrected_response = r#"{"items":[{"id":"seg:b","corrected_translation":"Questo paragrafo è stato finalmente tradotto."}]}"#;
+        let echoed_source = format!(
+            r#"{{"items":[{{"id":"seg:b","corrected_translation":{}}}]}}"#,
+            serde_json::to_string(prose).unwrap()
+        );
+
+        let double_check = DoubleCheckConfig {
+            mode: DoubleCheckMode::Formatting,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: true,
+            correction_rounds: 2,
+        };
+
+        // `SequenceProvider` hands out responses in FIFO order of this vec:
+        // round 1 receives the echoed-source rejection, round 2 the real fix.
+        let rounds_provider =
+            SequenceProvider::new(vec![echoed_source, corrected_response.to_string()]);
+        let records = run_double_check(
+            rounds_provider,
+            &[source_segment],
+            &[copied],
+            &run_config(),
+            &double_check,
+        )
+        .await
+        .expect("multi-round correction should resolve");
+
+        assert_eq!(records.len(), 1);
+        assert!(
+            matches!(records[0].status, CorrectionStatus::Applied),
+            "the second round should rescue the rejected first attempt"
+        );
+        assert_eq!(records[0].item_id, "seg:b");
     }
 }

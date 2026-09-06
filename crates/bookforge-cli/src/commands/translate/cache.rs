@@ -15,11 +15,34 @@ pub struct CacheContext<'a> {
     pub cache_namespace: &'a str,
 }
 
+/// Apply cross-job cache hits to the eligible `segments`.
+///
+/// `all_segments` is the FULL ordered segment set of the current run: the
+/// expected cache identity is computed over it because per-segment glossary
+/// selection depends on the ordered neighborhood/window, and a sparse subset
+/// (e.g. the pending candidates passed on resume) would select different terms
+/// than the original run and compute different fingerprints. `segments` is the
+/// subset the lookup is restricted to (pending, cacheable candidates).
 pub fn apply_cached_translations(
+    all_segments: &[Segment],
     segments: &[Segment],
     cache: CacheContext<'_>,
 ) -> Result<Vec<SegmentTranslation>> {
     let mut cached = Vec::new();
+
+    // The expected structured cache identity fingerprint is computed from the
+    // job's persisted run snapshot + cache policy over the FULL ordered
+    // segment set (never discovered from a prior segment row) and passed
+    // straight into the lookup for the eligible candidates only.
+    let expected_fingerprints = cache.store.expected_cache_fingerprints(
+        cache.job_id,
+        all_segments,
+        segments,
+        cache.provider,
+        cache.model,
+        cache.prompt_version,
+        cache.cache_namespace,
+    )?;
 
     let request = bookforge_store::CacheLookupRequest {
         prompt_version: cache.prompt_version,
@@ -28,6 +51,7 @@ pub fn apply_cached_translations(
         source_lang: cache.source_lang,
         target_lang: cache.target_lang,
         cache_namespace: cache.cache_namespace,
+        expected_fingerprints: &expected_fingerprints,
     };
 
     let hits = cache
@@ -60,6 +84,7 @@ pub fn apply_cached_translations(
             input_cached_tokens: None,
             output_tokens: None,
             tokens_estimated: false,
+            findings: Vec::new(),
         });
     }
     Ok(cached)

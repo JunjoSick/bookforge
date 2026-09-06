@@ -8,7 +8,7 @@ use bookforge_core::{
         render_entity_agreement_block,
     },
 };
-use bookforge_store::{JobStore, NewEntity};
+use bookforge_store::{JobStore, NewEntity, StoredEntity};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,8 @@ enum EntitiesCommand {
     List(ListArgs),
     /// Import entities from a BookForge TOML file.
     Import(ImportArgs),
+    /// Export matching entities to a BookForge TOML file.
+    Export(ExportArgs),
     /// Remove all entities in a selected scope.
     Clear(ClearArgs),
     /// Show the merged entity guidance for a translation context.
@@ -48,12 +50,33 @@ struct ImportArgs {
 }
 
 #[derive(Debug, Args)]
+struct ExportArgs {
+    file: PathBuf,
+
+    #[arg(long, value_enum)]
+    scope: Option<GlossaryScopeKind>,
+
+    #[arg(long)]
+    scope_id: Option<String>,
+
+    /// Language pair to pin, as `SOURCE->TARGET` (`:` and `/` also accepted),
+    /// matching `glossary export`.
+    #[arg(long)]
+    language: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct ClearArgs {
     #[arg(long, value_enum)]
     scope: GlossaryScopeKind,
 
     #[arg(long)]
     scope_id: Option<String>,
+
+    /// Confirm the deletion. Required so a stray Enter cannot wipe stored
+    /// guidance; nothing is removed without this flag.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -110,6 +133,7 @@ pub async fn run(args: EntitiesArgs) -> Result<()> {
     match args.command {
         EntitiesCommand::List(args) => list_entities(&store, args),
         EntitiesCommand::Import(args) => import_entities(&store, args),
+        EntitiesCommand::Export(args) => export_entities(&store, args),
         EntitiesCommand::Clear(args) => clear_entities(&store, args),
         EntitiesCommand::Show(args) => show_entities(&store, args),
     }
@@ -174,6 +198,66 @@ fn import_entities(store: &JobStore, args: ImportArgs) -> Result<()> {
     Ok(())
 }
 
+/// Mirror of `glossary export`: pull the matching rows and re-serialize them
+/// into the exact TOML schema `entities import` parses back.
+fn export_entities(store: &JobStore, args: ExportArgs) -> Result<()> {
+    let (source_language, target_language) = match args.language.as_deref() {
+        Some(language) => {
+            let (source, target) = crate::commands::glossary::parse_language_pair(language)?;
+            (Some(source), Some(target))
+        }
+        None => (None, None),
+    };
+    let stored = store.list_entities(
+        source_language.as_deref(),
+        target_language.as_deref(),
+        args.scope,
+        args.scope_id.as_deref(),
+    )?;
+    let output = entities_to_toml(&stored)?;
+    fs::write(&args.file, toml::to_string_pretty(&output)?)?;
+    println!("Exported {} entity rows.", output.entities.len());
+    Ok(())
+}
+
+fn entities_to_toml(records: &[StoredEntity]) -> Result<EntitiesToml> {
+    let Some(first) = records.first() else {
+        anyhow::bail!("no entities matched the export filters");
+    };
+    let same_tuple = records.iter().all(|record| {
+        record.scope_kind == first.scope_kind
+            && record.scope_id == first.scope_id
+            && record.source_language == first.source_language
+            && record.target_language == first.target_language
+    });
+    if !same_tuple {
+        anyhow::bail!(
+            "export matched multiple scope/language tuples; narrow with --scope, --scope-id, and --language"
+        );
+    }
+    Ok(EntitiesToml {
+        meta: EntitiesTomlMeta {
+            schema_version: 1,
+            source_language: first.source_language.clone(),
+            target_language: first.target_language.clone(),
+            scope: EntitiesTomlScope {
+                kind: first.scope_kind,
+                id: first.scope_id.clone(),
+            },
+        },
+        entities: records
+            .iter()
+            .map(|record| EntitiesTomlEntity {
+                source_name: record.source_name.clone(),
+                target_name: record.target_name.clone(),
+                gender_target: record.gender_target,
+                role: record.role.clone(),
+                notes: record.notes.clone(),
+            })
+            .collect(),
+    })
+}
+
 pub(crate) fn upsert_entities(store: &JobStore, entities: &[Entity]) -> Result<usize> {
     let rows: Vec<NewEntity<'_>> = entities
         .iter()
@@ -223,9 +307,21 @@ fn list_entities(store: &JobStore, args: ListArgs) -> Result<()> {
 
 fn clear_entities(store: &JobStore, args: ClearArgs) -> Result<()> {
     validate_scope(args.scope, args.scope_id.as_deref())?;
+    confirm_destructive_clear(args.yes, "entity")?;
     let count = store.clear_entities_scope(args.scope, args.scope_id.as_deref())?;
     println!("Cleared {count} entity rows.");
     Ok(())
+}
+
+/// Shared guard for destructive `clear` subcommands: refuse to delete stored
+/// guidance unless the caller passed an explicit `--yes`.
+fn confirm_destructive_clear(confirmed: bool, what: &str) -> Result<()> {
+    if confirmed {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to clear {what} without --yes; re-run with --yes to delete the selected scope"
+    )
 }
 
 fn show_entities(store: &JobStore, args: ShowArgs) -> Result<()> {
@@ -263,4 +359,104 @@ fn show_entities(store: &JobStore, args: ShowArgs) -> Result<()> {
     }
     let _ = entities_fingerprint(&merged); // exercise the fn for compilation symmetry
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{entities_to_toml, parse_entities_toml};
+    use bookforge_core::GlossaryScopeKind;
+    use bookforge_store::JobStore;
+
+    fn stored(
+        source_name: &str,
+        target_name: &str,
+        gender: Option<bookforge_core::EntityGender>,
+        role: Option<&str>,
+    ) -> bookforge_store::StoredEntity {
+        bookforge_store::StoredEntity {
+            id: 1,
+            scope_kind: GlossaryScopeKind::Global,
+            scope_id: None,
+            source_name: source_name.to_string(),
+            target_name: target_name.to_string(),
+            gender_target: gender,
+            role: role.map(str::to_string),
+            notes: None,
+            source_language: "English".to_string(),
+            target_language: "Italian".to_string(),
+        }
+    }
+
+    #[test]
+    fn exported_toml_reimports_same_entity_fields() {
+        let records = vec![
+            stored("Frodo", "Frodo", None, Some("ring-bearer")),
+            stored(
+                "Galadriel",
+                "Galadriel",
+                Some(bookforge_core::EntityGender::Feminine),
+                None,
+            ),
+        ];
+
+        let exported = entities_to_toml(&records).expect("entities should export");
+        let encoded = toml::to_string_pretty(&exported).expect("TOML should encode");
+        let reimported = parse_entities_toml(&encoded).expect("exported TOML should parse");
+
+        assert_eq!(reimported.len(), 2);
+        assert_eq!(reimported[0].source_name, "Frodo");
+        assert_eq!(reimported[0].role.as_deref(), Some("ring-bearer"));
+        assert_eq!(
+            reimported[0].scope_kind,
+            GlossaryScopeKind::Global,
+            "global scope must not serialize a spurious scope.id"
+        );
+        assert_eq!(reimported[1].gender_target, records[1].gender_target);
+    }
+
+    #[test]
+    fn export_refuses_empty_selections_and_mixed_tuples() {
+        assert!(entities_to_toml(&[]).is_err());
+
+        let mut mixed = vec![stored("A", "B", None, None)];
+        let mut other = stored("C", "D", None, None);
+        other.target_language = "Spanish".to_string();
+        mixed.push(other);
+        let error = entities_to_toml(&mixed).expect_err("mixed tuples must be refused");
+        assert!(error.to_string().contains("narrow with --scope"), "{error}");
+    }
+
+    #[test]
+    fn exported_rows_survive_a_full_store_roundtrip() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open(directory.path().join("jobs.sqlite")).expect("store");
+        let rows = [stored("Legolas", "Legolas", None, Some("elf"))];
+        store
+            .upsert_entities(
+                rows.iter()
+                    .map(|record| bookforge_store::NewEntity {
+                        scope_kind: record.scope_kind,
+                        scope_id: record.scope_id.as_deref(),
+                        source_name: &record.source_name,
+                        target_name: &record.target_name,
+                        gender_target: record.gender_target,
+                        role: record.role.as_deref(),
+                        notes: record.notes.as_deref(),
+                        source_language: &record.source_language,
+                        target_language: &record.target_language,
+                    })
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            )
+            .expect("rows upsert");
+        let listed = store.list_entities(None, None, None, None).expect("list");
+
+        let exported = entities_to_toml(&listed).expect("export");
+        let encoded = toml::to_string_pretty(&exported).expect("encode");
+        let reparsed = parse_entities_toml(&encoded).expect("parse back");
+        assert_eq!(reparsed.len(), listed.len());
+        assert_eq!(reparsed[0].source_name, "Legolas");
+        assert_eq!(reparsed[0].source_language, "English");
+        assert_eq!(reparsed[0].target_language, "Italian");
+    }
 }

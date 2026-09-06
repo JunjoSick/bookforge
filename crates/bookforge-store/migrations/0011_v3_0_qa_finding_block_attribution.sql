@@ -1,0 +1,21 @@
+-- v3.0: block attribution for qa_findings.
+--
+-- This file documents the schema delta; it is NOT executed at runtime
+-- (schema.rs builds the schema procedurally — see STORE-5). Migration 11 in
+-- schema.rs applies the equivalent change, gated behind a `migration_applied`
+-- check so reopened stores never take a write lock just to re-record it.
+--
+-- Audit remediation: QA findings used to lose block attribution because the
+-- CLI re-parsed engine error strings. `block_id` pins a finding to a single
+-- translated block; NULL keeps the historical segment-level meaning, so every
+-- pre-11 row reads back unattributed instead of failing loads. The column is
+-- added with the established ensure_column-style `ADD COLUMN` (no table
+-- rebuild needed for a nullable column).
+--
+-- Severity deliberately stays plain TEXT: only 'error'/'warning' may be
+-- persisted, enforced in Rust at the single insert choke point
+-- (db::findings::insert_qa_finding_row driving
+-- db::findings::validated_finding_severity), mirroring how migration 10
+-- enforces statuses where a rebuild is warranted and plain validation where
+-- one is not.
+ALTER TABLE qa_findings ADD COLUMN block_id TEXT;

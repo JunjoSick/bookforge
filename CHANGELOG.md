@@ -2,6 +2,262 @@
 
 ## Unreleased
 
+Dogfooding round on a real 400-page-scale EPUB (English→Italian, DeepSeek):
+fixes for every issue the live run surfaced.
+
+- **Latency-aware batch budgets:** batch planning caps output tokens so the
+  expected generation fits inside 80% of the request timeout, and the provider
+  extends an individual request's deadline to cover its own output budget
+  (never below the configured timeout, with a one-time log when it engages).
+  Large single-segment batches no longer race a fixed 180s deadline. A
+  slow-trickling-body regression test now proves the client timeout fires
+  mid-body instead of hanging.
+- **In-flight visibility:** `RequestProgress` heartbeats (every 5s per
+  outstanding request) make long normal generations distinguishable from a
+  stall, and `RequestStarted` gained an optional `effective_timeout_seconds`.
+- **Structured, block-attributed QA findings:** deterministic findings persist
+  with `kind`, instance severity, message, and `block_id` (migration 11).
+  Source-copy hits on title/heading/short proper-noun blocks are warnings —
+  leaving a book title or author line untranslated is editorially correct —
+  while unchanged prose stays an error. Reports, `status`, and the review page
+  prefer structured rows; legacy error strings decompose through a documented
+  parser. The CLI no longer regex-parses engine error text.
+- **Honest `estimate --pass-costs`:** per-pass surcharge lines plus a real
+  `Estimated total incl. passes` (the old line printed the surcharge alone,
+  less than the primary estimate). JSON events gained
+  `est_cost_usd_passes`/`est_cost_usd_total`.
+- **Supervised retries:** `retry` gains `--ui`, spawns a supervised
+  replacement worker whose deaths are surfaced (`replacement_worker_died`
+  events with exit status and stderr tail), respawn with exponential backoff,
+  and bounded give-up that marks the job honestly. Root-caused and fixed the
+  silent respawn loop from the dogfood run: the dashboard resume path held
+  the runtime launch claim across child spawn, so every replacement worker
+  bailed instantly on the claim check with its stderr discarded.
+- **Friendly validation errors:** persisted error text no longer leaks raw
+  serde internals ("missing field `translation` at line 1 column 157");
+  categorized plain-language sentences instead, with raw detail in debug logs.
+- `--no-thinking` and the provider connection flags gained real help text.
+
+## v3.0.0 (unreleased — release candidate)
+
+> **Version note (2026-08-31):** this section is a **release candidate**, not a
+> shipped release. The v3.0.0 campaign lives on branch
+> `remediation/audit-2026-08` (commit `aa90d94`), is **not merged to `main`**
+> (PR #112 open/blocked), and has **no tag or release**. The latest published
+> release remains **v2.6.1**. The content below describes what the v3.0.0
+> candidate contains once it ships; until then none of it is installable as v3.
+> Tracking: `docs/AUDIT-2026-08-31.md`.
+
+Remediation campaign for the 2026-08 deep audit (`docs/report.md`, waves 0–4):
+security hardening around the local dashboard, reliability repairs in the
+checkpoint/resume lifecycle, translation-quality work, audio/PDF fixes,
+breaking JSON/CLI surface changes, and corrections to two audit findings that
+turned out wrong. See `docs/HANDOFF-2026-08.md` (historical, release-candidate
+record) for the wave-by-wave detail.
+
+### Security
+
+- **Security:** the browser dashboard authenticates by default. The server
+  prints a one-time bootstrap URL containing its session token, and every
+  route beyond that page requires the token in the `x-bookforge-csrf` header —
+  closing the hole where any local process could harvest a token from `/` and
+  spend remembered provider keys. `--no-auth` restores unauthenticated serving
+  for consoles-only environments.
+- **Security:** `.bookforge` roots are created private (0700 on Unix) from the
+  first moment, pre-existing loose components are tightened at startup,
+  dashboard-uploaded EPUBs are written 0600, and estimate-upload parsing uses
+  unpredictable owner-only temporary directories that self-delete.
+- **Security:** cancel requests check whether the stored worker PID is alive
+  before any process action, so PID reuse can no longer kill unrelated trees.
+- **Security:** job ids passed through dashboard routes are strictly
+  allowlisted before reaching filesystem paths, blocking traversal-shaped
+  reads of arbitrary files.
+- **Security:** concurrent dashboard launches are capped, protecting against
+  many parallel billable runs sharing remembered keys, and every launch runs
+  behind a panic boundary so a crash cannot take the server down mid-run.
+- **Security:** book text enters prompts inside fenced, sanitized context
+  blocks instead of unfenced sections, shrinking the prompt-injection surface
+  while validation still bounds structural damage.
+- **Security:** archive reads for `reflow` and `validate` now go through the
+  same decompression budget as translation parsing — no CLI command remains
+  that an under-declared zip entry can OOM.
+- Infrastructure hardening: CI gains a least-privilege permissions block,
+  SHA-pinned actions, and a checksum-verified EPUBCheck download; zip is built
+  deflate-only on the pure-Rust zlib-rs backend (drops the zstd-sys C
+  toolchain requirement); explicit ignore rules cover test-key files and
+  editor scratch directories.
+
+### Reliability
+
+- Human corrections are frozen by SQL inside single immediate transactions:
+  `INSERT … WHERE human_corrected = 0` guarantees neither the CLI worker nor a
+  dashboard job racing the same segment can overwrite an accepted correction,
+  including during deliberate double-runs via `resume --force`.
+- Each segment checkpoint commits as one transaction instead of three to five
+  separate autocommits, removing crash windows between related writes.
+- One malformed batch response can no longer abort a paid run. Failures
+  carrying the phantom `"unknown"` segment id are re-attributed to the actual
+  requested segment (or dropped with a warning when unattributable), and the
+  checkpoint writer survives per-command errors: each poisoned command is
+  logged as an error event and skipped, with a final
+  `checkpoint_dropped_commands` warning totaling what was lost versus saved.
+- Resume tells the truth again. Completion is decided from persisted segment
+  statuses — not merely from rebuilt blocks — so jobs whose segments failed
+  again during resume no longer report `succeeded`, and dead-row failures are
+  surfaced. Hard command errors mark jobs `failed` instead of leaving them
+  stuck `running`.
+- Plain `resume` acquires a worker lease just like the dashboard, preventing
+  two live workers from doubling provider spend on the same job.
+- The pause/stop watcher owns one long-lived store connection instead of
+  reopening and fully migrating SQLite roughly ten times per second for the
+  life of every run.
+- Interrupting matters everywhere: Ctrl+C during `resume` cancels cleanly, an
+  attached TUI quit passes cancellation through, and late pause/stop requests
+  can no longer rewrite terminal outcomes in the completion window.
+- Exit codes are a stable documented taxonomy: `0` success/intentional stop,
+  `1` runtime failure, `2` usage error, `3` finished-with-unresolved-segments,
+  `130` interrupted. `doctor` exits non-zero on failed checks with `--no-fail`
+  preserving green scripts.
+- Store hardening: job and segment statuses gain typed enums at the boundary
+  enforced by CHECK constraints (migration 10, defensive `Unknown` decode);
+  the bundled SQL migration files become documented-and-parity-guarded rather
+  than silently drifted; retention groundwork lands as the store API
+  `JobStore::prune_jobs` (age/count/dry-run, running jobs protected per
+  deletion; a user-facing command is planned separately); file hashing
+  streams in chunks instead of reading whole EPUBs into RAM; startup sweeps
+  empty `retry_pending_overrides_<pid>` directories whose owner process is
+  gone.
+
+### Quality and performance
+
+- One canonical script-aware token estimator (`bookforge_core::token_estimate::estimate_tokens`)
+  replaces eight divergent per-crate helpers (chars/4, bytes/4, words×4/3,
+  dominant-case-class weighting) across batch packing, scheduler context
+  budgets, glossary selection, QA and double-check chunking, the EPUB reader,
+  provider mocks, and the judge examples. Unspaced-script characters (Han,
+  Kana, Hangul) weigh one token each; everything else keeps the classic four
+  characters per token, so mixed-script text is priced by proportion instead of
+  a whole-text verdict. `CACHE_KEY_SCHEMA_VERSION` bumps to v3 and glossary
+  fingerprint payloads to schema 2, invalidating cached translations produced
+  under differently-sized segment groupings or glossary packing.
+- Output-token budgets are honored uniformly: the effective ceiling is the
+  smaller of the user cap and the context remainder, floors apply to net
+  output, and batch and single-segment paths behave identically.
+- Transient batch retries are paced with backoff and classify 408/425 as
+  retryable; malformed JSON responses tolerate markdown fences and trailing
+  prose, avoiding needless split/retry churn.
+- Double-check concurrency settings are actually used; multiple correction
+  rounds run for real, and applied corrections persist transactionally with a
+  visible persistence marker before terminal events drain.
+- Long prompts stopped shipping mojibake em-dashes; seven templates were
+  repaired and a guard test keeps them clean.
+- EPUB internals: script/style/svg/math content is suppressed as verbatim
+  paired markers instead of being absorbed as translatable inline text;
+  marker nesting is depth-capped; sixteen divergent helper implementations
+  collapsed into one platform-neutral utility; validation matches extensions
+  case-insensitively and checks each file once.
+- Script-aware source-copy detection replaces the heuristic's Latin biases.
+- Terminal surfaces sanitize external text, unify tri-state flag syntax,
+  keep `--ui json` stdout free of human chatter, emit honest
+  `DroppedEvents` records when events are lost, and rebaseline rate/ETA on
+  resume epochs.
+- Pricing loaders and provider/model defaults collapsed into one
+  `bookforge_core::providers` registry (CLI wrappers, judge examples, and the
+  glossary base-url table all consume it); bundled pricing JSON lives in a
+  single package-owned copy instead of three divergent tree paths; `estimate`
+  gains an optional `--pass-costs` breakdown covering QA/double-check/repair
+  planning heuristics (`--double-check-passes`, `--repair-share`).
+- Dead code removed after caller verification: unused core config/marker/
+  entity/IR helpers, several CLI-only store/test plumbing pieces, PDF's dead
+  image-type arms, and a wide slice of audiobook crate internals (public
+  serde/report schemas untouched); the cache namespace gains its missing
+  glossary domain separator.
+
+### Audio
+
+- A transient network failure during ElevenLabs auto-model selection now
+  degrades deterministically to the cheapest suitable tier (never Eleven v3 or
+  another premium tier) instead of failing open to Multilingual v2 pricing;
+  the deterministic choice keeps resumed runs cache-compatible, and library
+  consumers see `degraded: true` plus a reason.
+- Audiobook output directories are locked cross-process while a build runs;
+  concurrent invocations fail fast instead of corrupting manifests or pruning
+  the other run's paid chunks, and stale locks left by dead processes are
+  reclaimed automatically.
+- Sentence chunking understands CJK punctuation (`。！？`) and stops cutting CJK
+  prose mid-word and English sentences after abbreviations such as "Mr.".
+- ffmpeg never blocks waiting for terminal input (`-nostdin`, null stdin),
+  runs under timeouts, and is killed-and-reaped when hung; `--loudnorm`
+  normalizes per-chapter intermediates so chapter markers track the published
+  audio, and silently ignored options now warn loudly instead.
+- `--prune` sweeps crash debris (interrupted `.part.tmp` writes, legacy
+  `.replace.bak` backups, staged concat inputs) while never deleting managed
+  outputs or lock files.
+
+### PDF
+
+- Temporary working directories are cleaned up through RAII even when figure
+  or media passes fail early; successful OCR no longer wipes figure blocks
+  anchored on the same pages; running-header removal is accounted for before
+  coverage thresholds fire spurious OCR.
+- Generated conversion artifacts gain deterministic content-hashed UIDs,
+  respect `SOURCE_DATE_EPOCH`, and build their table of contents from the
+  detected heading structure; caption detection warns when non-English labels
+  will be missed; render sizes and OCR request bodies are capped.
+- RTL lines (Arabic/Hebrew) emerge in logical reading order via a line-level
+  bidi pass; dominant-RTL pages report `rtl_dominant` and stop skewing the
+  coverage metric with embedding controls; justified-CJK kinsoku continuations
+  merge across pages without invented spaces; caption detection now covers
+  CJK typed prefixes (図/图/圖/表), a language-neutral lead-word fallback, and
+  fullwidth ordinals — the foreign-caption warning fires only for numeral
+  systems outside that repertoire.
+- A PopplerBackend seam plus an in-process fake poppler drive the conversion
+  test matrix on any OS, so env-scrubbing, timeouts, pipes, and cleanup claims
+  no longer ship untested on Windows (TEST-2/PDF-2).
+
+### Breaking-ish changes
+
+Automation consumers: `--ui json` stdout now carries a versioned envelope
+(UI-23). Every line is `{"v":2,"kind":"event"|"audiobook","payload":{…}}`:
+
+- `translate --ui json` and `resume --ui json`: each line previously was a raw
+  `ProgressEvent` object; it is now `kind:"event"` with that same object as
+  `payload`. Update parsers to read `payload`.
+- `audiobook --ui json`: each line previously was a raw `{"event":"…",…}`
+  object; it is now `kind:"audiobook"` with that object unchanged as
+  `payload`.
+- Scripts pinned to the old shapes can pass `--ui json-v1`, a deprecated alias
+  that reproduces the raw v1 streams byte-for-byte. The persisted
+  `events.jsonl` file log, `tail <job-id> --json`, and dashboard SSE frames are
+  **unchanged**. See `docs/events.md` for the full contract and stream table.
+- Rendering consolidation (UI-31): all four dashboards (TUI, progress bars,
+  `tail` reconstruction, serve folds) now share one RunState+EpochTracker view
+  and formatter set. Visible nits: an ETA of zero/unknown renders as `—`
+  instead of `0s` in the bars' rate line, and `tail`'s human reconstruction
+  block gained a `status:` row using the shared status vocabulary. Counts,
+  rates, and ETA values were already cross-checked by the wave-2 epoch tests
+  and remain identical otherwise.
+- `glossary clear`, `style clear`, and `entities clear` now require an
+  explicit `--yes` before they destroy data.
+- `doctor` exits non-zero when health checks fail (see Reliability) — scripts
+  that treated a failed check as green need `--no-fail`.
+- The dashboard authenticates by default (see Security): scripts driving the
+  loopback API without the session token receive `401`. `--no-auth` opts out.
+- The `bookforge-audio` crate's internal surface was trimmed: narration text
+  helpers (`Chapter::text`, `chunk_text`, `chapters_from_book`), ElevenLabs
+  constants/`fetch_elevenlabs_subscription_with_key`/`resolve_preferred_elevenlabs_model`
+  (superseded by `*_reported_with_cancel` variants), and
+  `single_file_ffmpeg_args` are no longer public. The serde report/manifest
+  schemas are unchanged.
+
+### Audit corrections
+
+- PDF-1 was refuted: `cargo test -p bookforge-pdf` compiles and runs on
+  Windows, and the ungated tests touch none of the cfg(unix) helpers.
+- PDF-4 was refuted with poppler 26.08 evidence: adding `-i` to pdftohtml
+  strips the image-placement tags the converter relies on, so the flag stays
+  absent deliberately.
+
 ## v2.6.1 - 2026-07-21
 
 - **Security:** ElevenLabs keys are no longer passed to the quota lookup through

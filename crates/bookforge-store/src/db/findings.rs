@@ -2,62 +2,58 @@ use super::*;
 
 use std::collections::BTreeMap;
 
+pub use bookforge_core::finding::EngineFinding;
 pub use bookforge_core::ir::QaFindingSeverity;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum QaFindingKind {
-    ProtectedSpanMissing,
-    InlineMarkerMissing,
-    InlineMarkerDuplicated,
-    InlineMarkerUnknown,
-    MarkerStructure,
-    BatchBlockMismatch,
-    SourceCopyUnchanged,
-    TargetLanguageGate,
-    ProviderError,
-    Interrupted,
-    Other,
-}
-
-impl QaFindingKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ProtectedSpanMissing => "protected_span_missing",
-            Self::InlineMarkerMissing => "inline_marker_missing",
-            Self::InlineMarkerDuplicated => "inline_marker_duplicated",
-            Self::InlineMarkerUnknown => "inline_marker_unknown",
-            Self::MarkerStructure => "marker_structure",
-            Self::BatchBlockMismatch => "batch_block_mismatch",
-            Self::SourceCopyUnchanged => "source_copy_unchanged",
-            Self::TargetLanguageGate => "target_language_gate",
-            Self::ProviderError => "provider_error",
-            Self::Interrupted => "interrupted",
-            Self::Other => "other",
-        }
-    }
-
-    pub fn severity(self) -> QaFindingSeverity {
-        match self {
-            Self::ProtectedSpanMissing
-            | Self::InlineMarkerMissing
-            | Self::InlineMarkerDuplicated
-            | Self::InlineMarkerUnknown
-            | Self::MarkerStructure
-            | Self::BatchBlockMismatch
-            | Self::ProviderError
-            | Self::Other => QaFindingSeverity::Error,
-            Self::SourceCopyUnchanged | Self::TargetLanguageGate | Self::Interrupted => {
-                QaFindingSeverity::Warning
-            }
-        }
-    }
-}
+// Canonical finding vocabulary (audit remediation): moved to
+// `bookforge_core::finding` so the engine, the store, and the CLI all share
+// one definition — the CLI used to re-parse engine error strings because the
+// classification lived here. This re-export keeps every historical item path
+// (`bookforge_store::QaFindingKind`, `bookforge_store::db::QaFindingKind`, and
+// `bookforge_store::db::findings::QaFindingKind`) resolving unchanged.
+pub use bookforge_core::finding::QaFindingKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QaFinding {
     pub kind: QaFindingKind,
     pub severity: QaFindingSeverity,
     pub message: String,
+    pub block_id: Option<String>,
+}
+
+impl QaFinding {
+    /// Build a finding with the kind's [`QaFindingKind::default_severity`]
+    /// and no block attribution; override per instance via
+    /// [`Self::with_severity`] / [`Self::with_block_id`].
+    pub fn new(kind: QaFindingKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            severity: kind.default_severity(),
+            message: message.into(),
+            block_id: None,
+        }
+    }
+
+    pub fn with_severity(mut self, severity: QaFindingSeverity) -> Self {
+        self.severity = severity;
+        self
+    }
+
+    pub fn with_block_id(mut self, block_id: impl Into<String>) -> Self {
+        self.block_id = Some(block_id.into());
+        self
+    }
+}
+
+impl From<EngineFinding> for QaFinding {
+    fn from(finding: EngineFinding) -> Self {
+        Self {
+            kind: finding.kind,
+            severity: finding.severity,
+            message: finding.message,
+            block_id: finding.block_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +63,18 @@ pub struct StoredQaFinding {
     pub kind: String,
     pub severity: String,
     pub message: String,
+    /// Block attribution (persisted since migration 11). Segment-level
+    /// findings and legacy rows read `None`.
+    pub block_id: Option<String>,
+}
+
+impl StoredQaFinding {
+    /// Typed decode of the stored kind string. Unknown legacy values decode
+    /// to [`QaFindingKind::Other`] instead of failing the load; the raw text
+    /// stays in [`Self::kind`] for read transparency.
+    pub fn finding_kind(&self) -> QaFindingKind {
+        QaFindingKind::from_db_str(&self.kind)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,11 +124,11 @@ pub fn classify_segment_error(error: &str) -> Vec<QaFinding> {
             previous.message.push_str(fragment);
             continue;
         }
-        findings.push(QaFinding {
-            kind,
-            severity: explicit_severity.unwrap_or_else(|| kind.severity()),
-            message: fragment.to_string(),
-        });
+        let mut finding = QaFinding::new(kind, fragment);
+        if let Some(severity) = explicit_severity {
+            finding.severity = severity;
+        }
+        findings.push(finding);
     }
     findings
 }
@@ -225,6 +233,57 @@ pub fn aggregate_findings(findings: impl IntoIterator<Item = QaFinding>) -> Vec<
     breakdown
 }
 
+/// The only severities `qa_findings.severity` accepts. CHECK-style guard in
+/// Rust — mirroring how migration 10 enforces statuses without a rebuild for
+/// every table: every findings insert funnels through
+/// [`insert_qa_finding_row`], so a typo'd or foreign severity can never be
+/// persisted and silently misbucket findings downstream.
+const FINDING_SEVERITY_DB_TEXTS: &[&str] = &["error", "warning"];
+
+/// Validate a severity string at the insert boundary. Returns the canonical
+/// `&'static str` so callers cannot accidentally write through a temporary.
+pub(super) fn validated_finding_severity(value: &str) -> Result<&'static str> {
+    match value {
+        "error" => Ok(QaFindingSeverity::Error.as_str()),
+        "warning" => Ok(QaFindingSeverity::Warning.as_str()),
+        other => Err(StoreError::Serialization(format!(
+            "qa finding severity must be one of {FINDING_SEVERITY_DB_TEXTS:?}, got {other:?}"
+        ))),
+    }
+}
+
+/// The single INSERT choke point for `qa_findings` rows. Every write path —
+/// deterministic error-text classification, structured engine findings, LLM
+/// review rows, and the migration-8 backfill — goes through here so the
+/// severity guard cannot be bypassed and block attribution stays uniform.
+pub(super) struct NewQaFindingRow<'a> {
+    pub id: &'a str,
+    pub segment_id: &'a str,
+    pub job_id: &'a str,
+    pub severity: &'a str,
+    pub kind: &'a str,
+    pub message: &'a str,
+    pub block_id: Option<&'a str>,
+}
+
+pub(super) fn insert_qa_finding_row(conn: &Connection, row: NewQaFindingRow<'_>) -> Result<usize> {
+    let severity = validated_finding_severity(row.severity)?;
+    Ok(conn.execute(
+        "INSERT OR REPLACE INTO qa_findings
+         (id, segment_id, job_id, severity, kind, message, block_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            row.id,
+            row.segment_id,
+            row.job_id,
+            severity,
+            row.kind,
+            row.message,
+            row.block_id,
+        ],
+    )?)
+}
+
 impl JobStore {
     /// Replace the stored findings for one segment with the classification of
     /// `error`. Returns how many rows were written.
@@ -234,44 +293,30 @@ impl JobStore {
         segment_id: &str,
         error: &str,
     ) -> Result<usize> {
-        let findings = classify_segment_error(error);
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
-        let exists = tx.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM segments WHERE job_id = ?1 AND id = ?2
-             )",
-            params![job_id, segment_id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !exists {
-            return Ok(0);
-        }
-
-        tx.execute(
-            "DELETE FROM qa_findings
-             WHERE job_id = ?1 AND segment_id = ?2 AND kind NOT GLOB 'llm_*'",
-            params![job_id, segment_id],
-        )?;
-        for (index, finding) in findings.iter().enumerate() {
-            let hash = stable_hash(&format!("{job_id}\u{1f}{segment_id}\u{1f}{index}"));
-            let id = format!("qaf_{}", &hash[..24]);
-            tx.execute(
-                "INSERT OR REPLACE INTO qa_findings
-                 (id, segment_id, job_id, severity, kind, message)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    id,
-                    segment_id,
-                    job_id,
-                    finding.severity.as_str(),
-                    finding.kind.as_str(),
-                    finding.message,
-                ],
-            )?;
-        }
+        let written = record_segment_findings_on(&tx, job_id, segment_id, error)?;
         tx.commit()?;
-        Ok(findings.len())
+        Ok(written)
+    }
+
+    /// Replace the stored deterministic findings for one segment with the
+    /// given structured engine findings — the canonical
+    /// `bookforge_core::finding::EngineFinding` contract. Each row persists
+    /// its per-instance severity (the engine may override the kind's default)
+    /// and its block attribution when the finding can be pinned to a single
+    /// block. LLM-review findings are never disturbed.
+    pub fn record_segment_engine_findings(
+        &self,
+        job_id: &str,
+        segment_id: &str,
+        findings: &[EngineFinding],
+    ) -> Result<usize> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        let written = record_segment_engine_findings_on(&tx, job_id, segment_id, findings)?;
+        tx.commit()?;
+        Ok(written)
     }
 
     /// Replace the LLM-review findings for a job without disturbing findings
@@ -312,11 +357,17 @@ impl JobStore {
                 "{job_id}\u{1f}llm\u{1f}{segment_id}\u{1f}{kind}\u{1f}{index}"
             ));
             let id = format!("qaf_{}", &hash[..24]);
-            inserted += tx.execute(
-                "INSERT INTO qa_findings
-                 (id, segment_id, job_id, severity, kind, message)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![id, segment_id, job_id, severity, kind, message],
+            inserted += insert_qa_finding_row(
+                &tx,
+                NewQaFindingRow {
+                    id: &id,
+                    segment_id,
+                    job_id,
+                    severity,
+                    kind: &kind,
+                    message,
+                    block_id: None,
+                },
             )?;
         }
         tx.commit()?;
@@ -328,12 +379,7 @@ impl JobStore {
     /// to NULL). LLM-review findings have their own replacement lifecycle.
     pub fn clear_segment_findings(&self, job_id: &str, segment_id: &str) -> Result<()> {
         let conn = self.conn.borrow();
-        conn.execute(
-            "DELETE FROM qa_findings
-             WHERE job_id = ?1 AND segment_id = ?2 AND kind NOT GLOB 'llm_*'",
-            params![job_id, segment_id],
-        )?;
-        Ok(())
+        clear_segment_findings_on(&conn, job_id, segment_id)
     }
 
     /// Drop stale error findings for segments that no longer carry an error.
@@ -357,7 +403,7 @@ impl JobStore {
     pub fn segment_qa_findings(&self, job_id: &str) -> Result<Vec<StoredQaFinding>> {
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
-            "SELECT id, segment_id, kind, severity, message
+            "SELECT id, segment_id, kind, severity, message, block_id
              FROM qa_findings
              WHERE job_id = ?1
              ORDER BY segment_id, id",
@@ -369,6 +415,7 @@ impl JobStore {
                 kind: row.get(2)?,
                 severity: row.get(3)?,
                 message: row.get(4)?,
+                block_id: row.get(5)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()

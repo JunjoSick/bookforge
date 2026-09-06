@@ -2,8 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::Write,
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    path::Path,
 };
 
 use bookforge_core::{
@@ -17,9 +16,19 @@ use quick_xml::{
     Reader, Writer,
     events::{BytesEnd, BytesText, Event},
 };
-use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
+use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
-use crate::archive_limits::{ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, validate_archive_metadata};
+use crate::{
+    archive_limits::{
+        ArchiveReadBudget, DEFAULT_ARCHIVE_LIMITS, preflight_archive_path, read_archive_text,
+        validate_archive_metadata,
+    },
+    util::{
+        MAX_MARKER_DEPTH, attr_value_unescaped, commit_staged_output, create_sibling_work_file,
+        deterministic_zip_time, is_xhtml_resource_name, join_epub_path, local_name, marker_id,
+        never_translate_element, normalize_translation_entities, package_base_dir, validate_xml,
+    },
+};
 
 const TRANSLATION_CLASS: &str = "bookforge-translation";
 const HEADING_TRANSLATION_CLASS: &str = "bookforge-heading-translation";
@@ -63,28 +72,14 @@ pub fn rebuild_epub(book: &Book, translations: &[BlockTranslation], output: &Pat
     rebuild_epub_with_options(book, translations, output, &RebuildOptions::default())
 }
 
-pub fn rebuild_epub_with_language(
-    book: &Book,
-    translations: &[BlockTranslation],
-    output: &Path,
-    target_language: Option<&str>,
-) -> Result<()> {
-    rebuild_epub_with_options(
-        book,
-        translations,
-        output,
-        &RebuildOptions::replace_with_target_language(target_language),
-    )
-}
-
 pub fn rebuild_epub_with_options(
     book: &Book,
     translations: &[BlockTranslation],
     output: &Path,
     options: &RebuildOptions,
 ) -> Result<()> {
-    let staged = sibling_work_path(output, "tmp");
-    let result = write_rebuilt_epub(book, translations, &staged, options);
+    let (staged, staged_file) = create_sibling_work_file(output, "tmp")?;
+    let result = write_rebuilt_epub(book, translations, staged_file, options);
     let skipped = match result {
         Ok(skipped) => skipped,
         Err(error) => {
@@ -92,7 +87,7 @@ pub fn rebuild_epub_with_options(
             return Err(error);
         }
     };
-    if let Err(error) = commit_staged_output(&staged, output) {
+    if let Err(error) = commit_staged_output_wrapper(&staged, output) {
         let _ = fs::remove_file(&staged);
         return Err(error);
     }
@@ -110,16 +105,16 @@ pub fn rebuild_epub_with_options(
 fn write_rebuilt_epub(
     book: &Book,
     translations: &[BlockTranslation],
-    output: &Path,
+    output_file: File,
     options: &RebuildOptions,
 ) -> Result<usize> {
     let source_path = book.source_path.as_deref().ok_or_else(|| {
         BookforgeError::InvalidInput("book IR does not include a source EPUB path".to_string())
     })?;
     let source = File::open(source_path)?;
+    preflight_archive_path(source_path)?;
     let mut archive = ZipArchive::new(source)?;
     let mut read_budget = validate_archive_metadata(&mut archive, DEFAULT_ARCHIVE_LIMITS)?;
-    let output_file = File::create(output)?;
     let mut writer = ZipWriter::new(output_file);
 
     let translations_by_block = translations
@@ -149,22 +144,32 @@ fn write_rebuilt_epub(
 
     write_mimetype_first(&mut archive, &mut writer, &mut read_budget)?;
 
-    let deflated = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .last_modified_time(deterministic_zip_time());
     let mut total_skipped = 0usize;
     for index in 0..archive.len() {
-        let file = archive.by_index_raw(index)?;
-        let name = file.name().to_string();
+        // A raw (metadata-only) handle answers cheap questions — name,
+        // directory-ness, declared compression — before any bytes move.
+        let raw = archive.by_index_raw(index)?;
+        let name = raw.name().to_string();
 
         if name == "mimetype" {
             continue;
         }
 
-        if file.is_dir() {
-            writer.add_directory(name, deflated)?;
+        if raw.is_dir() {
+            writer.add_directory(name, normalized_entry_options(CompressionMethod::Deflated))?;
             continue;
         }
+
+        // `raw_copy_file` would replay the source entry's original
+        // timestamp, breaking output determinism; every entry is therefore
+        // rewritten through the bounded read with fixed epoch metadata and
+        // its compression method preserved (stored stays stored, anything
+        // else is deflated).
+        let compression_method = match raw.compression() {
+            CompressionMethod::Stored => CompressionMethod::Stored,
+            _ => CompressionMethod::Deflated,
+        };
+        drop(raw);
 
         let requires_rebuild = patches_by_href.contains_key(name.as_str())
             || (name == book.id.0
@@ -175,11 +180,12 @@ fn write_rebuilt_epub(
                 && matches!(options.mode, BilingualMode::Replace)
                 && is_xhtml_resource_name(name.as_str()));
         if !requires_rebuild {
-            writer.raw_copy_file(file)?;
+            let bytes = read_archive_bytes(&mut archive, &mut read_budget, &name)?;
+            writer.start_file(name.clone(), normalized_entry_options(compression_method))?;
+            writer.write_all(&bytes)?;
             continue;
         }
 
-        drop(file);
         let mut file = archive.by_index(index)?;
         let compressed_size = file.compressed_size();
         let bytes = read_budget.read_entry(&mut file, &name, compressed_size)?;
@@ -259,12 +265,15 @@ fn write_rebuilt_epub(
             output_bytes = xhtml.into_bytes();
         }
 
-        writer.start_file(name, deflated)?;
+        writer.start_file(name, normalized_entry_options(compression_method))?;
         writer.write_all(&output_bytes)?;
     }
 
     if let Some(plan) = stylesheet {
-        writer.start_file(plan.archive_path, deflated)?;
+        writer.start_file(
+            plan.archive_path,
+            normalized_entry_options(CompressionMethod::Deflated),
+        )?;
         writer.write_all(plan.content.as_bytes())?;
     }
 
@@ -273,45 +282,20 @@ fn write_rebuilt_epub(
     Ok(total_skipped)
 }
 
-fn commit_staged_output(staged: &Path, output: &Path) -> Result<()> {
-    if !output.exists() {
-        fs::rename(staged, output)?;
-        return Ok(());
-    }
-
-    let backup = sibling_work_path(output, "backup");
-    fs::rename(output, &backup)?;
-    match fs::rename(staged, output) {
-        Ok(()) => {
-            if let Err(error) = fs::remove_file(&backup) {
-                tracing::warn!(
-                    backup = %backup.display(),
-                    error = %error,
-                    "rebuilt EPUB is committed but its backup could not be removed"
-                );
-            }
-            Ok(())
-        }
-        Err(error) => {
-            let _ = fs::rename(&backup, output);
-            Err(error.into())
-        }
-    }
+fn commit_staged_output_wrapper(staged: &Path, output: &Path) -> Result<()> {
+    commit_staged_output("rebuilt", staged, output)
 }
 
-fn sibling_work_path(output: &Path, label: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let name = output
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("book.epub");
-    output.with_file_name(format!(
-        ".{name}.bookforge-{label}-{}-{nonce}",
-        std::process::id()
-    ))
+/// Bounded decompression of one entry to bytes (UTF-8 not required:
+/// resources may be fonts or images).
+fn read_archive_bytes(
+    archive: &mut ZipArchive<File>,
+    read_budget: &mut ArchiveReadBudget,
+    name: &str,
+) -> Result<Vec<u8>> {
+    let mut file = archive.by_name(name)?;
+    let compressed_size = file.compressed_size();
+    read_budget.read_entry(&mut file, name, compressed_size)
 }
 
 fn write_mimetype_first(
@@ -319,24 +303,25 @@ fn write_mimetype_first(
     writer: &mut ZipWriter<File>,
     read_budget: &mut ArchiveReadBudget,
 ) -> Result<()> {
-    let mut file = source.by_name("mimetype")?;
-    let compressed_size = file.compressed_size();
-    let bytes = read_budget.read_entry(&mut file, "mimetype", compressed_size)?;
-    let mimetype = String::from_utf8(bytes).map_err(|error| {
-        BookforgeError::InvalidInput(format!("EPUB mimetype is not UTF-8: {error}"))
-    })?;
+    let mimetype = read_archive_text(source, read_budget, "mimetype")?;
     if mimetype.trim() != "application/epub+zip" {
         return Err(BookforgeError::InvalidInput(
             "EPUB mimetype must be application/epub+zip".to_string(),
         ));
     }
 
-    let stored = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Stored)
-        .last_modified_time(deterministic_zip_time());
+    let stored = normalized_entry_options(CompressionMethod::Stored);
     writer.start_file("mimetype", stored)?;
     writer.write_all(b"application/epub+zip")?;
     Ok(())
+}
+
+/// Per-entry output options: timestamps are always the fixed DOS epoch so
+/// rebuilt archives stay deterministic regardless of source metadata.
+fn normalized_entry_options(compression_method: CompressionMethod) -> SimpleFileOptions {
+    SimpleFileOptions::default()
+        .compression_method(compression_method)
+        .last_modified_time(deterministic_zip_time())
 }
 
 fn archive_entry_names(archive: &mut ZipArchive<File>) -> Result<HashSet<String>> {
@@ -345,10 +330,6 @@ fn archive_entry_names(archive: &mut ZipArchive<File>) -> Result<HashSet<String>
         names.insert(archive.by_index_raw(index)?.name().to_string());
     }
     Ok(names)
-}
-
-fn deterministic_zip_time() -> DateTime {
-    DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("DOS epoch timestamp should be valid")
 }
 
 #[derive(Debug, Clone)]
@@ -455,20 +436,6 @@ span.bookforge-translation[lang="ko"] {
     }
 }
 
-fn package_base_dir(path: &str) -> String {
-    path.rsplit_once('/')
-        .map(|(base, _)| base.to_string())
-        .unwrap_or_default()
-}
-
-fn join_epub_path(base: &str, href: &str) -> String {
-    if base.is_empty() {
-        href.to_string()
-    } else {
-        format!("{base}/{href}")
-    }
-}
-
 fn relative_href(from_file: &str, target_file: &str) -> String {
     let from_parts = from_file.split('/').collect::<Vec<_>>();
     let target_parts = target_file.split('/').collect::<Vec<_>>();
@@ -498,17 +465,6 @@ fn relative_href(from_file: &str, target_file: &str) -> String {
     } else {
         out.join("/")
     }
-}
-
-fn is_xhtml_resource_name(name: &str) -> bool {
-    name.rsplit_once('.')
-        .map(|(_, extension)| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "xhtml" | "html" | "htm"
-            )
-        })
-        .unwrap_or(false)
 }
 
 fn patches_by_href<'a>(
@@ -560,6 +516,9 @@ fn patch_opf_for_rebuild(
     Ok(patched)
 }
 
+/// Replace-mode language patch rewrites only the PRIMARY `dc:language`;
+/// secondary language tags are metadata about the book's contents and must
+/// survive translation into another language (audit EPUB-5).
 fn patch_opf_language(opf: &str, target_language: &str) -> Result<String> {
     let language_tag = epub_language_tag(target_language);
     let mut reader = Reader::from_str(opf);
@@ -571,13 +530,17 @@ fn patch_opf_language(opf: &str, target_language: &str) -> Result<String> {
 
     loop {
         match reader.read_event()? {
-            Event::Start(element) if local_name(element.name().as_ref()) == b"language" => {
+            Event::Start(element)
+                if !found_language && local_name(element.name().as_ref()) == b"language" =>
+            {
                 found_language = true;
                 in_language = true;
                 wrote_language = false;
                 writer.write_event(Event::Start(element))?;
             }
-            Event::Empty(element) if local_name(element.name().as_ref()) == b"language" => {
+            Event::Empty(element)
+                if !found_language && local_name(element.name().as_ref()) == b"language" =>
+            {
                 found_language = true;
                 writer.write_event(Event::Start(element.to_owned()))?;
                 writer.write_event(Event::Text(BytesText::new(&language_tag)))?;
@@ -1008,26 +971,6 @@ fn write_xhtml_root_with_language(
     Ok(())
 }
 
-fn local_name(name: &[u8]) -> &[u8] {
-    name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
-}
-
-fn attr_value_unescaped(
-    element: &quick_xml::events::BytesStart<'_>,
-    attr_name: &[u8],
-) -> Result<Option<String>> {
-    for attr in element.attributes() {
-        let attr = attr.map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-        if local_name(attr.key.as_ref()) == attr_name {
-            return Ok(Some(
-                attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?
-                    .into_owned(),
-            ));
-        }
-    }
-    Ok(None)
-}
-
 fn inject_stylesheet_link(xhtml: &str, href: &str) -> Result<String> {
     if xhtml_has_stylesheet_href(xhtml, href)? {
         return Ok(xhtml.to_string());
@@ -1104,6 +1047,7 @@ struct PatchSpec<'a> {
 
 #[derive(Debug)]
 struct ElementFrame {
+    name: Vec<u8>,
     path: Vec<usize>,
     child_count: usize,
     text_count: usize,
@@ -1173,6 +1117,11 @@ fn patch_xhtml_with_specs(
 
                 if let Some(patch) = patch_map.get(path.as_slice()).copied() {
                     let buffered = buffer_until_matching_end(&mut reader)?;
+                    // <hgroup> permits only heading children: a sibling
+                    // <p> after a heading inside the group would trip
+                    // EPUBCheck RSC-005, so those patches degrade to an
+                    // inline span appended to the heading itself.
+                    let inside_hgroup = stack.iter().any(|frame| frame.name == b"hgroup");
                     match options.mode {
                         BilingualMode::Replace => {
                             write_replace_block(
@@ -1193,6 +1142,7 @@ fn patch_xhtml_with_specs(
                                 options,
                                 &path,
                                 &mut skipped_blocks,
+                                inside_hgroup,
                             )?;
                         }
                     }
@@ -1207,7 +1157,7 @@ fn patch_xhtml_with_specs(
                             let name = element.name();
                             let name_str = String::from_utf8_lossy(name.as_ref()).into_owned();
                             writer.write_event(Event::Start(element.borrow()))?;
-                            writer.write_event(Event::Text(BytesText::new(patch.translation)))?;
+                            writer.write_event(translation_text_event(patch.translation))?;
                             writer.write_event(Event::End(BytesEnd::new(name_str)))?;
                         }
                         BilingualMode::AppendBlock | BilingualMode::AppendText => {
@@ -1236,17 +1186,11 @@ fn patch_xhtml_with_specs(
                 match text_node_patch(&patch_map, &mut stack, non_whitespace) {
                     Some(patch) => match options.mode {
                         BilingualMode::Replace => {
-                            writer.write_event(Event::Text(BytesText::new(patch.translation)))?
+                            writer.write_event(translation_text_event(patch.translation))?
                         }
                         BilingualMode::AppendText => {
                             writer.write_event(Event::Text(text.borrow()))?;
-                            write_inline_translation_span(
-                                &mut writer,
-                                patch,
-                                &[],
-                                options,
-                                &mut skipped_blocks,
-                            )?;
+                            write_inline_translation_span(&mut writer, patch, &[], options)?;
                         }
                         BilingualMode::AppendBlock => {
                             writer.write_event(Event::Text(text.borrow()))?;
@@ -1257,7 +1201,6 @@ fn patch_xhtml_with_specs(
                                 patch,
                                 &[],
                                 options,
-                                &mut skipped_blocks,
                             )?;
                         }
                     },
@@ -1272,17 +1215,11 @@ fn patch_xhtml_with_specs(
                 match text_node_patch(&patch_map, &mut stack, non_whitespace) {
                     Some(patch) => match options.mode {
                         BilingualMode::Replace => {
-                            writer.write_event(Event::Text(BytesText::new(patch.translation)))?
+                            writer.write_event(translation_text_event(patch.translation))?
                         }
                         BilingualMode::AppendText => {
                             writer.write_event(Event::CData(text.borrow()))?;
-                            write_inline_translation_span(
-                                &mut writer,
-                                patch,
-                                &[],
-                                options,
-                                &mut skipped_blocks,
-                            )?;
+                            write_inline_translation_span(&mut writer, patch, &[], options)?;
                         }
                         BilingualMode::AppendBlock => {
                             writer.write_event(Event::CData(text.borrow()))?;
@@ -1293,7 +1230,6 @@ fn patch_xhtml_with_specs(
                                 patch,
                                 &[],
                                 options,
-                                &mut skipped_blocks,
                             )?;
                         }
                     },
@@ -1374,7 +1310,7 @@ fn write_replace_block(
     if buffered.has_inline_children {
         match patch
             .block
-            .map(|block| render_marked_translation(block, patch.translation, &buffered.events))
+            .map(|_| render_marked_translation(patch.translation, &buffered.events))
         {
             Some(Ok(events)) => {
                 for event in &events {
@@ -1400,7 +1336,7 @@ fn write_replace_block(
             }
         }
     } else {
-        writer.write_event(Event::Text(BytesText::new(patch.translation)))?;
+        writer.write_event(translation_text_event(patch.translation))?;
     }
     Ok(())
 }
@@ -1420,6 +1356,7 @@ fn write_events_without_visible_text(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_append_block(
     writer: &mut Writer<Vec<u8>>,
     original_start: quick_xml::events::BytesStart<'_>,
@@ -1428,6 +1365,7 @@ fn write_append_block(
     options: &RebuildOptions,
     path: &[usize],
     skipped_blocks: &mut usize,
+    inside_hgroup: bool,
 ) -> Result<()> {
     if !source_has_visible_text(&buffered.events) || patch.translation.trim().is_empty() {
         write_events(writer, &buffered.events)?;
@@ -1435,7 +1373,10 @@ fn write_append_block(
         return Ok(());
     }
 
-    let action = append_action(&original_start, patch, options.mode);
+    let mut action = append_action(&original_start, patch, options.mode);
+    if inside_hgroup && matches!(action, AppendAction::SiblingParagraph { .. }) {
+        action = AppendAction::InlineAtEnd;
+    }
     match action {
         AppendAction::Skip => {
             write_events(writer, &buffered.events)?;
@@ -1451,7 +1392,6 @@ fn write_append_block(
                 patch,
                 &buffered.events,
                 options,
-                skipped_blocks,
             )
             .inspect_err(|error| {
                 *skipped_blocks += 1;
@@ -1471,7 +1411,6 @@ fn write_append_block(
                 patch,
                 &buffered.events,
                 options,
-                skipped_blocks,
             )
             .inspect_err(|error| {
                 *skipped_blocks += 1;
@@ -1485,21 +1424,15 @@ fn write_append_block(
         }
         AppendAction::InlineAtEnd => {
             write_events(writer, &buffered.events)?;
-            let _ = write_inline_translation_span(
-                writer,
-                patch,
-                &buffered.events,
-                options,
-                skipped_blocks,
-            )
-            .inspect_err(|error| {
-                *skipped_blocks += 1;
-                tracing::warn!(
-                    block_path = ?path,
-                    error = %error,
-                    "preserving source-only block: inline translation could not be rendered",
-                );
-            });
+            let _ = write_inline_translation_span(writer, patch, &buffered.events, options)
+                .inspect_err(|error| {
+                    *skipped_blocks += 1;
+                    tracing::warn!(
+                        block_path = ?path,
+                        error = %error,
+                        "preserving source-only block: inline translation could not be rendered",
+                    );
+                });
             writer.write_event(Event::End(buffered.end.borrow()))?;
         }
         AppendAction::InlineInLastParagraph => {
@@ -1624,14 +1557,8 @@ fn write_events_with_inline_in_last_paragraph(
     if let Some(insert_at) = insert_at {
         for (index, event) in events.iter().enumerate() {
             if index == insert_at {
-                let _ = write_inline_translation_span(
-                    writer,
-                    patch,
-                    events,
-                    options,
-                    skipped_blocks,
-                )
-                .inspect_err(|error| {
+                let _ = write_inline_translation_span(writer, patch, events, options)
+                    .inspect_err(|error| {
                     *skipped_blocks += 1;
                     tracing::warn!(
                         block_path = ?path,
@@ -1644,8 +1571,8 @@ fn write_events_with_inline_in_last_paragraph(
         }
     } else {
         write_events(writer, events)?;
-        let _ = write_inline_translation_span(writer, patch, events, options, skipped_blocks)
-            .inspect_err(|error| {
+        let _ =
+            write_inline_translation_span(writer, patch, events, options).inspect_err(|error| {
                 *skipped_blocks += 1;
                 tracing::warn!(
                     block_path = ?path,
@@ -1663,10 +1590,9 @@ fn write_inline_translation_span(
     patch: PatchSpec<'_>,
     original_events: &[Event<'static>],
     options: &RebuildOptions,
-    _skipped_blocks: &mut usize,
 ) -> Result<()> {
     let rendered = render_translation_for_append(patch, original_events)?;
-    writer.write_event(Event::Text(BytesText::new(&options.bilingual_separator)))?;
+    writer.write_event(translation_text_event(&options.bilingual_separator))?;
     write_translation_element(writer, "span", &[TRANSLATION_CLASS], options, &rendered)
 }
 
@@ -1677,7 +1603,6 @@ fn write_translation_element_for_patch(
     patch: PatchSpec<'_>,
     original_events: &[Event<'static>],
     options: &RebuildOptions,
-    _skipped_blocks: &mut usize,
 ) -> Result<()> {
     let rendered = render_translation_for_append(patch, original_events)?;
     write_translation_element(writer, element_name, classes, options, &rendered)
@@ -1687,13 +1612,11 @@ fn render_translation_for_append(
     patch: PatchSpec<'_>,
     original_events: &[Event<'static>],
 ) -> Result<Vec<Event<'static>>> {
-    if let Some(block) = patch.block {
-        let rendered = render_marked_translation(block, patch.translation, original_events)?;
+    if let Some(_block) = patch.block {
+        let rendered = marked_translation_rendered(patch.translation, original_events)?;
         return Ok(flatten_block_level_events(rendered));
     }
-    Ok(vec![Event::Text(
-        BytesText::new(patch.translation).into_owned(),
-    )])
+    Ok(vec![translation_text_event(patch.translation)])
 }
 
 /// Appended translations are wrapped in a single `<p>` or `<span>`.
@@ -1702,12 +1625,20 @@ fn render_translation_for_append(
 /// template reproduces those block elements inside the wrapper, emitting
 /// invalid nestings like `<p><p>…</p></p>` or `<span><p>…</p></span>`.
 /// Drop block-level tags from the rendered translation, keep their
-/// content, and separate former siblings with a single space.
-fn flatten_block_level_events(events: Vec<Event<'static>>) -> Vec<Event<'static>> {
-    let mut output: Vec<Event<'static>> = Vec::with_capacity(events.len());
+/// content, and separate former siblings with a single space. Verbatim
+/// (suppressed-subtree) events are never flattened: raw script/SVG/MathML
+/// bytes must survive untouched.
+fn flatten_block_level_events(events: Vec<RenderedEvent>) -> Vec<Event<'static>> {
+    let mut output: Vec<RenderedEvent> = Vec::with_capacity(events.len());
     let mut dropped_any = false;
-    for event in events {
-        let block_level = match &event {
+    for rendered in events {
+        // Verbatim suppressed-subtree bytes are never flattened and never
+        // trimmed away afterwards.
+        if rendered.verbatim {
+            output.push(rendered);
+            continue;
+        }
+        let block_level = match &rendered.event {
             Event::Start(element) | Event::Empty(element) => {
                 is_block_level_name(local_name(element.name().as_ref()))
             }
@@ -1716,35 +1647,45 @@ fn flatten_block_level_events(events: Vec<Event<'static>>) -> Vec<Event<'static>
         };
         if block_level {
             dropped_any = true;
-            if matches!(event, Event::End(_) | Event::Empty(_)) {
+            if matches!(rendered.event, Event::End(_) | Event::Empty(_)) {
                 push_flatten_separator(&mut output);
             }
             continue;
         }
-        output.push(event);
+        output.push(rendered);
     }
+
     if dropped_any {
-        while matches!(
-            output.last(),
-            Some(Event::Text(text))
-                if text.html_content().is_ok_and(|value| value.trim().is_empty())
-        ) {
+        while let Some(last) = output.last() {
+            let trims = !last.verbatim
+                && match &last.event {
+                    Event::Text(text) => text
+                        .html_content()
+                        .is_ok_and(|value| value.trim().is_empty()),
+                    _ => false,
+                };
+            if !trims {
+                break;
+            }
             output.pop();
         }
     }
-    output
+
+    output.into_iter().map(|rendered| rendered.event).collect()
 }
 
-fn push_flatten_separator(output: &mut Vec<Event<'static>>) {
+fn push_flatten_separator(output: &mut Vec<RenderedEvent>) {
     if !output.is_empty() && !last_event_ends_with_whitespace(output) {
-        output.push(Event::Text(BytesText::new(" ").into_owned()));
+        output.push(RenderedEvent::plain(Event::Text(
+            BytesText::new(" ").into_owned(),
+        )));
     }
 }
 
-fn last_event_ends_with_whitespace(events: &[Event<'static>]) -> bool {
+fn last_event_ends_with_whitespace(events: &[RenderedEvent]) -> bool {
     matches!(
         events.last(),
-        Some(Event::Text(text)) if text_ends_with_whitespace(text)
+        Some(RenderedEvent { event: Event::Text(text), .. }) if text_ends_with_whitespace(text)
     )
 }
 
@@ -1847,6 +1788,7 @@ struct InlineWhitespaceBoundary {
 struct RenderedEvent {
     event: Event<'static>,
     edge: Option<MarkerEdge>,
+    verbatim: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1855,15 +1797,50 @@ enum MarkerEdge {
     End(String),
 }
 
+#[derive(Debug, Clone)]
+struct RawCapture {
+    id: String,
+    root_name: Vec<u8>,
+    /// Number of unmatched nested Start events below the root element.
+    child_depth: usize,
+    events: Vec<Event<'static>>,
+}
+
+/// Result of one pass over a buffered block: translations templates for
+/// ordinary inline markup, verbatim byte-preserving captures for suppressed
+/// subtrees (script/style/svg/math), and the inter-marker whitespace
+/// boundaries the source layout depends on.
+#[derive(Debug, Default)]
+struct BlockScan {
+    templates: HashMap<String, InlineTemplate>,
+    raw_events: HashMap<String, Vec<Event<'static>>>,
+    boundaries: HashSet<InlineWhitespaceBoundary>,
+}
+
 impl RenderedEvent {
     fn plain(event: Event<'static>) -> Self {
-        Self { event, edge: None }
+        Self {
+            event,
+            edge: None,
+            verbatim: false,
+        }
     }
 
     fn marker(event: Event<'static>, edge: MarkerEdge) -> Self {
         Self {
             event,
             edge: Some(edge),
+            verbatim: false,
+        }
+    }
+
+    /// Raw suppressed content is written back byte-for-byte: neither
+    /// whitespace restoration nor append-mode flattening may touch it.
+    fn verbatim(event: Event<'static>) -> Self {
+        Self {
+            event,
+            edge: None,
+            verbatim: true,
         }
     }
 }
@@ -1878,130 +1855,196 @@ fn normalize_marker_whitespace(text: &str) -> String {
 }
 
 fn render_marked_translation(
-    block: &Block,
     translation: &str,
     original_events: &[Event<'static>],
 ) -> Result<Vec<Event<'static>>> {
+    Ok(marked_translation_rendered(translation, original_events)?
+        .into_iter()
+        .map(|rendered| rendered.event)
+        .collect())
+}
+
+/// Marker-aware rendering kept in `RenderedEvent` form so append modes can
+/// distinguish ordinary content from verbatim suppressed bytes.
+fn marked_translation_rendered(
+    translation: &str,
+    original_events: &[Event<'static>],
+) -> Result<Vec<RenderedEvent>> {
     let normalized = normalize_marker_whitespace(translation);
     let translation = normalized.as_str();
-    let templates = collect_inline_templates(block, original_events)?;
-    if templates.is_empty() {
-        return Ok(vec![Event::Text(BytesText::new(translation).into_owned())]);
+    let scan = scan_block_events(original_events)?;
+    if scan.templates.is_empty() && scan.raw_events.is_empty() {
+        return Ok(vec![RenderedEvent::plain(translation_text_event(
+            translation,
+        ))]);
     }
-    let inline_whitespace_boundaries = collect_inline_whitespace_boundaries(original_events)?;
 
     let mut rendered = Vec::new();
     let mut used = Vec::new();
-    push_marked_fragment(translation, &templates, &mut rendered, &mut used)?;
+    push_marked_fragment(
+        translation,
+        &scan.templates,
+        &scan.raw_events,
+        &mut rendered,
+        &mut used,
+        0,
+    )?;
 
-    let mut expected = templates.keys().cloned().collect::<Vec<_>>();
+    let mut expected = scan.templates.keys().cloned().collect::<Vec<_>>();
+    let mut used_sorted = used.clone();
     expected.sort();
-    used.sort();
-    used.dedup();
+    used_sorted.sort();
+    used_sorted.dedup();
 
-    if expected != used {
-        let missing = expected
-            .iter()
-            .filter(|id| !used.contains(id))
-            .cloned()
-            .collect::<Vec<_>>();
+    // Raw suppressed markers may be echoed or omitted freely; ordinary
+    // template markers remain mandatory.
+    let missing = expected
+        .iter()
+        .filter(|id| !used_sorted.contains(id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
         return Err(BookforgeError::InvalidInput(format!(
             "translation is missing required inline marker(s): {}",
             missing.join(", ")
         )));
     }
 
-    restore_inline_boundary_spaces(&mut rendered, &inline_whitespace_boundaries);
-    Ok(rendered
-        .into_iter()
-        .map(|rendered| rendered.event)
-        .collect())
+    // Suppressed subtrees whose markers the translation omitted are still
+    // emitted, at tail position: script/style/svg/math content must never
+    // disappear merely because a model dropped its empty marker pair.
+    let mut untouched = scan
+        .raw_events
+        .keys()
+        .filter(|id| !used.iter().any(|used_id| used_id == *id))
+        .cloned()
+        .collect::<Vec<_>>();
+    untouched.sort();
+    for id in untouched {
+        if let Some(events) = scan.raw_events.get(&id) {
+            for event in events {
+                rendered.push(RenderedEvent::verbatim(event.clone()));
+            }
+        }
+    }
+
+    restore_inline_boundary_spaces(&mut rendered, &scan.boundaries);
+    Ok(rendered)
 }
 
-fn collect_inline_templates(
-    block: &Block,
-    events: &[Event<'static>],
-) -> Result<HashMap<String, InlineTemplate>> {
+/// Single pass assigning template ids exactly like the reader does:
+/// every Start/Empty inside an active block consumes one SHARED ordinal,
+/// prefixed `m` or `r` respectively except elements nested inside a
+/// suppressed subtree, which consume none on either side of the protocol.
+/// The reader draws paired and empty marker ids from one counter
+/// (`BlockBuilder::next_marker`), so splitting into two independent
+/// sequences here desynchronizes any block mixing paired children with
+/// self-closing siblings: a valid marked translation would reference an
+/// unknown id and silently degrade to untranslated source bytes.
+/// That symmetry keeps reader- and writer-side marker ids aligned for
+/// patching (audit EPUB-3), while script/style/svg/math subtrees are
+/// captured verbatim instead of becoming translatable templates.
+fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
+    const STACK_UNDERFLOW: &str = "inline template stack underflow while scanning block contents";
+
+    let mut scan = BlockScan::default();
+    // Each open element's id plus the Start event needed later to build the
+    // paired template (None for raw-subtree roots, whose bytes live in
+    // `raw_events` rather than a template).
+    let mut stack = Vec::<(String, Option<Event<'static>>)>::new();
     let mut marker_ordinal = 0usize;
-    let mut templates = HashMap::new();
-    let mut stack = Vec::<(String, Event<'static>)>::new();
+    let mut pending_left = None::<String>;
+    let mut saw_whitespace = false;
+    let mut raw_capture: Option<RawCapture> = None;
 
     for event in events {
+        // While capturing raw suppressed bytes nothing else is interpreted.
+        if let Some(capture) = raw_capture.as_mut() {
+            match event {
+                Event::Start(_) => capture.child_depth += 1,
+                Event::End(end) => {
+                    capture.events.push(event.clone());
+                    if capture.child_depth == 0
+                        && local_name(end.name().as_ref()) == capture.root_name.as_slice()
+                    {
+                        let capture = raw_capture.take().expect("checked above");
+                        scan.raw_events.insert(capture.id.clone(), capture.events);
+                        let (id, _) = stack.pop().ok_or_else(|| {
+                            BookforgeError::InvalidInput(STACK_UNDERFLOW.to_string())
+                        })?;
+                        pending_left = Some(id);
+                        saw_whitespace = false;
+                    } else {
+                        capture.child_depth = capture.child_depth.saturating_sub(1);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            capture.events.push(event.clone());
+            continue;
+        }
+
         match event {
             Event::Start(element) => {
+                let name = local_name(element.name().as_ref()).to_vec();
                 let id = marker_id("m", marker_ordinal);
                 marker_ordinal += 1;
-                stack.push((id, Event::Start(element.clone())));
+                insert_pending_boundary(
+                    &mut scan.boundaries,
+                    pending_left.take(),
+                    saw_whitespace,
+                    &id,
+                );
+                saw_whitespace = false;
+                if never_translate_element(&name) {
+                    raw_capture = Some(RawCapture {
+                        id: id.clone(),
+                        root_name: name,
+                        child_depth: 0,
+                        events: vec![event.clone()],
+                    });
+                    stack.push((id, None));
+                } else {
+                    stack.push((id, Some(event.clone())));
+                }
             }
             Event::Empty(element) => {
                 let id = marker_id("r", marker_ordinal);
                 marker_ordinal += 1;
-                templates.insert(id, InlineTemplate::Empty(Event::Empty(element.clone())));
+                insert_pending_boundary(
+                    &mut scan.boundaries,
+                    pending_left.take(),
+                    saw_whitespace,
+                    &id,
+                );
+                pending_left = Some(id.clone());
+                saw_whitespace = false;
+                scan.templates
+                    .insert(id, InlineTemplate::Empty(Event::Empty(element.clone())));
             }
             Event::End(end) => {
                 let Some((id, start)) = stack.pop() else {
-                    return Err(BookforgeError::InvalidInput(format!(
-                        "inline template stack underflow in block '{}' at path {:?}. The EPUB may have unbalanced inline markup.",
-                        block.id.0, block.dom_path
-                    )));
+                    return Err(BookforgeError::InvalidInput(STACK_UNDERFLOW.to_string()));
                 };
-                templates.insert(
-                    id,
-                    InlineTemplate::Paired {
-                        start,
-                        end: end.clone(),
-                    },
-                );
-            }
-            _ => {}
-        }
-    }
-
-    if !stack.is_empty() {
-        return Err(BookforgeError::InvalidInput(
-            "inline template stack was not empty after collecting original events".to_string(),
-        ));
-    }
-
-    Ok(templates)
-}
-
-fn collect_inline_whitespace_boundaries(
-    events: &[Event<'static>],
-) -> Result<HashSet<InlineWhitespaceBoundary>> {
-    let mut marker_ordinal = 0usize;
-    let mut stack = Vec::<String>::new();
-    let mut boundaries = HashSet::new();
-    let mut pending_left = None::<String>;
-    let mut saw_whitespace = false;
-
-    for event in events {
-        match event {
-            Event::Start(_) => {
-                let id = marker_id("m", marker_ordinal);
-                marker_ordinal += 1;
-                insert_pending_boundary(&mut boundaries, pending_left.take(), saw_whitespace, &id);
+                pending_left = Some(id.clone());
                 saw_whitespace = false;
-                stack.push(id);
+                if let Some(start) = start {
+                    scan.templates.insert(
+                        id,
+                        InlineTemplate::Paired {
+                            start,
+                            end: end.clone(),
+                        },
+                    );
+                }
             }
-            Event::Empty(_) => {
-                let id = marker_id("r", marker_ordinal);
-                marker_ordinal += 1;
-                insert_pending_boundary(&mut boundaries, pending_left.take(), saw_whitespace, &id);
-                pending_left = Some(id);
-                saw_whitespace = false;
-            }
-            Event::End(_) => {
-                let Some(id) = stack.pop() else {
-                    return Err(BookforgeError::InvalidInput(
-                        "inline whitespace stack underflow while collecting original boundaries"
-                            .to_string(),
-                    ));
-                };
-                pending_left = Some(id);
-                saw_whitespace = false;
-            }
-            _ => {
+            Event::Text(_)
+            | Event::CData(_)
+            | Event::GeneralRef(_)
+            | Event::Comment(_)
+            | Event::PI(_)
+            | Event::Decl(_) => {
                 if let Some(is_whitespace) = event_text_is_whitespace(event)?
                     && pending_left.is_some()
                 {
@@ -2013,17 +2056,22 @@ fn collect_inline_whitespace_boundaries(
                     }
                 }
             }
+            _ => {}
         }
     }
 
+    if raw_capture.is_some() {
+        return Err(BookforgeError::InvalidInput(
+            "suppressed element inside block was not closed".to_string(),
+        ));
+    }
     if !stack.is_empty() {
         return Err(BookforgeError::InvalidInput(
-            "inline whitespace stack was not empty after collecting original boundaries"
-                .to_string(),
+            "inline template stack was not empty after collecting original events".to_string(),
         ));
     }
 
-    Ok(boundaries)
+    Ok(scan)
 }
 
 fn insert_pending_boundary(
@@ -2140,12 +2188,21 @@ fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_marked_fragment(
     mut text: &str,
     templates: &HashMap<String, InlineTemplate>,
+    raw_events: &HashMap<String, Vec<Event<'static>>>,
     output: &mut Vec<RenderedEvent>,
     used: &mut Vec<String>,
+    depth: usize,
 ) -> Result<()> {
+    if depth >= MAX_MARKER_DEPTH {
+        return Err(BookforgeError::InvalidInput(format!(
+            "translation nests formatting markers deeper than {MAX_MARKER_DEPTH} levels; refusing to recurse"
+        )));
+    }
+
     while let Some(index) = text.find('<') {
         push_text_event(&text[..index], output);
         let tag = &text[index..];
@@ -2172,7 +2229,7 @@ fn push_marked_fragment(
                         MarkerEdge::Start(id.clone()),
                     ));
                     used.push(id.clone());
-                    push_marked_fragment(inner, templates, output, used)?;
+                    push_marked_fragment(inner, templates, raw_events, output, used, depth + 1)?;
                     output.push(RenderedEvent::marker(
                         Event::End(end.clone()),
                         MarkerEdge::End(id),
@@ -2184,9 +2241,19 @@ fn push_marked_fragment(
                     )));
                 }
                 None => {
-                    return Err(BookforgeError::InvalidInput(format!(
-                        "translation contains unknown inline marker '{id}'"
-                    )));
+                    // Suppressed subtrees carry empty pairs in translations
+                    // or may be dropped entirely; either way the original
+                    // bytes are spliced back verbatim.
+                    if let Some(events) = raw_events.get(&id) {
+                        for event in events {
+                            output.push(RenderedEvent::verbatim(event.clone()));
+                        }
+                        used.push(id);
+                    } else {
+                        return Err(BookforgeError::InvalidInput(format!(
+                            "translation contains unknown inline marker '{id}'"
+                        )));
+                    }
                 }
             }
 
@@ -2229,20 +2296,30 @@ fn push_marked_fragment(
 
 fn push_text_event(text: &str, output: &mut Vec<RenderedEvent>) {
     if !text.is_empty() {
-        output.push(RenderedEvent::plain(Event::Text(
-            BytesText::new(text).into_owned(),
-        )));
+        output.push(RenderedEvent::plain(translation_text_event(text)));
     }
 }
 
+/// Model text escapes exactly once: entity-like sequences (`&amp;`,
+/// numeric references) are normalized to their characters and the
+/// serializer re-escapes them, so pre-escaped LLM output no longer
+/// double-escapes (audit EPUB-13). Unknown references pass through
+/// literally and are escaped like any other ampersand text.
+fn translation_text_event(text: &str) -> Event<'static> {
+    Event::Text(BytesText::new(&normalize_translation_entities(text)).into_owned())
+}
+
 fn find_matching_marker_close(text: &str, tag_name: &str) -> Result<usize> {
+    // Needle construction is hoisted so pathological long translations do
+    // not rebuild it per iteration (audit EPUB-10 quadratic behaviour).
     let close = format!("</{tag_name}>");
+    let open_needle = find_marker_open_needle(tag_name);
     let mut depth = 0usize;
     let mut offset = 0usize;
 
     loop {
         let remaining = &text[offset..];
-        let next_open = find_marker_open(remaining, tag_name);
+        let next_open = remaining.find(&open_needle);
         let next_close = remaining.find(&close);
 
         match (next_open, next_close) {
@@ -2282,26 +2359,11 @@ fn find_matching_marker_close(text: &str, tag_name: &str) -> Result<usize> {
     }
 }
 
-fn find_marker_open(text: &str, tag_name: &str) -> Option<usize> {
+fn find_marker_open_needle(tag_name: &str) -> String {
     if matches!(tag_name, "m" | "keep") {
-        text.find(&format!("<{tag_name} "))
+        format!("<{tag_name} ")
     } else {
-        text.find(&format!("<{tag_name}>"))
-    }
-}
-
-fn marker_id(prefix: &str, marker_ordinal: usize) -> String {
-    format!("{prefix}{}", marker_ordinal + 1)
-}
-
-pub(crate) fn validate_xml(xml: &str) -> Result<()> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(false);
-    loop {
-        match reader.read_event()? {
-            Event::Eof => return Ok(()),
-            _ => continue,
-        }
+        format!("<{tag_name}>")
     }
 }
 
@@ -2323,9 +2385,10 @@ fn text_node_patch<'a>(
     patch_map.get(path.as_slice()).copied()
 }
 
-fn enter_element(stack: &mut Vec<ElementFrame>, _name: &[u8]) -> Vec<usize> {
+fn enter_element(stack: &mut Vec<ElementFrame>, name: &[u8]) -> Vec<usize> {
     let path = next_child_path(stack);
     stack.push(ElementFrame {
+        name: name.to_vec(),
         path: path.clone(),
         child_count: 0,
         text_count: 0,
@@ -2725,9 +2788,11 @@ mod tests {
     #[test]
     fn flatten_block_level_events_separates_empty_block_markers() {
         let flattened = flatten_block_level_events(vec![
-            Event::Text(BytesText::new("Before").into_owned()),
-            Event::Empty(quick_xml::events::BytesStart::new("hr").into_owned()),
-            Event::Text(BytesText::new("After").into_owned()),
+            RenderedEvent::plain(Event::Text(BytesText::new("Before").into_owned())),
+            RenderedEvent::plain(Event::Empty(
+                quick_xml::events::BytesStart::new("hr").into_owned(),
+            )),
+            RenderedEvent::plain(Event::Text(BytesText::new("After").into_owned())),
         ]);
         let mut writer = Writer::new(Vec::new());
         write_events(&mut writer, &flattened).expect("flattened events should write");
@@ -2898,6 +2963,30 @@ mod tests {
             outcome.xhtml,
         );
         validate_xml(&outcome.xhtml).expect("marked output should re-parse");
+    }
+
+    /// The reader hands out paired (`mN`) and empty (`rN`) marker ids from
+    /// ONE shared counter; the writer scanner must consume ordinals from a
+    /// single stream too, or any block mixing a child element with a
+    /// self-closing sibling (reader ids `m1`/`r2`, writer rescan `m1`/`r1`)
+    /// would reject its legitimate translation as an unknown marker and
+    /// ship untranslated. Regression for the empty-element adjacency bug.
+    #[test]
+    fn scan_block_events_draws_paired_and_empty_ids_from_one_ordinal_stream() {
+        let events = vec![
+            Event::Start(quick_xml::events::BytesStart::new("td").into_owned()),
+            Event::End(BytesEnd::new("td")),
+            Event::Empty(quick_xml::events::BytesStart::new("td").into_owned()),
+        ];
+
+        let scan = scan_block_events(&events).expect("scan should succeed");
+
+        let template_ids = scan.templates.keys().cloned().collect::<Vec<_>>();
+        assert!(
+            scan.templates.contains_key("m1") && template_ids.contains(&"r2".to_string()),
+            "writer rescan must reproduce reader ids m1/r2 for paired+empty content, got: {template_ids:?}"
+        );
+        assert!(!template_ids.contains(&"r1".to_string()));
     }
 
     #[test]
@@ -3092,5 +3181,234 @@ mod tests {
                 kind: "p".to_string(),
             },
         ]
+    }
+
+    fn raw_subtree_block(inline_marks: Vec<InlineMark>) -> Block {
+        Block {
+            id: BlockId("b_000000".to_string()),
+            section_id: SectionId("sec_000000".to_string()),
+            kind: BlockKind::Paragraph,
+            dom_path: DomPath(vec![0, 0]),
+            text_runs: vec![TextRun {
+                id: "r000000_000".to_string(),
+                text: "Prima <m1></m1> dopo".to_string(),
+            }],
+            inline_marks,
+            protected_spans: Vec::new(),
+            token_estimate: 4,
+        }
+    }
+
+    #[test]
+    fn replace_mode_splices_suppressed_script_bytes_verbatim() {
+        let xhtml = r#"<root><p>Before <script type="text/javascript">var x = 1; // keep</script> tail</p></root>"#;
+        let block = raw_subtree_block(vec![InlineMark {
+            id: "m1".to_string(),
+            kind: "script".to_string(),
+        }]);
+        let outcome = patch_xhtml_blocks(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "Prima <m1></m1> dopo",
+            }],
+        )
+        .expect("scripted paragraph should patch");
+
+        assert_eq!(outcome.skipped_blocks, 0);
+        assert!(
+            outcome
+                .xhtml
+                .contains(r#"<script type="text/javascript">var x = 1; // keep</script>"#),
+            "raw script bytes must survive verbatim, got: {}",
+            outcome.xhtml
+        );
+        assert!(outcome.xhtml.contains("Prima"), "got: {}", outcome.xhtml);
+        assert!(outcome.xhtml.contains("dopo"), "got: {}", outcome.xhtml);
+        assert!(
+            !outcome.xhtml.contains("Before") && !outcome.xhtml.contains("tail"),
+            "source prose must be replaced, got: {}",
+            outcome.xhtml
+        );
+        validate_xml(&outcome.xhtml).expect("output should re-parse");
+    }
+
+    #[test]
+    fn replace_mode_splices_svg_and_mathml_verbatim() {
+        for (inner, kind) in [
+            (
+                "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"2\" height=\"2\"/></svg>",
+                "svg",
+            ),
+            ("<math><mi>x</mi><mo>+</mo><mn>1</mn></math>", "math"),
+        ] {
+            let xhtml = format!("<root><p>B {inner} A</p></root>");
+            let block = raw_subtree_block(vec![InlineMark {
+                id: "m1".to_string(),
+                kind: kind.to_string(),
+            }]);
+            let outcome = patch_xhtml_blocks(
+                &xhtml,
+                &[BlockPatch {
+                    block: &block,
+                    translation: "Prima <m1></m1> dopo",
+                }],
+            )
+            .unwrap_or_else(|error| panic!("{kind} paragraph should patch: {error}"));
+
+            assert_eq!(outcome.skipped_blocks, 0, "{kind}");
+            let expected_start = inner.to_string();
+            assert!(
+                outcome.xhtml.contains(&expected_start),
+                "{kind} bytes must survive: {}",
+                outcome.xhtml
+            );
+            validate_xml(&outcome.xhtml).expect("output should re-parse");
+        }
+    }
+
+    #[test]
+    fn omitted_raw_marker_still_splices_suppressed_content_at_tail() {
+        let xhtml = r#"<root><p>Before <style>p { color: red; }</style> tail</p></root>"#;
+        let block = raw_subtree_block(vec![InlineMark {
+            id: "m1".to_string(),
+            kind: "style".to_string(),
+        }]);
+        let outcome = patch_xhtml_blocks(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "Solo traduzione",
+            }],
+        )
+        .expect("missing raw marker must degrade gracefully, not fail");
+
+        assert_eq!(outcome.skipped_blocks, 0);
+        assert!(
+            outcome.xhtml.contains("<style>p { color: red; }</style>"),
+            "style bytes survive even without the marker pair, got: {}",
+            outcome.xhtml
+        );
+        assert!(outcome.xhtml.contains("Solo traduzione"));
+        validate_xml(&outcome.xhtml).expect("output should re-parse");
+    }
+
+    #[test]
+    fn translation_entity_like_output_is_escaped_exactly_once() {
+        let xhtml = "<root><p>Original</p></root>";
+        let path = DomPath(vec![0, 0]);
+        let outcome = patch_xhtml(xhtml, &[(&path, "A &amp; B &#65; C &#x43; &notanentity;")])
+            .expect("patch should succeed");
+
+        assert!(
+            !outcome.xhtml.contains("&amp;amp;"),
+            "double escaping is gone, got: {}",
+            outcome.xhtml
+        );
+        assert!(
+            !outcome.xhtml.contains("&#65;") && !outcome.xhtml.contains("&#x43;"),
+            "numeric references are decoded before serialization, got: {}",
+            outcome.xhtml
+        );
+        assert!(
+            outcome
+                .xhtml
+                .contains(">A &amp; B A C C &amp;notanentity;<"),
+            "unknown entity stays literal (once-escaped), got: {}",
+            outcome.xhtml
+        );
+        validate_xml(&outcome.xhtml).expect("output should re-parse");
+    }
+
+    #[test]
+    fn patch_opf_language_replaces_primary_and_keeps_secondary_tags() {
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:language>en</dc:language>
+    <dc:language>fr</dc:language>
+  </metadata>
+</package>"#;
+
+        let patched = patch_opf_language(opf, "Italian").expect("language should patch");
+
+        assert_eq!(
+            patched.matches(">it<").count(),
+            1,
+            "primary tag replaced once"
+        );
+        assert!(
+            patched.contains("<dc:language>it</dc:language>"),
+            "got: {patched}"
+        );
+        assert!(
+            patched.contains("<dc:language>fr</dc:language>"),
+            "secondary dc:language must survive, got: {patched}"
+        );
+        assert!(!patched.contains("<dc:language>en</dc:language>"));
+        validate_xml(&patched).expect("patched OPF should remain XML");
+    }
+
+    #[test]
+    fn append_block_inside_hgroup_degrades_to_inline_span() {
+        let xhtml = r#"<root><hgroup><h1>Title</h1></hgroup></root>"#;
+        let block = plain_block(
+            "b_000000",
+            DomPath(vec![0, 0, 0]),
+            BlockKind::Heading(1),
+            "Title",
+        );
+        let outcome = patch_xhtml_blocks_with_options(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "Titolo",
+            }],
+            &append_options(BilingualMode::AppendBlock),
+        )
+        .expect("hgroup patch should succeed");
+
+        assert!(
+            outcome.xhtml.contains(
+                r#"<h1>Title / <span class="bookforge-translation" lang="it">Titolo</span></h1>"#
+            ),
+            "translation must degrade to legal inline content inside hgroup, got: {}",
+            outcome.xhtml
+        );
+        assert!(
+            !outcome
+                .xhtml
+                .contains("</h1><p class=\"bookforge-translation\""),
+            "sibling <p> inside <hgroup> would trip EPUBCheck RSC-005, got: {}",
+            outcome.xhtml
+        );
+        validate_xml(&outcome.xhtml).expect("hgroup append output should re-parse");
+    }
+
+    #[test]
+    fn marker_nesting_beyond_cap_is_rejected_gracefully() {
+        const DEPTH: usize = MAX_MARKER_DEPTH + 1;
+        let mut events = Vec::new();
+        let mut text = String::new();
+        text.push_str("base ");
+        for index in (1..=DEPTH).rev() {
+            let id = format!("m{index}");
+            text.push_str(&format!("<{id}>"));
+            events.push(Event::Start(
+                quick_xml::events::BytesStart::new(format!("span{index}")).into_owned(),
+            ));
+        }
+        text.push_str("core");
+        for index in 1..=DEPTH {
+            text.push_str(&format!("</m{index}>"));
+            events.push(Event::End(quick_xml::events::BytesEnd::new(format!(
+                "span{index}"
+            ))));
+        }
+
+        let error = marked_translation_rendered(&text, &events)
+            .expect_err("over-deep nesting must be rejected without recursing abortively");
+
+        assert!(error.to_string().contains("deeper than"), "got: {error}");
     }
 }

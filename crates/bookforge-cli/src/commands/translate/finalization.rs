@@ -82,6 +82,7 @@ where
         progress.clone(),
         telemetry,
         glossary_rules,
+        human_stdout_enabled(cli_args.ui),
     )
     .await?;
     *translations = fallback_translations;
@@ -166,6 +167,12 @@ where
         timestamp_ms: bookforge_core::progress::now_ms(),
     });
 
+    // UI-21: finishing with unresolved segments is not a clean success. The
+    // artifacts are written, but scripts can distinguish this outcome from 0.
+    if summary.failed > 0 || summary.needs_review > 0 {
+        crate::exit_code::request(crate::exit_code::COMPLETED_WITH_FAILURES);
+    }
+
     Ok(())
 }
 
@@ -173,11 +180,17 @@ pub(super) async fn wait_for_finalize_stage_control(
     control: &mut crate::control::ControlFilePoller<'_>,
     signal: &bookforge_llm::PauseSignal,
 ) -> Result<bool> {
-    if let Some(delay_ms) = std::env::var("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+    // Test-only timing hook: release builds must not honor undocumented
+    // environment-controlled delays (CLI-18); the test suite keeps working
+    // because dev/test builds compile with debug assertions enabled.
+    #[cfg(any(test, debug_assertions))]
     {
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        if let Some(delay_ms) = std::env::var("BOOKFORGE_TEST_FINALIZE_BOUNDARY_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
     }
     Ok(!matches!(
         control.wait_until_running_or_stopped(signal).await?,
@@ -256,6 +269,10 @@ where
     if settings.double_check.mode == DoubleCheckMode::Off {
         return Ok(true);
     }
+    // UI-22: double-check progress is human-only stdout; `--ui json` must
+    // stay a parseable event stream end to end. The audited requests still
+    // surface as double-check-prefixed RequestStarted/Finished events.
+    let print_stdout = human_stdout_enabled(cli_args.ui);
 
     let (dc_provider, dc_provider_name, dc_model) =
         if cli_args.double_check_provider.is_some() || cli_args.double_check_model.is_some() {
@@ -311,9 +328,11 @@ where
     double_check_config.provider = dc_provider_name;
     double_check_config.model = dc_model;
 
-    println!("Double-check: auditing translations...");
+    if print_stdout {
+        println!("Double-check: auditing translations...");
+    }
     let corrections = match run_double_check(
-        ProgressRequestProvider::new(dc_provider, progress),
+        ProgressRequestProvider::new(dc_provider, progress.clone()),
         segments,
         translations,
         &double_check_config,
@@ -354,10 +373,37 @@ where
     let changed_segment_ids = apply_double_check_corrections(translations, &corrections);
     persist_corrected_translations(store, job_id, config, translations, &changed_segment_ids)?;
 
-    println!(
-        "  Corrections: {applied} applied, {rejected} rejected, {unresolved} unresolved, {} segments updated",
-        changed_segment_ids.len()
-    );
+    // Deterministic stop/lifecycle ordering (wave-2 LLM-9 follow-up): the
+    // correction chunks' ok-status RequestFinished events are *not*
+    // important to the JSONL flush policy and could otherwise sit in the
+    // writer buffer while finalize advanced into its terminal stage, making
+    // externally observed completion of corrections race with the final
+    // outcome. Emitting one important event here drains that buffer now,
+    // so any control request recorded after corrected blocks are visible is
+    // guaranteed a pre-terminal observation window.
+    if !changed_segment_ids.is_empty() {
+        progress.emit(bookforge_core::ProgressEvent::Warning {
+            kind: "double_check_corrections_persisted".to_string(),
+            message: format!(
+                "{applied} applied correction{} persisted for {} segment{}",
+                if applied == 1 { "" } else { "s" },
+                changed_segment_ids.len(),
+                if changed_segment_ids.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ),
+            timestamp_ms: bookforge_core::progress::now_ms(),
+        });
+    }
+
+    if print_stdout {
+        println!(
+            "  Corrections: {applied} applied, {rejected} rejected, {unresolved} unresolved, {} segments updated",
+            changed_segment_ids.len()
+        );
+    }
 
     Ok(true)
 }
@@ -430,30 +476,7 @@ pub(crate) fn persist_corrected_translations(
     Ok(())
 }
 
-pub(crate) async fn qa_reviews_for_mode<P>(
-    provider: P,
-    segments: &[Segment],
-    translations: &[SegmentTranslation],
-    config: &TranslationRunConfig,
-    qa_config: &bookforge_core::config::QaRunConfig,
-    qa_mode: QaMode,
-) -> Vec<QaSegmentReview>
-where
-    P: LlmProvider,
-{
-    qa_reviews_for_mode_with_max_output_tokens(
-        provider,
-        segments,
-        translations,
-        config,
-        qa_config,
-        qa_mode,
-        None,
-    )
-    .await
-}
-
-async fn qa_reviews_for_mode_with_max_output_tokens<P>(
+pub(crate) async fn qa_reviews_for_mode_with_max_output_tokens<P>(
     provider: P,
     segments: &[Segment],
     translations: &[SegmentTranslation],
@@ -627,6 +650,10 @@ pub(super) fn mark_unfinished_segments_failed(
         .map(|segment| segment.id.0.clone())
         .collect::<Vec<_>>();
     store.mark_unfinished_segments_failed(job_id, &segment_ids, error)?;
+    // The run is dead at this point; leaving the job row stuck on "running"
+    // hides the failure from doctor/dashboard (CLI-5). Store-side guards keep
+    // an already-final outcome intact.
+    let _ = store.mark_job_failed(job_id);
     Ok(())
 }
 
@@ -643,7 +670,16 @@ pub(crate) fn mark_job_finished(
     };
     let terminal_segments =
         summary.succeeded + summary.cached + summary.failed + summary.needs_review;
+    // The DB summary is authoritative: segments can hold a Failed or
+    // NeedsReview row WITHOUT any stored translation blocks (e.g. they failed
+    // again during a resume pass), so scanning only in-memory translations
+    // would green-light a book whose output still contains raw source text
+    // (H-4 / CLI-1).
     if terminal_segments < summary.total_segments || summary.retry_pending > 0 {
+        store.mark_job_needs_review(job_id)?;
+        return Ok(!job_was_stopped(store, job_id)? && !job_is_paused(store, job_id)?);
+    }
+    if summary.failed > 0 || summary.needs_review > 0 {
         store.mark_job_needs_review(job_id)?;
         return Ok(!job_was_stopped(store, job_id)? && !job_is_paused(store, job_id)?);
     }
@@ -807,7 +843,7 @@ mod suspicious_tests {
             SegmentStatus::NeedsReview,
         );
 
-        let reviews = qa_reviews_for_mode(
+        let reviews = qa_reviews_for_mode_with_max_output_tokens(
             MockProvider::new(MockMode::Identity, "Italian"),
             std::slice::from_ref(&segment),
             std::slice::from_ref(&translation),
@@ -821,6 +857,7 @@ mod suspicious_tests {
                 api_key_env: None,
             },
             QaMode::Suspicious,
+            None,
         )
         .await;
 
@@ -880,6 +917,7 @@ mod suspicious_tests {
             input_cached_tokens: Some(0),
             output_tokens: Some(10),
             tokens_estimated: false,
+            findings: Vec::new(),
         }
     }
 

@@ -129,8 +129,13 @@ pub fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
     settings.double_check.correction_rounds = args.correction_rounds;
 
     if settings.double_check.mode != DoubleCheckMode::Off && settings.double_check.model.is_none() {
+        // Be honest about what actually happens: without an explicit
+        // --double-check-model the audit runs against the primary provider and
+        // model, it is not refused (CLI-12).
         eprintln!(
-            "--double-check requires --double-check-model unless a default double-check model is configured"
+            "warning: --double-check is enabled without --double-check-model; the audit will reuse \
+             the primary translation provider/model. Configure --double-check-provider/--double-check-model \
+             to review with a different model."
         );
     }
 

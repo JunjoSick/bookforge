@@ -1,6 +1,9 @@
+use super::translations::MODEL_TRANSLATION_UPSERT;
 use super::*;
 use bookforge_core::{
+    finding::EngineFinding,
     ir::{BlockId, SectionId},
+    run_snapshot::CachePolicySnapshot,
     segment::{
         Segment, SegmentBlock, SegmentConstraints, SegmentContext, SegmentId, SegmentMetadata,
         SegmentSource, SegmentTextRun,
@@ -200,6 +203,55 @@ fn temp_path(name: &str) -> PathBuf {
         unix_timestamp_nanos(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+/// Compute the caller-computed expected fingerprints for the given segments,
+/// mirroring how the CLI wires cache lookups. Keyed by the current segment id
+/// so duplicate source text in different contexts stays unambiguous. The
+/// identity is derived over the SAME slice passed here (the full ordered set
+/// and the eligible candidates coincide in these fixtures).
+fn expected_fingerprints_for(
+    store: &JobStore,
+    job_id: &str,
+    segments: &[Segment],
+    provider: &str,
+    model: &str,
+    prompt_version: &str,
+    cache_namespace: &str,
+) -> HashMap<String, String> {
+    store
+        .expected_cache_fingerprints(
+            job_id,
+            segments,
+            segments,
+            provider,
+            model,
+            prompt_version,
+            cache_namespace,
+        )
+        .expect("expected fingerprints should compute")
+}
+
+/// Build a [`CacheLookupRequest`] carrying the caller-computed expected
+/// fingerprints map (which must outlive the returned request).
+fn cache_lookup_request<'a>(
+    prompt_version: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    source_lang: Option<&'a str>,
+    target_lang: &'a str,
+    cache_namespace: &'a str,
+    expected_fingerprints: &'a HashMap<String, String>,
+) -> CacheLookupRequest<'a> {
+    CacheLookupRequest {
+        prompt_version,
+        provider,
+        model,
+        source_lang,
+        target_lang,
+        cache_namespace,
+        expected_fingerprints,
+    }
 }
 
 #[test]
@@ -940,12 +992,23 @@ fn cached_translation_requires_matching_cache_namespace() {
     let hit = store
         .find_cached_translation(
             &seg,
-            "v1",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "ns_one",
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_one",
+                &expected_fingerprints_for(
+                    &store,
+                    &_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "ns_one",
+                ),
+            ),
         )
         .expect("query ok");
     assert!(hit.is_some(), "matching namespace should hit");
@@ -953,12 +1016,23 @@ fn cached_translation_requires_matching_cache_namespace() {
     let miss = store
         .find_cached_translation(
             &seg,
-            "v1",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "ns_two",
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_two",
+                &expected_fingerprints_for(
+                    &store,
+                    &_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "ns_two",
+                ),
+            ),
         )
         .expect("query ok");
     assert!(miss.is_none(), "different namespace must not hit");
@@ -1031,12 +1105,23 @@ fn cached_translation_rejects_mismatched_prompt_version() {
     let hit_v2 = store
         .find_cached_translation(
             &seg,
-            "v2",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "ns_bump",
+            cache_lookup_request(
+                "v2",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_bump",
+                &expected_fingerprints_for(
+                    &store,
+                    &job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v2",
+                    "ns_bump",
+                ),
+            ),
         )
         .expect("query ok");
     assert!(
@@ -1047,12 +1132,23 @@ fn cached_translation_rejects_mismatched_prompt_version() {
     let miss_v3 = store
         .find_cached_translation(
             &seg,
-            "v3",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "ns_bump",
+            cache_lookup_request(
+                "v3",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_bump",
+                &expected_fingerprints_for(
+                    &store,
+                    &job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v3",
+                    "ns_bump",
+                ),
+            ),
         )
         .expect("query ok");
     assert!(
@@ -1060,28 +1156,54 @@ fn cached_translation_rejects_mismatched_prompt_version() {
         "row stored under v2 must not be served back for a v3 (retry_guidance) query"
     );
 
-    let batch_request_v3 = CacheLookupRequest {
-        prompt_version: "v3",
-        provider: "mock",
-        model: "mock-prefix",
-        source_lang: Some("English"),
-        target_lang: "Italian",
-        cache_namespace: "ns_bump",
-    };
     let batch_miss = store
-        .find_cached_translations_batch(std::slice::from_ref(&seg), batch_request_v3)
+        .find_cached_translations_batch(
+            std::slice::from_ref(&seg),
+            cache_lookup_request(
+                "v3",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_bump",
+                &expected_fingerprints_for(
+                    &store,
+                    &job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v3",
+                    "ns_bump",
+                ),
+            ),
+        )
         .expect("batch query ok");
     assert!(
         batch_miss.is_empty(),
         "batch lookup must not return v2-era rows for a v3 query"
     );
 
-    let batch_request_v2 = CacheLookupRequest {
-        prompt_version: "v2",
-        ..batch_request_v3
-    };
     let batch_hit = store
-        .find_cached_translations_batch(std::slice::from_ref(&seg), batch_request_v2)
+        .find_cached_translations_batch(
+            std::slice::from_ref(&seg),
+            cache_lookup_request(
+                "v2",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_bump",
+                &expected_fingerprints_for(
+                    &store,
+                    &job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v2",
+                    "ns_bump",
+                ),
+            ),
+        )
         .expect("batch query ok");
     assert!(
         batch_hit.contains_key(&seg.id.0),
@@ -1104,12 +1226,23 @@ fn cached_translation_rejects_mismatched_block_ids() {
     let miss = store
         .find_cached_translation(
             &seg,
-            "v1",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "ns_x",
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "ns_x",
+                &expected_fingerprints_for(
+                    &store,
+                    &_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "ns_x",
+                ),
+            ),
         )
         .expect("query ok");
     assert!(
@@ -1212,28 +1345,50 @@ fn cached_translation_prefers_repaired_succeeded_rows_over_cached_clones() {
         })
         .expect("repaired translation should save");
 
-    let request = CacheLookupRequest {
-        prompt_version: "v1",
-        provider: "mock",
-        model: "mock-prefix",
-        source_lang: Some("English"),
-        target_lang: "Italian",
-        cache_namespace: "cache_ns",
-    };
     let single_hit = store
         .find_cached_translation(
             &seg,
-            request.prompt_version,
-            request.provider,
-            request.model,
-            request.source_lang,
-            request.target_lang,
-            request.cache_namespace,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "cache_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &repaired_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "cache_ns",
+                ),
+            ),
         )
         .expect("single lookup should succeed")
         .expect("single lookup should hit");
     let batch_hit = store
-        .find_cached_translations_batch(std::slice::from_ref(&seg), request)
+        .find_cached_translations_batch(
+            std::slice::from_ref(&seg),
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "cache_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &repaired_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "cache_ns",
+                ),
+            ),
+        )
         .expect("batch lookup should succeed")
         .remove(&seg.id.0)
         .expect("batch lookup should hit");
@@ -1257,12 +1412,23 @@ fn old_empty_cache_namespace_rows_do_not_match_new_runs() {
     let miss = store
         .find_cached_translation(
             &seg,
-            "v1",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "real_ns",
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "real_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "real_ns",
+                ),
+            ),
         )
         .expect("query ok");
     assert!(
@@ -1947,12 +2113,23 @@ fn manual_correction_is_auditable_frozen_and_not_cacheable() {
     let cached = store
         .find_cached_translation(
             &segment,
-            "v1",
-            "mock",
-            "mock-prefix",
-            Some("English"),
-            "Italian",
-            "manual_ns",
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "manual_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &job.id,
+                    std::slice::from_ref(&segment),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "manual_ns",
+                ),
+            ),
         )
         .expect("cache lookup should succeed");
     assert!(cached.is_none(), "manual corrections must remain job-local");
@@ -2767,6 +2944,3920 @@ fn qa_finding_breakdown_orders_counts_descending() {
     );
 
     drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn model_write_paths_do_not_clobber_preexisting_human_correction() {
+    // Regression for H-1/STORE-1 (check-then-write TOCTOU). The freeze check
+    // and the write used to be separate autocommit steps, so a dashboard
+    // process committing a manual correction between them was clobbered by
+    // `INSERT OR REPLACE`. Here the frozen row already exists when each
+    // model-write checkpoint runs — exactly the interleaving a losing race
+    // produced — and every path must yield without disturbing it.
+    let db_path = temp_path("toctou_frozen.sqlite");
+    let input_path = temp_path("input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let segments = vec![segment("seg_a", 0)];
+    store
+        .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "toctou_ns")
+        .expect("segments should insert");
+
+    // The other process lands a human correction first.
+    {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "INSERT INTO translations
+             (segment_id, job_id, translated_text, provider, model, prompt_version,
+              created_at, origin, human_corrected, corrected_at)
+             VALUES ('seg_a', ?1, 'Correzione umana', 'manual', 'manual', 'v1',
+                     '1000', 'manual', 1, '1000')",
+            params![job.id],
+        )
+        .expect("frozen translation should insert");
+        conn.execute(
+            "INSERT INTO translation_blocks (segment_id, job_id, block_id, translated_text)
+             VALUES ('seg_a', ?1, 'b_000000', 'Correzione umana')",
+            params![job.id],
+        )
+        .expect("frozen block should insert");
+        conn.execute(
+            "UPDATE segments SET status = 'succeeded', attempts = 1
+             WHERE job_id = ?1 AND id = 'seg_a'",
+            params![job.id],
+        )
+        .expect("frozen segment state should update");
+    }
+
+    let model_blocks = [BlockTranslation {
+        block_id: BlockId("b_000000".to_string()),
+        text: "MODEL OVERWRITE".to_string(),
+    }];
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            translated_text: "MODEL OVERWRITE",
+            blocks: &model_blocks,
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(9),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(9),
+            tokens_estimated: false,
+        })
+        .expect("model save should be ignored rather than fail");
+    store
+        .save_needs_review(SaveNeedsReview {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            preserved_text: "MODEL REVIEW OVERWRITE",
+            blocks: &model_blocks,
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            error: "qa issue",
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            tokens_estimated: false,
+        })
+        .expect("needs-review save should be ignored rather than fail");
+    store
+        .save_cached_translation(SaveCachedTranslation {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            translated_text: "MODEL CACHE OVERWRITE",
+            blocks: &model_blocks,
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+        })
+        .expect("cached save should be ignored rather than fail");
+
+    let conn = store.conn.borrow();
+    let row = conn
+        .query_row(
+            "SELECT translated_text, provider, model, origin, human_corrected, corrected_at
+             FROM translations WHERE job_id = ?1 AND segment_id = 'seg_a'",
+            params![job.id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .expect("frozen translation should survive all three model-write paths");
+    assert_eq!(row.0, "Correzione umana");
+    assert_eq!(row.1, "manual");
+    assert_eq!(row.2, "manual");
+    assert_eq!(row.3, "manual");
+    assert_eq!(row.4, 1);
+    assert_eq!(row.5.as_deref(), Some("1000"));
+
+    let block_text: String = conn
+        .query_row(
+            "SELECT translated_text FROM translation_blocks
+             WHERE job_id = ?1 AND segment_id = 'seg_a' AND block_id = 'b_000000'",
+            params![job.id],
+            |row| row.get(0),
+        )
+        .expect("corrected block should survive");
+    assert_eq!(block_text, "Correzione umana");
+
+    let segment_state = conn
+        .query_row(
+            "SELECT status, attempts FROM segments WHERE job_id = ?1 AND id = 'seg_a'",
+            params![job.id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .expect("segment should load");
+    assert_eq!(segment_state.0, "succeeded");
+    assert_eq!(
+        segment_state.1, 1,
+        "attempts must not advance on a frozen segment"
+    );
+    drop(conn);
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn guarded_model_upsert_leaves_frozen_rows_untouched_at_sql_level() {
+    // Even if a future caller bypasses the application-level freeze check,
+    // the single-statement upsert itself must refuse to overwrite a row with
+    // `human_corrected = 1` (and must not delete-and-reinsert it the way
+    // `INSERT OR REPLACE` did).
+    let db_path = temp_path("guarded_upsert.sqlite");
+    let (store, job, _seg) =
+        build_seeded_store_with_translation(&db_path, "guard_ns", &["b_000000"]);
+    {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "UPDATE translations SET human_corrected = 1, origin = 'manual',
+                    corrected_at = '1000'
+             WHERE job_id = ?1 AND segment_id = 'seg_a'",
+            params![job.id],
+        )
+        .expect("freeze flag should update");
+    }
+
+    let overwrite_before = {
+        let conn = store.conn.borrow();
+        let before: (String, String, i64) = conn
+            .query_row(
+                "SELECT translated_text, created_at, human_corrected FROM translations
+                 WHERE job_id = ?1 AND segment_id = 'seg_a'",
+                params![job.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("frozen row should load");
+        assert_eq!(before.0, "Tradotto");
+        assert_eq!(before.2, 1);
+        let changed = conn
+            .execute(
+                MODEL_TRANSLATION_UPSERT,
+                params![
+                    "seg_a",
+                    job.id,
+                    "SQL LEVEL OVERWRITE",
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "2000"
+                ],
+            )
+            .expect("guarded upsert should execute");
+        (changed, before.1)
+    };
+    assert_eq!(overwrite_before.0, 0, "a frozen row must not be updated");
+
+    let conn = store.conn.borrow();
+    let frozen = conn
+        .query_row(
+            "SELECT translated_text, created_at, origin, human_corrected FROM translations
+             WHERE job_id = ?1 AND segment_id = 'seg_a'",
+            params![job.id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .expect("frozen row should load");
+    assert_eq!(frozen.0, "Tradotto", "frozen text must not change");
+    assert_eq!(frozen.1, overwrite_before.1, "created_at must not change");
+    assert_eq!(frozen.2, "manual", "origin must survive the guarded upsert");
+    assert_eq!(frozen.3, 1);
+    drop(conn);
+
+    // Unfreezing lets the same statement through.
+    {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "UPDATE translations SET human_corrected = 0 WHERE job_id = ?1",
+            params![job.id],
+        )
+        .expect("unfreeze should work");
+    }
+    let overwrite = {
+        let conn = store.conn.borrow();
+        conn.execute(
+            MODEL_TRANSLATION_UPSERT,
+            params![
+                "seg_a",
+                job.id,
+                "SQL LEVEL OVERWRITE",
+                "mock",
+                "mock-prefix",
+                "v1",
+                "2000"
+            ],
+        )
+        .expect("guarded upsert should execute")
+    };
+    assert_eq!(overwrite, 1, "an unfrozen row must be updated");
+    let text: String = {
+        let conn = store.conn.borrow();
+        conn.query_row(
+            "SELECT translated_text FROM translations WHERE job_id = ?1 AND segment_id = 'seg_a'",
+            params![job.id],
+            |row| row.get(0),
+        )
+        .expect("row should load")
+    };
+    assert_eq!(text, "SQL LEVEL OVERWRITE");
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn resume_reinsert_refreshes_segment_cache_identity_columns() {
+    // STORE-11: resume re-runs insert_segments against rows that already
+    // exist. `INSERT OR IGNORE` left stale provider/model/prompt_version/
+    // source_hash/cache_namespace values behind after a config change, so
+    // later cache lookups misattributed hits.
+    let db_path = temp_path("resume_identity.sqlite");
+    let input_path = temp_path("input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "old-model",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+
+    let mut seg = segment("seg_a", 0);
+    seg.checksum = "checksum_old".to_string();
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "old-model",
+            "ns_old",
+        )
+        .expect("initial insert should work");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            translated_text: "Tradotto",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "Tradotto".to_string(),
+            }],
+            provider: "mock",
+            model: "old-model",
+            prompt_version: "v1",
+            input_tokens: Some(3),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(3),
+            tokens_estimated: false,
+        })
+        .expect("translation should save");
+
+    // Resume after a config change: new provider/model/prompt/source hash.
+    seg.checksum = "checksum_new".to_string();
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v2",
+            "openrouter",
+            "new-model",
+            "ns_new",
+        )
+        .expect("resume re-insert should work");
+
+    let conn = store.conn.borrow();
+    let row = conn
+        .query_row(
+            "SELECT provider, model, prompt_version, source_hash, cache_namespace,
+                    status, attempts
+             FROM segments WHERE job_id = ?1 AND id = 'seg_a'",
+            params![job.id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .expect("segment row should load");
+    drop(conn);
+
+    assert_eq!(row.0, "openrouter");
+    assert_eq!(row.1, "new-model");
+    assert_eq!(row.2, "v2");
+    assert_eq!(row.3, "checksum_new");
+    assert_eq!(row.4, "ns_new");
+    assert_eq!(row.5, "succeeded", "resume re-insert must not reset status");
+    assert_eq!(row.6, 1, "resume re-insert must not reset attempts");
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn global_scope_unique_indexes_reject_duplicate_globals_across_connections() {
+    // STORE-13: NULL scope_id made every global row distinct to the table
+    // UNIQUE constraints, so concurrent first-inserts on two connections
+    // duplicated global terms/styles/entities. The partial unique indexes
+    // close that hole; scoped rows keep working via the table constraints.
+    let db_path = temp_path("global_unique.sqlite");
+    let store_a = JobStore::open(&db_path).expect("store a opens");
+    let store_b = JobStore::open(&db_path).expect("store b opens (second connection)");
+
+    store_a
+        .upsert_glossary_terms(&[glossary_term(
+            bookforge_core::GlossaryScopeKind::Global,
+            None,
+            "Aragorn",
+            "Aragorn",
+        )])
+        .expect("global term inserts");
+
+    // A second writer inserting the same global identity must now fail.
+    let duplicate = {
+        let conn = store_b.conn.borrow();
+        conn.execute(
+            "INSERT INTO glossary_terms
+             (scope_kind, scope_id, source_text, target_text, category, notes,
+              case_sensitive, always_active, status, source_language, target_language,
+              source_count, created_at, updated_at)
+             VALUES ('global', NULL, 'Aragorn', 'other target', 'person', NULL,
+                     1, 0, 'user_seeded', 'English', 'Italian', 0, 't1', 't1')",
+            [],
+        )
+    };
+    assert!(
+        duplicate.is_err(),
+        "duplicate global glossary term must violate the partial unique index"
+    );
+
+    // Scoped rows are unaffected by the partial index.
+    let scoped = {
+        let conn = store_b.conn.borrow();
+        conn.execute(
+            "INSERT INTO glossary_terms
+             (scope_kind, scope_id, source_text, target_text, category, notes,
+              case_sensitive, always_active, status, source_language, target_language,
+              source_count, created_at, updated_at)
+             VALUES ('book', 'lotr', 'Aragorn', 'Granpasso', 'person', NULL,
+                     1, 0, 'user_seeded', 'English', 'Italian', 0, 't1', 't1')",
+            [],
+        )
+    };
+    assert!(scoped.is_ok(), "scoped rows must remain insertable");
+
+    // Same protection for global style sheets and entities.
+    let style_first = {
+        let conn = store_a.conn.borrow();
+        conn.execute(
+            "INSERT INTO style_sheets
+             (scope_kind, scope_id, target_language, content_toml, fingerprint,
+              created_at, updated_at)
+             VALUES ('global', NULL, 'Italian', 'toml-a', 'fp-a', 't1', 't1')",
+            [],
+        )
+    };
+    assert!(style_first.is_ok());
+    let style_dup = {
+        let conn = store_b.conn.borrow();
+        conn.execute(
+            "INSERT INTO style_sheets
+             (scope_kind, scope_id, target_language, content_toml, fingerprint,
+              created_at, updated_at)
+             VALUES ('global', NULL, 'Italian', 'toml-b', 'fp-b', 't2', 't2')",
+            [],
+        )
+    };
+    assert!(
+        style_dup.is_err(),
+        "duplicate global style sheet must violate the partial unique index"
+    );
+
+    let entity_first = {
+        let conn = store_a.conn.borrow();
+        conn.execute(
+            "INSERT INTO entities
+             (scope_kind, scope_id, source_name, target_name, gender_target,
+              role, notes, source_language, target_language, created_at, updated_at)
+             VALUES ('global', NULL, 'Ivan', 'Ivan', NULL, NULL, NULL,
+                     'English', 'Italian', 't1', 't1')",
+            [],
+        )
+    };
+    assert!(entity_first.is_ok());
+    let entity_dup = {
+        let conn = store_b.conn.borrow();
+        conn.execute(
+            "INSERT INTO entities
+             (scope_kind, scope_id, source_name, target_name, gender_target,
+              role, notes, source_language, target_language, created_at, updated_at)
+             VALUES ('global', NULL, 'Ivan', 'Ivan II', NULL, NULL, NULL,
+                     'English', 'Italian', 't2', 't2')",
+            [],
+        )
+    };
+    assert!(
+        entity_dup.is_err(),
+        "duplicate global entity must violate the partial unique index"
+    );
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn migration_nine_deduplicates_legacy_global_rows_and_recreates_indexes() {
+    let db_path = temp_path("migration_nine_dedupe.sqlite");
+    {
+        let store = JobStore::open(&db_path).expect("store opens");
+        {
+            let conn = store.conn.borrow();
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS ux_glossary_terms_global_identity;
+                 DELETE FROM _migrations WHERE version = 9;
+                 INSERT INTO glossary_terms
+                   (scope_kind, scope_id, source_text, target_text, category, notes,
+                    case_sensitive, always_active, status, source_language, target_language,
+                    source_count, created_at, updated_at)
+                 VALUES
+                   ('global', NULL, 'Ivan', 'vecchio', 'person', NULL,
+                    1, 0, 'user_seeded', 'English', 'Italian', 0, '10', '10'),
+                   ('global', NULL, 'Ivan', 'recente', 'person', NULL,
+                    1, 0, 'user_seeded', 'English', 'Italian', 0, '20', '20');",
+            )
+            .expect("pre-migration legacy state should initialize");
+        }
+    }
+
+    let reopened = JobStore::open(&db_path).expect("reopen runs migration 9");
+    let survivors = reopened
+        .list_glossary_terms(GlossaryFilter {
+            scope_kind: Some(GlossaryScopeKind::Global),
+            scope_id: None,
+            source_language: Some("English"),
+            target_language: Some("Italian"),
+            active_only: false,
+        })
+        .expect("terms should list");
+    assert_eq!(survivors.len(), 1, "duplicates must collapse to one row");
+    assert_eq!(
+        survivors[0].target_text, "recente",
+        "the most recently updated duplicate must win"
+    );
+
+    {
+        let conn = reopened.conn.borrow();
+        let index: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'index'
+                 AND name = 'ux_glossary_terms_global_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("unique index should be recreated");
+        assert_eq!(index, "ux_glossary_terms_global_identity");
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _migrations WHERE version = 9",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration marker should query");
+        assert_eq!(applied, 1);
+    }
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn migrate_creates_jobs_created_at_index() {
+    // STORE-16: the dashboard/watch job lists sort by created_at on every
+    // refresh; without this index each refresh sorted the whole table.
+    let db_path = temp_path("jobs_created_at_index.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+    let conn = store.conn.borrow();
+    let index: String = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'index'
+             AND name = 'idx_jobs_created_at'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("idx_jobs_created_at exists");
+    assert_eq!(index, "idx_jobs_created_at");
+    drop(conn);
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn add_glossary_term_returns_stable_row_id_and_updates_in_place() {
+    // STORE-15: the id used to come from a re-select after a separate
+    // transaction, so a concurrent writer could make the returned id point at
+    // a different row. The upsert now returns its own id atomically.
+    let db_path = temp_path("add_glossary_term_id.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+    let mut term = glossary_term(
+        bookforge_core::GlossaryScopeKind::Global,
+        None,
+        "Aragorn",
+        "Aragorn",
+    );
+    let first = store.add_glossary_term(&term).expect("first insert");
+    term.target_text = "Granpasso".to_string();
+    let second = store.add_glossary_term(&term).expect("update in place");
+    assert_eq!(first, second, "upsert must return the existing row's id");
+
+    let rows = store
+        .list_glossary_terms(GlossaryFilter::default())
+        .expect("terms list");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, Some(second));
+    assert_eq!(rows[0].target_text, "Granpasso");
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn not_found_and_policy_rejections_use_distinct_error_variants() {
+    // STORE-18: InvalidCorrection doubled as a generic rejection, so callers
+    // could not distinguish "this does not exist" from "policy says no".
+    let db_path = temp_path("not_found_vs_policy.sqlite");
+    let (store, job, _segment) =
+        build_seeded_store_with_translation(&db_path, "variant_ns", &["b_000000"]);
+
+    // Unknown segment on an inactive job -> NotFound.
+    store
+        .mark_job_needs_review(&job.id)
+        .expect("job should become reviewable");
+    let unknown_segment = store.save_manual_correction(SaveManualCorrection {
+        job_id: &job.id,
+        segment_id: "missing_segment",
+        translated_text: "Correzione",
+        blocks: &[BlockTranslation {
+            block_id: BlockId("b_000000".to_string()),
+            text: "Correzione".to_string(),
+        }],
+    });
+    assert!(
+        matches!(unknown_segment, Err(StoreError::NotFound(_))),
+        "unknown segment must be NotFound, got: {unknown_segment:?}"
+    );
+    let unknown_retry = store.request_segment_retry(&job.id, "missing_segment", None);
+    assert!(
+        matches!(unknown_retry, Err(StoreError::NotFound(_))),
+        "unknown retry target must be NotFound, got: {unknown_retry:?}"
+    );
+    let unknown_flag = store.set_dashboard_segment_flag(&job.id, "missing_segment", true);
+    assert!(
+        matches!(unknown_flag, Err(StoreError::NotFound(_))),
+        "unknown flag target must be NotFound, got: {unknown_flag:?}"
+    );
+    let unknown_job = store.save_manual_correction(SaveManualCorrection {
+        job_id: "missing_job",
+        segment_id: "seg_a",
+        translated_text: "Correzione",
+        blocks: &[BlockTranslation {
+            block_id: BlockId("b_000000".to_string()),
+            text: "Correzione".to_string(),
+        }],
+    });
+    assert!(
+        matches!(unknown_job, Err(StoreError::NotFound(_))),
+        "unknown job must be NotFound, got: {unknown_job:?}"
+    );
+
+    // Policy rejection on an active job stays InvalidCorrection.
+    store
+        .mark_job_running_for_resume(&job.id)
+        .expect("job should run again");
+    let policy = store.save_manual_correction(SaveManualCorrection {
+        job_id: &job.id,
+        segment_id: "seg_a",
+        translated_text: "Correzione",
+        blocks: &[BlockTranslation {
+            block_id: BlockId("b_000000".to_string()),
+            text: "Correzione".to_string(),
+        }],
+    });
+    assert!(
+        matches!(policy, Err(StoreError::InvalidCorrection(_))),
+        "running-job rejection is policy, got: {policy:?}"
+    );
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn migrate_legacy_rename_cascade_completes_and_preserves_data() {
+    // STORE-4: the pre-v1_0_1 rename cascade used to run as five separate
+    // autocommit statements; a crash mid-cascade orphaned data and the next
+    // open silently recreated empty tables. The cascade now commits once, so
+    // an open either leaves zero orphans plus fresh tables, or nothing at all.
+    // The fixture hand-builds the true pre-v1_0_1 shape (translations keyed
+    // by segment_id alone, no job_id column — the trigger the migrate pass
+    // detects).
+    let db_path = temp_path("legacy_rename_cascade.sqlite");
+    {
+        let conn = Connection::open(&db_path).expect("legacy db opens");
+        conn.execute_batch(
+            "
+            CREATE TABLE _migrations (
+              version INTEGER PRIMARY KEY,
+              name TEXT NOT NULL,
+              applied_at TEXT NOT NULL
+            );
+            CREATE TABLE jobs (
+              id TEXT PRIMARY KEY,
+              input_hash TEXT NOT NULL,
+              target_lang TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE segments (
+              id TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              section_id TEXT NOT NULL,
+              ordinal INTEGER NOT NULL,
+              source_hash TEXT NOT NULL,
+              prompt_version TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              status TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              error TEXT,
+              PRIMARY KEY (job_id, id)
+            );
+            CREATE TABLE translations (
+              segment_id TEXT NOT NULL PRIMARY KEY,
+              translated_text TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE translation_blocks (
+              segment_id TEXT NOT NULL,
+              block_id TEXT NOT NULL,
+              translated_text TEXT NOT NULL,
+              PRIMARY KEY (segment_id, block_id)
+            );
+            CREATE TABLE qa_findings (
+              id TEXT PRIMARY KEY,
+              segment_id TEXT NOT NULL
+            );
+            INSERT INTO _migrations VALUES (1, 'initial', 'legacy');
+            INSERT INTO jobs
+              (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+            VALUES
+              ('legacy_job', 'legacy_hash', 'Italian', 'mock', 'mock-prefix',
+               'succeeded', 'created', 'updated');
+            INSERT INTO segments
+              (id, job_id, section_id, ordinal, source_hash, prompt_version,
+               provider, model, status)
+            VALUES
+              ('legacy_segment', 'legacy_job', 'section_0', 0, 'hash', 'v1',
+               'mock', 'mock-prefix', 'succeeded');
+            INSERT INTO translations (segment_id, translated_text, created_at)
+            VALUES ('legacy_segment', 'Traduzione', 'c');
+            ",
+        )
+        .expect("legacy data should initialize");
+    }
+
+    let store = JobStore::open(&db_path).expect("store opens and migrates");
+    let conn = store.conn.borrow();
+    let legacy_tables: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%_legacy_%'",
+            )
+            .expect("legacy scan prepares");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("legacy scan queries");
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .expect("legacy scan collects")
+    };
+    assert_eq!(
+        legacy_tables.len(),
+        5,
+        "exactly the five renamed tables may remain: {legacy_tables:?}"
+    );
+
+    let preserved: i64 = legacy_tables
+        .iter()
+        .filter(|table| table.starts_with("translations_legacy_"))
+        .map(|table| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("legacy row count")
+        })
+        .sum();
+    assert_eq!(
+        preserved, 1,
+        "legacy translation data must survive the cascade"
+    );
+
+    let fresh_jobs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+        .expect("fresh jobs count");
+    assert_eq!(
+        fresh_jobs, 0,
+        "fresh tables start empty; data lives in the copies"
+    );
+    drop(conn);
+
+    let _ = fs::remove_file(db_path);
+}
+
+// ---------------------------------------------------------------------------
+// STORE-12: typed statuses + storage-level CHECK enforcement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_check_constraints_reject_non_canonical_writes() {
+    let db_path = temp_path("status_checks.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+    assert!(
+        store.take_diagnostics().is_empty(),
+        "fresh stores carry no diagnostics"
+    );
+
+    {
+        let conn = store.conn.borrow();
+        for text in JobStatus::KNOWN_DB_TEXTS {
+            let result = conn.execute(
+                "INSERT INTO jobs
+                 (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+                 VALUES (?1, 'h', 'Italian', 'mock', 'mock', ?2, 't', 't')",
+                params![format!("job_ok_{text}"), text],
+            );
+            assert!(result.is_ok(), "canonical job status '{text}' must insert");
+        }
+        for text in SegmentStatus::KNOWN_DB_TEXTS {
+            let result = conn.execute(
+                "INSERT INTO segments
+                 (id, job_id, section_id, ordinal, source_hash, prompt_version,
+                  provider, model, status)
+                 VALUES (?1, 'job_ok_running', 'sec', 0, 'sh', 'v', 'mock', 'mock', ?2)",
+                params![format!("seg_ok_{text}"), text],
+            );
+            assert!(
+                result.is_ok(),
+                "canonical segment status '{text}' must insert"
+            );
+        }
+
+        // CHECK constraints make every foreign vocabulary write fail at the
+        // SQL boundary instead of silently poisoning downstream matches.
+        let bad_job = conn.execute(
+            "INSERT INTO jobs
+             (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+             VALUES ('job_bad', 'h', 'Italian', 'mock', 'mock', 'mysteriously_broken', 't', 't')",
+            [],
+        );
+        assert!(
+            bad_job.is_err(),
+            "non-canonical job status must be rejected"
+        );
+        let bad_segment = conn.execute(
+            "INSERT INTO segments
+             (id, job_id, section_id, ordinal, source_hash, prompt_version,
+              provider, model, status)
+             VALUES ('seg_bad', 'job_ok_running', 'sec', 1, 'sh', 'v',
+                     'mock', 'mock', 'vendor_patched_state')",
+            [],
+        );
+        assert!(
+            bad_segment.is_err(),
+            "non-canonical segment status must be rejected"
+        );
+    }
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn legacy_unknown_status_degrades_to_warn_on_open_without_data_loss() {
+    let db_path = temp_path("legacy_unknown_status.sqlite");
+    // Hand-edited style database: a status value BookForge never wrote sits in
+    // a pre-CHECK table built straight from the v1 baseline.
+    {
+        let conn = Connection::open(&db_path).expect("legacy db opens");
+        conn.execute_batch(include_str!("../../migrations/0001_initial.sql"))
+            .expect("v1 baseline applies");
+        conn.execute_batch(
+            "
+            INSERT INTO _migrations (version, name, applied_at) VALUES
+              (1, 'initial', 'legacy'), (2, 'v1_0_1_input_snapshot', 'legacy'),
+              (3, 'v1_1_segment_flags', 'legacy'), (4, 'v1_2_glossary_terms', 'legacy'),
+              (5, 'v1_2_1_nullable_glossary_candidate_targets', 'legacy'),
+              (6, 'v1_3_context_styles_entities', 'legacy'),
+              (7, 'v2_4_human_corrections', 'legacy'), (8, 'v2_7_qa_findings', 'legacy');
+            INSERT INTO jobs
+              (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+            VALUES
+              ('legacy_job', 'hash', 'Italian', 'mock', 'mock',
+               'out_of_band', '1000', '1000');
+            ",
+        )
+        .expect("legacy fixture initializes");
+    }
+
+    let store = JobStore::open(&db_path).expect("open must tolerate unknown rows");
+    let diagnostics = store.take_diagnostics();
+    assert!(
+        diagnostics.iter().any(|note| note.contains("out_of_band")),
+        "unknown value must warn on open: {diagnostics:?}"
+    );
+
+    // Serialized format is unchanged externally; only the decoder differs.
+    let record = store
+        .get_job("legacy_job")
+        .expect("job reads")
+        .expect("row exists");
+    assert_eq!(
+        record.status, "out_of_band",
+        "raw text is preserved verbatim"
+    );
+    assert_eq!(
+        record.job_status(),
+        JobStatus::Unknown("out_of_band".to_string()),
+        "unknown decodes defensively instead of panicking"
+    );
+
+    drop(store);
+
+    // Repairing the data lets the next open finally apply the constraints.
+    {
+        let conn = Connection::open(&db_path).expect("repair reopens");
+        conn.execute(
+            "UPDATE jobs SET status = 'failed' WHERE id = 'legacy_job'",
+            [],
+        )
+        .expect("repair applies");
+    }
+    let hardened = JobStore::open(&db_path).expect("repaired store opens");
+    assert!(
+        hardened.take_diagnostics().is_empty(),
+        "canonical data no longer warns"
+    );
+    {
+        let conn = hardened.conn.borrow();
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _migrations WHERE version = 10",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration ledger readable");
+        assert_eq!(applied, 1, "hardening recorded once data conforms");
+        let bogus = conn.execute(
+            "INSERT INTO jobs
+             (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+             VALUES ('x', 'h', 'l', 'p', 'm', 'still_bogus', 't', 't')",
+            [],
+        );
+        assert!(bogus.is_err(), "constraints active after repair");
+    }
+
+    drop(hardened);
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn unknown_segment_status_counts_toward_totals_but_no_bucket() {
+    let db_path = temp_path("legacy_unknown_segment_status.sqlite");
+    {
+        let conn = Connection::open(&db_path).expect("legacy db opens");
+        conn.execute_batch(include_str!("../../migrations/0001_initial.sql"))
+            .expect("v1 baseline applies");
+        conn.execute_batch(
+            "
+            INSERT INTO _migrations (version, name, applied_at) VALUES
+              (1, 'initial', 'legacy'), (2, 'v1_0_1_input_snapshot', 'legacy'),
+              (3, 'v1_1_segment_flags', 'legacy'), (4, 'v1_2_glossary_terms', 'legacy'),
+              (5, 'v1_2_1_nullable_glossary_candidate_targets', 'legacy'),
+              (6, 'v1_3_context_styles_entities', 'legacy'),
+              (7, 'v2_4_human_corrections', 'legacy'), (8, 'v2_7_qa_findings', 'legacy');
+            INSERT INTO jobs
+              (id, input_hash, target_lang, provider, model, status, created_at, updated_at)
+            VALUES
+              ('j', 'h', 'Italian', 'mock', 'mock', 'stopped', '1', '2');
+            INSERT INTO segments
+              (id, job_id, section_id, ordinal,
+               source_hash, prompt_version, provider, model, status)
+            VALUES
+              ('s1', 'j', 'sec', 0, 'c1', 'v', 'mock', 'mock', 'succeeded'),
+              ('s2', 'j', 'sec', 1, 'c2', 'v', 'mock', 'mock', 'fancy_custom');
+            ",
+        )
+        .expect("legacy fixture initializes");
+    }
+
+    let store = JobStore::open(&db_path).expect("store opens with warning");
+    assert!(!store.take_diagnostics().is_empty());
+
+    let summary = store.summary("j").expect("summary").expect("job exists");
+    assert_eq!(summary.total_segments, 2, "unknown still counts");
+    assert_eq!(summary.succeeded, 1);
+    assert_eq!(summary.failed, 0, "unbucketed values stay unbucketed");
+
+    let records = store.segment_records("j").expect("records");
+    assert_eq!(
+        records[1].segment_status(),
+        SegmentStatus::Unknown("fancy_custom".to_string())
+    );
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+}
+
+// ---------------------------------------------------------------------------
+// STORE-17 part A: prune_jobs retention path
+// ---------------------------------------------------------------------------
+
+fn prune_fixture_job(store: &JobStore, label: &str) -> JobRecord {
+    let input_path = temp_path(&format!("{label}-input.epub"));
+    fs::write(&input_path, format!("{label} epub bytes")).expect("fixture input writes");
+    store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path(&format!("{label}-output.epub")),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("fixture job creates")
+}
+
+fn populate_full_job_tree(store: &JobStore, job: &JobRecord, artifacts_dir: &Path) {
+    fs::create_dir_all(artifacts_dir).expect("artifacts dir exists");
+    let events_path = artifacts_dir.join(format!("{}-events.jsonl", job.id));
+    let report_json_path = artifacts_dir.join(format!("{}-report.json", job.id));
+    let report_markdown_path = artifacts_dir.join(format!("{}-report.md", job.id));
+    fs::write(&events_path, b"event").expect("events artifact writes");
+    fs::write(&report_json_path, b"{}").expect("json report artifact writes");
+    fs::write(&report_markdown_path, b"# Report").expect("md report artifact writes");
+
+    store
+        .update_job_event_path(&job.id, &events_path)
+        .expect("events path set");
+    store
+        .update_job_report_paths(&job.id, &report_json_path, &report_markdown_path)
+        .expect("report paths set");
+
+    let segments = vec![segment("seg_a", 0), segment("seg_b", 1)];
+    store
+        .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "ns")
+        .expect("segments inserted");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            translated_text: "Tradotto",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "Tradotto".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            tokens_estimated: false,
+        })
+        .expect("translation saved");
+    store
+        .save_needs_review(SaveNeedsReview {
+            job_id: &job.id,
+            segment_id: "seg_b",
+            preserved_text: "Da rivedere",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000001".to_string()),
+                text: "Da rivedere".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            error: "needs eyes on it",
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            tokens_estimated: false,
+        })
+        .expect("needs review saved");
+    store
+        .set_dashboard_segment_flag(&job.id, "seg_b", true)
+        .expect("dashboard flag set");
+    store
+        .insert_segment_flags(&[NewSegmentFlag {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            kind: "dashboard_retry",
+            note: Some("please retry"),
+            suggested_source: None,
+            suggested_target: None,
+            consumed: true,
+        }])
+        .expect("flags inserted");
+}
+
+fn count_rows(store: &JobStore, table: &str, job_id: &str) -> i64 {
+    store
+        .conn
+        .borrow()
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE job_id = ?1"),
+            params![job_id],
+            |row| row.get(0),
+        )
+        .expect("count query")
+}
+
+#[test]
+fn prune_jobs_deletes_whole_tree_atomically_and_protects_running() {
+    let db_path = temp_path("prune_tree.sqlite");
+    let artifacts_dir = temp_path("prune-artifacts-root");
+    let store = JobStore::open(&db_path).expect("store opens");
+
+    let finished = prune_fixture_job(&store, "finished");
+    populate_full_job_tree(&store, &finished, &artifacts_dir);
+    store.mark_job_stopped(&finished.id).expect("job stopped");
+
+    // This one stays `running` from creation and is never touched.
+    let running = prune_fixture_job(&store, "running");
+    store
+        .insert_segments(
+            &running.id,
+            &[segment("seg_live", 0)],
+            "v1",
+            "mock",
+            "mock-prefix",
+            "ns",
+        )
+        .expect("running segments inserted");
+
+    let events_file_artifact = artifacts_dir.join(format!("{}-events.jsonl", finished.id));
+    let report_json_artifact = artifacts_dir.join(format!("{}-report.json", finished.id));
+
+    let report = store
+        .prune_jobs(PruneJobsOptions::default())
+        .expect("prunes");
+    assert_eq!(
+        report.protected_running_jobs, 1,
+        "the running job is guarded"
+    );
+    assert_eq!(report.candidate_count, 1);
+    assert_eq!(report.pruned_job_count(), 1);
+    let deletion = &report.deletions[0];
+    assert_eq!(deletion.job_id, finished.id);
+    assert_eq!(deletion.segments, 2);
+    assert!(deletion.translations >= 1);
+    assert!(deletion.translation_blocks >= 2);
+    assert!(
+        deletion.qa_findings >= 1,
+        "needs-review classification kept"
+    );
+    assert!(deletion.segment_flags >= 1);
+    assert!(deletion.artifacts_removed.contains(&events_file_artifact));
+    assert!(deletion.artifacts_removed.contains(&report_json_artifact));
+    assert!(!events_file_artifact.exists(), "artifact file removed");
+    assert!(!report_json_artifact.exists(), "artifact file removed");
+
+    // FK-cascade correctness across ALL child tables: zero orphans remain.
+    assert_eq!(count_rows(&store, "translations", &finished.id), 0);
+    assert_eq!(count_rows(&store, "translation_blocks", &finished.id), 0);
+    assert_eq!(count_rows(&store, "qa_findings", &finished.id), 0);
+    assert_eq!(count_rows(&store, "segment_flags", &finished.id), 0);
+    assert_eq!(count_rows(&store, "segments", &finished.id), 0);
+    assert!(store.get_job(&finished.id).expect("lookup").is_none());
+    assert!(
+        store.get_job(&running.id).expect("lookup").is_some(),
+        "running survives"
+    );
+    assert_eq!(count_rows(&store, "segments", &running.id), 1);
+
+    // Second pass finds nothing more to do.
+    let second = store
+        .prune_jobs(PruneJobsOptions::default())
+        .expect("idempotent");
+    assert_eq!(second.candidate_count, 0);
+    assert_eq!(second.pruned_job_count(), 0);
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(artifacts_dir);
+}
+
+#[test]
+fn prune_jobs_dry_run_reports_without_modifying_anything() {
+    let db_path = temp_path("prune_dry_run.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+    let job = prune_fixture_job(&store, "dry");
+    let artifacts_dir = temp_path("prune-dry-artifacts");
+    populate_full_job_tree(&store, &job, &artifacts_dir);
+    store.mark_job_stopped(&job.id).expect("stopped");
+    let events_artifact = artifacts_dir.join(format!("{}-events.jsonl", job.id));
+
+    let report = store
+        .prune_jobs(PruneJobsOptions {
+            dry_run: true,
+            ..PruneJobsOptions::default()
+        })
+        .expect("dry run");
+    assert!(report.dry_run);
+    assert_eq!(report.candidate_count, 1);
+    let deletion = &report.deletions[0];
+    assert_eq!(deletion.segments, 2);
+    assert!(deletion.segment_flags >= 1);
+
+    // Nothing actually changed.
+    assert!(store.get_job(&job.id).expect("lookup").is_some());
+    assert_eq!(count_rows(&store, "segments", &job.id), 2);
+    assert!(events_artifact.exists(), "dry run never touches artifacts");
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(artifacts_dir);
+}
+
+#[test]
+fn prune_jobs_respects_older_than_and_keep_last_n() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let db_path = temp_path("prune_filters.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+
+    let old_job = prune_fixture_job(&store, "old");
+    let mid_job = prune_fixture_job(&store, "mid");
+    let new_job = prune_fixture_job(&store, "new");
+    for (id, stamp) in [
+        (&old_job.id, "900"),
+        (&mid_job.id, "1500"),
+        (&new_job.id, "2000"),
+    ] {
+        {
+            let conn = store.conn.borrow();
+            conn.execute(
+                "UPDATE jobs SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+                params![stamp, id],
+            )
+            .expect("stamp set");
+        }
+        store.mark_job_stopped(id).expect("stopped");
+    }
+
+    // dry-ish age filter that excludes everything future.
+    let none_match = store
+        .prune_jobs(PruneJobsOptions {
+            older_than: Some(SystemTime::UNIX_EPOCH),
+            ..PruneJobsOptions::default()
+        })
+        .expect("future-only cutoff");
+    assert_eq!(none_match.candidate_count, 0);
+
+    // Age cutoff keeps only `mid`/`new` eligible; keep_last_n=1 then spares
+    // the newest survivor (`new`) — deleting exactly `mid`.
+    let cutoff_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        + 10;
+    let cutoff = UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(cutoff_secs))
+        .expect("cutoff");
+    let report = store
+        .prune_jobs(PruneJobsOptions {
+            older_than: Some(cutoff),
+            keep_last_n: Some(1),
+            ..PruneJobsOptions::default()
+        })
+        .expect("prunes");
+    assert_eq!(report.candidate_count, 3, "age floor is in the far future");
+    assert_eq!(report.retained_by_keep_last_n, 1);
+    assert_eq!(report.pruned_job_count(), 2, "mid+old deleted, newest kept");
+    let deleted_ids: Vec<&str> = report.deletions.iter().map(|d| d.job_id.as_str()).collect();
+    assert!(deleted_ids.contains(&old_job.id.as_str()));
+    assert!(deleted_ids.contains(&mid_job.id.as_str()));
+    assert!(store.get_job(&new_job.id).expect("lookup").is_some());
+    assert!(store.get_job(&old_job.id).expect("lookup").is_none());
+
+    // keep_last_n alone: rebuild order sensitivity by keeping 0 → all go.
+    let everything = store
+        .prune_jobs(PruneJobsOptions {
+            older_than: Some(cutoff),
+            keep_last_n: Some(0),
+            ..PruneJobsOptions::default()
+        })
+        .expect("prunes rest");
+    assert_eq!(everything.pruned_job_count(), 1, "only the newest remains");
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+}
+
+// ---------------------------------------------------------------------------
+// STORE-17 part B: bounded/streaming input hashing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn file_hash_streams_chunks_matching_the_single_shot_digest() {
+    use sha2::{Digest, Sha256};
+
+    let db_path = temp_path("streaming_hash.sqlite");
+    let big_input = temp_path("big-input.epub");
+    // > 2x FILE_HASH_CHUNK_BYTES so at least three streaming chunks are read,
+    // with an awkward remainder size to exercise partial-buffer handling.
+    let total_bytes = 64 * 1024 * 2 + 7;
+    let payload: Vec<u8> = (0..total_bytes).map(|i| (i % 251) as u8).collect();
+    fs::write(&big_input, &payload).expect("large fixture writes");
+
+    let store = JobStore::open(&db_path).expect("store opens");
+    let job = store
+        .create_job(CreateJob {
+            input: &big_input,
+            output: &temp_path("big-output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job creates");
+
+    let mut expected_hasher = Sha256::new();
+    expected_hasher.update(&payload);
+    let expected: String = expected_hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(job.input_hash, expected);
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(big_input);
+}
+
+// ---------------------------------------------------------------------------
+// Audit remediation: S-1 / S-2 / S-3 regressions + file_hash NIT
+// ---------------------------------------------------------------------------
+
+#[test]
+fn harden_failure_path_restores_foreign_key_enforcement() {
+    use super::restore_safe_status_harden;
+
+    let failing_step = |message: &'static str| {
+        move |_conn: &mut Connection| -> rusqlite::Result<()> {
+            Err(rusqlite::Error::InvalidParameterName(message.to_string()))
+        }
+    };
+
+    // Case 1: the inner rebuild fails immediately (no transaction open).
+    {
+        let db_path = temp_path("harden_fk_restore_instant.sqlite");
+        let mut conn = Connection::open(&db_path).expect("test db opens");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE parent (id TEXT PRIMARY KEY);
+             CREATE TABLE child (
+               id TEXT PRIMARY KEY,
+               parent_id TEXT NOT NULL REFERENCES parent(id)
+             );",
+        )
+        .expect("schema builds");
+        assert!(conn.is_autocommit(), "clean start is in autocommit");
+
+        let outcome = restore_safe_status_harden(&mut conn, failing_step("boom-instant"));
+        assert!(outcome.is_err(), "inner failure must propagate");
+
+        let enforcement: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign_keys pragma readable");
+        assert!(
+            enforcement,
+            "S-1: the failure path must switch foreign_keys back on"
+        );
+        let orphaned = conn.execute(
+            "INSERT INTO child (id, parent_id) VALUES ('orphan', 'ghost')",
+            [],
+        );
+        assert!(
+            orphaned.is_err(),
+            "enforcement must be active, not merely reporting ON"
+        );
+        drop(conn);
+        let _ = fs::remove_file(db_path);
+    }
+
+    // Case 2: the inner step fails while a raw transaction it opened via SQL
+    // is still open — exactly what a failed rollback leaves behind. PRAGMA
+    // inside a transaction is a silent no-op, so the guard must roll that
+    // stray transaction back before restoring.
+    {
+        let db_path = temp_path("harden_fk_restore_stray_txn.sqlite");
+        let mut conn = Connection::open(&db_path).expect("test db opens");
+        conn.execute_batch(
+            "CREATE TABLE parent (id TEXT PRIMARY KEY);
+             CREATE TABLE child (
+               id TEXT PRIMARY KEY,
+               parent_id TEXT NOT NULL REFERENCES parent(id)
+             );",
+        )
+        .expect("schema builds");
+        let stray_txn_step = |conn: &mut Connection| -> rusqlite::Result<()> {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            Err(rusqlite::Error::InvalidParameterName(
+                "boom-stray".to_string(),
+            ))
+        };
+
+        let outcome = restore_safe_status_harden(&mut conn, stray_txn_step);
+        assert!(outcome.is_err(), "stray-txn failure must propagate");
+
+        assert!(
+            conn.is_autocommit(),
+            "the stranded transaction must be rolled back first"
+        );
+        let enforcement: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign_keys pragma readable");
+        assert!(
+            enforcement,
+            "S-1: enforcement restored even when the txn was left open"
+        );
+        drop(conn);
+        let _ = fs::remove_file(db_path);
+    }
+
+    // Control: success still records enforcement and passes through.
+    {
+        let db_path = temp_path("harden_fk_restore_success.sqlite");
+        let mut conn = Connection::open(&db_path).expect("test db opens");
+        conn.execute_batch("CREATE TABLE marker (x INTEGER);")
+            .expect("schema builds");
+        let outcome = restore_safe_status_harden(&mut conn, |_| Ok(()));
+        assert!(outcome.is_ok(), "happy path stays happy");
+        let enforcement: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign_keys pragma readable");
+        assert!(enforcement, "success path also leaves FK enforced");
+        drop(conn);
+        let _ = fs::remove_file(db_path);
+    }
+}
+
+#[test]
+fn prune_skips_job_flipped_to_running_after_selection() {
+    // Regression for S-2: the running-guard used to be checked only during
+    // selection; each per-job deletion transaction never re-read status, so a
+    // job that turned `running` between the two phases could be deleted
+    // underneath its live checkpointing process. Emulate the interleaving
+    // with two connections: selection commits first, connection B flips the
+    // job to `running`, then A drives its pruning path.
+    let db_path = temp_path("prune_toctou_running.sqlite");
+    let artifacts_dir = temp_path("prune-toctou-artifacts");
+    let store = JobStore::open(&db_path).expect("store opens (conn A)");
+
+    let victim = prune_fixture_job(&store, "victim");
+    populate_full_job_tree(&store, &victim, &artifacts_dir);
+    store.mark_job_stopped(&victim.id).expect("job stopped");
+
+    // Phase 1 — select candidates on connection A. The job is stopped here.
+    let selection = store
+        .select_prune_candidates(None, None)
+        .expect("selection runs");
+    assert_eq!(selection.candidate_count, 1);
+    assert_eq!(selection.to_delete, vec![victim.id.clone()]);
+    assert_eq!(selection.protected_running_jobs, 0);
+
+    // Phase 2 — connection B flips the selected job to `running` after A's
+    // selection transaction has already committed.
+    {
+        let conn_b = Connection::open(&db_path).expect("second connection");
+        let flipped = conn_b
+            .execute(
+                "UPDATE jobs SET status = 'running' WHERE id = ?1",
+                params![victim.id],
+            )
+            .expect("concurrent flip applies");
+        assert_eq!(flipped, 1);
+    }
+
+    // Phase 3 — drive A's deletion path for the stale candidate list.
+    let options = PruneJobsOptions::default();
+    let mut report = PruneJobsReport {
+        dry_run: false,
+        candidate_count: selection.candidate_count,
+        protected_running_jobs: selection.protected_running_jobs,
+        protected_paused_jobs: selection.protected_paused_jobs,
+        retained_by_keep_last_n: selection.retained_by_keep_last_n,
+        deletions: Vec::new(),
+    };
+    store
+        .execute_prune_selection(&selection.to_delete, &options, &mut report)
+        .expect("execution runs");
+
+    assert!(
+        report.deletions.is_empty(),
+        "the re-check inside the deletion txn must skip this job entirely"
+    );
+    assert_eq!(
+        report.protected_running_jobs, 1,
+        "the late flip counts as protected"
+    );
+    assert_eq!(
+        report.candidate_count, 0,
+        "a running job is no longer an honest prune candidate"
+    );
+
+    // The whole tree plus artifacts survive untouched.
+    assert!(
+        store.get_job(&victim.id).expect("lookup").is_some(),
+        "flipped-to-running job row survives"
+    );
+    assert_eq!(count_rows(&store, "segments", &victim.id), 2);
+    assert!(
+        count_rows(&store, "translations", &victim.id) >= 1,
+        "model translation rows survive the skip"
+    );
+    assert!(
+        artifacts_dir
+            .join(format!("{}-events.jsonl", victim.id))
+            .exists(),
+        "artifact files are not unlinked for protected jobs"
+    );
+
+    // Sanity: once stopped again, pruning proceeds normally.
+    store.mark_job_stopped(&victim.id).expect("stopped again");
+    let second = store.prune_jobs(options).expect("normal prune resumes");
+    assert_eq!(second.pruned_job_count(), 1);
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(artifacts_dir);
+}
+
+#[test]
+fn prune_skips_job_flipped_to_paused_after_selection() {
+    // Lifecycle audit: a paused status generally means a LIVE paused worker
+    // holds a runtime lease. The paused guard must be enforced a second time
+    // inside the per-job deletion transaction, exactly like the running guard,
+    // so a job that turns `paused` between selection and deletion is never
+    // pruned underneath a live parked process.
+    let db_path = temp_path("prune_toctou_paused.sqlite");
+    let artifacts_dir = temp_path("prune-toctou-paused-artifacts");
+    let store = JobStore::open(&db_path).expect("store opens (conn A)");
+
+    let victim = prune_fixture_job(&store, "victim");
+    populate_full_job_tree(&store, &victim, &artifacts_dir);
+    store.mark_job_stopped(&victim.id).expect("job stopped");
+
+    // Phase 1 — select candidates on connection A. The job is stopped here.
+    let selection = store
+        .select_prune_candidates(None, None)
+        .expect("selection runs");
+    assert_eq!(selection.candidate_count, 1);
+    assert_eq!(selection.to_delete, vec![victim.id.clone()]);
+    assert_eq!(selection.protected_paused_jobs, 0);
+
+    // Phase 2 — connection B flips the selected job to `paused` after A's
+    // selection transaction has already committed.
+    {
+        let conn_b = Connection::open(&db_path).expect("second connection");
+        let flipped = conn_b
+            .execute(
+                "UPDATE jobs SET status = 'paused' WHERE id = ?1",
+                params![victim.id],
+            )
+            .expect("concurrent flip applies");
+        assert_eq!(flipped, 1);
+    }
+
+    // Phase 3 — drive A's deletion path for the stale candidate list.
+    let options = PruneJobsOptions::default();
+    let mut report = PruneJobsReport {
+        dry_run: false,
+        candidate_count: selection.candidate_count,
+        protected_running_jobs: selection.protected_running_jobs,
+        protected_paused_jobs: selection.protected_paused_jobs,
+        retained_by_keep_last_n: selection.retained_by_keep_last_n,
+        deletions: Vec::new(),
+    };
+    store
+        .execute_prune_selection(&selection.to_delete, &options, &mut report)
+        .expect("execution runs");
+
+    assert!(
+        report.deletions.is_empty(),
+        "the re-check inside the deletion txn must skip a job flipped to paused"
+    );
+    assert_eq!(report.protected_running_jobs, 0);
+    assert_eq!(
+        report.protected_paused_jobs, 1,
+        "the late flip is reported as a protected paused job"
+    );
+    assert_eq!(
+        report.candidate_count, 0,
+        "a paused job is no longer an honest prune candidate"
+    );
+    assert!(
+        store.get_job(&victim.id).expect("lookup").is_some(),
+        "flipped-to-paused job row survives"
+    );
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(artifacts_dir);
+}
+
+#[test]
+fn request_segment_retry_freeze_check_rides_inside_the_write_txn() {
+    // Regression for S-3 (H-1 TOCTOU family): the human-correction freeze
+    // check used to run BEFORE opening the IMMEDIATE write transaction. Hold
+    // the writer lock with a second connection so the retry blocks at the
+    // transaction door, land a frozen correction meanwhile, then release:
+    // the retry's in-transaction freeze check must now see it and refuse.
+    // The pre-transaction placement would instead pass the window and flip
+    // the segment to retry_pending over the correction.
+    let db_path = temp_path("retry_freeze_inside_txn.sqlite");
+    let input_path = temp_path("input.sqlite-retry.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture writes");
+
+    let store = JobStore::open(&db_path).expect("store opens");
+    let job_id = {
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("output-retry.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job creates");
+        store
+            .insert_segments(
+                &job.id,
+                &[segment("seg_a", 0)],
+                "v1",
+                "mock",
+                "mock-prefix",
+                "freeze_ns",
+            )
+            .expect("segments insert");
+        store.mark_job_stopped(&job.id).expect("stopped for retry");
+        job.id
+    };
+
+    {
+        // Second process grabs the IMMEDIATE writer lock FIRST so the
+        // retry's transaction below deterministically starts only after the
+        // correction is committed.
+        let conn_b = Connection::open(&db_path).expect("second connection");
+        conn_b
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("writer lock acquired before the retry can begin");
+        let job_id_for_thread = job_id.clone();
+        let db_path_for_thread = db_path.clone();
+        let handle = std::thread::spawn(move || {
+            // All migrations are already recorded, so this open takes no
+            // write lock and proceeds happily while B holds the writer.
+            let retry_store = JobStore::open(&db_path_for_thread).expect("retry-side store opens");
+            retry_store.request_segment_retry(&job_id_for_thread, "seg_a", Some("late guidance"))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        conn_b
+            .execute(
+                "INSERT INTO translations
+                 (segment_id, job_id, translated_text, provider, model, prompt_version,
+                  created_at, origin, human_corrected, corrected_at)
+                 VALUES ('seg_a', ?1, 'Correzione umana', 'manual', 'manual', 'v1',
+                         '2000', 'manual', 1, '2000')",
+                params![job_id],
+            )
+            .expect("frozen translation inserts under the lock");
+        conn_b
+            .execute(
+                "INSERT INTO translation_blocks
+                 (segment_id, job_id, block_id, translated_text)
+                 VALUES ('seg_a', ?1, 'b_000000', 'Correzione umana')",
+                params![job_id],
+            )
+            .expect("frozen block inserts under the lock");
+        conn_b
+            .execute_batch("COMMIT")
+            .expect("correction committed");
+
+        let result = handle.join().expect("retry thread joins without panic");
+        match result {
+            Err(StoreError::InvalidCorrection(message)) => {
+                assert!(
+                    message.contains("frozen human correction"),
+                    "the in-txn freeze check must reject, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidCorrection from the freeze check, got {other:?}"),
+        }
+    }
+
+    // The segment was NOT flipped and the correction survives verbatim.
+    {
+        let conn = store.conn.borrow();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM segments WHERE job_id = ?1 AND id = 'seg_a'",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .expect("segment readable");
+        assert_eq!(
+            status, "queued",
+            "a frozen segment must never transition to retry_pending"
+        );
+        let (origin, corrected): (String, i64) = conn
+            .query_row(
+                "SELECT origin, human_corrected FROM translations WHERE job_id = ?1 AND segment_id = 'seg_a'",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("translation readable");
+        assert_eq!(origin, "manual");
+        assert_eq!(corrected, 1);
+    }
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn file_hash_of_empty_input_is_the_canonical_sha256_digest() {
+    let empty_input = temp_path("empty-input.epub");
+    fs::write(&empty_input, b"").expect("empty fixture writes");
+
+    let hash = file_hash(&empty_input).expect("hashing succeeds");
+    assert_eq!(
+        hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "streaming zero chunks must equal SHA-256 of the empty string"
+    );
+
+    let _ = fs::remove_file(empty_input);
+}
+
+// ---------------------------------------------------------------------------
+// Audit remediation: block attribution + instance severity for qa_findings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn qa_findings_persist_block_attribution_and_read_null_for_legacy_rows() {
+    let (db_path, input_path, store, job) = setup_findings_store("qa_block_attribution.sqlite", 1);
+    let findings = vec![
+        EngineFinding::new(QaFindingKind::SourceCopyUnchanged, "title unchanged")
+            .with_block_id("b_000042"),
+        EngineFinding::new(QaFindingKind::BatchBlockMismatch, "missing=[\"b_000007\"]"),
+    ];
+    assert_eq!(
+        store
+            .record_segment_engine_findings(&job.id, "seg_0", &findings)
+            .expect("structured findings should record"),
+        2
+    );
+
+    // A row written the pre-11 way (no block_id column value at all) must
+    // read back as unattributed, never fail the load.
+    {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "INSERT INTO qa_findings
+             (id, segment_id, job_id, severity, kind, message)
+             VALUES ('qaf_legacy', 'seg_0', ?1, 'error', 'provider_error', 'legacy row')",
+            params![job.id],
+        )
+        .expect("legacy-shaped row should insert");
+    }
+
+    let stored = store
+        .segment_qa_findings(&job.id)
+        .expect("findings should load");
+    let attributed = stored
+        .iter()
+        .find(|finding| finding.kind == "source_copy_unchanged")
+        .expect("block-attributed finding stored");
+    assert_eq!(attributed.block_id.as_deref(), Some("b_000042"));
+    let segment_level = stored
+        .iter()
+        .find(|finding| finding.kind == "batch_block_mismatch")
+        .expect("segment-level finding stored");
+    assert_eq!(segment_level.block_id, None);
+    let legacy = stored
+        .iter()
+        .find(|finding| finding.id == "qaf_legacy")
+        .expect("legacy row loads");
+    assert_eq!(legacy.block_id, None, "legacy rows read NULL block ids");
+
+    // The legacy error-text path keeps writing NULL block ids.
+    store
+        .record_segment_findings(&job.id, "seg_0", "provider error: upstream unavailable")
+        .expect("text findings should record");
+    let text_rows = store
+        .segment_qa_findings(&job.id)
+        .expect("findings should reload");
+    assert!(
+        text_rows.iter().all(|finding| finding.block_id.is_none()),
+        "error-text classification stays segment-level: {text_rows:?}"
+    );
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn qa_finding_instance_severity_overrides_kind_default() {
+    let (db_path, input_path, store, job) = setup_findings_store("qa_instance_severity.sqlite", 1);
+    let findings = vec![
+        EngineFinding::new(QaFindingKind::SourceCopyUnchanged, "unchanged prose"),
+        EngineFinding::new(
+            QaFindingKind::SourceCopyUnchanged,
+            "unchanged section title",
+        )
+        .with_severity(QaFindingSeverity::Error),
+    ];
+    store
+        .record_segment_engine_findings(&job.id, "seg_0", &findings)
+        .expect("structured findings should record");
+
+    let stored = store
+        .segment_qa_findings(&job.id)
+        .expect("findings should load");
+    let default_row = stored
+        .iter()
+        .find(|finding| finding.message == "unchanged prose")
+        .expect("default-severity row stored");
+    assert_eq!(
+        default_row.severity, "warning",
+        "no override keeps the kind's default severity"
+    );
+    let override_row = stored
+        .iter()
+        .find(|finding| finding.message == "unchanged section title")
+        .expect("overridden row stored");
+    assert_eq!(
+        override_row.severity, "error",
+        "the per-instance override must win over the kind default"
+    );
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn unknown_qa_finding_kind_strings_decode_to_other_and_never_fail_loads() {
+    let (db_path, input_path, store, job) = setup_findings_store("qa_unknown_kind.sqlite", 1);
+    {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "INSERT INTO qa_findings
+             (id, segment_id, job_id, severity, kind, message, block_id)
+             VALUES ('qaf_mystery', 'seg_0', ?1, 'error', 'mystery_kind',
+                     'hand-edited row', NULL)",
+            params![job.id],
+        )
+        .expect("unknown-kind row should insert");
+    }
+
+    let stored = store
+        .segment_qa_findings(&job.id)
+        .expect("loads never fail on unknown kinds");
+    let mystery = stored
+        .iter()
+        .find(|finding| finding.id == "qaf_mystery")
+        .expect("unknown-kind row survives the read");
+    assert_eq!(
+        mystery.kind, "mystery_kind",
+        "raw text is preserved verbatim"
+    );
+    assert_eq!(
+        mystery.finding_kind(),
+        QaFindingKind::Other,
+        "typed decode maps unknown strings to Other"
+    );
+    assert_eq!(
+        QaFindingKind::from_db_str("source_copy_unchanged"),
+        QaFindingKind::SourceCopyUnchanged,
+        "known kinds round-trip through the same decode"
+    );
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn qa_finding_severity_guard_rejects_non_canonical_text() {
+    use super::findings::validated_finding_severity;
+
+    assert!(
+        matches!(
+            validated_finding_severity("critical"),
+            Err(StoreError::Serialization(_))
+        ),
+        "foreign severity text must be rejected at the insert boundary"
+    );
+    assert_eq!(
+        validated_finding_severity("error").expect("'error' is canonical"),
+        "error"
+    );
+    assert_eq!(
+        validated_finding_severity("warning").expect("'warning' is canonical"),
+        "warning"
+    );
+}
+
+#[test]
+fn migration_eleven_adds_block_id_once_and_reopen_takes_no_write_transaction() {
+    let db_path = temp_path("migration_eleven_gated.sqlite");
+    {
+        let store = JobStore::open(&db_path).expect("first open migrates");
+        assert!(
+            store.take_diagnostics().is_empty(),
+            "fresh stores carry no diagnostics"
+        );
+        {
+            let conn = store.conn.borrow();
+            let column: String = conn
+                .query_row(
+                    "SELECT name FROM pragma_table_info('qa_findings') WHERE name = 'block_id'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("block_id column exists after the first open");
+            assert_eq!(column, "block_id");
+            let applied: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM _migrations WHERE version = 11",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("migration ledger readable");
+            assert_eq!(applied, 1);
+        }
+    }
+
+    // Gated-once: with every migration recorded, a reopen must not attempt
+    // any write. Hold the writer lock on a second connection while
+    // reopening — the open only succeeds because it never takes a write
+    // transaction (same pattern as the freeze-check-inside-txn regression
+    // test above).
+    let conn_b = Connection::open(&db_path).expect("second connection");
+    conn_b
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("writer lock acquired");
+    let reopened = JobStore::open(&db_path).expect("reopen while the writer lock is held");
+    assert!(
+        reopened.take_diagnostics().is_empty(),
+        "an already-migrated reopen carries no diagnostics"
+    );
+    drop(reopened);
+    drop(conn_b);
+
+    {
+        let store = JobStore::open(&db_path).expect("third open");
+        let conn = store.conn.borrow();
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _migrations WHERE version = 11",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration ledger readable");
+        assert_eq!(applied, 1, "migration 11 is recorded exactly once");
+    }
+
+    let _ = fs::remove_file(db_path);
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle audit: prune must never delete live paused jobs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prune_never_deletes_paused_jobs() {
+    let db_path = temp_path("prune_paused.sqlite");
+    let artifacts_dir = temp_path("prune-paused-artifacts");
+    let store = JobStore::open(&db_path).expect("store opens");
+
+    let finished = prune_fixture_job(&store, "finished");
+    populate_full_job_tree(&store, &finished, &artifacts_dir);
+    store
+        .mark_job_stopped(&finished.id)
+        .expect("finished job stopped");
+
+    // A paused job: either a live worker parked on a runtime lease, or the
+    // leftover of one that died mid-pause. The store cannot tell which, so
+    // prune must protect it exactly like a running job (fail-closed).
+    let paused = prune_fixture_job(&store, "paused");
+    store.mark_job_paused(&paused.id).expect("job paused");
+
+    let report = store
+        .prune_jobs(PruneJobsOptions::default())
+        .expect("prune runs");
+
+    assert_eq!(
+        report.pruned_job_count(),
+        1,
+        "only the stopped job is pruned"
+    );
+    assert_eq!(
+        report.protected_paused_jobs, 1,
+        "the paused job is reported as protected"
+    );
+    assert!(
+        store.get_job(&paused.id).expect("lookup").is_some(),
+        "a paused job's row must survive pruning"
+    );
+    assert_eq!(
+        count_rows(&store, "segments", &paused.id),
+        0,
+        "a paused job has no segments yet (never ran)"
+    );
+    assert!(
+        store.get_job(&finished.id).expect("lookup").is_none(),
+        "the stopped job is pruned as before"
+    );
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(artifacts_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle audit: store mutation APIs fail closed with NotFound
+// ---------------------------------------------------------------------------
+
+#[test]
+fn store_status_mutations_return_not_found_for_missing_jobs() {
+    let db_path = temp_path("notfound_jobs.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+
+    let results = [
+        store.mark_job_running("job_missing"),
+        store.mark_job_paused("job_missing"),
+        store.mark_job_failed("job_missing"),
+        store.mark_job_stopped("job_missing"),
+        store.mark_job_running_for_resume("job_missing"),
+    ];
+    for error in results {
+        match error {
+            Err(StoreError::NotFound(message)) => {
+                assert!(
+                    message.contains("job_missing"),
+                    "NotFound names the row: {message}"
+                );
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn store_update_mutations_return_not_found_for_missing_jobs() {
+    let db_path = temp_path("notfound_updates.sqlite");
+    let store = JobStore::open(&db_path).expect("store opens");
+    let path = temp_path("out.epub");
+
+    let errors = [
+        store.update_job_output_path("job_missing", &path),
+        store.update_job_event_path("job_missing", &path),
+        store.update_job_report_paths("job_missing", &path, &path),
+        store.update_job_input_snapshot("job_missing", &path, "sha"),
+        store
+            .retry_segments("job_missing", RetryScope::Failed)
+            .map(|_| ()),
+        store
+            .mark_segments_needs_review("job_missing", &["seg_a".to_string()], "reason")
+            .map(|_| ()),
+        store
+            .mark_unfinished_segments_failed("job_missing", &["seg_a".to_string()], "reason")
+            .map(|_| ()),
+    ];
+    for error in errors {
+        assert!(
+            matches!(error, Err(StoreError::NotFound(_))),
+            "a missing job must surface NotFound, got: {error:?}"
+        );
+    }
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn store_segment_mutations_return_not_found_for_missing_segments() {
+    let db_path = temp_path("notfound_segments.sqlite");
+    let input_path = temp_path("notfound-segments-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture writes");
+    let store = JobStore::open(&db_path).expect("store opens");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("notfound-segments-out.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job creates");
+    // A running job would reject a retry with a policy error before the
+    // existence check; stop it so the retry reaches the segment lookup.
+    store.mark_job_stopped(&job.id).expect("job stopped");
+
+    let results = [
+        store.mark_segment_failed(&job.id, "seg_phantom", "boom"),
+        store.mark_segment_failed_if_unfinished(&job.id, "seg_phantom", "boom"),
+        store.request_segment_retry(&job.id, "seg_phantom", None),
+    ];
+    for error in results {
+        assert!(
+            matches!(error, Err(StoreError::NotFound(_))),
+            "expected NotFound, got {error:?}"
+        );
+    }
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+/// Bulk retry must be all-or-nothing: if anything inside the IMMEDIATE
+/// transaction fails, the segments must NOT be left half-flipped under a stale
+/// job status. Here the job row is missing, so the segment update inside the
+/// transaction never commits.
+#[test]
+fn retry_segments_is_atomic_and_rejects_missing_jobs_without_partial_mutation() {
+    let db_path = temp_path("retry_atomic.sqlite");
+    let input_path = temp_path("retry-atomic-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture writes");
+    let store = JobStore::open(&db_path).expect("store opens");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("retry-atomic-out.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job creates");
+    store
+        .insert_segments(
+            &job.id,
+            &[segment("seg_fail", 0)],
+            "v1",
+            "mock",
+            "mock-prefix",
+            "retry_ns",
+        )
+        .expect("segments insert");
+    store
+        .mark_segment_failed(&job.id, "seg_fail", "retryable")
+        .expect("segment failed");
+
+    // A normal bulk retry flips the failed segment and rolls the job up to
+    // retry_pending together.
+    let count = store
+        .retry_segments(&job.id, RetryScope::Failed)
+        .expect("bulk retry succeeds");
+    assert_eq!(count, 1);
+    assert_eq!(
+        store.get_job(&job.id).expect("job").expect("exists").status,
+        "retry_pending"
+    );
+
+    // A missing job refuses without touching anything (there is nothing to
+    // touch, but the transaction boundary is what keeps it all-or-nothing).
+    let error = store
+        .retry_segments("job_phantom", RetryScope::Failed)
+        .expect_err("missing job must fail closed");
+    assert!(matches!(error, StoreError::NotFound(_)));
+
+    drop(store);
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+/// A snapshot whose settings fully match the CLI's `mock`/`mock-prefix` test
+/// jobs, so structured cache identities built from it are stable across tests.
+fn snapshot_fixture() -> RunConfigSnapshot {
+    let settings = bookforge_core::TranslationProfile::Balanced.resolve();
+    RunConfigSnapshot {
+        input_path: PathBuf::from("input.epub"),
+        input_snapshot_path: None,
+        input_sha256: Some("abc123".to_string()),
+        output_path: PathBuf::from("output.epub"),
+        events_path: None,
+        report_json_path: None,
+        report_markdown_path: None,
+        source_language: Some("English".to_string()),
+        target_language: "Italian".to_string(),
+        creator: None,
+        provider: "mock".to_string(),
+        model: "mock-prefix".to_string(),
+        base_url: None,
+        api_key_env: None,
+        profile: settings.profile,
+        provider_preset: None,
+        prompt_version: "v1".to_string(),
+        cache_namespace: "identity_ns".to_string(),
+        book_id: None,
+        series_id: None,
+        glossary_budget_tokens: 800,
+        glossary_format: bookforge_core::GlossaryFormat::Json,
+        prompt_extra: None,
+        glossary_fingerprint: String::new(),
+        glossary_terms: Vec::new(),
+        context_window: 4,
+        context_budget_tokens: 400,
+        context_scope: bookforge_core::config::ContextScope::Chapter,
+        style_fingerprint: String::new(),
+        style_rendered_block: String::new(),
+        entities_fingerprint: String::new(),
+        entities_rendered_block: String::new(),
+        bilingual_mode: bookforge_core::BilingualMode::Replace,
+        bilingual_separator: " / ".to_string(),
+        bilingual_style: bookforge_core::BilingualStyle::Minimal,
+        bilingual_css: None,
+        fallback: None,
+        finalize: bookforge_core::run_snapshot::FinalizeCheckpointSnapshot::default(),
+        qa_mode: "off".to_string(),
+        validate_output: false,
+        settings: bookforge_core::ResolvedRunSettingsSnapshot::from_settings(&settings),
+    }
+}
+
+/// Create a job with a persisted run snapshot + cache policy, stamp one
+/// segment, and return both. `provider`/`model` must be `"mock"`/`"mock-prefix"`
+/// (the CLI primary for fixtures) unless a fallback provenance test overrides
+/// them via `save_translation`.
+fn seed_job_with_policy(
+    store: &JobStore,
+    cache_namespace: &str,
+    strict: bool,
+) -> (JobRecord, Segment) {
+    let input_path = temp_path("policy-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("policy-output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let mut snapshot = snapshot_fixture();
+    snapshot.cache_namespace = cache_namespace.to_string();
+    store
+        .update_job_config_snapshot(&job.id, &snapshot)
+        .expect("snapshot should persist");
+    store
+        .update_job_cache_policy(
+            &job.id,
+            &CachePolicySnapshot {
+                strict_context: Some(strict),
+            },
+        )
+        .expect("policy should persist");
+
+    let mut seg = segment("seg_identity", 0);
+    seg.block_ids = vec![BlockId("b_000000".to_string())];
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "mock-prefix",
+            cache_namespace,
+        )
+        .expect("segments should insert");
+    let _ = fs::remove_file(input_path);
+    (job, seg)
+}
+
+fn save_segment_translation(
+    store: &JobStore,
+    job_id: &str,
+    segment_id: &str,
+    provider: &str,
+    model: &str,
+    translated_text: &str,
+    prompt_version: &str,
+) {
+    store
+        .save_translation(SaveTranslation {
+            job_id,
+            segment_id,
+            translated_text,
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: translated_text.to_string(),
+            }],
+            provider,
+            model,
+            prompt_version,
+            input_tokens: Some(11),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(7),
+            tokens_estimated: false,
+        })
+        .expect("translation should save");
+}
+
+#[test]
+fn cache_lookup_isolates_strict_context_across_jobs() {
+    let db_path = temp_path("cache_strict.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    let (strict_job, seg) = seed_job_with_policy(&store, "strict_ns", true);
+    save_segment_translation(
+        &store,
+        &strict_job.id,
+        "seg_identity",
+        "mock",
+        "mock-prefix",
+        "Strict output",
+        "v1",
+    );
+
+    let (loose_job, _) = seed_job_with_policy(&store, "strict_ns", false);
+
+    // The loose job's expected identity is computed from ITS persisted policy
+    // (strict=false), so the strict-stamped cross-job row must never be
+    // reused — strict true vs false must differ.
+    let miss = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "strict_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &loose_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "strict_ns",
+                ),
+            ),
+        )
+        .expect("query ok");
+    assert!(
+        miss.is_none(),
+        "strict and loose contexts must not share cache"
+    );
+
+    // And the strict job's own row IS visible to a strict lookup.
+    let hit = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "strict_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &strict_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "strict_ns",
+                ),
+            ),
+        )
+        .expect("query ok")
+        .expect("strict lookup should hit its own row");
+    assert_eq!(hit.translated_text, "Strict output");
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn cache_lookup_never_serves_fallback_provenance_as_primary() {
+    let db_path = temp_path("cache_fallback.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    // Two jobs with identical primary config stamp the same fingerprint; the
+    // second's output was produced by a fallback provider/model.
+    let (primary_job, _) = seed_job_with_policy(&store, "fallback_ns", false);
+    save_segment_translation(
+        &store,
+        &primary_job.id,
+        "seg_identity",
+        "mock",
+        "mock-prefix",
+        "Primary output",
+        "v1",
+    );
+    let (fallback_job, seg) = seed_job_with_policy(&store, "fallback_ns", false);
+    save_segment_translation(
+        &store,
+        &fallback_job.id,
+        "seg_identity",
+        "deepseek",
+        "deepseek-v4-flash",
+        "Fallback output",
+        "v1",
+    );
+
+    // A fresh lookup context (no own translation) requesting the primary
+    // provider must only see the primary-produced row: the fallback row's
+    // real provenance (t.provider/t.model) excludes it.
+    let (lookup_job, _) = seed_job_with_policy(&store, "fallback_ns", false);
+    let hit = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "fallback_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "fallback_ns",
+                ),
+            ),
+        )
+        .expect("query ok")
+        .expect("primary lookup should hit the primary-produced row");
+    assert_eq!(hit.translated_text, "Primary output");
+
+    // Requesting the fallback provenance never surfaces it either: the
+    // expected identity (computed with the fallback provider/model) does not
+    // match the primary-stamped segment, so the fallback output stays
+    // job-local.
+    let fallback_miss = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "deepseek",
+                "deepseek-v4-flash",
+                Some("English"),
+                "Italian",
+                "fallback_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg),
+                    "deepseek",
+                    "deepseek-v4-flash",
+                    "v1",
+                    "fallback_ns",
+                ),
+            ),
+        )
+        .expect("query ok");
+    assert!(
+        fallback_miss.is_none(),
+        "fallback-produced output must remain job-local"
+    );
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn cache_lookup_isolates_different_provider_contexts() {
+    let db_path = temp_path("cache_provider.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    // Job A translates with openrouter/gemini; job B with deepseek — same
+    // source hash and namespace otherwise. Neither may reuse the other.
+    let (job_a, seg_a) = seed_job_with_policy(&store, "prov_ns", false);
+    store
+        .insert_segments(
+            &job_a.id,
+            std::slice::from_ref(&seg_a),
+            "v1",
+            "openrouter",
+            "google/gemini-2.5-flash",
+            "prov_ns",
+        )
+        .expect("job A segment should insert");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job_a.id,
+            segment_id: "seg_identity",
+            translated_text: "gemini output",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "gemini output".to_string(),
+            }],
+            provider: "openrouter",
+            model: "google/gemini-2.5-flash",
+            prompt_version: "v1",
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            tokens_estimated: false,
+        })
+        .expect("job A translation should save");
+
+    let (job_b, seg_b) = seed_job_with_policy(&store, "prov_ns", false);
+    store
+        .insert_segments(
+            &job_b.id,
+            std::slice::from_ref(&seg_b),
+            "v1",
+            "deepseek",
+            "deepseek-v4-flash",
+            "prov_ns",
+        )
+        .expect("job B segment should insert");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job_b.id,
+            segment_id: "seg_identity",
+            translated_text: "deepseek output",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "deepseek output".to_string(),
+            }],
+            provider: "deepseek",
+            model: "deepseek-v4-flash",
+            prompt_version: "v1",
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            tokens_estimated: false,
+        })
+        .expect("job B translation should save");
+
+    let (lookup_job, seg) = seed_job_with_policy(&store, "prov_ns", false);
+    let hit = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "deepseek",
+                "deepseek-v4-flash",
+                Some("English"),
+                "Italian",
+                "prov_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg),
+                    "deepseek",
+                    "deepseek-v4-flash",
+                    "v1",
+                    "prov_ns",
+                ),
+            ),
+        )
+        .expect("query ok")
+        .expect("deepseek lookup should hit job B");
+    assert_eq!(hit.translated_text, "deepseek output");
+
+    // A gemini context reuses the gemini-produced row (same effective
+    // provider/model) and never the deepseek output.
+    let gemini_hit = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "openrouter",
+                "google/gemini-2.5-flash",
+                Some("English"),
+                "Italian",
+                "prov_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg),
+                    "openrouter",
+                    "google/gemini-2.5-flash",
+                    "v1",
+                    "prov_ns",
+                ),
+            ),
+        )
+        .expect("query ok")
+        .expect("gemini context should hit job A");
+    assert_eq!(gemini_hit.translated_text, "gemini output");
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn cache_policy_mutation_apis_return_not_found_for_missing_rows() {
+    let db_path = temp_path("missing_rows.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    let policy = CachePolicySnapshot {
+        strict_context: Some(true),
+    };
+    let update_missing_job = store.update_job_cache_policy("job_missing", &policy);
+    assert!(
+        matches!(update_missing_job, Err(StoreError::NotFound(_))),
+        "update_job_cache_policy must reject a missing job"
+    );
+    let load_missing_job = store.load_job_cache_policy("job_missing");
+    assert!(
+        matches!(load_missing_job, Err(StoreError::NotFound(_))),
+        "load_job_cache_policy must reject a missing job"
+    );
+
+    let input_path = temp_path("missing-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("missing-output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+
+    let insert_into_missing_job = store.insert_segments(
+        "job_missing",
+        &[],
+        "v1",
+        "mock",
+        "mock-prefix",
+        "missing_ns",
+    );
+    assert!(
+        matches!(insert_into_missing_job, Err(StoreError::NotFound(_))),
+        "insert_segments must reject a missing job even with empty segments"
+    );
+
+    let save_missing = store.save_translation(SaveTranslation {
+        job_id: &job.id,
+        segment_id: "seg_missing",
+        translated_text: "x",
+        blocks: &[BlockTranslation {
+            block_id: BlockId("b_000000".to_string()),
+            text: "x".to_string(),
+        }],
+        provider: "mock",
+        model: "mock-prefix",
+        prompt_version: "v1",
+        input_tokens: None,
+        input_cached_tokens: None,
+        output_tokens: None,
+        tokens_estimated: false,
+    });
+    assert!(
+        matches!(save_missing, Err(StoreError::NotFound(_))),
+        "save_translation must reject a missing segment"
+    );
+
+    let record_missing = store.record_translation_attempt(RecordTranslationAttempt {
+        job_id: &job.id,
+        segment_id: "seg_missing",
+        batch_id: None,
+        phase: None,
+        provider: "mock",
+        model: "mock-prefix",
+        outcome: TranslationAttemptOutcome::Failure,
+        error: Some("boom"),
+        input_tokens: None,
+        input_cached_tokens: None,
+        output_tokens: None,
+        cost_estimate: None,
+    });
+    assert!(
+        matches!(record_missing, Err(StoreError::NotFound(_))),
+        "record_translation_attempt must reject a missing segment"
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn translation_attempt_ledger_aggregates_tokens_and_costs_monotonically() {
+    let db_path = temp_path("attempt_ledger.sqlite");
+    let input_path = temp_path("ledger-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("ledger-output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let mut seg = segment("seg_ledger", 0);
+    seg.block_ids = vec![BlockId("b_000000".to_string())];
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "mock-prefix",
+            "ledger_ns",
+        )
+        .expect("segments should insert");
+
+    store
+        .record_translation_attempt(RecordTranslationAttempt {
+            job_id: &job.id,
+            segment_id: "seg_ledger",
+            batch_id: None,
+            phase: None,
+            provider: "mock",
+            model: "mock-prefix",
+            outcome: TranslationAttemptOutcome::Failure,
+            error: Some("timeout"),
+            input_tokens: Some(100),
+            input_cached_tokens: Some(5),
+            output_tokens: Some(0),
+            cost_estimate: Some(1.0),
+        })
+        .expect("first attempt should record");
+    store
+        .record_translation_attempt(RecordTranslationAttempt {
+            job_id: &job.id,
+            segment_id: "seg_ledger",
+            batch_id: Some("batch_1"),
+            phase: Some(TranslationAttemptPhase::Repair),
+            provider: "mock",
+            model: "mock-prefix",
+            outcome: TranslationAttemptOutcome::Success,
+            error: None,
+            input_tokens: Some(40),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(60),
+            cost_estimate: Some(0.7),
+        })
+        .expect("second attempt should record");
+
+    let rows = store
+        .translation_attempts(&job.id, None, None)
+        .expect("attempts should load");
+    assert_eq!(rows.len(), 2, "both attempts persist");
+    assert_eq!(rows[0].attempt_ordinal, 1, "ordinals start at one");
+    assert_eq!(rows[1].attempt_ordinal, 2, "ordinals are monotonic");
+    assert_eq!(
+        rows[0].phase, "primary",
+        "phase inferred from provider/model"
+    );
+    assert_eq!(rows[1].phase, "repair", "explicit phase preserved");
+    assert_eq!(
+        rows[1].batch_id.as_deref(),
+        Some("batch_1"),
+        "batch id preserved"
+    );
+
+    let summary = store
+        .translation_attempt_summary(&job.id)
+        .expect("summary should aggregate");
+    assert_eq!(summary.attempts, 2);
+    assert_eq!(summary.input_tokens, 140, "input tokens aggregate");
+    assert_eq!(summary.input_cached_tokens, 5, "cached tokens aggregate");
+    assert_eq!(summary.output_tokens, 60, "output tokens aggregate");
+    assert!(
+        (summary.cost_estimate - 1.7).abs() < f64::EPSILON,
+        "cost aggregates"
+    );
+
+    // The job-level summary prefers the ledger once it has rows.
+    let job_summary = store
+        .summary(&job.id)
+        .expect("job summary should load")
+        .expect("job should exist");
+    assert_eq!(job_summary.input_tokens, 140);
+    assert_eq!(job_summary.output_tokens, 60);
+
+    // The ledger is immutable at the schema level: in-place edits are rejected.
+    let conn = store.conn.borrow();
+    let update_rejected = conn.execute(
+        "UPDATE translation_attempts SET outcome = 'success' WHERE job_id = ?1",
+        params![job.id],
+    );
+    assert!(
+        update_rejected.is_err(),
+        "append-only ledger must reject in-place updates"
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn translation_attempt_ledger_rejects_duplicate_ordinals() {
+    let db_path = temp_path("attempt_ordinal.sqlite");
+    let input_path = temp_path("ordinal-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("ordinal-output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let mut seg = segment("seg_ordinal", 0);
+    seg.block_ids = vec![BlockId("b_000000".to_string())];
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "mock-prefix",
+            "ordinal_ns",
+        )
+        .expect("segments should insert");
+
+    let request = RecordTranslationAttempt {
+        job_id: &job.id,
+        segment_id: "seg_ordinal",
+        batch_id: None,
+        phase: None,
+        provider: "mock",
+        model: "mock-prefix",
+        outcome: TranslationAttemptOutcome::Failure,
+        error: Some("boom"),
+        input_tokens: None,
+        input_cached_tokens: None,
+        output_tokens: None,
+        cost_estimate: None,
+    };
+    let _ = store
+        .record_translation_attempt(request)
+        .expect("first attempt");
+
+    // A manual attempt to force a duplicate ordinal violates the unique
+    // (job, segment, attempt_ordinal) constraint even though the store's
+    // own API always assigns the next ordinal.
+    let conn = store.conn.borrow();
+    let duplicate = conn.execute(
+        "INSERT INTO translation_attempts
+         (job_id, segment_id, batch_id, phase, attempt_ordinal, provider, model, outcome, error,
+          input_tokens, input_cached_tokens, output_tokens, cost_estimate, created_at)
+         VALUES (?1, ?2, NULL, 'primary', 1, 'mock', 'mock-prefix', 'failure', NULL,
+                 NULL, NULL, NULL, NULL, ?3)",
+        params![job.id, "seg_ordinal", timestamp_string()],
+    );
+    assert!(
+        duplicate.is_err(),
+        "duplicate attempt ordinals must be rejected"
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+/// Create a job with a persisted run snapshot but NO cache policy record, so
+/// lookups compute the conservative unknown-strictness identity.
+fn seed_job_with_snapshot_only(store: &JobStore, cache_namespace: &str) -> (JobRecord, Segment) {
+    let input_path = temp_path("snapshot-only-input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("snapshot-only-output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let mut snapshot = snapshot_fixture();
+    snapshot.cache_namespace = cache_namespace.to_string();
+    store
+        .update_job_config_snapshot(&job.id, &snapshot)
+        .expect("snapshot should persist");
+    let mut seg = segment("seg_identity", 0);
+    seg.block_ids = vec![BlockId("b_000000".to_string())];
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "mock-prefix",
+            cache_namespace,
+        )
+        .expect("segments should insert");
+    let _ = fs::remove_file(input_path);
+    (job, seg)
+}
+
+/// A segment whose source text/checksum is shared across clones while the
+/// ordered neighbor/context content differs — the duplicate-text /
+/// different-context cache-collision scenario.
+fn segment_with_neighbors(
+    id: &str,
+    source_text: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Segment {
+    let mut seg = segment(id, 0);
+    seg.checksum = "identical_source_checksum".to_string();
+    seg.source.text = source_text.to_string();
+    seg.source.blocks[0].text = source_text.to_string();
+    seg.source.blocks[0].text_runs[0].text = source_text.to_string();
+    seg.context = SegmentContext {
+        before: before.map(str::to_string),
+        after: after.map(str::to_string),
+    };
+    seg
+}
+
+#[test]
+fn duplicate_source_text_in_different_contexts_never_collides() {
+    let db_path = temp_path("cache_dup_ctx.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    let seg_a =
+        segment_with_neighbors("seg_a", "identical text", Some("before A"), Some("after A"));
+    let seg_b =
+        segment_with_neighbors("seg_b", "identical text", Some("before B"), Some("after B"));
+    assert_eq!(
+        seg_a.checksum, seg_b.checksum,
+        "both segments share the identical source checksum"
+    );
+
+    let (job_a, _) = seed_job_with_policy(&store, "dup_ctx_ns", false);
+    store
+        .insert_segments(
+            &job_a.id,
+            std::slice::from_ref(&seg_a),
+            "v1",
+            "mock",
+            "mock-prefix",
+            "dup_ctx_ns",
+        )
+        .expect("job A segment should insert");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job_a.id,
+            segment_id: "seg_a",
+            translated_text: "A output",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "A output".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            tokens_estimated: false,
+        })
+        .expect("job A translation should save");
+
+    let (job_b, _) = seed_job_with_policy(&store, "dup_ctx_ns", false);
+    store
+        .insert_segments(
+            &job_b.id,
+            std::slice::from_ref(&seg_b),
+            "v1",
+            "mock",
+            "mock-prefix",
+            "dup_ctx_ns",
+        )
+        .expect("job B segment should insert");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job_b.id,
+            segment_id: "seg_b",
+            translated_text: "B output",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "B output".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            tokens_estimated: false,
+        })
+        .expect("job B translation should save");
+
+    let (lookup_job, _) = seed_job_with_policy(&store, "dup_ctx_ns", false);
+
+    // The expected fingerprint is keyed by the CURRENT segment id; identical
+    // checksums in different contexts resolve to distinct expectations.
+    let expected_b = expected_fingerprints_for(
+        &store,
+        &lookup_job.id,
+        std::slice::from_ref(&seg_b),
+        "mock",
+        "mock-prefix",
+        "v1",
+        "dup_ctx_ns",
+    );
+    let hit_b = store
+        .find_cached_translation(
+            &seg_b,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "dup_ctx_ns",
+                &expected_b,
+            ),
+        )
+        .expect("query ok")
+        .expect("seg_b contract must hit job B");
+    assert_eq!(hit_b.translated_text, "B output", "never job A's row");
+
+    let hit_a = store
+        .find_cached_translation(
+            &seg_a,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "dup_ctx_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg_a),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "dup_ctx_ns",
+                ),
+            ),
+        )
+        .expect("query ok")
+        .expect("seg_a contract must hit job A");
+    assert_eq!(hit_a.translated_text, "A output");
+
+    // The batch path must also keep the two identical-source rows apart.
+    let both = &[seg_a.clone(), seg_b.clone()];
+    let hits = store
+        .find_cached_translations_batch(
+            both,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "dup_ctx_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    both,
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "dup_ctx_ns",
+                ),
+            ),
+        )
+        .expect("batch query ok");
+    assert_eq!(hits["seg_a"].translated_text, "A output");
+    assert_eq!(hits["seg_b"].translated_text, "B output");
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn fallback_attempts_carry_effective_provenance_and_phase() {
+    let db_path = temp_path("fallback_provenance.sqlite");
+    let input_path = temp_path("fallback_prov_input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("fallback_prov_output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let mut seg = segment("seg_fb", 0);
+    seg.block_ids = vec![BlockId("b_000000".to_string())];
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "mock-prefix",
+            "fb_ns",
+        )
+        .expect("segment should insert");
+
+    // The output was produced by the fallback provider/model: the
+    // translations row must preserve that effective provenance.
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_fb",
+            translated_text: "fallback output",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "fallback output".to_string(),
+            }],
+            provider: "deepseek",
+            model: "deepseek-v4-flash",
+            prompt_version: "v1",
+            input_tokens: Some(9),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(6),
+            tokens_estimated: false,
+        })
+        .expect("fallback translation should save");
+
+    // The real wire attempt records the same effective provider/model and the
+    // phase inference labels it a fallback attempt against the job primary.
+    let ordinal = store
+        .record_translation_attempt(RecordTranslationAttempt {
+            job_id: &job.id,
+            segment_id: "seg_fb",
+            batch_id: None,
+            phase: None,
+            provider: "deepseek",
+            model: "deepseek-v4-flash",
+            outcome: TranslationAttemptOutcome::Success,
+            error: None,
+            input_tokens: Some(9),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(6),
+            cost_estimate: Some(0.5),
+        })
+        .expect("attempt should record");
+    assert_eq!(ordinal, 1);
+
+    let attempts = store
+        .translation_attempts(&job.id, Some("seg_fb"), None)
+        .expect("attempts should load");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].phase, "fallback",
+        "effective provider infers fallback"
+    );
+    assert_eq!(attempts[0].provider, "deepseek");
+    assert_eq!(attempts[0].model, "deepseek-v4-flash");
+    assert_eq!(attempts[0].outcome, "success");
+
+    let stored = store
+        .load_terminal_segment_translations(&job.id)
+        .expect("terminal translations should load");
+    let record = stored
+        .iter()
+        .find(|record| record.segment_id == "seg_fb")
+        .expect("fallback segment translation");
+    assert_eq!(record.provider, "deepseek");
+    assert_eq!(record.model, "deepseek-v4-flash");
+
+    // A primary-context lookup never serves the fallback-produced row.
+    let (lookup_job, _) = seed_job_with_policy(&store, "fb_ns", false);
+    let miss = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "fb_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "fb_ns",
+                ),
+            ),
+        )
+        .expect("query ok");
+    assert!(
+        miss.is_none(),
+        "fallback provenance must never be served to a primary context"
+    );
+
+    // The segment's stamped cache fingerprint was computed with the job's
+    // PRIMARY provider/model at insert time (the fallback was not known yet),
+    // while the output's real provenance is the fallback provider/model. The
+    // write-time identity and a fallback-context expected identity therefore
+    // disagree, so even a fallback-context lookup cannot match this row: the
+    // fallback-produced output stays job-local and is never reused under a
+    // fabricated effective provider/model fingerprint. This is conservative
+    // (a missed cache opportunity, never a wrong reuse).
+    let fallback_miss = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "deepseek",
+                "deepseek-v4-flash",
+                Some("English"),
+                "Italian",
+                "fb_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &lookup_job.id,
+                    std::slice::from_ref(&seg),
+                    "deepseek",
+                    "deepseek-v4-flash",
+                    "v1",
+                    "fb_ns",
+                ),
+            ),
+        )
+        .expect("query ok");
+    assert!(
+        fallback_miss.is_none(),
+        "a fallback-produced row must stay job-local (never served under the effective provider)"
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn summary_mixes_ledger_and_legacy_segment_tokens_without_double_counting() {
+    let db_path = temp_path("mixed_ledger.sqlite");
+    let input_path = temp_path("mixed_ledger_input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let store = JobStore::open(&db_path).expect("store should open");
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("mixed_ledger_output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let seg_a = segment("seg_a", 0);
+    let seg_b = segment("seg_b", 1);
+    store
+        .insert_segments(
+            &job.id,
+            &[seg_a.clone(), seg_b.clone()],
+            "v1",
+            "mock",
+            "mock-prefix",
+            "mixed_ns",
+        )
+        .expect("segments should insert");
+
+    // seg_a completes with only legacy token columns (pre-ledger style: no
+    // wire attempt is recorded on the checkpoint path).
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            translated_text: "A",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".to_string()),
+                text: "A".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(10),
+            input_cached_tokens: Some(1),
+            output_tokens: Some(5),
+            tokens_estimated: false,
+        })
+        .expect("seg_a translation should save");
+
+    // seg_b has BOTH a legacy token record AND a real wire-attempt ledger row
+    // for the same attempt; the summary must use the ledger, not both.
+    store
+        .save_translation(SaveTranslation {
+            job_id: &job.id,
+            segment_id: "seg_b",
+            translated_text: "B",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000001".to_string()),
+                text: "B".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(20),
+            input_cached_tokens: Some(2),
+            output_tokens: Some(7),
+            tokens_estimated: false,
+        })
+        .expect("seg_b translation should save");
+    store
+        .record_translation_attempt(RecordTranslationAttempt {
+            job_id: &job.id,
+            segment_id: "seg_b",
+            batch_id: None,
+            phase: Some(TranslationAttemptPhase::Primary),
+            provider: "mock",
+            model: "mock-prefix",
+            outcome: TranslationAttemptOutcome::Success,
+            error: None,
+            input_tokens: Some(20),
+            input_cached_tokens: Some(2),
+            output_tokens: Some(7),
+            cost_estimate: None,
+        })
+        .expect("seg_b wire attempt should record");
+
+    let summary = store
+        .summary(&job.id)
+        .expect("summary query")
+        .expect("job exists");
+    assert_eq!(
+        summary.input_tokens, 30,
+        "seg_a legacy 10 + seg_b ledger 20 (not 50: seg_b must not double count)"
+    );
+    assert_eq!(summary.input_cached_tokens, 3);
+    assert_eq!(summary.output_tokens, 12);
+
+    let listed = store
+        .list_job_summaries()
+        .expect("list summaries")
+        .into_iter()
+        .find(|(record, _)| record.id == job.id)
+        .expect("job listed");
+    assert_eq!(listed.1.input_tokens, 30);
+    assert_eq!(listed.1.input_cached_tokens, 3);
+    assert_eq!(listed.1.output_tokens, 12);
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn concurrent_attempt_ordinals_are_monotonic_and_unique() {
+    let db_path = temp_path("concurrent_ordinals.sqlite");
+    let input_path = temp_path("concurrent_ord_input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+
+    let job_id = {
+        let store = JobStore::open(&db_path).expect("store should open");
+        let job = store
+            .create_job(CreateJob {
+                input: &input_path,
+                output: &temp_path("concurrent_ord_output.epub"),
+                source_lang: Some("English"),
+                target_lang: "Italian",
+                provider: "mock",
+                model: "mock-prefix",
+                base_url: None,
+                api_key_env: None,
+                book_id: None,
+                series_id: None,
+            })
+            .expect("job should be created");
+        let mut seg = segment("seg_conc", 0);
+        seg.block_ids = vec![BlockId("b_000000".to_string())];
+        store
+            .insert_segments(
+                &job.id,
+                std::slice::from_ref(&seg),
+                "v1",
+                "mock",
+                "mock-prefix",
+                "conc_ns",
+            )
+            .expect("segments should insert");
+        job.id
+    };
+
+    // Each thread opens its OWN connection and records a wire attempt for the
+    // same (job, segment). The IMMEDIATE transaction + atomic ordinal
+    // allocation serializes the writers; every attempt must succeed with a
+    // unique monotonic ordinal.
+    const THREADS: usize = 6;
+    let mut ordinals: Vec<i64> = Vec::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let db_path = db_path.clone();
+                let job_id = job_id.clone();
+                scope.spawn(move || {
+                    let store = JobStore::open(&db_path).expect("thread store opens");
+                    store
+                        .record_translation_attempt(RecordTranslationAttempt {
+                            job_id: &job_id,
+                            segment_id: "seg_conc",
+                            batch_id: None,
+                            phase: Some(TranslationAttemptPhase::Primary),
+                            provider: "mock",
+                            model: "mock-prefix",
+                            outcome: TranslationAttemptOutcome::Failure,
+                            error: Some("concurrent"),
+                            input_tokens: Some(1),
+                            input_cached_tokens: Some(0),
+                            output_tokens: Some(0),
+                            cost_estimate: None,
+                        })
+                        .expect("concurrent attempt should record")
+                })
+            })
+            .collect();
+        for handle in handles {
+            ordinals.push(handle.join().expect("thread should not panic"));
+        }
+    });
+
+    ordinals.sort_unstable();
+    let expected: Vec<i64> = (1..=THREADS as i64).collect();
+    assert_eq!(
+        ordinals, expected,
+        "ordinals must be a unique monotonic 1..=N sequence"
+    );
+
+    let store = JobStore::open(&db_path).expect("store reopens");
+    let rows = store
+        .translation_attempts(&job_id, Some("seg_conc"), None)
+        .expect("attempts should load");
+    assert_eq!(rows.len(), THREADS);
+    let mut loaded: Vec<usize> = rows.iter().map(|row| row.attempt_ordinal).collect();
+    loaded.sort_unstable();
+    assert_eq!(
+        loaded,
+        expected
+            .iter()
+            .map(|value| *value as usize)
+            .collect::<Vec<_>>()
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn migration_twelve_upgrades_legacy_schema_and_composite_fk_holds() {
+    let db_path = temp_path("migration12_legacy.sqlite");
+    // Hand-build a pre-v12 database: migrations 1..=7 recorded, the legacy
+    // jobs/segments tables WITHOUT the cache identity columns, and no
+    // translation_attempts table yet.
+    {
+        let conn = Connection::open(&db_path).expect("legacy connection opens");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE _migrations (
+              version INTEGER PRIMARY KEY,
+              name TEXT NOT NULL,
+              applied_at TEXT NOT NULL
+            );
+            INSERT INTO _migrations (version, name, applied_at) VALUES
+              (1, 'initial', '0'),
+              (2, 'v1_0_1_input_snapshot', '0'),
+              (3, 'v1_1_segment_flags', '0'),
+              (4, 'v1_2_glossary_terms', '0'),
+              (5, 'v1_2_1_nullable_glossary_candidate_targets', '0'),
+              (6, 'v1_3_context_styles_entities', '0'),
+              (7, 'v2_4_human_corrections', '0');
+            CREATE TABLE jobs (
+              id TEXT PRIMARY KEY,
+              input_path TEXT NOT NULL DEFAULT '',
+              input_snapshot_path TEXT,
+              input_sha256 TEXT,
+              output_path TEXT NOT NULL DEFAULT '',
+              input_hash TEXT NOT NULL,
+              source_lang TEXT,
+              target_lang TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              base_url TEXT,
+              api_key_env TEXT,
+              status TEXT NOT NULL,
+              config_json TEXT,
+              events_path TEXT,
+              report_json_path TEXT,
+              report_markdown_path TEXT,
+              book_id TEXT,
+              series_id TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE segments (
+              id TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              section_id TEXT NOT NULL,
+              ordinal INTEGER NOT NULL,
+              source_hash TEXT NOT NULL,
+              prompt_version TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              status TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              input_tokens INTEGER,
+              output_tokens INTEGER,
+              tokens_input INTEGER,
+              tokens_input_cached INTEGER,
+              tokens_output INTEGER,
+              tokens_estimated INTEGER NOT NULL DEFAULT 0,
+              cost_estimate REAL,
+              error TEXT,
+              translated_hash TEXT,
+              PRIMARY KEY (job_id, id),
+              FOREIGN KEY(job_id) REFERENCES jobs(id)
+            );
+            "#,
+        )
+        .expect("legacy schema should build");
+    }
+
+    let input_path = temp_path("migration12_legacy_input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let store = JobStore::open(&db_path).expect("migration should upgrade the legacy database");
+
+    // Migration 12 added the cache identity columns and the ledger table:
+    // they are usable immediately.
+    let job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("migration12_legacy_output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("job should be created");
+    let mut seg = segment("seg_m12", 0);
+    seg.block_ids = vec![BlockId("b_000000".to_string())];
+    store
+        .insert_segments(
+            &job.id,
+            std::slice::from_ref(&seg),
+            "v1",
+            "mock",
+            "mock-prefix",
+            "m12_ns",
+        )
+        .expect("segments should insert");
+    let ordinal = store
+        .record_translation_attempt(RecordTranslationAttempt {
+            job_id: &job.id,
+            segment_id: "seg_m12",
+            batch_id: None,
+            phase: Some(TranslationAttemptPhase::Primary),
+            provider: "mock",
+            model: "mock-prefix",
+            outcome: TranslationAttemptOutcome::Failure,
+            error: None,
+            input_tokens: None,
+            input_cached_tokens: None,
+            output_tokens: None,
+            cost_estimate: None,
+        })
+        .expect("attempt should record");
+    assert_eq!(ordinal, 1);
+
+    // The composite FK pins attempts to the segment row: a raw row for a
+    // missing (job, segment) pair is rejected at the SQL layer.
+    let conn = store.conn.borrow();
+    let fk_error = conn.execute(
+        "INSERT INTO translation_attempts
+         (job_id, segment_id, batch_id, phase, attempt_ordinal, provider, model, outcome, error,
+          input_tokens, input_cached_tokens, output_tokens, cost_estimate, created_at)
+         VALUES ('phantom_job', 'phantom_seg', NULL, 'primary', 1, 'mock', 'mock-prefix', 'failure',
+                 NULL, NULL, NULL, NULL, NULL, ?1)",
+        params![timestamp_string()],
+    );
+    assert!(
+        fk_error.is_err(),
+        "the composite foreign key must reject attempts for a missing segment"
+    );
+    drop(conn);
+
+    // Reopen is clean: data persists and the schema stays intact.
+    drop(store);
+    let store = JobStore::open(&db_path).expect("store reopens cleanly");
+    let attempts = store
+        .translation_attempts(&job.id, None, None)
+        .expect("attempts should load after reopen");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].attempt_ordinal, 1);
+    let conn = store.conn.borrow();
+    let has_fingerprint = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('segments') WHERE name = 'cache_fingerprint')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .expect("column check");
+    assert!(
+        has_fingerprint,
+        "segments.cache_fingerprint must exist after migration"
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(input_path);
+}
+
+#[test]
+fn unknown_cache_policy_fails_closed_against_explicit_choices() {
+    let db_path = temp_path("cache_unknown_policy.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    let (strict_job, seg) = seed_job_with_policy(&store, "unknown_ns", true);
+    save_segment_translation(
+        &store,
+        &strict_job.id,
+        "seg_identity",
+        "mock",
+        "mock-prefix",
+        "Strict output",
+        "v1",
+    );
+    let (loose_job, _) = seed_job_with_policy(&store, "unknown_ns", false);
+    save_segment_translation(
+        &store,
+        &loose_job.id,
+        "seg_identity",
+        "mock",
+        "mock-prefix",
+        "Loose output",
+        "v1",
+    );
+
+    // A lookup job that NEVER recorded a policy must not reuse either row: the
+    // unknown (conservative) expected fingerprint is hashed distinctly from
+    // both explicit choices, so it fails closed.
+    let (unknown_job, _) = seed_job_with_snapshot_only(&store, "unknown_ns");
+    let miss = store
+        .find_cached_translation(
+            &seg,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "unknown_ns",
+                &expected_fingerprints_for(
+                    &store,
+                    &unknown_job.id,
+                    std::slice::from_ref(&seg),
+                    "mock",
+                    "mock-prefix",
+                    "v1",
+                    "unknown_ns",
+                ),
+            ),
+        )
+        .expect("query ok");
+    assert!(
+        miss.is_none(),
+        "an unknown cache policy must never reuse an explicit strict or loose row"
+    );
+
+    let _ = fs::remove_file(db_path);
+}
+
+#[test]
+fn resume_identity_uses_full_ordered_neighborhood_for_glossary_selection() {
+    let db_path = temp_path("resume_window_glossary.sqlite");
+    let store = JobStore::open(&db_path).expect("store should open");
+
+    // Six segments in ONE section. The glossary term "anchor" appears only in
+    // segment 0; segment 5 picks it up through the recently-active window
+    // (previous 5 segments), so the per-segment selection is order/window
+    // sensitive: computing it over ONLY segment 5 would select nothing.
+    let anchor = bookforge_core::glossary::GlossaryTerm {
+        id: Some(1),
+        scope_kind: bookforge_core::GlossaryScopeKind::Global,
+        scope_id: None,
+        source_text: "anchor".to_string(),
+        target_text: "ancora".to_string(),
+        category: bookforge_core::GlossaryCategory::Other,
+        notes: None,
+        case_sensitive: false,
+        always_active: false,
+        status: bookforge_core::GlossaryStatus::UserSeeded,
+        source_language: "English".to_string(),
+        target_language: "Italian".to_string(),
+        source_count: 1,
+    };
+    let windowed = (0..6)
+        .map(|index| {
+            let mut seg = segment(&format!("seg_w{index}"), index);
+            let text = if index == 0 {
+                "anchor term".to_string()
+            } else {
+                format!("other text {index}")
+            };
+            seg.source.text = text.clone();
+            seg.source.blocks[0].text = text.clone();
+            seg.source.blocks[0].text_runs[0].text = text;
+            seg
+        })
+        .collect::<Vec<_>>();
+    let seg_5 = windowed[5].clone();
+
+    // Original run: snapshot carries the glossary term, all six segments are
+    // inserted together, and the last segment is translated.
+    let input_path = temp_path("resume_window_input.epub");
+    fs::write(&input_path, b"epub bytes").expect("input fixture should be writable");
+    let original = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("resume_window_output.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("original job should be created");
+    let mut snapshot = snapshot_fixture();
+    snapshot.cache_namespace = "window_ns".to_string();
+    snapshot.glossary_terms = vec![anchor];
+    store
+        .update_job_config_snapshot(&original.id, &snapshot)
+        .expect("snapshot should persist");
+    store
+        .insert_segments(
+            &original.id,
+            &windowed,
+            "v1",
+            "mock",
+            "mock-prefix",
+            "window_ns",
+        )
+        .expect("full segment set should insert");
+    store
+        .save_translation(SaveTranslation {
+            job_id: &original.id,
+            segment_id: "seg_w5",
+            translated_text: "translated w5",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000005".to_string()),
+                text: "translated w5".to_string(),
+            }],
+            provider: "mock",
+            model: "mock-prefix",
+            prompt_version: "v1",
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            tokens_estimated: false,
+        })
+        .expect("original translation should save");
+
+    // Resume run: the segment set rebuilds identically, but the lookup is
+    // restricted to the eligible pending candidate (segment 5 alone). The
+    // identity MUST still be computed over the FULL ordered set so the
+    // per-segment glossary selection (and therefore the fingerprint) matches
+    // what the original run stamped.
+    let resume_job = store
+        .create_job(CreateJob {
+            input: &input_path,
+            output: &temp_path("resume_window_output2.epub"),
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-prefix",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .expect("resume job should be created");
+    store
+        .update_job_config_snapshot(&resume_job.id, &snapshot)
+        .expect("resume snapshot should persist");
+
+    let full_set = std::slice::from_ref(&windowed[5]);
+
+    // Correct behavior (full ordered set for identity, candidate restricted):
+    // the resume reuses the original run's segment-5 row.
+    let expected_full = store
+        .expected_cache_fingerprints(
+            &resume_job.id,
+            &windowed,
+            full_set,
+            "mock",
+            "mock-prefix",
+            "v1",
+            "window_ns",
+        )
+        .expect("expected fingerprints should compute");
+    let hit = store
+        .find_cached_translation(
+            &seg_5,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "window_ns",
+                &expected_full,
+            ),
+        )
+        .expect("query ok")
+        .expect("full-set identity must hit the original row");
+    assert_eq!(hit.translated_text, "translated w5");
+
+    // Regression guard: computing the identity over ONLY the pending candidate
+    // (the sparse slice the pre-fix code passed on resume) selects no
+    // recently-active glossary term, so it must NOT match the stamped row.
+    let expected_sparse = store
+        .expected_cache_fingerprints(
+            &resume_job.id,
+            full_set,
+            full_set,
+            "mock",
+            "mock-prefix",
+            "v1",
+            "window_ns",
+        )
+        .expect("sparse expected fingerprints should compute");
+    assert_ne!(
+        expected_sparse["seg_w5"], expected_full["seg_w5"],
+        "sparse-set identity must differ from full-set identity"
+    );
+    let sparse_miss = store
+        .find_cached_translation(
+            &seg_5,
+            cache_lookup_request(
+                "v1",
+                "mock",
+                "mock-prefix",
+                Some("English"),
+                "Italian",
+                "window_ns",
+                &expected_sparse,
+            ),
+        )
+        .expect("query ok");
+    assert!(
+        sparse_miss.is_none(),
+        "a sparse window must never reuse the original prompt's cache row"
+    );
+
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_file(input_path);
 }

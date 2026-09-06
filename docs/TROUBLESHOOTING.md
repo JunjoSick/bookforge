@@ -1,5 +1,12 @@
 # Troubleshooting BookForge
 
+> **Version note (2026-08-31):** this document describes the working tree on the
+> **unreleased** v3.0.0 remediation branch (branch `remediation/audit-2026-08`
+> @ `aa90d94`; PR #112 open/blocked). The dashboard token-auth behavior in the
+> "dashboard does not open" section ships **only** with v3.0.0; the published
+> **v2.6.1** dashboard is unauthenticated. For current-published behavior,
+> install v2.6.1; remediation status is tracked in `docs/AUDIT-2026-08-31.md`.
+
 Start with these three checks:
 
 ```bash
@@ -39,9 +46,17 @@ bookforge serve --open
 ```
 
 The default address is `http://127.0.0.1:8765`. BookForge intentionally
-accepts only a loopback bind because the dashboard is unauthenticated and can
-launch runs with session-only provider keys. Do not expose it through a public
-interface or reverse proxy.
+accepts only a loopback bind, and the dashboard requires a session token by
+default: the console prints a one-time bootstrap URL containing it, and every
+other request needs the token header (see the dashboard notes in
+[CLI_REFERENCE.md](CLI_REFERENCE.md#local-browser-dashboard)). Open that printed
+URL rather than typing a bare address — with `--no-auth` any local process could
+reach remembered provider keys. Do not expose the port through a public
+interface or reverse proxy in either mode.
+
+If the URL from an older terminal or shell history stopped working, restart
+`bookforge serve` and use the freshly printed bootstrap link: each server
+process generates its own session token.
 
 If port 8765 is occupied, choose another loopback port:
 
@@ -59,7 +74,13 @@ bookforge status <job-id>
 ```
 
 The dashboard follows the same rule. Starting it from another folder displays
-that folder's independent job library.
+that folder's independent job library — with one exception: when the dashboard's
+working directory is not writable, `serve` relocates to a per-user data
+directory and says so on its console
+(`working directory was not writable; storing data in …`). Dashboard jobs then
+live under the printed directory and stay invisible to CLI commands run from
+the original folder; run them from there instead. There is no global store-path
+override today.
 
 Do not move only `jobs.sqlite`: run directories contain event logs, snapshots,
 review artifacts, and control files referenced by the database. Move or back
@@ -253,7 +274,8 @@ See [audiobooks.md](audiobooks.md) for provider-specific formats and limits.
 
 ## Cost estimates are unavailable or stale
 
-Pricing comes from the bundled `pricing/providers.json`. A custom or newly
+Pricing comes from the bundled `crates/bookforge-core/pricing/providers.json`.
+A custom or newly
 released model may not have a known price even though translation works.
 Override the catalog per command or environment:
 

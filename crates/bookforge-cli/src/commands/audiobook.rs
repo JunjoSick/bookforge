@@ -1,23 +1,25 @@
 use std::collections::BTreeSet;
 #[cfg(feature = "tui")]
 use std::io::IsTerminal;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bookforge_audio::{
-    AudioFormat, AudiobookOptions, ElevenLabsTtsConfig, ElevenLabsTtsProvider, GeminiTtsConfig,
-    GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider, Progress,
-    StitchOptions, TextNormalization, build_audiobook, elevenlabs_model_max_input_chars,
-    fetch_elevenlabs_subscription, list_elevenlabs_voices, plan_chunks, plan_chunks_for_prune,
-    resolve_preferred_elevenlabs_model, stitch, validate_options,
+    AudioFormat, AudiobookOptions, AudiobookOutputLock, ElevenLabsTtsConfig, ElevenLabsTtsProvider,
+    GeminiTtsConfig, GeminiTtsProvider, MockTtsProvider, OpenAiTtsConfig, OpenAiTtsProvider,
+    Progress, StitchOptions, TextNormalization, TtsProviderKind, acquire_audiobook_output_lock,
+    acquire_audiobook_output_lock_with_handoff, build_audiobook_with_lock,
+    elevenlabs_model_max_input_chars, feature_set, fetch_elevenlabs_subscription,
+    list_elevenlabs_voices, plan_chunks, plan_chunks_for_prune,
+    resolve_preferred_elevenlabs_model_reported_with_cancel, stitch, validate_options,
 };
-use bookforge_epub::{ReflowOptions, read_epub, reflow_epub};
 use clap::{Args, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio_util::sync::CancellationToken;
 
+use crate::sanitize::sanitize_terminal;
 use crate::{audio_cost::AudioCost, progress::UiMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -85,6 +87,9 @@ impl TextNormalizationArg {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Environment:\n  BOOKFORGE_AUDIO_PRICING_PATH  Override the bundled audio pricing table with a JSON file."
+)]
 pub struct AudiobookArgs {
     /// Source EPUB to narrate.
     pub input: Option<PathBuf>,
@@ -132,7 +137,7 @@ pub struct AudiobookArgs {
     #[arg(long, default_value_t = 4)]
     pub concurrency: usize,
 
-    #[arg(long, default_value_t = 120)]
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_seconds: u64,
 
     /// Optional delivery or pronunciation guidance. Supported by Gemini and
@@ -194,7 +199,9 @@ pub struct AudiobookArgs {
     pub m4b: bool,
 
     /// Do not automatically create the default chapter-marked `.m4b`.
-    #[arg(long, default_value_t = false)]
+    /// Mutually exclusive with `--m4b` (a book file cannot be both required
+    /// and suppressed); clap rejects the combination up front.
+    #[arg(long, default_value_t = false, conflicts_with = "m4b")]
     pub no_book_file: bool,
 
     /// Print the chapter/chunk plan and exit without synthesizing.
@@ -215,7 +222,9 @@ pub struct AudiobookArgs {
     pub retry_failed: bool,
 
     /// Progress output mode. `tui` opens an attached full-screen audiobook
-    /// dashboard; `json` emits one JSON object per completed chunk.
+    /// dashboard; `json` emits one versioned-envelope JSON line per completed
+    /// chunk and plan milestone (`kind:"audiobook"`, see docs/events.md);
+    /// `json-v1` keeps the deprecated raw `{"event":…}` lines.
     #[arg(long, value_enum, default_value_t = UiMode::Auto)]
     pub ui: UiMode,
 }
@@ -224,6 +233,30 @@ pub struct AudiobookArgs {
 struct QuotaInfo {
     remaining: u64,
     limit: u64,
+}
+
+/// Single choke point for every stdout JSON line this command emits (UI-23):
+/// `--ui json` wraps payloads in the versioned envelope (`kind:"audiobook"`,
+/// see `crate::envelope`); the deprecated `--ui json-v1` alias keeps the
+/// legacy raw `{"event":…}` lines byte-compatible for existing consumers.
+#[derive(Debug, Clone, Copy)]
+struct AudiobookJson(UiMode);
+
+impl AudiobookJson {
+    fn enabled(&self) -> bool {
+        matches!(self.0, UiMode::Json | UiMode::JsonV1)
+    }
+
+    fn emit(&self, payload: serde_json::Value) {
+        if self.0 == UiMode::Json {
+            println!(
+                "{}",
+                crate::envelope::stdout_line(crate::envelope::KIND_AUDIOBOOK, &payload)
+            );
+        } else if self.0 == UiMode::JsonV1 {
+            println!("{payload}");
+        }
+    }
 }
 
 pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
@@ -237,11 +270,28 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     if args.seed.is_some() && args.provider != AudioProviderKind::Elevenlabs {
         anyhow::bail!("--seed is supported only with --provider elevenlabs");
     }
-    if args.timeout_seconds == 0 {
-        anyhow::bail!("--timeout-seconds must be greater than zero");
+
+    // Long phases (EPUB parse, provider model preflight, chunk planning,
+    // quota checks) previously ran without any feedback before the header
+    // printed. Emit early progress so users know the command is alive (and
+    // so `--ui json` streams a machine-readable start marker).
+    let json_out = AudiobookJson(args.ui);
+    match args.ui {
+        UiMode::Json | UiMode::JsonV1 => json_out.emit(serde_json::json!({
+            "event": "audiobook_planning_started",
+            "input": input.display().to_string(),
+        })),
+        UiMode::Quiet | UiMode::Tui => {}
+        UiMode::Auto | UiMode::Progress => println!("Planning audio chunks..."),
     }
 
-    let (book, pdf_page_grouping) = read_epub_for_audio(input)?;
+    // Launch-parity preprocessing (AUDIO-7): staging, PDF-cleanup reflow, and
+    // page-group detection live in bookforge-audio so estimation, planning,
+    // and real builds share one pipeline and cannot drift apart.
+    let narration_source = bookforge_audio::read_narration_source(input, &std::env::temp_dir())
+        .with_context(|| format!("failed to prepare EPUB narration from {}", input.display()))?;
+    let book = narration_source.book;
+    let pdf_page_grouping = narration_source.pdf_page_grouping;
 
     let out_dir = args.out.clone().unwrap_or_else(|| default_out_dir(input));
     let format = args
@@ -298,6 +348,10 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
 
     let elevenlabs_dry_run_default =
         args.provider == AudioProviderKind::Elevenlabs && args.model.is_none() && args.dry_run;
+    // Why the chosen ElevenLabs model is a degraded substitute, when it is
+    // (AUDIO-3 follow-up): surfaced in plan/report output so an invisible
+    // cost downgrade becomes visible.
+    let mut degraded_model_reason: Option<String> = None;
     let (model, synthesis_id) = match args.provider {
         AudioProviderKind::Mock => {
             let model = args
@@ -356,14 +410,18 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                     config.api_key_env = api_key_env;
                 }
                 config.timeout_seconds = args.timeout_seconds.min(15);
-                match resolve_preferred_elevenlabs_model(
+                match resolve_preferred_elevenlabs_model_reported_with_cancel(
                     &config,
                     args.max_chars,
                     (args.speed - 1.0).abs() > f32::EPSILON,
+                    cancel.clone(),
                 )
                 .await
                 {
-                    Ok(model) => model,
+                    Ok(resolution) => {
+                        degraded_model_reason = resolution.reason;
+                        resolution.model
+                    }
                     Err(error) => {
                         eprintln!(
                             "warning: ElevenLabs model preflight failed ({error}); using default eleven_multilingual_v2"
@@ -394,6 +452,8 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             "eleven_v3 has no speed control on the ElevenLabs TTS endpoint; use --speed 1.0 or pick another model"
         );
     }
+    warn_unsupported_provider_options(&args);
+
     let language_code = resolve_language_code(
         args.provider,
         &model,
@@ -433,6 +493,30 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         );
     }
     let full_prune_plan = args.prune.then(|| plan_chunks_for_prune(&book, &options));
+    // Live runs take ownership before the first cache read (`--retry-failed`)
+    // and retain it through synthesis, stitching, warnings, and prune. Dry
+    // runs deliberately skip the lock so inspecting a plan never creates the
+    // output directory or any lock file.
+    let output_lock = if args.dry_run {
+        None
+    } else {
+        Some(match std::env::var("BOOKFORGE_AUDIO_OUT_LOCK_HANDOFF") {
+            Ok(nonce) if !nonce.is_empty() => {
+                acquire_audiobook_output_lock_with_handoff(&out_dir, &nonce).with_context(|| {
+                    format!(
+                        "could not adopt the dashboard output lock in {}",
+                        out_dir.display()
+                    )
+                })?
+            }
+            _ => acquire_audiobook_output_lock(&out_dir).with_context(|| {
+                format!(
+                    "could not acquire audiobook output lock in {}",
+                    out_dir.display()
+                )
+            })?,
+        })
+    };
     if args.retry_failed {
         let failed = bookforge_audio::failed_chunk_files(&out_dir.join("manifest.json"))
             .with_context(|| {
@@ -454,6 +538,24 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     let total_chars: usize = plan.iter().map(|chunk| chunk.chars).sum();
+
+    // Detected sizes land before provider cost/quota preflights, which can
+    // take seconds on hosted providers — surface them as soon as they exist.
+    match args.ui {
+        UiMode::Json | UiMode::JsonV1 => json_out.emit(serde_json::json!({
+            "event": "audiobook_plan_detected_sizes",
+            "chapters": chapter_count,
+            "chunks": plan.len(),
+            "characters": total_chars,
+        })),
+        UiMode::Quiet | UiMode::Tui => {}
+        UiMode::Auto | UiMode::Progress => println!(
+            "Detected {} chapters, {} chunks, {total_chars} characters; estimating cost...",
+            chapter_count,
+            plan.len()
+        ),
+    }
+
     let provider_name = audio_provider_name(args.provider);
     crate::audio_cost::load_audio_pricing()?;
     let estimated_cost = crate::audio_cost::estimate_audio_cost(provider_name, &model, total_chars);
@@ -466,12 +568,18 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     )
     .await;
 
-    let human_output = !matches!(args.ui, UiMode::Quiet | UiMode::Json | UiMode::Tui);
+    let human_output = args.ui.human_stdout();
     if human_output {
         println!("Input: {}", input.display());
+        // EPUB metadata is externally controlled; sanitize before the
+        // terminal sees it (UI-5).
         println!(
             "Title: {}",
-            book.metadata.title.as_deref().unwrap_or("(untitled)")
+            book.metadata
+                .title
+                .as_deref()
+                .map(sanitize_terminal)
+                .unwrap_or_else(|| "(untitled)".to_string())
         );
         println!("Output: {}", out_dir.display());
         println!("Voice: {voice} | Format: {}", format.extension());
@@ -481,6 +589,11 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             );
         } else {
             println!("Model: {model}");
+        }
+        // AUDIO-3 follow-up: an auto-selected model can be a degraded
+        // fallback when the models endpoint was unreachable; say so and why.
+        if let Some(reason) = &degraded_model_reason {
+            println!("Degraded model choice: {reason}");
         }
         println!(
             "Plan: {chapter_count} chapters, {} chunks, {total_chars} characters",
@@ -510,40 +623,8 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         } else {
             Vec::new()
         };
-        if args.ui == UiMode::Json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "audiobook_plan",
-                    "chapters": chapter_count,
-                    "chunks": plan.len(),
-                    "characters": total_chars,
-                    "provider": provider_name,
-                    "model": model,
-                    "estimated_cost_usd": estimated_cost.and_then(|cost| cost.usd),
-                    "estimated_credits": estimated_cost.and_then(|cost| cost.credits),
-                    "quota_remaining": quota.map(|quota| quota.remaining),
-                    "quota_limit": quota.map(|quota| quota.limit),
-                    "book_file": make_m4b,
-                    "single_file": args.single,
-                    "dry_run": true,
-                    "stale_chunks": stale.len(),
-                    "stale_bytes": stale.iter().map(|chunk| chunk.bytes).sum::<u64>(),
-                })
-            );
-        } else if human_output {
-            println!("Dry run: no audio synthesized.");
-            if args.prune {
-                report_stale_chunks(&stale, true);
-            }
-        }
-        return Ok(());
-    }
-
-    if args.ui == UiMode::Json {
-        println!(
-            "{}",
-            serde_json::json!({
+        if json_out.enabled() {
+            json_out.emit(serde_json::json!({
                 "event": "audiobook_plan",
                 "chapters": chapter_count,
                 "chunks": plan.len(),
@@ -556,9 +637,39 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                 "quota_limit": quota.map(|quota| quota.limit),
                 "book_file": make_m4b,
                 "single_file": args.single,
-                "dry_run": false,
-            })
-        );
+                "dry_run": true,
+                "stale_chunks": stale.len(),
+                "stale_bytes": stale.iter().map(|chunk| chunk.bytes).sum::<u64>(),
+                "model_degraded_reason": &degraded_model_reason,
+            }));
+        } else if human_output {
+            println!("Dry run: no audio synthesized.");
+            if args.prune {
+                report_stale_chunks(&stale, true);
+            }
+        }
+        return Ok(());
+    }
+
+    let output_lock = output_lock.expect("non-dry audiobook run must hold its output lock");
+
+    if json_out.enabled() {
+        json_out.emit(serde_json::json!({
+            "event": "audiobook_plan",
+            "chapters": chapter_count,
+            "chunks": plan.len(),
+            "characters": total_chars,
+            "provider": provider_name,
+            "model": model,
+            "estimated_cost_usd": estimated_cost.and_then(|cost| cost.usd),
+            "estimated_credits": estimated_cost.and_then(|cost| cost.credits),
+            "quota_remaining": quota.map(|quota| quota.remaining),
+            "quota_limit": quota.map(|quota| quota.limit),
+            "book_file": make_m4b,
+            "single_file": args.single,
+            "dry_run": false,
+            "model_degraded_reason": &degraded_model_reason,
+        }));
     }
 
     #[cfg(feature = "tui")]
@@ -583,7 +694,12 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             provider: provider_name.to_string(),
             model: model.clone(),
             voice: voice.clone(),
-            cost_line: Some(cost_line.clone()),
+            // Keep the degraded-model note next to the cost estimate where a
+            // driver has a hope of noticing an invisible downgrade.
+            cost_line: Some(match &degraded_model_reason {
+                Some(reason) => format!("{cost_line} | degraded: {reason}"),
+                None => cost_line.clone(),
+            }),
             chapters_total: chapter_count,
             total: plan.len(),
         })?;
@@ -593,6 +709,7 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
             &book,
             &options,
             &model,
+            &output_lock,
             cancel.clone(),
             callback,
         ));
@@ -629,12 +746,30 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         outcome?
     } else {
         let callback = progress_callback(args.ui, plan.len());
-        synthesize(&args, &book, &options, &model, cancel.clone(), callback).await?
+        synthesize(
+            &args,
+            &book,
+            &options,
+            &model,
+            &output_lock,
+            cancel.clone(),
+            callback,
+        )
+        .await?
     };
     #[cfg(not(feature = "tui"))]
     let report = {
         let callback = progress_callback(args.ui, plan.len());
-        synthesize(&args, &book, &options, &model, cancel.clone(), callback).await?
+        synthesize(
+            &args,
+            &book,
+            &options,
+            &model,
+            &output_lock,
+            cancel.clone(),
+            callback,
+        )
+        .await?
     };
 
     let fallback_tui_output = args.ui == UiMode::Tui && !use_tui;
@@ -650,32 +785,29 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                     failure.chapter_index + 1,
                     failure.part,
                     failure.file,
-                    failure.error
+                    sanitize_terminal(&failure.error)
                 );
             }
             eprintln!(
                 "Retry: rerun the same command with --retry-failed to call the provider only for these failures."
             );
             eprintln!("Manifest: {}", report.manifest_path.display());
-        } else if args.ui == UiMode::Json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "audiobook_finished",
-                    "status": "failed",
-                    "synthesized": report.chunks_synthesized,
-                    "cached": report.chunks_skipped,
-                    "failed": report.chunks_failed,
-                    "chunks": report.chunks_total,
-                    "manifest": report.manifest_path,
-                    "chunk_files": report.files,
-                    "chapter_files": [],
-                    "audiobook": null,
-                    "single_file": null,
-                    "failures": report.failures,
-                    "warnings": [],
-                })
-            );
+        } else if json_out.enabled() {
+            json_out.emit(serde_json::json!({
+                "event": "audiobook_finished",
+                "status": "failed",
+                "synthesized": report.chunks_synthesized,
+                "cached": report.chunks_skipped,
+                "failed": report.chunks_failed,
+                "chunks": report.chunks_total,
+                "manifest": report.manifest_path,
+                "chunk_files": report.files,
+                "chapter_files": [],
+                "audiobook": null,
+                "single_file": null,
+                "failures": report.failures,
+                "warnings": [],
+            }));
         }
         anyhow::bail!(
             "{} audiobook chunk(s) failed; successful chunks are resumable from {}",
@@ -763,26 +895,23 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         for error in &deliverable_errors {
             eprintln!("error: {error}");
         }
-    } else if args.ui == UiMode::Json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "event": "audiobook_finished",
-                "status": final_status,
-                "deliverable_status": deliverable_status,
-                "synthesized": report.chunks_synthesized,
-                "cached": report.chunks_skipped,
-                "failed": 0,
-                "chunks": report.chunks_total,
-                "manifest": report.manifest_path,
-                "chunk_files": report.files,
-                "chapter_files": stitch_report.as_ref().map(|result| &result.chapter_files),
-                "audiobook": stitch_report.as_ref().and_then(|result| result.book_file.as_ref()),
-                "single_file": stitch_report.as_ref().and_then(|result| result.single_file.as_ref()),
-                "warnings": stitch_report.as_ref().map(|result| &result.warnings),
-                "deliverable_errors": deliverable_errors,
-            })
-        );
+    } else if json_out.enabled() {
+        json_out.emit(serde_json::json!({
+            "event": "audiobook_finished",
+            "status": final_status,
+            "deliverable_status": deliverable_status,
+            "synthesized": report.chunks_synthesized,
+            "cached": report.chunks_skipped,
+            "failed": 0,
+            "chunks": report.chunks_total,
+            "manifest": report.manifest_path,
+            "chunk_files": report.files,
+            "chapter_files": stitch_report.as_ref().map(|result| &result.chapter_files),
+            "audiobook": stitch_report.as_ref().and_then(|result| result.book_file.as_ref()),
+            "single_file": stitch_report.as_ref().and_then(|result| result.single_file.as_ref()),
+            "warnings": stitch_report.as_ref().map(|result| &result.warnings),
+            "deliverable_errors": deliverable_errors,
+        }));
     }
 
     if !strict_deliverable_errors.is_empty() {
@@ -806,15 +935,12 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
         }
         let (removed, freed) = bookforge_audio::remove_stale_chunks(&stale)
             .with_context(|| format!("removing stale chunks in {}", out_dir.display()))?;
-        if args.ui == UiMode::Json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "audiobook_pruned",
-                    "removed": removed,
-                    "freed_bytes": freed,
-                })
-            );
+        if json_out.enabled() {
+            json_out.emit(serde_json::json!({
+                "event": "audiobook_pruned",
+                "removed": removed,
+                "freed_bytes": freed,
+            }));
         } else if human_output || fallback_tui_output {
             if removed == 0 {
                 println!("Prune: no stale chunks from earlier runs.");
@@ -911,6 +1037,10 @@ fn resolve_language_code(
     {
         return language;
     }
+    // Model-level nuance (which ElevenLabs models reject language_code at
+    // all) stays here because the provider-kind capability matrix cannot see
+    // it. Provider-level drops (--language on other backends) are surfaced by
+    // `warn_unsupported_provider_options` instead.
     if provider == AudioProviderKind::Elevenlabs && language.is_some() {
         eprintln!(
             "warning: ElevenLabs model {model} rejects language_code; ignoring {} language",
@@ -919,11 +1049,6 @@ fn resolve_language_code(
             } else {
                 "the EPUB"
             }
-        );
-    } else if explicit.is_some() {
-        eprintln!(
-            "warning: --language is only applied to ElevenLabs flash/turbo v2.5 models; ignoring it for {}",
-            audio_provider_name(provider)
         );
     }
     None
@@ -965,6 +1090,56 @@ fn audio_provider_name(provider: AudioProviderKind) -> &'static str {
     }
 }
 
+/// The bookforge-audio backend a CLI provider flag selects, so capability
+/// checks (AUDIO-6 / ASYM-1) share one table with synthesis itself.
+fn tts_provider_kind(provider: AudioProviderKind) -> TtsProviderKind {
+    match provider {
+        AudioProviderKind::Mock => TtsProviderKind::Mock,
+        AudioProviderKind::Openai => TtsProviderKind::OpenAi,
+        AudioProviderKind::Gemini => TtsProviderKind::Gemini,
+        AudioProviderKind::Elevenlabs => TtsProviderKind::ElevenLabs,
+    }
+}
+
+/// Warn-and-drop pass over launch-shaping options the selected backend cannot
+/// consume (CLI AUDIO-6 surface). Everything that reaches this point survived
+/// the explicit hard errors above (seed off ElevenLabs, Gemini playback speed,
+/// ElevenLabs instructions), so whatever remains unsupported here is exactly
+/// what synthesis would silently ignore — surface it once, uniformly, before
+/// any spend. The matrix in `bookforge_audio::capabilities` is the single
+/// source of truth; message names come from `unsupported_names()` so they
+/// cannot drift from what the request builders actually send.
+fn warn_unsupported_provider_options(args: &AudiobookArgs) {
+    let features = feature_set(tts_provider_kind(args.provider));
+    // A non-default text-normalization arg is the only way to distinguish an
+    // explicit request from clap's Auto default.
+    let requested = [
+        ("--seed", args.seed.is_some()),
+        ("--language", args.language.is_some()),
+        (
+            "--text-normalization",
+            !matches!(args.text_normalization, TextNormalizationArg::Auto),
+        ),
+        ("--instructions", args.instructions.is_some()),
+        ("--speed", (args.speed - 1.0).abs() > f32::EPSILON),
+    ];
+    let unsupported = features.unsupported_names();
+    let dropped: Vec<&str> = requested
+        .into_iter()
+        .filter(|(_, wanted)| *wanted)
+        .map(|(flag, _)| flag)
+        .filter(|flag| unsupported.contains(flag))
+        .collect();
+    if !dropped.is_empty() {
+        eprintln!(
+            "warning: {} TTS does not support {}; dropping {} before synthesis",
+            audio_provider_name(args.provider),
+            dropped.join(", "),
+            if dropped.len() == 1 { "it" } else { "them" }
+        );
+    }
+}
+
 fn format_audio_cost_line(cost: Option<AudioCost>) -> String {
     match cost {
         Some(AudioCost {
@@ -983,9 +1158,6 @@ fn format_audio_cost_line(cost: Option<AudioCost>) -> String {
 async fn list_voices_and_exit(args: &AudiobookArgs) -> Result<()> {
     if args.provider != AudioProviderKind::Elevenlabs {
         anyhow::bail!("--list-voices requires --provider elevenlabs");
-    }
-    if args.timeout_seconds == 0 {
-        anyhow::bail!("--timeout-seconds must be greater than zero");
     }
     let base_url = args
         .base_url
@@ -1111,56 +1283,19 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn read_epub_for_audio(input: &std::path::Path) -> Result<(bookforge_core::ir::Book, bool)> {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let staged = std::env::temp_dir().join(format!(
-        "bookforge-audio-clean-{}-{}-{sequence}.epub",
-        std::process::id(),
-        bookforge_core::now_ms()
-    ));
-    let cleanup = TemporaryEpub(staged.clone());
-    let reflow = reflow_epub(
-        input,
-        &staged,
-        &ReflowOptions {
-            dry_run: false,
-            aggressive: false,
-            pdf_cleanup: true,
-        },
-    )
-    .with_context(|| format!("failed to prepare EPUB narration from {}", input.display()))?;
-    let mut book =
-        read_epub(&staged).with_context(|| format!("failed to read EPUB {}", input.display()))?;
-    book.source_path = Some(input.to_path_buf());
-    let pdf_page_grouping = reflow.report.totals.pdf_documents_detected > 0;
-    drop(cleanup);
-    Ok((book, pdf_page_grouping))
-}
-
-struct TemporaryEpub(PathBuf);
-
-impl Drop for TemporaryEpub {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 fn progress_callback(ui: UiMode, total: usize) -> Arc<dyn Fn(Progress) + Send + Sync> {
-    if ui == UiMode::Json {
-        return Arc::new(|event: Progress| {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "audiobook_chunk_finished",
-                    "done": event.done,
-                    "total": event.total,
-                    "chapter": event.chapter_title,
-                    "cached": event.skipped,
-                    "failed": event.failed,
-                    "error": event.error,
-                })
-            );
+    if matches!(ui, UiMode::Json | UiMode::JsonV1) {
+        let json_out = AudiobookJson(ui);
+        return Arc::new(move |event: Progress| {
+            json_out.emit(serde_json::json!({
+                "event": "audiobook_chunk_finished",
+                "done": event.done,
+                "total": event.total,
+                "chapter": event.chapter_title,
+                "cached": event.skipped,
+                "failed": event.failed,
+                "error": event.error,
+            }));
         });
     }
     if ui == UiMode::Quiet {
@@ -1180,7 +1315,12 @@ fn progress_callback(ui: UiMode, total: usize) -> Arc<dyn Fn(Progress) + Send + 
         } else {
             "synthesized"
         };
-        progress.set_message(format!("{state}: {}", event.chapter_title));
+        // Chapter titles come from the EPUB; strip control characters before
+        // the indicatif bar echoes them to the terminal (UI-5).
+        progress.set_message(format!(
+            "{state}: {}",
+            sanitize_terminal(&event.chapter_title)
+        ));
         if event.done == event.total {
             progress.finish_and_clear();
         }
@@ -1192,18 +1332,20 @@ async fn synthesize(
     book: &bookforge_core::ir::Book,
     options: &AudiobookOptions,
     model: &str,
+    output_lock: &AudiobookOutputLock,
     cancel: CancellationToken,
     on_progress: Arc<dyn Fn(Progress) + Send + Sync>,
 ) -> Result<bookforge_audio::AudiobookReport> {
     let report = match args.provider {
         AudioProviderKind::Mock => {
             let callback = on_progress.clone();
-            build_audiobook(
+            build_audiobook_with_lock(
                 book,
                 Arc::new(MockTtsProvider::new()),
                 options,
                 cancel.clone(),
                 move |event| callback(event),
+                output_lock,
             )
             .await?
         }
@@ -1219,12 +1361,13 @@ async fn synthesize(
             let provider = OpenAiTtsProvider::new_with_cancel(config, cancel.clone())
                 .context("failed to build TTS provider")?;
             let callback = on_progress.clone();
-            build_audiobook(
+            build_audiobook_with_lock(
                 book,
                 Arc::new(provider),
                 options,
                 cancel.clone(),
                 move |event| callback(event),
+                output_lock,
             )
             .await?
         }
@@ -1240,12 +1383,13 @@ async fn synthesize(
             let provider = GeminiTtsProvider::new_with_cancel(config, cancel.clone())
                 .context("failed to build Gemini TTS provider")?;
             let callback = on_progress.clone();
-            build_audiobook(
+            build_audiobook_with_lock(
                 book,
                 Arc::new(provider),
                 options,
                 cancel.clone(),
                 move |event| callback(event),
+                output_lock,
             )
             .await?
         }
@@ -1261,12 +1405,13 @@ async fn synthesize(
             let provider = ElevenLabsTtsProvider::new_with_cancel(config, cancel.clone())
                 .context("failed to build ElevenLabs TTS provider")?;
             let callback = on_progress;
-            build_audiobook(
+            build_audiobook_with_lock(
                 book,
                 Arc::new(provider),
                 options,
                 cancel.clone(),
                 move |event| callback(event),
+                output_lock,
             )
             .await?
         }
@@ -1536,6 +1681,7 @@ fn missing_requested_deliverables(
 }
 
 fn write_stitch_warnings_to_process(out_dir: &std::path::Path, warnings: &[String]) -> Result<()> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = out_dir.join("process.json");
     if !path.is_file() {
         return Ok(());
@@ -1550,24 +1696,42 @@ fn write_stitch_warnings_to_process(out_dir: &std::path::Path, warnings: &[Strin
         .context("audiobook process state must be a JSON object")?;
     object.insert("warnings".to_string(), serde_json::json!(warnings));
 
-    let staged = out_dir.join("process.warnings.part.tmp");
-    std::fs::write(&staged, serde_json::to_vec_pretty(&process)?)
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staged = out_dir.join(format!(
+        ".process-warnings-{}-{sequence}.part.tmp",
+        std::process::id()
+    ));
+    let bytes = serde_json::to_vec_pretty(&process)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
         .with_context(|| format!("failed to stage process state {}", staged.display()))?;
-    let backup = out_dir.join("process.warnings.replace.bak");
-    let _ = std::fs::remove_file(&backup);
-    std::fs::rename(&path, &backup)
-        .with_context(|| format!("failed to preserve process state {}", path.display()))?;
-    match std::fs::rename(&staged, &path) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(backup);
-            Ok(())
-        }
-        Err(error) => {
-            let _ = std::fs::rename(&backup, &path);
-            let _ = std::fs::remove_file(staged);
-            Err(error)
-                .with_context(|| format!("failed to publish process state {}", path.display()))
-        }
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&staged);
+        return Err(error)
+            .with_context(|| format!("failed to flush process state {}", staged.display()));
+    }
+    drop(file);
+    if let Err(error) = bookforge_audio::replace_file(&staged, &path) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error)
+            .with_context(|| format!("failed to publish process state {}", path.display()));
+    }
+    sync_audio_directory(out_dir)
+        .with_context(|| format!("failed to durable-sync process state {}", path.display()))
+}
+
+fn sync_audio_directory(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 

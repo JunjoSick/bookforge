@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!-- PDF-10 fixture: a Chinese vector chart page whose caption uses the
+     simplified-Chinese prefix 图 followed by a FULLWIDTH ordinal
+     (U+FF11). Vector-figure recovery must treat it exactly like an
+     ASCII-digit ordinal. -->
+<pdf2xml producer="poppler">
+<page number="1" width="600" height="800">
+<fontspec id="0" size="10" family="Sans"/>
+<fontspec id="1" size="13" family="Sans"/>
+<text top="100" left="248" width="28" height="10" font="0">95</text>
+<text top="140" left="250" width="26" height="10" font="0">90</text>
+<text top="180" left="250" width="26" height="10" font="0">85</text>
+<text top="220" left="250" width="26" height="10" font="0">80</text>
+<text top="260" left="255" width="21" height="10" font="0">75</text>
+<text top="288" left="272" width="66" height="10" font="0">训练轮次</text>
+<text top="330" left="196" width="216" height="15" font="1">图１ 全局精度对比</text>
+</page>
+</pdf2xml>

@@ -60,7 +60,19 @@ Translation profiles control segmentation, scheduler, batching, compact prompts,
 
 ## JSON Mode
 
-`JsonMode::Auto` tries provider-native JSON response format where supported and falls back when the provider rejects it. `PromptOnly` relies on prompt instructions only. `Strict` requires native JSON support to work.
+The `--json-mode` flag on `translate` selects how BookForge requests structured
+responses from OpenAI-compatible providers:
+
+| Mode | Behavior |
+| --- | --- |
+| `Auto` (default) | Sends provider-native `response_format` where the runtime configuration supports it. When a provider rejects `response_format` with an HTTP 400, Auto retries once without it rather than failing the request. |
+| `ResponseFormat` | Always sends native JSON `response_format`. A provider that does not support it surfaces that as a real provider error instead of being retried without it. |
+| `PromptOnly` | Never sends `response_format`; structured output is left entirely to the prompt instructions. Useful for endpoints that mishandle the field. |
+
+There is no `Strict` mode: strictness comes from BookForge's own response
+validation, which applies to every mode. The resolved mode is reported in the
+`RuntimeConfigResolved` progress event as `"Auto"`, `"ResponseFormat"`, or
+`"PromptOnly"`.
 
 ## Retry Boundaries
 

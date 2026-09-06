@@ -1,5 +1,8 @@
 # Handoff to Codex — §9c source-EPUB reflow (2026-07-04)
 
+> **Historical snapshot:** this milestone shipped in v2.3.0 (2026-07-05).
+> Content preserved as written; behavior details may have evolved since.
+
 Written by Claude Code on behalf of the maintainer. First of two
 quality-of-life milestones scheduled after v2.2.0 (the other is §10.1.1
 pause/stop, which will follow on its own branch).

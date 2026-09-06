@@ -7,6 +7,8 @@ use bookforge_pdf::{
 };
 use clap::Args;
 
+use super::output;
+
 #[derive(Debug, Args)]
 pub struct ConvertArgs {
     /// Input PDF.
@@ -148,6 +150,9 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
         .report
         .clone()
         .unwrap_or_else(|| output.with_extension("convert.json"));
+    output::ensure_distinct_paths("PDF input/output", &args.input, &output)?;
+    output::ensure_distinct_paths("PDF output/report", &output, &report_path)?;
+    output::ensure_distinct_paths("PDF input/report", &args.input, &report_path)?;
 
     let options = ConvertOptions {
         columns: args.columns.into(),
@@ -175,6 +180,14 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
         config.image_mode = args.ocr_image_mode.as_str().to_string();
         config
     });
+    // Reject remote plain-HTTP OCR endpoints up front: page content and keys
+    // must never traverse an unauthenticated network path. HTTPS and HTTP
+    // loopback remain allowed.
+    if let Some(config) = &ocr_config {
+        config
+            .validate_base_url()
+            .with_context(|| "invalid OCR endpoint")?;
+    }
     if let Some(path) = &args.ocr_logit_processor {
         let processor = tokio::fs::read_to_string(path)
             .await
@@ -195,6 +208,10 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
     let input = args.input.clone();
     let conversion_input = input.clone();
     let conversion_output = output.clone();
+    // The conversion (and optional OCR of low-confidence pages) can take
+    // minutes; previously everything printed only after completion, leaving
+    // a silent start. Announce the work up front.
+    println!("Converting {} → {} ...", input.display(), output.display());
     let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
         let ocr_client = ocr_config
             .map(HttpOcrClient::new)
@@ -208,7 +225,7 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
     .context("PDF conversion worker failed")??;
 
     let json = serde_json::to_string_pretty(&outcome.report)?;
-    std::fs::write(&report_path, json)
+    output::write_atomic(&report_path, json.as_bytes())
         .with_context(|| format!("writing report {}", report_path.display()))?;
 
     println!("Input: {}", input.display());

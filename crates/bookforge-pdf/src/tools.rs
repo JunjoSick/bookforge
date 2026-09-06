@@ -18,9 +18,17 @@ use std::{
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 
 pub const PDF_RENDER_DPI: u32 = 150;
+/// Bound every non-OCR raster, including figure crops and preserved pages.
+pub const MAX_RENDER_PIXELS: u64 = 32_000_000;
+const MAX_RENDER_EDGE: u32 = 4096;
+const MAX_EXTRACTED_IMAGES: usize = 4096;
+const MAX_IMAGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_IMAGE_AGGREGATE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_SCRATCH_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PNG_DECOMPRESSED_BYTES: u64 = MAX_RENDER_PIXELS * 4 + MAX_RENDER_PIXELS;
 const PDF_XML_ZOOM: &str = "1.5";
-const PDF_XML_ZOOM_NUM: i64 = 3;
-const PDF_XML_ZOOM_DEN: i64 = 2;
+pub(crate) const PDF_XML_ZOOM_NUM: i64 = 3;
+pub(crate) const PDF_XML_ZOOM_DEN: i64 = 2;
 const PDF_POINTS_PER_INCH: i64 = 72;
 pub const DEFAULT_POPPLER_TIMEOUT: Duration = Duration::from_secs(120);
 /// XML from large, layout-heavy PDFs can be substantial, so stdout gets a
@@ -102,8 +110,8 @@ impl PageCrop {
             page: self.page,
             left: scale_xml_to_render_px(self.left).max(0),
             top: scale_xml_to_render_px(self.top).max(0),
-            width: scale_xml_to_render_px(self.width).max(1),
-            height: scale_xml_to_render_px(self.height).max(1),
+            width: scale_xml_to_render_px(self.width).clamp(1, MAX_RENDER_EDGE as i32),
+            height: scale_xml_to_render_px(self.height).clamp(1, MAX_RENDER_EDGE as i32),
         }
     }
 }
@@ -146,6 +154,11 @@ impl PopplerTools {
     }
 
     /// Run `pdftohtml -xml` and return the XML document.
+    ///
+    /// Note: deliberately launched *without* `-i`. Empirically (poppler
+    /// 26.08) `-i` does not merely skip writing image files; it also
+    /// suppresses the `<image>` placement tags in the XML, which are
+    /// required downstream for figure/caption anchoring. See docs/report.md §4.5 PDF-4.
     pub fn pdf_to_xml(&self, pdf: &Path) -> Result<String, ToolError> {
         self.pdf_to_xml_with_timeout(pdf, DEFAULT_POPPLER_TIMEOUT)
     }
@@ -156,34 +169,30 @@ impl PopplerTools {
         pdf: &Path,
         timeout: Duration,
     ) -> Result<String, ToolError> {
-        let work_dir = scoped_temp_dir("bookforge-pdftohtml")?;
+        let work_dir = ScopedTempDir::new("bookforge-pdftohtml")?;
         let pdf = absolute_path(pdf)?;
-        let result = (|| {
-            let mut command = poppler_command(&self.pdftohtml);
-            command.current_dir(&work_dir).args([
-                "-xml",
-                "-stdout",
-                "-q",
-                "-enc",
-                "UTF-8",
-                "-fmt",
-                "png",
-                "-zoom",
-                PDF_XML_ZOOM,
-            ]);
-            command.arg(pdf);
-            let output = command_output(&mut command, "pdftohtml", timeout)?;
-            if !output.status.success() {
-                return Err(ToolError::Failed {
-                    tool: "pdftohtml",
-                    code: output.status.code(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        })();
-        let _ = fs::remove_dir_all(&work_dir);
-        result
+        let mut command = poppler_command(&self.pdftohtml);
+        command.current_dir(work_dir.path()).args([
+            "-xml",
+            "-stdout",
+            "-q",
+            "-enc",
+            "UTF-8",
+            "-fmt",
+            "png",
+            "-zoom",
+            PDF_XML_ZOOM,
+        ]);
+        command.arg(pdf);
+        let output = command_output(&mut command, "pdftohtml", timeout)?;
+        if !output.status.success() {
+            return Err(ToolError::Failed {
+                tool: "pdftohtml",
+                code: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Raw text via `pdftotext`, used as the coverage baseline: it makes
@@ -232,6 +241,7 @@ impl PopplerTools {
         if listed.is_empty() {
             return Ok(Vec::new());
         }
+        validate_listed_image_limits(&listed)?;
 
         let root = output_dir.join("image");
         let mut command = poppler_command(self.pdfimages_path()?);
@@ -256,6 +266,8 @@ impl PopplerTools {
         if paths.is_empty() {
             paths = extracted_image_paths(output_dir)?;
         }
+        validate_extracted_image_paths(output_dir, &paths)?;
+        validate_scratch_directory(output_dir)?;
         paths.sort();
         pair_extracted_images_with_list_rows(paths, &listed)
     }
@@ -266,21 +278,39 @@ impl PopplerTools {
         page: u32,
         output_dir: &Path,
     ) -> Result<PathBuf, ToolError> {
-        self.render_page_png_with_timeout(pdf, page, output_dir, DEFAULT_POPPLER_TIMEOUT)
+        self.render_page_png_scaled(pdf, page, output_dir, PDF_RENDER_DPI)
     }
 
-    /// Render one page with a caller-selected deadline.
-    pub fn render_page_png_with_timeout(
+    /// Render one page at a caller-selected DPI with the default deadline.
+    pub fn render_page_png_scaled(
         &self,
         pdf: &Path,
         page: u32,
         output_dir: &Path,
+        dpi: u32,
+    ) -> Result<PathBuf, ToolError> {
+        self.render_page_png_at_dpi_with_timeout(
+            pdf,
+            page,
+            output_dir,
+            dpi,
+            DEFAULT_POPPLER_TIMEOUT,
+        )
+    }
+
+    /// Render one page with a caller-selected deadline and DPI.
+    pub fn render_page_png_at_dpi_with_timeout(
+        &self,
+        pdf: &Path,
+        page: u32,
+        output_dir: &Path,
+        dpi: u32,
         timeout: Duration,
     ) -> Result<PathBuf, ToolError> {
         fs::create_dir_all(output_dir)?;
         let root = output_dir.join(format!("page-{page:04}"));
         let page_arg = page.to_string();
-        let dpi_arg = PDF_RENDER_DPI.to_string();
+        let dpi_arg = dpi.max(1).to_string();
         let mut command = poppler_command(self.pdftoppm_path()?);
         command
             .args([
@@ -292,6 +322,8 @@ impl PopplerTools {
                 "-png",
                 "-r",
                 &dpi_arg,
+                "-scale-to",
+                &MAX_RENDER_EDGE.to_string(),
             ])
             .arg(pdf)
             .arg(&root);
@@ -303,7 +335,10 @@ impl PopplerTools {
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             });
         }
-        Ok(root.with_extension("png"))
+        let output = root.with_extension("png");
+        validate_png_file(&output)?;
+        validate_scratch_directory(output_dir)?;
+        Ok(output)
     }
 
     pub fn render_page_crop_png(
@@ -364,7 +399,10 @@ impl PopplerTools {
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             });
         }
-        Ok(root.with_extension("png"))
+        let output = root.with_extension("png");
+        validate_png_file(&output)?;
+        validate_scratch_directory(output_dir)?;
+        Ok(output)
     }
 
     fn list_images(&self, pdf: &Path, timeout: Duration) -> Result<Vec<ListedImage>, ToolError> {
@@ -384,16 +422,22 @@ impl PopplerTools {
     }
 }
 
-fn poppler_command(program: &Path) -> Command {
-    let mut command = Command::new(program);
+/// Environment-variable allowlist applied to every poppler invocation,
+/// shared verbatim by the real subprocess path and by tests that build
+/// commands in-process on any OS. Lookups are injected so scrub
+/// behaviour is observable without spawning anything.
+fn apply_environment_allowlist(
+    command: &mut Command,
+    lookup: &mut dyn FnMut(&str) -> Option<std::ffi::OsString>,
+) {
     command.env_clear();
-    copy_environment_variable(&mut command, "PATH");
+    copy_environment_variable(command, "PATH", lookup);
     #[cfg(windows)]
     {
         // Windows needs these for system DLL discovery and temporary-file APIs.
-        copy_environment_variable(&mut command, "SYSTEMROOT");
-        copy_environment_variable(&mut command, "TEMP");
-        copy_environment_variable(&mut command, "TMP");
+        copy_environment_variable(command, "SYSTEMROOT", lookup);
+        copy_environment_variable(command, "TEMP", lookup);
+        copy_environment_variable(command, "TMP", lookup);
     }
     #[cfg(unix)]
     {
@@ -416,15 +460,98 @@ fn poppler_command(program: &Path) -> Command {
             "FONTCONFIG_FILE",
             "TMPDIR",
         ] {
-            copy_environment_variable(&mut command, name);
+            copy_environment_variable(command, name, lookup);
         }
     }
+}
+
+fn copy_environment_variable(
+    command: &mut Command,
+    name: &'static str,
+    lookup: &mut dyn FnMut(&str) -> Option<std::ffi::OsString>,
+) {
+    if let Some(value) = lookup(name) {
+        command.env(name, value);
+    }
+}
+
+fn poppler_command(program: &Path) -> Command {
+    let mut command = Command::new(program);
+    apply_environment_allowlist(&mut command, &mut |name| std::env::var_os(name));
     command
 }
 
-fn copy_environment_variable(command: &mut Command, name: &'static str) {
-    if let Some(value) = std::env::var_os(name) {
-        command.env(name, value);
+/// The tool surface reconstruction/OCR orchestration actually drives.
+///
+/// Implemented by [`PopplerTools`] over real subprocesses; integration
+/// tests supply an in-process fake so failure, timing and cleanup paths
+/// run identically on any OS (TEST-2/PDF-2).
+pub trait PopplerBackend {
+    /// `pdftohtml -xml` output for the whole document.
+    fn pdf_to_xml(&self, pdf: &Path) -> Result<String, ToolError>;
+
+    /// Raw `pdftotext` output used as the coverage baseline.
+    fn pdf_to_text(&self, pdf: &Path) -> Result<String, ToolError>;
+
+    /// Extract embedded images into `output_dir`.
+    fn extract_images(
+        &self,
+        pdf: &Path,
+        output_dir: &Path,
+    ) -> Result<Vec<ExtractedImage>, ToolError>;
+
+    /// Render one page at [`PDF_RENDER_DPI`].
+    fn render_page_png(
+        &self,
+        pdf: &Path,
+        page: u32,
+        output_dir: &Path,
+    ) -> Result<PathBuf, ToolError>;
+
+    /// Render one page at a caller-selected DPI.
+    fn render_page_png_scaled(
+        &self,
+        pdf: &Path,
+        page: u32,
+        output_dir: &Path,
+        dpi: u32,
+    ) -> Result<PathBuf, ToolError>;
+}
+
+impl PopplerBackend for PopplerTools {
+    fn pdf_to_xml(&self, pdf: &Path) -> Result<String, ToolError> {
+        self.pdf_to_xml(pdf)
+    }
+
+    fn pdf_to_text(&self, pdf: &Path) -> Result<String, ToolError> {
+        self.pdf_to_text(pdf)
+    }
+
+    fn extract_images(
+        &self,
+        pdf: &Path,
+        output_dir: &Path,
+    ) -> Result<Vec<ExtractedImage>, ToolError> {
+        self.extract_images(pdf, output_dir)
+    }
+
+    fn render_page_png(
+        &self,
+        pdf: &Path,
+        page: u32,
+        output_dir: &Path,
+    ) -> Result<PathBuf, ToolError> {
+        self.render_page_png(pdf, page, output_dir)
+    }
+
+    fn render_page_png_scaled(
+        &self,
+        pdf: &Path,
+        page: u32,
+        output_dir: &Path,
+        dpi: u32,
+    ) -> Result<PathBuf, ToolError> {
+        self.render_page_png_scaled(pdf, page, output_dir, dpi)
     }
 }
 
@@ -481,6 +608,13 @@ fn command_output_with_limits(
             stream: "stdout",
             limit: stdout_limit,
         });
+    }
+    if stderr.exceeded {
+        // stderr only feeds diagnostics, so a truncated capture is not
+        // fatal — but it must never be silently swallowed.
+        tracing::warn!(
+            "poppler tool '{tool}' exceeded the {stderr_limit}-byte stderr capture limit; diagnostics are truncated"
+        );
     }
 
     Ok(Output {
@@ -552,7 +686,24 @@ enum WaitError {
     Io(io::Error),
 }
 
-fn wait_with_timeout(child: &mut ChildGuard, timeout: Duration) -> Result<ExitStatus, WaitError> {
+/// The wait surface [`wait_with_timeout`] needs: polling exit status.
+/// [`ChildGuard`] implements it over a real process; tests drive it
+/// with synthetic children so deadline/kill arithmetic runs in-process
+/// on any OS (TEST-2/PDF-2).
+trait PollWait {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
+}
+
+impl PollWait for ChildGuard {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        Self::try_wait_status(self)
+    }
+}
+
+fn wait_with_timeout(
+    child: &mut impl PollWait,
+    timeout: Duration,
+) -> Result<ExitStatus, WaitError> {
     let started = Instant::now();
     loop {
         match child.try_wait().map_err(WaitError::Io)? {
@@ -588,7 +739,7 @@ impl ChildGuard {
         self.child.as_mut()?.stderr.take()
     }
 
-    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+    fn try_wait_status(&mut self) -> io::Result<Option<ExitStatus>> {
         let status = self
             .child
             .as_mut()
@@ -623,7 +774,7 @@ impl Drop for ChildGuard {
 fn scale_xml_to_render_px(value: i32) -> i32 {
     let numerator = value as i64 * PDF_RENDER_DPI as i64 * PDF_XML_ZOOM_DEN;
     let denominator = PDF_POINTS_PER_INCH * PDF_XML_ZOOM_NUM;
-    ((numerator + denominator / 2) / denominator) as i32
+    ((numerator + denominator / 2) / denominator).clamp(0, i32::MAX as i64) as i32
 }
 
 #[derive(Debug)]
@@ -634,6 +785,151 @@ struct PngImage {
     bit_depth: u8,
     bytes_per_pixel: usize,
     pixels: Vec<u8>,
+}
+
+fn validate_listed_image_limits(images: &[ListedImage]) -> Result<(), ToolError> {
+    if images.len() > MAX_EXTRACTED_IMAGES {
+        return Err(ToolError::UnsupportedPng(format!(
+            "pdf contains {} embedded images, exceeding the {MAX_EXTRACTED_IMAGES}-image limit",
+            images.len()
+        )));
+    }
+    for image in images {
+        if let (Some(width), Some(height)) = (image.width, image.height) {
+            let pixels = u64::from(width).saturating_mul(u64::from(height));
+            if pixels > MAX_RENDER_PIXELS {
+                return Err(ToolError::UnsupportedPng(format!(
+                    "embedded image {} on page {} has {pixels} pixels, exceeding the {MAX_RENDER_PIXELS}-pixel limit",
+                    image.num, image.page
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_extracted_image_paths(
+    output_dir: &Path,
+    paths: &[PathBuf],
+) -> Result<(), ToolError> {
+    if paths.len() > MAX_EXTRACTED_IMAGES {
+        return Err(ToolError::UnsupportedPng(format!(
+            "pdfimages produced {} files, exceeding the {MAX_EXTRACTED_IMAGES}-image limit",
+            paths.len()
+        )));
+    }
+    let root = fs::canonicalize(output_dir)?;
+    let mut total = 0u64;
+    for path in paths {
+        // Keep a missing path visible to the downstream figure pass. That
+        // preserves its error/reporting behavior while still bounding every
+        // artifact that the external tool actually materialized.
+        if !path.exists() {
+            continue;
+        }
+        let canonical = fs::canonicalize(path)?;
+        if !canonical.starts_with(&root) {
+            return Err(ToolError::UnsupportedPng(format!(
+                "pdfimages produced a path outside its scratch directory: {}",
+                path.display()
+            )));
+        }
+        let metadata = fs::metadata(&canonical)?;
+        if !metadata.is_file() {
+            return Err(ToolError::UnsupportedPng(format!(
+                "pdfimages output is not a regular file: {}",
+                path.display()
+            )));
+        }
+        if metadata.len() > MAX_IMAGE_FILE_BYTES {
+            return Err(ToolError::UnsupportedPng(format!(
+                "extracted image {} is {} bytes, exceeding the {MAX_IMAGE_FILE_BYTES}-byte limit",
+                path.display(),
+                metadata.len()
+            )));
+        }
+        total = total
+            .checked_add(metadata.len())
+            .ok_or_else(|| ToolError::UnsupportedPng("image byte total overflowed".to_string()))?;
+        if total > MAX_IMAGE_AGGREGATE_BYTES {
+            return Err(ToolError::UnsupportedPng(format!(
+                "extracted images total {total} bytes, exceeding the {MAX_IMAGE_AGGREGATE_BYTES}-byte limit"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_scratch_directory(path: &Path) -> Result<(), ToolError> {
+    validate_scratch_directories(&[path])
+}
+
+pub(crate) fn validate_scratch_directories(paths: &[&Path]) -> Result<(), ToolError> {
+    let mut total = 0u64;
+    for path in paths {
+        let mut stack = vec![(*path).to_path_buf()];
+        while let Some(current) = stack.pop() {
+            for entry in fs::read_dir(current)? {
+                let entry = entry?;
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.file_type().is_symlink() {
+                    return Err(ToolError::UnsupportedPng(format!(
+                        "scratch directory contains a symlink: {}",
+                        entry.path().display()
+                    )));
+                }
+                if metadata.is_dir() {
+                    stack.push(entry.path());
+                } else if metadata.is_file() {
+                    total = total.checked_add(metadata.len()).ok_or_else(|| {
+                        ToolError::UnsupportedPng("scratch byte total overflowed".to_string())
+                    })?;
+                    if total > MAX_SCRATCH_BYTES {
+                        return Err(ToolError::UnsupportedPng(format!(
+                            "combined scratch output exceeds the {MAX_SCRATCH_BYTES}-byte limit"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_png_file(path: &Path) -> Result<(), ToolError> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_IMAGE_FILE_BYTES {
+        return Err(ToolError::UnsupportedPng(format!(
+            "PNG {} is {} bytes, exceeding the {MAX_IMAGE_FILE_BYTES}-byte limit",
+            path.display(),
+            metadata.len()
+        )));
+    }
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 33];
+    file.read_exact(&mut header)?;
+    if &header[..8] != b"\x89PNG\r\n\x1a\n" || &header[12..16] != b"IHDR" {
+        return Err(ToolError::UnsupportedPng(format!(
+            "{} is not a PNG with an IHDR header",
+            path.display()
+        )));
+    }
+    let width = u32::from_be_bytes(header[16..20].try_into().expect("PNG width"));
+    let height = u32::from_be_bytes(header[20..24].try_into().expect("PNG height"));
+    if width == 0 || height == 0 {
+        return Err(ToolError::UnsupportedPng(format!(
+            "{} has zero PNG dimensions",
+            path.display()
+        )));
+    }
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if pixels > MAX_RENDER_PIXELS {
+        return Err(ToolError::UnsupportedPng(format!(
+            "PNG {} has {pixels} pixels, exceeding the {MAX_RENDER_PIXELS}-pixel limit",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn crop_png_to_file(
@@ -669,7 +965,11 @@ pub(crate) fn crop_png_to_file(
         image.bit_depth,
         image.bytes_per_pixel,
         &pixels,
-    )
+    )?;
+    if let Some(parent) = output.parent() {
+        validate_scratch_directory(parent)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -687,6 +987,14 @@ pub(crate) fn write_solid_rgb_png(
 }
 
 fn read_png(path: &Path) -> Result<PngImage, ToolError> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_IMAGE_FILE_BYTES {
+        return Err(ToolError::UnsupportedPng(format!(
+            "PNG {} is {} bytes, exceeding the {MAX_IMAGE_FILE_BYTES}-byte limit",
+            path.display(),
+            metadata.len()
+        )));
+    }
     let bytes = fs::read(path)?;
     if bytes.len() < 8 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
         return Err(ToolError::UnsupportedPng(format!(
@@ -745,6 +1053,11 @@ fn read_png(path: &Path) -> Result<PngImage, ToolError> {
 
     let width = width.ok_or_else(|| ToolError::UnsupportedPng("missing IHDR".to_string()))?;
     let height = height.ok_or_else(|| ToolError::UnsupportedPng("missing IHDR".to_string()))?;
+    if width == 0 || height == 0 {
+        return Err(ToolError::UnsupportedPng(
+            "PNG dimensions must be non-zero".to_string(),
+        ));
+    }
     let bit_depth = bit_depth.unwrap_or_default();
     let color_type = color_type.unwrap_or_default();
     if bit_depth != 8 {
@@ -763,11 +1076,31 @@ fn read_png(path: &Path) -> Result<PngImage, ToolError> {
             )));
         }
     };
-    let mut decoder = ZlibDecoder::new(idat.as_slice());
-    let mut inflated = Vec::new();
-    decoder.read_to_end(&mut inflated)?;
-    let row_stride = width as usize * bytes_per_pixel;
-    let expected = (row_stride + 1) * height as usize;
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG pixel count overflowed".to_string()))?;
+    if pixels > MAX_RENDER_PIXELS {
+        return Err(ToolError::UnsupportedPng(format!(
+            "PNG has {pixels} pixels, exceeding the {MAX_RENDER_PIXELS}-pixel limit"
+        )));
+    }
+    let row_stride = (width as usize)
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG row size overflowed".to_string()))?;
+    let expected = row_stride
+        .checked_add(1)
+        .and_then(|stride| stride.checked_mul(height as usize))
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG decompressed size overflowed".to_string()))?;
+    if expected as u64 > MAX_PNG_DECOMPRESSED_BYTES {
+        return Err(ToolError::UnsupportedPng(format!(
+            "PNG decompressed data exceeds the {MAX_PNG_DECOMPRESSED_BYTES}-byte limit"
+        )));
+    }
+    let decoder = ZlibDecoder::new(idat.as_slice());
+    let mut inflated = Vec::with_capacity(expected.min(64 * 1024));
+    decoder
+        .take(expected as u64 + 1)
+        .read_to_end(&mut inflated)?;
     if inflated.len() != expected {
         return Err(ToolError::UnsupportedPng(format!(
             "inflated data length {} did not match expected {expected}",
@@ -775,7 +1108,10 @@ fn read_png(path: &Path) -> Result<PngImage, ToolError> {
         )));
     }
 
-    let mut pixels = vec![0; row_stride * height as usize];
+    let pixel_bytes = row_stride
+        .checked_mul(height as usize)
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG pixel buffer size overflowed".to_string()))?;
+    let mut pixels = vec![0; pixel_bytes];
     for row in 0..height as usize {
         let raw_offset = row * (row_stride + 1);
         let filter = inflated[raw_offset];
@@ -835,13 +1171,30 @@ fn write_png(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let row_stride = width as usize * bytes_per_pixel;
-    if pixels.len() != row_stride * height as usize {
+    let row_stride = (width as usize)
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG row size overflowed".to_string()))?;
+    let expected_pixels = row_stride
+        .checked_mul(height as usize)
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG pixel buffer size overflowed".to_string()))?;
+    let pixel_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG pixel count overflowed".to_string()))?;
+    if pixel_count > MAX_RENDER_PIXELS || expected_pixels as u64 > MAX_PNG_DECOMPRESSED_BYTES {
+        return Err(ToolError::UnsupportedPng(
+            "PNG dimensions exceed the raster safety limits".to_string(),
+        ));
+    }
+    if pixels.len() != expected_pixels {
         return Err(ToolError::UnsupportedPng(
             "pixel buffer length did not match PNG dimensions".to_string(),
         ));
     }
-    let mut filtered = Vec::with_capacity((row_stride + 1) * height as usize);
+    let filtered_len = row_stride
+        .checked_add(1)
+        .and_then(|stride| stride.checked_mul(height as usize))
+        .ok_or_else(|| ToolError::UnsupportedPng("PNG filtered size overflowed".to_string()))?;
+    let mut filtered = Vec::with_capacity(filtered_len);
     for row in 0..height as usize {
         filtered.push(0);
         let start = row * row_stride;
@@ -987,7 +1340,7 @@ fn extracted_image_paths(output_dir: &Path) -> Result<Vec<PathBuf>, ToolError> {
         let is_image = path
             .extension()
             .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg"));
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
         if is_image {
             paths.push(path);
         }
@@ -1002,35 +1355,65 @@ fn absolute_path(path: &Path) -> Result<PathBuf, ToolError> {
     Ok(std::env::current_dir()?.join(path))
 }
 
-pub(crate) fn scoped_temp_dir(prefix: &str) -> Result<PathBuf, ToolError> {
-    for _ in 0..TEMP_DIR_CREATE_ATTEMPTS {
-        let mut random = [0_u8; TEMP_DIR_RANDOM_BYTES];
-        fill_secure_random(&mut random)?;
-        let suffix = random
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let path = std::env::temp_dir().join(format!("{prefix}-{suffix}"));
-        let builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        let builder = {
-            use std::os::unix::fs::DirBuilderExt;
+/// A securely randomized private temporary directory that is removed
+/// (best effort, recursively) when dropped.
+///
+/// RAII cleanup guarantees scratch directories disappear on every error
+/// path (`?`), not only on success — docs/report.md §4.5 PDF-3.
+pub(crate) struct ScopedTempDir {
+    path: PathBuf,
+}
 
-            let mut builder = builder;
-            builder.mode(0o700);
-            builder
-        };
-        match builder.create(&path) {
-            Ok(()) => return Ok(path),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err.into()),
+impl ScopedTempDir {
+    pub(crate) fn new(prefix: &str) -> Result<Self, ToolError> {
+        for _ in 0..TEMP_DIR_CREATE_ATTEMPTS {
+            let mut random = [0_u8; TEMP_DIR_RANDOM_BYTES];
+            fill_secure_random(&mut random)?;
+            let suffix = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let path = std::env::temp_dir().join(format!("{prefix}-{suffix}"));
+            let builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::DirBuilderExt;
+
+                let mut builder = builder;
+                builder.mode(0o700);
+                builder
+            };
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
         }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not create a unique secure temporary directory",
+        )
+        .into())
     }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not create a unique secure temporary directory",
-    )
-    .into())
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScopedTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+impl std::fmt::Debug for ScopedTempDir {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScopedTempDir")
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 #[cfg(unix)]
@@ -1197,6 +1580,48 @@ mod tests {
         );
     }
 
+    /// A process substitute that never yields an exit status, letting the
+    /// poll/deadline arithmetic of [`wait_with_timeout`] run on any OS
+    /// without spawning anything (TEST-2/PDF-2).
+    struct NeverYieldingChild;
+
+    impl PollWait for NeverYieldingChild {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn deadline_fires_for_a_synthetic_never_exiting_child() {
+        let started = Instant::now();
+        let outcome = wait_with_timeout(&mut NeverYieldingChild, Duration::from_millis(40));
+
+        assert!(
+            matches!(outcome, Err(WaitError::TimedOut)),
+            "a child that never reports a status must hit the deadline"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "deadline respected: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "no unbounded waiting: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn exhausted_deadline_stops_polling_immediately() {
+        // The remaining-time delay must clamp to zero once the deadline
+        // has passed, so the loop cannot keep sleeping past it.
+        let started = Instant::now();
+        let outcome = wait_with_timeout(&mut NeverYieldingChild, Duration::ZERO);
+
+        assert!(matches!(outcome, Err(WaitError::TimedOut)));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
     #[test]
     fn oversized_stdout_is_rejected_at_the_configured_limit() {
         let mut command = fake_tool_command("tools::tests::fake_tool_emits_large_stdout");
@@ -1250,15 +1675,24 @@ mod tests {
     }
 
     #[test]
-    fn scoped_temp_dirs_are_securely_randomized() {
-        let first = scoped_temp_dir("bookforge-secure-temp").expect("first temp dir");
-        let second = scoped_temp_dir("bookforge-secure-temp").expect("second temp dir");
+    fn scoped_temp_dirs_are_securely_randomized_and_removed_on_drop() {
+        let first = ScopedTempDir::new("bookforge-secure-temp").expect("first temp dir");
+        let second = ScopedTempDir::new("bookforge-secure-temp").expect("second temp dir");
 
-        assert_ne!(first, second);
-        assert!(first.is_dir());
-        assert!(second.is_dir());
-        fs::remove_dir_all(first).expect("first temp dir removes");
-        fs::remove_dir_all(second).expect("second temp dir removes");
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().is_dir());
+        assert!(second.path().is_dir());
+
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+        drop(first);
+        drop(second);
+
+        assert!(
+            !first_path.exists(),
+            "dropped temp dir must be removed (PDF-3)"
+        );
+        assert!(!second_path.exists());
     }
 
     #[test]
@@ -1362,5 +1796,56 @@ mod tests {
         assert_eq!(image.width, 7);
         assert_eq!(image.height, 8);
         assert_eq!(image.pixels[..3], [12, 34, 56]);
+    }
+
+    #[test]
+    fn rejects_png_dimensions_before_inflating_data() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("oversized.png");
+        let mut header = [0u8; 33];
+        header[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        header[8..12].copy_from_slice(&13u32.to_be_bytes());
+        header[12..16].copy_from_slice(b"IHDR");
+        header[16..20].copy_from_slice(&(MAX_RENDER_PIXELS as u32).to_be_bytes());
+        header[20..24].copy_from_slice(&2u32.to_be_bytes());
+        header[24] = 8;
+        header[25] = 2;
+        fs::write(&path, header).expect("fixture writes");
+
+        let error = read_png(&path).expect_err("oversized dimensions must be rejected");
+        assert!(error.to_string().contains("pixel"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_directory_with_a_symlink_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let outside = dir.path().join("outside.png");
+        fs::write(&outside, b"data").expect("outside writes");
+        let scratch = dir.path().join("scratch");
+        fs::create_dir(&scratch).expect("scratch creates");
+        fs::write(scratch.join("page-0001.png"), b"png").expect("png writes");
+        std::os::unix::fs::symlink(&outside, scratch.join("escape.png")).expect("symlink creates");
+
+        let error = validate_scratch_directory(&scratch)
+            .expect_err("a scratch directory must not contain symlinks");
+        assert!(error.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn render_crop_dimensions_are_clamped_to_the_render_edge() {
+        let crop = PageCrop {
+            page: 1,
+            left: -5000,
+            top: -1,
+            width: i32::MAX,
+            height: i32::MAX,
+        }
+        .to_render_pixels();
+
+        assert_eq!(crop.left, 0);
+        assert_eq!(crop.top, 0);
+        assert_eq!(crop.width, MAX_RENDER_EDGE as i32);
+        assert_eq!(crop.height, MAX_RENDER_EDGE as i32);
     }
 }

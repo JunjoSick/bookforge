@@ -178,8 +178,9 @@ fn decode_gemini_audio(response: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::test_support::one_request_server;
-    use std::time::Duration;
+    use crate::provider::test_support::{
+        CAPTURE_WINDOW, one_request_server, retry_transient_transport,
+    };
 
     fn request(format: AudioFormat) -> SpeechRequest {
         SpeechRequest {
@@ -246,27 +247,36 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        let (base_url, captured) = one_request_server(response, "application/json");
         let key_env = "BOOKFORGE_GEMINI_TTS_CONTRACT_TEST_KEY";
-        // SAFETY: this test uses a crate-specific variable that no production
-        // code or parallel test reads.
-        unsafe { std::env::set_var(key_env, "gemini-test-key") };
-        let provider = GeminiTtsProvider::new(GeminiTtsConfig {
-            base_url,
-            api_key_env: key_env.to_string(),
-            model: "gemini-3.1-flash-tts-preview".to_string(),
-            timeout_seconds: 5,
-            max_attempts: 1,
+        let (clip_bytes, raw) = retry_transient_transport(|| {
+            let response = response.clone();
+            async move {
+                let (base_url, captured) = one_request_server(response, "application/json");
+                // SAFETY: this test uses a crate-specific variable that no
+                // production code or parallel test reads.
+                unsafe { std::env::set_var(key_env, "gemini-test-key") };
+                let provider = GeminiTtsProvider::new(GeminiTtsConfig {
+                    base_url,
+                    api_key_env: key_env.to_string(),
+                    model: "gemini-3.1-flash-tts-preview".to_string(),
+                    timeout_seconds: 5,
+                    max_attempts: 1,
+                })
+                .unwrap();
+                let clip = provider.synthesize(request(AudioFormat::Wav)).await;
+                unsafe { std::env::remove_var(key_env) };
+                clip.map(|clip| {
+                    let raw = captured
+                        .recv_timeout(CAPTURE_WINDOW)
+                        .expect("mock should capture the request");
+                    (clip.bytes, raw)
+                })
+            }
         })
-        .unwrap();
-        let clip = provider
-            .synthesize(request(AudioFormat::Wav))
-            .await
-            .expect("mocked Gemini synthesis");
-        unsafe { std::env::remove_var(key_env) };
+        .await
+        .expect("mocked Gemini synthesis");
 
-        assert_eq!(&clip.bytes[..4], b"RIFF");
-        let raw = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(&clip_bytes[..4], b"RIFF");
         let lowercase = raw.to_ascii_lowercase();
         assert!(
             raw.starts_with(

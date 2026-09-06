@@ -70,6 +70,11 @@ struct ClearArgs {
 
     #[arg(long)]
     scope_id: Option<String>,
+
+    /// Confirm the deletion. Required so a stray Enter cannot wipe stored
+    /// guidance; nothing is removed without this flag.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -232,9 +237,21 @@ fn export_style(store: &JobStore, args: ExportArgs) -> Result<()> {
 
 fn clear_style(store: &JobStore, args: ClearArgs) -> Result<()> {
     validate_scope(args.scope, args.scope_id.as_deref())?;
+    confirm_destructive_clear(args.yes)?;
     let count = store.clear_style_scope(args.scope, args.scope_id.as_deref())?;
     println!("Cleared {count} style sheets.");
     Ok(())
+}
+
+/// Shared guard for destructive `clear` subcommands: refuse to delete stored
+/// guidance unless the caller passed an explicit `--yes`.
+fn confirm_destructive_clear(confirmed: bool) -> Result<()> {
+    if confirmed {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to clear style sheets without --yes; re-run with --yes to delete the selected scope"
+    )
 }
 
 fn show_style(store: &JobStore, args: ShowArgs) -> Result<()> {

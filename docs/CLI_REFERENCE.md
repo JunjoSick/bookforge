@@ -1,5 +1,14 @@
 # BookForge CLI guide
 
+> **Version note (2026-08-31):** this guide documents the working tree on the
+> **unreleased** v3.0.0 remediation branch (branch `remediation/audit-2026-08`
+> @ `aa90d94`; PR #112 open/blocked). Several behaviors described below — the
+> dashboard's default token auth, the exit-code taxonomy, the `--ui json`
+> versioned envelope, `--pass-costs` — ship **only** with v3.0.0 and are **not
+> present in the published v2.6.1** release. For current-published behavior,
+> install v2.6.1; for authoritative remediation status see
+> `docs/AUDIT-2026-08-31.md`.
+
 This guide explains how the commands fit together. Run `bookforge <command>
 --help` for the complete, version-specific option list.
 
@@ -60,8 +69,9 @@ bookforge serve --open
 ```
 
 Use `--bind` to select another loopback address or port. `--refresh-ms` controls
-the live-update interval; values are clamped to the range from 50 through 5,000
-milliseconds.
+the live-update interval; values are clamped to the range from 20 through 5,000
+milliseconds — the same floor (`MIN_REFRESH_MS`, 20 ms) that
+`watch --refresh-ms` uses.
 
 ```bash
 bookforge serve --bind 127.0.0.1:9000 --refresh-ms 500
@@ -81,15 +91,33 @@ unwritable directory is replaced with `%LOCALAPPDATA%\BookForge`, falling back
 to `%USERPROFILE%\BookForge`. On other platforms it uses
 `$XDG_DATA_HOME/bookforge`, falling back to `$HOME/.local/share/bookforge`.
 Uploads, job state, outputs, and dashboard-launched child processes then use
-that relocated working directory.
+that relocated working directory. When the relocation happens, the server
+prints `working directory was not writable; storing data in …` on its console.
+The CLI has no relocation logic: a job launched in the dashboard is visible to
+`bookforge status`, `resume`, and friends only when you run them from the same
+directory the server resolved — which is your current directory whenever it was
+writable. There is no global override that redirects all BookForge state to one
+shared location today, so treat relocation notices as the signal to start other
+commands from the printed directory.
 
-The dashboard is deliberately unauthenticated and may hold provider API keys,
-so it is only for the person at that machine. This is enforced at the network
-boundary: `--bind` rejects every non-loopback address and directs remote users
-to an SSH tunnel. Keys pasted into the dashboard remain in server memory only
-for the lifetime of the process. They are never written to disk, logged, or
-placed on a child process's command line; spawned runs receive them through
-their environment.
+The dashboard is authenticated by default. At startup the server generates a
+per-session token, prints a bootstrap URL of the form
+`http://127.0.0.1:8765/?token=…` on its console, and requires that token on
+every route outside that one bootstrap page: API and mutating requests must
+carry it in the `x-bookforge-csrf` header, which is also what mutation requests
+always used; wrong or missing tokens get a bare 401. The bootstrap URL is the
+console equivalent of handing the browser the session — never share or re-print
+it (and redact it in screenshots). `--no-auth` disables the token check as an
+escape hatch for environments where the console is unreachable (for example a
+container orchestrator that only forwards the port); with the token disabled,
+any local process can spend remembered provider keys, so prefer an SSH tunnel
+plus the default token flow instead.
+
+Because only loopback processes should hold session tokens anyway, `--bind`
+rejects every non-loopback address and directs remote users to an SSH tunnel.
+Keys pasted into the dashboard remain in server memory only for the lifetime
+of the process. They are never written to disk, logged, or placed on a child
+process's command line; spawned runs receive them through their environment.
 
 Mutating requests require the per-server CSRF token in the
 `x-bookforge-csrf` header, and Host-header middleware rejects requests that do
@@ -196,6 +224,33 @@ bookforge estimate book.epub \
   --model google/gemini-2.5-flash-lite
 ```
 
+The printed estimate prices the primary translation pass only. QA review,
+double-check, and repair re-runs are real extra passes during a run, so
+`--pass-costs` appends an approximate breakdown for them, each pass with its
+own explicit surcharge, and a total that adds every surcharge to the primary
+cost:
+
+```text
+Estimated cost: $0.0482
+Pass-cost estimates (planning heuristics; not metered):
+  assumptions: 1 qa pass(es) @1.25x in/0.20x out | 0 double-check pass(es) @1.50x in/0.15x out | repair share 0.05
+  qa review    ~130337 in / ~23982 out  (+$0.0250)
+  repair share ~5213 in / ~5996 out     (+$0.0024)
+Estimated total incl. passes: $0.0755
+```
+
+The `Estimated total incl. passes` line is primary + sum(surcharges) — a real
+total, never the surcharges alone. Each row reuses the same estimator and
+pricing catalog as the primary line: input tokens are the primary estimate
+scaled by the pass's input multiplier, and output tokens by its output
+multiplier, with one QA pass per run and one double-check pass when the
+profile's double-check mode is enabled (`--double-check-passes` overrides it;
+`--repair-share`, default `0.05`, models the fraction of segments assumed to
+need a batch repair re-run). Every figure is deterministic but approximate:
+cache discounts, failed-request billing, provider rounding, and per-segment
+variability are not modeled, so treat totals as planning heuristics rather
+than expected spend.
+
 Start the translation. Presets bundle a provider, model, endpoint, and suitable
 defaults; explicit provider flags remain available when you need them.
 
@@ -218,13 +273,14 @@ packing and avoids paying prompt overhead for extra requests. If a response
 body still fails to decode after a retry, BookForge bisects a multi-item batch;
 a single item remains the recovery floor.
 
-`--no-thinking` asks the selected endpoint to suppress reasoning. BookForge
-sends OpenRouter's `reasoning.enabled=false`, OpenAI Chat Completions'
-`reasoning_effort=none`, or DeepSeek's `thinking.type=disabled`, selected from
-the base URL or a known OpenRouter/DeepSeek preset credential identity. Other
-OpenAI-compatible endpoints receive no guessed suppression field and produce a
-warning. This includes the bundled local Ollama and llama.cpp endpoints until
-they expose a compatible, documented control.
+`--no-thinking` asks DeepSeek-family endpoints to disable thinking mode: BookForge
+adds the provider-appropriate suppression parameter — OpenRouter's
+`reasoning.enabled=false`, OpenAI Chat Completions' `reasoning_effort=none`, or
+DeepSeek's `thinking.type=disabled` — selected from the base URL or a known
+OpenRouter/DeepSeek preset credential identity. The flag is ignored elsewhere:
+other OpenAI-compatible endpoints receive no guessed suppression field and
+produce a warning. This includes the bundled local Ollama and llama.cpp
+endpoints until they expose a compatible, documented control.
 
 Provider-reported `completion_tokens` is the billable output aggregate and
 already includes any `completion_tokens_details.reasoning_tokens` breakdown.
@@ -280,6 +336,10 @@ bookforge watch <job-id>
 bookforge tail <job-id> --last 40
 ```
 
+`watch` follows a job's durable event log live in the terminal dashboard. Its
+`--refresh-ms` flag (default 150) sets the replay/refresh cadence and is clamped
+to the shared 20–5,000 ms range, exactly like `serve --refresh-ms`.
+
 After translation, review and validate the output:
 
 ```bash
@@ -308,14 +368,28 @@ completed checkpoints. `resume` first tries to wake a live worker and otherwise
 starts one replacement worker. Avoid `resume --force` unless a paused worker is
 known to be gone; forcing a second live worker can duplicate requests.
 
-`retry` changes segment state but does not itself run the provider. Mark the
-desired scope and then resume:
+`retry` marks the desired scope and then launches a supervised replacement
+worker that processes the marked segments:
 
 ```bash
 bookforge retry <job-id> --only failed
 bookforge retry <job-id> --only needs-review
-bookforge resume <job-id>
 ```
+
+The supervisor logs each spawn ("replacement worker starting (attempt N)"),
+surfaces every non-success child exit as a `replacement_worker_died` error
+event with the child's stderr tail, and backs off exponentially between
+respawns (1s, 2s, 4s, ... capped at 60s). After five consecutive dead workers
+it gives up honestly: a retry that never made any progress marks the job
+failed, otherwise the job is left exactly as the last worker left it — and the
+command exits non-zero with a clear message either way. When a live worker
+already holds the job (fresh runtime lease), or another process is mid-launch,
+`retry` only marks the segments and refuses to spawn a second worker; run
+`bookforge resume <job-id>` yourself in that case.
+
+`--ui` controls the supervision reporting (`--ui quiet` keeps stdout clean for
+machines; `--ui json` emits the versioned envelope). Omitted, the command
+behaves as before the flag existed.
 
 Completed compatible segments are loaded from checkpoints or cache rather than
 translated again. The input snapshot and run configuration recorded with the
@@ -345,6 +419,23 @@ existing checkpoints incompatible. Start a new job for those changes.
 
 The command records a revisioned override file under the job's run directory.
 `status` shows active overrides and the worker reports when it applies them.
+
+### Tri-state boolean flags
+
+Boolean *override* flags such as `--adaptive-concurrency`,
+`--adaptive-batch-sizing`, `--validate-output` (reconfigure), and
+`--adaptive-concurrency`, `--compact-prompts`, `--retry-failed-only`
+(translate) are tri-state: unset, explicitly on, or explicitly off. They
+accept both forms everywhere — a bare flag means `true`, and an explicit value
+works in either spelling:
+
+```bash
+bookforge translate book.epub --target Italian --adaptive-concurrency=false
+bookforge reconfigure <job-id> --validate-output        # same as =true
+```
+
+The bare form is equivalent to passing `true`; passing the flag with no value
+never leaves it "unset".
 
 ## Review, flag, and correct
 
@@ -626,6 +717,36 @@ Set `BOOKFORGE_EPUBCHECK` to an EPUBCheck executable, its directory, or an
 `epubcheck.jar` when automatic discovery is insufficient. Without EPUBCheck,
 the report records `unavailable`; BookForge's own checks still run.
 
+## UI modes (`--ui`)
+
+Translation-family commands (`translate`, `resume`, and the audiobook command)
+accept `--ui` to select how progress is presented:
+
+| Mode | Behavior |
+| --- | --- |
+| `auto` | Default. Live progress bars when stderr is attached to a terminal; silent otherwise. |
+| `progress` | Always render live multi-bar progress on the terminal, even without a TTY. |
+| `quiet` | No progress rendering at all — no bars, no event lines. Command-level errors still reach stderr through the normal error path, and run artifacts/checkpoints are unaffected. |
+| `json` | One JSON line per progress event on stdout, wrapped in the versioned envelope `{"v":2,"kind":"event"|"audiobook","payload":{…}}` (UI-23): translation runs carry the [events.md](events.md) objects in `payload`, audiobook runs keep their own payload with its inner `"event":"audiobook_*"` discriminator. See [events.md § Stdout JSON envelope](events.md#stdout-json-envelope---ui-json). Script against stdout only after verifying you use this mode: everything human-facing moves out of the way. |
+| `json-v1` | Deprecated compatibility alias. Reproduces the pre-envelope raw-line stdout dialects byte-for-byte: raw `ProgressEvent` objects for `translate`/`resume`, raw `{"event":…}` objects for `audiobook`. Use only to keep consumers pinned to v1; new automation should read the `v`/`kind` fields of `json`. |
+| `tui` | Full-screen terminal dashboard attached to the in-process run (requires the `tui` build feature). |
+
+JSON stdout purity: with `--ui json` (or its legacy alias), `translate` and
+`resume` emit *only* enveloped progress lines on stdout — banners, warnings,
+QA/double-check notices, and resume hints are suppressed there (they would
+otherwise pollute a machine-parsed stream) instead of being redirected.
+Human-readable diagnostics continue on stderr, so automation can safely parse
+stdout alone. The audiobook command uses the same purity discipline with
+`kind:"audiobook"` payloads (see [events.md](events.md)).
+
+Regardless of mode, passing `--progress-jsonl <path>` durably records the full
+event stream in every mode — including `quiet` and `progress` — using lazy file
+creation after the job id is known.
+
+The envelope applies **only** to stdout in these modes: the persisted
+`--progress-jsonl` file log keeps the plain un-enveloped `ProgressEvent`
+schema, and `tail <job-id> --json` passes those file-log lines through raw.
+
 For automation, select JSON progress and a durable event file:
 
 ```bash
@@ -637,8 +758,35 @@ bookforge translate book.epub \
   --progress-jsonl .bookforge/runs/example/events.jsonl
 ```
 
+Example stdout lines:
+
+```jsonl
+{"v":2,"kind":"event","payload":{"JobCreated":{"job_id":"job_abc","input_path":"book.epub","output_path":"book.it.epub","timestamp_ms":1710000000000}}}
+{"v":2,"kind":"event","payload":{"TranslationFinished":{"succeeded":42,"cached":0,"needs_review":0,"failed":0,"input_tokens":1234,"output_tokens":456,"elapsed_ms":120000,"timestamp_ms":1710000120000}}}
+```
+
 Use `tail <job-id> --json` for persisted event objects after launch. See
-[events.md](events.md) for the event schema and folding rules.
+[events.md](events.md) for the event schema, folding rules, and the full
+envelope contract including the stream coverage table.
+
+## Exit codes
+
+Automation can rely on a small, stable exit-code taxonomy (also summarized by
+`bookforge --help`):
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success, including an intentional stop (`pause`, `stop`, TUI quit after the run finished). |
+| 1 | Runtime failure: provider/config errors, IO errors, failed `doctor` checks, incomplete audiobook deliverables. |
+| 2 | Usage error from the argument parser. |
+| 3 | The job reached its end but segments remain failed and/or needs-review; artifacts exist but the output is not clean. Retry or resume to finish them. |
+| 130 | Interrupted by Ctrl+C (or an attached `--ui tui` quit). Progress is checkpointed; run `resume` to continue. |
+
+An interruption always reports 130 even if a provider error followed, and any
+returned runtime error reports 1. `doctor` participates directly: with failed
+checks it exits 1 and tells you so on stderr; scripts that relied on the old
+always-green behavior can pass `--no-fail` to keep a zero exit while the report
+itself still records every failure.
 
 ## Benchmark provider latency and throughput
 
@@ -664,8 +812,8 @@ however, read the `--provider` name: even though that parsed value defaults to
 `https://openrouter.ai/api/v1`, reads `OPENROUTER_API_KEY`, uses
 `openrouter/auto`, and applies a 120-second timeout.
 
-Samples currently run one at a time. `--concurrency` defaults to 1, but its
-value appears only in the printed header and does not make requests parallel.
+Samples run with bounded parallelism: `--concurrency` (default 1) sets how many
+requests are in flight at once; `1` reproduces the old sequential behavior.
 
 Each sample prints success or failure. Successful lines include latency, token
 counts, and approximate output tokens per second. The results block always
@@ -689,6 +837,12 @@ provider:
 bookforge audiobook book.epub --provider mock --dry-run
 bookforge audiobook book.epub --voice alloy --format mp3 --stitch
 ```
+
+Cost estimates come from the bundled schema-1
+`crates/bookforge-core/pricing/audio-providers.json`; set
+`BOOKFORGE_AUDIO_PRICING_PATH` to a JSON file with the same structure to
+override it for every estimate, dry run, and plan. Estimates are planning
+figures only.
 
 See [audiobooks.md](audiobooks.md) for providers, formats, resume hashing,
 pruning, ffmpeg stitching, and M4B assembly. The M4B embeds the EPUB 3

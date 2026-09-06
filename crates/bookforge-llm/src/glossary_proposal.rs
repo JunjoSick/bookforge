@@ -404,7 +404,7 @@ fn validate_proposals(
 }
 
 fn estimate_tokens(text: &str) -> usize {
-    text.chars().count().div_ceil(4).max(1)
+    bookforge_core::segment::estimate_tokens(text).max(1)
 }
 
 #[cfg(test)]

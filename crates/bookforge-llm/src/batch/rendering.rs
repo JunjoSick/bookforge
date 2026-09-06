@@ -1,6 +1,137 @@
 use super::*;
+use bookforge_core::finding::QaFindingKind;
 use serde::Deserialize;
 use std::collections::HashSet;
+
+/// Structured, block-attributed mirror of a batch item validation report:
+/// every violation becomes one [`EngineFinding`] pinned to the item's block.
+impl BatchItemValidationError {
+    fn engine_findings(
+        &self,
+        item: &TranslationBatchItem,
+        translation: &str,
+    ) -> Vec<EngineFinding> {
+        self.violations
+            .iter()
+            .map(|violation| engine_finding_for_violation(violation, item, translation))
+            .collect()
+    }
+}
+
+/// Map one deterministic validation violation to its canonical finding kind,
+/// always attributing it to the failed item's block. Source-copy hits get
+/// kind-aware severity: a block a professional translator would intentionally
+/// leave unchanged (titles, headings, short reference-like lines) is a
+/// warning, everything else stays an error.
+fn engine_finding_for_violation(
+    violation: &BatchItemValidationViolation,
+    item: &TranslationBatchItem,
+    translation: &str,
+) -> EngineFinding {
+    let message = violation.message.as_str();
+    let kind = if message.starts_with("translation is unchanged from the source-language prose")
+        || message.starts_with("translation retains ")
+    {
+        QaFindingKind::SourceCopyUnchanged
+    } else if message.starts_with("protected span missing") {
+        QaFindingKind::ProtectedSpanMissing
+    } else if message.starts_with("inline marker missing") {
+        QaFindingKind::InlineMarkerMissing
+    } else if message.starts_with("inline marker duplicated") {
+        QaFindingKind::InlineMarkerDuplicated
+    } else if message.starts_with("unknown inline marker") {
+        QaFindingKind::InlineMarkerUnknown
+    } else if message.contains("marker") {
+        QaFindingKind::MarkerStructure
+    } else if message.contains("Toki Pona") {
+        QaFindingKind::TargetLanguageGate
+    } else {
+        QaFindingKind::Other
+    };
+    let severity = if kind == QaFindingKind::SourceCopyUnchanged
+        && intentionally_unchanged_block(&item.kind, &item.source_text, translation)
+    {
+        QaFindingSeverity::Warning
+    } else {
+        violation.severity
+    };
+    EngineFinding::new(kind, message)
+        .with_block_id(item.block_id.0.clone())
+        .with_severity(severity)
+}
+
+/// Blocks at most this long (after whitespace/markers normalization) can be
+/// short reference-like lines: book titles, author bylines, imprint lines.
+const INTENTIONALLY_UNCHANGED_MAX_CHARS: usize = 64;
+
+/// A short block counts as "reference-like" when more than this share of its
+/// word tokens are capitalized or proper-noun-ish.
+const PROPER_NOUN_TOKEN_SHARE: f64 = 0.8;
+
+/// Whether a source-copy hit on this block is plausibly intentional.
+///
+/// Professional translators deliberately leave some blocks unchanged when a
+/// book crosses languages: the book title itself ("Cannibal Capitalism"),
+/// author bylines ("Nancy Fraser"), imprint lines, and short reference-like
+/// fragments. Flagging those as hard errors drowns the report in noise while
+/// genuine per-block attribution is lost. A block is considered intentionally
+/// unchanged when:
+///
+/// * its kind is `title` or `heading` (structural intent), or
+/// * both the source and the returned "translation" normalize to under
+///   [`INTENTIONALLY_UNCHANGED_MAX_CHARS`] chars AND more than
+///   [`PROPER_NOUN_TOKEN_SHARE`] of the source's word tokens are capitalized
+///   or proper-noun-ish (a title-case short line, e.g. an imprint byline).
+///
+/// Long prose that merely retained most of its source words never qualifies:
+/// in-text English quotations embedded in translated paragraphs live in long
+/// paragraph blocks and keep the error severity.
+pub(crate) fn intentionally_unchanged_block(
+    block_kind: &str,
+    source: &str,
+    translation: &str,
+) -> bool {
+    let kind = block_kind.trim().to_ascii_lowercase();
+    if kind == "title" || kind == "heading" {
+        return true;
+    }
+    let source_normalized = normalized_line(source);
+    if source_normalized.chars().count() >= INTENTIONALLY_UNCHANGED_MAX_CHARS {
+        return false;
+    }
+    // A short block whose "translation" ballooned into long prose is not an
+    // intentional unchanged case — something else went wrong.
+    if normalized_line(translation).chars().count() >= INTENTIONALLY_UNCHANGED_MAX_CHARS {
+        return false;
+    }
+    let tokens = source_normalized
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    !tokens.is_empty()
+        && (tokens
+            .iter()
+            .filter(|token| is_proper_noun_ish(token))
+            .count() as f64)
+            / (tokens.len() as f64)
+            > PROPER_NOUN_TOKEN_SHARE
+}
+
+/// Whitespace-collapsed text with marker tokens stripped, for length checks.
+fn normalized_line(text: &str) -> String {
+    bookforge_core::marker::strip_marker_tokens(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Capitalized words, initialisms, and digit-bearing reference tokens
+/// ("1987", "p. 28") all read as proper-noun-ish.
+fn is_proper_noun_ish(token: &str) -> bool {
+    token.chars().next().is_some_and(char::is_uppercase)
+        || token.chars().all(char::is_uppercase)
+        || token.chars().any(|ch| ch.is_ascii_digit())
+}
 
 pub fn batch_item_validation_error(
     item: &TranslationBatchItem,
@@ -457,6 +588,62 @@ pub(super) fn parse_batch_response_with_validation(
     }
 }
 
+/// Deserialize a batch response that was requested as bare JSON. Providers
+/// occasionally wrap the payload in markdown fences or append trailing
+/// commentary, which a strict parse turns into split/retry churn; when a
+/// direct parse fails, fall back to parsing just the balanced outermost
+/// JSON value. Only the transport wrapper is stripped — the item schema is
+/// never loosened.
+fn decode_batch_json<T: serde::de::DeserializeOwned>(content: &str) -> Result<T, String> {
+    match serde_json::from_str(content) {
+        Ok(parsed) => Ok(parsed),
+        Err(direct_error) => {
+            let recovered =
+                outermost_json_value(content).and_then(|span| serde_json::from_str(span).ok());
+            recovered.ok_or_else(|| format!("invalid batch JSON: {direct_error}"))
+        }
+    }
+}
+
+/// Return the balanced outermost JSON value in `content`, if any, ignoring
+/// prose and markdown fencing around it. Scanning starts at the first `{`
+/// or `[`, respects string literals so braces inside them are skipped, and
+/// tracks a stack of open delimiters so each closer must match the most
+/// recent unclosed opener.
+fn outermost_json_value(content: &str) -> Option<&str> {
+    let (open_index, _) = content
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '{' | '['))?;
+    let mut open_delimiters = Vec::<char>::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in content[open_index..].char_indices() {
+        let index = open_index + offset;
+        if in_string {
+            match ch {
+                '\\' => escaped = !escaped,
+                '"' if !escaped => in_string = false,
+                _ => escaped = false,
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            ch @ ('{' | '[') => {
+                open_delimiters.push(if ch == '{' { '}' } else { ']' });
+            }
+            '}' | ']' if open_delimiters.last() == Some(&ch) => {
+                open_delimiters.pop();
+                if open_delimiters.is_empty() {
+                    return Some(&content[open_index..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn parse_text_batch_response(
     batch: &TranslationBatch,
     content: &str,
@@ -465,8 +652,7 @@ fn parse_text_batch_response(
     section_titles: Option<&HashMap<String, String>>,
     target_language: Option<&str>,
 ) -> Result<BatchTranslationResult, String> {
-    let parsed: BatchTextResponse =
-        serde_json::from_str(content).map_err(|e| format!("invalid batch JSON: {e}"))?;
+    let parsed: BatchTextResponse = decode_batch_json(content)?;
 
     let requested_ids: HashMap<&str, &TranslationBatchItem> = batch
         .items
@@ -488,6 +674,10 @@ fn parse_text_batch_response(
                 input_cached_tokens: None,
                 output_tokens: None,
                 tokens_estimated: false,
+                findings: vec![EngineFinding::new(
+                    QaFindingKind::BatchBlockMismatch,
+                    "duplicate item ID in batch response",
+                )],
             });
             continue;
         }
@@ -516,6 +706,10 @@ fn parse_text_batch_response(
                 input_cached_tokens: None,
                 output_tokens: None,
                 tokens_estimated: false,
+                findings: vec![
+                    EngineFinding::new(QaFindingKind::Other, error)
+                        .with_block_id(request_item.block_id.0.clone()),
+                ],
             });
             continue;
         }
@@ -544,9 +738,9 @@ fn parse_text_batch_response(
             .as_ref()
             .is_some_and(BatchItemValidationError::has_errors)
         {
-            let error = validation_error
-                .expect("validation report checked as present")
-                .persistence_message();
+            let report = validation_error.expect("validation report checked as present");
+            let findings = report.engine_findings(request_item, &translation);
+            let error = report.persistence_message();
             failures.push(BatchItemFailure {
                 item_id: item.id.clone(),
                 segment_id: request_item.segment_id.clone(),
@@ -555,6 +749,7 @@ fn parse_text_batch_response(
                 input_cached_tokens: None,
                 output_tokens: None,
                 tokens_estimated: false,
+                findings,
             });
             continue;
         }
@@ -603,8 +798,7 @@ fn parse_run_batch_response(
     section_titles: Option<&HashMap<String, String>>,
     target_language: Option<&str>,
 ) -> Result<BatchTranslationResult, String> {
-    let parsed: BatchRunResponse =
-        serde_json::from_str(content).map_err(|e| format!("invalid batch JSON: {e}"))?;
+    let parsed: BatchRunResponse = decode_batch_json(content)?;
 
     let requested_ids: HashMap<&str, &TranslationBatchItem> = batch
         .items
@@ -626,6 +820,10 @@ fn parse_run_batch_response(
                 input_cached_tokens: None,
                 output_tokens: None,
                 tokens_estimated: false,
+                findings: vec![EngineFinding::new(
+                    QaFindingKind::BatchBlockMismatch,
+                    "duplicate item ID in batch response",
+                )],
             });
             continue;
         }
@@ -638,17 +836,22 @@ fn parse_run_batch_response(
 
         let expected_run_count = projected_item.text_runs.len();
         if item.runs.len() != expected_run_count {
+            let error = format!(
+                "run count mismatch: expected {expected_run_count}, got {}",
+                item.runs.len()
+            );
             failures.push(BatchItemFailure {
                 item_id: item.id.clone(),
                 segment_id: request_item.segment_id.clone(),
-                error: format!(
-                    "run count mismatch: expected {expected_run_count}, got {}",
-                    item.runs.len()
-                ),
+                error: error.clone(),
                 input_tokens: None,
                 input_cached_tokens: None,
                 output_tokens: None,
                 tokens_estimated: false,
+                findings: vec![
+                    EngineFinding::new(QaFindingKind::MarkerStructure, error)
+                        .with_block_id(request_item.block_id.0.clone()),
+                ],
             });
             continue;
         }
@@ -691,11 +894,15 @@ fn parse_run_batch_response(
             failures.push(BatchItemFailure {
                 item_id: item.id.clone(),
                 segment_id: request_item.segment_id.clone(),
-                error,
+                error: error.clone(),
                 input_tokens: None,
                 input_cached_tokens: None,
                 output_tokens: None,
                 tokens_estimated: false,
+                findings: vec![
+                    EngineFinding::new(QaFindingKind::MarkerStructure, error)
+                        .with_block_id(request_item.block_id.0.clone()),
+                ],
             });
             continue;
         }
@@ -725,6 +932,10 @@ fn parse_run_batch_response(
                 input_cached_tokens: None,
                 output_tokens: None,
                 tokens_estimated: false,
+                findings: vec![
+                    EngineFinding::new(QaFindingKind::Other, error)
+                        .with_block_id(request_item.block_id.0.clone()),
+                ],
             });
             continue;
         }
@@ -742,9 +953,9 @@ fn parse_run_batch_response(
             .as_ref()
             .is_some_and(BatchItemValidationError::has_errors)
         {
-            let error = validation_error
-                .expect("validation report checked as present")
-                .persistence_message();
+            let report = validation_error.expect("validation report checked as present");
+            let findings = report.engine_findings(request_item, &translation);
+            let error = report.persistence_message();
             failures.push(BatchItemFailure {
                 item_id: item.id.clone(),
                 segment_id: request_item.segment_id.clone(),
@@ -753,6 +964,7 @@ fn parse_run_batch_response(
                 input_cached_tokens: None,
                 output_tokens: None,
                 tokens_estimated: false,
+                findings,
             });
             continue;
         }
@@ -797,7 +1009,7 @@ fn incomplete_batch_response_error(requested: usize, missing: &[&str]) -> String
 }
 
 pub(super) fn batch_response_item_count(batch: &TranslationBatch, content: &str) -> Option<usize> {
-    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let parsed = decode_batch_json::<serde_json::Value>(content).ok()?;
     let items = parsed.get("items")?.as_array()?;
     let requested = batch
         .items
@@ -1026,6 +1238,132 @@ fn wrap_text_only_translation_with_source_markers(source: &str, translation: &st
         return translation;
     }
     format!("{prefix}{translation}")
+}
+
+#[cfg(test)]
+mod finding_attribution_tests {
+    use super::*;
+    use bookforge_core::finding::QaFindingKind;
+    use bookforge_core::{
+        ir::{BlockId, SectionId},
+        segment::SegmentId,
+    };
+
+    fn item_with_kind(kind: &str, source: &str) -> TranslationBatchItem {
+        TranslationBatchItem {
+            item_id: "item".to_string(),
+            segment_id: SegmentId("segment".to_string()),
+            section_id: SectionId("section".to_string()),
+            block_id: BlockId("block_title_001".to_string()),
+            ordinal: 0,
+            kind: kind.to_string(),
+            source_text: source.to_string(),
+            text_runs: Vec::new(),
+            protected_spans: Vec::new(),
+            required_markers: Vec::new(),
+            checksum: "checksum".to_string(),
+        }
+    }
+
+    const LONG_PROSE: &str = "This deliberately long English paragraph contains enough ordinary \
+        prose to exercise untranslated-copy detection in the production response validator. It \
+        repeats no special protected data and should be rejected when a provider returns it \
+        unchanged instead of translating the body into the requested target language.";
+
+    #[test]
+    fn title_block_copy_hit_is_a_warning_finding_with_block_id() {
+        let item = item_with_kind("title", "Cannibal Capitalism");
+        let validation =
+            batch_item_validation_error(&item, "Cannibal Capitalism", true, None, None)
+                .expect("an unchanged title must still fail validation as before");
+        assert!(
+            validation.has_errors(),
+            "error-string behavior is unchanged"
+        );
+
+        let findings = validation.engine_findings(&item, "Cannibal Capitalism");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, QaFindingKind::SourceCopyUnchanged);
+        // Kind-aware severity: an intentionally unchanged title is editorially
+        // expected, so the finding is a warning even though the legacy
+        // violation (and thus the item failure) stays an error.
+        assert_eq!(findings[0].severity, QaFindingSeverity::Warning);
+        assert_eq!(findings[0].block_id.as_deref(), Some("block_title_001"));
+    }
+
+    #[test]
+    fn prose_block_copy_hit_is_an_error_finding_with_block_id() {
+        let item = item_with_kind("paragraph", LONG_PROSE);
+        let validation = batch_item_validation_error(&item, LONG_PROSE, true, None, None)
+            .expect("unchanged prose must fail validation");
+
+        let findings = validation.engine_findings(&item, LONG_PROSE);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, QaFindingKind::SourceCopyUnchanged);
+        assert_eq!(findings[0].severity, QaFindingSeverity::Error);
+        assert_eq!(findings[0].block_id.as_deref(), Some("block_title_001"));
+    }
+
+    #[test]
+    fn short_proper_noun_line_is_intentionally_unchanged_without_a_title_kind() {
+        // An author byline or imprint line: short and title-case.
+        assert!(intentionally_unchanged_block(
+            "paragraph",
+            "Nancy Fraser",
+            "Nancy Fraser"
+        ));
+        assert!(intentionally_unchanged_block(
+            "paragraph",
+            "Verso Futures",
+            "Verso Futures"
+        ));
+        // Structural kinds always qualify.
+        assert!(intentionally_unchanged_block(
+            "heading", "anything", "anything"
+        ));
+        assert!(intentionally_unchanged_block(
+            "title", "anything", "anything"
+        ));
+        // Long prose never qualifies, even when copied.
+        assert!(!intentionally_unchanged_block(
+            "paragraph",
+            LONG_PROSE,
+            LONG_PROSE
+        ));
+        // Short lowercase prose is not reference-like: a genuine untranslated
+        // sentence must keep its error severity.
+        assert!(!intentionally_unchanged_block(
+            "paragraph",
+            "the quick brown fox jumps over the lazy dog",
+            "the quick brown fox jumps over the lazy dog"
+        ));
+        // A short block whose "translation" ballooned into long prose is not
+        // an intentional unchanged case.
+        assert!(!intentionally_unchanged_block(
+            "paragraph",
+            "Nancy Fraser",
+            LONG_PROSE
+        ));
+    }
+
+    #[test]
+    fn marker_and_protected_span_findings_are_block_attributed() {
+        let mut item = item_with_kind("paragraph", "Visit https://example.com today");
+        item.protected_spans = vec![ProtectedSpan {
+            kind: ProtectedSpanKind::Url,
+            text: "https://example.com".to_string(),
+        }];
+        let validation =
+            batch_item_validation_error(&item, "Visita il sito oggi", true, None, None)
+                .expect("a dropped protected URL must fail validation");
+
+        let findings = validation.engine_findings(&item, "Visita il sito oggi");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, QaFindingKind::ProtectedSpanMissing);
+        assert_eq!(findings[0].severity, QaFindingSeverity::Error);
+        assert_eq!(findings[0].block_id.as_deref(), Some("block_title_001"));
+        assert!(findings[0].message.contains("protected span missing"));
+    }
 }
 
 #[cfg(test)]
@@ -1381,5 +1719,106 @@ mod text_only_marker_tests {
 
         assert_eq!(wrapped, "<m1></m1>toki pona");
         assert_eq!(bookforge_core::marker::marker_ids_in_text(&wrapped), ["m1"]);
+    }
+}
+
+#[cfg(test)]
+mod lenient_response_decoding_tests {
+    use super::*;
+    use bookforge_core::{
+        ir::{BlockId, SectionId},
+        segment::SegmentId,
+    };
+
+    fn plain_batch() -> TranslationBatch {
+        let item = TranslationBatchItem {
+            item_id: "item".to_string(),
+            segment_id: SegmentId("segment".to_string()),
+            section_id: SectionId("section".to_string()),
+            block_id: BlockId("block".to_string()),
+            ordinal: 0,
+            kind: "paragraph".to_string(),
+            source_text: "Hello".to_string(),
+            text_runs: Vec::new(),
+            protected_spans: Vec::new(),
+            required_markers: Vec::new(),
+            checksum: "checksum".to_string(),
+        };
+        TranslationBatch {
+            id: "batch".to_string(),
+            ordinal: 0,
+            mode: BatchMode::Plain,
+            kind: BatchKind::Translation,
+            items: vec![item],
+            token_estimate: 10,
+            section_id: SectionId("section".to_string()),
+        }
+    }
+
+    const VALID_ITEMS: &str = r#"{"items":[{"id":"item","translation":"Ciao"}]}"#;
+
+    #[test]
+    fn bare_json_still_parses_directly() {
+        let result = parse_batch_response(&plain_batch(), VALID_ITEMS).expect("bare JSON parses");
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "Ciao");
+    }
+
+    #[test]
+    fn markdown_fenced_json_is_accepted() {
+        let fenced = format!("```json\n{VALID_ITEMS}\n```");
+        let result = parse_batch_response(&plain_batch(), &fenced).expect("fenced JSON parses");
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "Ciao");
+    }
+
+    #[test]
+    fn trailing_prose_after_valid_json_is_accepted() {
+        let wrapped = format!("{VALID_ITEMS}\n\nEcco la traduzione richiesta!");
+        let result = parse_batch_response(&plain_batch(), &wrapped)
+            .expect("trailing prose must not fail the parse");
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "Ciao");
+    }
+
+    #[test]
+    fn prose_before_valid_json_is_accepted() {
+        let wrapped = format!("Certamente! Ecco il JSON richiesto:\n{VALID_ITEMS}");
+        let result = parse_batch_response(&plain_batch(), &wrapped)
+            .expect("leading prose must not fail the parse");
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "Ciao");
+    }
+
+    #[test]
+    fn garbage_response_is_rejected() {
+        let err = parse_batch_response(&plain_batch(), "this is not json at all").unwrap_err();
+        assert!(
+            err.starts_with("invalid batch JSON: "),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn braces_inside_strings_do_not_confuse_extraction() {
+        // The translation itself contains braces and the payload is fenced:
+        // string-aware scanning must recover the outermost value intact.
+        let response = concat!(
+            "```json\n",
+            r#"{"items":[{"id":"item","translation":"{braced} }"}]}"#,
+            "\n```\nFatto."
+        );
+        let result = parse_batch_response(&plain_batch(), response).expect("nested braces parse");
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations[0].text, "{braced} }");
+    }
+
+    #[test]
+    fn unterminated_json_is_rejected() {
+        let err = parse_batch_response(&plain_batch(), "{\"items\":[{\"id\":\"item\"").unwrap_err();
+        assert!(
+            err.starts_with("invalid batch JSON: "),
+            "unexpected error: {err}"
+        );
     }
 }

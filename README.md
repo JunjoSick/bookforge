@@ -18,8 +18,17 @@ of translation quality.
 
 ## Status
 
-BookForge v2.6.1 is usable for EPUB translation, PDF-to-EPUB ingestion, and
-local browser-based translation runs:
+> **Version note (2026-08-31):** the **latest published release is v2.6.1**. The
+> v3.0.0 remediation campaign is a **release candidate** on branch
+> `remediation/audit-2026-08` (commit `aa90d94`) and is **not published**: there
+> is no v3.0.0 tag/release and no v3 binaries to install. Some features in this
+> README — dashboard token auth, the exit-code taxonomy, the `--ui json`
+> versioned envelope, `--pass-costs`, and the audit remediations — are **not yet
+> in any release**; install v2.6.1 for current published behavior, or build from
+> source to try the candidate. Tracking: `docs/AUDIT-2026-08-31.md`.
+
+BookForge v2.6.1 (latest published release) is usable for EPUB translation,
+PDF-to-EPUB ingestion, and local browser-based translation runs:
 
 - EPUB inspect, parse, segment, and rebuild
 - EPUBCheck-backed standalone and post-translation validation
@@ -98,6 +107,11 @@ local browser-based translation runs:
 
 ### For non-technical users
 
+The installers below install the **latest published release, currently
+BookForge v2.6.1**. There is no published v3.0.0 yet; until a v3.0.0 release
+exists, these links never install v3 binaries — they resolve to v2.6.1. To try
+the v3.0.0 candidate, build from source (`cargo build --release` below).
+
 BookForge v2 ships prebuilt installers for macOS, Linux, and Windows. You do
 not need Rust, Cargo, Git, Python, Node, or a source-code checkout.
 
@@ -142,10 +156,13 @@ bookforge
 ```
 
 Running `bookforge` with no extra words opens the local web app. If the browser
-does not open automatically, go to:
+does not open automatically, open the link the terminal prints — in the
+unreleased v3.0.0 candidate the link contains your one-time session token (the
+dashboard authenticates every request by default; `--no-auth` opts out). The
+published v2.6.1 release does **not** have dashboard token auth yet:
 
 ```txt
-http://127.0.0.1:8765
+http://127.0.0.1:8765/?token=…
 ```
 
 The dashboard is intentionally local-only. It binds to `127.0.0.1`, so it is
@@ -171,8 +188,10 @@ open a new one, and try `bookforge` again.
 10. If segments fail or need review, use **Retry failed / needs-review**.
 
 Outputs, uploads, checkpoints, review data, and validation reports are stored
-locally under `.bookforge/` in the folder where you started BookForge. Do not
-share `.bookforge/` if the book or translation is private.
+locally under `.bookforge/` in the folder where you started BookForge (if that
+folder is not writable, the dashboard relocates its data to a per-user
+directory and prints the new location). Do not share `.bookforge/` if the book
+or translation is private.
 
 To stop the web app, return to the terminal running `bookforge` and press
 `Ctrl+C`. The translation data stays on disk and can be opened again later.
@@ -290,7 +309,8 @@ cargo run -p bookforge-cli -- estimate book.epub \
   --model deepseek/deepseek-v4-flash
 ```
 
-Pricing is loaded from the bundled `pricing/providers.json`. Override it with
+Pricing is loaded from the bundled
+`crates/bookforge-core/pricing/providers.json`. Override it with
 `--pricing custom.json` or `BOOKFORGE_PRICING_PATH`.
 
 Translate with OpenRouter:
@@ -508,9 +528,12 @@ chapter markers and title/artist metadata. `--no-book-file` opts out,
 only whole-book assembly; per-chapter files remain unnormalized. Point
 `--base-url` at a local server such as kokoro-fastapi to synthesize offline.
 
-Plans and dry runs use `crates/bookforge-cli/pricing/audio-providers.json` for
-cost estimates, and ElevenLabs performs a non-fatal quota preflight. The
-estimates are planning figures only; provider billing is authoritative. The
+Plans and dry runs use `crates/bookforge-core/pricing/audio-providers.json` for
+cost estimates; point `BOOKFORGE_AUDIO_PRICING_PATH` at a same-structure JSON
+file to override it. ElevenLabs performs a non-fatal quota preflight, and a
+transient failure while auto-selecting the ElevenLabs model degrades
+deterministically to the cheapest suitable tier instead of an expensive one.
+The estimates are planning figures only; provider billing is authoritative. The
 browser dashboard adds ElevenLabs Auto model selection and a voice picker, a
 pre-launch cost/quota estimate, per-chapter progress, in-page playback, and
 Advanced controls for chapter pause, flat output, loudness, seed, and language.
@@ -567,6 +590,19 @@ cargo run -p bookforge-cli -- translate book.epub \
 
 Review artifacts contain the full source and translated text of the book. They are written locally under `.bookforge/runs/<job-id>/review/`; treat them as private user data.
 
+### Exit codes
+
+Scripts can rely on a small taxonomy (full table in
+[docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md)): `0` success or intentional
+stop, `1` runtime failure, `2` usage error, `3` the job finished but segments
+remain failed/needs-review, and `130` interrupted by Ctrl+C with progress saved
+for `resume`.
+
+> Version note: this exit-code taxonomy landed with the **unreleased v3.0.0
+> candidate** (audit UI-21). The published v2.6.1 release does not guarantee
+> these codes; the previous undefined/surprising behavior (Ctrl+C → 0, errors →
+> 1, `doctor` failures → 0) applies until v3 ships.
+
 Known limitations: terminal commands read provider API keys from environment
 variables, while the browser dashboard can also accept a session-only pasted
 key. PDF ingestion currently prioritizes text reconstruction; complex figures
@@ -614,7 +650,7 @@ export OPENROUTER_API_KEY=...
 ```bash
 cargo fmt --all --check
 cargo test --workspace
-cargo clippy --workspace --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for what's expected in issues
@@ -633,7 +669,6 @@ crates/bookforge-audio  Audiobook TTS: chunking, providers, stitch
 crates/bookforge-store  SQLite checkpoint store
 crates/bookforge-cli    CLI commands and reports
 docs/                   Architecture notes
-pricing/                bundled provider/model pricing
 tests/corpus/            pinned Standard Ebooks corpus manifest
 ```
 

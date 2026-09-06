@@ -8,6 +8,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bookforge_core::ir::Book;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::lock::acquire_out_dir_lock;
 use crate::provider::{AudioFormat, SpeechRequest, TextNormalization, TtsProvider};
 use crate::text::{ChunkKind, chapters_from_book_with_options, chunk_blocks};
 
@@ -207,6 +209,9 @@ pub enum BuildError {
     #[error("invalid audiobook options: {0}")]
     InvalidOptions(String),
 
+    #[error("output directory is locked by another BookForge audiobook run: {0}")]
+    OutputLocked(String),
+
     #[error("provider returned {actual} audio for a {requested} request")]
     FormatMismatch {
         requested: &'static str,
@@ -221,6 +226,15 @@ pub enum BuildError {
 }
 
 type Result<T> = std::result::Result<T, BuildError>;
+
+impl From<crate::lock::LockError> for BuildError {
+    fn from(error: crate::lock::LockError) -> Self {
+        match error {
+            crate::lock::LockError::Held { detail } => BuildError::OutputLocked(detail.to_string()),
+            crate::lock::LockError::Io { path, source } => BuildError::Io { path, source },
+        }
+    }
+}
 
 /// Progress notification emitted after each chunk is resolved.
 #[derive(Debug, Clone)]
@@ -396,11 +410,144 @@ where
         return Err(BuildError::NoText);
     }
 
-    std::fs::create_dir_all(&options.out_dir).map_err(|source| BuildError::Io {
-        path: options.out_dir.clone(),
+    let lock = acquire_audiobook_output_lock(&options.out_dir)?;
+    build_audiobook_locked(book, provider, options, cancel, on_progress, plan, &lock).await
+}
+
+/// Ownership of one audiobook output directory.
+///
+/// Keep this guard alive while any operation may read or mutate the cache,
+/// manifest, stitched artifacts, or prune candidates. The CLI uses it to
+/// extend the builder's lock through post-processing; dashboard prune uses it
+/// to serialize its scan-and-delete transaction with child runs.
+#[derive(Debug)]
+pub struct AudiobookOutputLock {
+    out_dir: PathBuf,
+    inner: crate::lock::OutDirLock,
+}
+
+impl AudiobookOutputLock {
+    /// Read the owner record currently written by the holder of the kernel
+    /// lock. Terminal writers use this to confirm the child they are closing
+    /// out still owns the operation before touching durable state.
+    pub fn record(&self) -> Result<crate::lock::OwnerRecord> {
+        self.inner.record().map_err(|source| BuildError::Io {
+            path: self.inner.path.clone(),
+            source,
+        })
+    }
+
+    /// Pre-address this held lock to the child that will adopt it: rewrite
+    /// the owner record with a fresh handoff `nonce` while keeping the pid.
+    /// The child waits on the kernel lock, acquires it after this process
+    /// releases, and adopts only when the record still carries `nonce`.
+    /// Callers must abort the spawn if this fails so the child never adopts a
+    /// record that was not written.
+    pub fn handoff_nonce(&self, nonce: &str) -> Result<()> {
+        self.inner
+            .write_record(std::process::id(), nonce)
+            .map_err(|source| BuildError::Io {
+                path: self.inner.path.clone(),
+                source,
+            })
+    }
+}
+
+/// Generate a fresh nonce for an [`AudiobookOutputLock::handoff_nonce`]
+/// handoff. The dashboard passes the same value to the child it is about to
+/// spawn (via the child environment) so the child can adopt the pre-addressed
+/// lock instead of racing the parent's release.
+pub fn new_lock_handoff_nonce() -> String {
+    crate::lock::generate_nonce()
+}
+
+/// Acquire the cross-process ownership lock for an audiobook output directory.
+pub fn acquire_audiobook_output_lock(out_dir: &Path) -> Result<AudiobookOutputLock> {
+    std::fs::create_dir_all(out_dir).map_err(|source| BuildError::Io {
+        path: out_dir.to_path_buf(),
         source,
     })?;
+    let inner = acquire_out_dir_lock(out_dir)?;
+    Ok(AudiobookOutputLock {
+        out_dir: out_dir.to_path_buf(),
+        inner,
+    })
+}
 
+/// Acquire a lock that a dashboard parent handed off to this process: wait on
+/// the kernel lock, then adopt only if the record still carries
+/// `handoff_nonce`. A record with any other nonce is refused.
+pub fn acquire_audiobook_output_lock_with_handoff(
+    out_dir: &Path,
+    handoff_nonce: &str,
+) -> Result<AudiobookOutputLock> {
+    std::fs::create_dir_all(out_dir).map_err(|source| BuildError::Io {
+        path: out_dir.to_path_buf(),
+        source,
+    })?;
+    let inner = crate::lock::acquire_out_dir_lock_with_handoff(out_dir, handoff_nonce)?;
+    Ok(AudiobookOutputLock {
+        out_dir: out_dir.to_path_buf(),
+        inner,
+    })
+}
+
+/// Take the kernel lock without claiming the owner record, for terminal
+/// writers (the dashboard watcher and restart cancellation) that must first
+/// inspect who currently owns the lock before writing durable state. Fails
+/// with [`BuildError::OutputLocked`] while another live run holds it.
+pub fn acquire_audiobook_output_lock_peek(out_dir: &Path) -> Result<AudiobookOutputLock> {
+    std::fs::create_dir_all(out_dir).map_err(|source| BuildError::Io {
+        path: out_dir.to_path_buf(),
+        source,
+    })?;
+    let inner = crate::lock::acquire_out_dir_lock_peek(out_dir)?;
+    Ok(AudiobookOutputLock {
+        out_dir: out_dir.to_path_buf(),
+        inner,
+    })
+}
+
+/// Build while the caller retains ownership of `lock` for later post-process
+/// and prune decisions. The lock must belong to `options.out_dir`.
+pub async fn build_audiobook_with_lock<P, F>(
+    book: &Book,
+    provider: Arc<P>,
+    options: &AudiobookOptions,
+    cancel: CancellationToken,
+    on_progress: F,
+    lock: &AudiobookOutputLock,
+) -> Result<AudiobookReport>
+where
+    P: TtsProvider + 'static,
+    F: Fn(Progress) + Send + Sync + 'static,
+{
+    validate_options(options)?;
+    let plan = build_plan(book, options);
+    if plan.is_empty() {
+        return Err(BuildError::NoText);
+    }
+    if lock.out_dir != options.out_dir {
+        return Err(BuildError::InvalidOptions(
+            "audiobook output lock belongs to a different directory".to_string(),
+        ));
+    }
+    build_audiobook_locked(book, provider, options, cancel, on_progress, plan, lock).await
+}
+
+async fn build_audiobook_locked<P, F>(
+    book: &Book,
+    provider: Arc<P>,
+    options: &AudiobookOptions,
+    cancel: CancellationToken,
+    on_progress: F,
+    plan: Vec<PlannedChunk>,
+    _lock: &AudiobookOutputLock,
+) -> Result<AudiobookReport>
+where
+    P: TtsProvider + 'static,
+    F: Fn(Progress) + Send + Sync + 'static,
+{
     let total = plan.len();
     let semaphore = Arc::new(Semaphore::new(options.concurrency.max(1)));
     let on_progress = Arc::new(on_progress);
@@ -490,6 +637,9 @@ where
 
     let mut set = tokio::task::JoinSet::new();
     for (record_index, chunk) in plan.into_iter().enumerate() {
+        // AUDIO-15: share one Arc per planned chunk across the queued future
+        // instead of moving a fresh copy of the whole-book text into each.
+        let chunk = Arc::new(chunk);
         let provider = Arc::clone(&provider);
         let semaphore = Arc::clone(&semaphore);
         let cancel = cancel.clone();
@@ -586,7 +736,7 @@ where
                 chapter_index: chunk.chapter_index,
                 chapter_title: chunk.chapter_title.clone(),
                 part: chunk.part,
-                path: chunk.path,
+                path: chunk.path.clone(),
                 report_progress,
                 result,
             }
@@ -732,11 +882,27 @@ where
     })
 }
 
+/// Load cached audio for a planned chunk if it is still trustworthy.
+///
+/// Verification order (AUDIO-16): the manifest-recorded byte size rejects a
+/// replaced or truncated file without reading its contents; only files that
+/// pass the size gate are read fully, magic-byte validated, and then hashed
+/// against `audio_sha256`. The hash remains the authority — size+mtime style
+/// fast paths alone cannot detect same-size corruption — so the fast path is
+/// documented here as *rejection* filtering, never as proof of validity.
+/// Files with no prior record (or an older manifest without sizes/hashes)
+/// always take the full-read path.
 fn read_valid_cached_audio(
     path: &Path,
     format: AudioFormat,
     expected: Option<&ChunkRecord>,
 ) -> Option<Vec<u8>> {
+    if let Some(expected_bytes) = expected.and_then(|record| record.bytes) {
+        let recorded_len = std::fs::metadata(path).ok()?.len();
+        if recorded_len != expected_bytes {
+            return None;
+        }
+    }
     let bytes = std::fs::read(path).ok()?;
     crate::provider::validate_audio_payload(format, None, &bytes).ok()?;
     if let Some(expected_bytes) = expected.and_then(|record| record.bytes)
@@ -936,36 +1102,44 @@ fn synthesis_hash_with_version(
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Write bytes by writing a temp sibling then renaming, so an interrupted
-/// write never leaves a half-file that a resume would mistake for done.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("part.tmp");
-    std::fs::write(&tmp, bytes).map_err(|source| BuildError::Io {
-        path: tmp.clone(),
-        source,
-    })?;
-    if !path.exists() {
-        return std::fs::rename(&tmp, path).map_err(|source| BuildError::Io {
-            path: path.to_path_buf(),
-            source,
-        });
-    }
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    // Windows rename does not replace an existing file. Keep the previous
-    // complete file as a backup until the replacement is safely in place.
-    let backup = path.with_extension("replace.bak");
-    let _ = std::fs::remove_file(&backup);
-    std::fs::rename(path, &backup).map_err(|source| BuildError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(backup);
-            Ok(())
-        }
+/// Per-process random component for temp names, so two writers that somehow
+/// share a pid namespace (containers) still do not collide.
+fn temp_random_component() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(std::process::id() as u64);
+    hasher.finish()
+}
+
+/// Write bytes by writing a uniquely named temp sibling then renaming it
+/// into place, so an interrupted write never leaves a half-file that a
+/// resume would mistake for done and never clobbers another writer's temp.
+///
+/// [`crate::atomic::replace_file`] preserves that atomic replacement contract
+/// on Windows as well as Unix. The unique suffix
+/// (`pid` + process-lifetime counter + per-process random) makes concurrent
+/// writers to one directory impossible only because the out_dir lock
+/// serializes them — the suffix is defense in depth for stale debris from
+/// any pre-lock era or foreign writer, and `--prune` sweeps recognize the
+/// `.part.tmp` shape as debris.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let random = temp_random_component();
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = file_name_of(path);
+    let tmp = path.with_file_name(format!(
+        "{file_name}.{}-{sequence}-{random:016x}.part.tmp",
+        std::process::id()
+    ));
+    if let Err(source) = std::fs::write(&tmp, bytes) {
+        return Err(BuildError::Io { path: tmp, source });
+    }
+    match crate::atomic::replace_file(&tmp, path) {
+        Ok(()) => Ok(()),
         Err(source) => {
-            let _ = std::fs::rename(&backup, path);
+            let _ = std::fs::remove_file(&tmp);
             Err(BuildError::Io {
                 path: path.to_path_buf(),
                 source,
@@ -1396,6 +1570,338 @@ mod tests {
             validate_options(&options),
             Err(BuildError::InvalidOptions(_))
         ));
+    }
+
+    /// Provider that parks the first synthesis until released, so the test
+    /// can hold a mid-run build open deterministically.
+    struct GatedProvider {
+        started: Arc<tokio::sync::Notify>,
+        gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl TtsProvider for GatedProvider {
+        async fn synthesize(
+            &self,
+            request: SpeechRequest,
+        ) -> std::result::Result<AudioClip, TtsError> {
+            self.started.notify_one();
+            while !self.gate.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            MockTtsProvider::new().synthesize(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_build_of_same_out_dir_is_refused_naming_the_holder() {
+        use crate::lock::{LOCK_FILE_NAME, LockError, acquire_out_dir_lock};
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+        let options = AudiobookOptions {
+            out_dir: out_dir.clone(),
+            max_chars: 40,
+            concurrency: 1,
+            ..AudiobookOptions::default()
+        };
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let book = book_with_sections();
+            let options = options.clone();
+            let gate = Arc::clone(&gate);
+            let started = Arc::clone(&started);
+            tokio::spawn(async move {
+                build_audiobook(
+                    &book,
+                    Arc::new(GatedProvider { started, gate }),
+                    &options,
+                    CancellationToken::new(),
+                    |_| {},
+                )
+                .await
+            })
+        };
+        // Wait until the run has acquired the lock and begun synthesizing.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if out_dir.join(LOCK_FILE_NAME).exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first run should create the lock promptly");
+
+        let contention = match acquire_out_dir_lock(&out_dir) {
+            Err(LockError::Held { detail }) => detail.to_string(),
+            _ => panic!("contended acquisition must report the holder"),
+        };
+        assert!(contention.contains("pid"), "{contention}");
+        assert!(contention.contains("another audiobook run"), "{contention}");
+
+        gate.store(true, Ordering::SeqCst);
+        task.await
+            .expect("build task")
+            .expect("first build succeeds");
+
+        // Release must restore availability for the next run.
+        let reacquired = acquire_out_dir_lock(&out_dir).expect("lock re-acquirable");
+        drop(reacquired);
+    }
+
+    #[test]
+    fn kernel_lock_fails_closed_for_a_held_out_dir_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+        let first = acquire_audiobook_output_lock(&out_dir).expect("first holder acquires");
+
+        let contended = acquire_audiobook_output_lock(&out_dir)
+            .expect_err("a second holder must be refused while the lock is held");
+        assert!(
+            matches!(contended, BuildError::OutputLocked(_)),
+            "expected OutputLocked, got {contended:?}"
+        );
+
+        drop(first);
+        let reacquired = acquire_audiobook_output_lock(&out_dir).expect("reacquirable after drop");
+        drop(reacquired);
+    }
+
+    /// A stale owner record never blocks a fresh acquisition: the kernel
+    /// released the lock when the previous holder exited, so the record is
+    /// informational only and is simply overwritten.
+    #[test]
+    fn stale_record_from_a_dead_owner_does_not_block_acquisition() {
+        use crate::lock::{LOCK_FILE_NAME, read_lock_record};
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        std::fs::create_dir_all(out_dir).unwrap();
+        let lock_file = out_dir.join(LOCK_FILE_NAME);
+        std::fs::write(&lock_file, "pid=4194304\nstarted_at_ms=1\n").unwrap();
+
+        let guard = acquire_audiobook_output_lock(out_dir).expect("kernel lock is free");
+        let record = read_lock_record(&lock_file).unwrap();
+        assert_eq!(record.pid, std::process::id(), "record is overwritten");
+        drop(guard);
+        assert!(
+            lock_file.exists(),
+            "the lock file persists so the kernel lock is never split across inodes"
+        );
+    }
+
+    /// Owner-record reads and writes used for claim/adoption round-trip through
+    /// the held handle. On Windows the ownership byte is deliberately beyond
+    /// EOF, so diagnostic readers can still inspect the record through another
+    /// handle without weakening exclusive ownership.
+    #[test]
+    fn held_handle_round_trips_the_owner_record() {
+        use crate::lock::{LOCK_FILE_NAME, read_lock_record};
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        let guard = acquire_audiobook_output_lock(out_dir).expect("acquire");
+
+        // Write through the held handle (the handoff rewrite and the adopting
+        // child both do this), then read it back through the same held handle.
+        guard
+            .handoff_nonce("held-handle-nonce")
+            .expect("record write");
+        let via_held = guard.record().expect("record read");
+        assert_eq!(via_held.pid, std::process::id());
+        assert_eq!(via_held.nonce.as_deref(), Some("held-handle-nonce"));
+
+        // Diagnostics use a second handle while ownership is held. This is the
+        // Windows regression: the lock byte must not overlap the record bytes.
+        let diagnostic = read_lock_record(&out_dir.join(LOCK_FILE_NAME))
+            .expect("record range remains readable while the lock is held");
+        assert_eq!(diagnostic, via_held);
+
+        // The record remains durable after release for the addressed child.
+        drop(guard);
+        let on_disk = read_lock_record(&out_dir.join(LOCK_FILE_NAME)).unwrap();
+        assert_eq!(on_disk, via_held, "record persists for the child");
+    }
+
+    /// A handoff written for child A must never let child B adopt the lock:
+    /// once the parent releases, an unrelated waiter acquires the kernel
+    /// lock, sees it is not the addressed child, and fails closed without
+    /// overwriting the record.
+    #[test]
+    fn handoff_nonce_is_adopted_only_by_the_child_it_was_addressed_to() {
+        use crate::lock::{LOCK_FILE_NAME, read_lock_record};
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        std::fs::create_dir_all(out_dir).unwrap();
+        let lock_file = out_dir.join(LOCK_FILE_NAME);
+
+        // Dashboard parent acquires, pre-addresses the child, and releases.
+        let parent = acquire_audiobook_output_lock(out_dir).expect("parent acquires");
+        let handoff = "handoff-nonce-for-the-real-child";
+        parent.handoff_nonce(handoff).expect("parent pre-addresses");
+        drop(parent);
+
+        // A child holding a different nonce must be refused and must leave the
+        // record untouched.
+        let error = acquire_audiobook_output_lock_with_handoff(out_dir, "wrong-nonce")
+            .expect_err("a lock addressed elsewhere is never adopted");
+        assert!(
+            matches!(error, BuildError::OutputLocked(_)),
+            "expected OutputLocked, got {error:?}"
+        );
+        assert_eq!(
+            read_lock_record(&lock_file).unwrap().nonce.as_deref(),
+            Some(handoff),
+            "the record must survive the failed adoption"
+        );
+
+        // The addressed child adopts the lock and owns the record.
+        let child = acquire_audiobook_output_lock_with_handoff(out_dir, handoff)
+            .expect("addressed child adopts the lock");
+        let record = read_lock_record(&lock_file).unwrap();
+        assert_eq!(record.pid, std::process::id(), "child now owns the record");
+        assert_eq!(record.nonce.as_deref(), Some(handoff));
+        drop(child);
+    }
+
+    /// The kernel-serialized handoff: the parent holds the kernel lock while
+    /// the child's acquire waits; the child must not race or fail, and it
+    /// adopts only after the parent releases.
+    #[test]
+    fn handoff_child_waits_on_the_kernel_lock_and_adopts_after_parent_release() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        let handoff = "kernel-gated-handoff";
+
+        // Parent holds the kernel lock across the "spawn".
+        let parent = acquire_audiobook_output_lock(out_dir).expect("parent acquires");
+        parent.handoff_nonce(handoff).expect("parent pre-addresses");
+
+        // Child starts its acquire while the parent still holds the kernel
+        // lock; it must block, not fail.
+        let (child_lock_tx, child_lock_rx) = mpsc::channel::<AudiobookOutputLock>();
+        let out_dir_child = out_dir.to_path_buf();
+        let handoff_child = handoff.to_string();
+        let child_thread = std::thread::spawn(move || {
+            let child = acquire_audiobook_output_lock_with_handoff(&out_dir_child, &handoff_child)
+                .expect("child adopts after the parent releases");
+            let _ = child_lock_tx.send(child);
+        });
+
+        // While the parent still holds the kernel lock, the child must still
+        // be waiting — no completion, no failure.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            child_lock_rx.try_recv().is_err(),
+            "child must still be waiting on the kernel lock while the parent holds it"
+        );
+
+        // Release the parent; the child then acquires and adopts promptly.
+        drop(parent);
+        let child = child_lock_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("child must adopt promptly once the parent releases");
+        child_thread.join().expect("child thread joins");
+        assert_eq!(child.record().unwrap().nonce.as_deref(), Some(handoff));
+        drop(child);
+    }
+
+    /// The child's handoff acquire must fail closed when it is not the
+    /// addressed owner and the parent has already released.
+    #[test]
+    fn handoff_child_is_refused_when_the_record_names_a_different_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        let parent = acquire_audiobook_output_lock(out_dir).expect("parent acquires");
+        parent
+            .handoff_nonce("nonce-for-someone-else")
+            .expect("parent pre-addresses");
+        drop(parent);
+
+        let error = acquire_audiobook_output_lock_with_handoff(out_dir, "my-nonce")
+            .expect_err("a mismatched record is never adopted");
+        assert!(
+            matches!(error, BuildError::OutputLocked(_)),
+            "expected OutputLocked, got {error:?}"
+        );
+    }
+
+    /// A terminal writer that only peeks must see the current owner and must
+    /// not claim the record.
+    #[test]
+    fn peek_acquire_observes_the_owner_without_claiming() {
+        use crate::lock::{LOCK_FILE_NAME, read_lock_record};
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path();
+        let holder = acquire_audiobook_output_lock(out_dir).expect("holder acquires");
+
+        assert!(
+            matches!(
+                acquire_audiobook_output_lock_peek(out_dir),
+                Err(BuildError::OutputLocked(_))
+            ),
+            "peek must defer while a live builder holds the kernel lock"
+        );
+
+        drop(holder);
+        let peeked = acquire_audiobook_output_lock_peek(out_dir).expect("peek after release");
+        let record = peeked.record().expect("record readable while held");
+        assert_eq!(
+            record.pid,
+            std::process::id(),
+            "record names the last holder"
+        );
+        // Peek must not claim a fresh record.
+        assert_eq!(
+            read_lock_record(&out_dir.join(LOCK_FILE_NAME)).unwrap(),
+            record
+        );
+        drop(peeked);
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_content_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("chunk.wav");
+        std::fs::write(&target, b"previous-audio").unwrap();
+
+        write_atomic(&target, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            leftovers.len(),
+            1,
+            "no temp siblings may survive: {leftovers:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("chunk.wav")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn failed_rename_cleans_up_its_temp_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        // Renaming onto an occupied *directory* path fails on every platform
+        // and exercises the cleanup branch deterministically without stubs.
+        let target = dir.path().join("occupied-as-directory");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(write_atomic(&target, b"bytes").is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
     }
 
     #[tokio::test]

@@ -165,7 +165,11 @@ async fn remove_glossary(
     let store_path = state.store_path.clone();
     let removed = tokio::task::spawn_blocking(move || -> Result<usize> {
         let store = JobStore::open(store_path)?;
-        Ok(store.remove_glossary_term(id)?)
+        let removed = store.remove_glossary_term(id)?;
+        if removed > 0 {
+            eprintln!("[serve] glossary delete id={id} removed={removed}");
+        }
+        Ok(removed)
     })
     .await??;
     Ok(Json(json!({ "removed": removed })).into_response())

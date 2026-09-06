@@ -1,14 +1,16 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::Result;
+use bookforge_core::finding::findings_from_legacy_error_text;
 use bookforge_core::segment::{SEGMENT_UNIT_NAME, Segment};
 use bookforge_llm::{QaIssue, QaSegmentReview};
 use bookforge_store::{
-    JobRecord, JobStore, JobSummary, SegmentRecord, aggregate_findings, classify_segment_error,
+    JobRecord, JobStore, JobSummary, QaFinding, QaFindingCount, QaFindingSeverity, SegmentRecord,
+    StoredQaFinding, aggregate_findings,
 };
 use serde::Serialize;
 
@@ -59,6 +61,11 @@ pub(crate) struct ReportInput<'a> {
     pub segment_records: &'a [SegmentRecord],
     pub translations: &'a [TranslationQaInput],
     pub qa_reviews: &'a [QaSegmentReview],
+    /// Structured QA findings persisted for this job (from the store's
+    /// `qa_findings` table). These are the preferred source for the finding
+    /// breakdown: they carry block attribution and the per-instance severity
+    /// recorded at checkpoint time.
+    pub qa_findings: Vec<StoredQaFinding>,
     pub performance: Option<RunPerformanceSummary>,
     pub output: &'a Path,
     /// Count of segments whose stored translation carries a human
@@ -198,7 +205,7 @@ pub(crate) fn write_report(input: ReportInput<'_>) -> Result<ReportFiles> {
         ),
         qa_reviewed_segments: input.qa_reviews.len(),
         qa_warnings: qa_warnings(&input),
-        finding_breakdown: finding_breakdown(input.segment_records),
+        finding_breakdown: finding_breakdown(input.segment_records, &input.qa_findings),
         performance: input.performance.clone(),
     };
 
@@ -229,18 +236,63 @@ pub(crate) fn report_paths(output: &Path) -> ReportFiles {
 /// failures up by kind so a single misfiring validator is obvious at the top of
 /// the list.
 ///
-/// The report is written as a run finalizes, so it classifies straight from the
-/// segment records rather than reading `qa_findings` back out of the store.
-/// Both paths run [`classify_segment_error`], so the report and
-/// `bookforge status` cannot drift apart.
-fn finding_breakdown(records: &[SegmentRecord]) -> Vec<QaFindingBreakdownEntry> {
-    let counts = aggregate_findings(
-        records
-            .iter()
-            .filter(|record| matches!(record.status.as_str(), "failed" | "needs_review"))
-            .filter_map(|record| record.error.as_deref())
-            .flat_map(classify_segment_error),
-    );
+/// Structured rows from the store (`qa_findings`, persisted at checkpoint
+/// time) are the preferred source: they keep block attribution and the
+/// per-instance severity the checkpoint recorded — a source-copy hit on a
+/// section title stays a warning instead of the legacy "70% error" display.
+/// Only flagged segments with no structured rows fall back to decomposing
+/// their stored `segments.error` string, and that decomposition goes through
+/// the shared core parser (`findings_from_legacy_error_text`) rather than a
+/// CLI-local duplicate. LLM-review rows keep their own `llm_*` namespace and
+/// stay out of this deterministic rollup. `status` consumes the same counts,
+/// so the report and `bookforge status` cannot drift apart.
+pub(crate) fn finding_breakdown_counts(
+    records: &[SegmentRecord],
+    qa_findings: &[StoredQaFinding],
+) -> Vec<QaFindingCount> {
+    let flagged: HashSet<&str> = records
+        .iter()
+        .filter(|record| matches!(record.status.as_str(), "failed" | "needs_review"))
+        .map(|record| record.id.as_str())
+        .collect();
+    if flagged.is_empty() {
+        return Vec::new();
+    }
+
+    let mut structured = Vec::new();
+    let mut segments_with_rows = HashSet::new();
+    for finding in qa_findings {
+        if finding.kind.starts_with("llm_") || !flagged.contains(finding.segment_id.as_str()) {
+            continue;
+        }
+        segments_with_rows.insert(finding.segment_id.as_str());
+        structured.push(QaFinding {
+            kind: finding.finding_kind(),
+            severity: finding_severity(&finding.severity),
+            message: finding.message.clone(),
+            block_id: finding.block_id.clone(),
+        });
+    }
+
+    let legacy = records
+        .iter()
+        .filter(|record| {
+            flagged.contains(record.id.as_str()) && !segments_with_rows.contains(record.id.as_str())
+        })
+        .filter_map(|record| record.error.as_deref())
+        .flat_map(findings_from_legacy_error_text)
+        .map(QaFinding::from);
+
+    aggregate_findings(structured.into_iter().chain(legacy))
+}
+
+/// The report's breakdown view of the shared counts (same rows, plus each
+/// kind's share of the total).
+fn finding_breakdown(
+    records: &[SegmentRecord],
+    qa_findings: &[StoredQaFinding],
+) -> Vec<QaFindingBreakdownEntry> {
+    let counts = finding_breakdown_counts(records, qa_findings);
     let total = counts.iter().map(|count| count.count).sum::<usize>();
     counts
         .iter()
@@ -251,6 +303,13 @@ fn finding_breakdown(records: &[SegmentRecord]) -> Vec<QaFindingBreakdownEntry> 
             share_percent: count.share_percent(total),
         })
         .collect()
+}
+
+fn finding_severity(value: &str) -> QaFindingSeverity {
+    match value {
+        "warning" => QaFindingSeverity::Warning,
+        _ => QaFindingSeverity::Error,
+    }
 }
 
 fn qa_warnings(input: &ReportInput<'_>) -> Vec<QaWarning> {
@@ -966,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn finding_breakdown_rolls_flagged_segments_up_by_kind() {
+    fn finding_breakdown_falls_back_to_core_parser_without_structured_rows() {
         let records = [
             segment_record(
                 "seg_0",
@@ -988,14 +1047,95 @@ mod tests {
             segment_record("seg_3", "succeeded", Some("protected span missing: x")),
         ];
 
-        let breakdown = finding_breakdown(&records);
+        let breakdown = finding_breakdown(&records, &[]);
 
         assert_eq!(breakdown.len(), 2);
         assert_eq!(breakdown[0].kind, "protected_span_missing");
         assert_eq!(breakdown[0].count, 2);
         assert_eq!(breakdown[0].share_percent, 66.7);
-        assert_eq!(breakdown[1].kind, "provider_error");
+        assert_eq!(breakdown[1].kind, "other");
         assert_eq!(breakdown[1].count, 1);
+    }
+
+    #[test]
+    fn finding_breakdown_prefers_structured_rows_with_instance_severity() {
+        let records = [
+            segment_record(
+                "seg_0",
+                "needs_review",
+                Some("error: translation is unchanged from the source-language prose"),
+            ),
+            segment_record("seg_1", "failed", Some("provider error: HTTP 500")),
+        ];
+        // Structured rows as persisted at checkpoint time: the source-copy
+        // hit carries its instance warning severity, and the raw error string
+        // is never re-parsed for this segment.
+        let stored = vec![
+            StoredQaFinding {
+                id: "qaf_a".to_string(),
+                segment_id: "seg_0".to_string(),
+                kind: "source_copy_unchanged".to_string(),
+                severity: "warning".to_string(),
+                message: "title block copied unchanged".to_string(),
+                block_id: Some("b_000001".to_string()),
+            },
+            StoredQaFinding {
+                id: "qaf_b".to_string(),
+                segment_id: "seg_1".to_string(),
+                kind: "provider_error".to_string(),
+                severity: "error".to_string(),
+                message: "provider error: HTTP 500".to_string(),
+                block_id: None,
+            },
+        ];
+
+        let breakdown = finding_breakdown(&records, &stored);
+
+        assert_eq!(breakdown.len(), 2);
+        let source_copy = breakdown
+            .iter()
+            .find(|entry| entry.kind == "source_copy_unchanged")
+            .expect("structured source copy entry");
+        assert_eq!(source_copy.severity, "warning", "instance severity wins");
+        assert_eq!(source_copy.count, 1);
+        let provider = breakdown
+            .iter()
+            .find(|entry| entry.kind == "provider_error")
+            .expect("structured provider entry");
+        assert_eq!(provider.severity, "error");
+        // No duplicate rows from re-parsing the legacy strings.
+        assert!(breakdown.iter().all(|entry| entry.count == 1));
+    }
+
+    #[test]
+    fn finding_breakdown_merges_structured_and_legacy_rows() {
+        let records = [
+            // seg_0 has a structured row; seg_1 only a legacy error string.
+            segment_record("seg_0", "needs_review", Some("unparsed legacy text")),
+            segment_record(
+                "seg_1",
+                "failed",
+                Some("protected span missing from segment 'seg_1': 4th"),
+            ),
+        ];
+        let stored = vec![StoredQaFinding {
+            id: "qaf_a".to_string(),
+            segment_id: "seg_0".to_string(),
+            kind: "inline_marker_missing".to_string(),
+            severity: "error".to_string(),
+            message: "inline marker missing: m1".to_string(),
+            block_id: None,
+        }];
+
+        let breakdown = finding_breakdown(&records, &stored);
+
+        assert_eq!(
+            breakdown
+                .iter()
+                .map(|entry| entry.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["inline_marker_missing", "protected_span_missing"]
+        );
     }
 
     #[test]
@@ -1009,7 +1149,7 @@ mod tests {
             ),
         )];
 
-        let breakdown = finding_breakdown(&records);
+        let breakdown = finding_breakdown(&records, &[]);
 
         assert_eq!(
             breakdown
@@ -1019,11 +1159,17 @@ mod tests {
             vec!["batch_block_mismatch", "source_copy_unchanged"]
         );
         assert!(breakdown.iter().all(|entry| entry.count == 1));
+        // The legacy source-copy hit is a warning at the instance level.
+        let source_copy = breakdown
+            .iter()
+            .find(|entry| entry.kind == "source_copy_unchanged")
+            .expect("source copy entry");
+        assert_eq!(source_copy.severity, "warning");
     }
 
     #[test]
     fn finding_breakdown_is_empty_without_flagged_segments() {
-        assert!(finding_breakdown(&[segment_record("seg_0", "succeeded", None)]).is_empty());
+        assert!(finding_breakdown(&[segment_record("seg_0", "succeeded", None)], &[]).is_empty());
     }
 
     #[test]
@@ -1140,6 +1286,7 @@ mod tests {
             segment_records: &[],
             translations: &[],
             qa_reviews: &reviews,
+            qa_findings: Vec::new(),
             performance: None,
             output: &output,
             corrected_segments: 0,

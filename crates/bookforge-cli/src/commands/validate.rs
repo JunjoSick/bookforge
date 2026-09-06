@@ -1,7 +1,10 @@
 use std::{
     env, fs,
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -11,9 +14,25 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::output;
+
 const VALIDATION_REPORT_SCHEMA_VERSION: u32 = 3;
 
+/// Finite deadlines for EPUBCheck subprocesses. A hung `--version` probe or a
+/// validation run that never exits must never block the CLI forever, and the
+/// child must be killed and reaped on expiry rather than abandoned.
+const EPUBCHECK_VERSION_DEADLINE: Duration = Duration::from_secs(30);
+const EPUBCHECK_VALIDATION_DEADLINE: Duration = Duration::from_secs(600);
+/// Per-stream retained output cap. stdout/stderr are drained concurrently but
+/// only this much of each stream is ever buffered, so a chatty EPUBCheck
+/// cannot grow process memory without bound.
+const EPUBCHECK_STREAM_CAP_BYTES: usize = 128 * 1024;
+const EPUBCHECK_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Environment:\n  BOOKFORGE_EPUBCHECK  Path to an EPUBCheck executable, wrapper script, or .jar (otherwise found on PATH)."
+)]
 pub struct ValidateArgs {
     pub input: PathBuf,
 
@@ -109,15 +128,13 @@ pub(crate) fn validate_and_write(
     report_path: &Path,
     strict_epubcheck: bool,
 ) -> Result<ValidationOutcome> {
+    output::ensure_distinct_paths("EPUB input/report", input, report_path)?;
     let outcome = validate_path(input, strict_epubcheck);
-    if let Some(parent) = report_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating report directory {}", parent.display()))?;
-    }
-    fs::write(report_path, serde_json::to_string_pretty(&outcome.report)?)
-        .with_context(|| format!("writing validation report {}", report_path.display()))?;
+    output::write_atomic(
+        report_path,
+        serde_json::to_string_pretty(&outcome.report)?.as_bytes(),
+    )
+    .with_context(|| format!("writing validation report {}", report_path.display()))?;
     Ok(outcome)
 }
 
@@ -275,7 +292,12 @@ enum EpubCheckCommand {
 }
 
 impl EpubCheckCommand {
-    fn output(&self, args: &[&str], input: Option<&Path>) -> std::io::Result<Output> {
+    /// Base process for this invocation: the resolved command line plus a
+    /// scrubbed child environment. Provider/API credentials in the parent
+    /// environment are never inherited by EPUBCheck, Java, or wrapper
+    /// scripts; only the allowlisted variables needed for them to run are
+    /// carried over.
+    fn command(&self) -> Command {
         let mut command = match self {
             EpubCheckCommand::Direct(path) => Command::new(path),
             EpubCheckCommand::JavaJar { java, jar } => {
@@ -289,11 +311,235 @@ impl EpubCheckCommand {
                 command
             }
         };
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+
+            // Run in an isolated process group so a deadline kill can
+            // terminate a wrapper (shell script / cmd) and its descendants
+            // (java) together instead of abandoning a runaway grandchild.
+            let _ = command.process_group(0);
+        }
+        apply_epubcheck_environment_allowlist(&mut command, &mut |name| env::var_os(name));
+        command
+    }
+
+    /// Run `args` (plus `input` when present) under a finite `deadline`:
+    /// stdin is nulled, stdout/stderr are piped and drained concurrently
+    /// with bounded retained memory, and on expiry the process tree is
+    /// killed and reaped (`EpubcheckCapture::timed_out`).
+    fn run(
+        &self,
+        args: &[&str],
+        input: Option<&Path>,
+        deadline: Duration,
+    ) -> io::Result<EpubcheckCapture> {
+        let mut command = self.command();
         command.args(args);
         if let Some(input) = input {
             command.arg(input);
         }
-        command.output()
+        run_epubcheck_bounded(command, deadline, EPUBCHECK_STREAM_CAP_BYTES)
+    }
+}
+
+/// Bounded output of one EPUBCheck subprocess run.
+#[derive(Debug)]
+struct EpubcheckCapture {
+    status: Option<ExitStatus>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_exceeded: bool,
+    stderr_exceeded: bool,
+    timed_out: bool,
+}
+
+/// Spawn `command`, drain both output streams concurrently while retaining
+/// at most `stream_cap` bytes each, and reap the child when it exits or when
+/// `deadline` expires (killing the process group first). stdin is null so a
+/// tool waiting on a tty fails fast instead of hanging forever.
+fn run_epubcheck_bounded(
+    mut command: Command,
+    deadline: Duration,
+    stream_cap: usize,
+) -> io::Result<EpubcheckCapture> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("EPUBCheck stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("EPUBCheck stderr was not piped"))?;
+    let stdout_reader = match spawn_epubcheck_stream_reader(stdout, stream_cap, "stdout") {
+        Ok(reader) => reader,
+        Err(error) => {
+            terminate_epubcheck_child(&mut child);
+            return Err(error);
+        }
+    };
+    let stderr_reader = match spawn_epubcheck_stream_reader(stderr, stream_cap, "stderr") {
+        Ok(reader) => reader,
+        Err(error) => {
+            terminate_epubcheck_child(&mut child);
+            let _ = stdout_reader.join();
+            return Err(error);
+        }
+    };
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if started.elapsed() >= deadline {
+            timed_out = true;
+            terminate_epubcheck_child(&mut child);
+            break None;
+        }
+        let delay = deadline
+            .saturating_sub(started.elapsed())
+            .min(EPUBCHECK_POLL_INTERVAL);
+        if delay.is_zero() {
+            timed_out = true;
+            terminate_epubcheck_child(&mut child);
+            break None;
+        }
+        thread::sleep(delay);
+    };
+
+    let stdout = join_epubcheck_stream_reader(stdout_reader)?;
+    let stderr = join_epubcheck_stream_reader(stderr_reader)?;
+    Ok(EpubcheckCapture {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        stdout_exceeded: stdout.exceeded,
+        stderr_exceeded: stderr.exceeded,
+        timed_out,
+    })
+}
+
+struct EpubcheckStreamCapture {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn spawn_epubcheck_stream_reader<R>(
+    mut reader: R,
+    cap: usize,
+    stream: &'static str,
+) -> io::Result<thread::JoinHandle<io::Result<EpubcheckStreamCapture>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::Builder::new()
+        .name(format!("epubcheck-{stream}-reader"))
+        .spawn(move || {
+            let mut bytes = Vec::with_capacity(cap.min(64 * 1024));
+            let mut exceeded = false;
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                let retained = count.min(cap.saturating_sub(bytes.len()));
+                bytes.extend_from_slice(&buffer[..retained]);
+                exceeded |= retained < count;
+            }
+            Ok(EpubcheckStreamCapture { bytes, exceeded })
+        })
+}
+
+fn join_epubcheck_stream_reader(
+    reader: thread::JoinHandle<io::Result<EpubcheckStreamCapture>>,
+) -> io::Result<EpubcheckStreamCapture> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("EPUBCheck output reader thread panicked"))?
+}
+
+/// Kill the child process (group) and reap it. On Unix the child was placed
+/// in its own process group before spawn, so the negative-PID signal covers
+/// wrapper + java descendants; the direct kill + wait is the cross-platform
+/// fallback and reaps the process so no zombie is left behind.
+fn terminate_epubcheck_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        if pid != 0 {
+            let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Minimal cross-platform environment allowlist for EPUBCheck child
+/// processes. Starting from `env_clear` and re-adding only these names means
+/// provider/API credentials and other secrets are never inherited, while Java
+/// (`JAVA_HOME`, temp dirs), wrapper scripts (`PATH`, `HOME`, locale) and
+/// Windows `cmd` (`SYSTEMROOT`/`COMSPEC`) keep working.
+fn apply_epubcheck_environment_allowlist(
+    command: &mut Command,
+    lookup: &mut dyn FnMut(&str) -> Option<std::ffi::OsString>,
+) {
+    command.env_clear();
+    for name in epubcheck_environment_allowlist() {
+        if let Some(value) = lookup(name) {
+            command.env(name, value);
+        }
+    }
+}
+
+fn epubcheck_environment_allowlist() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &[
+            "PATH",
+            "HOME",
+            "JAVA_HOME",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "LANGUAGE",
+            "TZ",
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "PATHEXT",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "NUMBER_OF_PROCESSORS",
+            "PROCESSOR_ARCHITECTURE",
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        &[
+            "PATH",
+            "HOME",
+            "JAVA_HOME",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "LANGUAGE",
+            "TZ",
+        ]
     }
 }
 
@@ -304,13 +550,14 @@ fn run_epubcheck(input: &Path) -> EpubCheckReport {
     };
 
     let version = command
-        .output(&["--version"], None)
+        .run(&["--version"], None, EPUBCHECK_VERSION_DEADLINE)
         .ok()
-        .and_then(|output| {
+        .filter(|capture| !capture.timed_out)
+        .and_then(|capture| {
             let text = format!(
                 "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&capture.stdout),
+                String::from_utf8_lossy(&capture.stderr)
             );
             parse_version_banner(&text)
         });
@@ -324,14 +571,53 @@ fn run_epubcheck(input: &Path) -> EpubCheckReport {
             .as_nanos()
     ));
     let report_arg = report_path.to_string_lossy().into_owned();
-    let output = match command.output(&["--json", &report_arg], Some(input)) {
-        Ok(output) => output,
+    let capture = match command.run(
+        &["--json", &report_arg],
+        Some(input),
+        EPUBCHECK_VALIDATION_DEADLINE,
+    ) {
+        Ok(capture) => capture,
         Err(error) => {
+            // Spawn failures happen before any child runs; remove the (never
+            // created) temp path anyway so no stale report can survive.
+            let _ = fs::remove_file(&report_path);
             return unavailable_epubcheck(format!("failed to run EPUBCheck: {error}"));
         }
     };
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&capture.stderr);
+    if capture.stdout_exceeded {
+        tracing::warn!(
+            "EPUBCheck exceeded the {}-byte stdout capture limit; output is truncated",
+            EPUBCHECK_STREAM_CAP_BYTES
+        );
+    }
+    if capture.stderr_exceeded {
+        tracing::warn!(
+            "EPUBCheck exceeded the {}-byte stderr capture limit; diagnostics are truncated",
+            EPUBCHECK_STREAM_CAP_BYTES
+        );
+    }
+    if capture.timed_out {
+        let _ = fs::remove_file(&report_path);
+        return EpubCheckReport {
+            ran: true,
+            version,
+            status: "errors".to_string(),
+            messages: vec![ValidationMessage {
+                severity: "error".to_string(),
+                code: "EPUBCHECK-TIMEOUT".to_string(),
+                location: None,
+                text: format!(
+                    "EPUBCheck did not finish within {} seconds and was terminated. stderr: {}",
+                    EPUBCHECK_VALIDATION_DEADLINE.as_secs(),
+                    stderr.trim()
+                ),
+            }],
+        };
+    }
     let report_json = fs::read_to_string(&report_path);
+    // The report file is private temp state for one validation; remove it as
+    // soon as its bytes are no longer needed, on every path below.
     let _ = fs::remove_file(&report_path);
     let report_json = match report_json {
         Ok(report) => report,
@@ -354,7 +640,8 @@ fn run_epubcheck(input: &Path) -> EpubCheckReport {
     };
     match parse_epubcheck_json(&report_json, version.clone()) {
         Ok(mut report) => {
-            if report.messages.is_empty() && !output.status.success() {
+            if report.messages.is_empty() && !capture.status.is_some_and(|status| status.success())
+            {
                 report.messages.push(ValidationMessage {
                     severity: "error".to_string(),
                     code: "EPUBCHECK-EXIT".to_string(),
@@ -701,6 +988,178 @@ mod tests {
         assert_eq!(
             parse_version_banner("EPUBCheck v5.3.0\nMessages: 0 errors"),
             Some("5.3.0".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // EPUBCheck subprocess hardening. These tests re-exec the current test
+    // binary as a stand-in "EPUBCheck" so deadline/kill, output-limit and
+    // environment-scrubbing behaviour runs deterministically on any OS
+    // without a real Java/EPUBCheck install (mirroring the tools.rs pattern).
+    // -----------------------------------------------------------------------
+
+    const SLEEPING_EPUBCHECK_STAND_IN: &str =
+        "commands::validate::tests::fake_epubcheck_sleeps_then_marks_completion";
+    const SPAMMING_EPUBCHECK_STAND_IN: &str =
+        "commands::validate::tests::fake_epubcheck_spams_both_streams";
+
+    fn epubcheck_stand_in_command(test_name: &str) -> Command {
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut command = Command::new(executable);
+        command.args(["--ignored", "--exact", test_name, "--nocapture"]);
+        command
+    }
+
+    #[test]
+    #[ignore = "stand-in child invoked by the bounded-capture timeout test"]
+    fn fake_epubcheck_sleeps_then_marks_completion() {
+        // Sleeps well past any deadline the parent test uses, then writes a
+        // marker. If the parent's kill failed, the marker appears and the
+        // parent test fails; if it was killed, the marker never appears.
+        thread::sleep(Duration::from_millis(1_500));
+        fs::write("epubcheck-fake-completed", b"completed").expect("completion marker writes");
+    }
+
+    #[test]
+    #[ignore = "stand-in child invoked by the bounded-capture output-limit test"]
+    fn fake_epubcheck_spams_both_streams() {
+        use std::io::Write as _;
+
+        let bytes = vec![b'x'; 64 * 1024];
+        io::stdout()
+            .write_all(&bytes)
+            .and_then(|()| io::stdout().flush())
+            .expect("stand-in stdout writes");
+        io::stderr()
+            .write_all(&bytes)
+            .and_then(|()| io::stderr().flush())
+            .expect("stand-in stderr writes");
+    }
+
+    #[test]
+    fn timed_out_epubcheck_child_is_killed_and_reaped() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut command = epubcheck_stand_in_command(SLEEPING_EPUBCHECK_STAND_IN);
+        command.current_dir(dir.path());
+
+        let started = Instant::now();
+        let capture = run_epubcheck_bounded(command, Duration::from_millis(250), 4096)
+            .expect("stand-in should run and time out");
+        let elapsed = started.elapsed();
+
+        assert!(capture.timed_out, "deadline must be enforced");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "deadline kill must be prompt, took {elapsed:?}"
+        );
+        // Give the stand-in enough time to have written its marker had it
+        // survived: 250 ms deadline vs a 1.5 s sleep.
+        thread::sleep(Duration::from_millis(1_400));
+        assert!(
+            !dir.path().join("epubcheck-fake-completed").exists(),
+            "a timed-out EPUBCheck must be killed and reaped, not left running"
+        );
+    }
+
+    #[test]
+    fn oversized_epubcheck_output_is_retained_within_the_bound() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut command = epubcheck_stand_in_command(SPAMMING_EPUBCHECK_STAND_IN);
+        command.current_dir(dir.path());
+
+        let capture = run_epubcheck_bounded(command, Duration::from_secs(30), 4096)
+            .expect("stand-in should exit normally");
+        assert!(!capture.timed_out);
+        assert!(
+            capture.status.is_some_and(|status| status.success()),
+            "a bounded child that exits normally must report success"
+        );
+        assert!(
+            capture.stdout.len() <= 4096,
+            "stdout retention must stay bounded"
+        );
+        assert!(
+            capture.stderr.len() <= 4096,
+            "stderr retention must stay bounded"
+        );
+        assert!(
+            capture.stdout_exceeded,
+            "spammed stdout should trip the limit"
+        );
+        assert!(
+            capture.stderr_exceeded,
+            "spammed stderr should trip the limit"
+        );
+    }
+
+    #[test]
+    fn epubcheck_child_environment_excludes_secrets_but_keeps_allowlist() {
+        // Seed the command with credential-named variables (as an inheriting
+        // spawn would receive them), then apply the scrubbing allowlist: the
+        // secrets must vanish while PATH and the other allowlisted variables
+        // present in the parent environment are copied through.
+        let mut command = Command::new("epubcheck");
+        command.env("OPENAI_API_KEY", "secret-openai");
+        command.env("OCR_API_KEY", "secret-ocr");
+        command.env("ELEVENLABS_API_KEY", "secret-elevenlabs");
+        command.env("BOOKFORGE_EPUBCHECK_TEST_SECRET", "secret-fixture");
+        apply_epubcheck_environment_allowlist(&mut command, &mut |name| env::var_os(name));
+
+        let environment = command.get_envs().collect::<Vec<_>>();
+        for (name, _) in &environment {
+            let name = name.to_string_lossy();
+            assert!(
+                !name.eq_ignore_ascii_case("OPENAI_API_KEY"),
+                "{name} leaked"
+            );
+            assert!(!name.eq_ignore_ascii_case("OCR_API_KEY"), "{name} leaked");
+            assert!(
+                !name.eq_ignore_ascii_case("ELEVENLABS_API_KEY"),
+                "{name} leaked"
+            );
+            assert!(
+                !name.eq_ignore_ascii_case("BOOKFORGE_EPUBCHECK_TEST_SECRET"),
+                "{name} leaked"
+            );
+        }
+
+        let names = environment
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().to_ascii_uppercase())
+            .collect::<Vec<_>>();
+        assert!(
+            !names.iter().any(|name| name == "OPENAI_API_KEY"),
+            "secrets must not be re-added by the allowlist"
+        );
+        assert!(
+            names.iter().any(|name| name == "PATH"),
+            "PATH must survive scrubbing so EPUBCheck/Java/scripts can still run"
+        );
+    }
+
+    #[test]
+    fn bounded_capture_reports_success_for_a_fast_exit() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut command = epubcheck_stand_in_command(SPAMMING_EPUBCHECK_STAND_IN);
+        command.current_dir(dir.path());
+
+        let capture = run_epubcheck_bounded(command, Duration::from_secs(30), 1_024 * 1024)
+            .expect("stand-in should exit normally");
+        assert!(!capture.timed_out);
+        assert!(
+            !capture.stdout_exceeded,
+            "a 1 MiB cap must hold 64 KiB of output"
+        );
+        assert!(!capture.stderr_exceeded);
+        assert!(
+            capture.stdout.len() >= 64 * 1024 && capture.stdout.len() <= 1024 * 1024,
+            "full stdout should be retained up to the cap, got {} bytes",
+            capture.stdout.len()
+        );
+        assert!(
+            capture.stderr.len() >= 64 * 1024 && capture.stderr.len() <= 1024 * 1024,
+            "full stderr should be retained up to the cap, got {} bytes",
+            capture.stderr.len()
         );
     }
 }

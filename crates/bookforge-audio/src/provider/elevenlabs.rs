@@ -28,12 +28,21 @@ impl fmt::Debug for ApiKey {
     }
 }
 
-/// Absolute maximum Unicode characters accepted by an ElevenLabs TTS model.
-pub const ELEVENLABS_MAX_INPUT_CHARS: usize = 40_000;
-
 /// ElevenLabs models in BookForge's preferred auto-selection order.
-pub const ELEVENLABS_PREFERRED_MODELS: &[&str] = &[
+pub(crate) const ELEVENLABS_PREFERRED_MODELS: &[&str] = &[
     "eleven_v3",
+    "eleven_flash_v2_5",
+    "eleven_turbo_v2_5",
+    "eleven_multilingual_v2",
+];
+
+/// Degradation order used when the preflight cannot reach the models
+/// endpoint (AUDIO-3 / DOC-15): cheapest suitable tier first, so a transient
+/// network failure fails open to Flash rather than to the most expensive
+/// tier. `eleven_v3` is deliberately absent — as the priciest option it must
+/// never be chosen by a *degraded* path, and it is additionally excluded by
+/// request whenever speed control is needed.
+pub(crate) const ELEVENLABS_DEGRADED_FALLBACK_ORDER: &[&str] = &[
     "eleven_flash_v2_5",
     "eleven_turbo_v2_5",
     "eleven_multilingual_v2",
@@ -58,6 +67,15 @@ pub struct ElevenLabsSubscription {
 pub async fn fetch_elevenlabs_subscription(
     config: &ElevenLabsTtsConfig,
 ) -> Result<ElevenLabsSubscription> {
+    fetch_elevenlabs_subscription_with_cancel(config, CancellationToken::new()).await
+}
+
+/// AUDIO-17: cancellation-safe variant; a cancelled token aborts an
+/// in-flight metadata request instead of waiting out the timeout.
+async fn fetch_elevenlabs_subscription_with_cancel(
+    config: &ElevenLabsTtsConfig,
+    cancel_token: CancellationToken,
+) -> Result<ElevenLabsSubscription> {
     let api_key = if base_url_is_loopback(&config.base_url) {
         std::env::var(&config.api_key_env)
             .ok()
@@ -71,24 +89,23 @@ pub async fn fetch_elevenlabs_subscription(
         api_key.as_ref(),
         config.timeout_seconds,
         config.max_attempts,
+        &cancel_token,
     )
     .await
 }
 
-/// Fetch ElevenLabs subscription usage with a caller-supplied API key.
-///
-/// This path never reads or mutates the process environment.
-pub async fn fetch_elevenlabs_subscription_with_key(
+pub async fn fetch_elevenlabs_subscription_with_key_and_cancel(
     base_url: &str,
     api_key: &str,
     timeout_seconds: u64,
+    cancel_token: CancellationToken,
 ) -> Result<ElevenLabsSubscription> {
-    let api_key = ApiKey::new(api_key);
     fetch_elevenlabs_subscription_request(
         base_url,
-        Some(&api_key),
+        Some(&ApiKey::new(api_key)),
         timeout_seconds,
         ELEVENLABS_METADATA_MAX_ATTEMPTS,
+        &cancel_token,
     )
     .await
 }
@@ -98,12 +115,12 @@ async fn fetch_elevenlabs_subscription_request(
     api_key: Option<&ApiKey>,
     timeout_seconds: u64,
     max_attempts: usize,
+    cancel_token: &CancellationToken,
 ) -> Result<ElevenLabsSubscription> {
     let endpoint = format!("{}/user/subscription", base_url.trim_end_matches('/'));
     let client = build_http_client(timeout_seconds)?;
-    let cancel_token = CancellationToken::new();
     let payload = send_with_retry(
-        &cancel_token,
+        cancel_token,
         max_attempts,
         MAX_JSON_RESPONSE_BODY_BYTES,
         || {
@@ -127,6 +144,17 @@ pub async fn list_elevenlabs_voices(
     api_key: &str,
     timeout_seconds: u64,
 ) -> Result<Vec<ElevenLabsVoice>> {
+    list_elevenlabs_voices_with_cancel(base_url, api_key, timeout_seconds, CancellationToken::new())
+        .await
+}
+
+/// AUDIO-17: cancellation-safe voices listing.
+pub async fn list_elevenlabs_voices_with_cancel(
+    base_url: &str,
+    api_key: &str,
+    timeout_seconds: u64,
+    cancel_token: CancellationToken,
+) -> Result<Vec<ElevenLabsVoice>> {
     #[derive(serde::Deserialize)]
     struct VoicesResponse {
         voices: Vec<ElevenLabsVoice>,
@@ -135,7 +163,6 @@ pub async fn list_elevenlabs_voices(
     let api_key = ApiKey::new(api_key);
     let endpoint = format!("{}/voices", base_url.trim_end_matches('/'));
     let client = build_http_client(timeout_seconds)?;
-    let cancel_token = CancellationToken::new();
     let payload = send_with_retry(
         &cancel_token,
         ELEVENLABS_METADATA_MAX_ATTEMPTS,
@@ -167,11 +194,95 @@ pub fn elevenlabs_model_max_input_chars(model: &str) -> usize {
     }
 }
 
+/// Deterministic cheapest-suitable model for a degraded (cannot-reach-
+/// preflight) run. A pure function of the same inputs as the full resolver,
+/// so resume attempts after a transient outage hash identically to the
+/// original run: the model string is what feeds `synthesis_id`, and a stable
+/// fallback means a resumed build reuses the previous run's paid chunks.
+///
+/// Fail-open target per DOC-15: the CHEAPEST tier that can still satisfy the
+/// request, never `eleven_v3` or any premium tier.
+pub(crate) fn degraded_elevenlabs_model(
+    max_chars: usize,
+    needs_speed_control: bool,
+) -> Option<&'static str> {
+    // Speed control rides on voice_settings, which every non-v3 preferred
+    // model accepts; only v3's absence would change anything and it is not
+    // in the degradation order anyway.
+    let _ = needs_speed_control;
+    ELEVENLABS_DEGRADED_FALLBACK_ORDER
+        .iter()
+        .copied()
+        .find(|model| elevenlabs_model_max_input_chars(model) >= max_chars)
+}
+
+/// Which model was chosen for synthesis and how. The CLI/dashboard surface
+/// this in plan/report output; the boolean plus reason make an otherwise
+/// invisible cost downgrade visible to operators.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ElevenLabsModelResolution {
+    pub model: String,
+    /// True when the models endpoint was unreachable and the cheapest
+    /// suitable tier was substituted.
+    pub degraded: bool,
+    pub reason: Option<String>,
+}
+
 /// Select the best available ElevenLabs model for the requested contract.
-pub async fn resolve_preferred_elevenlabs_model(
+/// Cancellation-safe, fully-reporting resolver. Callers that own a run-level
+/// token must use this so a cancel during model preflight aborts instead of
+/// silently waiting for retries.
+pub async fn resolve_preferred_elevenlabs_model_reported_with_cancel(
     config: &ElevenLabsTtsConfig,
     max_chars: usize,
     needs_speed_control: bool,
+    cancel_token: CancellationToken,
+) -> Result<ElevenLabsModelResolution> {
+    match resolve_preferred_elevenlabs_model_inner(
+        config,
+        max_chars,
+        needs_speed_control,
+        &cancel_token,
+    )
+    .await
+    {
+        Ok(model) => Ok(ElevenLabsModelResolution {
+            model,
+            degraded: false,
+            reason: None,
+        }),
+        Err(error @ TtsError::Http(_)) if error.is_transient_transport() => {
+            let detail = error.to_string();
+            let fallback =
+                degraded_elevenlabs_model(max_chars, needs_speed_control).ok_or(error)?;
+            Ok(ElevenLabsModelResolution {
+                model: fallback.to_string(),
+                degraded: true,
+                reason: Some(format!(
+                    "ElevenLabs model preflight failed transiently ({detail}); degraded to the \
+                     cheapest suitable tier {fallback} so cost stays bounded and the choice is \
+                     deterministic across resume attempts"
+                )),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+impl TtsError {
+    /// Transport-level transience mirror of the retry policy used by
+    /// [`super::send_with_retry`]: timeouts and connect failures are the
+    /// exactly-the-network class eligible for open degradation.
+    pub fn is_transient_transport(&self) -> bool {
+        matches!(self, TtsError::Http(inner) if inner.is_timeout() || inner.is_connect())
+    }
+}
+
+async fn resolve_preferred_elevenlabs_model_inner(
+    config: &ElevenLabsTtsConfig,
+    max_chars: usize,
+    needs_speed_control: bool,
+    cancel_token: &CancellationToken,
 ) -> Result<String> {
     let endpoint = format!("{}/models", config.base_url.trim_end_matches('/'));
     let api_key = if base_url_is_loopback(&config.base_url) {
@@ -183,9 +294,8 @@ pub async fn resolve_preferred_elevenlabs_model(
     }
     .map(ApiKey::new);
     let client = build_http_client(config.timeout_seconds)?;
-    let cancel_token = CancellationToken::new();
     let payload = send_with_retry(
-        &cancel_token,
+        cancel_token,
         config.max_attempts.min(ELEVENLABS_METADATA_MAX_ATTEMPTS),
         MAX_JSON_RESPONSE_BODY_BYTES,
         || {
@@ -393,9 +503,24 @@ fn elevenlabs_request_body(model: &str, request: &SpeechRequest) -> serde_json::
 mod tests {
     use super::*;
     use crate::provider::test_support::{
-        one_request_server, one_request_server_with_content_length,
+        CAPTURE_WINDOW, one_request_server, one_request_server_with_content_length,
+        retry_transient_transport,
     };
-    use std::time::Duration;
+
+    async fn resolve_preferred_elevenlabs_model(
+        config: &ElevenLabsTtsConfig,
+        max_chars: usize,
+        needs_speed_control: bool,
+    ) -> Result<String> {
+        resolve_preferred_elevenlabs_model_reported_with_cancel(
+            config,
+            max_chars,
+            needs_speed_control,
+            CancellationToken::new(),
+        )
+        .await
+        .map(|resolution| resolution.model)
+    }
 
     fn request(format: AudioFormat) -> SpeechRequest {
         SpeechRequest {
@@ -470,27 +595,35 @@ mod tests {
 
     #[tokio::test]
     async fn synthesis_sends_context_consistency_fields() {
-        let (base_url, captured) = one_request_server(b"ID3mock-audio".to_vec(), "audio/mpeg");
-        let key_env = "BOOKFORGE_ELEVENLABS_CONTEXT_BODY_TEST_KEY";
-        unsafe { std::env::set_var(key_env, "context-key") };
-        let provider = ElevenLabsTtsProvider::new(ElevenLabsTtsConfig {
-            base_url,
-            api_key_env: key_env.to_string(),
-            model: "eleven_flash_v2_5".to_string(),
-            timeout_seconds: 5,
-            max_attempts: 1,
+        let raw = retry_transient_transport(|| async {
+            let (base_url, captured) = one_request_server(b"ID3mock-audio".to_vec(), "audio/mpeg");
+            let key_env = "BOOKFORGE_ELEVENLABS_CONTEXT_BODY_TEST_KEY";
+            unsafe { std::env::set_var(key_env, "context-key") };
+            let provider = ElevenLabsTtsProvider::new(ElevenLabsTtsConfig {
+                base_url,
+                api_key_env: key_env.to_string(),
+                model: "eleven_flash_v2_5".to_string(),
+                timeout_seconds: 5,
+                max_attempts: 1,
+            })
+            .unwrap();
+            let mut speech = request(AudioFormat::Mp3);
+            speech.previous_text = Some("before".to_string());
+            speech.next_text = Some("after".to_string());
+            speech.seed = Some(42);
+            speech.language_code = Some("it".to_string());
+            speech.text_normalization = Some(crate::provider::TextNormalization::On);
+            let result = provider.synthesize(speech).await;
+            unsafe { std::env::remove_var(key_env) };
+            result.map(|_| {
+                captured
+                    .recv_timeout(CAPTURE_WINDOW)
+                    .expect("mock should capture the request")
+            })
         })
-        .unwrap();
-        let mut speech = request(AudioFormat::Mp3);
-        speech.previous_text = Some("before".to_string());
-        speech.next_text = Some("after".to_string());
-        speech.seed = Some(42);
-        speech.language_code = Some("it".to_string());
-        speech.text_normalization = Some(crate::provider::TextNormalization::On);
-        provider.synthesize(speech).await.unwrap();
-        unsafe { std::env::remove_var(key_env) };
+        .await
+        .expect("mocked ElevenLabs synthesis");
 
-        let raw = captured.recv_timeout(Duration::from_secs(2)).unwrap();
         let body: serde_json::Value =
             serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(body["previous_text"], "before");
@@ -518,14 +651,24 @@ mod tests {
             {"model_id": "eleven_flash_v2_5"},
             {"model_id": "eleven_v3"}
         ]});
-        let (base_url, _) = one_request_server(body.to_string().into_bytes(), "application/json");
         let key_env = "BOOKFORGE_ELEVENLABS_RESOLVER_V3_TEST_KEY";
-        unsafe { std::env::set_var(key_env, "resolver-v3-key") };
-        let resolved =
-            resolve_preferred_elevenlabs_model(&resolver_config(base_url, key_env), 5_000, false)
-                .await
-                .unwrap();
-        unsafe { std::env::remove_var(key_env) };
+        let resolved = retry_transient_transport(|| {
+            let body = body.to_string();
+            async move {
+                let (base_url, _) = one_request_server(body.into_bytes(), "application/json");
+                unsafe { std::env::set_var(key_env, "resolver-v3-key") };
+                let resolved = resolve_preferred_elevenlabs_model(
+                    &resolver_config(base_url, key_env),
+                    5_000,
+                    false,
+                )
+                .await;
+                unsafe { std::env::remove_var(key_env) };
+                resolved
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(resolved, "eleven_v3");
     }
 
@@ -537,14 +680,24 @@ mod tests {
             {"model_id": "eleven_turbo_v2_5"},
             {"model_id": "eleven_multilingual_v2"}
         ]);
-        let (base_url, _) = one_request_server(body.to_string().into_bytes(), "application/json");
         let key_env = "BOOKFORGE_ELEVENLABS_RESOLVER_LIMIT_TEST_KEY";
-        unsafe { std::env::set_var(key_env, "resolver-limit-key") };
-        let resolved =
-            resolve_preferred_elevenlabs_model(&resolver_config(base_url, key_env), 8_000, false)
-                .await
-                .unwrap();
-        unsafe { std::env::remove_var(key_env) };
+        let resolved = retry_transient_transport(|| {
+            let body = body.to_string();
+            async move {
+                let (base_url, _) = one_request_server(body.into_bytes(), "application/json");
+                unsafe { std::env::set_var(key_env, "resolver-limit-key") };
+                let resolved = resolve_preferred_elevenlabs_model(
+                    &resolver_config(base_url, key_env),
+                    8_000,
+                    false,
+                )
+                .await;
+                unsafe { std::env::remove_var(key_env) };
+                resolved
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(resolved, "eleven_flash_v2_5");
     }
 
@@ -554,14 +707,24 @@ mod tests {
             {"model_id": "eleven_v3", "can_do_text_to_speech": false},
             {"model_id": "eleven_flash_v2_5", "can_do_text_to_speech": true}
         ]);
-        let (base_url, _) = one_request_server(body.to_string().into_bytes(), "application/json");
         let key_env = "BOOKFORGE_ELEVENLABS_RESOLVER_TTS_TEST_KEY";
-        unsafe { std::env::set_var(key_env, "resolver-tts-key") };
-        let resolved =
-            resolve_preferred_elevenlabs_model(&resolver_config(base_url, key_env), 5_000, false)
-                .await
-                .unwrap();
-        unsafe { std::env::remove_var(key_env) };
+        let resolved = retry_transient_transport(|| {
+            let body = body.to_string();
+            async move {
+                let (base_url, _) = one_request_server(body.into_bytes(), "application/json");
+                unsafe { std::env::set_var(key_env, "resolver-tts-key") };
+                let resolved = resolve_preferred_elevenlabs_model(
+                    &resolver_config(base_url, key_env),
+                    5_000,
+                    false,
+                )
+                .await;
+                unsafe { std::env::remove_var(key_env) };
+                resolved
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(resolved, "eleven_flash_v2_5");
     }
 
@@ -571,32 +734,56 @@ mod tests {
             {"model_id": "eleven_v3"},
             {"model_id": "eleven_flash_v2_5"}
         ]);
-        let (base_url, _) = one_request_server(body.to_string().into_bytes(), "application/json");
         let key_env = "BOOKFORGE_ELEVENLABS_RESOLVER_SPEED_TEST_KEY";
-        unsafe { std::env::set_var(key_env, "resolver-speed-key") };
-        let resolved =
-            resolve_preferred_elevenlabs_model(&resolver_config(base_url, key_env), 5_000, true)
-                .await
-                .unwrap();
-        unsafe { std::env::remove_var(key_env) };
+        let resolved = retry_transient_transport(|| {
+            let body = body.to_string();
+            async move {
+                let (base_url, _) = one_request_server(body.into_bytes(), "application/json");
+                unsafe { std::env::set_var(key_env, "resolver-speed-key") };
+                let resolved = resolve_preferred_elevenlabs_model(
+                    &resolver_config(base_url, key_env),
+                    5_000,
+                    true,
+                )
+                .await;
+                unsafe { std::env::remove_var(key_env) };
+                resolved
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(resolved, "eleven_flash_v2_5");
     }
 
     #[tokio::test]
     async fn resolver_sends_models_get_and_api_key_header() {
         let body = serde_json::json!([{"model_id": "eleven_multilingual_v2"}]);
-        let (base_url, captured) =
-            one_request_server(body.to_string().into_bytes(), "application/json");
         let key_env = "BOOKFORGE_ELEVENLABS_RESOLVER_REQUEST_TEST_KEY";
-        unsafe { std::env::set_var(key_env, "resolver-request-key") };
-        let resolved =
-            resolve_preferred_elevenlabs_model(&resolver_config(base_url, key_env), 5_000, false)
-                .await
-                .unwrap();
-        unsafe { std::env::remove_var(key_env) };
+        let (resolved, raw) = retry_transient_transport(|| {
+            let body = body.to_string();
+            async move {
+                let (base_url, captured) =
+                    one_request_server(body.into_bytes(), "application/json");
+                unsafe { std::env::set_var(key_env, "resolver-request-key") };
+                let resolved = resolve_preferred_elevenlabs_model(
+                    &resolver_config(base_url, key_env),
+                    5_000,
+                    false,
+                )
+                .await;
+                unsafe { std::env::remove_var(key_env) };
+                resolved.map(|resolved| {
+                    let raw = captured
+                        .recv_timeout(CAPTURE_WINDOW)
+                        .expect("mock should capture the request");
+                    (resolved, raw)
+                })
+            }
+        })
+        .await
+        .unwrap();
 
         assert_eq!(resolved, "eleven_multilingual_v2");
-        let raw = captured.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(raw.starts_with("GET /v1/models HTTP/1.1"));
         assert!(
             raw.to_ascii_lowercase()
@@ -606,45 +793,191 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_errors_on_unparseable_body() {
-        let (base_url, _) = one_request_server(b"not json".to_vec(), "application/json");
         let key_env = "BOOKFORGE_ELEVENLABS_RESOLVER_GARBAGE_TEST_KEY";
-        unsafe { std::env::set_var(key_env, "resolver-garbage-key") };
-        let error =
-            resolve_preferred_elevenlabs_model(&resolver_config(base_url, key_env), 5_000, false)
-                .await
-                .unwrap_err();
-        unsafe { std::env::remove_var(key_env) };
+        let error = retry_transient_transport(|| async {
+            let (base_url, _) = one_request_server(b"not json".to_vec(), "application/json");
+            unsafe { std::env::set_var(key_env, "resolver-garbage-key") };
+            let resolved = resolve_preferred_elevenlabs_model(
+                &resolver_config(base_url, key_env),
+                5_000,
+                false,
+            )
+            .await
+            .map(|_| panic!("garbage body should not resolve"));
+            unsafe { std::env::remove_var(key_env) };
+            resolved
+        })
+        .await
+        .unwrap_err();
         assert!(matches!(error, TtsError::Provider(_)));
         assert!(error.to_string().contains("parse ElevenLabs models"));
     }
 
     #[tokio::test]
     async fn resolver_errors_on_empty_body() {
-        let (base_url, _) = one_request_server(Vec::new(), "application/json");
         let key_env = "BOOKFORGE_ELEVENLABS_RESOLVER_EMPTY_TEST_KEY";
-        unsafe { std::env::set_var(key_env, "resolver-empty-key") };
-        let error =
-            resolve_preferred_elevenlabs_model(&resolver_config(base_url, key_env), 5_000, false)
-                .await
-                .unwrap_err();
-        unsafe { std::env::remove_var(key_env) };
+        let error = retry_transient_transport(|| async {
+            let (base_url, _) = one_request_server(Vec::new(), "application/json");
+            unsafe { std::env::set_var(key_env, "resolver-empty-key") };
+            let resolved = resolve_preferred_elevenlabs_model(
+                &resolver_config(base_url, key_env),
+                5_000,
+                false,
+            )
+            .await
+            .map(|_| panic!("empty body should not resolve"));
+            unsafe { std::env::remove_var(key_env) };
+            resolved
+        })
+        .await
+        .unwrap_err();
         assert!(matches!(error, TtsError::Provider(_)));
         assert!(error.to_string().contains("empty response body"));
+    }
+
+    /// Bind + drop a listener to obtain a port that reliably refuses
+    /// connections — an offline, deterministic stand-in for a network outage.
+    fn closed_loopback_url() -> String {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("listener for port reservation");
+        let address = listener.local_addr().expect("reserved address");
+        drop(listener);
+        format!("http://{address}/v1")
+    }
+
+    #[tokio::test]
+    async fn unreachable_preflight_fails_open_to_the_cheapest_suitable_tier() {
+        let config = resolver_config(closed_loopback_url(), "RESOLVER_DEGRADE_UNUSED_KEY");
+        let resolution = resolve_preferred_elevenlabs_model_reported_with_cancel(
+            &config,
+            5_000,
+            false,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("transient outage must degrade, not fail the run");
+
+        assert!(resolution.degraded);
+        assert_eq!(resolution.model, "eleven_flash_v2_5");
+        assert!(
+            resolution
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cheapest suitable tier"),
+            "{:?}",
+            resolution.reason
+        );
+        // The string-returning wrapper stays contract-compatible.
+        assert_eq!(
+            resolve_preferred_elevenlabs_model(&config, 5_000, false)
+                .await
+                .unwrap(),
+            "eleven_flash_v2_5"
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_choice_is_deterministic_across_resume_attempts() {
+        let config = resolver_config(closed_loopback_url(), "RESOLVER_DEGRADE_STABLE_KEY");
+        let first = resolve_preferred_elevenlabs_model_reported_with_cancel(
+            &config,
+            12_000,
+            false,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let second = resolve_preferred_elevenlabs_model_reported_with_cancel(
+            &config,
+            12_000,
+            false,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, second, "identical inputs must resolve identically");
+        // Flash carries the 40k ceiling too, so 12k chars still fit the
+        // cheapest tier; turbo would only appear for models that out-live
+        // flash's ceiling, which none do today.
+        assert_eq!(first.model, "eleven_flash_v2_5");
+        assert!(first.degraded && second.degraded);
+
+        // Pure-function parity: same answer without any request at all.
+        assert_eq!(
+            degraded_elevenlabs_model(12_000, false),
+            Some("eleven_flash_v2_5")
+        );
+    }
+
+    #[test]
+    fn degraded_order_never_selects_premium_tiers() {
+        for max_chars in [1usize, 5_000, 40_000] {
+            if let Some(model) = degraded_elevenlabs_model(max_chars, false) {
+                assert_ne!(model, "eleven_v3");
+                assert_ne!(model, "eleven_multilingual_v2", "chars={max_chars}");
+            }
+        }
+        assert_eq!(degraded_elevenlabs_model(40_001, false), None);
+    }
+
+    #[tokio::test]
+    async fn preflight_metadata_honours_cancellation_instead_of_waiting() {
+        // AUDIO-17: a cancelled token aborts the request path immediately
+        // (before any network work), regardless of endpoint reachability.
+        let config = resolver_config(closed_loopback_url(), "RESOLVER_CANCEL_UNUSED_KEY");
+        let token = CancellationToken::new();
+        token.cancel();
+        let started = std::time::Instant::now();
+        let outcome =
+            resolve_preferred_elevenlabs_model_reported_with_cancel(&config, 5_000, false, token)
+                .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        match outcome {
+            Err(TtsError::Cancelled) => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+
+        let key_token = CancellationToken::new();
+        key_token.cancel();
+        let cancelled = fetch_elevenlabs_subscription_with_key_and_cancel(
+            &closed_loopback_url(),
+            "sub-key",
+            5,
+            key_token,
+        )
+        .await;
+        assert!(matches!(cancelled, Err(TtsError::Cancelled)));
     }
 
     #[tokio::test]
     async fn explicit_key_subscription_get_parses_counts_and_sends_key() {
         let body = serde_json::json!({"character_count": 123, "character_limit": 456});
-        let (base_url, captured) =
-            one_request_server(body.to_string().into_bytes(), "application/json");
-        let subscription =
-            fetch_elevenlabs_subscription_with_key(&base_url, "explicit-subscription-key", 5)
+        let (subscription, raw) = retry_transient_transport(|| {
+            let body = body.to_string();
+            async move {
+                let (base_url, captured) =
+                    one_request_server(body.into_bytes(), "application/json");
+                fetch_elevenlabs_subscription_with_key_and_cancel(
+                    &base_url,
+                    "explicit-subscription-key",
+                    5,
+                    CancellationToken::new(),
+                )
                 .await
-                .unwrap();
+                .map(|subscription| {
+                    let raw = captured
+                        .recv_timeout(CAPTURE_WINDOW)
+                        .expect("mock should capture the request");
+                    (subscription, raw)
+                })
+            }
+        })
+        .await
+        .unwrap();
 
         assert_eq!(subscription.character_count, 123);
         assert_eq!(subscription.character_limit, 456);
-        let raw = captured.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(raw.starts_with("GET /v1/user/subscription HTTP/1.1"));
         assert!(
             raw.to_ascii_lowercase()
@@ -655,17 +988,29 @@ mod tests {
     #[tokio::test]
     async fn config_subscription_wrapper_resolves_key_from_environment() {
         let body = serde_json::json!({"character_count": 123, "character_limit": 456});
-        let (base_url, captured) =
-            one_request_server(body.to_string().into_bytes(), "application/json");
         let key_env = "BOOKFORGE_ELEVENLABS_SUBSCRIPTION_WRAPPER_TEST_KEY";
-        unsafe { std::env::set_var(key_env, "wrapper-subscription-key") };
-        let subscription = fetch_elevenlabs_subscription(&resolver_config(base_url, key_env))
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var(key_env) };
+        let (subscription, raw) = retry_transient_transport(|| {
+            let body = body.to_string();
+            async move {
+                let (base_url, captured) =
+                    one_request_server(body.into_bytes(), "application/json");
+                unsafe { std::env::set_var(key_env, "wrapper-subscription-key") };
+                let subscription =
+                    fetch_elevenlabs_subscription(&resolver_config(base_url, key_env)).await;
+                unsafe { std::env::remove_var(key_env) };
+                subscription.map(|subscription| {
+                    let raw = captured
+                        .recv_timeout(CAPTURE_WINDOW)
+                        .expect("mock should capture the request");
+                    (subscription, raw)
+                })
+            }
+        })
+        .await
+        .unwrap();
+
         assert_eq!(subscription.character_count, 123);
         assert_eq!(subscription.character_limit, 456);
-        let raw = captured.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(raw.starts_with("GET /v1/user/subscription HTTP/1.1"));
         assert!(
             raw.to_ascii_lowercase()
@@ -676,30 +1021,52 @@ mod tests {
     #[tokio::test]
     async fn config_subscription_wrapper_allows_missing_key_on_loopback() {
         let body = serde_json::json!({"character_count": 12, "character_limit": 34});
-        let (base_url, captured) =
-            one_request_server(body.to_string().into_bytes(), "application/json");
         let key_env = "BOOKFORGE_ELEVENLABS_SUBSCRIPTION_LOOPBACK_MISSING_TEST_KEY";
-        unsafe { std::env::remove_var(key_env) };
-        let subscription = fetch_elevenlabs_subscription(&resolver_config(base_url, key_env))
-            .await
-            .unwrap();
+        let (subscription, raw) = retry_transient_transport(|| {
+            let body = body.to_string();
+            async move {
+                let (base_url, captured) =
+                    one_request_server(body.into_bytes(), "application/json");
+                unsafe { std::env::remove_var(key_env) };
+                fetch_elevenlabs_subscription(&resolver_config(base_url, key_env))
+                    .await
+                    .map(|subscription| {
+                        let raw = captured
+                            .recv_timeout(CAPTURE_WINDOW)
+                            .expect("mock should capture the request");
+                        (subscription, raw)
+                    })
+            }
+        })
+        .await
+        .unwrap();
 
         assert_eq!(subscription.character_count, 12);
         assert_eq!(subscription.character_limit, 34);
-        let raw = captured.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(!raw.to_ascii_lowercase().contains("xi-api-key:"));
     }
 
     #[tokio::test]
     async fn subscription_rejects_oversized_json_before_buffering_body() {
-        let (base_url, _) = one_request_server_with_content_length(
-            b"{}".to_vec(),
-            "application/json",
-            MAX_JSON_RESPONSE_BODY_BYTES as u64 + 1,
-        );
-        let error = fetch_elevenlabs_subscription_with_key(&base_url, "oversize-key", 5)
-            .await
-            .unwrap_err();
+        let error = retry_transient_transport(|| async {
+            let (base_url, _) = one_request_server_with_content_length(
+                b"{}".to_vec(),
+                "application/json",
+                MAX_JSON_RESPONSE_BODY_BYTES as u64 + 1,
+            );
+            let outcome: std::result::Result<(), TtsError> =
+                fetch_elevenlabs_subscription_with_key_and_cancel(
+                    &base_url,
+                    "oversize-key",
+                    5,
+                    CancellationToken::new(),
+                )
+                .await
+                .map(|_| panic!("oversized response should be rejected"));
+            outcome
+        })
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, TtsError::Provider(_)));
         assert!(error.to_string().contains("8388608-byte limit"));
@@ -707,13 +1074,18 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_errors_on_garbage_body() {
-        let (base_url, _) = one_request_server(b"garbage".to_vec(), "application/json");
         let key_env = "BOOKFORGE_ELEVENLABS_SUBSCRIPTION_GARBAGE_TEST_KEY";
-        unsafe { std::env::set_var(key_env, "subscription-garbage-key") };
-        let error = fetch_elevenlabs_subscription(&resolver_config(base_url, key_env))
-            .await
-            .unwrap_err();
-        unsafe { std::env::remove_var(key_env) };
+        let error = retry_transient_transport(|| async {
+            let (base_url, _) = one_request_server(b"garbage".to_vec(), "application/json");
+            unsafe { std::env::set_var(key_env, "subscription-garbage-key") };
+            let subscription = fetch_elevenlabs_subscription(&resolver_config(base_url, key_env))
+                .await
+                .map(|_| panic!("garbage body should not parse"));
+            unsafe { std::env::remove_var(key_env) };
+            subscription
+        })
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("parse ElevenLabs subscription"));
     }
 
@@ -725,27 +1097,45 @@ mod tests {
             "category": "premade",
             "labels": {"accent": "italian"}
         }]});
-        let (base_url, captured) =
-            one_request_server(body.to_string().into_bytes(), "application/json");
-        let voices = list_elevenlabs_voices(&base_url, "voices-key", 5)
-            .await
-            .unwrap();
+        let (voices, raw) = retry_transient_transport(|| {
+            let body = body.to_string();
+            async move {
+                let (base_url, captured) =
+                    one_request_server(body.into_bytes(), "application/json");
+                list_elevenlabs_voices(&base_url, "voices-key", 5)
+                    .await
+                    .map(|voices| {
+                        let raw = captured
+                            .recv_timeout(CAPTURE_WINDOW)
+                            .expect("mock should capture the request");
+                        (voices, raw)
+                    })
+            }
+        })
+        .await
+        .unwrap();
+
         assert_eq!(voices.len(), 1);
         assert_eq!(voices[0].voice_id, "voice-1");
         assert_eq!(voices[0].name, "Narrator");
         assert_eq!(voices[0].category, "premade");
         assert_eq!(voices[0].labels["accent"], "italian");
-        let raw = captured.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(raw.starts_with("GET /v1/voices HTTP/1.1"));
         assert!(raw.to_ascii_lowercase().contains("xi-api-key: voices-key"));
     }
 
     #[tokio::test]
     async fn voices_errors_on_garbage_body() {
-        let (base_url, _) = one_request_server(b"garbage".to_vec(), "application/json");
-        let error = list_elevenlabs_voices(&base_url, "voices-garbage-key", 5)
-            .await
-            .unwrap_err();
+        let error = retry_transient_transport(|| async {
+            let (base_url, _) = one_request_server(b"garbage".to_vec(), "application/json");
+            let outcome: std::result::Result<(), TtsError> =
+                list_elevenlabs_voices(&base_url, "voices-garbage-key", 5)
+                    .await
+                    .map(|_| panic!("garbage body should not parse"));
+            outcome
+        })
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("parse ElevenLabs voices"));
     }
 
@@ -780,27 +1170,36 @@ mod tests {
     #[tokio::test]
     async fn sends_elevenlabs_header_voice_path_query_and_json_to_mock_server() {
         let expected_audio = b"ID3mock-audio".to_vec();
-        let (base_url, captured) = one_request_server(expected_audio.clone(), "audio/mpeg");
         let key_env = "BOOKFORGE_ELEVENLABS_TTS_CONTRACT_TEST_KEY";
-        // SAFETY: this test uses a crate-specific variable that no production
-        // code or parallel test reads.
-        unsafe { std::env::set_var(key_env, "eleven-test-key") };
-        let provider = ElevenLabsTtsProvider::new(ElevenLabsTtsConfig {
-            base_url,
-            api_key_env: key_env.to_string(),
-            model: "eleven_multilingual_v2".to_string(),
-            timeout_seconds: 5,
-            max_attempts: 1,
+        let (clip_bytes, raw) = retry_transient_transport(|| {
+            let expected_audio = expected_audio.clone();
+            async move {
+                let (base_url, captured) = one_request_server(expected_audio.clone(), "audio/mpeg");
+                // SAFETY: this test uses a crate-specific variable that no
+                // production code or parallel test reads.
+                unsafe { std::env::set_var(key_env, "eleven-test-key") };
+                let provider = ElevenLabsTtsProvider::new(ElevenLabsTtsConfig {
+                    base_url,
+                    api_key_env: key_env.to_string(),
+                    model: "eleven_multilingual_v2".to_string(),
+                    timeout_seconds: 5,
+                    max_attempts: 1,
+                })
+                .unwrap();
+                let clip = provider.synthesize(request(AudioFormat::Mp3)).await;
+                unsafe { std::env::remove_var(key_env) };
+                clip.map(|clip| {
+                    let raw = captured
+                        .recv_timeout(CAPTURE_WINDOW)
+                        .expect("mock should capture the request");
+                    (clip.bytes, raw)
+                })
+            }
         })
-        .unwrap();
-        let clip = provider
-            .synthesize(request(AudioFormat::Mp3))
-            .await
-            .expect("mocked ElevenLabs synthesis");
-        unsafe { std::env::remove_var(key_env) };
+        .await
+        .expect("mocked ElevenLabs synthesis");
 
-        assert_eq!(clip.bytes, expected_audio);
-        let raw = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(clip_bytes, expected_audio);
         let lowercase = raw.to_ascii_lowercase();
         assert!(raw.starts_with(
             "POST /v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb?output_format=mp3_44100_128 HTTP/1.1"

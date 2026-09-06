@@ -1,4 +1,6 @@
+use super::translations::translation_is_human_corrected_on;
 use super::*;
+use rusqlite::TransactionBehavior;
 
 #[derive(Debug, Clone, Copy)]
 pub enum RetryScope {
@@ -8,23 +10,40 @@ pub enum RetryScope {
 }
 
 impl JobStore {
+    /// Bulk-retry the segments matching `scope` for one job.
+    ///
+    /// The segment flip AND the job status roll-up commit in ONE `IMMEDIATE`
+    /// transaction so a crash between the two can never leave segments
+    /// `retry_pending` under a stale job status (atomic bulk retry). A missing
+    /// job row is an explicit [`StoreError::NotFound`], never a silent no-op.
     pub fn retry_segments(&self, job_id: &str, scope: RetryScope) -> Result<usize> {
-        let where_status = match scope {
-            RetryScope::Failed => "status = 'failed'",
-            RetryScope::NeedsReview => "status = 'needs_review'",
-            RetryScope::All => "status IN ('failed', 'needs_review')",
+        let wanted: &[SegmentStatus] = match scope {
+            RetryScope::Failed => &[SegmentStatus::Failed],
+            RetryScope::NeedsReview => &[SegmentStatus::NeedsReview],
+            RetryScope::All => &[SegmentStatus::Failed, SegmentStatus::NeedsReview],
         };
-        let sql = format!(
-            "UPDATE segments SET status = 'retry_pending', error = NULL WHERE job_id = ?1 AND {where_status}"
-        );
+        let where_status = format!("status IN ({})", SegmentStatus::sql_set(wanted));
         let count = {
-            let conn = self.conn.borrow();
-            conn.execute(&sql, params![job_id])?
+            let mut conn = self.conn.borrow_mut();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            ensure_job_exists(&tx, job_id)?;
+            let sql = format!(
+                "UPDATE segments SET status = '{}', error = NULL WHERE job_id = ?1 AND {where_status}",
+                SegmentStatus::RetryPending.as_db_text()
+            );
+            let count = tx.execute(&sql, params![job_id])?;
+            touch_job_unless_status_on(
+                &tx,
+                job_id,
+                JobStatus::RetryPending,
+                &[JobStatus::Stopped],
+            )?;
+            tx.commit()?;
+            count
         };
         // Findings are instrumentation, so a failed findings write must never
         // fail the surrounding translation checkpoint.
         let _ = self.prune_stale_findings(job_id);
-        self.touch_job_unless_status(job_id, "retry_pending", &["stopped"])?;
         Ok(count)
     }
 
@@ -34,13 +53,19 @@ impl JobStore {
         segment_id: &str,
         guidance: Option<&str>,
     ) -> Result<()> {
-        if self.translation_is_human_corrected(job_id, segment_id)? {
+        let mut conn = self.conn.borrow_mut();
+        // IMMEDIATE so the freeze check, the running/paused policy check, and
+        // the retry write are atomic against other processes sharing the
+        // database file. Checking human corrections here rather than before
+        // the transaction closes the window where a dashboard process could
+        // land a frozen correction between the check and the write (same
+        // TOCTOU family as H-1).
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if translation_is_human_corrected_on(&tx, job_id, segment_id)? {
             return Err(StoreError::InvalidCorrection(format!(
                 "segment '{segment_id}' has a frozen human correction"
             )));
         }
-        let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
         let job_status = tx
             .query_row(
                 "SELECT status FROM jobs WHERE id = ?1",
@@ -49,19 +74,25 @@ impl JobStore {
             )
             .optional()?;
         if let Some(job_status) = &job_status
-            && matches!(job_status.as_str(), "running" | "paused")
+            && matches!(
+                JobStatus::from_db_text(job_status),
+                JobStatus::Running | JobStatus::Paused
+            )
         {
             return Err(StoreError::InvalidCorrection(format!(
                 "job '{job_id}' is {job_status}; stop it before requesting a retry"
             )));
         }
         let updated = tx.execute(
-            "UPDATE segments SET status = 'retry_pending', error = NULL
-             WHERE job_id = ?1 AND id = ?2",
+            &format!(
+                "UPDATE segments SET status = '{}', error = NULL
+                 WHERE job_id = ?1 AND id = ?2",
+                SegmentStatus::RetryPending.as_db_text()
+            ),
             params![job_id, segment_id],
         )?;
         if updated == 0 {
-            return Err(StoreError::InvalidCorrection(format!(
+            return Err(StoreError::NotFound(format!(
                 "segment '{segment_id}' was not found in job '{job_id}'"
             )));
         }
@@ -84,7 +115,7 @@ impl JobStore {
         }
         tx.commit()?;
         drop(conn);
-        self.touch_job_unless_status(job_id, "retry_pending", &["stopped"])?;
+        self.touch_job_unless_status(job_id, JobStatus::RetryPending, &[JobStatus::Stopped])?;
         Ok(())
     }
 
@@ -120,7 +151,7 @@ impl JobStore {
             |row| row.get::<_, i64>(0),
         )? != 0;
         if !exists {
-            return Err(StoreError::InvalidCorrection(format!(
+            return Err(StoreError::NotFound(format!(
                 "segment '{segment_id}' was not found in job '{job_id}'"
             )));
         }
@@ -184,6 +215,7 @@ impl JobStore {
         segment_ids: &[String],
         reason: &str,
     ) -> Result<usize> {
+        ensure_job_exists(&self.conn.borrow(), job_id)?;
         const SQLITE_IN_CHUNK_SIZE: usize = 900;
         let mut updated = 0usize;
         for chunk in segment_ids.chunks(SQLITE_IN_CHUNK_SIZE) {
@@ -195,10 +227,11 @@ impl JobStore {
                 .join(", ");
             let sql = format!(
                 "UPDATE segments
-                 SET status = 'needs_review',
+                 SET status = '{}',
                      error = ?
                  WHERE job_id = ?
-                   AND id IN ({placeholders})"
+                   AND id IN ({placeholders})",
+                SegmentStatus::NeedsReview.as_db_text()
             );
             let conn = self.conn.borrow();
             let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(chunk.len() + 2);

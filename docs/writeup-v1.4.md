@@ -1,5 +1,8 @@
 # BookForge: Translating EPUBs Without Letting the LLM Near the Structure
 
+> **Historical snapshot:** this draft describes the v1.x-era implementation
+> and its batch contract; treat current `docs/` files as authoritative.
+
 Draft note refreshed after the v1.5 extraction and scheduling work. The file
 name is historical; the details below describe the current implementation.
 

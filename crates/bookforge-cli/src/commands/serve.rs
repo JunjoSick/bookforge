@@ -27,7 +27,7 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, Request, State},
+    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, RawQuery, Request, State},
     http::{HeaderMap, StatusCode, header::HOST},
     middleware::{self, Next},
     response::{
@@ -49,15 +49,19 @@ use crate::eventlog::{EventLogTailer, events_path_for};
 
 mod assets;
 mod audio;
+mod entities;
 mod glossary;
 mod jobs;
 mod options;
 mod security;
+mod styles;
 mod translation;
 
 use super::{audiobook, correct, estimate, reconfigure, review, validate};
 use security::{
-    generate_csrf_token, reject_mutation, require_loopback_bind, validate_dashboard_host,
+    AuthState, BootstrapOutcome, apply_security_headers, auth_logout, build_session_cookie,
+    is_cross_site_browser_request, reject_mutation, require_loopback_bind, session_cookie_from,
+    unauthorized, validate_dashboard_host,
 };
 use translation::{
     configure_dashboard_child_environment, provider_key_env, resolve_dashboard_provider_key,
@@ -68,6 +72,12 @@ const UPLOAD_DIR: &str = ".bookforge/serve-uploads";
 
 /// Cap on a multipart upload body (EPUBs in the regression corpus reach ~11 MB).
 const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Cap on dashboard operations that spawn work sharing remembered provider
+/// keys (translation launches, resumes, audiobook launches). A stray tab or a
+/// looping script must not be able to start unbounded billable runs in one
+/// burst; the slot is held only for the launch handshake itself.
+const MAX_CONCURRENT_DASHBOARD_LAUNCHES: usize = 4;
 
 /// Briefly check a detached translation child before reporting launch success.
 const CHILD_STARTUP_CHECK: Duration = Duration::from_millis(150);
@@ -144,24 +154,36 @@ const OPENROUTER_MODELS: &[&str] = &[
     "google/gemini-2.5-flash",
 ];
 const OPENAI_COMPATIBLE_MODELS: &[&str] = &["gpt-4o-mini", "gpt-4o"];
-const CSRF_HEADER: &str = "x-bookforge-csrf";
-const CSRF_TOKEN_PLACEHOLDER: &str = "__BOOKFORGE_CSRF_TOKEN__";
 const DASHBOARD_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; connect-src 'self'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; media-src 'self'; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'";
 
-/// Monotonic suffix for estimate temp files, so two uploads landing in the same
-/// millisecond never collide on a path (and delete each other's input mid-parse).
-static ESTIMATE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Monotonic suffix for launch tags and estimate temp files, so two uploads
+/// landing in the same millisecond never collide on a path (and delete each
+/// other's input mid-parse).
+static LAUNCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_launch_seq() -> u64 {
+    LAUNCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Debug, clap::Args)]
 pub struct ServeArgs {
-    /// Address to bind. Must be loopback because the dashboard is unauthenticated
-    /// and can accept provider API keys for child translation runs.
+    /// Address to bind. Must be loopback because the dashboard serves private
+    /// book text and can accept provider API keys for child runs.
     #[arg(long, default_value = "127.0.0.1:8765")]
     pub bind: String,
 
     /// Open the dashboard in your default browser once the server is up.
     #[arg(long)]
     pub open: bool,
+
+    /// Disable the session-token login printed at startup.
+    ///
+    /// Escape hatch for environments where the console is not reachable (for
+    /// example a container orchestrator that only forwards the port). With the
+    /// token disabled, any local process can spend remembered provider keys,
+    /// so prefer an SSH tunnel plus the default token flow instead.
+    #[arg(long)]
+    pub no_auth: bool,
 
     /// Server-sent-events refresh interval in milliseconds.
     #[arg(long, default_value_t = 250)]
@@ -171,7 +193,9 @@ pub struct ServeArgs {
 #[derive(Clone)]
 struct AppState {
     refresh: Duration,
-    csrf_token: String,
+    /// Server-side authentication: bootstrap-token exchange, in-memory session
+    /// store, and the `--no-auth` escape hatch. Default-on per H-5.
+    auth: Arc<AuthState>,
     host_port: u16,
     /// Root for browser uploads and audiobook operation directories. Production
     /// uses [`UPLOAD_DIR`]; tests inject a temp directory so route coverage does
@@ -207,12 +231,21 @@ struct AppState {
     /// missing the other's edit — while SQLite retains both, so the store and
     /// the book silently disagree.
     correction_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Held slots for dashboard launch operations (see
+    /// [`MAX_CONCURRENT_DASHBOARD_LAUNCHES`]).
+    launch_slots: Arc<Mutex<usize>>,
     #[cfg(test)]
     resume_launches: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     resume_child_environments: Option<Arc<Mutex<Vec<CapturedChildEnvironment>>>>,
+    /// Test hook mirroring [`Self::resume_launches`] for audiobook
+    /// retry-failed relaunches: when set, endpoint tests record the launch
+    /// count instead of exec'ing this binary as a child.
     #[cfg(test)]
-    audio_restart_cancels: Option<Arc<Mutex<Vec<u32>>>>,
+    retry_launches: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Test hook for proving spawn-failure cleanup without executing a child.
+    #[cfg(test)]
+    retry_fail_spawns: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[cfg(test)]
@@ -246,7 +279,7 @@ fn ensure_writable_workdir() -> Result<()> {
 
     let fallback =
         stable_data_dir().context("could not determine a writable data directory for BookForge")?;
-    std::fs::create_dir_all(&fallback)
+    ensure_private_dir_under(&fallback, &fallback)
         .with_context(|| format!("failed to create data directory {}", fallback.display()))?;
     if !data_root_is_writable(&fallback) {
         return Err(anyhow::anyhow!(
@@ -266,9 +299,14 @@ fn ensure_writable_workdir() -> Result<()> {
 /// Return true when a `.bookforge` directory can be created and written under
 /// `base`. A directory that merely exists isn't enough — it may be read-only —
 /// so this probes with an actual file write and cleans up after itself.
+///
+/// The probe creates the root through [`ensure_private_dir_under`] so the
+/// directory is 0700 on Unix from the first second of its existence (H-6):
+/// an earlier version used plain `create_dir_all`, which shipped a
+/// world-readable `.bookforge` until (or unless) something else tightened it.
 fn data_root_is_writable(base: &std::path::Path) -> bool {
     let root = base.join(".bookforge");
-    if std::fs::create_dir_all(&root).is_err() {
+    if ensure_private_dir_under(base, &root).is_err() {
         return false;
     }
     let probe = root.join(".write-probe");
@@ -278,6 +316,168 @@ fn data_root_is_writable(base: &std::path::Path) -> bool {
             true
         }
         Err(_) => false,
+    }
+}
+
+/// Tighten the serve-owned `.bookforge` root under the current working
+/// directory to 0700 (Unix), including one that a previous, world-readable
+/// run created. Every other component that lands inside the root goes through
+/// these helpers too — uploads, launch directories, private files.
+fn ensure_private_data_root() -> Result<()> {
+    ensure_private_dir_under(Path::new("."), Path::new(".bookforge"))
+        .context("failed to prepare the .bookforge data directory")
+}
+
+/// Drain store-open diagnostics once per serve process so schema-tolerance
+/// notes (unknown legacy statuses, skipped hardening) reach the operator
+/// instead of dying in the store's queue, matching the CLI surface behavior.
+fn drain_store_diagnostics_once() {
+    match bookforge_store::JobStore::open_default() {
+        Ok(store) => {
+            for diagnostic in store.take_diagnostics() {
+                tracing::warn!(surface = "serve", "{diagnostic}");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                surface = "serve",
+                "store open failed during diagnostics drain: {error}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private-directory and private-file helpers (H-6)
+//
+// Mirrors translate/snapshot.rs (`create_private_dir_all`, the 0600 snapshot
+// writer): recursive creation is asked for mode 0700 on Unix, and any
+// directory that already exists with looser bits (a leftover from an older,
+// pre-hardening release) is tightened in place. Non-Unix targets have no
+// equivalent permission model, so the chmod halves degrade to no-ops.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
+/// Ensure `path` exists as a private directory whose every component between
+/// it and `base` (inclusive on both ends) carries private permissions —
+/// creation happens with 0700 and pre-existing loose components are tightened.
+fn ensure_private_dir_under(base: &Path, path: &Path) -> std::io::Result<()> {
+    create_private_dir_all(path)?;
+    tighten_private_under(base, path);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn tighten_private_under(base: &Path, path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        // Best effort: tightening must never turn a writable-data-dir probe
+        // or an upload into a hard failure.
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        if dir == base {
+            break;
+        }
+        current = dir.parent();
+    }
+}
+
+#[cfg(not(unix))]
+fn tighten_private_under(_base: &Path, _path: &Path) {}
+
+/// A self-deleting scratch directory for untrusted upload content (SERVE-5).
+///
+/// Production code cannot use the `tempfile` crate (it is only a
+/// dev-dependency of this crate and Cargo.toml changes are outside this
+/// workstream), so this is a ~20-line equivalent holding the properties that
+/// matter: unpredictable per-request names (PID + monotonic counter + random
+/// bytes), creation with owner-only permissions on Unix, and deletion on drop
+/// whether the parse succeeds, fails, or panics.
+struct PrivateTempDir {
+    path: PathBuf,
+}
+
+impl Drop for PrivateTempDir {
+    fn drop(&mut self) {
+        // Best effort: leftover directories are swept by the OS tmp cleaner.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+impl PrivateTempDir {
+    fn create() -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..8 {
+            let mut randomness = [0u8; 8];
+            getrandom::fill(&mut randomness)
+                .context("failed to generate temporary directory name")?;
+            let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "bookforge-private-{}-{seq}-{}.tmp",
+                std::process::id(),
+                u64::from_be_bytes(randomness),
+            ));
+
+            #[cfg(unix)]
+            let created = {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new().mode(0o700).create(&path)
+            };
+            #[cfg(not(unix))]
+            let created = std::fs::create_dir(&path);
+
+            match created {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(anyhow::anyhow!(
+            "could not allocate a private temporary directory"
+        ))
+    }
+}
+
+/// Write `bytes` to `path` with owner-only permissions (0600 on Unix),
+/// including over a pre-existing, previously-loose file. Used for every EPUB
+/// the dashboard persists to disk.
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        // The creation mode already lands at 0600; normalize explicitly in
+        // case the overwrite reused a stale 0644 file from an older release.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
     }
 }
 
@@ -321,6 +521,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // untouched, so `bookforge serve` from a project folder still keeps its
     // `.bookforge` there.
     ensure_writable_workdir()?;
+    ensure_private_data_root()?;
+    drain_store_diagnostics_once();
 
     let addr: SocketAddr = args
         .bind
@@ -332,9 +534,17 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
     let local = listener.local_addr().unwrap_or(addr);
+    let auth_enabled = !args.no_auth;
+    let auth = AuthState::new(auth_enabled)?;
+    let bootstrap_url_token = auth.bootstrap_token();
     let state = AppState {
-        refresh: Duration::from_millis(args.refresh_ms.clamp(50, 5_000)),
-        csrf_token: generate_csrf_token()?,
+        // Same floor as `watch` (crate::commands::MIN_REFRESH_MS): one flag
+        // value, one floor, whichever UI consumes it.
+        refresh: Duration::from_millis(
+            args.refresh_ms
+                .clamp(crate::commands::MIN_REFRESH_MS, 5_000),
+        ),
+        auth: Arc::new(auth),
         host_port: local.port(),
         upload_dir: PathBuf::from(UPLOAD_DIR),
         keys: Arc::new(Mutex::new(HashMap::new())),
@@ -343,16 +553,27 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         store_path: default_store_path(),
         runtime_lease_stale_after: crate::control::RUNTIME_LEASE_STALE_AFTER,
         correction_locks: Arc::new(Mutex::new(HashMap::new())),
+        launch_slots: Arc::new(Mutex::new(0)),
         #[cfg(test)]
         resume_launches: None,
         #[cfg(test)]
         resume_child_environments: None,
         #[cfg(test)]
-        audio_restart_cancels: None,
+        retry_launches: None,
+        #[cfg(test)]
+        retry_fail_spawns: None,
     };
 
     let app = dashboard_router(state);
-    let url = format!("http://{local}/");
+    // With auth enabled, only this bootstrap URL — which embeds the one-time
+    // bootstrap token as a query parameter — may enter the dashboard. The
+    // exchange mints an HttpOnly session cookie and redirects to the clean
+    // root. Never echo the bootstrap token anywhere else.
+    let url = if auth_enabled {
+        format!("http://{local}/?token={bootstrap_url_token}")
+    } else {
+        format!("http://{local}/")
+    };
 
     println!("BookForge dashboard listening on {url}");
     println!("  press Ctrl-C to stop");
@@ -372,19 +593,143 @@ pub async fn run(args: ServeArgs) -> Result<()> {
 
 fn dashboard_router(state: AppState) -> Router {
     let host_state = state.clone();
+    let auth_state = state.clone();
     Router::new()
+        .route("/api/auth/logout", post(auth_logout))
         .merge(assets::routes())
         .merge(jobs::routes())
         .merge(options::routes())
         .merge(audio::routes())
         .merge(translation::routes())
         .merge(glossary::routes())
+        .merge(styles::routes())
+        .merge(entities::routes())
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        // H-5 / SERVE-1: every route outside the `/` bootstrap exchange and
+        // the `/api/auth/logout` session-management endpoint requires a live
+        // in-memory session cookie; hardened headers are stamped onto every
+        // response (SERVE-9). The host allowlist stays outermost so a forged
+        // Host is still rejected before authentication is even attempted.
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            enforce_dashboard_access,
+        ))
         .layer(middleware::from_fn_with_state(
             host_state,
             validate_dashboard_host,
         ))
         .with_state(state)
+}
+
+/// Gate middleware for the whole dashboard.
+///
+/// - Auth-on: everything except the `/` bootstrap exchange (which issues the
+///   session cookie) and `/api/auth/logout` (which a stale browser must be
+///   able to reach) requires the HttpOnly session cookie. Wrong/missing
+///   cookies get a bare 401 with no detail.
+/// - Security headers ride along on every response, not just the index page.
+async fn enforce_dashboard_access(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = if state.auth.enabled && !is_unauthenticated_dashboard_route(&request) {
+        if !state
+            .auth
+            .has_session(session_cookie_from(request.headers()))
+        {
+            let mut response = unauthorized();
+            apply_security_headers(&mut response);
+            return response;
+        }
+        next.run(request).await
+    } else {
+        next.run(request).await
+    };
+    apply_security_headers(&mut response);
+    response
+}
+
+/// Routes reachable without an authenticated session: the `/` bootstrap
+/// exchange and the logout endpoint (which must be callable to clear a stale
+/// cookie even when the session is already gone).
+fn is_unauthenticated_dashboard_route(request: &Request) -> bool {
+    matches!(request.uri().path(), "/" | "/api/auth/logout")
+}
+
+// ---------------------------------------------------------------------------
+// Shared request-safety helpers
+// ---------------------------------------------------------------------------
+
+/// Strict allowlist for job ids before they touch filesystem paths
+/// (SERVE-4; mirrors [`crate::commands::serve::audio`]'s audiobook-id check).
+/// Real ids look like `job_<unix-nanos>_<12 hex>`, so alphanumerics plus `-`
+/// and `_` accept everything legitimate while rejecting traversal, slashes,
+/// and percent-decoded junk outright.
+pub(super) fn valid_job_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 160
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// Filesystem-safe sanity bound for segment ids. Unlike job ids these reach
+/// SQL more than disk, so a looser but still path-hostile charset suffices:
+/// no separators, no traversal segments, no NULs, bounded length.
+fn valid_segment_id(segment_id: &str) -> bool {
+    !segment_id.is_empty()
+        && segment_id.len() <= 200
+        && !segment_id.contains(['/', '\\'])
+        && segment_id != ".."
+}
+
+fn invalid_job_id_response() -> Response {
+    bad_request("invalid job id")
+}
+
+/// A counted slot holding one dashboard launch above the
+/// [`MAX_CONCURRENT_DASHBOARD_LAUNCHES`] cap. Dropping the guard releases the
+/// slot, so panics or early returns cannot strand capacity.
+struct LaunchSlotGuard {
+    slots: Arc<Mutex<usize>>,
+}
+
+impl Drop for LaunchSlotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.slots.lock() {
+            *held = held.saturating_sub(1);
+        }
+    }
+}
+
+enum LaunchSlot {
+    Acquired(LaunchSlotGuard),
+    Exhausted,
+}
+
+fn try_acquire_launch_slot(state: &AppState) -> Result<LaunchSlot> {
+    let mut held = state
+        .launch_slots
+        .lock()
+        .map_err(|_| anyhow::anyhow!("dashboard launch registry is unavailable"))?;
+    if *held >= MAX_CONCURRENT_DASHBOARD_LAUNCHES {
+        return Ok(LaunchSlot::Exhausted);
+    }
+    *held += 1;
+    Ok(LaunchSlot::Acquired(LaunchSlotGuard {
+        slots: Arc::clone(&state.launch_slots),
+    }))
+}
+
+fn launch_slot_exhausted() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "error": "another dashboard launch is already starting; try again in a moment",
+        })),
+    )
+        .into_response()
 }
 
 async fn shutdown_signal() {
@@ -455,13 +800,23 @@ fn forbidden(message: &str) -> Response {
 }
 
 /// Wraps any error so handlers can use `?`; renders as a 500 JSON body.
+///
+/// The response carries a generic message plus a short correlation reference
+/// instead of the anyhow chain (SERVE-10): chains have repeatedly leaked
+/// absolute store/run paths that are useless — and mildly informative — to an
+/// HTTP client. The full chain still reaches the server console for triage.
 struct AppError(anyhow::Error);
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let chain = format!("{:?}\n{:#}", self.0, self.0);
+        let reference = error_reference(&chain);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": self.0.to_string() })),
+            Json(json!({
+                "error": "internal server error",
+                "reference": reference,
+            })),
         )
             .into_response()
     }
@@ -472,8 +827,21 @@ where
     E: Into<anyhow::Error>,
 {
     fn from(err: E) -> Self {
-        Self(err.into())
+        let err: anyhow::Error = err.into();
+        eprintln!("[serve] internal error: {err:#}");
+        Self(err)
     }
+}
+
+/// A short stable digest of the error chain so a user-reported `reference`
+/// can be matched against the console log without exposing the chain itself.
+fn error_reference(detail: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in detail.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 // ---------------------------------------------------------------------------

@@ -2,37 +2,57 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bookforge_core::{
     Result as CoreResult,
     entity::EntityGender,
-    glossary::{GlossaryCategory, GlossaryScopeKind, GlossaryStatus, GlossaryTerm},
+    glossary::{
+        GlossaryCategory, GlossaryPromptTerm, GlossaryScopeKind, GlossaryStatus, GlossaryTerm,
+        select_glossary_for_segments,
+    },
     ir::BlockId,
-    run_snapshot::RunConfigSnapshot,
-    segment::{BlockTranslation, Segment},
+    run_snapshot::{CachePolicySnapshot, CachePromptInputs, RunConfigSnapshot},
+    segment::{BlockTranslation, CacheIdentity, MinimalCacheIdentity, Segment},
 };
 use rusqlite::{Connection, OptionalExtension, params, types::Type};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 
+mod assets_delete;
 mod findings;
 mod flags;
 mod glossary;
 mod jobs;
+mod prune;
 mod schema;
+mod status;
 mod translations;
 
+#[cfg(test)]
+mod migrations_docs;
+
+// Internal cross-module helpers shared by the transactional checkpoint paths.
+use findings::{NewQaFindingRow, insert_qa_finding_row};
+use jobs::{ensure_job_exists, job_exists_on, touch_job_unless_status_on};
+use translations::{
+    clear_segment_findings_on, record_segment_engine_findings_on, record_segment_findings_on,
+};
+
 pub use findings::{
-    QaFinding, QaFindingCount, QaFindingKind, QaFindingSeverity, StoredQaFinding,
+    EngineFinding, QaFinding, QaFindingCount, QaFindingKind, QaFindingSeverity, StoredQaFinding,
     aggregate_findings, classify_segment_error,
 };
 pub use flags::RetryScope;
+pub use prune::{PruneJobDeletion, PruneJobsOptions, PruneJobsReport};
 pub use schema::run_doctor;
 #[cfg(test)]
-use schema::table_column_is_not_null;
+use schema::{restore_safe_status_harden, table_column_is_not_null};
+pub use status::{JobStatus, SegmentStatus};
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -52,11 +72,44 @@ pub enum StoreError {
 
     #[error("manual correction rejected: {0}")]
     InvalidCorrection(String),
+
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 pub struct JobStore {
     conn: RefCell<Connection>,
     path: PathBuf,
+    /// Non-fatal conditions noticed while opening or migrating (for example
+    /// status values outside the canonical sets on legacy databases). Empty in
+    /// the common case; `take_diagnostics` drains them for surfacing.
+    diagnostics: Mutex<Vec<String>>,
+}
+
+impl JobStore {
+    pub(crate) fn new(conn: Connection, path: PathBuf) -> Self {
+        Self {
+            conn: RefCell::new(conn),
+            path,
+            diagnostics: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Drain non-fatal open/migration diagnostics (warn-once per call). The
+    /// common case is an empty vec: every field is only populated when the
+    /// underlying database carries state BookForge never wrote.
+    pub fn take_diagnostics(&self) -> Vec<String> {
+        self.diagnostics
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn push_diagnostic(&self, message: String) {
+        if let Ok(mut guard) = self.diagnostics.lock() {
+            guard.push(message);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +134,14 @@ pub struct JobRecord {
     pub series_id: Option<String>,
 }
 
+impl JobRecord {
+    /// Typed decode of [`Self::status`]. Unknown legacy values decode to
+    /// [`JobStatus::Unknown`] instead of panicking.
+    pub fn job_status(&self) -> JobStatus {
+        JobStatus::from_db_text(&self.status)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct JobSummary {
     pub id: String,
@@ -95,6 +156,13 @@ pub struct JobSummary {
     pub input_tokens: u64,
     pub input_cached_tokens: u64,
     pub output_tokens: u64,
+}
+
+impl JobSummary {
+    /// Typed decode of [`Self::status`]. See [`JobRecord::job_status`].
+    pub fn job_status(&self) -> JobStatus {
+        JobStatus::from_db_text(&self.status)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +191,14 @@ pub struct SegmentRecord {
     pub tokens_estimated: bool,
 }
 
+impl SegmentRecord {
+    /// Typed decode of [`Self::status`]. Unknown legacy values decode to
+    /// [`SegmentStatus::Unknown`] instead of panicking.
+    pub fn segment_status(&self) -> SegmentStatus {
+        SegmentStatus::from_db_text(&self.status)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredBlockTranslation {
     pub segment_id: String,
@@ -142,6 +218,13 @@ pub struct StoredSegmentTranslation {
     pub model: String,
     pub human_corrected: bool,
     pub corrected_at: Option<String>,
+}
+
+impl StoredSegmentTranslation {
+    /// Typed decode of [`Self::status`]. See [`SegmentRecord::segment_status`].
+    pub fn segment_status(&self) -> SegmentStatus {
+        SegmentStatus::from_db_text(&self.status)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +291,140 @@ pub struct CacheLookupRequest<'a> {
     pub source_lang: Option<&'a str>,
     pub target_lang: &'a str,
     pub cache_namespace: &'a str,
+    /// Caller-computed expected structured cache identity fingerprints keyed
+    /// by CURRENT segment id (see
+    /// [`JobStore::expected_cache_fingerprints`]). Keying by segment id — not
+    /// by source checksum — makes the per-current-segment contract
+    /// unambiguous: duplicate source text at different positions/context
+    /// resolves to different expected fingerprints and can never collide.
+    /// Lookups match candidates on these directly and never discover an
+    /// expected fingerprint by searching prior segment rows.
+    pub expected_fingerprints: &'a HashMap<String, String>,
+}
+
+/// Pipeline phase of a translation attempt, persisted in the append-only
+/// `translation_attempts` ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslationAttemptPhase {
+    Primary,
+    Fallback,
+    Repair,
+    Qa,
+    DoubleCheck,
+}
+
+impl TranslationAttemptPhase {
+    pub fn as_db_text(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Fallback => "fallback",
+            Self::Repair => "repair",
+            Self::Qa => "qa",
+            Self::DoubleCheck => "double_check",
+        }
+    }
+
+    pub fn from_db_text(text: &str) -> Option<Self> {
+        match text {
+            "primary" => Some(Self::Primary),
+            "fallback" => Some(Self::Fallback),
+            "repair" => Some(Self::Repair),
+            "qa" => Some(Self::Qa),
+            "double_check" => Some(Self::DoubleCheck),
+            _ => None,
+        }
+    }
+}
+
+/// Outcome of a translation attempt. `Skipped` covers cache hits: the segment
+/// was fulfilled without a fresh provider call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslationAttemptOutcome {
+    Success,
+    Failure,
+    Partial,
+    Skipped,
+}
+
+impl TranslationAttemptOutcome {
+    pub fn as_db_text(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Partial => "partial",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn from_db_text(text: &str) -> Option<Self> {
+        match text {
+            "success" => Some(Self::Success),
+            "failure" => Some(Self::Failure),
+            "partial" => Some(Self::Partial),
+            "skipped" => Some(Self::Skipped),
+            _ => None,
+        }
+    }
+}
+
+/// Append-only attempt record request. `batch_id` ties the attempt to a batch
+/// when it was produced by one; `cost_estimate` is an optional dollar cost.
+/// `attempt_ordinal` is assigned monotonically by the store (one past the
+/// current per-(job, segment) count); `phase` is inferred from the provider/
+/// model against the job's primary configuration when `None`.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordTranslationAttempt<'a> {
+    pub job_id: &'a str,
+    pub segment_id: &'a str,
+    pub batch_id: Option<&'a str>,
+    pub phase: Option<TranslationAttemptPhase>,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub outcome: TranslationAttemptOutcome,
+    pub error: Option<&'a str>,
+    pub input_tokens: Option<u64>,
+    pub input_cached_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cost_estimate: Option<f64>,
+}
+
+/// One persisted `translation_attempts` row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranslationAttemptRecord {
+    pub id: i64,
+    pub job_id: String,
+    pub segment_id: String,
+    pub batch_id: Option<String>,
+    pub phase: String,
+    pub attempt_ordinal: usize,
+    pub provider: String,
+    pub model: String,
+    pub outcome: String,
+    pub error: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub input_cached_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cost_estimate: Option<f64>,
+    pub created_at: String,
+}
+
+/// Aggregated token/cost totals for one job, derived from the append-only
+/// ledger. [`Self::has_ledger`] reports whether the job has any attempt rows
+/// at all; job-level summaries mix the ledger with legacy per-segment token
+/// columns so jobs that straddle the ledger boundary aggregate accurately.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TranslationAttemptSummary {
+    pub attempts: usize,
+    pub input_tokens: u64,
+    pub input_cached_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_estimate: f64,
+}
+
+impl TranslationAttemptSummary {
+    pub fn has_ledger(&self) -> bool {
+        self.attempts > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -317,9 +534,25 @@ pub struct StorageDoctor {
     pub note: String,
 }
 
+/// SHA-256 of a file read in bounded chunks (STORE-17 part B). EPUB inputs run
+/// into the hundreds of megabytes; hashing streamed 64 KiB at a time keeps the
+/// store's peak memory flat instead of loading the whole file into RAM like the
+/// former `fs::read` + one-shot digest did.
+const FILE_HASH_CHUNK_BYTES: usize = 64 * 1024;
+
 fn file_hash(path: &Path) -> CoreResult<String> {
-    let bytes = fs::read(path)?;
-    Ok(stable_hash_bytes(&bytes))
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; FILE_HASH_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn stable_hash(text: &str) -> String {

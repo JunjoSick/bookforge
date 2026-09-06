@@ -207,8 +207,6 @@ impl BatchModeSizing {
         let mut state = Self {
             target_tokens: initial_target_tokens,
             max_items: initial_max_items,
-            initial_target_tokens,
-            initial_max_items,
             // Explicit user/runtime limits below the adaptive defaults are
             // still authoritative. They become the floor for this sizing
             // epoch; adaptation may grow from them but must not silently
@@ -560,6 +558,24 @@ pub(super) fn token_estimate(text: &str) -> usize {
     bookforge_core::segment::estimate_tokens(text)
 }
 
+/// Fixed prompt-scaffold overhead for one batch request, measured over the
+/// built-in templates (`translate_batch_plain.v3.md`, `_marker_safe_`,
+/// `_run_preserving_`, `_repair_`; system section plus the fixed user
+/// instructions): their static text alone estimates to roughly 180–680
+/// tokens at the ~4-chars-per-token heuristic, before any item payload.
+/// 512 is the conservative middle used when the context-window remainder
+/// is computed, because the per-item JSON payload is already part of
+/// `token_estimate`.
+pub(super) const BATCH_TEMPLATE_OVERHEAD_TOKENS: usize = 512;
+
+/// Prompt-token estimate for one batch request as seen by the model's
+/// context window: the packed item payload plus the fixed template scaffold.
+pub(super) fn batch_prompt_estimate(batch: &TranslationBatch) -> usize {
+    batch
+        .token_estimate
+        .saturating_add(BATCH_TEMPLATE_OVERHEAD_TOKENS)
+}
+
 fn item_token_estimate(
     item: &TranslationBatchItem,
     config: Option<&TranslationRunConfig>,
@@ -614,10 +630,33 @@ fn expected_batch_output_tokens(mode: BatchMode, items: &[TranslationBatchItem])
         .saturating_add(run_envelope)
 }
 
-fn configured_batch_output_limit(config: Option<&TranslationRunConfig>) -> Option<usize> {
+/// The configured provider timeout, when the run surfaces one through its
+/// live runtime settings. Library callers without runtime settings get `None`
+/// and planning then imposes no latency constraint (the provider-side
+/// per-request timeout extension still applies).
+pub(super) fn configured_timeout_seconds(config: Option<&TranslationRunConfig>) -> Option<u64> {
     config
+        .and_then(|config| config.runtime_settings.as_ref())
+        .map(|receiver| receiver.borrow().timeout_seconds)
+}
+
+fn configured_batch_output_limit(config: Option<&TranslationRunConfig>) -> Option<usize> {
+    let user_cap = config
         .and_then(|config| config.batch_max_output_tokens.or(config.max_output_tokens))
-        .map(|limit| limit as usize)
+        .map(|limit| limit as usize);
+    // Latency-aware output dimension: a batch whose expected output would
+    // take longer than 80% of the configured timeout to generate is treated
+    // as exceeding the output limit, so the normal planning machinery splits
+    // it instead of dispatching a request that can only succeed by luck.
+    // Single-item batches cannot split and keep their budget — the
+    // provider's per-request timeout extension covers them.
+    let latency_cap = configured_timeout_seconds(config)
+        .map(crate::latency::planning_output_token_cap)
+        .map(|limit| limit as usize);
+    match (user_cap, latency_cap) {
+        (Some(user_cap), Some(latency_cap)) => Some(user_cap.min(latency_cap)),
+        (user_cap, latency_cap) => user_cap.or(latency_cap),
+    }
 }
 
 fn batch_fits_limits(

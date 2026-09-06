@@ -1,9 +1,11 @@
 use bookforge_core::{
     config::{BatchConfig, ProviderRequestMetric, TranslationProfile},
+    finding::EngineFinding,
     glossary::GlossaryFormat,
     ir::{BlockId, ProtectedSpan, ProtectedSpanKind, QaFindingSeverity},
     segment::{BlockTranslation, Segment, SegmentId, SegmentStatus, SegmentTextRun},
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque, hash_map::Entry};
 use std::sync::{
     Arc,
@@ -38,15 +40,16 @@ use execution::{
     translate_one_batch,
 };
 pub use execution::{
-    collect_repair_items, translate_batches_with_callback, translate_batches_with_control,
+    block_mismatch_findings, collect_repair_items, translate_batches_with_callback,
+    translate_batches_with_control,
 };
 #[cfg(test)]
 use planning::repack_batch;
 pub use planning::{account_for_batch_prompt_overhead, build_translation_batches, split_batch};
 use planning::{
-    adaptive_sizer_mut, increment_batch_item_attempts, normalize_batch_for_current_sizer,
-    repartition_pending_batches, set_batch_output_override, split_batch_with_config,
-    take_batch_output_override, token_estimate,
+    adaptive_sizer_mut, batch_prompt_estimate, configured_timeout_seconds,
+    increment_batch_item_attempts, normalize_batch_for_current_sizer, repartition_pending_batches,
+    set_batch_output_override, split_batch_with_config, take_batch_output_override, token_estimate,
 };
 pub use rendering::batch_item_validation_error;
 pub use rendering::parse_batch_response;
@@ -192,7 +195,7 @@ impl std::ops::Deref for BatchItemValidationError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchItemFailure {
     pub item_id: String,
     pub segment_id: SegmentId,
@@ -201,6 +204,12 @@ pub struct BatchItemFailure {
     pub input_cached_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub tokens_estimated: bool,
+    /// Structured, block-attributed findings captured at the validation
+    /// point that produced this failure. Additive and backward compatible:
+    /// payloads written before this field existed deserialize with an empty
+    /// vec, and consumers that still read `error` keep working unchanged.
+    #[serde(default)]
+    pub findings: Vec<EngineFinding>,
 }
 
 #[derive(Clone)]
@@ -215,10 +224,6 @@ pub struct BatchSizer {
 pub struct BatchModeSizing {
     target_tokens: usize,
     max_items: usize,
-    #[allow(dead_code)]
-    initial_target_tokens: usize,
-    #[allow(dead_code)]
-    initial_max_items: usize,
     min_tokens: usize,
     max_tokens: usize,
     min_items: usize,

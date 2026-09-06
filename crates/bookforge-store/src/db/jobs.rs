@@ -1,5 +1,15 @@
 use super::*;
 
+/// Whether a `jobs` row exists. Mutation APIs use this to surface
+/// [`StoreError::NotFound`] instead of silently succeeding on a missing job.
+pub(super) fn job_exists_on(conn: &Connection, job_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = ?1)",
+        params![job_id],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
 impl JobStore {
     pub fn create_job(&self, request: CreateJob<'_>) -> Result<JobRecord> {
         let input_hash = file_hash(request.input)?;
@@ -8,10 +18,14 @@ impl JobStore {
         let input_path = request.input.to_path_buf();
         let output_path = request.output.to_path_buf();
         let conn = self.conn.borrow();
-        conn.execute(
+        let sql = format!(
             "INSERT INTO jobs
              (id, input_path, output_path, input_hash, source_lang, target_lang, provider, model, base_url, api_key_env, book_id, series_id, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'running', ?13, ?13)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, '{}', ?13, ?13)",
+            JobStatus::Running.as_db_text()
+        );
+        conn.execute(
+            &sql,
             params![
                 id,
                 input_path.to_string_lossy(),
@@ -42,7 +56,7 @@ impl JobStore {
             model: request.model.to_string(),
             base_url: request.base_url.map(ToOwned::to_owned),
             api_key_env: request.api_key_env.map(ToOwned::to_owned),
-            status: "running".to_string(),
+            status: JobStatus::Running.label().to_string(),
             events_path: None,
             report_json_path: None,
             report_markdown_path: None,
@@ -59,6 +73,7 @@ impl JobStore {
         let json = serde_json::to_string(snapshot)
             .map_err(|e| StoreError::Serialization(e.to_string()))?;
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         conn.execute(
             "UPDATE jobs
              SET config_json = ?1,
@@ -102,6 +117,7 @@ impl JobStore {
         input_sha256: &str,
     ) -> Result<()> {
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         conn.execute(
             "UPDATE jobs
              SET input_snapshot_path = ?1,
@@ -116,6 +132,45 @@ impl JobStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Persist the durable cache policy (strict-context and future
+    /// cache-affecting settings that are not part of the historical
+    /// [`RunConfigSnapshot`] surface). Jobs that never record a policy read
+    /// back the conservative default, which can never reuse cache written by
+    /// a run that states an explicit policy.
+    pub fn update_job_cache_policy(
+        &self,
+        job_id: &str,
+        policy: &CachePolicySnapshot,
+    ) -> Result<()> {
+        let json = serde_json::to_string(policy)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let conn = self.conn.borrow();
+        let updated = conn.execute(
+            "UPDATE jobs
+             SET cache_policy_json = ?1, updated_at = ?2
+             WHERE id = ?3",
+            params![json, timestamp_string(), job_id],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound(format!(
+                "job '{job_id}' was not found"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Load the persisted cache policy, defaulting to the conservative
+    /// unknown-strictness policy for jobs that never recorded one.
+    pub fn load_job_cache_policy(&self, job_id: &str) -> Result<CachePolicySnapshot> {
+        let conn = self.conn.borrow();
+        if !job_exists_on(&conn, job_id)? {
+            return Err(StoreError::NotFound(format!(
+                "job '{job_id}' was not found"
+            )));
+        }
+        super::translations::load_cache_policy_on(&conn, job_id)
     }
 
     pub fn load_job_config_snapshot(&self, job_id: &str) -> Result<Option<RunConfigSnapshot>> {
@@ -139,6 +194,7 @@ impl JobStore {
 
     pub fn update_job_event_path(&self, job_id: &str, path: &Path) -> Result<()> {
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         conn.execute(
             "UPDATE jobs SET events_path = ?1, updated_at = ?2 WHERE id = ?3",
             params![path.to_string_lossy(), timestamp_string(), job_id],
@@ -153,6 +209,7 @@ impl JobStore {
         markdown_path: &Path,
     ) -> Result<()> {
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         conn.execute(
             "UPDATE jobs
              SET report_json_path = ?1, report_markdown_path = ?2, updated_at = ?3
@@ -169,6 +226,7 @@ impl JobStore {
 
     pub fn update_job_output_path(&self, job_id: &str, path: &Path) -> Result<()> {
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         conn.execute(
             "UPDATE jobs SET output_path = ?1, updated_at = ?2 WHERE id = ?3",
             params![path.to_string_lossy(), timestamp_string(), job_id],
@@ -177,40 +235,42 @@ impl JobStore {
     }
 
     pub fn recompute_job_status(&self, job_id: &str) -> Result<()> {
+        let resolved = SegmentStatus::sql_set(SegmentStatus::resolved());
         let conn = self.conn.borrow();
-        let (total, unresolved) = conn.query_row(
+        let sql = format!(
             "SELECT COUNT(*),
-                    COALESCE(SUM(CASE WHEN status IN ('succeeded', 'skipped_cached') THEN 0 ELSE 1 END), 0)
-             FROM segments WHERE job_id = ?1",
-            params![job_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )?;
+                    COALESCE(SUM(CASE WHEN status IN ({resolved}) THEN 0 ELSE 1 END), 0)
+             FROM segments WHERE job_id = ?1"
+        );
+        let (total, unresolved) = conn.query_row(&sql, params![job_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
         drop(conn);
         if total > 0 && unresolved == 0 {
-            self.touch_job(job_id, "succeeded")
+            self.touch_job(job_id, JobStatus::Succeeded)
         } else {
-            self.touch_job(job_id, "needs_review")
+            self.touch_job(job_id, JobStatus::NeedsReview)
         }
     }
 
     pub fn mark_job_complete(&self, job_id: &str) -> Result<()> {
-        self.touch_job_unless_status(job_id, "succeeded", &["stopped"])
+        self.touch_job_unless_status(job_id, JobStatus::Succeeded, &[JobStatus::Stopped])
     }
 
     pub fn mark_job_running(&self, job_id: &str) -> Result<()> {
-        self.touch_job_unless_status(job_id, "running", &["stopped"])
+        self.touch_job_unless_status(job_id, JobStatus::Running, &[JobStatus::Stopped])
     }
 
     pub fn mark_job_running_for_resume(&self, job_id: &str) -> Result<()> {
-        self.touch_job(job_id, "running")
+        self.touch_job(job_id, JobStatus::Running)
     }
 
     pub fn mark_job_paused(&self, job_id: &str) -> Result<()> {
-        self.touch_job_unless_status(job_id, "paused", &["stopped"])
+        self.touch_job_unless_status(job_id, JobStatus::Paused, &[JobStatus::Stopped])
     }
 
     pub fn mark_job_stopped(&self, job_id: &str) -> Result<()> {
-        self.touch_job(job_id, "stopped")
+        self.touch_job(job_id, JobStatus::Stopped)
     }
 
     pub fn mark_job_succeeded(&self, job_id: &str) -> Result<()> {
@@ -218,24 +278,40 @@ impl JobStore {
     }
 
     pub fn mark_job_needs_review(&self, job_id: &str) -> Result<()> {
-        self.touch_job_unless_status(job_id, "needs_review", &["stopped"])
+        self.touch_job_unless_status(job_id, JobStatus::NeedsReview, &[JobStatus::Stopped])
     }
 
     pub fn mark_job_interrupted(&self, job_id: &str) -> Result<()> {
-        self.touch_job_unless_status(job_id, "interrupted", &["stopped"])
+        self.touch_job_unless_status(job_id, JobStatus::Interrupted, &[JobStatus::Stopped])
     }
 
     pub fn mark_job_failed(&self, job_id: &str) -> Result<()> {
-        self.touch_job_unless_status(job_id, "failed", &["stopped"])
+        self.touch_job_unless_status(job_id, JobStatus::Failed, &[JobStatus::Stopped])
     }
 
+    /// Force a segment into `failed` regardless of its current status.
+    ///
+    /// Production checkpoint paths should prefer
+    /// [`JobStore::mark_segment_failed_if_unfinished`], which refuses to
+    /// clobber terminal-with-translation states (`succeeded`,
+    /// `needs_review`, ...) so a late failure report can never destroy work
+    /// already persisted. Keep this twin only where overwriting is the point
+    /// (fixtures, deliberate state repair).
     pub fn mark_segment_failed(&self, job_id: &str, segment_id: &str, error: &str) -> Result<()> {
-        {
+        let updated = {
             let conn = self.conn.borrow();
-            conn.execute(
-                "UPDATE segments SET status = 'failed', attempts = attempts + 1, error = ?1 WHERE job_id = ?2 AND id = ?3",
-                params![error, job_id, segment_id],
-            )?;
+            ensure_job_exists(&conn, job_id)?;
+            let sql = format!(
+                "UPDATE segments SET status = '{}', attempts = attempts + 1, error = ?1
+                 WHERE job_id = ?2 AND id = ?3",
+                SegmentStatus::Failed.as_db_text()
+            );
+            conn.execute(&sql, params![error, job_id, segment_id])?
+        };
+        if updated == 0 {
+            return Err(StoreError::NotFound(format!(
+                "segment '{segment_id}' was not found in job '{job_id}'"
+            )));
         }
         // Findings are instrumentation, so a failed findings write must never
         // fail the surrounding translation checkpoint.
@@ -252,15 +328,26 @@ impl JobStore {
     ) -> Result<()> {
         let updated = {
             let conn = self.conn.borrow();
-            conn.execute(
+            ensure_job_exists(&conn, job_id)?;
+            let sql = format!(
                 "UPDATE segments
-                 SET status = 'failed', attempts = attempts + 1, error = ?1
+                 SET status = '{}', attempts = attempts + 1, error = ?1
                  WHERE job_id = ?2
                    AND id = ?3
-                   AND status NOT IN ('succeeded', 'skipped_cached', 'needs_review')",
-                params![error, job_id, segment_id],
-            )?
+                   AND status NOT IN ({})",
+                SegmentStatus::Failed.as_db_text(),
+                SegmentStatus::sql_set(SegmentStatus::terminal_with_translation())
+            );
+            conn.execute(&sql, params![error, job_id, segment_id])?
         };
+        if updated == 0 && !segment_exists(&self.conn.borrow(), job_id, segment_id)? {
+            // Zero rows can legitimately mean "the segment already reached a
+            // terminal-with-translation state" (an intentional no-op); a
+            // segment that does not EXIST at all must surface as NotFound.
+            return Err(StoreError::NotFound(format!(
+                "segment '{segment_id}' was not found in job '{job_id}'"
+            )));
+        }
         if updated > 0 {
             // Findings are instrumentation, so a failed findings write must
             // never fail the surrounding translation checkpoint.
@@ -276,8 +363,11 @@ impl JobStore {
         candidate_segment_ids: &[String],
         error: &str,
     ) -> Result<usize> {
+        ensure_job_exists(&self.conn.borrow(), job_id)?;
         const SQLITE_IN_CHUNK_SIZE: usize = 900;
         let mut updated = 0;
+        let failed_status = SegmentStatus::Failed.as_db_text();
+        let untouched = SegmentStatus::sql_set(SegmentStatus::terminal_with_translation());
 
         for chunk in candidate_segment_ids.chunks(SQLITE_IN_CHUNK_SIZE) {
             if chunk.is_empty() {
@@ -291,15 +381,15 @@ impl JobStore {
                 "SELECT id FROM segments
                  WHERE job_id = ?
                    AND id IN ({placeholders})
-                   AND status NOT IN ('succeeded', 'skipped_cached', 'needs_review')
+                   AND status NOT IN ({untouched})
                  ORDER BY id"
             );
             let update_sql = format!(
                 "UPDATE segments
-                 SET status = 'failed', attempts = attempts + 1, error = ?
+                 SET status = '{failed_status}', attempts = attempts + 1, error = ?
                  WHERE job_id = ?
                    AND id IN ({placeholders})
-                   AND status NOT IN ('succeeded', 'skipped_cached', 'needs_review')"
+                   AND status NOT IN ({untouched})"
             );
 
             let (chunk_updated, failed_segment_ids) = {
@@ -383,20 +473,40 @@ impl JobStore {
         let Some(job) = self.get_job(job_id)? else {
             return Ok(None);
         };
-        let conn = self.conn.borrow();
+        // Aggregation is per-segment, mixing the append-only attempt ledger
+        // with legacy token columns (STORE-A): a segment that has any ledger
+        // row is aggregated from the ledger (its authoritative attempt record);
+        // a segment with NO ledger rows — a pre-ledger completion, a cache hit,
+        // or a state-only record — keeps its legacy token columns. Summing
+        // both for the same segment would double count; dropping the legacy
+        // columns for ledger-less segments would undercount.
+        let ledger = self.translation_attempt_summary(job_id)?;
         let mut summary = JobSummary {
             id: job.id,
             status: job.status,
             ..JobSummary::default()
         };
+        summary.input_tokens = ledger.input_tokens;
+        summary.input_cached_tokens = ledger.input_cached_tokens;
+        summary.output_tokens = ledger.output_tokens;
 
+        let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
             "SELECT status,
                     COUNT(*),
-                    COALESCE(SUM(COALESCE(tokens_input, input_tokens)), 0),
-                    COALESCE(SUM(tokens_input_cached), 0),
-                    COALESCE(SUM(COALESCE(tokens_output, output_tokens)), 0)
-             FROM segments WHERE job_id = ?1 GROUP BY status",
+                    COALESCE(SUM(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM translation_attempts a
+                        WHERE a.job_id = s.job_id AND a.segment_id = s.id
+                    ) THEN COALESCE(s.tokens_input, s.input_tokens) ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM translation_attempts a
+                        WHERE a.job_id = s.job_id AND a.segment_id = s.id
+                    ) THEN s.tokens_input_cached ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM translation_attempts a
+                        WHERE a.job_id = s.job_id AND a.segment_id = s.id
+                    ) THEN COALESCE(s.tokens_output, s.output_tokens) ELSE 0 END), 0)
+             FROM segments s WHERE s.job_id = ?1 GROUP BY status",
         )?;
         let rows = stmt.query_map(params![job_id], |row| {
             Ok((
@@ -415,13 +525,15 @@ impl JobStore {
             summary.input_tokens += input_tokens as u64;
             summary.input_cached_tokens += input_cached_tokens as u64;
             summary.output_tokens += output_tokens as u64;
-            match status.as_str() {
-                "succeeded" => summary.succeeded += count,
-                "failed" => summary.failed += count,
-                "needs_review" => summary.needs_review += count,
-                "retry_pending" => summary.retry_pending += count,
-                "skipped_cached" => summary.cached += count,
-                _ => {}
+            match SegmentStatus::from_db_text(&status) {
+                SegmentStatus::Succeeded => summary.succeeded += count,
+                SegmentStatus::Failed => summary.failed += count,
+                SegmentStatus::NeedsReview => summary.needs_review += count,
+                SegmentStatus::RetryPending => summary.retry_pending += count,
+                SegmentStatus::SkippedCached => summary.cached += count,
+                // Unknown legacy values still count toward the totals above;
+                // they just cannot be bucketed into a lifecycle column.
+                SegmentStatus::Unknown(_) | SegmentStatus::Queued => {}
             }
         }
 
@@ -463,15 +575,29 @@ impl JobStore {
             .query_map([], Self::job_record_from_row)?
             .collect::<rusqlite::Result<Vec<JobRecord>>>()?;
 
-        // One pass over the segments table, aggregated per (job, status).
+        // One pass over the segments table, aggregated per (job, status). The
+        // token columns only count for segments with NO ledger rows: a segment
+        // covered by the append-only ledger aggregates from the ledger (its
+        // authoritative attempt record), while a segment without ledger rows
+        // (pre-ledger completion, cache hit) keeps its legacy columns. This
+        // keeps mixed legacy/new jobs accurate without double counting.
         let mut aggregates: HashMap<String, JobSummary> = HashMap::new();
         let mut seg_stmt = conn.prepare(
             "SELECT job_id, status,
                     COUNT(*),
-                    COALESCE(SUM(COALESCE(tokens_input, input_tokens)), 0),
-                    COALESCE(SUM(tokens_input_cached), 0),
-                    COALESCE(SUM(COALESCE(tokens_output, output_tokens)), 0)
-             FROM segments GROUP BY job_id, status",
+                    COALESCE(SUM(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM translation_attempts a
+                        WHERE a.job_id = s.job_id AND a.segment_id = s.id
+                    ) THEN COALESCE(s.tokens_input, s.input_tokens) ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM translation_attempts a
+                        WHERE a.job_id = s.job_id AND a.segment_id = s.id
+                    ) THEN s.tokens_input_cached ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM translation_attempts a
+                        WHERE a.job_id = s.job_id AND a.segment_id = s.id
+                    ) THEN COALESCE(s.tokens_output, s.output_tokens) ELSE 0 END), 0)
+             FROM segments s GROUP BY job_id, status",
         )?;
         let seg_rows = seg_stmt.query_map([], |row| {
             Ok((
@@ -491,13 +617,15 @@ impl JobStore {
             summary.input_tokens += input_tokens as u64;
             summary.input_cached_tokens += input_cached_tokens as u64;
             summary.output_tokens += output_tokens as u64;
-            match status.as_str() {
-                "succeeded" => summary.succeeded += count,
-                "failed" => summary.failed += count,
-                "needs_review" => summary.needs_review += count,
-                "retry_pending" => summary.retry_pending += count,
-                "skipped_cached" => summary.cached += count,
-                _ => {}
+            match SegmentStatus::from_db_text(&status) {
+                SegmentStatus::Succeeded => summary.succeeded += count,
+                SegmentStatus::Failed => summary.failed += count,
+                SegmentStatus::NeedsReview => summary.needs_review += count,
+                SegmentStatus::RetryPending => summary.retry_pending += count,
+                SegmentStatus::SkippedCached => summary.cached += count,
+                // Unknown legacy values still count toward the totals above;
+                // they just cannot be bucketed into a lifecycle column.
+                SegmentStatus::Unknown(_) | SegmentStatus::Queued => {}
             }
         }
 
@@ -512,6 +640,36 @@ impl JobStore {
             aggregates.entry(job_id).or_default().retried = retried as usize;
         }
 
+        // Append the attempt ledger for jobs that have one, ADDING it to the
+        // legacy-column contribution above (which already excluded segments
+        // covered by the ledger), so mixed legacy/new jobs stay accurate.
+        let mut ledger_stmt = conn.prepare(
+            "SELECT job_id,
+                    COUNT(*),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(input_cached_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0)
+             FROM translation_attempts GROUP BY job_id",
+        )?;
+        let ledger_rows = ledger_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in ledger_rows {
+            let (job_id, attempts, input_tokens, input_cached_tokens, output_tokens) = row?;
+            if attempts > 0 {
+                let summary = aggregates.entry(job_id).or_default();
+                summary.input_tokens += input_tokens as u64;
+                summary.input_cached_tokens += input_cached_tokens as u64;
+                summary.output_tokens += output_tokens as u64;
+            }
+        }
+
         Ok(jobs
             .into_iter()
             .map(|job| {
@@ -523,11 +681,12 @@ impl JobStore {
             .collect())
     }
 
-    pub(super) fn touch_job(&self, job_id: &str, status: &str) -> Result<()> {
+    pub(super) fn touch_job(&self, job_id: &str, status: JobStatus) -> Result<()> {
         let conn = self.conn.borrow();
+        ensure_job_exists(&conn, job_id)?;
         conn.execute(
             "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
-            params![status, timestamp_string(), job_id],
+            params![status.as_db_text(), timestamp_string(), job_id],
         )?;
         Ok(())
     }
@@ -535,36 +694,81 @@ impl JobStore {
     pub(super) fn touch_job_unless_status(
         &self,
         job_id: &str,
-        status: &str,
-        protected_statuses: &[&str],
+        status: JobStatus,
+        protected_statuses: &[JobStatus],
     ) -> Result<()> {
-        let now = timestamp_string();
         let conn = self.conn.borrow();
-        if protected_statuses.is_empty() {
-            conn.execute(
-                "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                params![status, now, job_id],
-            )?;
-            return Ok(());
-        }
-
-        let placeholders = std::iter::repeat_n("?", protected_statuses.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "UPDATE jobs
-             SET status = ?, updated_at = ?
-             WHERE id = ? AND status NOT IN ({placeholders})"
-        );
-        let mut params: Vec<&dyn rusqlite::types::ToSql> =
-            Vec::with_capacity(3 + protected_statuses.len());
-        params.push(&status);
-        params.push(&now);
-        params.push(&job_id);
-        for protected in protected_statuses {
-            params.push(protected);
-        }
-        conn.execute(&sql, params.as_slice())?;
-        Ok(())
+        ensure_job_exists(&conn, job_id)?;
+        touch_job_unless_status_on(&conn, job_id, status, protected_statuses)
     }
+}
+
+/// Fail closed when a mutation targets a job row that does not exist: a
+/// silent zero-row UPDATE would otherwise let a typo'd or already-pruned job
+/// be "mutated" without ever surfacing (STORE lifecycle audit).
+pub(super) fn ensure_job_exists(conn: &Connection, job_id: &str) -> Result<()> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = ?1)",
+        params![job_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if exists {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound(format!(
+            "job '{job_id}' was not found"
+        )))
+    }
+}
+
+pub(super) fn segment_exists(conn: &Connection, job_id: &str, segment_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM segments WHERE job_id = ?1 AND id = ?2)",
+        params![job_id, segment_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+/// Connection-scoped variant of [`JobStore::touch_job_unless_status`] so the
+/// per-segment checkpoint can update the job inside its own transaction.
+pub(super) fn touch_job_unless_status_on(
+    conn: &Connection,
+    job_id: &str,
+    status: JobStatus,
+    protected_statuses: &[JobStatus],
+) -> Result<()> {
+    let now = timestamp_string();
+    if protected_statuses.is_empty() {
+        conn.execute(
+            "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status.as_db_text(), now, job_id],
+        )?;
+        return Ok(());
+    }
+
+    let placeholders = std::iter::repeat_n("?", protected_statuses.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "UPDATE jobs
+         SET status = ?, updated_at = ?
+         WHERE id = ? AND status NOT IN ({placeholders})"
+    );
+    // Owned copies keep the referenced values alive until execute; the texts
+    // themselves are constant identifiers, never user input.
+    let status_text = status.as_db_text().to_string();
+    let protected_texts: Vec<String> = protected_statuses
+        .iter()
+        .map(|protected| protected.as_db_text().to_string())
+        .collect();
+    let mut params: Vec<&dyn rusqlite::types::ToSql> =
+        Vec::with_capacity(3 + protected_texts.len());
+    params.push(&status_text);
+    params.push(&now);
+    params.push(&job_id);
+    for protected in &protected_texts {
+        params.push(protected);
+    }
+    conn.execute(&sql, params.as_slice())?;
+    Ok(())
 }

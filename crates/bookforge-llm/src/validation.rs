@@ -6,6 +6,131 @@ const MIN_SOURCE_CHARS: usize = 120;
 const MIN_OVERLAP_WORDS: usize = 30;
 const COPIED_WORD_RATIO: f64 = 0.92;
 
+/// Coarse family of an invalid model response, used to pick a user-facing
+/// sentence instead of leaking serde internals like "missing field
+/// `translation` at line 1 column 157" into persisted segment rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvalidResponseCategory {
+    /// A required field for one or more blocks was absent from the payload.
+    MissingField,
+    /// The payload was not the JSON structure the batch contract requires.
+    InvalidJson,
+    /// The payload parsed but violated the document's structural contract
+    /// (markers, protected spans, the requested item set, run structure).
+    MarkerMismatch,
+    /// Anything else, including truncated or empty responses.
+    Unknown,
+}
+
+impl InvalidResponseCategory {
+    fn friendly_sentence(self) -> &'static str {
+        match self {
+            Self::MissingField => {
+                "The model's response was missing a required field for one or more blocks \
+                 — the batch will be retried or repaired."
+            }
+            Self::InvalidJson => {
+                "The model returned malformed JSON instead of the expected batch format \
+                 — the batch will be retried, split, or repaired."
+            }
+            Self::MarkerMismatch => {
+                "The response did not preserve the document's required structure (inline \
+                 markers, protected spans, or the requested set of items) — the batch will \
+                 be split or the affected items repaired."
+            }
+            Self::Unknown => {
+                "The model returned a response that could not be used as-is \
+                 — the batch will be retried or repaired."
+            }
+        }
+    }
+}
+
+/// Classify a raw invalid-response message. Raw serde and parse phrases are
+/// matched by their stable substrings; unknown text degrades to `Unknown`
+/// rather than being mislabeled.
+pub(crate) fn invalid_response_category(raw: &str) -> InvalidResponseCategory {
+    let lowered = raw.to_ascii_lowercase();
+
+    // Specific structural failures outrank generic parse noise: a message
+    // like "invalid batch JSON: missing field `translation` at line 1 column
+    // 157" is a missing-field failure even though it also mentions JSON.
+    const STRUCTURAL_PHRASES: [&str; 12] = [
+        "batch response incomplete",
+        "batch translation block mismatch",
+        "duplicate item id in batch response",
+        "run count mismatch",
+        "unknown run id",
+        "missing run id",
+        "changed marker run",
+        "inline marker",
+        "protected span",
+        "marker structure",
+        "lost its reference text",
+        "unknown item id",
+    ];
+    for phrase in STRUCTURAL_PHRASES {
+        if lowered.contains(phrase) {
+            return InvalidResponseCategory::MarkerMismatch;
+        }
+    }
+
+    const MISSING_FIELD_PHRASES: [&str; 3] =
+        ["missing field", "invalid length 0", "duplicate field"];
+    for phrase in MISSING_FIELD_PHRASES {
+        if lowered.contains(phrase) {
+            return InvalidResponseCategory::MissingField;
+        }
+    }
+
+    const INVALID_JSON_PHRASES: [&str; 11] = [
+        "invalid batch json",
+        "json parse failed",
+        "eof while parsing",
+        "trailing characters",
+        "expected value",
+        "expected ident",
+        "expected `:`",
+        "expected `,` or `}`",
+        "expected `,` or `]`",
+        "key must be a string",
+        "control character",
+    ];
+    for phrase in INVALID_JSON_PHRASES {
+        if lowered.contains(phrase) {
+            return InvalidResponseCategory::InvalidJson;
+        }
+    }
+
+    InvalidResponseCategory::Unknown
+}
+
+/// Map a raw invalid-response message to a user-facing sentence. Raw detail
+/// is never included in the result — callers keep it available through the
+/// error chain and `tracing::debug!`.
+pub(crate) fn friendly_validation_error(raw: &str) -> String {
+    // Truncation and empty-content failures have their own precise remedies;
+    // give them specific sentences even though they have no serde signature.
+    // The empty-content check runs first: its message names the output
+    // budget, which would otherwise be mistaken for truncation.
+    let lowered = raw.to_ascii_lowercase();
+    if lowered.starts_with("the model produced no content") {
+        return "The model produced no usable content for this batch \
+                — the batch will be retried; if this repeats, raise the output-token \
+                budget or lower the batch size."
+            .to_string();
+    }
+    if lowered.contains("truncated") || lowered.contains("output budget") {
+        return "The model's response was cut off before it finished — the output-token \
+                budget was exhausted; the batch will be retried with a larger budget or \
+                split into smaller pieces."
+            .to_string();
+    }
+    invalid_response_category(raw)
+        .friendly_sentence()
+        .to_string()
+}
+
 const TOKI_PONA_WORDS: &[&str] = &[
     "a",
     "akesi",
@@ -202,21 +327,65 @@ pub(crate) fn source_copy_validation_error(
         return None;
     }
 
-    let source_words = words(&source_normalized);
-    if source_words.len() < MIN_OVERLAP_WORDS {
+    let (source_units, translation_units, unit) =
+        comparison_units(&source_normalized, &translation_normalized);
+    if source_units.len() < MIN_OVERLAP_WORDS {
         return None;
     }
-    let translation_words = words(&translation_normalized);
-    let overlap = multiset_overlap(&source_words, &translation_words);
-    let ratio = overlap as f64 / source_words.len() as f64;
+    let overlap = multiset_overlap(&source_units, &translation_units);
+    let ratio = overlap as f64 / source_units.len() as f64;
     if overlap >= MIN_OVERLAP_WORDS && ratio >= COPIED_WORD_RATIO {
         return Some(format!(
-            "translation retains {:.0}% of the source-language words",
+            "translation retains {:.0}% of the source-language {unit}",
             ratio * 100.0
         ));
     }
 
     None
+}
+
+/// Choose the unit the near-copy comparison counts in, based on whether the
+/// source delimits its words with whitespace.
+///
+/// `words` splits on runs of alphanumerics, which is only a word count for text
+/// that puts spaces between words. Han, Kana and Hangul characters are
+/// alphanumeric and unspaced, so a whole clause comes back as one "word" and
+/// the `MIN_OVERLAP_WORDS` floor is never cleared: measured across the two
+/// Chinese books in the corpus, only 24% and 67% of substantial paragraphs
+/// reached the overlap test at all, against 83-88% for English and Italian.
+/// The detector was therefore silently switched off for exactly the material
+/// it was most needed on, since a model that echoes an unspaced source stops
+/// being caught by the exact-copy check the moment it alters one token.
+///
+/// For unspaced text the comparison runs on adjacent character pairs instead.
+/// Bigrams are the standard unit for this: they track a near-copy closely, and
+/// a genuine translation into a different script shares essentially none of
+/// them. The test is on spacing rather than on case, because Arabic and Hebrew
+/// are caseless yet space-delimited and should keep counting words.
+fn comparison_units(source: &str, translation: &str) -> (Vec<String>, Vec<String>, &'static str) {
+    if !bookforge_core::script::is_space_delimited(source) {
+        (
+            character_bigrams(source),
+            character_bigrams(translation),
+            "character pairs",
+        )
+    } else {
+        (words(source), words(translation), "words")
+    }
+}
+
+/// Adjacent pairs of the text's alphanumeric characters, in order. Punctuation
+/// and whitespace are dropped first so that a re-punctuated copy still matches.
+fn character_bigrams(text: &str) -> Vec<String> {
+    let characters = text
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<Vec<_>>();
+    characters
+        .windows(2)
+        .map(|pair| pair.iter().collect())
+        .collect()
 }
 
 pub(crate) fn empty_translation_validation_error(
@@ -225,6 +394,26 @@ pub(crate) fn empty_translation_validation_error(
 ) -> Option<&'static str> {
     (!source.trim().is_empty() && translation.trim().is_empty())
         .then_some("empty translation for non-empty source")
+}
+
+const KNOWN_QA_VERDICTS: [&str; 3] = ["pass", "warn", "fail"];
+
+/// Validate a model-supplied QA verdict against the documented set
+/// (`pass | warn | fail`). Anything else is unvalidated freeform today;
+/// instead of letting it flow verbatim into reports and gates, degrade it
+/// to `warn` (the conservative default that keeps human eyes on the
+/// segment) and attach an explanatory finding.
+pub(crate) fn normalize_qa_verdict(raw: &str) -> (&'static str, Option<String>) {
+    let folded = raw.trim().to_ascii_lowercase();
+    if let Some(known) = KNOWN_QA_VERDICTS.iter().find(|known| **known == folded) {
+        return (known, None);
+    }
+    (
+        "warn",
+        Some(format!(
+            "QA provider returned an unrecognized verdict {raw:?}; treated as warn"
+        )),
+    )
 }
 
 /// Conservative hard gates for the built-in Toki Pona style. These checks
@@ -1121,6 +1310,112 @@ fn normalize_number_sign(ch: char) -> char {
 mod tests {
     use super::*;
 
+    #[test]
+    fn friendly_validation_error_maps_raw_serde_phrases_to_sentences() {
+        // (raw message, expected category, substring that must appear in the
+        // friendly sentence). The dogfood example is the first entry: raw
+        // serde internals must never leak into persisted text.
+        let mapping: &[(&str, InvalidResponseCategory, &str)] = &[
+            (
+                "invalid batch JSON: missing field `translation` at line 1 column 157",
+                InvalidResponseCategory::MissingField,
+                "missing a required field",
+            ),
+            (
+                "invalid batch JSON: EOF while parsing a value at line 1 column 88",
+                InvalidResponseCategory::InvalidJson,
+                "malformed JSON",
+            ),
+            (
+                "JSON parse failed after 3 attempts: trailing characters at line 2 column 1",
+                InvalidResponseCategory::InvalidJson,
+                "malformed JSON",
+            ),
+            (
+                "batch response incomplete: requested 5 items, returned 3; missing item IDs: a, b",
+                InvalidResponseCategory::MarkerMismatch,
+                "requested set of items",
+            ),
+            (
+                "error: inline marker missing: m1",
+                InvalidResponseCategory::MarkerMismatch,
+                "required structure",
+            ),
+            (
+                "error: protected span missing: https://example.com [kind=url]",
+                InvalidResponseCategory::MarkerMismatch,
+                "protected spans",
+            ),
+            (
+                "duplicate item ID in batch response",
+                InvalidResponseCategory::MarkerMismatch,
+                "required structure",
+            ),
+            (
+                "batch output was truncated: max_output_tokens limit reached",
+                InvalidResponseCategory::Unknown,
+                "cut off before it finished",
+            ),
+            (
+                "the model produced no content after 4096 output tokens: it exhausted its \
+                 output budget before answering.",
+                InvalidResponseCategory::Unknown,
+                "no usable content",
+            ),
+            (
+                "some totally unfamiliar failure",
+                InvalidResponseCategory::Unknown,
+                "could not be used as-is",
+            ),
+        ];
+        for (raw, category, expected_substring) in mapping {
+            assert_eq!(
+                invalid_response_category(raw),
+                *category,
+                "category mismatch for raw: {raw}"
+            );
+            let friendly = friendly_validation_error(raw);
+            assert!(
+                friendly.contains(expected_substring),
+                "friendly text for {raw:?} should mention {expected_substring:?}, got: {friendly}"
+            );
+        }
+    }
+
+    #[test]
+    fn friendly_validation_error_never_leaks_raw_serde_internals() {
+        for raw in [
+            "invalid batch JSON: missing field `translation` at line 1 column 157",
+            "invalid batch JSON: EOF while parsing an object at line 1 column 88",
+            "JSON parse failed after 3 attempts: trailing characters at line 2 column 1",
+        ] {
+            let friendly = friendly_validation_error(raw);
+            for leak in ["line 1", "column", "`translation`", "invalid batch JSON"] {
+                assert!(
+                    !friendly.contains(leak),
+                    "friendly text must not leak {leak:?}: {friendly}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn friendly_validation_error_sentences_are_stable() {
+        // The sentences are a contract for reports and dashboards; pin them.
+        assert_eq!(
+            friendly_validation_error("invalid batch JSON: missing field `id` at line 1 column 4"),
+            "The model's response was missing a required field for one or more blocks \
+             — the batch will be retried or repaired."
+        );
+        assert_eq!(
+            friendly_validation_error(
+                "batch output was truncated: max_output_tokens limit reached"
+            ),
+            "The model's response was cut off before it finished — the output-token \
+             budget was exhausted; the batch will be retried with a larger budget or \
+             split into smaller pieces."
+        );
+    }
     const SOURCE: &str = "This deliberately long English paragraph contains enough ordinary \
         prose to exercise untranslated-copy detection in the production response validator. It \
         repeats no special protected data and should be rejected when a provider returns it \
@@ -1163,6 +1458,45 @@ mod tests {
     fn allows_reference_sections() {
         assert!(source_copy_validation_error(SOURCE, SOURCE, Some("Endnotes")).is_none());
         assert!(source_copy_validation_error(SOURCE, SOURCE, Some("Bibliography")).is_none());
+    }
+
+    /// Unspaced prose of a length the detector is meant to cover. `words`
+    /// splits on non-alphanumerics and Han characters are alphanumeric, so
+    /// each of these clauses is one "word" -- far below the word floor the
+    /// English paragraph above clears easily.
+    const CJK_SOURCE: &str = "矛盾的普遍性和特殊性的关系是矛盾问题的精髓，\
+        不懂得它就等于抛弃了辩证法。事物的性质主要地是由取得支配地位的矛盾的主要方面所规定的，\
+        取得支配地位的矛盾的主要方面起了变化，事物的性质也就随着变化。\
+        然而这种情形不是固定的，矛盾的主要和非主要的方面互相转化着，事物的性质也就随着起变化。";
+
+    #[test]
+    fn rejects_nearly_complete_source_copy_in_an_unspaced_script() {
+        // The same defect as `rejects_nearly_complete_source_copy`: a provider
+        // echoed the source back with a token changed rather than translating.
+        let translation = CJK_SOURCE.replace("精髓", "核心");
+        let error = source_copy_validation_error(CJK_SOURCE, &translation, Some("第一章"));
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|message| message.contains("retains")),
+            "an unspaced near-copy must be caught like a spaced one, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn allows_a_real_translation_of_unspaced_source() {
+        assert!(
+            source_copy_validation_error(
+                CJK_SOURCE,
+                "Il rapporto fra universalità e particolarità della contraddizione è \
+                 l'essenza del problema della contraddizione, e non comprenderlo equivale \
+                 ad abbandonare la dialettica. La natura di una cosa è determinata \
+                 principalmente dall'aspetto principale della contraddizione dominante.",
+                Some("第一章")
+            )
+            .is_none(),
+            "a genuine translation must not be flagged"
+        );
     }
 
     #[test]

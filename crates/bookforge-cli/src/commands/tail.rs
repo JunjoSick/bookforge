@@ -1,11 +1,25 @@
 use clap::Args;
 
-use std::{io::BufRead, path::PathBuf};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    path::PathBuf,
+};
 
 use bookforge_core::RunConfigSnapshot;
 use serde_json::Value;
 
 use bookforge_store::{JobRecord, JobStore};
+
+use crate::presentation::RunView;
+
+/// When reconstructing dashboard state from recent events, never walk further
+/// back than this many lines even if `--last` is smaller. Keeps `tail`
+/// bounded on very long logs (CLI-15).
+const RECONSTRUCT_TAIL_LINES: usize = 512;
+/// Hard ceiling on how many raw bytes a single tail read may buffer.
+const MAX_TAIL_BYTES: usize = 8 * 1024 * 1024;
+/// Backwards read granularity.
+const TAIL_CHUNK_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Args)]
 pub struct TailArgs {
@@ -26,14 +40,18 @@ pub async fn run(args: TailArgs) -> anyhow::Result<()> {
 
     ensure_event_log_exists(&args.job_id, &event_log_path)?;
 
-    let file = std::fs::File::open(&event_log_path)?;
-    let reader = std::io::BufReader::new(file);
+    let mut file = std::fs::File::open(&event_log_path)?;
+    // Bounded read from the end of the log: only as much history as the tail
+    // print plus the state-reconstruction window needs is ever loaded.
+    let fetch_lines = args.last.max(RECONSTRUCT_TAIL_LINES);
+    let events = read_last_lines(&mut file, fetch_lines)?;
 
-    let mut events: Vec<String> = Vec::new();
-    for line in reader.lines() {
-        match line {
-            Ok(l) if !l.trim().is_empty() => events.push(l),
-            _ => {}
+    // JSON mode keeps stdout machine-pure; corrupt lines are warned on stderr
+    // so they are never silently invisible (UI-28/30).
+    if args.json {
+        let skipped = events.iter().filter(|line| parse_failed(line)).count();
+        if skipped > 0 {
+            eprintln!("warning: {skipped} unparseable line(s) skipped while reading the event log");
         }
     }
 
@@ -43,6 +61,56 @@ pub async fn run(args: TailArgs) -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+fn parse_failed(line: &str) -> bool {
+    serde_json::from_str::<Value>(line).is_err()
+}
+
+/// Read at most `max_lines` trailing lines from `file` by scanning backwards,
+/// so a multi-megabyte event log no longer has to be fully loaded (CLI-15).
+fn read_last_lines(file: &mut std::fs::File, max_lines: usize) -> std::io::Result<Vec<String>> {
+    let len = file.metadata()?.len();
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut newlines_seen = 0usize;
+    let mut end = len;
+    let mut reached_start = false;
+
+    while end > 0 {
+        let start = end.saturating_sub(TAIL_CHUNK_BYTES);
+        let chunk_len = usize::try_from(end - start).unwrap_or(0);
+        let mut chunk = vec![0_u8; chunk_len];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut chunk)?;
+        newlines_seen += chunk.iter().filter(|&&byte| byte == b'\n').count();
+
+        let mut combined = Vec::with_capacity(chunk.len() + buffer.len());
+        combined.extend_from_slice(&chunk);
+        combined.extend_from_slice(&buffer);
+        buffer = combined;
+
+        end = start;
+        reached_start = start == 0;
+        if newlines_seen > max_lines || buffer.len() >= MAX_TAIL_BYTES {
+            break;
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buffer);
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    // When the backwards window stopped before the beginning of the file, the
+    // first recovered line may be a torn fragment of an older record.
+    if !reached_start && !lines.is_empty() {
+        lines.remove(0);
+    }
+    if lines.len() > max_lines {
+        lines.drain(..lines.len() - max_lines);
+    }
+    Ok(lines)
 }
 
 fn event_log_path_for_tail(
@@ -80,6 +148,10 @@ fn render_tail(job_id: &str, events: &[String], last: usize, json: bool) -> Stri
     }
 
     if json {
+        // Raw-line pass-through keeps the machine contract stable. Corrupt
+        // lines are still surfaced — as a warning on stderr from `run` — so
+        // nothing disappears silently (UI-28/30) while stdout stays pure
+        // JSONL.
         let mut output = String::new();
         for line in recent {
             output.push_str(line);
@@ -94,74 +166,88 @@ fn render_tail(job_id: &str, events: &[String], last: usize, json: bool) -> Stri
         recent.len(),
         job_id
     ));
+    let mut unparsed_lines = 0usize;
 
     for line in &recent {
-        if let Ok(parsed) = serde_json::from_str::<Value>(line) {
-            let event_type = parsed
-                .as_object()
-                .and_then(|o| o.keys().next())
-                .map(|k| k.as_str())
-                .unwrap_or("?");
-            let compact = serde_json::to_string(&parsed).unwrap_or_else(|_| line.to_string());
-            output.push_str(&format!("[{event_type}] {compact}\n"));
-        } else {
-            output.push_str(line);
-            output.push('\n');
+        match serde_json::from_str::<Value>(line) {
+            Ok(parsed) => {
+                let event_type = parsed
+                    .as_object()
+                    .and_then(|o| o.keys().next())
+                    .map(|k| k.as_str())
+                    .unwrap_or("?");
+                let compact = serde_json::to_string(&parsed).unwrap_or_else(|_| line.to_string());
+                output.push_str(&format!("[{event_type}] {compact}\n"));
+            }
+            // Rendered verbatim below the JSON events; counted exactly once
+            // by the reconstruction pass so nothing vanishes silently.
+            Err(_) => {
+                output.push_str(line);
+                output.push('\n');
+            }
         }
     }
 
     output.push('\n');
 
-    // Reconstruct a simple dashboard from recent events
-    let mut stage = String::new();
-    let mut segments_total = 0usize;
-    let mut segments_done = 0usize;
-    let mut cache_hits = 0usize;
+    // Reconstruct dashboard state by folding every parseable event through
+    // the canonical RunView (RunState + epoch baselines) the other dashboards
+    // use, so counts and rates agree across resume epochs (UI-28/30/31). The
+    // hand-scanner this replaces drifted from fold semantics (it counted every
+    // SegmentFinished, ignored terminal-status rules) and miscounted across
+    // epochs.
+    let mut view = RunView::new();
     let mut cache_misses = 0usize;
-    let mut input_tokens = 0u64;
-    let mut output_tokens = 0u64;
-    let mut checkpoint_flushed = 0usize;
-
-    for line in events.iter().rev() {
-        if let Ok(parsed) = serde_json::from_str::<Value>(line) {
-            if let Some(v) = parsed.get("StageStarted")
-                && let Some(s) = v.get("stage").and_then(|s| s.as_str())
-                && stage.is_empty()
-            {
-                stage = s.to_string();
+    for line in events {
+        match serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|value| serde_json::from_value::<bookforge_core::ProgressEvent>(value).ok())
+        {
+            Some(event) => {
+                if let bookforge_core::ProgressEvent::CacheScanFinished { misses, .. } = &event {
+                    cache_misses = *misses;
+                }
+                view.fold(&event);
             }
-            if let Some(v) = parsed.get("SegmentationFinished") {
-                segments_total =
-                    v.get("segment_count").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
-            }
-            if let Some(v) = parsed.get("CacheScanFinished") {
-                cache_hits = v.get("hits").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
-                cache_misses = v.get("misses").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
-            }
-            if let Some(v) = parsed.get("SegmentFinished") {
-                segments_done += 1;
-                input_tokens += v.get("input_tokens").and_then(|s| s.as_u64()).unwrap_or(0);
-                output_tokens += v.get("output_tokens").and_then(|s| s.as_u64()).unwrap_or(0);
-            }
-            if let Some(_v) = parsed.get("CheckpointFlushed") {
-                checkpoint_flushed += 1;
+            None => {
+                // Already counted in the per-line rendering above for the
+                // tail window; malformed lines outside that window are
+                // counted here so reconstruction never under-reports.
+                unparsed_lines += 1;
             }
         }
     }
 
     output.push_str("Reconstructed state:\n");
-    output.push_str(&format!("  stage:        {stage}\n"));
+    // Status naming comes from the shared presentation vocabulary (UI-31);
+    // additive for `tail`, matching what watch/serve would title the run.
     output.push_str(&format!(
-        "  segments:     {segments_done}/{segments_total}\n"
+        "  status:       {}\n",
+        crate::presentation::run_status_name(&view)
+    ));
+    output.push_str(&format!(
+        "  stage:        {}\n",
+        view.stage.as_deref().unwrap_or("")
+    ));
+    output.push_str(&format!(
+        "  segments:     {}/{}\n",
+        view.done_segments, view.total_segments
     ));
     output.push_str(&format!(
         "  cache:        {} hits, {} misses",
-        cache_hits, cache_misses
+        view.cached, cache_misses
     ));
     output.push('\n');
-    output.push_str(&format!("  input tokens:  {input_tokens}\n"));
-    output.push_str(&format!("  output tokens: {output_tokens}\n"));
-    output.push_str(&format!("  checkpoints:   {checkpoint_flushed}\n"));
+    output.push_str(&format!("  input tokens:  {}\n", view.input_tokens));
+    output.push_str(&format!("  output tokens: {}\n", view.output_tokens));
+    output.push_str(&format!("  checkpoints:   {}\n", view.checkpoint_flushed));
+
+    if unparsed_lines > 0 {
+        // Corrupt log lines are skipped for counting, but never silently.
+        output.push_str(&format!(
+            "\nwarning: {unparsed_lines} unparseable line(s) skipped while reading the event log\n"
+        ));
+    }
 
     output
 }
@@ -295,5 +381,142 @@ mod tests {
 
         assert!(error.to_string().contains("event log not found"));
         assert!(error.to_string().contains("job_missing_log"));
+    }
+
+    #[test]
+    fn read_last_lines_returns_only_the_requested_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            (0..1000)
+                .map(|n| format!("line-{n:04}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let tail = read_last_lines(&mut file, 5).unwrap();
+        assert_eq!(
+            tail,
+            vec![
+                "line-0995",
+                "line-0996",
+                "line-0997",
+                "line-0998",
+                "line-0999"
+            ]
+        );
+    }
+
+    #[test]
+    fn read_last_lines_handles_short_files_and_missing_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let short = dir.path().join("short.jsonl");
+        std::fs::write(&short, "a\nb\nc").unwrap();
+
+        let mut file = std::fs::File::open(&short).unwrap();
+        assert_eq!(read_last_lines(&mut file, 10).unwrap(), vec!["a", "b", "c"]);
+
+        // Requesting fewer lines than exist must still yield exactly that many
+        // complete lines, never a torn fragment.
+        assert_eq!(read_last_lines(&mut file, 2).unwrap(), vec!["b", "c"]);
+    }
+
+    #[test]
+    fn read_last_lines_skips_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blanky.jsonl");
+        std::fs::write(&path, "\n\none\n\n\ntwo\n\n").unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(read_last_lines(&mut file, 3).unwrap(), vec!["one", "two"]);
+    }
+
+    /// UI-28/30: reconstruction must agree with the dashboards' RunState fold
+    /// — only terminal SegmentFinished statuses count as done, tokens come
+    /// from those events, and resume epochs keep cumulative totals sane.
+    #[test]
+    fn reconstructed_state_matches_runstate_fold_semantics() {
+        let events = vec![
+            r#"{"JobCreated":{"job_id":"job_x","input_path":"i.epub","output_path":"o.epub","timestamp_ms":1}}"#.to_string(),
+            r#"{"StageStarted":{"stage":"translating","timestamp_ms":2}}"#.to_string(),
+            r#"{"SegmentationFinished":{"segment_count":4,"timestamp_ms":3}}"#.to_string(),
+            r#"{"CacheScanFinished":{"hits":1,"misses":3,"timestamp_ms":4}}"#.to_string(),
+            // A non-terminal status line: the old hand-scanner counted it.
+            r#"{"SegmentFinished":{"segment_id":"s0","status":"started","input_tokens":5,"output_tokens":7,"timestamp_ms":5}}"#.to_string(),
+            r#"{"SegmentFinished":{"segment_id":"s1","status":"succeeded","input_tokens":11,"output_tokens":13,"timestamp_ms":6}}"#.to_string(),
+            r#"{"CheckpointFlushed":{"segment_id":"s1","flushed_count":2,"latency_ms":3,"timestamp_ms":7}}"#.to_string(),
+        ];
+
+        let output = render_tail("job_x", &events, 20, false);
+
+        assert!(output.contains("stage:        translating"));
+        // The non-terminal `started` line must not inflate progress or skip
+        // status rules, matching every other RunState consumer.
+        assert!(
+            output.contains("segments:     2/4"),
+            "only succeeded/failed/review/cached statuses are done: {output}"
+        );
+        assert!(output.contains("cache:        1 hits, 3 misses"));
+        // Token totals follow the same single fold as the dashboards.
+        assert!(output.contains("input tokens:  16"));
+        assert!(output.contains("output tokens: 20"));
+        assert!(output.contains("checkpoints:   2"));
+        assert!(!output.contains("unparseable"));
+    }
+
+    #[test]
+    fn corrupt_lines_are_counted_not_swallowed() {
+        let events = vec![
+            r#"{"JobCreated":{"job_id":"job_y","input_path":"i.epub","output_path":"o.epub","timestamp_ms":1}}"#.to_string(),
+            "{not json at all".to_string(),
+            "trunc".to_string(),
+        ];
+
+        let human = render_tail("job_y", &events, 10, false);
+        assert!(
+            human.contains("warning: 2 unparseable line(s) skipped"),
+            "human output must surface corrupt lines: {human}"
+        );
+
+        let json = render_tail("job_y", &events, 10, true);
+        // Machine contract stays pure JSONL passthrough.
+        for line in json.lines() {
+            let _ =
+                serde_json::from_str::<serde_json::Value>(line).unwrap_or(serde_json::Value::Null);
+        }
+        assert_eq!(json.lines().count(), 3);
+    }
+
+    #[test]
+    fn resumed_log_epoch_keeps_reconstruction_consistent_with_dashboards() {
+        // Two epochs in one appended log; the epoch-aware fold keeps counts
+        // consistent with what `watch`/serve would show after replaying the
+        // same file, instead of drifting like the old hand-scanner.
+        let mut events = vec![
+            r#"{"JobCreated":{"job_id":"job_z","input_path":"i.epub","output_path":"o1.epub","timestamp_ms":1}}"#.to_string(),
+            r#"{"SegmentationFinished":{"segment_count":4,"timestamp_ms":50}}"#.to_string(),
+        ];
+        for i in 0..3 {
+            events.push(format!(
+                r#"{{"SegmentFinished":{{"segment_id":"a{i}","status":"succeeded","input_tokens":null,"output_tokens":null,"timestamp_ms":{}}}}}"#,
+                100 + i
+            ));
+        }
+        // Resume epoch appends a fresh JobCreated to the same log.
+        events.push(
+            r#"{"JobCreated":{"job_id":"job_z","input_path":"i.epub","output_path":"o2.epub","timestamp_ms":9000}}"#.to_string(),
+        );
+        events.push(
+            r#"{"SegmentFinished":{"segment_id":"b0","status":"needs_review","input_tokens":null,"output_tokens":null,"timestamp_ms":9500}}"#
+                .to_string(),
+        );
+
+        let output = render_tail("job_z", &events, 20, false);
+        assert!(
+            output.contains("segments:     4/4"),
+            "terminal statuses accumulate across epochs exactly like the dashboards: {output}"
+        );
     }
 }

@@ -6,7 +6,7 @@ You are a professional book translator working inside a structured EPUB translat
 
 Translate the human-readable prose from {{source_language}} to {{target_language}} while preserving all structural markers exactly.
 
-CRITICAL REQUIREMENT â€” MARKER PRESERVATION:
+CRITICAL REQUIREMENT — MARKER PRESERVATION:
 
 Structural markers represent formatting, links, footnotes, emphasis, anchors, spans, or other EPUB inline structure. They are NOT part of the prose. They are NOT optional. They are NOT decoration. THEY MUST APPEAR UNCHANGED IN YOUR OUTPUT.
 
@@ -89,7 +89,7 @@ Context after this segment:
 {{context_after}}
 ```
 
-Already-translated prior segments (use for pronoun, gender, and voice consistency only â€” do not retranslate):
+Already-translated prior segments (use for pronoun, gender, and voice consistency only — do not retranslate):
 
 ```txt
 {{context_translation_pairs}}
@@ -166,6 +166,6 @@ Before returning, verify internally that:
 5. No marker has been deleted, renamed, or duplicated.
 6. No unknown marker has been invented.
 7. No prose has been skipped.
-8. The output contains ONLY valid JSON â€” no commentary or Markdown.
+8. The output contains ONLY valid JSON — no commentary or Markdown.
 
-Markers are CRITICAL â€” missing markers will corrupt the EPUB.
+Markers are CRITICAL — missing markers will corrupt the EPUB.

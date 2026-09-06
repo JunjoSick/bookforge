@@ -5,24 +5,56 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use bookforge_core::{ProgressEvent, ProgressSink, RunState};
+use bookforge_core::{ProgressEvent, ProgressSink};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+use crate::envelope;
+use crate::presentation::RunView;
+use crate::sanitize::sanitize_terminal;
+
 pub const PROGRESS_EVENT_QUEUE_CAPACITY: usize = 2048;
+
+/// How often live renderers surface newly dropped events as durable
+/// `DroppedEvents` records (UI-10). A burst of drops becomes a log line within
+/// this interval instead of vanishing until shutdown.
+const DROPPED_EVENTS_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum UiMode {
     Auto,
     Progress,
+    /// Machine-readable stdout: every progress line is wrapped in the
+    /// versioned JSON envelope (v2; see `crate::envelope`).
     Json,
+    /// Deprecated alias reproducing the legacy pre-envelope stdout dialects
+    /// byte-for-byte (`translate`/`resume`: raw `ProgressEvent` objects;
+    /// `audiobook`: raw `{"event":…}` objects). For consumers pinned to v1.
+    JsonV1,
     Quiet,
     /// Full-screen terminal dashboard (requires the `tui` build feature and a TTY).
     Tui,
+}
+
+impl UiMode {
+    /// True when the mode suppresses all human-facing stdout chatter so a
+    /// machine can own the stream (UI-22). `--ui json` and its legacy alias
+    /// behave identically here.
+    pub fn machine_stdout(self) -> bool {
+        matches!(
+            self,
+            UiMode::Json | UiMode::JsonV1 | UiMode::Quiet | UiMode::Tui
+        )
+    }
+
+    /// Inverse of [`UiMode::machine_stdout`].
+    pub fn human_stdout(self) -> bool {
+        !self.machine_stdout()
+    }
 }
 
 /// A progress sink that sends events over a bounded mpsc channel using
@@ -35,11 +67,6 @@ pub struct ChannelProgressSink {
 impl ChannelProgressSink {
     pub fn new(tx: mpsc::Sender<ProgressEvent>, dropped: Arc<AtomicUsize>) -> Self {
         Self { tx, dropped }
-    }
-
-    #[allow(dead_code)]
-    pub fn dropped_count(&self) -> usize {
-        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -63,14 +90,6 @@ pub struct ProgressReporter {
 }
 
 impl ProgressReporter {
-    pub fn spawn_with_append(ui_mode: UiMode, jsonl_path: Option<PathBuf>, append: bool) -> Self {
-        Self::spawn_with_options(ui_mode, jsonl_path, append, None)
-    }
-
-    /// Spawn the reporter, optionally passing a cancellation token. The token
-    /// is only consulted by the attached TUI renderer (`--ui tui`), which
-    /// cancels it when the user quits before the run has finished — because in
-    /// raw mode Ctrl-C does not reach the process's SIGINT handler.
     pub fn spawn_with_options(
         ui_mode: UiMode,
         jsonl_path: Option<PathBuf>,
@@ -109,6 +128,20 @@ impl ProgressReporter {
     }
 }
 
+/// Return the number of events dropped since the previous call, so a burst of
+/// queue-overflow losses becomes a durable `DroppedEvents` record with honest
+/// accounting instead of being silently absorbed (UI-10).
+fn take_newly_dropped(dropped: &AtomicUsize, reported: &mut usize) -> Option<usize> {
+    let total = dropped.load(Ordering::Relaxed);
+    if total > *reported {
+        let fresh = total - *reported;
+        *reported = total;
+        Some(fresh)
+    } else {
+        None
+    }
+}
+
 async fn render_loop(
     mut rx: mpsc::Receiver<ProgressEvent>,
     ui_mode: UiMode,
@@ -134,10 +167,17 @@ async fn render_loop(
             RenderMode::Quiet
         };
         let mut renderer = Renderer::new(fallback)?;
+        let mut reported_drops = 0usize;
         while let Some(event) = rx.recv().await {
             file_writer.write_event(&event)?;
             renderer.handle_event(&event)?;
         }
+        flush_final_dropped_events(
+            &dropped,
+            &mut reported_drops,
+            &mut file_writer,
+            &mut renderer,
+        )?;
         file_writer.flush()?;
         renderer.finish()?;
         return Ok(());
@@ -146,12 +186,36 @@ async fn render_loop(
     let _ = &cancel;
 
     let mut renderer = Renderer::new(render_mode)?;
+    let mut reported_drops = 0usize;
+    let mut drop_tick = tokio::time::interval(DROPPED_EVENTS_FLUSH_INTERVAL);
+    drop_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick so a clean start does not record drops.
+    drop_tick.tick().await;
 
-    while let Some(event) = rx.recv().await {
-        file_writer.write_event(&event)?;
-        renderer.handle_event(&event)?;
+    loop {
+        tokio::select! {
+            maybe_event = rx.recv() => {
+                let Some(event) = maybe_event else { break };
+                file_writer.write_event(&event)?;
+                renderer.handle_event(&event)?;
+            }
+            _ = drop_tick.tick() => {
+                flush_final_dropped_events(
+                    &dropped,
+                    &mut reported_drops,
+                    &mut file_writer,
+                    &mut renderer,
+                )?;
+            }
+        }
     }
 
+    flush_final_dropped_events(
+        &dropped,
+        &mut reported_drops,
+        &mut file_writer,
+        &mut renderer,
+    )?;
     file_writer.flush()?;
     renderer.finish()?;
 
@@ -160,6 +224,26 @@ async fn render_loop(
         eprintln!("({d} progress events dropped)");
     }
 
+    Ok(())
+}
+
+/// Persist and render any event-bucket overflow that happened since the last
+/// call. Writers append the `DroppedEvents` marker into the replay log so the
+/// gap stays visible in `tail`/`watch`/serve replays forever.
+fn flush_final_dropped_events(
+    dropped: &AtomicUsize,
+    reported: &mut usize,
+    file_writer: &mut JsonlFileWriter,
+    renderer: &mut Renderer,
+) -> Result<()> {
+    if let Some(count) = take_newly_dropped(dropped, reported) {
+        let event = ProgressEvent::DroppedEvents {
+            count,
+            timestamp_ms: bookforge_core::progress::now_ms(),
+        };
+        file_writer.write_event(&event)?;
+        renderer.handle_event(&event)?;
+    }
     Ok(())
 }
 
@@ -175,8 +259,14 @@ async fn run_tui_attached(
     use crate::tui::{TuiApp, TuiMode};
 
     let mut app = TuiApp::new(TuiMode::Attached)?;
-    let loop_result =
-        drive_attached_tui(&mut app, &mut rx, &mut file_writer, cancel.as_ref()).await;
+    let loop_result = drive_attached_tui(
+        &mut app,
+        &mut rx,
+        &mut file_writer,
+        &dropped,
+        cancel.as_ref(),
+    )
+    .await;
     let restore_result = app.restore();
     file_writer.flush().ok();
     loop_result.and(restore_result)?;
@@ -193,10 +283,14 @@ async fn drive_attached_tui(
     app: &mut crate::tui::TuiApp,
     rx: &mut mpsc::Receiver<ProgressEvent>,
     file_writer: &mut JsonlFileWriter,
+    dropped: &AtomicUsize,
     cancel: Option<&CancellationToken>,
 ) -> Result<()> {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick so a clean start does not record drops.
+    tick.tick().await;
+    let mut reported_drops = 0usize;
     app.draw()?;
 
     loop {
@@ -214,10 +308,24 @@ async fn drive_attached_tui(
                 }
             }
             _ = tick.tick() => {
+                if let Some(count) =
+                    take_newly_dropped_for_tui(dropped, &mut reported_drops)
+                {
+                    let event = ProgressEvent::DroppedEvents {
+                        count,
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    };
+                    file_writer.write_event(&event)?;
+                    app.fold(&event);
+                }
                 if app.pump_input()? {
-                    // Quitting before the run finishes aborts it (Ctrl-C cannot
-                    // reach the SIGINT handler while the terminal is in raw mode).
-                    if !app.state.finished && let Some(token) = cancel {
+                    // Quitting before the run finishes cancels it at the next
+                    // safe boundary (Ctrl-C cannot reach the SIGINT handler
+                    // while the terminal is in raw mode). The token is shared
+                    // with the worker, so attached TUIs quit truthfully for
+                    // both `translate` and `resume` (UI-2): no orphaned
+                    // headless worker keeps spending after the user leaves.
+                    if !app.view.finished && let Some(token) = cancel {
                         token.cancel();
                     }
                     app.draw().ok();
@@ -230,11 +338,22 @@ async fn drive_attached_tui(
     Ok(())
 }
 
+/// TUI-side alias of [`take_newly_dropped`] so both render paths share the
+/// same honest drop accounting (UI-10).
+#[cfg(feature = "tui")]
+fn take_newly_dropped_for_tui(dropped: &AtomicUsize, reported: &mut usize) -> Option<usize> {
+    take_newly_dropped(dropped, reported)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderMode {
     Quiet,
     Progress,
-    JsonStdout,
+    /// JSON lines on stdout. `legacy_v1` selects the historical raw-line
+    /// dialect (`--ui json-v1`) instead of the versioned envelope.
+    JsonStdout {
+        legacy_v1: bool,
+    },
     #[cfg(feature = "tui")]
     Tui,
 }
@@ -244,7 +363,8 @@ fn resolve_render_mode(ui_mode: UiMode, stderr_is_tty: bool) -> RenderMode {
         UiMode::Auto if stderr_is_tty => RenderMode::Progress,
         UiMode::Auto => RenderMode::Quiet,
         UiMode::Progress => RenderMode::Progress,
-        UiMode::Json => RenderMode::JsonStdout,
+        UiMode::Json => RenderMode::JsonStdout { legacy_v1: false },
+        UiMode::JsonV1 => RenderMode::JsonStdout { legacy_v1: true },
         UiMode::Quiet => RenderMode::Quiet,
         UiMode::Tui => {
             #[cfg(feature = "tui")]
@@ -300,7 +420,9 @@ impl JsonlFileWriter {
             return Ok(());
         };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|err| {
+                anyhow::anyhow!("cannot create JSONL progress log {}: {err}", path.display())
+            })?;
         }
         let file_result = std::fs::OpenOptions::new()
             .create(true)
@@ -312,16 +434,20 @@ impl JsonlFileWriter {
             Ok(file) => {
                 self.writer = Some(BufWriter::new(file));
                 self.last_flush = Instant::now();
+                Ok(())
             }
             Err(err) => {
+                // A failed log open must FAIL the run, not degrade into a
+                // silent warn-and-continue that drops every subsequent event.
+                // The reporter surfaces the original error and stops; replay
+                // consumers then see an honest failure instead of a gap.
                 self.failed = true;
-                eprintln!(
-                    "warn: cannot create JSONL progress log {}: {err}",
+                Err(anyhow::anyhow!(
+                    "cannot create JSONL progress log {}: {err}",
                     path.display()
-                );
+                ))
             }
         }
-        Ok(())
     }
 
     fn write_event(&mut self, event: &ProgressEvent) -> Result<()> {
@@ -375,7 +501,7 @@ impl JsonlFileWriter {
 
 enum Renderer {
     Quiet,
-    JsonStdout,
+    JsonStdout { legacy_v1: bool },
     // Boxed: `ProgressBars` is far larger than the other variants.
     Progress(Box<ProgressBars>),
 }
@@ -384,7 +510,7 @@ impl Renderer {
     fn new(mode: RenderMode) -> Result<Self> {
         match mode {
             RenderMode::Quiet => Ok(Renderer::Quiet),
-            RenderMode::JsonStdout => Ok(Renderer::JsonStdout),
+            RenderMode::JsonStdout { legacy_v1 } => Ok(Renderer::JsonStdout { legacy_v1 }),
             RenderMode::Progress => Ok(Renderer::Progress(Box::new(ProgressBars::new()?))),
             #[cfg(feature = "tui")]
             RenderMode::Tui => {
@@ -396,8 +522,14 @@ impl Renderer {
     fn handle_event(&mut self, event: &ProgressEvent) -> Result<()> {
         match self {
             Renderer::Quiet => Ok(()),
-            Renderer::JsonStdout => {
-                println!("{}", serde_json::to_string(event)?);
+            Renderer::JsonStdout { legacy_v1 } => {
+                if *legacy_v1 {
+                    // v1 contract: raw `ProgressEvent` objects, byte-identical
+                    // to the file log.
+                    println!("{}", serde_json::to_string(event)?);
+                } else {
+                    println!("{}", envelope::stdout_line(envelope::KIND_EVENT, event));
+                }
                 Ok(())
             }
             Renderer::Progress(bars) => bars.handle_event(event),
@@ -419,9 +551,9 @@ struct ProgressBars {
     batch_bar: indicatif::ProgressBar,
     rate_bar: indicatif::ProgressBar,
     checkpoint_bar: indicatif::ProgressBar,
-    /// Renderer-agnostic state, kept in sync by folding each event. The bars
-    /// below only render numbers sourced from here.
-    state: RunState,
+    /// Canonical presentation view (UI-31): the shared RunState+EpochTracker
+    /// fold, so the bars below only render numbers sourced from here.
+    view: RunView,
 }
 
 impl ProgressBars {
@@ -481,14 +613,14 @@ impl ProgressBars {
             batch_bar,
             rate_bar,
             checkpoint_bar,
-            state: RunState::default(),
+            view: RunView::new(),
         })
     }
 
     fn handle_event(&mut self, event: &ProgressEvent) -> Result<()> {
         // Fold first so the bars below render numbers from a single source of
         // truth; the match only handles indicatif-specific presentation.
-        self.state.fold(event);
+        self.view.fold(event);
         match event {
             ProgressEvent::StageStarted { stage, .. } => {
                 self.stage_bar.set_message(format!("{stage}..."));
@@ -499,35 +631,35 @@ impl ProgressBars {
                     .enable_steady_tick(std::time::Duration::from_millis(80));
             }
             ProgressEvent::SegmentationFinished { .. } => {
-                self.seg_bar.set_length(self.state.total_segments as u64);
+                self.seg_bar.set_length(self.view.total_segments as u64);
                 self.seg_bar
-                    .set_message(format!("{} cached", self.state.cached));
+                    .set_message(format!("{} cached", self.view.cached));
             }
             ProgressEvent::CacheScanFinished { .. } => {
-                self.seg_bar.set_position(self.state.done_segments as u64);
+                self.seg_bar.set_position(self.view.done_segments as u64);
                 self.seg_bar
-                    .set_message(format!("{} cached", self.state.cached));
+                    .set_message(format!("{} cached", self.view.cached));
             }
             ProgressEvent::SegmentFinished { status, .. } => match status.as_str() {
                 "succeeded" | "skipped_cached" | "needs_review" | "failed" => {
-                    self.seg_bar.set_position(self.state.done_segments as u64);
+                    self.seg_bar.set_position(self.view.done_segments as u64);
                     self.rate_bar.set_message(format!(
-                        "{}/{} done, {:.1} seg/min, ETA {}",
-                        self.state.done_segments,
-                        self.state.total_segments,
-                        self.state.segments_per_minute(),
-                        format_eta(self.state.eta_secs()),
+                        "{}/{} done, {}, ETA {}",
+                        self.view.done_segments,
+                        self.view.total_segments,
+                        crate::presentation::format_rate(self.view.segments_per_minute()),
+                        crate::presentation::format_eta(self.view.eta_secs()),
                     ));
                 }
                 _ => {}
             },
             ProgressEvent::RequestStarted { .. } | ProgressEvent::RequestFinished { .. } => {
                 self.batch_bar
-                    .set_message(format!("{} active", self.state.active_requests));
+                    .set_message(format!("{} active", self.view.active_requests));
             }
             ProgressEvent::CheckpointFlushed { .. } => {
                 self.checkpoint_bar
-                    .set_message(format!("flushed {}", self.state.checkpoint_flushed));
+                    .set_message(format!("flushed {}", self.view.checkpoint_flushed));
             }
             ProgressEvent::JobPaused { .. } => {
                 self.stage_bar.set_message("paused");
@@ -537,7 +669,7 @@ impl ProgressBars {
             ProgressEvent::JobResumed { .. } => {
                 self.stage_bar.set_message("translating...");
                 self.batch_bar
-                    .set_message(format!("{} active", self.state.active_requests));
+                    .set_message(format!("{} active", self.view.active_requests));
             }
             ProgressEvent::BatchQueued { batch_id, .. } => {
                 self.batch_bar
@@ -561,29 +693,47 @@ impl ProgressBars {
                     ))
                     .ok();
             }
+            // `changed_fields`/`application` above are crate-generated
+            // identifiers, but rejection reasons and warning/error messages
+            // carry provider- or book-controlled text; sanitize anything
+            // external before the terminal sees it (UI-5).
             ProgressEvent::RuntimeConfigRejected {
                 revision, message, ..
             } => {
                 let revision = revision.map_or_else(String::new, |value| format!(" r{value}"));
                 self.multi
-                    .println(format!("  [runtime{revision} rejected] {message}"))
+                    .println(format!(
+                        "  [runtime{revision} rejected] {}",
+                        sanitize_terminal(message)
+                    ))
                     .ok();
             }
             ProgressEvent::Warning { message, .. } => {
-                self.multi.println(format!("  [warn] {message}")).ok();
+                self.multi
+                    .println(format!("  [warn] {}", sanitize_terminal(message)))
+                    .ok();
             }
             ProgressEvent::Error { message, .. } => {
-                self.multi.println(format!("  [error] {message}")).ok();
+                self.multi
+                    .println(format!("  [error] {}", sanitize_terminal(message)))
+                    .ok();
+            }
+            ProgressEvent::DroppedEvents { count, .. } => {
+                self.multi
+                    .println(format!(
+                        "  [dropped] {count} progress event(s) lost to queue overflow"
+                    ))
+                    .ok();
             }
             ProgressEvent::TranslationFinished {
                 needs_review,
                 failed,
                 ..
             } => {
-                self.seg_bar.set_position(self.state.done_segments as u64);
+                self.seg_bar.set_position(self.view.done_segments as u64);
                 self.seg_bar.finish_with_message(format!(
                     "{} done, {} needs review, {} failed",
-                    self.state.done_segments, *needs_review, *failed
+                    self.view.done_segments, *needs_review, *failed
                 ));
                 self.stage_bar.finish_and_clear();
                 self.batch_bar.finish_and_clear();
@@ -598,16 +748,6 @@ impl ProgressBars {
     fn finish(&mut self) -> Result<()> {
         self.multi.clear().ok();
         Ok(())
-    }
-}
-
-fn format_eta(eta_secs: f64) -> String {
-    if eta_secs > 3600.0 {
-        format!("{:.1}h", eta_secs / 3600.0)
-    } else if eta_secs > 60.0 {
-        format!("{:.0}m", eta_secs / 60.0)
-    } else {
-        format!("{:.0}s", eta_secs)
     }
 }
 
@@ -662,12 +802,37 @@ mod tests {
     fn ui_json_always_uses_json_stdout() {
         assert_eq!(
             resolve_render_mode(UiMode::Json, false),
-            RenderMode::JsonStdout
+            RenderMode::JsonStdout { legacy_v1: false }
         );
         assert_eq!(
             resolve_render_mode(UiMode::Json, true),
-            RenderMode::JsonStdout
+            RenderMode::JsonStdout { legacy_v1: false }
         );
+    }
+
+    #[test]
+    fn ui_json_v1_selects_the_legacy_raw_stdout_dialect() {
+        assert_eq!(
+            resolve_render_mode(UiMode::JsonV1, false),
+            RenderMode::JsonStdout { legacy_v1: true }
+        );
+        assert_eq!(
+            resolve_render_mode(UiMode::JsonV1, true),
+            RenderMode::JsonStdout { legacy_v1: true }
+        );
+    }
+
+    /// The human-stdout gate treats `json` and its deprecated `json-v1`
+    /// alias identically (UI-22 contract extended to the new mode).
+    #[test]
+    fn json_modes_suppress_human_stdout() {
+        for mode in [UiMode::Json, UiMode::JsonV1, UiMode::Quiet, UiMode::Tui] {
+            assert!(mode.machine_stdout(), "{mode:?} must suppress human stdout");
+            assert!(!mode.human_stdout());
+        }
+        for mode in [UiMode::Auto, UiMode::Progress] {
+            assert!(mode.human_stdout(), "{mode:?} is human-facing");
+        }
     }
 
     #[test]
@@ -697,7 +862,7 @@ mod tests {
         })
         .expect("translation finished event should render");
 
-        assert_eq!(bars.state.done_segments, 4);
+        assert_eq!(bars.view.done_segments, 4);
         assert_eq!(bars.seg_bar.position(), 4);
     }
 
@@ -846,6 +1011,90 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("Warning"));
+    }
+
+    /// A JSONL open failure (unwritable location) must surface as an error
+    /// from the reporter, not be silently absorbed into a warn-and-continue
+    /// that drops every event from the durable log.
+    #[tokio::test]
+    async fn jsonl_open_failure_surfaces_as_an_error() {
+        let blocker = std::env::temp_dir().join(format!(
+            "bookforge-test-blocker-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&blocker, b"a plain file").expect("blocker writes");
+        let bad_path = blocker.join("events.jsonl");
+
+        let (tx, rx) = mpsc::channel::<ProgressEvent>(16);
+        let handle = tokio::spawn(render_loop(
+            rx,
+            UiMode::Quiet,
+            Some(bad_path),
+            false,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        ));
+
+        tx.send(ProgressEvent::StageStarted {
+            stage: "boom".to_string(),
+            timestamp_ms: 0,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let result = handle.await.expect("render loop should not panic");
+        let error = result.expect_err("JSONL open failure must surface");
+        assert!(
+            error.to_string().contains("JSONL progress log"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// UI-10: queue overflow must be reported with honest accounting. The
+    /// delta helper only surfaces fresh drops once each.
+    #[test]
+    fn newly_dropped_events_are_reported_exactly_once_per_batch() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut reported = 0usize;
+
+        assert!(take_newly_dropped(&dropped, &mut reported).is_none());
+
+        dropped.fetch_add(7, Ordering::Relaxed);
+        assert_eq!(take_newly_dropped(&dropped, &mut reported), Some(7));
+        assert!(take_newly_dropped(&dropped, &mut reported).is_none());
+
+        dropped.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(take_newly_dropped(&dropped, &mut reported), Some(2));
+        assert_eq!(reported, 9);
+    }
+
+    /// UI-10: a `DroppedEvents` marker written through the JSONL writer lands
+    /// in the durable replay log so burst losses stay visible to tail/watch.
+    #[test]
+    fn dropped_events_marker_is_persisted_to_the_replay_log() {
+        let path = std::env::temp_dir().join(format!(
+            "bookforge-test-dropped-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut writer = JsonlFileWriter::new(Some(path.clone()), false);
+        writer
+            .write_event(&ProgressEvent::DroppedEvents {
+                count: 12,
+                timestamp_ms: 42,
+            })
+            .unwrap();
+        writer.flush().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let parsed: serde_json::Value = serde_json::from_str(content.trim())
+            .expect("dropped-events marker should be valid JSONL");
+        assert_eq!(parsed["DroppedEvents"]["count"], 12);
     }
 
     #[test]

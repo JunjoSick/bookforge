@@ -96,11 +96,20 @@ pub fn telemetry_summary(entries: &[ProviderRequestMetric]) -> String {
     let total = entries.len();
     let succeeded = entries.iter().filter(|e| e.status == "ok").count();
     let failed = total - succeeded;
+    // Real HTTP 429 codes are the primary signal now that request recording
+    // actually persists them; legacy entries whose `status_code` stayed None
+    // but whose derived status says rate_limited are counted too, so the
+    // printed counter never silently reads zero for those.
     let rate_limited = entries
         .iter()
-        .filter(|e| e.status_code == Some(429))
+        .filter(|e| {
+            e.status_code == Some(429) || (e.status_code.is_none() && e.status == "rate_limited")
+        })
         .count();
-    let timed_out = entries.iter().filter(|e| e.status == "timeout").count();
+    let timed_out = entries
+        .iter()
+        .filter(|e| e.status == "timeout" || e.status_code == Some(408))
+        .count();
     let total_input_tokens: u64 = entries.iter().filter_map(|e| e.input_tokens).sum();
     let total_output_tokens: u64 = entries.iter().filter_map(|e| e.output_tokens).sum();
 
@@ -153,5 +162,61 @@ mod tests {
             telemetry.record_glossary_entry(rule, true);
             assert_eq!(telemetry.glossary_rule_counts(rule), (2, 1));
         }
+    }
+
+    fn metric(status: &str, status_code: Option<u16>) -> ProviderRequestMetric {
+        ProviderRequestMetric {
+            request_id: format!("req-{status}-{status_code:?}"),
+            batch_id: None,
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            profile: "balanced".to_string(),
+            items: 1,
+            estimated_input_tokens: 1,
+            max_output_tokens: None,
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            latency_ms: 10,
+            finish_reason: None,
+            status: status.to_string(),
+            status_code,
+            retry_count: 0,
+            backoff_ms: 0,
+            error_kind: None,
+        }
+    }
+
+    #[test]
+    fn summary_counts_real_status_codes_not_placeholder_zeros() {
+        // Before the fix, every recorded metric carried status_code=None, so
+        // the printed `429s=` counter was dead regardless of what happened.
+        let entries = vec![
+            metric("ok", Some(200)),
+            metric("rate_limited", Some(429)),
+            metric("rate_limited", Some(429)),
+            metric("timeout", None),
+            metric("too_early", Some(425)),
+            metric("timeout", Some(408)),
+        ];
+
+        let summary = telemetry_summary(&entries);
+
+        assert!(summary.contains("429s=2"), "got: {summary}");
+        assert!(
+            summary.contains("timeouts=2"),
+            "408 codes count as timeouts too: {summary}"
+        );
+    }
+
+    #[test]
+    fn summary_falls_back_to_derived_status_for_legacy_entries() {
+        let entries = vec![metric("rate_limited", None), metric("ok", None)];
+
+        let summary = telemetry_summary(&entries);
+
+        assert!(
+            summary.contains("429s=1"),
+            "legacy rows still count: {summary}"
+        );
     }
 }

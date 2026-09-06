@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 use bookforge_core::{RetryAfterPolicy, marker::is_marker_token};
 
@@ -17,6 +17,15 @@ const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Provider error bodies can be verbose, but only a short diagnostic belongs
 /// in errors and logs.
 const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 8 * 1024;
+
+/// Upper bound on a `Retry-After` hint we are willing to honor, whether the
+/// server sent delay-seconds or an HTTP-date. A hostile or buggy endpoint can
+/// otherwise stall one request (and with it a whole worker) for hours. Five
+/// minutes is generous enough for every documented rate-limit window we have
+/// seen in practice while staying far below the old 60s cap's loss of intent:
+/// hints beyond the cap are clamped rather than discarded, so the spirit of
+/// the header survives.
+const MAX_HONORED_RETRY_AFTER_SECS: u64 = 300;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
@@ -771,9 +780,16 @@ impl OpenAiCompatibleConfig {
 pub struct OpenAiCompatibleProvider {
     config: OpenAiCompatibleConfig,
     client: reqwest::Client,
+    /// The total timeout actually baked into `client` (the configured timeout,
+    /// raised to the ≥300s reasoning floor when applicable). Per-request
+    /// timeout extensions are computed against this value so they can never
+    /// accidentally *shorten* the client default.
+    client_timeout_seconds: u64,
     reasoning_detected: AtomicBool,
     response_format_supported: AtomicBool,
     thinking_warning_emitted: AtomicBool,
+    collapsed_budget_warning_emitted: AtomicBool,
+    timeout_extension_emitted: AtomicBool,
     pub cancel_token: CancellationToken,
 }
 
@@ -782,12 +798,20 @@ impl Clone for OpenAiCompatibleProvider {
         Self {
             config: self.config.clone(),
             client: self.client.clone(),
+            client_timeout_seconds: self.client_timeout_seconds,
             reasoning_detected: AtomicBool::new(self.reasoning_detected.load(Ordering::Relaxed)),
             response_format_supported: AtomicBool::new(
                 self.response_format_supported.load(Ordering::Relaxed),
             ),
             thinking_warning_emitted: AtomicBool::new(
                 self.thinking_warning_emitted.load(Ordering::Relaxed),
+            ),
+            collapsed_budget_warning_emitted: AtomicBool::new(
+                self.collapsed_budget_warning_emitted
+                    .load(Ordering::Relaxed),
+            ),
+            timeout_extension_emitted: AtomicBool::new(
+                self.timeout_extension_emitted.load(Ordering::Relaxed),
             ),
             cancel_token: self.cancel_token.clone(),
         }
@@ -803,8 +827,14 @@ impl OpenAiCompatibleProvider {
         config: OpenAiCompatibleConfig,
         cancel_token: CancellationToken,
     ) -> Result<Self> {
-        let is_reasoning = model_name_is_reasoning(&config.model);
-        let effective_timeout = if is_reasoning {
+        // Names alone are not the whole story (see `model_ships_with_thinking`):
+        // a request that explicitly disables thinking never spends its output
+        // budget on hidden chain-of-thought, so it needs neither the x3
+        // multiplier nor the ≥300s timeout floor. Runtime detection on
+        // `reasoning_content` still flips this back on if an endpoint thinks
+        // anyway.
+        let bootstrapped_reasoning = bootstrapped_reasoning(&config);
+        let effective_timeout = if bootstrapped_reasoning {
             config.timeout_seconds.max(300)
         } else {
             config.timeout_seconds
@@ -819,9 +849,12 @@ impl OpenAiCompatibleProvider {
         Ok(Self {
             config,
             client,
-            reasoning_detected: AtomicBool::new(is_reasoning),
+            client_timeout_seconds: effective_timeout,
+            reasoning_detected: AtomicBool::new(bootstrapped_reasoning),
             response_format_supported: AtomicBool::new(true),
             thinking_warning_emitted: AtomicBool::new(false),
+            collapsed_budget_warning_emitted: AtomicBool::new(false),
+            timeout_extension_emitted: AtomicBool::new(false),
             cancel_token,
         })
     }
@@ -841,7 +874,27 @@ impl OpenAiCompatibleProvider {
         });
 
         if let Some(max_tokens) = request.max_output_tokens {
-            body["max_tokens"] = json!(max_tokens);
+            // Audit LLM-P3c: a degenerate plan (context remainder clamped to
+            // zero, e.g. a pathological segment bigger than the whole window)
+            // must never serialize a zero-token request — that is a guaranteed
+            // opaque HTTP 400 on most endpoints. Floor the wire value at 1 and
+            // surface a plan warning so oversized segments are visible instead
+            // of vanishing into a silent 400 chase.
+            let limit = max_tokens.max(1);
+            if max_tokens == 0
+                && !self
+                    .collapsed_budget_warning_emitted
+                    .swap(true, Ordering::Relaxed)
+            {
+                warn!(
+                    base_url = %self.config.base_url,
+                    model = %self.config.model,
+                    segment_id = ?request.metadata.segment_id,
+                    "plan warning: output budget collapsed to 1 token — segment exceeds its \
+                     context window; request sent with max_tokens=1 and will likely truncate"
+                );
+            }
+            body["max_tokens"] = json!(limit);
         }
 
         if self.config.thinking_disabled {
@@ -946,6 +999,27 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .provider_max_attempts
             .unwrap_or(self.config.provider_max_attempts)
             .max(1);
+        // Latency-aware per-request timeout (see crate::latency): a request's
+        // own output budget implies a minimum generation time, so the preset
+        // client timeout is extended for it — never shortened. Silently
+        // failing a legitimate 6-minute generation is worse than a bounded,
+        // explained extension; the extension is derived from the request, not
+        // from wall-clock observation.
+        let (request_timeout, timeout_extended) = crate::latency::effective_request_timeout(
+            Duration::from_secs(self.client_timeout_seconds),
+            request.max_output_tokens,
+        );
+        if timeout_extended && !self.timeout_extension_emitted.swap(true, Ordering::Relaxed) {
+            info!(
+                model = %self.config.model,
+                configured_seconds = self.client_timeout_seconds,
+                effective_seconds = request_timeout.as_secs(),
+                max_output_tokens = ?request.max_output_tokens,
+                "provider: per-request timeout extended beyond the configured timeout to cover \
+                 this request's output budget; legitimate long generations are given a bounded \
+                 window derived from the request itself instead of being failed at the preset"
+            );
+        }
         let body_len = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
         let max_backoff = Duration::from_secs(self.config.max_backoff_seconds);
         let policy = self.config.retry_after_policy;
@@ -954,7 +1028,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let mut tried_response_format_fallback = false;
         let mut attempt = 0usize;
         while attempt < max_attempts {
-            let mut request_builder = self.client.post(&endpoint).json(&body);
+            // RequestBuilder::timeout overrides the client default for this
+            // request only, and covers the whole cycle including the response
+            // body — so slow-trickling bodies are bounded by it too.
+            let mut request_builder = self
+                .client
+                .post(&endpoint)
+                .timeout(request_timeout)
+                .json(&body);
             if let Some(api_key) = api_key.as_deref() {
                 request_builder = request_builder.bearer_auth(api_key);
             }
@@ -1279,14 +1360,124 @@ async fn apply_retry_delay(
 }
 
 fn is_retryable_status(status: u16) -> bool {
-    status == 429 || (500..=599).contains(&status)
+    // 408 (Request Timeout) and 425 (Too Early) are transient by
+    // specification: both describe timing conditions that a later retry can
+    // resolve, unlike the permanent 4xx family around them.
+    status == 429 || status == 408 || status == 425 || (500..=599).contains(&status)
 }
 
+/// Parse a `Retry-After` header value, honoring both defined forms.
+///
+/// RFC 7231 allows either `delay-seconds` or an HTTP-date. The seconds form
+/// was already handled; the date form was silently dropped before, which made
+/// polite servers look like they had sent nothing. A date in the past means
+/// "retry now" and yields a zero delay. Both forms are clamped to
+/// [`MAX_HONORED_RETRY_AFTER_SECS`]; the clamp is a durability guard against
+/// hostile values, not a policy judgment about small hints.
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
-    let secs: u64 = raw.trim().parse().ok()?;
-    // Cap at 60s so a buggy or hostile server can't stall a request for hours.
-    Some(Duration::from_secs(secs.min(60)))
+    let raw = raw.trim();
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(secs.min(MAX_HONORED_RETRY_AFTER_SECS)));
+    }
+    let target_unix = parse_http_date_unix(raw)?;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(Duration::from_secs(
+        target_unix
+            .saturating_sub(now_unix)
+            .min(MAX_HONORED_RETRY_AFTER_SECS),
+    ))
+}
+
+/// Parse an HTTP-date into Unix seconds. Supports IMF-fixdate
+/// (`Sun, 06 Nov 1994 08:49:37 GMT`) and the obsolete RFC 850 form
+/// (`Sunday, 06-Nov-94 08:49:37 GMT`); asctime is rare enough on the wire
+/// that falling back to the exponential backoff for it is acceptable.
+fn parse_http_date_unix(input: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+
+    let body = input.split(',').nth(1)?.trim_start();
+    let tokens: Vec<&str> = body.split_whitespace().collect();
+
+    // IMF-fixdate carries five tokens ("06 Nov 1994 08:49:37 GMT"); RFC 850
+    // folds the date into one hyphenated token ("06-Nov-94 08:49:37 GMT").
+    let (day_token, month_token, year_token, time_token) = match tokens.as_slice() {
+        [date_token, time_token, zone] if zone.eq_ignore_ascii_case("GMT") => {
+            let (day, rest) = date_token.split_once('-')?;
+            let (month, year) = rest.split_once('-')?;
+            (day, month, year.to_string(), *time_token)
+        }
+        [day_token, month_token, year_token, time_token, zone]
+            if zone.eq_ignore_ascii_case("GMT") =>
+        {
+            (
+                *day_token,
+                *month_token,
+                (*year_token).to_string(),
+                *time_token,
+            )
+        }
+        _ => return None,
+    };
+
+    let day: u32 = day_token.parse().ok()?;
+    let month_index = MONTHS
+        .iter()
+        .position(|name| month_token.eq_ignore_ascii_case(name))? as u32
+        + 1;
+    let year: i64 = match year_token.parse::<i64>() {
+        // Two-digit years only appear in the RFC 850 form; the pivot follows
+        // the common two-digit-year convention (00–68 => 20xx).
+        Ok(short @ 0..=99) if year_token.len() == 2 => {
+            if short < 70 {
+                2000 + short
+            } else {
+                1900 + short
+            }
+        }
+        Ok(full) => full,
+        Err(_) => return None,
+    };
+    let mut clock = time_token.split(':');
+    let hour: u32 = clock.next()?.parse().ok()?;
+    let minute: u32 = clock.next()?.parse().ok()?;
+    let second: u32 = clock.next()?.parse().ok()?;
+    // Audit LLM-P3d: bound the year like every other field above. Years
+    // below 1600 predate any sane HTTP semantics and can wrap the unsigned
+    // Unix result negative-side (days-from-civil goes negative); years
+    // beyond 9999 are nonsense on the wire and could overflow the day math.
+    // Both collapse to `None` — the same rejection style as the other
+    // bounds — so a hostile header falls back to exponential backoff.
+    if clock.next().is_some()
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+        || !(1600..=9999).contains(&year)
+    {
+        return None;
+    }
+
+    // Days-from-civil (Howard Hinnant's algorithm); Gregorian, leap-safe.
+    let shifted_year = year - i64::from(month_index <= 2);
+    let era = shifted_year.div_euclid(400);
+    let year_of_era = shifted_year - era * 400;
+    let month_of_season = if month_index > 2 {
+        month_index - 3
+    } else {
+        month_index + 9
+    };
+    let day_of_season = (153 * month_of_season + 2) / 5 + day - 1;
+    let day_of_era =
+        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + i64::from(day_of_season);
+    let days = era * 146_097 + day_of_era - 719_468;
+
+    Some((days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64) as u64)
 }
 
 fn is_retryable_http_error(error: &reqwest::Error) -> bool {
@@ -1305,21 +1496,36 @@ fn attempt_limit_for_http_error(error: &reqwest::Error, max_attempts: usize) -> 
     }
 }
 
-fn exponential_delay(attempt: usize) -> Duration {
+pub(crate) fn exponential_delay(attempt: usize) -> Duration {
     let millis: u64 = 500u64.saturating_mul(2u64.saturating_pow(attempt as u32));
     Duration::from_millis(millis.min(60_000))
 }
 
-fn apply_jitter(base: Duration, attempt: usize) -> Duration {
+/// Widen `base` into a ±20% window around it and pick a point inside.
+///
+/// The offset is mixed from wall-clock nanoseconds and the process id on
+/// every call instead of derived only from the attempt index. A purely
+/// attempt-derived sequence made every concurrent worker compute the *same*
+/// delay for the same retry round — a thundering herd re-synchronized onto
+/// the exact moment the rate limiter was least able to absorb them
+/// (audit LLM-10).
+pub(crate) fn apply_jitter(base: Duration, attempt: usize) -> Duration {
     let millis = base.as_millis() as u64;
     if millis < 2 {
         return base;
     }
     let spread = millis / 5;
-    let offset = (attempt as u64)
-        .wrapping_mul(1103515245)
-        .wrapping_add(12345)
-        % spread.max(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|now| now.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let seed = nanos
+        ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (attempt as u64).wrapping_mul(1103515245);
+    let offset = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let offset = (offset >> 33) % spread.max(1);
     Duration::from_millis(millis.saturating_sub(spread / 2).saturating_add(offset))
 }
 
@@ -1338,9 +1544,14 @@ fn retry_delay(
 
         RetryAfterPolicy::Fixed => Some(Duration::from_millis(750).min(max_backoff)),
 
+        // A server-provided hint outranks our own curve even under the
+        // jittered policy; when absent the exponential estimate applies.
+        // The hint is still honored through its clamp in `parse_retry_after`.
         RetryAfterPolicy::JitteredExponential => {
-            let base = exponential_delay(attempt).min(max_backoff);
-            Some(apply_jitter(base, attempt))
+            let base = retry_after.unwrap_or_else(|| exponential_delay(attempt).min(max_backoff));
+            // Re-clamp after jittering so the ±20% window can never push a
+            // delay past the operator's ceiling.
+            Some(apply_jitter(base, attempt).min(max_backoff))
         }
     }
 }
@@ -1392,16 +1603,41 @@ fn parse_finish_reason(value: &str) -> FinishReason {
     }
 }
 
-/// Heuristic to detect reasoning / chain-of-thought models by name.
-/// These models consume part of the `max_tokens` budget for internal reasoning
-/// and thus need a higher output token allowance.
-fn model_name_is_reasoning(model: &str) -> bool {
+/// Heuristic: which model names imply chain-of-thought output budget?
+///
+/// Two distinct families live here deliberately:
+///
+/// * Dedicated reasoners (`deepseek-reasoner`-style IDs, the OpenAI
+///   o-series) always consume output tokens for hidden reasoning, toggle or
+///   no toggle, and keep their unconditional treatment.
+/// * DeepSeek V4 chat tiers (`v4-flash`, `v4-pro`) merely **default** to
+///   thinking per DeepSeek's published docs (api-docs.deepseek.com,
+///   "Models & Pricing" / "Thinking Mode", checked 2026-08-26), toggled via
+///   `{"thinking": {"type": ...}}`. For those the caller must confirm
+///   thinking wasn't disabled before treating the model as reasoning — see
+///   `new_with_cancel` and the BookForge presets that ship
+///   `thinking_disabled: true`.
+fn model_ships_with_thinking(model: &str) -> bool {
     let lower = model.to_lowercase();
     lower.contains("reasoner")
         || lower.contains("v4-flash")
+        || lower.contains("v4-pro")
         || lower.starts_with("o1")
         || lower.starts_with("o3")
         || lower.starts_with("o4")
+}
+
+/// Whether the initial classification treats this config as a reasoning
+/// deployment. Dedicated reasoners ignore the disable toggle (their budget
+/// is spent regardless of whether the suppression parameter lands);
+/// default-thinking chat tiers honor it.
+fn bootstrapped_reasoning(config: &OpenAiCompatibleConfig) -> bool {
+    let lower = config.model.to_lowercase();
+    let dedicated = lower.contains("reasoner")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4");
+    dedicated || (model_ships_with_thinking(&config.model) && !config.thinking_disabled)
 }
 
 fn local_api_key_is_optional(name: &str) -> bool {
@@ -1413,6 +1649,39 @@ mod tests {
     use super::*;
     use bookforge_core::RetryAfterPolicy;
     use tokio::time::Duration;
+
+    /// Read one HTTP request off a mock connection: headers plus the declared
+    /// body. A single read is not enough under load: requests arrive split
+    /// across segments, and closing with unread inbound data makes Windows
+    /// answer with RST instead of FIN, which surfaces to clients as decode
+    /// errors.
+    async fn read_mock_request<S>(stream: &mut S) -> Vec<u8>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        let mut scratch = [0u8; 8192];
+        loop {
+            match stream.read(&mut scratch).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => request.extend_from_slice(&scratch[..read]),
+            }
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            let declared = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + declared {
+                break;
+            }
+        }
+        request
+    }
 
     #[test]
     fn offline_usage_estimate_is_script_aware() {
@@ -1534,6 +1803,119 @@ mod tests {
         );
     }
 
+    // ---- Audit LLM-P3c: zero-token budgets never reach the wire ------------
+
+    #[test]
+    fn degenerate_zero_token_budget_is_floored_and_flagged() {
+        let provider = offline_provider("https://llm.example.test/v1", "custom-model");
+        assert!(
+            !provider
+                .collapsed_budget_warning_emitted
+                .load(Ordering::Relaxed)
+        );
+
+        let mut request = offline_request();
+        request.max_output_tokens = Some(0);
+        let body = provider.request_body(&request);
+
+        assert_eq!(body["max_tokens"], json!(1), "the wire value must be 1");
+        assert!(
+            provider
+                .collapsed_budget_warning_emitted
+                .load(Ordering::Relaxed),
+            "a collapsed budget must surface its plan warning"
+        );
+
+        // A healthy budget passes through untouched and emits no warning.
+        let healthy_provider = offline_provider("https://llm.example.test/v1", "custom-model");
+        let body = healthy_provider.request_body(&offline_request());
+        assert_eq!(body["max_tokens"], json!(256));
+        assert!(
+            !healthy_provider
+                .collapsed_budget_warning_emitted
+                .load(Ordering::Relaxed)
+        );
+    }
+
+    /// Pathological case end-to-end: a segment whose plan collapsed to a
+    /// one-token budget still completes against the endpoint — floored at
+    /// max_tokens=1, warning flagged, and no error/400-chase behavior.
+    #[tokio::test]
+    async fn collapsed_budget_request_still_proceeds_with_floored_limit() {
+        let (response, wire_body, budget_flagged) = retry_transient_transport(|| {
+            use tokio::io::AsyncWriteExt;
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("test listener should bind");
+                let addr = listener.local_addr().unwrap();
+                let server_handle = tokio::spawn(async move {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return None;
+                    };
+                    let inbound = read_mock_request(&mut stream).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let payload = json!({
+                        "choices": [
+                            {"message": {"content": "ok"}, "finish_reason": "stop"}
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    });
+                    let _ = stream.write_all(payload.to_string().as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    Some(inbound)
+                });
+
+                let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+                    base_url: format!("http://{addr}"),
+                    // Local providers intentionally permit an absent API key.
+                    api_key_env: "OLLAMA_API_KEY".to_string(),
+                    model: "test-model".to_string(),
+                    timeout_seconds: 10,
+                    provider_max_attempts: 1,
+                    thinking_disabled: true,
+                    retry_after_policy: RetryAfterPolicy::None,
+                    max_backoff_seconds: 1,
+                    max_idle_per_host: 1,
+                    json_mode: bookforge_core::JsonMode::PromptOnly,
+                })
+                .expect("offline provider config should be valid");
+                let mut request = offline_request();
+                request.max_output_tokens = Some(0);
+                // A floored budget completes normally instead of erroring.
+                let response = provider.complete(request).await?;
+                let inbound = server_handle
+                    .await
+                    .expect("mock server joins")
+                    .expect("mock server should capture the inbound request");
+                let budget_flagged =
+                    provider.collapsed_budget_warning_emitted.load(Ordering::Relaxed);
+                Ok((response, inbound, budget_flagged))
+            }
+        })
+        .await
+        .expect("floored budget scenario should succeed without transport flake");
+
+        // The run proceeded: the endpoint answered, nothing chased a 400.
+        assert_eq!(response.content, "ok");
+        assert_eq!(response.finish_reason, FinishReason::Stop);
+        assert!(
+            budget_flagged,
+            "the collapsed budget must be surfaced as a plan warning"
+        );
+
+        // And the wire actually carried the floored limit, not zero.
+        let raw = String::from_utf8_lossy(&wire_body);
+        let body_start = raw.find("\r\n\r\n").expect("headers/body split") + 4;
+        let parsed: Value =
+            serde_json::from_str(raw[body_start..].trim()).expect("JSON request body");
+        assert_eq!(parsed["max_tokens"], json!(1));
+    }
+
     #[test]
     fn billable_output_does_not_double_count_reasoning_breakdown() {
         let raw = json!({
@@ -1626,6 +2008,109 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_delay_seconds_is_honored_and_capped() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("45"),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(45)));
+
+        let mut hostile = reqwest::header::HeaderMap::new();
+        hostile.insert(
+            reqwest::header::RETRY_AFTER,
+            // 100 hours.
+            reqwest::header::HeaderValue::from_static("360000"),
+        );
+        assert_eq!(
+            parse_retry_after(&hostile),
+            Some(Duration::from_secs(MAX_HONORED_RETRY_AFTER_SECS)),
+            "the clamp must bound hostile hints"
+        );
+    }
+
+    #[test]
+    fn retry_after_http_date_is_parsed_not_dropped() {
+        // The canonical RFC 7231 example (RFC 2616 §3.3.1 test vector).
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        let parsed = parse_retry_after(&headers).expect("HTTP-date must yield a delay");
+        assert!(
+            parsed <= Duration::from_secs(MAX_HONORED_RETRY_AFTER_SECS),
+            "a past date must degrade to an immediate retry, got {parsed:?}"
+        );
+
+        let unix =
+            parse_http_date_unix("Sun, 06 Nov 1994 08:49:37 GMT").expect("IMF-fixdate must parse");
+        assert_eq!(unix, 784_111_777);
+
+        let rfc850 =
+            parse_http_date_unix("Sunday, 06-Nov-94 08:49:37 GMT").expect("RFC 850 must parse");
+        assert_eq!(rfc850, 784_111_777);
+
+        assert_eq!(
+            parse_http_date_unix("Sat, 01 Jan 2000 00:00:00 GMT"),
+            Some(946_684_800)
+        );
+        assert_eq!(parse_http_date_unix("not a date"), None);
+    }
+
+    // Audit LLM-P3d: absurd years must be rejected, not run through the
+    // civil-calendar math where they underflow the unsigned Unix result
+    // (or overflow it). The bounds keep hostile Retry-After headers on the
+    // same graceful None path as any other malformed date.
+    #[test]
+    fn http_dates_outside_the_plausible_year_window_are_rejected() {
+        assert_eq!(
+            parse_http_date_unix("Wed, 01 Jan 1599 00:00:00 GMT"),
+            None,
+            "pre-1600 years must be rejected"
+        );
+        assert_eq!(
+            parse_http_date_unix("Wed, 01 Jan 10000 00:00:00 GMT"),
+            None,
+            "five-digit years must be rejected"
+        );
+        assert_eq!(
+            parse_http_date_unix("Wed, 01 Jan -0500 00:00:00 GMT"),
+            None,
+            "negative years must be rejected before the unsigned cast"
+        );
+        // Boundary values inside the window still parse.
+        assert!(
+            parse_http_date_unix("Wed, 01 Jan 1600 00:00:00 GMT").is_some(),
+            "the lower bound itself is accepted"
+        );
+        assert!(
+            parse_http_date_unix("Sun, 01 Jan 9999 12:00:00 GMT").is_some(),
+            "the upper bound itself is accepted"
+        );
+    }
+
+    #[test]
+    fn jittered_exponential_prefers_a_server_hint() {
+        let hint = Some(Duration::from_secs(3));
+        for attempt in 0..5 {
+            let delay = retry_delay(
+                RetryAfterPolicy::JitteredExponential,
+                attempt,
+                hint,
+                Duration::from_secs(30),
+            )
+            .expect("policy yields a delay");
+            // Jitter widens to ±20%, so a honored 3s hint stays near it
+            // rather than collapsing onto our own curve.
+            assert!(
+                delay >= Duration::from_millis(2_000) && delay <= Duration::from_millis(4_000),
+                "hint should dominate the schedule, got {delay:?}"
+            );
+        }
+    }
+
+    #[test]
     fn local_provider_keys_are_optional_only_for_known_presets() {
         assert!(local_api_key_is_optional("OLLAMA_API_KEY"));
         assert!(local_api_key_is_optional("LLAMACPP_API_KEY"));
@@ -1696,68 +2181,173 @@ mod tests {
         assert!(!preview.contains(&"x".repeat(MAX_PROVIDER_ERROR_BODY_BYTES + 1)));
     }
 
+    /// Regression for audit LLM-13. DeepSeek's published docs state that
+    /// `deepseek-v4-flash` (and `-pro`) support both modes with thinking
+    /// enabled *by default* — but every BookForge preset ships
+    /// `thinking_disabled: true`, and a disabled request never burns its
+    /// output budget on hidden chain-of-thought, so it must not receive the
+    /// reasoning ×3 budget or the ≥300s timeout floor.
+    #[test]
+    fn thinking_disabled_names_do_not_bootstrap_reasoning_budgets() {
+        let disabled = offline_provider("https://api.deepseek.com/v1", "deepseek-v4-flash");
+        assert!(
+            !disabled.is_reasoning(),
+            "thinking_disabled flash must not pre-classify as reasoning"
+        );
+        let disabled_pro = offline_provider("https://api.deepseek.com/v1", "deepseek-v4-pro");
+        assert!(!disabled_pro.is_reasoning());
+
+        // With thinking allowed, the documented default applies.
+        let mut enabled_config =
+            OpenAiCompatibleConfig::deepseek(Some("deepseek-v4-flash".to_string()));
+        enabled_config.thinking_disabled = false;
+        enabled_config.base_url = "https://api.deepseek.test/v1".to_string();
+        enabled_config.timeout_seconds = 10;
+        enabled_config.api_key_env = "BOOKFORGE_OFFLINE_TEST_API_KEY".to_string();
+        let enabled = OpenAiCompatibleProvider::new(enabled_config).expect("provider");
+        assert!(
+            enabled.is_reasoning(),
+            "a thinking-enabled V4 chat model defaults to thinking per provider docs"
+        );
+    }
+
+    #[test]
+    fn dedicated_reasoner_ids_stay_classified_as_reasoning() {
+        let reasoner = offline_provider("https://api.deepseek.com/v1", "deepseek-reasoner");
+        assert!(
+            reasoner.is_reasoning(),
+            "deepseek-reasoner-style IDs remain reasoning regardless of the toggle"
+        );
+    }
+
+    #[test]
+    fn transient_timing_statuses_are_retryable() {
+        assert!(is_retryable_status(408));
+        assert!(is_retryable_status(425));
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(503));
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(404));
+    }
+
+    /// Windows loopback connections intermittently reset or truncate under
+    /// heavy thread churn, and a fast mock server can finish streaming before
+    /// a loaded client trips its own byte limit (surfacing as a chunk-decode
+    /// error instead of the limit error). These are environmental, so
+    /// transport-level failures get a few whole-scenario retries before the
+    /// test treats them as a real regression.
+    fn is_transient_transport_error(error: &LlmError) -> bool {
+        let mut detail = error.to_string().to_ascii_lowercase();
+        let mut source = std::error::Error::source(error);
+        while let Some(error) = source {
+            detail.push_str("; ");
+            detail.push_str(&error.to_string().to_ascii_lowercase());
+            if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+                detail.push_str(&format!(
+                    " os-code={}",
+                    io_error.raw_os_error().unwrap_or(0)
+                ));
+            }
+            source = error.source();
+        }
+        // reqwest hides the OS code behind Debug-only formatting, so also
+        // scan the debug representation for the well-known Winsock codes.
+        detail.push_str(&format!("{error:?}").to_ascii_lowercase());
+        detail.contains("connection reset")
+            || detail.contains("forcibly closed")
+            || detail.contains("os-code=10054")
+            || detail.contains("broken pipe")
+            || detail.contains("10038")
+            || detail.contains("error decoding response body")
+    }
+
+    async fn retry_transient_transport<T, F, Fut>(
+        mut attempt: F,
+    ) -> std::result::Result<T, LlmError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, LlmError>>,
+    {
+        let mut last = None;
+        for index in 0..5 {
+            if index > 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            match attempt().await {
+                Ok(value) => return Ok(value),
+                Err(error) if is_transient_transport_error(&error) => last = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last.expect("a retried transport error must be recorded"))
+    }
+
     #[tokio::test]
     async fn oversized_provider_response_body_is_rejected_while_streaming() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
+        // Each scenario attempt gets its own listener and one-shot server so
+        // a retried attempt never connects to an already-consumed server.
+        let error = retry_transient_transport(|| {
+            async move {
+                use tokio::io::AsyncWriteExt;
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("test listener should bind");
+                let addr = listener.local_addr().unwrap();
+                let server_handle = tokio::spawn(async move {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let _ = read_mock_request(&mut stream).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
 
-        let listener = match TcpListener::bind("127.0.0.1:0").await {
-            Ok(listener) => listener,
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(err) => panic!("test listener should bind: {err}"),
-        };
-        let addr = listener.local_addr().unwrap();
-        let server_handle = tokio::spawn(async move {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let mut request = vec![0_u8; 8_192];
-            let _ = stream.read(&mut request).await;
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                )
-                .await;
+                    let chunk = vec![b'x'; 64 * 1024];
+                    let chunk_header = format!("{:X}\r\n", chunk.len());
+                    for _ in 0..=(MAX_PROVIDER_RESPONSE_BODY_BYTES / chunk.len()) {
+                        if stream.write_all(chunk_header.as_bytes()).await.is_err()
+                            || stream.write_all(&chunk).await.is_err()
+                            || stream.write_all(b"\r\n").await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let _ = stream.write_all(b"0\r\n\r\n").await;
+                    let _ = stream.shutdown().await;
+                });
 
-            let chunk = vec![b'x'; 64 * 1024];
-            let chunk_header = format!("{:X}\r\n", chunk.len());
-            for _ in 0..=(MAX_PROVIDER_RESPONSE_BODY_BYTES / chunk.len()) {
-                if stream.write_all(chunk_header.as_bytes()).await.is_err()
-                    || stream.write_all(&chunk).await.is_err()
-                    || stream.write_all(b"\r\n").await.is_err()
-                {
-                    break;
-                }
+                let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+                    base_url: format!("http://{addr}"),
+                    // Local providers intentionally permit an absent API key.
+                    api_key_env: "OLLAMA_API_KEY".to_string(),
+                    model: "test-model".to_string(),
+                    timeout_seconds: 10,
+                    provider_max_attempts: 1,
+                    thinking_disabled: true,
+                    retry_after_policy: RetryAfterPolicy::None,
+                    max_backoff_seconds: 1,
+                    max_idle_per_host: 1,
+                    json_mode: bookforge_core::JsonMode::PromptOnly,
+                })
+                .unwrap();
+                let outcome = provider
+                    .complete(CompletionRequest {
+                        system: "translate".to_string(),
+                        user: "hello".to_string(),
+                        response_format: ResponseFormat::Json,
+                        temperature: 0.2,
+                        max_output_tokens: Some(256),
+                        metadata: RequestMetadata::default(),
+                    })
+                    .await;
+                server_handle.abort();
+                outcome
             }
-            let _ = stream.write_all(b"0\r\n\r\n").await;
-            let _ = stream.shutdown().await;
-        });
-
-        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
-            base_url: format!("http://{addr}"),
-            // Local providers intentionally permit an absent API key.
-            api_key_env: "OLLAMA_API_KEY".to_string(),
-            model: "test-model".to_string(),
-            timeout_seconds: 10,
-            provider_max_attempts: 1,
-            thinking_disabled: true,
-            retry_after_policy: RetryAfterPolicy::None,
-            max_backoff_seconds: 1,
-            max_idle_per_host: 1,
-            json_mode: bookforge_core::JsonMode::PromptOnly,
         })
-        .unwrap();
-        let error = provider
-            .complete(CompletionRequest {
-                system: "translate".to_string(),
-                user: "hello".to_string(),
-                response_format: ResponseFormat::Json,
-                temperature: 0.2,
-                max_output_tokens: Some(256),
-                metadata: RequestMetadata::default(),
-            })
-            .await
-            .expect_err("oversized response must be rejected");
+        .await
+        .expect_err("oversized response must be rejected");
 
         assert!(
             error.to_string().contains(&format!(
@@ -1765,121 +2355,264 @@ mod tests {
             )),
             "unexpected error: {error}"
         );
+    }
+
+    /// Regression for the dogfood "slow-trickle" open question: reqwest's
+    /// total request timeout must fire on a body that keeps trickling in
+    /// forever (headers arrive, bytes dribble), not only on a dead-quiet
+    /// connection. One byte per 100ms is slower than any timeout-related
+    /// idle detection could rescue; the request must end in a timeout error
+    /// at about the configured timeout rather than hang.
+    #[tokio::test]
+    async fn slow_trickling_body_times_out_instead_of_hanging() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_mock_request(&mut stream).await;
+            let _ = stream
+                .write_all(
+                    // Declare a body far larger than we will ever send, then
+                    // drip it out one byte per 100ms — forever.
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            loop {
+                if stream.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://{addr}"),
+            // Local providers intentionally permit an absent API key.
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            model: "test-model".to_string(),
+            timeout_seconds: 2,
+            provider_max_attempts: 1,
+            thinking_disabled: true,
+            retry_after_policy: RetryAfterPolicy::None,
+            max_backoff_seconds: 1,
+            max_idle_per_host: 1,
+            json_mode: bookforge_core::JsonMode::PromptOnly,
+        })
+        .expect("offline provider config should be valid");
+
+        // No output budget => the timeout extension cannot engage, so the
+        // effective timeout is exactly the configured 2s.
+        let mut request = offline_request();
+        request.max_output_tokens = None;
+        let started = Instant::now();
+        let error = provider
+            .complete(request)
+            .await
+            .expect_err("a slow-trickling body must end in a timeout");
+        let elapsed = started.elapsed();
         server_handle.abort();
+
+        assert!(
+            matches!(&error, LlmError::Http(error) if error.is_timeout()),
+            "expected a timeout error, got: {error}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(1_500),
+            "timeout fired too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(10),
+            "the request hung instead of timing out: {elapsed:?}"
+        );
+        assert!(
+            !provider.timeout_extension_emitted.load(Ordering::Relaxed),
+            "a request without an output budget must not extend the timeout"
+        );
+    }
+
+    /// The counterpart guarantee: a slow but legitimate generation that needs
+    /// longer than the configured timeout must SURVIVE when its output budget
+    /// extends the per-request timeout. The body arrives after 3s — past the
+    /// 2s configured timeout — and the request still completes.
+    #[tokio::test]
+    async fn timeout_extension_covers_a_slow_but_legitimate_generation() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_mock_request(&mut stream).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            // A "legitimate" generation that takes 3s against a 2s preset.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let payload = json!({
+                "choices": [
+                    {"message": {"content": "ok"}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            });
+            let _ = stream.write_all(payload.to_string().as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://{addr}"),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            model: "test-model".to_string(),
+            timeout_seconds: 2,
+            provider_max_attempts: 1,
+            thinking_disabled: true,
+            retry_after_policy: RetryAfterPolicy::None,
+            max_backoff_seconds: 1,
+            max_idle_per_host: 1,
+            json_mode: bookforge_core::JsonMode::PromptOnly,
+        })
+        .expect("offline provider config should be valid");
+
+        let started = Instant::now();
+        let response = provider
+            .complete(offline_request())
+            .await
+            .expect("the extended per-request timeout must cover a slow legit generation");
+        let elapsed = started.elapsed();
+        server_handle.abort();
+
+        assert_eq!(response.content, "ok");
+        assert!(
+            elapsed >= Duration::from_millis(2_500),
+            "the 2s configured timeout must not have fired before the 3s body: {elapsed:?}"
+        );
+        assert!(
+            provider.timeout_extension_emitted.load(Ordering::Relaxed),
+            "the output-budget extension must have engaged"
+        );
     }
 
     /// Verify that json_mode_auto_fallback retries without response_format
     /// when the server returns 400, and does NOT consume a provider attempt.
     #[tokio::test]
     async fn json_mode_auto_fallback_works_with_one_provider_attempt() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-
         // We need to override reading of the API key env var.
         // Use a well-known env var name; the actual value is unused by
         // the test server, but the provider MUST be able to read it.
         unsafe { std::env::set_var("BOOKFORGE_TEST_JSON_FALLBACK_KEY", "test") };
 
-        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let request_count_clone = request_count.clone();
+        // Each scenario attempt gets its own listener, request counter, and
+        // provider so a retried attempt always observes the full
+        // 400-then-200 sequence instead of continuing a previous attempt's
+        // server-side state.
+        let (_response, fallback_disabled, received) = retry_transient_transport(|| {
+            let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            async move {
+                use tokio::io::AsyncWriteExt;
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("test listener should bind");
+                let port = listener.local_addr().unwrap().port();
 
-        let listener = match TcpListener::bind("127.0.0.1:0").await {
-            Ok(listener) => listener,
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(err) => panic!("test listener should bind: {err}"),
-        };
-        let addr = listener.local_addr().unwrap();
-        let port = addr.port();
+                // Server: returns 400 on the first request (simulating
+                // unsupported response_format), then 200 with valid JSON.
+                let server_count = request_count.clone();
+                let server_handle = tokio::spawn(async move {
+                    loop {
+                        let Ok((mut stream, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let cnt =
+                            server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Read the request so the client doesn't stall
+                        let _ = read_mock_request(&mut stream).await;
 
-        // Server: returns 400 on first request (simulating unsupported
-        // response_format), then 200 with valid JSON on second request.
-        let server_handle = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let cnt = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                // Read the request so the client doesn't stall
-                let mut buf = vec![0u8; 8192];
-                let _ = stream.read(&mut buf).await;
+                        if cnt == 0 {
+                            // First attempt: 400 — unsupported response_format
+                            let body =
+                                br#"{"error":{"message":"response_format is not supported"}}"#;
+                            let header = format!(
+                                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(header.as_bytes()).await;
+                            let _ = stream.write_all(body).await;
+                        } else {
+                            // Second attempt: 200 OK with valid translation
+                            let body = br#"{"choices":[{"message":{"content":"{\"translation\":\"Ciao\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#;
+                            let header = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(header.as_bytes()).await;
+                            let _ = stream.write_all(body).await;
+                        }
+                        let _ = stream.shutdown().await;
+                    }
+                });
 
-                if cnt == 0 {
-                    // First attempt: 400 — unsupported response_format
-                    let body = br#"{"error":{"message":"response_format is not supported"}}"#;
-                    let header = format!(
-                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = stream.write_all(header.as_bytes()).await;
-                    let _ = stream.write_all(body).await;
-                } else {
-                    // Second attempt: 200 OK with valid translation
-                    let body = br#"{"choices":[{"message":{"content":"{\"translation\":\"Ciao\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#;
-                    let header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = stream.write_all(header.as_bytes()).await;
-                    let _ = stream.write_all(body).await;
-                }
-                let _ = stream.shutdown().await;
+                let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+                    base_url: format!("http://127.0.0.1:{port}"),
+                    api_key_env: "BOOKFORGE_TEST_JSON_FALLBACK_KEY".to_string(),
+                    model: "test-model".to_string(),
+                    timeout_seconds: 10,
+                    provider_max_attempts: 1,
+                    thinking_disabled: true,
+                    retry_after_policy: RetryAfterPolicy::None,
+                    max_backoff_seconds: 30,
+                    max_idle_per_host: 32,
+                    json_mode: bookforge_core::JsonMode::Auto,
+                })
+                .unwrap();
+
+                let outcome = provider
+                    .complete(CompletionRequest {
+                        system: "translate".to_string(),
+                        user: "hello".to_string(),
+                        response_format: ResponseFormat::Json,
+                        temperature: 0.2,
+                        max_output_tokens: Some(256),
+                        metadata: RequestMetadata::default(),
+                    })
+                    .await;
+                let disabled = !provider
+                    .response_format_supported
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let received = request_count.load(std::sync::atomic::Ordering::SeqCst);
+                server_handle.abort();
+                let response = outcome?;
+                Ok((response, disabled, received))
             }
-        });
-
-        let config = OpenAiCompatibleConfig {
-            base_url: format!("http://127.0.0.1:{port}"),
-            api_key_env: "BOOKFORGE_TEST_JSON_FALLBACK_KEY".to_string(),
-            model: "test-model".to_string(),
-            timeout_seconds: 10,
-            provider_max_attempts: 1,
-            thinking_disabled: true,
-            retry_after_policy: RetryAfterPolicy::None,
-            max_backoff_seconds: 30,
-            max_idle_per_host: 32,
-            json_mode: bookforge_core::JsonMode::Auto,
-        };
-
-        let provider = OpenAiCompatibleProvider::new(config).unwrap();
-        let request = CompletionRequest {
-            system: "translate".to_string(),
-            user: "hello".to_string(),
-            response_format: ResponseFormat::Json,
-            temperature: 0.2,
-            max_output_tokens: Some(256),
-            metadata: RequestMetadata::default(),
-        };
-
-        let result = provider.complete(request).await;
+        })
+        .await
+        .expect("json_mode_auto_fallback should succeed after 400 fallback");
 
         // Server should have received 2 requests (first 400, second 200)
-        let received = request_count.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             received, 2,
             "expected 2 requests for 400 fallback + successful retry, got {received}"
         );
 
-        // The single attempt should succeed after fallback
-        assert!(
-            result.is_ok(),
-            "json_mode_auto_fallback should succeed: {:?}",
-            result.err()
-        );
-
         // response_format_supported should be set to false after 400
         assert!(
-            !provider
-                .response_format_supported
-                .load(std::sync::atomic::Ordering::Relaxed),
+            fallback_disabled,
             "response_format_supported should be false after 400 fallback"
         );
-
-        server_handle.abort();
     }
 
     #[tokio::test]
     async fn request_metadata_freezes_provider_attempts_per_call() {
         use std::sync::{Arc, atomic::AtomicUsize};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -1896,8 +2629,7 @@ mod tests {
                     break;
                 };
                 server_count.fetch_add(1, Ordering::SeqCst);
-                let mut buf = vec![0u8; 8_192];
-                let _ = stream.read(&mut buf).await;
+                let _ = read_mock_request(&mut stream).await;
                 let body = br#"{"error":{"message":"retry me"}}"#;
                 let header = format!(
                     "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

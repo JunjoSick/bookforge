@@ -50,10 +50,6 @@ impl MarkerPromptProjection {
         self.omitted_ids.contains(id)
     }
 
-    pub fn collapsed_pair_count(&self) -> usize {
-        self.omitted_ids.len()
-    }
-
     /// Restore markers omitted from the prompt around their retained parent.
     ///
     /// Callers still validate the expanded text against the original marker
@@ -414,11 +410,7 @@ pub fn marker_structure_error(text: &str) -> Option<String> {
     })
 }
 
-pub fn extract_marker_id(tag: &str) -> Option<String> {
-    extract_marker_id_attr(tag).or_else(|| short_marker_name(tag).map(ToString::to_string))
-}
-
-fn extract_marker_id_attr(tag: &str) -> Option<String> {
+pub fn extract_marker_id_attr(tag: &str) -> Option<String> {
     let id_offset = tag.find("id=")? + 3;
     let quote = tag[id_offset..].chars().next()?;
     if quote != '"' && quote != '\'' {
@@ -563,16 +555,6 @@ pub fn strip_marker_tokens(text: &str) -> String {
     output
 }
 
-fn short_marker_name(tag: &str) -> Option<&str> {
-    if let Some(open) = tag.strip_prefix("</") {
-        let name = open.strip_suffix('>')?;
-        return is_short_paired_marker_name(name).then_some(name);
-    }
-    let body = tag.strip_prefix('<')?.strip_suffix('>')?;
-    let name = body.strip_suffix('/').unwrap_or(body);
-    (is_short_paired_marker_name(name) || is_short_empty_marker_name(name)).then_some(name)
-}
-
 fn is_short_paired_marker_name(name: &str) -> bool {
     name.strip_prefix('m')
         .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
@@ -581,15 +563,6 @@ fn is_short_paired_marker_name(name: &str) -> bool {
 fn is_short_empty_marker_name(name: &str) -> bool {
     name.strip_prefix('r')
         .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
-}
-
-pub fn has_markers_in_expected_set(text: &str, expected: &HashSet<String>) -> bool {
-    let actual_set: HashSet<String> = marker_ids_in_text(text).into_iter().collect();
-    actual_set == *expected
-}
-
-pub fn all_markers_present(text: &str, required: &[String]) -> bool {
-    required.iter().all(|marker| text.contains(marker))
 }
 
 #[cfg(test)]
@@ -602,7 +575,6 @@ mod tests {
         let projection = collapse_nested_markers_for_prompt(source);
 
         assert_eq!(projection.text, "<m1>eyes</m1> and text");
-        assert_eq!(projection.collapsed_pair_count(), 1);
         assert!(projection.is_omitted("m2"));
         assert_eq!(projection.restore(&projection.text), source);
         assert_eq!(
@@ -617,7 +589,7 @@ mod tests {
         let projection = collapse_nested_markers_for_prompt(source);
 
         assert_eq!(projection.text, source);
-        assert_eq!(projection.collapsed_pair_count(), 0);
+        assert!(!projection.is_omitted("m2"));
         assert_eq!(projection.restore(source), source);
     }
 
@@ -626,7 +598,8 @@ mod tests {
         let projection = collapse_nested_markers_for_prompt("<m1><m2><m3>eyes</m3></m2></m1>");
 
         assert_eq!(projection.text, "<m1>eyes</m1>");
-        assert_eq!(projection.collapsed_pair_count(), 2);
+        assert!(projection.is_omitted("m2"));
+        assert!(projection.is_omitted("m3"));
         assert_eq!(
             projection.restore("<m1>occhi</m1>"),
             "<m1><m2><m3>occhi</m3></m2></m1>"
@@ -648,7 +621,7 @@ mod tests {
         let projection = collapse_nested_markers_for_prompt(source);
 
         assert_eq!(projection.text, source);
-        assert_eq!(projection.collapsed_pair_count(), 0);
+        assert!(!projection.is_omitted("m1"));
     }
 
     #[test]

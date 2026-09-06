@@ -26,6 +26,11 @@ pub struct ConversionReport {
     /// dropped content and the page list below says where.
     pub coverage_percent: f64,
     pub two_column_pages: usize,
+    /// Pages whose strong-script evidence leans Arabic/Hebrew-class
+    /// (PDF-7). Observability only: RTL pages are judged by the same
+    /// coverage ratio once invisible formatting characters are excluded
+    /// on both sides.
+    pub rtl_dominant_pages: usize,
     pub images: usize,
     pub figures: usize,
     pub tables: usize,
@@ -96,6 +101,7 @@ impl ConversionReport {
             baseline_chars: metrics.baseline_chars,
             coverage_percent,
             two_column_pages: page_stats.iter().filter(|page| page.two_column).count(),
+            rtl_dominant_pages: page_stats.iter().filter(|page| page.rtl_dominant).count(),
             images: metrics.images,
             figures: metrics.figures,
             tables: metrics.tables,
@@ -112,10 +118,11 @@ impl ConversionReport {
 
     pub fn summary(&self) -> String {
         let mut out = format!(
-            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nImages: {} extracted, {} figure block(s)\nTables: {} crop(s)\nEquations: {} crop(s)\nLow-confidence pages: {}\nOCR-recovered pages: {}\nText coverage vs pdftotext: {:.1}% ({} reconstructed + {} preserved as images / {} baseline characters)\n",
+            "Pages: {}\nBlocks: {}\nTwo-column pages: {}\nRTL-dominant pages: {}\nImages: {} extracted, {} figure block(s)\nTables: {} crop(s)\nEquations: {} crop(s)\nLow-confidence pages: {}\nOCR-recovered pages: {}\nText coverage vs pdftotext: {:.1}% ({} reconstructed + {} preserved as images / {} baseline characters)\n",
             self.pages,
             self.blocks,
             self.two_column_pages,
+            self.rtl_dominant_pages,
             self.images,
             self.figures,
             self.tables,
@@ -189,7 +196,9 @@ mod tests {
                 lines: 0,
                 chars: 0,
                 baseline_chars: 0,
+                running_header_chars: 0,
                 two_column: false,
+                rtl_dominant: false,
                 low_confidence: false,
                 low_confidence_action: None,
             }],
@@ -220,7 +229,9 @@ mod tests {
                 lines: 0,
                 chars: 0,
                 baseline_chars: 42,
+                running_header_chars: 0,
                 two_column: false,
+                rtl_dominant: false,
                 low_confidence: false,
                 low_confidence_action: None,
             }],
@@ -253,7 +264,9 @@ mod tests {
                 lines: 1,
                 chars: 4,
                 baseline_chars: 100,
+                running_header_chars: 0,
                 two_column: false,
+                rtl_dominant: false,
                 low_confidence: true,
                 low_confidence_action: Some("preserve".to_string()),
             }],
@@ -291,7 +304,9 @@ mod tests {
                 lines: 1,
                 chars: 4,
                 baseline_chars: 100,
+                running_header_chars: 0,
                 two_column: false,
+                rtl_dominant: false,
                 low_confidence: true,
                 low_confidence_action: Some("ocr".to_string()),
             }],

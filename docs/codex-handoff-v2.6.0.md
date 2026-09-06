@@ -1,5 +1,8 @@
 # BookForge v2.6.0 — Codex handoff: audiobook narration quality + WebUI parity
 
+> **Historical snapshot:** v2.6.0 shipped on 2026-07-21. "In progress" status
+> markers below are preserved as written during the milestone.
+
 > **Renumbering note:** This work was drafted as v3.0 and renumbered to v2.6.0
 > before release. The branch and worktree names below intentionally retain
 > their original draft-era names.

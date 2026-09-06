@@ -1,6 +1,6 @@
 [package]
 name = "bookforge-audio"
-version = "2.6.1"
+version = "3.0.0"
 description = "Audiobook generation for BookForge with OpenAI, Gemini, ElevenLabs, and local TTS providers."
 edition.workspace = true
 license.workspace = true
@@ -9,8 +9,8 @@ rust-version.workspace = true
 
 [dependencies]
 base64.workspace = true
-bookforge-core = { version = "2.6.1", path = "../bookforge-core" }
-bookforge-epub = { version = "2.6.1", path = "../bookforge-epub" }
+bookforge-core = { version = "3.0.0", path = "../bookforge-core" }
+bookforge-epub = { version = "3.0.0", path = "../bookforge-epub" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -18,7 +18,6 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

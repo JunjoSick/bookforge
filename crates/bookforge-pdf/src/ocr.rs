@@ -15,6 +15,11 @@ static UNLIMITED_OCR_NO_PROCESSOR_WARNING: Once = Once::new();
 // OCR responses are JSON text, so 8 MiB leaves ample room for dense pages
 // while preventing an untrusted endpoint from streaming unbounded data.
 const MAX_OCR_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+// Raw PNG bytes above this limit are rejected before base64 encoding:
+// the encoded request body would be ~4/3× larger, and oversized rasters
+// are almost always extreme-MediaBox pages that should be downscaled or
+// skipped instead of OOMing the process (docs/report.md §4.5 PDF-22).
+pub(crate) const MAX_OCR_REQUEST_BODY_BYTES: usize = 24 * 1024 * 1024;
 const MAX_OCR_ERROR_DETAIL_CHARS: usize = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +59,13 @@ impl OcrConfig {
             max_attempts: 3,
         }
     }
+
+    /// Reject a base URL whose transport is unsafe for OCR page data before
+    /// any request is sent or API key is read: only HTTPS, or plain HTTP to a
+    /// loopback host (`localhost`, `127.0.0.1`, `[::1]`), is permitted.
+    pub fn validate_base_url(&self) -> Result<(), OcrError> {
+        validate_ocr_base_url(&self.base_url)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +81,9 @@ pub enum OcrError {
 
     #[error("invalid OCR response: {0}")]
     InvalidResponse(String),
+
+    #[error("unsafe OCR base URL: {0}")]
+    UnsafeBaseUrl(String),
 }
 
 pub trait OcrEngine: Send + Sync {
@@ -88,6 +103,10 @@ pub struct HttpOcrClient {
 
 impl HttpOcrClient {
     pub fn new(config: OcrConfig) -> Result<Self, OcrError> {
+        // Transport validation happens before the client is built, so a
+        // remote plain-HTTP endpoint can never reach a request or trigger a
+        // key lookup.
+        config.validate_base_url()?;
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(config.timeout_seconds))
@@ -141,11 +160,42 @@ fn api_key_for_request(config: &OcrConfig) -> Result<Option<String>, OcrError> {
     }
 }
 
+/// Validate that an OCR base URL uses an allowed transport: HTTPS anywhere,
+/// or plain HTTP only to a loopback host. Remote plain HTTP (and any other
+/// scheme) is rejected because page content and credentials would otherwise
+/// traverse an unauthenticated network path.
+pub fn validate_ocr_base_url(base_url: &str) -> Result<(), OcrError> {
+    let url = Url::parse(base_url).map_err(|error| {
+        OcrError::UnsafeBaseUrl(format!("{base_url:?} is not a valid absolute URL: {error}"))
+    })?;
+    let host_loopback = url.host_str().is_some_and(is_loopback_host);
+    let allowed = match url.scheme() {
+        "https" => url.host_str().is_some(),
+        "http" => host_loopback,
+        _ => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(OcrError::UnsafeBaseUrl(format!(
+            "{base_url:?} is not allowed: OCR endpoints must use HTTPS, or plain HTTP only to a loopback host (localhost, 127.0.0.1, [::1])"
+        )))
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
 fn base_url_is_loopback(base_url: &str) -> bool {
     Url::parse(base_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+        // IPv6 hosts serialize with square brackets ("[::1]"); strip them
+        // so the documented no-key loopback exemption also applies to
+        // bracketed literals.
+        .is_some_and(|host| is_loopback_host(&host))
 }
 
 fn ocr_request_body(config: &OcrConfig, image_png: &[u8]) -> Value {
@@ -392,12 +442,55 @@ impl OcrEngine for MockOcrEngine {
 mod tests {
     use std::{
         io::{Read, Write},
-        net::TcpListener,
+        net::{Shutdown, TcpListener},
         sync::mpsc,
         time::Duration,
     };
 
     use super::*;
+
+    const TRANSPORT_ATTEMPTS: usize = 5;
+    const CAPTURE_WINDOW: Duration = Duration::from_secs(30);
+
+    fn transport_error_detail(error: &OcrError) -> String {
+        let mut detail = error.to_string();
+        let mut source = std::error::Error::source(error);
+        while let Some(error) = source {
+            detail.push_str("; ");
+            detail.push_str(&error.to_string());
+            source = error.source();
+        }
+        detail
+    }
+
+    /// Windows loopback connections are intermittently reset under heavy
+    /// thread churn (observed ~10% of fresh connections on a 12-core box under
+    /// CPU saturation, independent of harness behavior). These resets are
+    /// environmental, so transport-level failures get a few whole-scenario
+    /// retries before the test treats them as a real regression.
+    fn is_transient_transport_error(error: &OcrError) -> bool {
+        let detail = transport_error_detail(error).to_ascii_lowercase();
+        detail.contains("connection reset")
+            || detail.contains("forcibly closed")
+            || detail.contains("10054")
+            || detail.contains("broken pipe")
+            || detail.contains("10038")
+    }
+
+    fn retry_transport<T>(mut attempt: impl FnMut() -> Result<T, OcrError>) -> Result<T, OcrError> {
+        let mut last = None;
+        for index in 0..TRANSPORT_ATTEMPTS {
+            if index > 0 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            match attempt() {
+                Ok(value) => return Ok(value),
+                Err(error) if is_transient_transport_error(&error) => last = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last.expect("a retried transport error must be recorded"))
+    }
 
     fn one_request_server(response_body: &str) -> (String, mpsc::Receiver<String>) {
         one_request_server_with_content_length(response_body, response_body.len() as u64)
@@ -412,42 +505,138 @@ mod tests {
         let response_body = response_body.as_bytes().to_vec();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("mock accept");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("read timeout");
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
             let mut request = Vec::new();
             let mut scratch = [0u8; 4096];
             loop {
-                let read = stream.read(&mut scratch).expect("read request");
-                if read == 0 {
-                    break;
+                match stream.read(&mut scratch) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&scratch[..read]),
                 }
-                request.extend_from_slice(&scratch[..read]);
                 let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
                 else {
                     continue;
                 };
                 let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
-                let content_length = headers
+                let declared = headers
                     .lines()
                     .find_map(|line| line.strip_prefix("content-length:"))
                     .and_then(|value| value.trim().parse::<usize>().ok())
                     .unwrap_or(0);
-                if request.len() >= header_end + 4 + content_length {
+                if request.len() >= header_end + 4 + declared {
                     break;
                 }
             }
+            // Queue the capture before responding: once the client call
+            // completes, the captured request is already waiting on the
+            // channel and `recv` can never race the server thread.
+            let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
             );
-            stream.write_all(response.as_bytes()).expect("headers");
-            stream.write_all(&response_body).expect("body");
-            sender
-                .send(String::from_utf8_lossy(&request).into_owned())
-                .expect("captured request");
+            if stream.write_all(response.as_bytes()).is_err()
+                || stream.write_all(&response_body).is_err()
+            {
+                return;
+            }
+            // Close write-side first and drain until the peer finishes so the
+            // socket never closes with unread inbound data (Windows answers
+            // that with RST instead of FIN, which surfaces to clients).
+            let _ = stream.shutdown(Shutdown::Write);
+            let mut drain = [0u8; 4096];
+            while matches!(stream.read(&mut drain), Ok(read) if read > 0) {}
         });
         (format!("http://{address}/v1"), receiver)
+    }
+
+    #[test]
+    fn loopback_exemption_covers_bracketed_ipv6_literals() {
+        // PDF-11: url serializes IPv6 hosts with brackets, which used to
+        // break the documented no-key loopback exemption for [::1].
+        assert!(base_url_is_loopback("http://localhost/v1"));
+        assert!(base_url_is_loopback("http://127.0.0.1:8080/v1"));
+        assert!(base_url_is_loopback("http://[::1]:9000/v1"));
+        assert!(base_url_is_loopback("https://[::1]/v1"));
+        assert!(!base_url_is_loopback("http://[fe80::1]/v1"));
+        assert!(!base_url_is_loopback("http://example.com/v1"));
+        assert!(
+            Url::parse("http://[::1]:9000/v1")
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .is_some_and(|host| host == "[::1]")
+        );
+    }
+
+    #[test]
+    fn https_and_http_loopback_ocr_base_urls_are_accepted() {
+        for base_url in [
+            "https://api.example.com/v1",
+            "https://ocr.internal.example/v1/",
+            "https://localhost:8443/v1",
+            "https://127.0.0.1/v1",
+            "https://[::1]/v1",
+            "http://localhost/v1",
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://[::1]:9000/v1",
+        ] {
+            assert!(
+                validate_ocr_base_url(base_url).is_ok(),
+                "expected {base_url:?} to be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_plain_http_ocr_base_urls_are_rejected_before_request_or_key_use() {
+        for base_url in [
+            "http://example.com/v1",
+            "http://api.openai.com/v1",
+            "http://10.0.0.8:8000/v1",
+            "http://192.168.1.10:9000/v1",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[fe80::1]/v1",
+            "ftp://example.com/v1",
+            "file:///etc/passwd",
+            "not a url",
+            "localhost:8000/v1",
+        ] {
+            let error = validate_ocr_base_url(base_url)
+                .expect_err(&format!("expected {base_url:?} to be rejected"));
+            assert!(
+                matches!(error, OcrError::UnsafeBaseUrl(_)),
+                "expected UnsafeBaseUrl for {base_url:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_construction_rejects_remote_plain_http_even_without_a_key() {
+        let mut config = OcrConfig::new("http://example.com/v1");
+        config.api_key_env = "BOOKFORGE_OCR_TEST_REMOTE_HTTP_KEY".to_string();
+        // No API key is set (and validation runs before any key lookup), so
+        // refusal must come from the transport gate alone.
+        let error = match HttpOcrClient::new(config) {
+            Ok(_) => panic!("remote http client construction must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, OcrError::UnsafeBaseUrl(_)),
+            "refusal must happen before any key lookup or request: {error}"
+        );
+    }
+
+    #[test]
+    fn client_construction_still_accepts_loopback_http() {
+        let mut config = OcrConfig::new("http://127.0.0.1:1/v1");
+        config.api_key_env = "BOOKFORGE_OCR_TEST_CLIENT_LOOPBACK_KEY".to_string();
+        // No server is listening; the point is only that construction (the
+        // transport gate) succeeds for loopback HTTP and no connection is
+        // attempted during it.
+        assert!(HttpOcrClient::new(config).is_ok());
     }
 
     #[test]
@@ -510,18 +699,26 @@ mod tests {
 
     #[test]
     fn tcp_round_trip_uses_path_and_authorization() {
-        let (base_url, captured) =
-            one_request_server(r#"{"choices":[{"message":{"content":"OCR text"}}]}"#);
         let key_env = "BOOKFORGE_OCR_TEST_ROUND_TRIP_KEY";
         unsafe { std::env::set_var(key_env, "secret") };
-        let mut config = OcrConfig::new(base_url);
-        config.api_key_env = key_env.to_string();
-        config.max_attempts = 1;
-        let client = HttpOcrClient::new(config).unwrap();
-        assert_eq!(client.ocr_page(b"png", 1).unwrap(), "OCR text");
+        let outcome = retry_transport(|| {
+            let (base_url, captured) =
+                one_request_server(r#"{"choices":[{"message":{"content":"OCR text"}}]}"#);
+            let mut config = OcrConfig::new(base_url);
+            config.api_key_env = key_env.to_string();
+            config.max_attempts = 1;
+            let client = HttpOcrClient::new(config).unwrap();
+            client.ocr_page(b"png", 1).map(|text| {
+                let request = captured
+                    .recv_timeout(CAPTURE_WINDOW)
+                    .expect("mock should capture the request");
+                (text, request)
+            })
+        });
         unsafe { std::env::remove_var(key_env) };
 
-        let request = captured.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (text, request) = outcome.expect("ocr_page should succeed against the mock");
+        assert_eq!(text, "OCR text");
         assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
         assert!(
             request
@@ -532,32 +729,45 @@ mod tests {
 
     #[test]
     fn loopback_succeeds_without_api_key() {
-        let (base_url, captured) =
-            one_request_server(r#"{"choices":[{"message":{"content":"local OCR"}}]}"#);
         let key_env = "BOOKFORGE_OCR_TEST_UNSET_LOOPBACK_KEY";
         unsafe { std::env::remove_var(key_env) };
-        let mut config = OcrConfig::new(base_url);
-        config.api_key_env = key_env.to_string();
-        config.max_attempts = 1;
-        let client = HttpOcrClient::new(config).unwrap();
-        assert_eq!(client.ocr_page(b"png", 9).unwrap(), "local OCR");
+        let outcome = retry_transport(|| {
+            let (base_url, captured) =
+                one_request_server(r#"{"choices":[{"message":{"content":"local OCR"}}]}"#);
+            let mut config = OcrConfig::new(base_url);
+            config.api_key_env = key_env.to_string();
+            config.max_attempts = 1;
+            let client = HttpOcrClient::new(config).unwrap();
+            client.ocr_page(b"png", 9).map(|text| {
+                let request = captured
+                    .recv_timeout(CAPTURE_WINDOW)
+                    .expect("mock should capture the request");
+                (text, request)
+            })
+        });
 
-        let request = captured.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (text, request) = outcome.expect("ocr_page should succeed against the mock");
+        assert_eq!(text, "local OCR");
         assert!(!request.to_ascii_lowercase().contains("authorization:"));
     }
 
     #[test]
     fn ocr_page_rejects_oversized_response_before_buffering_body() {
         let body = r#"{"choices":[{"message":{"content":"small"}}]}"#;
-        let (base_url, _) =
-            one_request_server_with_content_length(body, MAX_OCR_RESPONSE_BODY_BYTES as u64 + 1);
         let key_env = "BOOKFORGE_OCR_TEST_OVERSIZED_PAGE_KEY";
         unsafe { std::env::remove_var(key_env) };
-        let mut config = OcrConfig::new(base_url);
-        config.api_key_env = key_env.to_string();
-        config.max_attempts = 1;
-        let client = HttpOcrClient::new(config).unwrap();
-        let error = client.ocr_page(b"png", 1).unwrap_err();
+        let error = retry_transport(|| {
+            let (base_url, _) = one_request_server_with_content_length(
+                body,
+                MAX_OCR_RESPONSE_BODY_BYTES as u64 + 1,
+            );
+            let mut config = OcrConfig::new(base_url);
+            config.api_key_env = key_env.to_string();
+            config.max_attempts = 1;
+            let client = HttpOcrClient::new(config).unwrap();
+            client.ocr_page(b"png", 1).map(drop)
+        })
+        .unwrap_err();
 
         assert!(matches!(error, OcrError::Provider(_)));
         assert!(error.to_string().contains("8388608-byte limit"));
@@ -565,17 +775,20 @@ mod tests {
 
     #[test]
     fn health_check_rejects_oversized_response_before_buffering_body() {
-        let (base_url, _) = one_request_server_with_content_length(
-            r#"{"data":[]}"#,
-            MAX_OCR_RESPONSE_BODY_BYTES as u64 + 1,
-        );
         let key_env = "BOOKFORGE_OCR_TEST_OVERSIZED_HEALTH_KEY";
         unsafe { std::env::remove_var(key_env) };
-        let mut config = OcrConfig::new(base_url);
-        config.api_key_env = key_env.to_string();
-        config.max_attempts = 1;
-        let client = HttpOcrClient::new(config).unwrap();
-        let error = client.health_check().unwrap_err();
+        let error = retry_transport(|| {
+            let (base_url, _) = one_request_server_with_content_length(
+                r#"{"data":[]}"#,
+                MAX_OCR_RESPONSE_BODY_BYTES as u64 + 1,
+            );
+            let mut config = OcrConfig::new(base_url);
+            config.api_key_env = key_env.to_string();
+            config.max_attempts = 1;
+            let client = HttpOcrClient::new(config).unwrap();
+            client.health_check().map(drop)
+        })
+        .unwrap_err();
 
         assert!(matches!(error, OcrError::Provider(_)));
         assert!(error.to_string().contains("8388608-byte limit"));

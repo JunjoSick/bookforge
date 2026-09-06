@@ -1,0 +1,186 @@
+# BookForge Audit Remediation — Agent Handoff (2026-08-25)
+
+You are resuming a multi-wave remediation campaign. This file is your complete context.
+
+> **STATUS CORRECTION (2026-08-31):** the claims below that v3.0.0 shipped, that
+> the campaign is complete, or that work is "post-release" are **false**. The
+> branch `remediation/audit-2026-08` at commit `aa90d94` is **not released** and
+> **not merged to `main`** (PR #112 is open/blocked; PR #108 is folded into it).
+> GitHub has no v3.0.0 tag/release; the latest published release is **v2.6.1**.
+> Treat the wave/fix record below as **historical + release-candidate/dogfood**,
+> not as shipped. The authoritative, current ledger is
+> **`docs/AUDIT-2026-08-31.md`** — read it first and update it, not this file,
+> when statuses change.
+
+The historical tracking base is `docs/report.md` (the full audit report;
+finding IDs are stable references).
+
+**Branch:** `remediation/audit-2026-08` (integration branch, based on `main` @ fe953c4c).
+Push it if absent: `git fetch origin && git checkout remediation/audit-2026-08`.
+
+---
+
+## 1. Locked decisions (from the repo owner — do not re-litigate)
+
+1. **Scope:** EVERYTHING in the report — all severities (🔴🟠🟡⚪) plus all 12 investment items (§6 "Worth starting now").
+2. **Git workflow:** per-phase PRs. Short-lived workstream branches merged sequentially into `remediation/audit-2026-08`; final reviewable PR set to `main`.
+3. **Serve auth (H-5):** token auth DEFAULT-ON (auto-generated session token, printed URL bootstraps browser, all API routes require it) with a `--no-auth` opt-out escape hatch.
+4. **Semver:** minor-breaking changes acceptable → final version bump likely **v3.0.0** (status enums replace magic strings, unified estimator changes cache keys, JSON envelope versioning).
+
+## 2. Current state — Waves 0–4 COMPLETE on the branch ✅ · Review round COMPLETE on the branch ✅ · v3.0.0 NOT released (candidate on `remediation/audit-2026-08` @ `aa90d94`) · Dogfooding round 1 done (2026-08-28) · Branch NOT merged to `main` (PR #112 open/blocked)
+
+**Dogfooding round 1** (real book: Cannibal Capitalism EN→IT, deepseek-v4-flash, ~$0.14 real spend, final EPUB EPUBCheck-valid with all chapters Italian; log: `test/DOGFOOD-2026-08-27.md`):
+
+- **Agent-ergonomics gotchas for future unattended sessions (learned the hard way):**
+  1. Background children die with the Bash tool-call teardown — `nohup … &` is NOT enough; launch long runs with `setsid nohup … < /dev/null & disown` and find the real PID via `pgrep -a bookforge` (`$!` after a pipeline captures the wrong process).
+  2. NEVER `pkill -f <pattern>` where the pattern appears in your own command line — it self-matches the tool shell and wedges the session for hours. Kill by explicit PID only.
+  3. Avoid touching paths outside the repo (e.g. `/tmp`) in unattended sessions — harness confirmations stall everything.
+  4. A frozen `events.jsonl` does NOT mean a hung engine — first verify the worker process is still alive.
+- **Product fixes landed for every dogfood finding** (see CHANGELOG `Unreleased`): latency-aware batch budgets + slow-trickle timeout proof, `RequestProgress` heartbeats + `effective_timeout_seconds`, structured block-attributed findings (migration 11, title/author blocks = warnings), honest `--pass-costs` totals, supervised retries with surfaced deaths + bounded give-up, root cause of the silent respawn loop fixed (dashboard resume held the launch claim across spawn), friendly validation errors, `--no-thinking`/connection-flag help text, `retry --ui`.
+- **Known residual — addressed on the branch by commit `aa90d94`** (`feat:
+  thread engine findings through SegmentTranslation end-to-end`): engine
+  `BatchItemFailure.findings` are now threaded through `SegmentTranslation`
+  instead of the `ENGINE_FINDINGS_PLACEHOLDER`. Verify the end-to-end path and
+  its tests on release before closing (ledger TRANS-2). Mixed-script bidi
+  fixtures and the property-harness grammar extensions from the review round
+  remain open items (ledger PDF-7 / EPUB-18).
+- **Release status:** the entire record below shipped **nowhere** — it exists
+  on the unreleased branch only. See the ledger (`docs/AUDIT-2026-08-31.md`)
+  for authoritative Open/Fixed-on-branch status per category.
+
+All five audit waves executed to completion on this branch plus a professional
+pre-merge review round (six specialist reviewers: store integrity, serve
+security, llm engine, cli lifecycle, epub+pdf protocol, release readiness).
+Every BLOCKER/MAJOR finding from the review round was fixed and
+mutation/red-green verified on the branch; P2/P3 leftovers are recorded as
+fast-follow tickets below. **Merging to `main` and releasing v3.0.0 are still
+pending (PR #112 open/blocked); the campaign is not complete until they are.**
+
+**Wave 4 highlights:** EPUB-18 seeded property harness (200 seeds, byte-stability + ordinal-protocol invariants) + 15-case hostile corpus + EPUB2 parity — the harness caught a real bug (unattributable zip-open errors, fixed); PDF gained a line-level bidi pass (Arabic/Hebrew logical order), justified-CJK kinsoku merging, tri-tier caption detection, and an in-process FakePoppler driving 15 conversion tests dual-path on any OS; pricing loaders + provider defaults collapsed into `bookforge_core::providers` (single package-owned JSON, anti-duplication guard test); `--pass-costs` estimate breakdown; `--ui json` stdout now carries a versioned envelope (`--ui json-v1` preserves legacy streams); one RunView presentation layer feeds all four dashboards; styles/entities CRUD + audiobook parity controls on the dashboard; entities export; atomic single-row store deletes.
+
+**Review-round fixes (commit `17176a4`):** FK-restore on failed hardening, prune running-protection TOCTOU (mutation-proven test), retry freeze-check inside txn, diagnostics drained at all canonical opens, dashboard auth-header seam across all 40 fetch sites (static-analysis guarded), atomic styles/entities delete primitives, retry-failed claim+slot race, paused-repair in-flight drain, escalation user-cap, prompt-overhead estimates, max_tokens=0 floor+warning, HTTP-date year bound, reflow 10k depth cap (pre-fix SIGABRT proven), Arabic/Hebrew continuation support.
+
+**Fast-follow tickets (Open in `docs/AUDIT-2026-08-31.md`; intentionally after
+the branch merges, NOT post-release — nothing has been released):** SERVE-7
+child isolation (needs audiobook plan-mode flags), CSP nonce work to drop
+`unsafe-inline`, `doctor`/CLI surface for `JobStore::prune_jobs` retention,
+batch upsert paths routing partial-index collisions to update arms (STORE-13
+tail), mixed-script street-address bidi regression fixtures + configurable
+poppler logical-order escape hatch, prompt-fencing extension to item payloads
+(LLM-15 tail vs current context-block scope), lease-heartbeat error dedup,
+fallback-pass progress sink visibility, `LogPersistenceFailed` warning event,
+property-harness grammar extensions (suppression-nesting, marker
+omission/reorder stress).
+
+## 2.a Historical — Wave 3 COMPLETE ✅ (2026-08-26)
+
+- **P3-docs**: ~28 doc claims reconciled with landed code; 7 historical banners; full CHANGELOG Unreleased written; 70 links verified.
+- **P3-estimator (solo, cross-crate)**: canonical `bookforge_core::token_estimate::estimate_tokens` (per-char weights: Han/Kana/Hangul ×1, else ×¼) replacing 9 divergent implementations; `CACHE_KEY_SCHEMA_VERSION` 2→3 + glossary fingerprint schema 2 in the same change set.
+- **P3-deadcode**: 15 items removed after caller-grep proofs; 6 kept-with-evidence (incl. refuted Xml/Zip-variant claim); CORE-13 `|glossary|` namespace separator fixed with pin re-derived.
+- **P3-store-hardening**: STORE-5 resolved (SQL files demoted to guarded documentation, parity test); STORE-12 typed statuses + CHECK migration 10; STORE-17 prune_jobs + streaming hash; INFRA-10 startup reaper.
+
+## 2.b Historical — Wave 4 COMPLETE ✅ (2026-08-26/27)
+
+- **4a**: EPUB-18 harness + hostile fixtures + EPUB2 sample + injectable limits (epub); PopplerBackend seam + FakePoppler dual-path suite, bidi.rs UAX#9 line subset, PDF-9/10 completion (pdf); pricing/provider registry + `--pass-costs` (core/cli).
+- **4b**: UI-23 envelope v2 + UI-31 RunView consolidation; styles/entities dashboard CRUD + `entities export` + audiobook flag parity (chapters/retry-failed/prune/text-norm/timeout) + options.rs registry consumption.
+
+## 2.c Historical — Wave 2 COMPLETE ✅ (2026-08-26)
+
+**Wave 2 landed as individual commits (`fix(llm)` / `fix(audio)` / `fix(pdf)` / `fix(cli)`, all gates green post-integration: fmt/clippy 0 warnings/test 1132 passed):**
+
+- **P2-llm**: LLM-1 output-budget redesign (min(user,remainder), floor-as-net, batch+single identical); LLM-3 repair-phase control signals; LLM-4 transient backoff + 408/425 reclass; LLM-9 double-check concurrency + honest multi-round corrections; LLM-13 DeepSeek classification verified against live provider docs (thinking-mode default-on ⇒ flash gets normal multipliers when disabled); LLM-15 prompt fencing w/ sanitization; LLM-10..20 trivia group fixed; stop-determinism at double-check boundaries.
+- **P2-audio**: AUDIO-3 fail-open→cheapest tier (deterministic, visible); AUDIO-1 rename simplification; AUDIO-2 cross-process out_dir lock; AUDIO-4 CJK splitters; AUDIO-5 ffmpeg -nostdin/null-stdin/timeouts/kill-and-reap; AUDIO-11 debris sweep in --prune; AUDIO-12/13/14 honest warnings + two-phase loudnorm markers; AUDIO-15..17 perf/cancellation; nav-audio structural backstop; library-side capabilities matrix (`capabilities.rs`) + `read_narration_source` estimator pipeline (`source.rs`). **REMAINING (carried): CLI audiobook estimate-path + serve/audio.rs wiring of those two APIs (AUDIO-6/7/8 surface) — assigned as immediate follow-up.**
+- **P2-pdf**: PDF-3 RAII temp dirs; PDF-5 figure preservation under OCR; PDF-6 pre-header threshold accounting; PDF-10 warning half; PDF-8/9/12/13 cheap-correct set; PDF-14 small half (hash UID, SOURCE_DATE_EPOCH, heading-built TOC); PDF-22 render/body caps; PDF-11/15/16/18/20; **PDF-4 REFUTED with poppler 26.08 evidence** (-i strips image placement tags) — treat like PDF-1; dead arms removed.
+- **P2-ui-clap**: UI-22 stdout purity; UI-21 exit-code taxonomy + docs; UI-2 truthful attached-TUI cancel; UI-5 ANSI sanitization module; UI-9/10 epoch rebaseline + real DroppedEvents emission; UI-13 tri-state syntax unification; UI-1 scroll math; UI-28/30 epoch-aware tail folds; 🟡⚪ tail items (ArgGroups conflicts, --yes gates, planning progress events, refresh floors, env-var help). Also pinned the JSONL visibility of persisted corrections via a warning event (cross-workstream determinism).
+
+**Wave 2 hardening notes:** llm stop-determinism regression (lifecycle resume-after-stop) caught by integration gate, root-caused to JSONL buffering visibility ordering + missing pass-boundary stop checks; fixed inside double_check.rs + one warning-event emit in finalization.rs.
+
+Outstanding sub-items carried forward: STORE-5 sql-file drift reconciliation, SERVE-7 child isolation (needs plan-mode flags), tempfile promotion decision, CSP unsafe-inline removal, AUDIO capabilities/estimator CLI+serve wiring (in flight), core `cap_output_tokens` export now unused by llm crate (delete/repair during estimator/deadcode waves).
+
+## 2.d Historical — Wave 1 COMPLETE ✅ (2026-08-26)
+
+Wave 1 landed on this branch as individual commits (all gates green post-integration: fmt/clippy 0 warnings/test 1043 passed):
+
+- `test:` lifecycle fixture made EPUBCheck-valid (nav doc + dcterms:modified) — was failing output validation on any machine with EPUBCheck installed.
+- **P1-store** (`fix(store)`): H-1/STORE-1 atomic correction freeze (IMMEDIATE txn + guarded upsert, SQL-enforced), STORE-3 single-txn checkpoints, STORE-4 transactional glossary rebuild/rename cascade, STORE-13 partial unique indexes for global rows (+dedupe migration 0009), STORE-16 created_at index, STORE-11 resume re-insert refreshes provider/model/source_hash, STORE-14/15/18 (txn upsert_entities, RETURNING add_glossary_term, StoreError::NotFound), H-7 store half (record_migration gated → zero migration writes on reopen).
+- **P1-llm-hotfix** (`fix(llm)`): H-3 llm half (unknown-segment failures re-attributed/unattributable dropped at aggregation), LLM-7 mojibake fixed in 7 templates + guard test extended, DRIFT-1 repair templates renamed .v2→.v3 + stale headings fixed, LLM-6 conservative fence/prose-stripping JSON decode.
+- **P1-epub** (`fix(epub)`): H-2 ArchiveReadBudget wired through reflow + validate (+case-insensitive ext), EPUB-3 script/style/svg/math suppression as verbatim paired markers, EPUB-10 depth cap + de-quadratic close scan, EPUB-4 folio-range numeric-heading cleanup, EPUB-11 canonical util.rs replacing 16 divergent helpers (platform-neutral path normalization), EPUB-5/6/7/9/12/13/14/15/16/17, EPUB-8 assessed-only (cell granularity = core redesign). Follow-up `fix(epub)`: writer scanner marker ids restored to single shared ordinal stream (adjacency regression caught by roundtrip suite, now pinned by new tests).
+- **P1-cli-lifecycle** (`fix(cli)`): H-3 cli half (checkpoint writer log-and-continue + dropped tally), H-4 resume truthfulness (DB-status-driven completion; blockless terminal rows emitted), H-7 cli half (watcher owns one long-lived connection), CLI-3 Ctrl+C in resume, CLI-4 late-control cannot rewrite terminal outcomes, CLI-5 hard errors mark job failed, CLI-7 rename-based stale claim reclaim, CLI-8 lease acquisition for plain resume, CLI-10 O(n) fallback scan, CLI-16 resume flag parity, CLI-12–18 (honest warning, benchmark provider_config, job-id validation for pause/stop, bounded tail read, doctor non-zero exit w/ --no-fail, release builds drop test-only hook).
+- **P1-serve-security** (`fix(serve)`): H-5 token auth default-on (--no-auth opt-out; bootstrap URL flow; header on every route incl. SSE/audio re-wiring), H-6 private dirs/files at serve entry points, SERVE-3 fail-closed PID liveness gate, SERVE-4 strict job-id allowlist, SERVE-5 PrivateTempDir estimate uploads, SERVE-6 launch slot cap, SERVE-7 panic boundary (child isolation deferred: needs audiobook plan-mode plumbing — documented), SERVE-8/9/10 + quality items (spawn_blocking large writes, monotonic launch tags, orphan cleanup, lock eviction).
+- Merged external **PR #108** into the campaign branch (script-aware source-copy detection + shared core ScriptClass; groundwork for P3-estimator).
+
+Outstanding sub-items carried forward: STORE-5 sql-file drift reconciliation (wave 3), SERVE-7 child isolation needs plan-mode flags (note for future audio/ui waves), tempfile promotion decision (dev-dep only), CSP unsafe-inline removal (needs nonce plumbing).
+
+## 2.e Historical — Wave 0 COMPLETE ✅
+
+Commits on this branch:
+- `636b3a89` docs: add 2026-08 deep audit report (remediation tracking base)
+- `e04b1efb` test: deflake loopback-capture harnesses and cli flaky tests
+- `af93ce0` chore(infra): CI permissions + SHA pins + epubcheck checksum, zip codec trim, gitignore intent rules
+
+Wave 0 resolved:
+- **TEST flakes (all 5 clusters):** root cause = Windows loopback RSTs under thread churn + mock-server lifecycle races. Fixes: tolerant mock IO (`let _ =` writes), capture queued BEFORE response, full content-length-aware request reads, `Shutdown::Write` + drain loop before close, and transient-classification retry wrappers around whole scenarios. Suites verified: audio ×3+×5, llm ×10, pdf ×3, cli ×5, full workspace green.
+- **INFRA-3/4:** ci.yml permissions block; all floating action refs SHA-pinned (release.yml already was; left alone).
+- **INFRA-5:** EPUBCheck download sha256-verified (v5.3.0, both corpus jobs).
+- **INFRA-1/2/11 (partial):** explicit `/tests/*KEY*`, `__pycache__/`, `.agents/` ignore rules; tracked `.pyc` untracked (file kept on disk).
+- **Deps §:** zip trimmed to `default-features=false, features=["deflate-flate2-zlib-rs"]` — kills zstd-sys C-toolchain build dep + several transitive chains. NOTE: plain `["deflate-flate2"]` does NOT compile (flate2 default-features=false has no backend); zlib-rs is pure Rust, byte-identical backend.
+- **rustdoc:** ambiguous `[stitch]` link fixed (audio/lib.rs).
+- Verified: `cargo fmt --check`, clippy --workspace --all-targets ZERO warnings, cargo test --workspace exit 0, `cargo +1.88.0 check --workspace` clean (MSRV holds post-trim).
+
+## 3. Remaining plan
+
+| Wave | Agents | Scope |
+|---|---|---|
+| **1** | 4 heavy + 1 light | P1-store: H-1 atomic correction freeze (translations.rs:49 check-then-write → single conditional stmt / IMMEDIATE txn), STORE-3 txn checkpoints, STORE-4, STORE-13 NULL scope_id, STORE-16 created_at index, STORE-11, STORE-14/15/18, H-7 store-side gate `record_migration`. · P1-epub: H-2 ArchiveReadBudget into reflow.rs:148–164 + validate.rs:55–96 (+ case-insensitive ext), EPUB-3 script/style suppression, EPUB-10 recursion cap, EPUB-4, EPUB-11 helper dedup, EPUB-5/6/7/9/13, EPUB-12/14–17, assess EPUB-8. · P1-cli-lifecycle: H-3 writer log-and-continue (cli/checkpoint.rs:133), H-4 resume truthfulness (resume.rs:461–517,1167) + regression test, CLI-3 cancel token into resume, CLI-4 completion-window races, CLI-5 stuck-running errors, CLI-7 rename-based claim, CLI-8 lease for plain resume, CLI-10, CLI-16, CLI-12–18, H-7 watcher-owned connection (control.rs:24, RefCell makes JobStore !Send). · P1-serve-security: H-5 token auth default-on + --no-auth, H-6 private dirs via create_private_dir_all semantics (serve.rs:269–282, translation.rs:79, audio.rs:413), SERVE-3 PID liveness, SERVE-4 path sanitize, SERVE-5 temp uploads, SERVE-6 launch cap, SERVE-7 child-isolation for audio parse, SERVE-8/9/10 + quality items. · P1-llm-hotfix (light): H-3 llm-side filter unknown segments at aggregation (batch/rendering.rs:366–377 vs execution.rs:1244/1693), LLM-7 mojibake fix in 7 templates, DRIFT-1 repair .v2.md→.v3.md renames, LLM-6 strip markdown fences/trailing prose. |
+| **2** | 4 heavy | P2-llm: LLM-1 cap floors (+CORE-4, LLM-16, mode-dependence), LLM-3 repair-phase signals, LLM-4 batch retry pacing, LLM-9 concurrency/rounds ignored, LLM-13 verify DeepSeek classification against provider docs BEFORE changing, LLM-15 prompt fencing, LLM-10/11/12/14/17/19/20. · P2-audio: AUDIO-1 Windows rename premise, AUDIO-2 out_dir cross-process lock, AUDIO-3 fail-open→cheapest tier, AUDIO-4 CJK splitters, AUDIO-5 ffmpeg -nostdin/stdin(null)/timeout, AUDIO-6/8 asymmetry, AUDIO-7 estimator preprocessing, AUDIO-11 debris sweep, AUDIO-12/13/14, AUDIO-15–18, nav-audio backstop. · P2-pdf: PDF-3 temp leak, PDF-5 OCR wipes figures, PDF-6 header threshold, PDF-10 caption English-only warning, PDF-4 `-i` flag, PDF-8/9/12/13, PDF-14 small half, PDF-22 uncapped OCR body, PDF-11/15/16/18–21. · P2-ui-clap (after P1-cli merges): UI-22 stdout gating, UI-21 exit codes, UI-2 tui footer lie, UI-5 ANSI escaping, UI-9/10 RunState epochs + DroppedEvents, UI-13 tri-state syntax, UI-1, UI-28/30, 🟡⚪ tail. |
+| **3** | mixed | P3-estimator (SOLO, cross-crate): DUP-1/LLM-5 one script-aware token estimator in core (CJK×1 else chars/4), rewire llm/core/epub/judge, cache-namespace version bump same commit. ‖ P3-docs (parallel, docs-only): DOC-2 events.md 4 variants, DOC-3 exit codes, DOC-4 store location, DOC-14 Strict mode, DOC-5–18 remainder. THEN sequential: P3-deadcode (re-verify DEAD list post-estimator first), P3-store-hardening (STORE-5 dual migration truth, STORE-12 status enums + CHECK, STORE-17 retention/prune, retry_pending_overrides reaper INFRA-10). |
+| **4** | 3 batches ×~2 | Investments: (a) EPUB-18 property/fuzz reader↔writer harness + hostile fixtures + EPUB2 sample; TEST-2/PDF-2 Windows parity via in-process fake PopplerTools. (b) PDF-7/9/10 RTL/CJK reconstruction; provider registry + pricing-loader dedup (DUP rows §5). (c) UI-23/31 JSON envelope v2 + rendering consolidation; ASYM dashboard CRUD for style/entity stores + audiobook flag parity. |
+| **5** | orchestrator only | Full gates (fmt/clippy/test/msrv/cargo audit), report.md status column update, CHANGELOG, version bump v3.0.0, PRs to main. |
+
+**Excluded (do not do):** key rotation/moving (owner confirmed keys are intentionally untracked, never leaked, history clean), cargo-dist residuals INFRA-6, base64/getrandom dedup, per-feature MSRV matrix, PDF-1 (refuted).
+
+### Cross-crate contracts (H-fix spans)
+- **H-3:** llm-side aggregation filter (P1-llm-hotfix) ↔ cli-side writer tolerance (P1-cli). Both required.
+- **H-7:** store-side migration gating (P1-store) ↔ cli-side dedicated watch connection (P1-cli).
+- **H-2:** fixed entirely in epub crate (library layer). No cli changes.
+
+## 4. Dispatch playbook (how to run agents)
+
+- Use the Task tool, `subagent_type: general`. Concurrency cap: **≤3 heavy + 1 light** (one machine; cargo serializes on target/ lock — slow but safe).
+- **Crate/file ownership is exclusive per concurrent agent.** Never two agents in one crate. Dep files (Cargo.toml/Cargo.lock) frozen unless designated.
+- Every agent prompt MUST contain: scope boundaries (exact paths), finding list w/ report line refs, exit criteria, and this mandatory-output clause (an agent once returned EMPTY twice without it):
+  > "Final message requirements (MANDATORY — your final message is the only thing returned to the orchestrator; it must be complete even if long): 1) per-finding status, 2) files modified, 3) flagged production issues, 4) verification evidence (commands + results), 5) confirmation of zero-warning clippy."
+- Exit criteria per agent: `cargo fmt --check`, `cargo clippy -p <crate> --all-targets` zero warnings, scoped `cargo test -p <crate>` green, structured report.
+- Integration gate between waves (orchestrator runs): `cargo fmt --all --check` · `cargo clippy --workspace --all-targets` (zero warnings) · `cargo test --workspace` (exit 0) · commit workstreams as logical commits · then open next wave.
+- Re-dispatch immediately on empty/failed agent results.
+
+## 5. Gotchas & lessons learned (READ BEFORE WORKING)
+
+1. **NEVER roundtrip source files through PowerShell Get-Content/Set-Content.** It caused BOM insertion + double-encoded em-dashes (mojibake — ironically finding LLM-7's bug class) and one zero-byte file. Use file edit tools only. If you must inspect bytes: `[System.IO.File]::ReadAllBytes`.
+2. **Agents dying mid-task can leave stale-buffer overwrites** (happened twice this campaign: helper blocks vanished while sibling imports remained). After ANY interrupted agent: `git status`, review diffs of its claimed scope, then `cargo check --workspace --all-targets` before trusting anything.
+3. **PowerShell quirks:** `$LASTEXITCODE` directly after native commands; `MatchInfo` has no `.Trim()` (use `.Line`); native stderr shows scary-but-harmless `NativeCommandError` wrapper text; avoid masking stderr with `2>$null` when verifying exit codes; `git diff` output through `Select-String "^@@"` works fine.
+4. **Toolchain MSRV check:** use fully-qualified `cargo +1.88.0 ...`. Shorthand `+1.88` attempts a network channel sync that fails behind TLS interception.
+5. **Windows loopback flake class (now largely fixed):** RSTs under thread churn (~10% fresh connections saturated). The proven pattern, applied across audio/llm/pdf/cli harnesses: tolerant IO (`let _ =` on writes/sends), capture queued BEFORE responding, read requests until headers+content-length complete (single reads split under load), `shutdown(Write)` + drain-read before drop, and whole-scenario retries gated by a transient classifier. **Classifier lesson:** reqwest/hyper hide Winsock codes behind Debug-only formatting — Display-only string checks miss them. The llm classifier walks `std::error::Error::source()` chain downcasting to io::Error AND scans `{:#?}`. The AUDIO classifier is still Display-only (passing today; align it when convenient).
+6. **Per-attempt isolation matters in retried scenarios:** shared server-side counters/listeners corrupt state across scenario retries (a retried attempt sees wrong 400/200 sequence or a dead listener). Each retry attempt must spawn its own listener+server+counter (see llm json_mode_auto_fallback / oversized tests for the pattern).
+7. `request_metadata_freezes_provider_attempts_per_call` (llm) remains unwrapped by design — a retry would double-count its exact assertion counts. Hasn't flaked recently; revisit only if it does.
+8. **Keys:** `tests/{DEEPSEEK,ELEVENLABS,OPENROUTER}_KEY.txt` exist locally, untracked BY INTENT (explicit ignore rule now in .gitignore). Never rotate/delete/commit them. Never print their contents.
+9. CI notes: epubcheck checksum line assumes GNU coreutils `sha256sum` (ubuntu runners OK). Workflow YAML wasn't executed end-to-end locally — first CI run after push is the real test.
+10. Untracked local noise you WILL see: `target/` 53GB, `.claude/worktrees/` 31GB (nine abandoned clones), `tmp/` 1GB, `.tools/` vendored toolchains, personal EPUBs under `tests/`. Leave them alone (see §6).
+11. Report caveats still standing: LLM-13 may be intentional (verify first); SERVE severities assume multi-user threat model; dependency "latest" statements were knowledge-dated (run `cargo audit` at wrap).
+
+## 6. Manual cleanup checklist — REQUIRES EXPLICIT OWNER APPROVAL, never agent-initiated
+
+- [ ] Prune `.claude/worktrees/` (31 GB, nine abandoned clones)
+- [ ] Delete `tmp/` scratch (1 GB)
+- [ ] Periodic `cargo clean` of stale profiles in `target/` (53 GB)
+- [ ] Delete orphaned `.tools/java17` JRE (wrapper resolves jdk-21); add digest sidecars for remaining vendored tools
+- [ ] Move personal/copyrighted EPUBs out of `tests/` (legal foot-gun if tree ever shared)
+- [ ] Consider retention cap for root `.bookforge/` job history (371 MB)
+
+## 7. Resumption procedure
+
+1. `git checkout remediation/audit-2026-08 && git pull`
+2. Read §2 (done) and §3 (next wave table). Wave 1 is next.
+3. Dispatch per §4 with scopes from §3; include relevant excerpt lines from docs/report.md §3 detail section in each prompt (report.md is committed on this branch).
+4. Between waves: run integration gate, commit, update this handoff's §2 with what landed, push.
+5. At wrap (§3 wave 5): update report.md statuses, CHANGELOG, version bump, PRs to main.

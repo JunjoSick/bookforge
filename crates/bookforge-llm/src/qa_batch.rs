@@ -372,10 +372,25 @@ where
         if !seen_ids.insert(parsed_review.id.clone()) {
             continue;
         }
+        // Audit ⚪ group: verdict strings are validated against the known
+        // set; unrecognized values degrade to warn with a finding instead of
+        // flowing verbatim into reports.
+        let (verdict, mut verdict_issue) =
+            crate::validation::normalize_qa_verdict(&parsed_review.verdict);
+        let mut issues = parsed_review.issues;
+        if let Some(message) = verdict_issue.take() {
+            issues.push(QaIssue {
+                severity: "low".to_string(),
+                kind: "qa_unknown_verdict".to_string(),
+                message,
+                source_excerpt: None,
+                translation_excerpt: None,
+            });
+        }
         reviews.push(QaSegmentReview {
             segment_id: item.translation.segment_id.clone(),
-            verdict: parsed_review.verdict,
-            issues: parsed_review.issues,
+            verdict: verdict.to_string(),
+            issues,
         });
     }
 
@@ -453,8 +468,11 @@ fn estimate_qa_item_tokens(item: &QaWorkItem) -> usize {
             .sum::<usize>()
 }
 
+/// Per-item text counting for QA prompts: the canonical script-aware
+/// estimator with the historical one-token floor so tiny fields
+/// (markers, ids) still reserve space in the batch budget.
 fn estimate_text_tokens(text: &str) -> usize {
-    (text.chars().count() / 4).max(1)
+    bookforge_core::segment::estimate_tokens(text).max(1)
 }
 
 fn is_json_shape_error(error: &LlmError) -> bool {
@@ -696,7 +714,7 @@ mod tests {
                     }],
                     protected_spans: Vec::new(),
                 }],
-                token_estimate: (text.chars().count() / 4).max(1),
+                token_estimate: bookforge_core::segment::estimate_tokens(text).max(1),
             },
             context: SegmentContext::default(),
             metadata: SegmentMetadata::default(),
@@ -726,11 +744,102 @@ mod tests {
             input_cached_tokens: None,
             output_tokens: None,
             tokens_estimated: false,
+            findings: Vec::new(),
         }
     }
 
     fn translation(segment: &Segment, text: &str) -> SegmentTranslation {
         translation_with_status(segment, text, SegmentStatus::Succeeded)
+    }
+
+    #[tokio::test]
+    async fn unrecognized_qa_verdict_degrades_to_warn_with_finding() {
+        let segments = vec![segment("seg_1", 0, "Hello")];
+        let translations = vec![translation(&segments[0], "Ciao")];
+
+        #[derive(Default)]
+        struct OddVerdictProvider {
+            requests: Arc<Mutex<Vec<CompletionRequest>>>,
+        }
+
+        impl LlmProvider for OddVerdictProvider {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> crate::provider::Result<CompletionResponse> {
+                self.requests.lock().expect("requests mutex").push(request);
+                Ok(CompletionResponse {
+                    content: serde_json::to_string(&json!({
+                        "reviews": [{
+                            "id": "seg_1",
+                            "verdict": "magnificent",
+                            "issues": [],
+                        }],
+                    }))
+                    .unwrap(),
+                    input_tokens: None,
+                    input_cached_tokens: None,
+                    output_tokens: None,
+                    finish_reason: FinishReason::Stop,
+                    provider_latency_ms: 0,
+                    raw: json!({}),
+                })
+            }
+
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    supports_json_response_format: true,
+                    supports_usage_tokens: true,
+                }
+            }
+        }
+
+        let reviews = qa_segments_parallel(
+            OddVerdictProvider::default(),
+            &segments,
+            &translations,
+            &run_config(),
+            &qa_config(10_000),
+        )
+        .await;
+
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(
+            reviews[0].verdict, "warn",
+            "unknown verdicts must not pass through"
+        );
+        assert!(
+            reviews[0]
+                .issues
+                .iter()
+                .any(|issue| issue.kind == "qa_unknown_verdict"
+                    && issue.message.contains("magnificent")),
+            "the finding should name the raw verdict: {:?}",
+            reviews[0].issues
+        );
+    }
+
+    #[test]
+    fn normalize_qa_verdict_accepts_only_the_documented_set() {
+        for (raw, expected) in [
+            ("pass", "pass"),
+            (" WARN ", "warn"),
+            ("fail", "fail"),
+            ("excellent", "warn"),
+            ("", "warn"),
+        ] {
+            let recognized = matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "pass" | "warn" | "fail"
+            );
+            let (verdict, issue) = crate::validation::normalize_qa_verdict(raw);
+            assert_eq!(verdict, expected, "input {raw:?}");
+            assert_eq!(
+                issue.is_some(),
+                !recognized,
+                "only unrecognized verdicts carry a finding: {raw:?}"
+            );
+        }
     }
 
     #[tokio::test]

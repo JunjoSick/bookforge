@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use bookforge_core::{IssueLevel, ProgressEvent, RunState};
+use bookforge_core::{ProgressEvent, RunState};
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -18,6 +18,8 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Gauge, List, ListItem, ListState, Paragraph},
 };
+
+use crate::presentation::{RunView, format_count, format_eta, format_rate, run_status_name};
 
 /// One row in the job picker shown by `bookforge watch` with no job id.
 pub struct JobPickerEntry {
@@ -114,6 +116,80 @@ impl TuiMode {
     }
 }
 
+/// Scroll state for the event-log pane (UI-1).
+///
+/// While following, `offset` is re-pinned to the newest row on every frame,
+/// so it must not be trusted as "the row the user is looking at". Leaving
+/// follow mode with ↑ therefore starts from the *last rendered* bottom
+/// position (`last_max_scroll`) and steps up exactly one line, instead of
+/// falling back to a stale offset of 0 (which jumped to the oldest entry).
+#[derive(Debug, Default)]
+struct LogScroll {
+    /// Scroll offset from the top, in lines.
+    offset: u16,
+    /// When true, the log pins to the newest entries.
+    follow: bool,
+    /// Largest legal offset seen on the previous render.
+    last_max_scroll: u16,
+}
+
+impl LogScroll {
+    fn new() -> Self {
+        Self {
+            offset: 0,
+            follow: true,
+            last_max_scroll: 0,
+        }
+    }
+
+    fn key_up(&mut self) {
+        if self.follow {
+            self.offset = self.last_max_scroll.saturating_sub(1);
+        } else {
+            self.offset = self.offset.saturating_sub(1);
+        }
+        self.follow = false;
+    }
+
+    fn key_down(&mut self) {
+        self.follow = false;
+        self.offset = self.offset.saturating_add(1);
+    }
+
+    fn page_up(&mut self) {
+        if self.follow {
+            self.offset = self.last_max_scroll.saturating_sub(10);
+        } else {
+            self.offset = self.offset.saturating_sub(10);
+        }
+        self.follow = false;
+    }
+
+    fn page_down(&mut self) {
+        self.follow = false;
+        self.offset = self.offset.saturating_add(10);
+    }
+
+    fn top(&mut self) {
+        self.follow = false;
+        self.offset = 0;
+    }
+
+    fn bottom(&mut self) {
+        self.follow = true;
+    }
+
+    /// Re-pin/clamp the offset for this frame. Returns `(offset, max_scroll)`.
+    fn pre_render(&mut self, total_lines: u16, inner_height: u16) -> (u16, u16) {
+        let max_scroll = total_lines.saturating_sub(inner_height);
+        self.last_max_scroll = max_scroll;
+        if self.follow || self.offset > max_scroll {
+            self.offset = max_scroll;
+        }
+        (self.offset, max_scroll)
+    }
+}
+
 /// A user-requested action the host loop should perform. Kept store-agnostic so
 /// the TUI does not depend on the persistence layer.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -125,15 +201,15 @@ pub enum TuiAction {
     StopJob,
 }
 
-/// Owns the terminal and the folded [`RunState`]; renders the dashboard.
+/// Owns the terminal and the folded run view; renders the dashboard.
 pub struct TuiApp {
     terminal: DefaultTerminal,
     mode: TuiMode,
-    pub state: RunState,
-    /// Log scroll offset from the top, in lines.
-    scroll: u16,
-    /// When true, the log pins to the newest entries.
-    follow: bool,
+    /// Canonical presentation view (UI-31): the one RunState+EpochTracker
+    /// pairing shared with the bars, `tail`, and serve folds.
+    pub view: RunView,
+    /// Event-log pane scroll/follow state (UI-1).
+    log_scroll: LogScroll,
     quit: bool,
     /// Actions requested by the user, drained by the host loop.
     actions: Vec<TuiAction>,
@@ -311,9 +387,8 @@ impl TuiApp {
         Ok(Self {
             terminal,
             mode,
-            state: RunState::default(),
-            scroll: 0,
-            follow: true,
+            view: RunView::new(),
+            log_scroll: LogScroll::new(),
             quit: false,
             actions: Vec::new(),
             status_message: None,
@@ -328,7 +403,7 @@ impl TuiApp {
 
     /// Fold one event into the displayed state.
     pub fn fold(&mut self, event: &ProgressEvent) {
-        self.state.fold(event);
+        self.view.fold(event);
     }
 
     /// Drain and handle all currently-pending key input without blocking.
@@ -354,27 +429,12 @@ impl TuiApp {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.follow = false;
-                self.scroll = self.scroll.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.follow = false;
-                self.scroll = self.scroll.saturating_add(1);
-            }
-            KeyCode::PageUp => {
-                self.follow = false;
-                self.scroll = self.scroll.saturating_sub(10);
-            }
-            KeyCode::PageDown => {
-                self.follow = false;
-                self.scroll = self.scroll.saturating_add(10);
-            }
-            KeyCode::Home | KeyCode::Char('g') => {
-                self.follow = false;
-                self.scroll = 0;
-            }
-            KeyCode::End | KeyCode::Char('G') => self.follow = true,
+            KeyCode::Up | KeyCode::Char('k') => self.log_scroll.key_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.log_scroll.key_down(),
+            KeyCode::PageUp => self.log_scroll.page_up(),
+            KeyCode::PageDown => self.log_scroll.page_down(),
+            KeyCode::Home | KeyCode::Char('g') => self.log_scroll.top(),
+            KeyCode::End | KeyCode::Char('G') => self.log_scroll.bottom(),
             // Retry is only meaningful when watching a persisted job, not while
             // attached to a run that is still producing segments.
             KeyCode::Char('r') if self.mode == TuiMode::Watch => {
@@ -410,29 +470,47 @@ impl TuiApp {
         let Self {
             terminal,
             mode,
-            state,
-            scroll,
-            follow,
+            view,
+            log_scroll,
             status_message,
             ..
         } = self;
         let mode = *mode;
-        let follow = *follow;
-        let scroll_ref = scroll;
         let status = status_message.as_deref();
-        terminal.draw(|frame| render_dashboard(frame, state, mode, scroll_ref, follow, status))?;
+        // Rate/ETA come from the canonical epoch-aware view so resumed runs do
+        // not inherit timing baselines from earlier epochs (UI-9/31).
+        let per_min = view.segments_per_minute();
+        let eta = view.eta_secs();
+        let ratio = view.progress_ratio();
+        terminal.draw(|frame| {
+            render_dashboard(
+                frame,
+                DashboardRenderContext {
+                    state: &view.state,
+                    mode,
+                    segments_per_minute: per_min,
+                    eta_secs: eta,
+                    ratio,
+                    scroll: log_scroll,
+                    status,
+                },
+            )
+        })?;
         Ok(())
     }
 }
 
-fn render_dashboard(
-    frame: &mut Frame,
-    state: &RunState,
+struct DashboardRenderContext<'a> {
+    state: &'a RunState,
     mode: TuiMode,
-    scroll: &mut u16,
-    follow: bool,
-    status: Option<&str>,
-) {
+    segments_per_minute: f64,
+    eta_secs: f64,
+    ratio: f64,
+    scroll: &'a mut LogScroll,
+    status: Option<&'a str>,
+}
+
+fn render_dashboard(frame: &mut Frame, context: DashboardRenderContext<'_>) {
     let chunks = Layout::vertical([
         Constraint::Length(5), // header
         Constraint::Length(3), // progress gauge
@@ -442,23 +520,29 @@ fn render_dashboard(
     ])
     .split(frame.area());
 
-    render_header(frame, chunks[0], state, mode);
-    render_gauge(frame, chunks[1], state);
-    render_stats(frame, chunks[2], state);
-    render_log(frame, chunks[3], state, scroll, follow);
-    render_footer(frame, chunks[4], state, mode, status);
+    render_header(frame, chunks[0], context.state, context.mode);
+    // Gauge ratio comes from the canonical epoch-aware view (UI-31).
+    render_gauge(frame, chunks[1], context.state, context.ratio);
+    render_stats(
+        frame,
+        chunks[2],
+        context.state,
+        context.segments_per_minute,
+        context.eta_secs,
+    );
+    render_log(frame, chunks[3], context.state, context.scroll);
+    render_footer(
+        frame,
+        chunks[4],
+        context.state,
+        context.mode,
+        context.status,
+    );
 }
 
 fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunState, mode: TuiMode) {
-    let status = if state.finished {
-        "done"
-    } else if state.paused {
-        "paused"
-    } else if state.total_segments > 0 {
-        "running"
-    } else {
-        "starting"
-    };
+    // Status naming comes from the shared presentation vocabulary (UI-31).
+    let status = run_status_name(state);
     let job = state.job_id.as_deref().unwrap_or("(no job yet)");
     let model = match (state.provider.as_deref(), state.model.as_deref()) {
         (Some(p), Some(m)) => format!("{p} / {m}"),
@@ -489,12 +573,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunStat
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_gauge(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunState) {
-    let ratio = if state.total_segments > 0 {
-        (state.done_segments as f64 / state.total_segments as f64).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+fn render_gauge(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunState, ratio: f64) {
     let stage = state.stage.as_deref().unwrap_or("…");
     let label = format!(
         "{}/{} ({} cached)",
@@ -508,7 +587,13 @@ fn render_gauge(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunState
     frame.render_widget(gauge, area);
 }
 
-fn render_stats(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunState) {
+fn render_stats(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    state: &RunState,
+    segments_per_minute: f64,
+    eta_secs: f64,
+) {
     let counts = Line::from(vec![
         Span::styled(
             format!("✓ {} ok", state.succeeded),
@@ -533,11 +618,11 @@ fn render_stats(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunState
     let eta = if state.finished {
         "—".to_string()
     } else {
-        format_duration(state.eta_secs())
+        format_eta(eta_secs)
     };
     let rates = Line::from(format!(
-        "{:.1} seg/min · ETA {} · tokens {} in / {} out · flushed {}",
-        state.segments_per_minute(),
+        "{} · ETA {} · tokens {} in / {} out · flushed {}",
+        format_rate(segments_per_minute),
         eta,
         format_count(state.input_tokens),
         format_count(state.output_tokens),
@@ -553,26 +638,29 @@ fn render_log(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
     state: &RunState,
-    scroll: &mut u16,
-    follow: bool,
+    scroll: &mut LogScroll,
 ) {
-    let lines: Vec<Line> = state.recent_events.iter().map(format_event_line).collect();
+    // Events that have no dedicated log line render as empty strings; skip
+    // them so the visible log (and its scroll math) is not polluted with
+    // blank rows.
+    let lines: Vec<Line> = state
+        .recent_events
+        .iter()
+        .map(format_event_line)
+        .filter(|line| !line.spans.iter().all(|span| span.content.is_empty()))
+        .collect();
     let total = lines.len() as u16;
     // Inner height excludes the top/bottom border rows.
     let inner_h = area.height.saturating_sub(2);
-    let max_scroll = total.saturating_sub(inner_h);
-    // Pin to the newest line when following, and never scroll past the end.
-    if follow || *scroll > max_scroll {
-        *scroll = max_scroll;
-    }
-    let title = if follow {
+    let (offset, max_scroll) = scroll.pre_render(total, inner_h);
+    let title = if scroll.follow {
         " Events (following) ".to_string()
     } else {
-        format!(" Events ({}/{}) ", (*scroll).min(max_scroll), max_scroll)
+        format!(" Events ({}/{}) ", offset.min(max_scroll), max_scroll)
     };
     let paragraph = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title(title))
-        .scroll((*scroll, 0));
+        .scroll((offset, 0));
     frame.render_widget(paragraph, area);
 }
 
@@ -601,7 +689,10 @@ fn render_footer(
                 .unwrap_or_default();
             format!(" finished · q to exit{review}")
         }
-        (TuiMode::Attached, false) => format!(" q/Ctrl-C abort & quit · {keys}"),
+        // Quitting cancels the run: the token is shared with the worker for
+        // both `translate --ui tui` and `resume --ui tui` (UI-2). The run
+        // stops at its next safe boundary and progress stays checkpointed.
+        (TuiMode::Attached, false) => format!(" q/Ctrl-C cancel run & quit · {keys}"),
         (TuiMode::Watch, _) => format!(" q quit · p pause · u resume · s stop · r retry · {keys}"),
     };
     frame.render_widget(
@@ -714,63 +805,19 @@ fn format_event_line(event: &ProgressEvent) -> Line<'static> {
             format!("✓ finished: {succeeded} ok, {needs_review} review, {failed} failed"),
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
         ),
+        ProgressEvent::DroppedEvents { count, .. } => (
+            format!("[dropped] {count} event(s) lost to queue overflow"),
+            Style::new().fg(Color::DarkGray),
+        ),
         // Quieter / high-frequency events are not worth a log line each.
         _ => return Line::from(Span::raw("")),
     };
     Line::from(Span::styled(text, style))
 }
 
-/// Issue level → display colour, kept for any future issues panel.
-#[allow(dead_code)]
-fn issue_style(level: IssueLevel) -> Style {
-    match level {
-        IssueLevel::Warning => Style::new().fg(Color::Yellow),
-        IssueLevel::Error => Style::new().fg(Color::Red),
-    }
-}
-
-fn format_duration(secs: f64) -> String {
-    if secs <= 0.0 {
-        return "—".to_string();
-    }
-    if secs > 3600.0 {
-        format!("{:.1}h", secs / 3600.0)
-    } else if secs > 60.0 {
-        format!("{:.0}m", secs / 60.0)
-    } else {
-        format!("{secs:.0}s")
-    }
-}
-
-fn format_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn count_formatting_is_compact() {
-        assert_eq!(format_count(0), "0");
-        assert_eq!(format_count(999), "999");
-        assert_eq!(format_count(12_345), "12.3k");
-        assert_eq!(format_count(2_000_000), "2.0M");
-    }
-
-    #[test]
-    fn duration_formatting_buckets_by_scale() {
-        assert_eq!(format_duration(0.0), "—");
-        assert_eq!(format_duration(45.0), "45s");
-        assert_eq!(format_duration(150.0), "2m");
-        assert_eq!(format_duration(7200.0), "2.0h");
-    }
 
     #[test]
     fn dashboard_renders_key_fields_into_buffer() {
@@ -798,10 +845,21 @@ mod tests {
         }
 
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
-        let mut scroll = 0u16;
+        let mut scroll = LogScroll::new();
         terminal
             .draw(|frame| {
-                render_dashboard(frame, &state, TuiMode::Watch, &mut scroll, true, None);
+                render_dashboard(
+                    frame,
+                    DashboardRenderContext {
+                        state: &state,
+                        mode: TuiMode::Watch,
+                        segments_per_minute: 0.0,
+                        eta_secs: 0.0,
+                        ratio: 0.0,
+                        scroll: &mut scroll,
+                        status: None,
+                    },
+                );
             })
             .unwrap();
 
@@ -817,6 +875,191 @@ mod tests {
         assert!(text.contains("3 ok"), "succeeded count missing");
         assert!(text.contains("3/10"), "gauge label missing");
         assert!(text.contains("q quit"), "watch footer missing");
+    }
+
+    /// UI-2: the attached footer must tell the truth — quitting cancels the
+    /// run (the token is shared with the worker for translate and resume).
+    #[test]
+    fn attached_footer_promises_cancel_and_quit_truthfully() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = RunState::default();
+        state.fold(&ProgressEvent::JobCreated {
+            job_id: "job_footer".into(),
+            input_path: "a.epub".into(),
+            output_path: "b.epub".into(),
+            timestamp_ms: 1,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        let mut scroll = LogScroll::new();
+        // An unfinished attached run shows the cancel-and-quit hint...
+        terminal
+            .draw(|frame| {
+                render_dashboard(
+                    frame,
+                    DashboardRenderContext {
+                        state: &state,
+                        mode: TuiMode::Attached,
+                        segments_per_minute: 0.0,
+                        eta_secs: 0.0,
+                        ratio: 0.0,
+                        scroll: &mut scroll,
+                        status: None,
+                    },
+                );
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("cancel run & quit"),
+            "attached footer must describe cancel semantics: {text}"
+        );
+        assert!(
+            !text.contains("abort"),
+            "old misleading wording must be gone"
+        );
+
+        // ...and a finished one only offers plain exit.
+        state.fold(&ProgressEvent::TranslationFinished {
+            succeeded: 1,
+            cached: 0,
+            needs_review: 0,
+            failed: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            elapsed_ms: 1,
+            timestamp_ms: 2,
+        });
+        let mut scroll = LogScroll::new();
+        terminal
+            .draw(|frame| {
+                render_dashboard(
+                    frame,
+                    DashboardRenderContext {
+                        state: &state,
+                        mode: TuiMode::Attached,
+                        segments_per_minute: 0.0,
+                        eta_secs: 0.0,
+                        ratio: 0.0,
+                        scroll: &mut scroll,
+                        status: None,
+                    },
+                );
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("finished · q to exit"));
+        assert!(!text.contains("cancel run"));
+    }
+
+    /// UI-1: leaving follow mode with ↑ must step up exactly one line from
+    /// the bottom, not jump to the oldest entry via a stale offset.
+    #[test]
+    fn arrow_up_from_follow_moves_up_one_row() {
+        // Simulate a log whose window bottom is at offset 40.
+        let mut scroll = LogScroll::new();
+        let total_lines = 60u16;
+        let inner_height = 20u16;
+        let (offset, max_scroll) = scroll.pre_render(total_lines, inner_height);
+        assert_eq!(
+            (offset, max_scroll),
+            (40, 40),
+            "follow pins to the newest row"
+        );
+
+        scroll.key_up();
+        let (offset, _) = scroll.pre_render(total_lines, inner_height);
+        assert_eq!(offset, 39, "↑ must move up exactly one line");
+        assert!(!scroll.follow);
+
+        scroll.key_down();
+        let (offset, _) = scroll.pre_render(total_lines, inner_height);
+        assert_eq!(offset, 40, "↓ returns to the bottom; follow stays off");
+
+        // G/End re-pins to follow; ↑ afterwards still steps up by one.
+        scroll.bottom();
+        scroll.key_up();
+        let (offset, _) = scroll.pre_render(total_lines, inner_height);
+        assert_eq!(offset, 39);
+    }
+
+    #[test]
+    fn event_log_rendering_skips_blank_rows_from_unhandled_events() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = RunState::default();
+        // RequestStarted has no dedicated log line and previously rendered as
+        // an empty row.
+        state.fold(&ProgressEvent::RequestStarted {
+            request_id: "r1".into(),
+            batch_id: None,
+            segment_id: None,
+            provider: None,
+            model: None,
+            prompt_template: None,
+            items: 1,
+            estimated_input_tokens: 0,
+            max_output_tokens: None,
+            active_requests: 1,
+            target_concurrency: 2,
+            runtime_config_revision: None,
+            provider_max_attempts: None,
+            effective_timeout_seconds: None,
+            timestamp_ms: 1,
+        });
+        state.fold(&ProgressEvent::Warning {
+            kind: "test".into(),
+            message: "visible".into(),
+            timestamp_ms: 2,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let mut scroll = LogScroll::new();
+        terminal
+            .draw(|frame| {
+                render_dashboard(
+                    frame,
+                    DashboardRenderContext {
+                        state: &state,
+                        mode: TuiMode::Watch,
+                        segments_per_minute: 0.0,
+                        eta_secs: 0.0,
+                        ratio: 0.0,
+                        scroll: &mut scroll,
+                        status: None,
+                    },
+                );
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("[warn] visible"));
+
+        // DroppedEvents now renders as an honest marker line (UI-10).
+        let line = format_event_line(&ProgressEvent::DroppedEvents {
+            count: 5,
+            timestamp_ms: 3,
+        });
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered.contains("[dropped] 5 event(s) lost"));
     }
 
     #[test]

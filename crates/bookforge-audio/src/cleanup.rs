@@ -14,6 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::builder::ChunkRecord;
+use crate::lock::LOCK_FILE_NAME;
 
 /// Audio container extensions BookForge can emit. Used to keep pruning to
 /// files this crate actually manages.
@@ -55,6 +56,42 @@ fn is_managed_chunk_name(name: &str) -> bool {
         && parts[4].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// AUDIO-11: crash debris in the output directory that no run will ever
+/// reference again. The shapes are exactly what this crate can leave behind
+/// when a build or stitch dies mid-write:
+///
+/// - `*.part.tmp` — interrupted atomic chunk/manifest writes (current names
+///   are `<chunk>.<pid>-<seq>-<rand>.part.tmp`; legacy names from before the
+///   AUDIO-1 fix end in `.part.tmp` / `.replace.bak` too);
+/// - `*.replace.bak` — legacy backup copies of overwritten outputs;
+/// - `.*.part.<ext>` — staged ffmpeg/m4b publish files (dot-prefixed) left
+///   by a stitch killed between encode and rename;
+/// - `*.concat.txt`, `chapters.ffmeta.txt` — scratch lists and chapter
+///   metadata from an interrupted stitch.
+///
+/// Lock files are never debris (see [`is_protected_lock_name`]): deleting
+/// one would let a second build corrupt the first run's directory.
+pub fn is_debris_name(name: &str) -> bool {
+    if is_protected_lock_name(name) || name == "manifest.json" {
+        return false;
+    }
+    let lowered = name.to_ascii_lowercase();
+    lowered.ends_with(".part.tmp")
+        || lowered.ends_with(".replace.bak")
+        // Staged ffmpeg publishes keep their container extension after a
+        // final ".part", e.g. ".audiobook.m4b.1234-7.part.m4b".
+        || (name.starts_with('.') && lowered.contains(".part."))
+        // AUDIO-13 intermediates from an interrupted loudnorm stitch.
+        || lowered.starts_with(".normalized-chapter-")
+        || lowered.ends_with(".concat.txt")
+        || lowered == "chapters.ffmeta.txt"
+}
+
+/// Files the lock protocol owns; pruning must never see them as deletable.
+pub fn is_protected_lock_name(name: &str) -> bool {
+    name == LOCK_FILE_NAME || name.ends_with(".bookforge-audio.lock") || name.ends_with(".lock")
+}
+
 /// List managed chunk files in `out_dir` that the current `plan` does not
 /// reference.
 ///
@@ -63,6 +100,11 @@ fn is_managed_chunk_name(name: &str) -> bool {
 /// sufficient: existing chunks for omitted chapters may still be reusable.
 /// Given a complete plan, a resume never uses the returned files, so they are
 /// safe to remove.
+///
+/// Crash debris ([`is_debris_name`]) is included in the listing regardless of
+/// any plan, so `--prune --dry-run` previews it exactly as it would delete
+/// it. A live build holds [`crate::lock::LOCK_FILE_NAME`]; that file (and any
+/// lock-suffixed file) is excluded from both listing and removal.
 ///
 /// Returns an empty list if `out_dir` does not exist. Results are sorted by
 /// path for stable reporting.
@@ -84,7 +126,9 @@ pub fn find_stale_chunks(out_dir: &Path, plan: &[ChunkRecord]) -> std::io::Resul
         let Some(name) = name.to_str() else {
             continue;
         };
-        if is_managed_chunk_name(name) && !kept.contains(name) {
+        let debris = is_debris_name(name);
+        let stale_chunk = is_managed_chunk_name(name) && !kept.contains(name);
+        if debris || stale_chunk {
             let bytes = entry.metadata()?.len();
             stale.push(StaleChunk {
                 path: entry.path(),
@@ -241,5 +285,61 @@ mod tests {
     fn missing_directory_yields_no_stale_files() {
         let found = find_stale_chunks(Path::new("does-not-exist-xyz"), &[]).expect("scan");
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn crash_debris_is_recognized_and_lock_files_protected() {
+        assert!(is_debris_name(
+            "chapter-001-part-001-0123456789abcdef.wav.1234-0-deadbeef00000000.part.tmp"
+        ));
+        assert!(is_debris_name(".audiobook.m4b.1234-7.part.m4b"));
+        assert!(is_debris_name("manifest.json.replace.bak"));
+        assert!(is_debris_name("book.concat.txt"));
+        assert!(is_debris_name("chapters.ffmeta.txt"));
+        // Managed outputs are never debris.
+        assert!(!is_debris_name("chapter-001-part-002-0123456789abcdef.mp3"));
+        assert!(!is_debris_name("manifest.json"));
+        assert!(!is_debris_name("audiobook.m4b"));
+        // Lock files are protected in both name forms.
+        assert!(!is_debris_name(LOCK_FILE_NAME));
+        assert!(!is_debris_name("out-dir.bookforge-audio.lock"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path();
+        let keep = "chapter-001-part-001-0123456789abcdef.mp3";
+        let debris = "chapter-001-part-001-fedcba9876543210.mp3.9999-3-abcdefabcdefabcdef.part.tmp";
+        let staged = ".audiobook.m4b.1234-7.part.m4b";
+        for name in [keep, debris, staged, LOCK_FILE_NAME, "manifest.json"] {
+            fs::write(out.join(name), b"data").expect("write fixture");
+        }
+
+        let found = find_stale_chunks(out, &[record(keep)]).expect("scan");
+        let names: Vec<String> = found
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.contains(&debris.to_string()));
+        assert!(names.contains(&staged.to_string()));
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == LOCK_FILE_NAME || name == keep || name == "manifest.json")
+        );
+
+        let (removed, _) = remove_stale_chunks(&found).expect("remove");
+        assert_eq!(removed, 2);
+        // The live build's lock file and managed outputs survive.
+        assert!(out.join(LOCK_FILE_NAME).exists());
+        assert!(out.join(keep).exists());
+        assert!(!out.join(debris).exists());
+        assert!(!out.join(staged).exists());
     }
 }

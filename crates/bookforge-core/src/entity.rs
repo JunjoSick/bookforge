@@ -159,15 +159,6 @@ pub fn entities_fingerprint(entities: &[Entity]) -> String {
     hex
 }
 
-/// Convenience: produce both the rendered block and the fingerprint
-/// from a single merge.
-pub fn render_and_fingerprint(merged: &[Entity]) -> (String, String) {
-    (
-        render_entity_agreement_block(merged),
-        entities_fingerprint(merged),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -124,6 +124,12 @@ pub enum ProgressEvent {
         runtime_config_revision: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_max_attempts: Option<usize>,
+        /// Per-request effective timeout (seconds) after the latency-aware
+        /// output-budget extension, when the engine knows the configured
+        /// timeout. `None`/absent for older rows and library callers that do
+        /// not surface a timeout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effective_timeout_seconds: Option<u64>,
         timestamp_ms: u64,
     },
     RequestFinished {
@@ -138,6 +144,17 @@ pub enum ProgressEvent {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         error_kind: Option<String>,
+        timestamp_ms: u64,
+    },
+    /// Periodic in-flight heartbeat emitted while a batch request is being
+    /// served, so dashboards can show liveness between RequestStarted and
+    /// RequestFinished. Informational only; consumers must fold it as a
+    /// no-op and log writers must not treat it as an important (flush
+    /// forcing) event.
+    RequestProgress {
+        batch_id: String,
+        items: usize,
+        elapsed_ms: u64,
         timestamp_ms: u64,
     },
     SegmentStarted {
@@ -227,6 +244,7 @@ pub fn event_timestamp_ms(event: &ProgressEvent) -> u64 {
         | BatchRepairFinished { timestamp_ms, .. }
         | RequestStarted { timestamp_ms, .. }
         | RequestFinished { timestamp_ms, .. }
+        | RequestProgress { timestamp_ms, .. }
         | SegmentStarted { timestamp_ms, .. }
         | SegmentFinished { timestamp_ms, .. }
         | CheckpointQueued { timestamp_ms, .. }
@@ -755,6 +773,7 @@ mod tests {
             target_concurrency: 4,
             runtime_config_revision: None,
             provider_max_attempts: None,
+            effective_timeout_seconds: None,
             timestamp_ms: 1,
         };
         state.fold(&started);
@@ -820,6 +839,25 @@ mod tests {
     }
 
     #[test]
+    fn request_progress_round_trips_and_is_not_an_issue() {
+        let event = ProgressEvent::RequestProgress {
+            batch_id: "batch_0001".into(),
+            items: 4,
+            elapsed_ms: 15_023,
+            timestamp_ms: 42,
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        let parsed: ProgressEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(event_timestamp_ms(&parsed), 42);
+        // Folding a heartbeat must not mutate any counter beyond the event ring.
+        let mut state = RunState::default();
+        state.fold(&parsed);
+        assert_eq!(state.active_requests, 0);
+        assert_eq!(state.recent_events.len(), 1);
+        assert_eq!(state.recent_issues.len(), 0);
+    }
+
+    #[test]
     fn job_pause_events_fold_into_state() {
         let mut state = RunState::default();
         state.fold(&ProgressEvent::JobPaused {
@@ -873,6 +911,7 @@ mod tests {
             target_concurrency: 4,
             runtime_config_revision: None,
             provider_max_attempts: None,
+            effective_timeout_seconds: None,
             timestamp_ms: ts,
         };
         state.fold(&started(3, 1));

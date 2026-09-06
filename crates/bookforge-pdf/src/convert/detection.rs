@@ -588,13 +588,21 @@ pub(super) fn figure_blocks_from_images(
         .map(|page| (page.number, page))
         .collect::<HashMap<_, _>>();
     let candidates = image_figure_candidates(&pages_by_number, images);
-    let repeated_regionless = repeated_regionless_image_signatures(&candidates);
     let two_column_pages = page_stats
         .iter()
         .filter(|stats| stats.two_column)
         .map(|stats| stats.page)
         .collect::<HashSet<_>>();
     let mut warnings = Vec::new();
+    // Content signatures are computed once per image file (read-once)
+    // and shared by both the repeat-ornament detector and the drop
+    // decision below; hashing combines length + CRC-32 of the actual
+    // bytes rather than a fixed-key process-local hash.
+    let image_signatures = candidates
+        .iter()
+        .map(|candidate| image_content_signature(candidate.image))
+        .collect::<Vec<_>>();
+    let repeated_regionless = repeated_regionless_image_signatures(&candidates, &image_signatures);
     let vector_regions = vector_figure_regions(pages, &two_column_pages, &mut warnings);
     let vector_rects = vector_regions
         .iter()
@@ -686,7 +694,12 @@ pub(super) fn figure_blocks_from_images(
             warnings.push(caption_overlap_warning(candidate.image.page, caption.top));
         }
         if candidate.region.is_none()
-            && should_drop_regionless_image(candidate.image, &repeated_regionless, &mut warnings)
+            && should_drop_regionless_image(
+                candidate.image,
+                image_signatures[index],
+                &repeated_regionless,
+                &mut warnings,
+            )
         {
             continue;
         }
@@ -1036,15 +1049,18 @@ fn relative_delta(left: f64, right: f64) -> f64 {
     (left - right).abs() / left.max(right)
 }
 
-fn repeated_regionless_image_signatures(candidates: &[ImageFigureCandidate<'_>]) -> HashSet<u64> {
+fn repeated_regionless_image_signatures(
+    candidates: &[ImageFigureCandidate<'_>],
+    signatures: &[Option<u64>],
+) -> HashSet<u64> {
     let mut pages_by_signature: HashMap<u64, HashSet<u32>> = HashMap::new();
-    for candidate in candidates {
+    for (candidate, signature) in candidates.iter().zip(signatures.iter()) {
         if candidate.region.is_some() {
             continue;
         }
-        if let Some(signature) = image_byte_signature(candidate.image) {
+        if let Some(signature) = signature {
             pages_by_signature
-                .entry(signature)
+                .entry(*signature)
                 .or_default()
                 .insert(candidate.image.page);
         }
@@ -1059,6 +1075,7 @@ fn repeated_regionless_image_signatures(candidates: &[ImageFigureCandidate<'_>])
 
 fn should_drop_regionless_image(
     image: &ExtractedImage,
+    signature: Option<u64>,
     repeated_signatures: &HashSet<u64>,
     warnings: &mut Vec<String>,
 ) -> bool {
@@ -1073,8 +1090,7 @@ fn should_drop_regionless_image(
         ));
         return true;
     }
-    if image_byte_signature(image).is_some_and(|signature| repeated_signatures.contains(&signature))
-    {
+    if signature.is_some_and(|signature| repeated_signatures.contains(&signature)) {
         warnings.push(format!(
             "page {}: dropped repeated regionless image {} as likely running ornament/logo",
             image.page, image.index
@@ -1084,11 +1100,14 @@ fn should_drop_regionless_image(
     false
 }
 
-fn image_byte_signature(image: &ExtractedImage) -> Option<u64> {
+/// Content-derived signature (length + CRC-32 of the actual bytes) so
+/// identical images dedupe regardless of path; the file is read at most
+/// once per candidate. `None` when the file cannot be read.
+fn image_content_signature(image: &ExtractedImage) -> Option<u64> {
     let bytes = fs::read(&image.path).ok()?;
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    Some(hasher.finish())
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&bytes);
+    Some((u64::from(bytes.len() as u32) << 32) | u64::from(hasher.finalize()))
 }
 
 pub(super) fn vector_figure_regions<'a>(
@@ -1470,6 +1489,96 @@ fn figure_caption_fragments(page: &Page) -> Vec<&Fragment> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Caption recognition (PDF-10 deep half).
+//
+// Three tiers, cheapest first; the English fast path stays byte-for-byte
+// what shipped before this expansion so English documents cannot regress:
+//
+// 1. Typed English prefixes ("figure", "fig.", "table") — exact prefix
+//    match, unchanged.
+// 2. Typed CJK prefixes — 図 (Japanese figure), 图/圖 (Chinese simplified/
+//    traditional figure), 表 (Japanese/Chinese table), each optionally
+//    spaced, each requiring an ordinal in ASCII or fullwidth digits.
+//    Other CJK-first fragments (prose like "第一章…") carry no such
+//    ordinal and fall out.
+// 3. Language-neutral fallback — a short alphabetic leading word (any
+//    script), whitespace, an explicit ordinal in ASCII or fullwidth
+//    digits, then a caption separator. This is deliberately the same
+//    shape the wave-2 warning scanned for, promoted into actual
+//    detection: "Abbildung 3:", "Tabla 2.", "Figura 12 –" and Korean
+//    "그림 1:" now associate with figures instead of being merely counted.
+//
+// Caption fragments that still match the caption SHAPE while using
+// ordinals outside the Latin/fullwidth repertoire (Devanagari, Thai, …)
+// remain undetected and are surfaced through the warning below, which
+// is why that warning survives in narrowed form.
+
+/// CJK figure prefixes: Japanese 図, Chinese simplified 图, traditional 圖.
+const CJK_FIGURE_PREFIXES: &[char] = &['\u{56f3}', '\u{56fe}', '\u{5716}'];
+/// CJK table prefix: 表 serves Japanese and Chinese alike.
+const CJK_TABLE_PREFIXES: &[char] = &['\u{8868}'];
+
+fn leading_char_in(text: &str, set: &[char]) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|first| set.contains(&first))
+}
+
+fn is_ordinal_digit(ch: char) -> bool {
+    ch.is_ascii_digit() || ('\u{FF10}'..='\u{FF19}').contains(&ch)
+}
+
+/// Characters allowed INSIDE a caption's leading word beyond plain
+/// letters: the Unicode Alphabetic property misses combining marks
+/// (Devanagari matras/virama, Thai vowels and tone signs, generic
+/// diacritics), which appear mid-word in every Brahmic/Thai script.
+/// Whole-script blocks are accepted here rather than individual marks;
+/// ordinal digits still terminate the word during scanning below, so
+/// numerals inside the ranges never leak past the boundary.
+fn is_caption_lead_word_char(ch: char) -> bool {
+    ch.is_alphabetic()
+        || matches!(ch as u32,
+            0x0300..=0x036F  // combining diacritical marks
+            | 0x0900..=0x097F  // Devanagari incl. matras, virama
+            | 0x0E00..=0x0E7F  // Thai incl. vowel/tone signs
+        )
+}
+
+/// Whether a CJK caption prefix is followed (optionally across spaces,
+/// NBSP or ideographic spaces) by an explicit ordinal. Without the
+/// ordinal requirement ordinary prose opening with these characters
+/// ("表現力の高い…") would misclassify.
+fn cjk_prefix_takes_ordinal(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next(); // the prefix character itself
+    let mut seen_space = false;
+    for ch in chars.take(3) {
+        if is_ordinal_digit(ch) {
+            return true;
+        }
+        if ch.is_whitespace() || ch == '\u{00a0}' {
+            if seen_space {
+                return false;
+            }
+            seen_space = true;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+fn is_cjk_figure_caption(text: &str) -> bool {
+    leading_char_in(text.trim_start(), CJK_FIGURE_PREFIXES)
+        && cjk_prefix_takes_ordinal(text.trim_start())
+}
+
+fn is_cjk_table_caption(text: &str) -> bool {
+    leading_char_in(text.trim_start(), CJK_TABLE_PREFIXES)
+        && cjk_prefix_takes_ordinal(text.trim_start())
+}
+
 pub(super) fn detect_caption_fragment<'a>(
     page: &'a Page,
     region: Option<&ImageRegion>,
@@ -1494,7 +1603,28 @@ fn detect_caption_fragment_for_rect(page: &Page, region: Option<RegionRect>) -> 
     }
 }
 
-fn is_figure_caption_text(text: &str) -> bool {
+pub(super) fn is_figure_caption_text(text: &str) -> bool {
+    // Tier 1: English fast path, byte-for-byte identical to its
+    // pre-PDF-10 behaviour and always evaluated first.
+    if english_figure_prefix(text) {
+        return true;
+    }
+    // Tier 2: typed CJK prefixes with ordinals.
+    if is_cjk_figure_caption(text) {
+        return true;
+    }
+    // Tier 3: language-neutral shape fallback.
+    generic_localized_caption(text)
+}
+
+pub(super) fn is_table_caption_text(text: &str) -> bool {
+    if english_table_prefix(text) {
+        return true;
+    }
+    is_cjk_table_caption(text)
+}
+
+fn english_figure_prefix(text: &str) -> bool {
     let lower = text.trim_start().to_ascii_lowercase();
     lower.starts_with("figure ")
         || lower.starts_with("figure\u{00a0}")
@@ -1503,13 +1633,176 @@ fn is_figure_caption_text(text: &str) -> bool {
         || lower.starts_with("fig ")
 }
 
-fn is_caption_text(text: &str) -> bool {
-    is_figure_caption_text(text) || is_table_caption_text(text)
-}
-
-fn is_table_caption_text(text: &str) -> bool {
+fn english_table_prefix(text: &str) -> bool {
     let lower = text.trim_start().to_ascii_lowercase();
     lower.starts_with("table ") || lower.starts_with("table\u{00a0}")
+}
+
+// --- language-neutral caption shape ---------------------------------------
+
+const FOREIGN_CAPTION_MAX_CHARS: usize = 140;
+const FOREIGN_CAPTION_MAX_WORDS: usize = 20;
+/// Real captions are short; a full sentence leading with "In 2019:" is
+/// prose, not a skipped caption.
+const FOREIGN_CAPTION_MAX_CAPTION_WORDS: usize = 9;
+const LOCALIZED_CAPTION_MAX_LEAD_WORD: usize = 14;
+
+/// Which numeral repertoire the ordinal scan accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrdinalRepertoire {
+    /// ASCII digits and fullwidth forms (U+FF10..FF19) — what detection
+    /// itself acts on.
+    Latin,
+    /// Anything `char::is_numeric` accepts. Superset used only to notice
+    /// caption-shaped text that detection cannot act on (genuinely
+    /// unknown scripts).
+    AnyNumeric,
+}
+
+fn scan_ordinal_digits(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    repertoire: OrdinalRepertoire,
+) -> usize {
+    let mut ordinal_digits = 0usize;
+    while chars.peek().is_some_and(|ch| match repertoire {
+        OrdinalRepertoire::Latin => is_ordinal_digit(*ch),
+        OrdinalRepertoire::AnyNumeric => ch.is_numeric(),
+    }) {
+        chars.next();
+        ordinal_digits += 1;
+    }
+    ordinal_digits
+}
+
+fn caption_separator_next(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    matches!(
+        chars.peek(),
+        Some('.' | ':' | ')' | '\u{ff0e}' | '\u{ff1a}' | '\u{ff09}')
+            | Some('-' | '\u{2013}' | '\u{2014}')
+    )
+}
+
+/// The shared caption SHAPE: short alphabetic leading word in any script,
+/// whitespace(s), an explicit ordinal, whitespace, then a separator.
+/// `words <= FOREIGN_CAPTION_MAX_CAPTION_WORDS` keeps ordinary numbered
+/// prose headings ("1. Introduction") out — they lead with a digit and
+/// are rejected earlier anyway, but long wordy sentences also fall out
+/// here.
+fn localized_caption_shape(trimmed: &str, repertoire: OrdinalRepertoire) -> bool {
+    let char_count = trimmed.chars().count();
+    if !(5..=FOREIGN_CAPTION_MAX_CHARS).contains(&char_count) {
+        return false;
+    }
+    let words = trimmed.split_whitespace().count();
+    if words > FOREIGN_CAPTION_MAX_WORDS {
+        return false;
+    }
+    // A leading digit alone ("1. Introduction") is a numbered heading,
+    // not a caption; captions lead with a word.
+    let mut chars = trimmed.char_indices();
+    let Some((_, first)) = chars.next() else {
+        return false;
+    };
+    if first.is_ascii_digit() {
+        return false;
+    }
+    // The lead word runs until whitespace or an ordinal in the active
+    // repertoire; anything `is_numeric` implies an exotic ordinal and
+    // must terminate the scan too, so the repertoire drives the stop.
+    let lead_len = trimmed
+        .chars()
+        .take_while(|ch| {
+            !ch.is_whitespace()
+                && !is_ordinal_digit(*ch)
+                && !(repertoire == OrdinalRepertoire::AnyNumeric && ch.is_numeric())
+        })
+        .count();
+    if lead_len == 0
+        || lead_len > LOCALIZED_CAPTION_MAX_LEAD_WORD
+        || !trimmed
+            .chars()
+            .take(lead_len)
+            .all(is_caption_lead_word_char)
+    {
+        return false;
+    }
+    let cut = trimmed
+        .char_indices()
+        .nth(lead_len)
+        .map(|(index, _)| index)
+        .unwrap_or(trimmed.len());
+    let mut rest_chars = trimmed[cut..].chars().peekable();
+    while rest_chars
+        .peek()
+        .is_some_and(|ch| ch.is_whitespace() || *ch == '\u{00a0}')
+    {
+        rest_chars.next();
+    }
+    // An explicit ordinal followed by a caption separator: "1:", "1.",
+    // "1)", full-width variants, or a spaced dash ("Figura 12 – …").
+    if scan_ordinal_digits(&mut rest_chars, repertoire) == 0 {
+        return false;
+    }
+    while rest_chars
+        .peek()
+        .is_some_and(|ch| *ch == ' ' || *ch == '\u{00a0}')
+    {
+        rest_chars.next();
+    }
+    caption_separator_next(&mut rest_chars) && words <= FOREIGN_CAPTION_MAX_CAPTION_WORDS
+}
+
+/// Positive language-neutral detector: caption-shaped text whose leading
+/// word is not English/CJK-typed. Only shapes with actionable ordinals
+/// (Latin or fullwidth digits) count — anything else would promise an
+/// association the crop logic cannot compute better for being told.
+fn generic_localized_caption(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    !english_figure_prefix(trimmed)
+        && !english_table_prefix(trimmed)
+        && !is_cjk_figure_caption(trimmed)
+        && !is_cjk_table_caption(trimmed)
+        && localized_caption_shape(trimmed, OrdinalRepertoire::Latin)
+}
+
+/// Caption-shaped fragment that NO tier of the detector covers. Because
+/// the Latin/fullwidth repertoire is handled positively above, surviving
+/// fragments use genuinely unhandled numeral systems (Devanagari, Thai,
+/// …) — exactly the residue the report warning should still mention.
+pub(super) fn localized_caption_skipped(text: &str) -> bool {
+    !is_caption_text(text) && localized_caption_shape(text.trim(), OrdinalRepertoire::AnyNumeric)
+}
+
+/// Summary warning for caption-shaped fragments whose ordinals use a
+/// numeral system the detector cannot act on (docs/report.md §4.5 PDF-10).
+/// Since the deep-half expansion, English prefixes, CJK prefixes
+/// (図/图/圖/表) and any Latin/fullwidth-digit caption are detected
+/// positively; what survives is genuinely unknown, e.g. Devanagari or
+/// Thai numerals. `None` when nothing was skipped, so documents within
+/// the covered repertoire are never burdened with the notice.
+pub(super) fn skipped_foreign_caption_warning(pages: &[Page]) -> Option<String> {
+    let mut pages_affected = 0usize;
+    let mut candidates = 0usize;
+    for page in pages {
+        let on_page = page
+            .fragments
+            .iter()
+            .filter(|fragment| localized_caption_skipped(&spans_text(&fragment.spans)))
+            .count();
+        if on_page > 0 {
+            pages_affected += 1;
+            candidates += on_page;
+        }
+    }
+    (pages_affected > 0).then(|| {
+        format!(
+            "{candidates} fragment(s) on {pages_affected} page(s) look like figure or table captions in a script the caption detector does not recognize (English and CJK-prefixed captions with Latin or fullwidth digits are detected); vector-figure and table recovery were skipped for them"
+        )
+    })
+}
+
+fn is_caption_text(text: &str) -> bool {
+    is_figure_caption_text(text) || is_table_caption_text(text)
 }
 
 fn detect_table_caption(page: &Page, rect: RegionRect) -> Option<Vec<Span>> {

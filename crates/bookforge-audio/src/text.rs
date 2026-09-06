@@ -10,16 +10,17 @@
 
 use bookforge_core::ir::{Block, BlockId, BlockKind, Book};
 use bookforge_core::marker::strip_marker_tokens;
+use bookforge_core::script::is_space_delimited;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NarrationBlockKind {
+pub(crate) enum NarrationBlockKind {
     Title,
     Heading(u8),
     Paragraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NarrationBlock {
+pub(crate) struct NarrationBlock {
     pub kind: NarrationBlockKind,
     pub text: String,
 }
@@ -34,7 +35,7 @@ pub enum ChunkKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NarrationChunk {
+pub(crate) struct NarrationChunk {
     pub kind: ChunkKind,
     pub text: String,
 }
@@ -43,7 +44,7 @@ pub struct NarrationChunk {
 /// with a display title used for filenames and (when stitched) chapter
 /// markers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Chapter {
+pub(crate) struct Chapter {
     /// Zero-based position in reading order.
     pub index: usize,
     pub title: String,
@@ -53,35 +54,18 @@ pub struct Chapter {
 }
 
 impl Chapter {
-    pub fn text(&self) -> String {
-        self.blocks
-            .iter()
-            .map(|block| block.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    }
-
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.blocks.iter().all(|block| block.text.trim().is_empty())
     }
-}
-
-/// Extract narratable chapters in reading order.
-///
-/// The reader synthesizes structural sections from the OPF metadata and the
-/// NCX table of contents so those get translated; narration does not want
-/// them (nobody wants a table of contents read aloud), so they are skipped
-/// here. Chapters are numbered contiguously over the sections that survive
-/// filtering. Sections with no readable prose are still returned (with empty
-/// `text`) so the builder can skip them via [`Chapter::is_empty`].
-pub fn chapters_from_book(book: &Book) -> Vec<Chapter> {
-    chapters_from_book_with_options(book, false)
 }
 
 /// Extract chapters with optional physical-page grouping for positively
 /// identified pdftohtml sources. Ordinary EPUBs always preserve their spine
 /// section boundaries.
-pub fn chapters_from_book_with_options(book: &Book, pdf_page_grouping: bool) -> Vec<Chapter> {
+pub(crate) fn chapters_from_book_with_options(
+    book: &Book,
+    pdf_page_grouping: bool,
+) -> Vec<Chapter> {
     let block_index: std::collections::HashMap<&BlockId, &Block> =
         book.blocks.iter().map(|block| (&block.id, block)).collect();
     let navigation_hrefs: std::collections::HashSet<String> = book
@@ -97,6 +81,7 @@ pub fn chapters_from_book_with_options(book: &Book, pdf_page_grouping: bool) -> 
         .filter(|section| {
             !section.id.0.starts_with("sec_nav_")
                 && is_narratable_section(&section.href, &navigation_hrefs)
+                && !looks_like_table_of_contents(section, &block_index)
         })
         .collect::<Vec<_>>();
 
@@ -459,6 +444,111 @@ fn is_narratable_section(href: &str, navigation_hrefs: &std::collections::HashSe
     !(path.ends_with(".opf") || path.ends_with(".ncx") || is_navigation)
 }
 
+/// nav-audio residual backstop: a malformed EPUB 3 whose navigation document
+/// forgot the `nav` property still declares itself through its file name.
+/// True when the stem looks like a ToC container (`nav.xhtml`, `toc-1.html`,
+/// `OEBPS/contents.xhtml`, …). Structural sections (opf/ncx) are filtered
+/// before this runs; the match is deliberately narrow to avoid dropping real
+/// chapters whose author liked the word "navigation".
+fn toc_named_href(path: &str) -> bool {
+    if !matches!(path.rsplit('.').next(), Some("xhtml" | "html" | "htm")) {
+        return false;
+    }
+    let Some(file) = path.rsplit('/').next() else {
+        return false;
+    };
+    let Some((stem, _)) = file.split_once('.') else {
+        return false;
+    };
+    let stem = stem.trim_matches(['-', '_', ' ', '.']);
+    for prefix in [
+        "table of contents",
+        "table-of-contents",
+        "toc",
+        "nav",
+        "contents",
+    ] {
+        if stem == prefix
+            || stem
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with(['-', '_', ' ']))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Heuristic backstop for EPUBs whose printed/navigation ToC survives in a
+/// regular spine document without any `nav` property to identify it. Such a
+/// section would otherwise be narrated wholesale ("Chapter Three dot dot dot
+/// one hundred and twenty seven"). A spine section counts as a ToC when its
+/// readable blocks overwhelmingly look like entries: short lines, most ending
+/// in an Arabic or Roman folio. Real prose chapters never approach that ratio,
+/// while lists of illustrations/maps — furniture under every reading — do.
+///
+/// text_coverage honesty is unaffected: coverage is computed over the source
+/// document by the epub crate, not over what narration skips.
+fn looks_like_table_of_contents(
+    section: &bookforge_core::ir::Section,
+    block_index: &std::collections::HashMap<&BlockId, &Block>,
+) -> bool {
+    if toc_named_href(&normalized_href(&section.href)) {
+        return true;
+    }
+    let mut blocks = 0usize;
+    let mut folio_terminated = 0usize;
+    let mut total_chars = 0usize;
+    for block_id in &section.block_ids {
+        let Some(block) = block_index.get(block_id) else {
+            continue;
+        };
+        if block.kind == BlockKind::PageFurniture {
+            continue;
+        }
+        let text = clean_block_text(block);
+        if text.is_empty() {
+            continue;
+        }
+        blocks += 1;
+        total_chars += text.chars().count();
+        if text.ends_with_folio() {
+            folio_terminated += 1;
+        }
+    }
+    blocks >= 8
+        && folio_terminated * 4 >= blocks * 3
+        && total_chars / blocks <= TOC_ENTRY_MAX_AVG_CHARS
+}
+
+const TOC_ENTRY_MAX_AVG_CHARS: usize = 60;
+
+trait EndsWithFolio {
+    fn ends_with_folio(&self) -> bool;
+}
+
+impl EndsWithFolio for str {
+    fn ends_with_folio(&self) -> bool {
+        let trimmed = self.trim_end_matches(['.', ')', ']']);
+        if trimmed.is_empty() {
+            return false;
+        }
+        if trimmed
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            return true;
+        }
+        is_roman_folio(
+            trimmed
+                .rsplit(char::is_whitespace)
+                .next()
+                .unwrap_or_default(),
+        )
+    }
+}
+
 fn normalized_href(href: &str) -> String {
     href.split(['#', '?'])
         .next()
@@ -504,7 +594,7 @@ fn collapse_whitespace(text: &str) -> String {
 /// `max_chars` counts Unicode scalar values, not bytes; every returned
 /// chunk is a valid string and non-empty. Returns an empty vector for
 /// blank input.
-pub fn chunk_blocks(blocks: &[NarrationBlock], max_chars: usize) -> Vec<NarrationChunk> {
+pub(crate) fn chunk_blocks(blocks: &[NarrationBlock], max_chars: usize) -> Vec<NarrationChunk> {
     let max_chars = max_chars.max(1);
     let mut chunks = Vec::new();
     let mut paragraphs = Vec::new();
@@ -550,20 +640,6 @@ pub fn chunk_blocks(blocks: &[NarrationBlock], max_chars: usize) -> Vec<Narratio
     chunks
 }
 
-/// Compatibility wrapper for callers that have unstructured prose.
-pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
-    chunk_blocks(
-        &[NarrationBlock {
-            kind: NarrationBlockKind::Paragraph,
-            text: text.to_string(),
-        }],
-        max_chars,
-    )
-    .into_iter()
-    .map(|chunk| chunk.text)
-    .collect()
-}
-
 fn chunk_body_text(text: &str, max_chars: usize) -> Vec<String> {
     let max_chars = max_chars.max(1);
     let mut chunks: Vec<String> = Vec::new();
@@ -607,36 +683,125 @@ fn chunk_body_text(text: &str, max_chars: usize) -> Vec<String> {
 }
 
 /// Break text into trimmed sentences. Sentence terminators are `.`, `!`,
-/// `?`, and `…`; a boundary is only taken when the terminator is followed
-/// by whitespace or end of input, which keeps decimals and abbreviations
-/// like "3.14" or "e.g." intact. Blank lines also force a boundary so
-/// paragraph structure is respected.
+/// `?`, `…` and the CJK terminators `。`, `！`, `？`. A Latin terminator is
+/// only taken when followed by whitespace or end of input, and common
+/// abbreviations ("Mr.", "e.g.", single-letter initials) never break, which
+/// keeps decimals like "3.14" intact too. CJK terminators always break —
+/// CJK prose has no spaces to fall back on, so requiring one would swallow
+/// whole paragraphs into a single sentence. Closing quotes and brackets that
+/// immediately follow a terminator stay attached to their sentence, so
+/// `他说。"…"`-style punctuation is not orphaned. Blank lines also force a
+/// boundary so paragraph structure is respected.
 fn split_sentences(text: &str) -> Vec<String> {
     let mut sentences: Vec<String> = Vec::new();
     let mut current = String::new();
     let chars: Vec<char> = text.chars().collect();
+    let mut index = 0usize;
 
-    for (i, &ch) in chars.iter().enumerate() {
+    while index < chars.len() {
+        let ch = chars[index];
         current.push(ch);
-        let is_terminator = matches!(ch, '.' | '!' | '?' | '…');
-        if is_terminator {
-            let next_is_break = chars
-                .get(i + 1)
-                .map(|next| next.is_whitespace())
-                .unwrap_or(true);
-            if next_is_break {
-                push_trimmed(&mut sentences, &mut current);
+        if is_sentence_terminator(ch) && terminator_ends_sentence(&chars, index, &current) {
+            index += 1;
+            // Attach any run of closing quotes/brackets plus an ellipsis run
+            // tail to the finished sentence; narrating a lone """ or "…" is
+            // what produced the old orphaned-punctuation artifacts.
+            while index < chars.len() && is_closing_punctuation(chars[index]) {
+                current.push(chars[index]);
+                index += 1;
             }
-        } else if ch == '\n' {
+            while index < chars.len() && chars[index] == '…' {
+                current.push(chars[index]);
+                index += 1;
+                if !chars.get(index).is_some_and(|&next| next == '…') {
+                    break;
+                }
+            }
+            push_trimmed(&mut sentences, &mut current);
+            continue;
+        }
+        if ch == '\n' {
             // A paragraph break (blank line) is a hard boundary even without
             // terminal punctuation, e.g. headings.
-            if chars.get(i + 1).is_none_or(|next| *next == '\n') {
+            if chars.get(index + 1).is_none_or(|next| *next == '\n') {
                 push_trimmed(&mut sentences, &mut current);
             }
         }
+        index += 1;
     }
     push_trimmed(&mut sentences, &mut current);
     sentences
+}
+
+fn is_sentence_terminator(ch: char) -> bool {
+    matches!(ch, '.' | '!' | '?' | '…' | '。' | '！' | '？')
+}
+
+/// CJK terminators carry no whitespace convention, so they always end a
+/// sentence; Latin-script terminators keep the historical whitespace rule and
+/// additionally suppress breaks inside abbreviations and initials.
+fn terminator_ends_sentence(chars: &[char], index: usize, current: &str) -> bool {
+    match chars[index] {
+        '。' | '！' | '？' => true,
+        '…' => true,
+        _ => following_is_break(chars, index) && !is_abbreviation_boundary(current),
+    }
+}
+
+fn following_is_break(chars: &[char], index: usize) -> bool {
+    chars
+        .get(index + 1)
+        .map(|next| next.is_whitespace())
+        .unwrap_or(true)
+}
+
+fn is_closing_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '"' | '\'' | '”' | '’' | ')' | ']' | '」' | '』' | '）' | '】' | '》'
+    )
+}
+
+const SENTENCE_ABBREVIATIONS: &[&str] = &[
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "mt", "vs", "etc", "eg", "ie", "cf", "al",
+    "fig", "no", "vol", "pp", "ed", "approx", "dept", "est", "inc", "ltd", "capt", "sgt", "lt",
+];
+
+/// True when `current` ends in a form whose final dot is part of the word:
+/// "Mr.", "e.g.", "i.e.", "Inc." — or a person initial such as "J.".
+/// Everything is compared on the trailing alphanumerics before the dot, so
+/// entity-escaped or full-width look-alikes are untouched.
+fn is_abbreviation_boundary(current: &str) -> bool {
+    let Some(dot_position) = current
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| *ch == '.')
+        .map(|(i, _)| i)
+    else {
+        return false;
+    };
+    if dot_position == 0 {
+        return false;
+    }
+    let token: String = current[..dot_position]
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_alphanumeric())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if token.is_empty() {
+        return false;
+    }
+    // A lone letter before the dot reads as an initial ("J. R. R. Tolkien");
+    // lower-case single letters after dots are still rare enough in prose
+    // that keeping them unbroken is harmless.
+    if token.chars().count() == 1 {
+        return true;
+    }
+    SENTENCE_ABBREVIATIONS.contains(&token.as_str())
 }
 
 fn push_trimmed(sentences: &mut Vec<String>, current: &mut String) {
@@ -649,12 +814,34 @@ fn push_trimmed(sentences: &mut Vec<String>, current: &mut String) {
 
 /// Split a unit longer than `max_chars`, preferring word boundaries and
 /// falling back to character boundaries for a single oversize word.
+///
+/// Unspaced scripts (Han, Kana, Hangul — anything failing
+/// [`is_space_delimited`]) have no words to fall back on, so plain
+/// whitespace splitting degenerates to counting characters mid-word. For
+/// those units the splitter first cuts on CJK clause punctuation (、 ， ； ：),
+/// which yields natural narratable clauses; only a clause still longer than
+/// the limit ends up hard-split on a character boundary, which remains
+/// Unicode-scalar safe.
 fn split_long_unit(unit: &str, max_chars: usize) -> Vec<String> {
     let mut pieces: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut current_len = 0usize;
 
-    for word in unit.split_whitespace() {
+    // Unspaced units are rejoined without separators so the chunks
+    // reproduce the source bytes exactly; whitespace-delimited ones keep the
+    // historical single-space joins.
+    let (words, separator) = if is_space_delimited(unit) {
+        (
+            unit.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            Some(' '),
+        )
+    } else {
+        (split_unspaced_clauses(unit), None)
+    };
+
+    for word in &words {
         let word_len = word.chars().count();
         if word_len > max_chars {
             if current_len > 0 {
@@ -664,13 +851,15 @@ fn split_long_unit(unit: &str, max_chars: usize) -> Vec<String> {
             pieces.extend(split_by_chars(word, max_chars));
             continue;
         }
-        let separator = usize::from(current_len > 0);
-        if current_len + separator + word_len > max_chars {
+        let separator_len = usize::from(separator.is_some() && current_len > 0);
+        if current_len + separator_len + word_len > max_chars {
             pieces.push(std::mem::take(&mut current));
             current_len = 0;
         }
-        if current_len > 0 {
-            current.push(' ');
+        if current_len > 0
+            && let Some(sep) = separator
+        {
+            current.push(sep);
             current_len += 1;
         }
         current.push_str(word);
@@ -681,6 +870,28 @@ fn split_long_unit(unit: &str, max_chars: usize) -> Vec<String> {
         pieces.push(current);
     }
     pieces
+}
+
+/// Cut unspaced prose into clause-sized units at ideographic commas,
+/// semicolons, and colons (plus the ASCII comma for mixed inserts). The
+/// punctuation stays attached to its clause so re-joining with spaces
+/// preserves every character exactly. A piece still longer than the chunk
+/// limit falls through to the hard character-boundary split upstream.
+fn split_unspaced_clauses(unit: &str) -> Vec<String> {
+    const CLAUSE_BREAKS: &[char] = &['、', '，', '；', '：', ','];
+    let mut clauses = Vec::new();
+    let mut current = String::new();
+    for ch in unit.chars() {
+        current.push(ch);
+        if CLAUSE_BREAKS.contains(&ch) && !current.trim().is_empty() {
+            clauses.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.trim().is_empty() {
+        clauses.push(current);
+    }
+    clauses.retain(|clause| !clause.is_empty());
+    clauses
 }
 
 fn split_by_chars(word: &str, max_chars: usize) -> Vec<String> {
@@ -704,6 +915,28 @@ fn split_by_chars(word: &str, max_chars: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chapter_text(chapter: &Chapter) -> String {
+        chapter
+            .blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
+        chunk_blocks(
+            &[NarrationBlock {
+                kind: NarrationBlockKind::Paragraph,
+                text: text.to_string(),
+            }],
+            max_chars,
+        )
+        .into_iter()
+        .map(|chunk| chunk.text)
+        .collect()
+    }
 
     #[test]
     fn collapses_internal_whitespace() {
@@ -757,6 +990,165 @@ mod tests {
     #[test]
     fn empty_text_yields_no_chunks() {
         assert!(chunk_text("   \n  ", 100).is_empty());
+    }
+
+    #[test]
+    fn abbreviations_and_initials_do_not_terminate_sentences() {
+        assert_eq!(
+            split_sentences("Mr. Smith met Dr. Who at 3 p. m. Today was fine."),
+            vec!["Mr. Smith met Dr. Who at 3 p. m. Today was fine."]
+        );
+        assert_eq!(
+            split_sentences("Compare e.g. apples vs. pears, i.e. fruit."),
+            vec!["Compare e.g. apples vs. pears, i.e. fruit."]
+        );
+        assert_eq!(
+            split_sentences("It was J. R. R. Tolkien himself. He wrote on."),
+            vec!["It was J. R. R. Tolkien himself.", "He wrote on."]
+        );
+    }
+
+    #[test]
+    fn cjk_terminators_break_without_whitespace() {
+        assert_eq!(
+            split_sentences("矛盾是普遍的。矛盾又是特殊的！这是为何？"),
+            vec!["矛盾是普遍的。", "矛盾又是特殊的！", "这是为何？"]
+        );
+        // Ellipsis runs stay attached to their sentence instead of leaking
+        // an orphaned "…" into the next chunk.
+        assert_eq!(
+            split_sentences("他犹豫了……然后开口。"),
+            vec!["他犹豫了……", "然后开口。"]
+        );
+        // Closing punctuation after a CJK terminator stays attached; a lone
+        // right quote never becomes its own chunk.
+        assert_eq!(
+            split_sentences("他说。”然后他沉默了。"),
+            vec!["他说。”", "然后他沉默了。"]
+        );
+    }
+
+    #[test]
+    fn unspaced_prose_splits_on_clause_punctuation_not_mid_word() {
+        let unit = "矛盾的普遍性和特殊性，是矛盾问题的精髓，一切皆然；这是定论：无人可以反驳";
+        let pieces = split_long_unit(unit, 12);
+        for piece in &pieces {
+            assert!(piece.chars().count() <= 12, "piece too long: {piece:?}");
+        }
+        // Character-exact round trip: no injected separators, nothing lost.
+        let rejoined: String = if pieces.len() > 1 {
+            pieces.join("")
+        } else {
+            pieces.concat()
+        };
+        assert_eq!(rejoined.replace(' ', ""), unit);
+        assert_eq!(rejoined.chars().filter(|ch| *ch == '，').count(), 2);
+        // Every break lands right after clause punctuation, never mid-word.
+        for window in pieces.windows(2) {
+            let boundary = window[0].chars().last().unwrap();
+            assert!(
+                "，；：、".contains(boundary) || window[0].ends_with('。'),
+                "bad boundary before {:?}",
+                window[1]
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_nav_document_is_excluded_from_narration() {
+        use bookforge_core::ir::{
+            Block, BlockId, BookFormat, BookId, DomPath, Metadata, Section, SectionId, TextRun,
+        };
+
+        let make_section = |id: &str,
+                            spine_index: usize,
+                            href: &str,
+                            entries: Vec<String>,
+                            blocks: &mut Vec<Block>| {
+            let section_id = SectionId(id.to_string());
+            let block_ids = entries
+                .into_iter()
+                .enumerate()
+                .map(|(part, text)| {
+                    let block_id = BlockId(format!("{id}-{part}"));
+                    blocks.push(Block {
+                        id: block_id.clone(),
+                        section_id: section_id.clone(),
+                        kind: BlockKind::Paragraph,
+                        dom_path: DomPath(vec![part]),
+                        text_runs: vec![TextRun {
+                            id: format!("{id}-r{part}"),
+                            text,
+                        }],
+                        inline_marks: Vec::new(),
+                        protected_spans: Vec::new(),
+                        token_estimate: 1,
+                    });
+                    block_id
+                })
+                .collect();
+            Section {
+                id: section_id,
+                href: href.to_string(),
+                spine_index,
+                title: None,
+                heading_level: None,
+                block_ids,
+                prev: None,
+                next: None,
+            }
+        };
+        let mut blocks = Vec::new();
+        let toc_entries = (1..=10)
+            .map(|page| format!("Capitolo {page} / La storia Pag. {}", page * 9))
+            .collect();
+        let prose = (0..10)
+            .map(|paragraph| {
+                format!("Il capitolo numero {paragraph} narra una vicenda completa di lunga prosa")
+            })
+            .collect();
+        let book = Book {
+            source_path: None,
+            id: BookId("nav-less".to_string()),
+            format: BookFormat::Epub,
+            metadata: Metadata {
+                title: Some("No Nav Property".to_string()),
+                ..Metadata::default()
+            },
+            manifest: Vec::new(),
+            spine: Vec::new(),
+            // Neither section carries the EPUB3 `nav` property in its
+            // manifest entry: one is caught by the structural-entry
+            // heuristic, the other by the ToC-shaped file name.
+            sections: vec![
+                make_section(
+                    "toc-by-name",
+                    0,
+                    "Text/nav-2.xhtml",
+                    toc_entries,
+                    &mut blocks,
+                ),
+                make_section(
+                    "toc-by-shape",
+                    1,
+                    "Text/indice-alternativo.xhtml",
+                    (0..8).map(|n| format!("Chapter {n} · part {n}")).collect(),
+                    &mut blocks,
+                ),
+                make_section(
+                    "real-chapter",
+                    2,
+                    "Text/chapter-1.xhtml",
+                    prose,
+                    &mut blocks,
+                ),
+            ],
+            blocks,
+        };
+
+        let chapters = chapters_from_book_with_options(&book, false);
+        assert_eq!(chapters.len(), 1);
+        assert!(chapter_text(&chapters[0]).starts_with("Il capitolo numero"));
     }
 
     #[test]
@@ -855,7 +1247,7 @@ mod tests {
             blocks,
         };
 
-        let chapters = chapters_from_book(&book);
+        let chapters = chapters_from_book_with_options(&book, false);
         assert_eq!(chapters.len(), 3);
         assert_eq!(chapters[0].title, "Test Book");
         assert_eq!(chapters[1].title, "CAPITOLO I:");
@@ -866,12 +1258,12 @@ mod tests {
         assert!(
             chapters
                 .iter()
-                .all(|chapter| !chapter.text().contains("Repeated Book Title"))
+                .all(|chapter| !chapter_text(chapter).contains("Repeated Book Title"))
         );
         assert!(
             chapters
                 .iter()
-                .all(|chapter| chapter.text().lines().all(|line| {
+                .all(|chapter| chapter_text(chapter).lines().all(|line| {
                     let line = line.trim();
                     line.is_empty() || !line.chars().all(|ch| ch.is_ascii_digit())
                 }))
@@ -926,7 +1318,7 @@ mod tests {
             ],
         };
 
-        let chapters = chapters_from_book(&book);
+        let chapters = chapters_from_book_with_options(&book, false);
         assert_eq!(chapters[0].blocks[0].kind, NarrationBlockKind::Title);
         assert_eq!(chapters[0].blocks[2].kind, NarrationBlockKind::Heading(2));
         assert_eq!(

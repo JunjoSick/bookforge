@@ -47,7 +47,6 @@ pub struct Resource {
 pub struct SpineItem {
     pub idref: String,
     pub href: Option<String>,
-    pub linear: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,7 +150,8 @@ impl ProtectedSpanKind {
 }
 
 /// Severity shared by deterministic validation and durable QA findings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum QaFindingSeverity {
     Error,
     Warning,

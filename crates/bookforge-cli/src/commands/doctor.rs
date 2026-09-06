@@ -6,7 +6,9 @@ use bookforge_llm::{
     RequestMetadata, ResponseFormat,
 };
 use bookforge_pdf::{HttpOcrClient, OcrConfig, PopplerTools};
-use bookforge_store::run_doctor;
+use bookforge_store::{JobStore, run_doctor};
+
+use crate::sanitize::{sanitize_terminal, sanitize_truncated};
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
@@ -41,48 +43,77 @@ pub struct DoctorArgs {
     /// Request timeout in seconds
     #[arg(long, default_value_t = 30)]
     pub timeout_seconds: u64,
+
+    /// Always exit 0, even when checks report failures (for scripts that
+    /// parse the output and handle exit codes themselves).
+    #[arg(long, default_value_t = false)]
+    pub no_fail: bool,
 }
 
 pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     let mut ran = false;
+    let mut failed_checks = Vec::<&'static str>::new();
 
     if args.storage {
         ran = true;
-        run_storage_doctor().await?;
+        if !run_storage_doctor().await? {
+            failed_checks.push("storage");
+        }
     }
 
     if args.pdf {
         ran = true;
-        run_pdf_doctor()?;
+        if !run_pdf_doctor()? {
+            failed_checks.push("pdf");
+        }
     }
 
     if let Some(provider) = &args.provider {
         ran = true;
-        run_provider_doctor(
+        if !run_provider_doctor(
             provider,
             args.model.as_deref(),
             args.base_url.as_deref(),
             args.api_key_env.as_deref(),
             args.timeout_seconds,
         )
-        .await?;
+        .await?
+        {
+            failed_checks.push("provider");
+        }
     }
 
     if let Some(endpoint) = &args.ocr_endpoint {
         ran = true;
-        run_ocr_doctor(
+        if !run_ocr_doctor(
             endpoint,
             args.model.as_deref(),
             args.api_key_env.as_deref(),
             args.timeout_seconds,
         )
-        .await?;
+        .await?
+        {
+            failed_checks.push("ocr");
+        }
     }
 
-    if !ran {
-        run_storage_doctor().await?;
+    if !ran && !run_storage_doctor().await? {
+        failed_checks.push("storage");
     }
 
+    // Reporting a FAILED check and then exiting 0 lies to CI (CLI-17).
+    // Explicitly pass --no-fail to keep the old always-green behavior.
+    evaluate_doctor_exit(&failed_checks, args.no_fail)
+}
+
+/// Shared exit policy so the rule is testable independently of live checks.
+fn evaluate_doctor_exit(failed_checks: &[&str], no_fail: bool) -> anyhow::Result<()> {
+    if !failed_checks.is_empty() && !no_fail {
+        anyhow::bail!(
+            "doctor check(s) failed: {}. Use --no-fail to keep the exit code green.",
+            failed_checks.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -91,7 +122,7 @@ async fn run_ocr_doctor(
     model: Option<&str>,
     api_key_env: Option<&str>,
     timeout_seconds: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let mut config = OcrConfig::new(endpoint);
     if let Some(model) = model {
         config.model = model.to_string();
@@ -107,6 +138,14 @@ async fn run_ocr_doctor(
     println!("  Base URL: {display_endpoint}");
     println!("  Model: {display_model}");
 
+    // Reject remote plain-HTTP endpoints before any request or key use;
+    // HTTPS and HTTP loopback remain allowed.
+    if let Err(error) = config.validate_base_url() {
+        println!("  Reachable: no");
+        println!("  Error: {}", sanitize_terminal(&error.to_string()));
+        return Ok(false);
+    }
+
     let result = tokio::task::spawn_blocking(move || {
         HttpOcrClient::new(config).and_then(|client| client.health_check())
     })
@@ -119,21 +158,28 @@ async fn run_ocr_doctor(
             if models.is_empty() {
                 println!("  Models: (none reported)");
             } else {
+                // Model ids come from the remote endpoint; strip control
+                // characters before the terminal sees them (UI-5).
+                let models = models
+                    .iter()
+                    .map(|model| sanitize_terminal(model))
+                    .collect::<Vec<_>>();
                 println!("  Models: {}", models.join(", "));
             }
+            Ok(true)
         }
         Err(error) => {
             println!("  Reachable: no");
-            println!("  Error: {error}");
+            println!("  Error: {}", sanitize_terminal(&error.to_string()));
             println!(
                 "  Hint: OCR_API_KEY is only needed for non-loopback endpoints (or set --api-key-env to another variable)."
             );
+            Ok(false)
         }
     }
-    Ok(())
 }
 
-fn run_pdf_doctor() -> anyhow::Result<()> {
+fn run_pdf_doctor() -> anyhow::Result<bool> {
     println!("PDF conversion tooling:");
     match PopplerTools::discover() {
         Ok(tools) => {
@@ -156,6 +202,7 @@ fn run_pdf_doctor() -> anyhow::Result<()> {
             if let Some(version) = tools.version() {
                 println!("  version: {version}");
             }
+            Ok(true)
         }
         Err(err) => {
             println!("  MISSING: {err}");
@@ -163,13 +210,14 @@ fn run_pdf_doctor() -> anyhow::Result<()> {
             println!(
                 "  Install poppler and add at least pdftohtml and pdftotext to PATH. pdfimages and pdftoppm are recommended for figure preservation."
             );
+            Ok(false)
         }
     }
-    Ok(())
 }
 
-async fn run_storage_doctor() -> anyhow::Result<()> {
+async fn run_storage_doctor() -> anyhow::Result<bool> {
     let doctor = run_doctor(None)?;
+    let mut healthy = true;
 
     println!("SQLite storage:");
     if doctor.database_exists {
@@ -195,6 +243,7 @@ async fn run_storage_doctor() -> anyhow::Result<()> {
         println!("  integrity_check: {}", doctor.integrity_check);
         if !doctor.wal_sidecars_normal {
             println!("  WARNING: WAL sidecars are not normal");
+            healthy = false;
         }
         if !doctor.note.is_empty() {
             println!();
@@ -206,13 +255,38 @@ async fn run_storage_doctor() -> anyhow::Result<()> {
             println!(
                 "  WARNING: integrity check failed — consider running PRAGMA integrity_check manually"
             );
+            healthy = false;
+        }
+
+        // Canonical open point for the diagnostics queue: legacy warn-on-open
+        // conditions (unknown statuses, skipped hardening) would otherwise be
+        // unreachable in any shipped surface. Listing is verbose here; the
+        // take clears the queue so repeat runs only show new entries.
+        match JobStore::open_default() {
+            Ok(store) => {
+                let diagnostics = store.take_diagnostics();
+                if !diagnostics.is_empty() {
+                    println!();
+                    println!("Storage diagnostics (open/migration warnings):");
+                    for diagnostic in &diagnostics {
+                        println!("  {diagnostic}");
+                        tracing::warn!(surface = "doctor", "{diagnostic}");
+                    }
+                }
+            }
+            Err(error) => {
+                println!();
+                println!(
+                    "  WARNING: could not open jobs database to collect storage diagnostics: {error}"
+                );
+            }
         }
     } else {
         println!("  database: {} (not found)", doctor.database_path.display());
         println!("  No storage issues to report.");
     }
 
-    Ok(())
+    Ok(healthy)
 }
 
 async fn run_provider_doctor(
@@ -221,7 +295,7 @@ async fn run_provider_doctor(
     base_url: Option<&str>,
     api_key_env: Option<&str>,
     timeout_seconds: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     use bookforge_core::RetryAfterPolicy;
 
     println!("Provider doctor: {provider}");
@@ -232,36 +306,35 @@ async fn run_provider_doctor(
             .await;
     }
 
-    // 1. Determine config
-    let (default_url, default_key_env, default_model) = match provider {
-        "deepseek" => (
-            "https://api.deepseek.com/v1",
-            "DEEPSEEK_API_KEY",
-            "deepseek-v4-flash",
-        ),
-        "openrouter" => (
-            "https://openrouter.ai/api/v1",
-            "OPENROUTER_API_KEY",
-            "openrouter/auto",
-        ),
-        "openai-compatible" if base_url.is_some() => (
-            base_url.expect("checked above"),
-            api_key_env.unwrap_or("OPENAI_API_KEY"),
-            model.unwrap_or("local-model"),
-        ),
+    // 1. Determine config (registry-backed; exact-match ids mirror the
+    //    literal tables this replaces)
+    let defaults = match provider {
+        "deepseek" | "openrouter" | "openai-compatible" => {
+            bookforge_core::providers::provider_defaults(provider)
+                .expect("allow-list above matches registry entries")
+        }
         _ => {
             anyhow::bail!(
                 "Provider '{provider}' is not supported for doctor checks. Use deepseek, openrouter, local-ollama, local-llamacpp, or openai-compatible with --base-url."
             );
         }
     };
+    if provider == "openai-compatible" && base_url.is_none() {
+        anyhow::bail!(
+            "Provider '{provider}' is not supported for doctor checks. Use deepseek, openrouter, local-ollama, local-llamacpp, or openai-compatible with --base-url."
+        );
+    }
 
     let provider_name = provider;
     let _ = provider_name; // used below in recommended preset
 
-    let effective_url = base_url.unwrap_or(default_url);
-    let effective_key_env = api_key_env.unwrap_or(default_key_env);
-    let effective_model = model.unwrap_or(default_model);
+    let effective_url = base_url.unwrap_or_else(|| defaults.base_url.unwrap_or_default());
+    let effective_key_env = api_key_env.unwrap_or(defaults.api_key_env);
+    let effective_model = model.unwrap_or_else(|| {
+        defaults
+            .default_model
+            .unwrap_or(bookforge_core::providers::LOCAL_MODEL_PLACEHOLDER)
+    });
 
     println!("  Base URL: {effective_url}");
     println!("  Model: {effective_model}");
@@ -279,7 +352,7 @@ async fn run_provider_doctor(
             println!(
                 "  Set the environment variable {effective_key_env} before using this provider."
             );
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -304,7 +377,7 @@ async fn run_provider_doctor(
         Ok(p) => p,
         Err(e) => {
             println!("  Provider init: FAILED ({e})");
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -325,6 +398,7 @@ async fn run_provider_doctor(
     let latency_ms = started.elapsed().as_millis() as u64;
     println!("  Latency: {latency_ms}ms");
 
+    let mut healthy = true;
     match result {
         Ok(response) => {
             println!("  Finish reason: {:?}", response.finish_reason);
@@ -333,10 +407,13 @@ async fn run_provider_doctor(
                 response.input_tokens.unwrap_or(0),
                 response.output_tokens.unwrap_or(0),
             );
-            println!("  Content preview: {}", {
-                let truncated: String = response.content.chars().take(200).collect();
-                truncated
-            });
+            // The response body is fully provider-controlled: sanitize AND
+            // bound the preview so a crafted EPUB/provider cannot inject
+            // escape sequences into the terminal (UI-5).
+            println!(
+                "  Content preview: {}",
+                sanitize_truncated(&response.content, 200)
+            );
 
             // JSON response_format support
             if response.content.trim().starts_with('{') || response.content.trim().starts_with('[')
@@ -361,7 +438,8 @@ async fn run_provider_doctor(
         }
         Err(e) => {
             println!("  Completion: FAILED");
-            println!("  Error: {e}");
+            println!("  Error: {}", sanitize_terminal(&e.to_string()));
+            healthy = false;
         }
     }
 
@@ -370,7 +448,7 @@ async fn run_provider_doctor(
         "  Recommended preset: --profile v1-fast --provider {provider_name} --model {effective_model}"
     );
 
-    Ok(())
+    Ok(healthy)
 }
 
 async fn run_local_provider_doctor(
@@ -379,19 +457,21 @@ async fn run_local_provider_doctor(
     base_url: Option<&str>,
     api_key_env: Option<&str>,
     timeout_seconds: u64,
-) -> anyhow::Result<()> {
-    let (default_url, default_key_env, default_model) = match provider {
-        "local-ollama" => ("http://localhost:11434/v1", "OLLAMA_API_KEY", "qwen2.5:14b"),
-        "local-llamacpp" => (
-            "http://localhost:8080/v1",
-            "LLAMACPP_API_KEY",
-            "local-model",
-        ),
+) -> anyhow::Result<bool> {
+    let defaults = match provider {
+        "local-ollama" | "local-llamacpp" => bookforge_core::providers::provider_defaults(provider)
+            .expect("caller filters local providers"),
         _ => unreachable!("caller filters local providers"),
     };
-    let effective_url = base_url.unwrap_or(default_url).trim_end_matches('/');
-    let effective_key_env = api_key_env.unwrap_or(default_key_env);
-    let effective_model = model.unwrap_or(default_model);
+    let effective_url = base_url
+        .unwrap_or_else(|| defaults.base_url.unwrap_or_default())
+        .trim_end_matches('/');
+    let effective_key_env = api_key_env.unwrap_or(defaults.api_key_env);
+    let effective_model = model.unwrap_or_else(|| {
+        defaults
+            .default_model
+            .unwrap_or(bookforge_core::providers::LOCAL_MODEL_PLACEHOLDER)
+    });
     let models_url = format!("{effective_url}/models");
 
     println!("  Base URL: {effective_url}");
@@ -412,19 +492,23 @@ async fn run_local_provider_doctor(
     }
 
     let started = std::time::Instant::now();
-    let response = request
-        .send()
-        .await
-        .map_err(|error| anyhow::anyhow!("local models endpoint is unavailable: {error}"))?;
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            println!("  Models endpoint: UNREACHABLE ({error})");
+            return Ok(false);
+        }
+    };
     let status = response.status();
     let body = response.text().await?;
     println!("  Latency: {}ms", started.elapsed().as_millis());
     if !status.is_success() {
-        anyhow::bail!(
-            "local models endpoint returned HTTP {}: {}",
+        println!(
+            "  Models endpoint returned HTTP {}: {}",
             status.as_u16(),
-            body.chars().take(300).collect::<String>()
+            sanitize_truncated(&body, 300)
         );
+        return Ok(false);
     }
 
     let parsed: Value = serde_json::from_str(&body)
@@ -439,17 +523,44 @@ async fn run_local_provider_doctor(
 
     println!("  Loaded models: {}", models.len());
     if !models.contains(&effective_model) {
-        anyhow::bail!(
-            "model '{effective_model}' is not loaded; available models: {}",
-            if models.is_empty() {
-                "(none)".to_string()
-            } else {
-                models.join(", ")
-            }
+        // Remote-supplied ids: sanitize before printing (UI-5).
+        let available = if models.is_empty() {
+            "(none)".to_string()
+        } else {
+            models
+                .iter()
+                .map(|model| sanitize_terminal(model))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!(
+            "  Model loaded: no — model '{effective_model}' is not available; available models: {available}"
         );
+        return Ok(false);
     }
     println!("  Model loaded: yes");
     println!();
     println!("  Recommended preset: --provider-preset {provider} --model {effective_model}");
-    Ok(())
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doctor_exit_policy_fails_loudly_unless_no_fail_is_set() {
+        assert!(evaluate_doctor_exit(&[], false).is_ok());
+        assert!(evaluate_doctor_exit(&[], true).is_ok());
+
+        let error = evaluate_doctor_exit(&["storage", "provider"], false)
+            .expect_err("failed checks must flip the exit code");
+        let message = error.to_string();
+        assert!(message.contains("storage"));
+        assert!(message.contains("provider"));
+        assert!(message.contains("--no-fail"));
+
+        // Legacy scripts that explicitly pass --no-fail keep the green exit.
+        assert!(evaluate_doctor_exit(&["pdf"], true).is_ok());
+    }
 }

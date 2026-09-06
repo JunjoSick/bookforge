@@ -1,5 +1,8 @@
 # Handoff to Codex — on-the-fly settings reconfiguration + truncation fail-alert (2026-07-06)
 
+> **Historical snapshot:** these features shipped in v2.4.0 (2026-07-13).
+> Content preserved as written; behavior details may have evolved since.
+
 Two related tasks, both surfaced by a real run (Italian → Toki Pona) that hit
 repeated output truncation and could not be re-tuned without abandoning
 progress. **The authoritative specs are `docs/ROADMAP.md` §10.1.3 and §10.1.4 —

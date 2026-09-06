@@ -743,6 +743,5 @@ deepseek-v4-pro, and roughly $1.72 on Kimi K3 before cache hits. The entire
 two-day measurement effort cost under $3. A full QA pass over one book with
 Kimi K3 is about $0.35.
 
-Add new models to `pricing/providers.json` **and** the packaged copy at
-`crates/bookforge-cli/pricing/providers.json` — a test asserts they are
-identical.
+Add new models to `crates/bookforge-core/pricing/providers.json` — the single
+bundled catalog; a guard test rejects re-introduced duplicate copies.
