@@ -1,3 +1,4 @@
+use crate::util::is_block_level_name;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
@@ -87,7 +88,7 @@ pub fn rebuild_epub_with_options(
             return Err(error);
         }
     };
-    if let Err(error) = commit_staged_output_wrapper(&staged, output) {
+    if let Err(error) = commit_staged_output("rebuilt", &staged, output) {
         let _ = fs::remove_file(&staged);
         return Err(error);
     }
@@ -280,10 +281,6 @@ fn write_rebuilt_epub(
     writer.finish()?;
 
     Ok(total_skipped)
-}
-
-fn commit_staged_output_wrapper(staged: &Path, output: &Path) -> Result<()> {
-    commit_staged_output("rebuilt", staged, output)
 }
 
 /// Bounded decompression of one entry to bytes (UTF-8 not required:
@@ -1692,41 +1689,6 @@ fn last_event_ends_with_whitespace(events: &[RenderedEvent]) -> bool {
 fn text_ends_with_whitespace(text: &BytesText<'_>) -> bool {
     text.html_content()
         .is_ok_and(|value| value.chars().next_back().is_some_and(char::is_whitespace))
-}
-
-fn is_block_level_name(name: &[u8]) -> bool {
-    matches!(
-        name,
-        b"p" | b"div"
-            | b"blockquote"
-            | b"li"
-            | b"ul"
-            | b"ol"
-            | b"dl"
-            | b"dt"
-            | b"dd"
-            | b"table"
-            | b"thead"
-            | b"tbody"
-            | b"tfoot"
-            | b"tr"
-            | b"td"
-            | b"th"
-            | b"caption"
-            | b"h1"
-            | b"h2"
-            | b"h3"
-            | b"h4"
-            | b"h5"
-            | b"h6"
-            | b"section"
-            | b"article"
-            | b"aside"
-            | b"figure"
-            | b"figcaption"
-            | b"pre"
-            | b"hr"
-    )
 }
 
 fn write_translation_element(

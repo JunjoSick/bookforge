@@ -50,12 +50,16 @@ usually won't move.
 Before submitting:
 
 ```bash
-cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --workspace --locked
+bash scripts/qa-doctor.sh
+npm ci --prefix qa/browser
+(cd qa/browser && npx --no-install playwright install chromium)
+bash scripts/verify.sh full
 ```
 
-All three should pass cleanly. CI runs the same set.
+Use `bash scripts/verify.sh quick` while iterating. The full command and Linux
+CI share the same checks, including examples, the CLI without default features,
+and an authenticated Chromium smoke test. See [QA workflow](docs/qa-workflow.md)
+for isolated worktrees, debug access, artifacts, and real-book quality checks.
 
 On Windows, use the MSVC Rust host (`stable-x86_64-pc-windows-msvc`) and
 install the Visual Studio Build Tools C++ workload. The GNU host requires a

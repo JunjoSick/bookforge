@@ -1,3 +1,4 @@
+use super::glossary::parse_glossary_scope;
 use super::*;
 
 use bookforge_store::{NewStyleSheet, StoredStyleSheet};
@@ -36,10 +37,6 @@ pub(super) fn routes() -> Router<AppState> {
 // API accepts neither.
 // ---------------------------------------------------------------------------
 
-fn parse_style_scope(value: &str) -> GlossaryScopeKind {
-    super::glossary::parse_glossary_scope(value)
-}
-
 fn style_record_json(record: &StoredStyleSheet) -> serde_json::Value {
     json!({
         "id": record.id,
@@ -58,7 +55,7 @@ fn resolved_style_scope(
     scope_id: Option<&str>,
 ) -> std::result::Result<(GlossaryScopeKind, Option<String>), String> {
     let scope_kind = scope
-        .map(parse_style_scope)
+        .map(parse_glossary_scope)
         .unwrap_or(GlossaryScopeKind::Global);
     let scope_id = if scope_kind == GlossaryScopeKind::Global {
         None
@@ -153,7 +150,7 @@ async fn list_style_sheets_route(
                 .get("scope")
                 .map(String::as_str)
                 .filter(|value| !value.is_empty())
-                .map(parse_style_scope),
+                .map(parse_glossary_scope),
             params
                 .get("scope_id")
                 .map(String::as_str)

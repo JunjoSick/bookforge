@@ -1,4 +1,5 @@
 use super::*;
+use crate::progress::finalize_reporter;
 
 pub async fn run(
     args: TranslateArgs,
@@ -124,21 +125,6 @@ pub(super) fn human_stdout_enabled(ui: crate::progress::UiMode) -> bool {
     // so suppress plain stdout/stderr prints that would corrupt them
     // (UI-22; single source of truth in `UiMode` so `json-v1` cannot drift).
     ui.human_stdout()
-}
-
-async fn finalize_reporter<T>(
-    result: Result<T, anyhow::Error>,
-    reporter: crate::progress::ProgressReporter,
-) -> Result<T> {
-    let reporter_result = reporter.shutdown().await;
-    match (result, reporter_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(e)) => Err(e),
-        (Err(e), Ok(())) => Err(e),
-        (Err(main_err), Err(progress_err)) => Err(anyhow::anyhow!(
-            "{main_err}; additionally progress reporter failed: {progress_err}"
-        )),
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

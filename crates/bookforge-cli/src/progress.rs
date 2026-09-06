@@ -309,7 +309,7 @@ async fn drive_attached_tui(
             }
             _ = tick.tick() => {
                 if let Some(count) =
-                    take_newly_dropped_for_tui(dropped, &mut reported_drops)
+                    take_newly_dropped(dropped, &mut reported_drops)
                 {
                     let event = ProgressEvent::DroppedEvents {
                         count,
@@ -336,13 +336,6 @@ async fn drive_attached_tui(
         }
     }
     Ok(())
-}
-
-/// TUI-side alias of [`take_newly_dropped`] so both render paths share the
-/// same honest drop accounting (UI-10).
-#[cfg(feature = "tui")]
-fn take_newly_dropped_for_tui(dropped: &AtomicUsize, reported: &mut usize) -> Option<usize> {
-    take_newly_dropped(dropped, reported)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -769,8 +762,55 @@ fn is_important_event(event: &ProgressEvent) -> bool {
     }
 }
 
+pub(crate) async fn finalize_reporter<T>(
+    result: Result<T, anyhow::Error>,
+    reporter: crate::progress::ProgressReporter,
+) -> Result<T> {
+    let reporter_result = reporter.shutdown().await;
+    match (result, reporter_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(e)) => Err(e),
+        (Err(e), Ok(())) => Err(e),
+        (Err(main_err), Err(progress_err)) => Err(anyhow::anyhow!(
+            "{main_err}; additionally progress reporter failed: {progress_err}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn finalization_preserves_values_and_both_errors() {
+        for main_fails in [false, true] {
+            for reporter_fails in [false, true] {
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                let reporter = super::ProgressReporter {
+                    tx,
+                    join: tokio::spawn(async move {
+                        if reporter_fails {
+                            anyhow::bail!("report failure");
+                        }
+                        Ok(())
+                    }),
+                    dropped: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                };
+                let result = if main_fails {
+                    Err(anyhow::anyhow!("main failure"))
+                } else {
+                    Ok(42)
+                };
+                let result = super::finalize_reporter(result, reporter).await;
+                if !main_fails && !reporter_fails {
+                    assert_eq!(result.unwrap(), 42);
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert_eq!(error.contains("main failure"), main_fails);
+                    assert_eq!(error.contains("report failure"), reporter_fails);
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

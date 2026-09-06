@@ -1,3 +1,5 @@
+use bookforge_core::math::is_inline_math_operator;
+use bookforge_core::math::is_strong_inline_math_operator;
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -1554,16 +1556,8 @@ fn is_math_operator_token(value: &str) -> bool {
     )
 }
 
-fn is_inline_math_operator(ch: char) -> bool {
-    bookforge_core::math::is_inline_math_operator(ch)
-}
-
 fn is_math_token_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || is_inline_math_operator(ch) || matches!(ch, '.' | ',')
-}
-
-fn is_strong_inline_math_operator(ch: char) -> bool {
-    bookforge_core::math::is_strong_inline_math_operator(ch)
 }
 
 fn trim_token(raw: &str) -> &str {

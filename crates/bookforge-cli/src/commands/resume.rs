@@ -1,3 +1,5 @@
+use super::resolve_job_input;
+use crate::progress::finalize_reporter;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -183,7 +185,7 @@ pub async fn run(
     let mut snapshot = load_resume_snapshot(&store, &args.job_id)?;
     let overrides = load_resume_overrides_for_status(&args.job_id, &job.status)?;
     validate_resume_snapshot(&args.job_id, &snapshot)?;
-    let _validated_input = resolve_resume_input(&job, &snapshot)?;
+    let _validated_input = resolve_job_input(&job, &snapshot)?;
     let _validated_output = resume_output_path(&args, &snapshot)?;
     // Flag validation is cheap and IO-free; run it up front so a bad flag
     // combination (e.g. --fallback-provider without --fallback-model) never
@@ -410,21 +412,6 @@ fn acquire_or_adopt_launch_claim(job_id: &str) -> Result<crate::control::Runtime
     Ok(claim)
 }
 
-async fn finalize_reporter<T>(
-    result: Result<T, anyhow::Error>,
-    reporter: crate::progress::ProgressReporter,
-) -> Result<T> {
-    let reporter_result = reporter.shutdown().await;
-    match (result, reporter_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(e)) => Err(e),
-        (Err(e), Ok(())) => Err(e),
-        (Err(main_err), Err(progress_err)) => Err(anyhow::anyhow!(
-            "{main_err}; additionally progress reporter failed: {progress_err}"
-        )),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_inner(
     args: &ResumeArgs,
@@ -441,7 +428,7 @@ async fn run_inner(
         stage: "resume".to_string(),
         timestamp_ms: now_ms(),
     });
-    let input = resolve_resume_input(&job, snapshot)?;
+    let input = resolve_job_input(&job, snapshot)?;
     let output = args
         .output
         .clone()
@@ -993,44 +980,6 @@ fn human_stdout_enabled(ui: Option<crate::progress::UiMode>) -> bool {
     // Single source of truth in `UiMode` so `json-v1` cannot drift from the
     // UI-22 machine-stdout contract.
     ui.is_none_or(|mode| mode.human_stdout())
-}
-
-fn resolve_resume_input(job: &JobRecord, snapshot: &RunConfigSnapshot) -> Result<PathBuf> {
-    if let Some(path) = snapshot
-        .input_snapshot_path
-        .as_ref()
-        .or(job.input_snapshot_path.as_ref())
-        && path.exists()
-    {
-        return Ok(path.clone());
-    }
-
-    if snapshot.input_snapshot_path.is_none() && job.input_snapshot_path.is_none() {
-        tracing::warn!(
-            "job '{}' predates input EPUB snapshots; falling back to original input path",
-            job.id
-        );
-        if snapshot.input_path.exists() {
-            return Ok(snapshot.input_path.clone());
-        }
-        anyhow::bail!(
-            "job '{}' does not have an input snapshot and the original input path no longer exists: {}",
-            job.id,
-            snapshot.input_path.display()
-        );
-    }
-
-    let snapshot_path = snapshot
-        .input_snapshot_path
-        .as_ref()
-        .or(job.input_snapshot_path.as_ref())
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "<missing>".to_string());
-    anyhow::bail!(
-        "job '{}' input snapshot is missing: {}",
-        job.id,
-        snapshot_path
-    )
 }
 
 fn select_pending_segments(segments: &[Segment], pending_ids: &[String]) -> Result<Vec<Segment>> {
@@ -2329,6 +2278,51 @@ mod tests {
                 .contains("segment IDs that no longer exist")
         );
         assert!(error.to_string().contains("seg_missing"));
+    }
+
+    #[test]
+    fn job_input_resolution_preserves_snapshot_precedence_and_legacy_errors() {
+        let mut fixture = resume_fixture(TranslationProfile::V1Fast.resolve(), 1);
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.epub");
+        let stored = dir.path().join("stored.epub");
+        let configured = dir.path().join("configured.epub");
+        for path in [&original, &stored, &configured] {
+            std::fs::write(path, "fixture").unwrap();
+        }
+        fixture.snapshot.input_path = original.clone();
+        assert_eq!(
+            resolve_job_input(&fixture.job, &fixture.snapshot).unwrap(),
+            original
+        );
+        fixture.job.input_snapshot_path = Some(stored.clone());
+        assert_eq!(
+            resolve_job_input(&fixture.job, &fixture.snapshot).unwrap(),
+            stored
+        );
+        fixture.snapshot.input_snapshot_path = Some(configured.clone());
+        assert_eq!(
+            resolve_job_input(&fixture.job, &fixture.snapshot).unwrap(),
+            configured
+        );
+        std::fs::remove_file(&configured).unwrap();
+        assert!(
+            resolve_job_input(&fixture.job, &fixture.snapshot)
+                .unwrap_err()
+                .to_string()
+                .contains("input snapshot is missing")
+        );
+        fixture.snapshot.input_snapshot_path = None;
+        std::fs::remove_file(&stored).unwrap();
+        assert!(resolve_job_input(&fixture.job, &fixture.snapshot).is_err());
+        fixture.job.input_snapshot_path = None;
+        std::fs::remove_file(&original).unwrap();
+        assert!(
+            resolve_job_input(&fixture.job, &fixture.snapshot)
+                .unwrap_err()
+                .to_string()
+                .contains("original input path no longer exists")
+        );
     }
 
     fn resume_fixture(settings: ResolvedRunSettings, segment_count: usize) -> ResumeFixture {

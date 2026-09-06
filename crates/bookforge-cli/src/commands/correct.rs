@@ -15,7 +15,7 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    review::resolve_review_input,
+    resolve_job_input,
     translate::{rebuild_options_from_snapshot, regenerate_report_after_correction},
 };
 
@@ -103,7 +103,7 @@ pub(crate) fn correct_job_segment(
     let snapshot = store
         .load_job_config_snapshot(job_id)?
         .ok_or_else(|| anyhow::anyhow!("job '{job_id}' has no run configuration snapshot"))?;
-    let input = resolve_review_input(&job, &snapshot)?;
+    let input = resolve_job_input(&job, &snapshot)?;
     let book = bookforge_epub::read_epub(&input)?;
     let segments = build_segments(&book, &snapshot.settings.to_settings().segmentation)?;
     let segment = segments

@@ -1,3 +1,7 @@
+use bookforge_core::numeric::{
+    canonical_decimal_number, compact_ascii_whitespace, compact_numeric_punctuation_span,
+    dangling_numeric_span, normalize_number_sign, normalize_number_signs,
+};
 use std::collections::HashMap;
 
 use bookforge_core::marker::{marker_inner_texts, marker_reference_token, strip_marker_tokens};
@@ -1192,96 +1196,6 @@ fn looks_like_bilingual_gloss(text: &str) -> bool {
     text.contains("or in english:") || text.contains("in english:")
 }
 
-fn dangling_numeric_span(value: &str) -> bool {
-    let normalized = normalize_number_signs(value);
-    let trimmed = normalized.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
-        )
-    });
-    trimmed.ends_with('-') && trimmed.chars().any(|ch| ch.is_ascii_digit())
-}
-
-fn compact_numeric_punctuation_span(value: &str) -> Option<String> {
-    let normalized = normalize_number_signs(value);
-    let trimmed = normalized.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
-        )
-    });
-    let digits = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
-    if digits < 2 {
-        return None;
-    }
-    if !trimmed.chars().all(|ch| {
-        ch.is_ascii_digit()
-            || ch.is_ascii_whitespace()
-            || matches!(
-                ch,
-                '.' | ',' | ';' | ':' | '/' | '-' | '+' | '%' | '$' | '(' | ')'
-            )
-    }) {
-        return None;
-    }
-    Some(compact_ascii_whitespace(trimmed))
-}
-
-fn compact_ascii_whitespace(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace())
-        .collect()
-}
-
-fn canonical_decimal_number(value: &str) -> Option<String> {
-    let normalized = normalize_number_signs(value);
-    let trimmed = normalized.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
-        )
-    });
-    if trimmed.is_empty() || !trimmed.chars().any(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    let percent = trimmed.ends_with('%');
-    let numeric = trimmed.strip_suffix('%').unwrap_or(trimmed);
-    if !numeric
-        .chars()
-        .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+'))
-    {
-        return None;
-    }
-    if numeric.matches('.').count() + numeric.matches(',').count() > 1 {
-        return None;
-    }
-    let separator = numeric.find('.').or_else(|| numeric.find(','));
-    let mut canonical = match separator {
-        Some(index) => {
-            let (whole, fractional_with_separator) = numeric.split_at(index);
-            let fractional = &fractional_with_separator[1..];
-            if whole.is_empty()
-                || fractional.is_empty()
-                || !whole
-                    .trim_start_matches(['-', '+'])
-                    .chars()
-                    .all(|ch| ch.is_ascii_digit())
-                || !fractional.chars().all(|ch| ch.is_ascii_digit())
-            {
-                return None;
-            }
-            format!("{whole}.{fractional}")
-        }
-        None => numeric.to_string(),
-    };
-    if percent {
-        canonical.push('%');
-    }
-    Some(canonical)
-}
-
 fn numeric_runs(text: &str) -> Vec<String> {
     let mut runs = Vec::new();
     let mut current = String::new();
@@ -1297,17 +1211,6 @@ fn numeric_runs(text: &str) -> Vec<String> {
         runs.push(current);
     }
     runs
-}
-
-fn normalize_number_signs(value: &str) -> String {
-    value.chars().map(normalize_number_sign).collect()
-}
-
-fn normalize_number_sign(ch: char) -> char {
-    match ch {
-        '−' | '–' | '—' => '-',
-        _ => ch,
-    }
 }
 
 #[cfg(test)]
