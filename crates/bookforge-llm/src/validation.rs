@@ -312,7 +312,11 @@ pub(crate) fn source_copy_validation_error(
     }
 
     let source_normalized = normalized_prose(source);
-    if looks_like_page_reference(&source_normalized)
+    // Identifiers, numeric headings, and ornamental separators have no
+    // source-language prose to translate. Their preservation is checked by
+    // the structural/protected-span validators, not the language-copy gate.
+    if !source_normalized.chars().any(char::is_alphabetic)
+        || looks_like_page_reference(&source_normalized)
         || looks_like_bilingual_gloss(&source_normalized)
     {
         return None;
@@ -1428,6 +1432,25 @@ mod tests {
             error.as_deref(),
             Some("translation is unchanged from the source-language prose")
         );
+    }
+
+    #[test]
+    fn allows_unchanged_nonlinguistic_blocks() {
+        for text in [
+            "9780795707711",
+            "9780795707711-2",
+            "* * *",
+            "1983",
+            "<m1>1</m1>",
+        ] {
+            assert!(
+                source_copy_validation_error(text, text, None).is_none(),
+                "{text}"
+            );
+        }
+        // A numerical prefix must not exempt the prose that follows it.
+        let prose = "1983: The revolution begins";
+        assert!(source_copy_validation_error(prose, prose, None).is_some());
     }
 
     #[test]
