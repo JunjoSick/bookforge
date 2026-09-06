@@ -1842,7 +1842,7 @@ fn marked_translation_rendered(
     }
 
     let mut rendered = Vec::new();
-    let mut used = Vec::new();
+    let mut used = HashSet::new();
     push_marked_fragment(
         translation,
         &scan.templates,
@@ -1852,19 +1852,14 @@ fn marked_translation_rendered(
         0,
     )?;
 
-    let mut expected = scan.templates.keys().cloned().collect::<Vec<_>>();
-    let mut used_sorted = used.clone();
-    expected.sort();
-    used_sorted.sort();
-    used_sorted.dedup();
-
-    // Raw suppressed markers may be echoed or omitted freely; ordinary
-    // template markers remain mandatory.
-    let missing = expected
-        .iter()
-        .filter(|id| !used_sorted.contains(id))
+    // Membership is unordered, but diagnostics and emitted raw subtrees stay sorted.
+    let mut missing = scan
+        .templates
+        .keys()
+        .filter(|id| !used.contains(*id))
         .cloned()
         .collect::<Vec<_>>();
+    missing.sort();
     if !missing.is_empty() {
         return Err(BookforgeError::InvalidInput(format!(
             "translation is missing required inline marker(s): {}",
@@ -1878,7 +1873,7 @@ fn marked_translation_rendered(
     let mut untouched = scan
         .raw_events
         .keys()
-        .filter(|id| !used.iter().any(|used_id| used_id == *id))
+        .filter(|id| !used.contains(*id))
         .cloned()
         .collect::<Vec<_>>();
     untouched.sort();
@@ -2090,58 +2085,52 @@ fn restore_inline_boundary_spaces(
         return;
     }
 
-    let mut index = 0usize;
-    while index + 1 < rendered.len() {
-        let boundary = match (&rendered[index].edge, &rendered[index + 1].edge) {
-            (Some(MarkerEdge::End(left)), Some(MarkerEdge::Start(right))) => {
-                InlineWhitespaceBoundary {
-                    left: left.clone(),
-                    right: right.clone(),
-                }
-            }
-            _ => {
-                index += 1;
-                continue;
-            }
-        };
+    // Cache the next visible character once. Empty/nested markers must not
+    // cause repeated scans over the same suffix.
+    let mut following = vec![None; rendered.len() + 1];
+    for index in (0..rendered.len()).rev() {
+        following[index] = event_text(&rendered[index].event)
+            .and_then(|text| text.chars().next())
+            .or(following[index + 1]);
+    }
 
-        if boundaries.contains(&boundary) && boundary_needs_space(rendered, index) {
-            rendered.insert(
-                index + 1,
-                RenderedEvent::plain(Event::Text(BytesText::new(" ").into_owned())),
-            );
-            index += 1;
+    let original = std::mem::take(rendered);
+    rendered.reserve(original.len());
+    let mut events = original.into_iter().enumerate().peekable();
+    let mut previous = None;
+    while let Some((index, event)) = events.next() {
+        previous = event_text(&event.event)
+            .and_then(|text| text.chars().next_back())
+            .or(previous);
+        let needs_space = match (
+            &event.edge,
+            events.peek().and_then(|(_, next)| next.edge.as_ref()),
+        ) {
+            (Some(MarkerEdge::End(left)), Some(MarkerEdge::Start(right))) => {
+                previous.is_some_and(is_word_char)
+                    && following[index + 1].is_some_and(is_word_char)
+                    && boundaries.contains(&InlineWhitespaceBoundary {
+                        left: left.clone(),
+                        right: right.clone(),
+                    })
+            }
+            _ => false,
+        };
+        rendered.push(event);
+        if needs_space {
+            rendered.push(RenderedEvent::plain(Event::Text(
+                BytesText::new(" ").into_owned(),
+            )));
+            // Inserted spaces affect later boundaries across empty markers.
+            previous = Some(' ');
         }
-        index += 1;
     }
 }
 
-fn boundary_needs_space(rendered: &[RenderedEvent], left_edge_index: usize) -> bool {
-    let previous = last_visible_char_before(rendered, left_edge_index);
-    let next = first_visible_char_after(rendered, left_edge_index + 1);
-
-    previous.is_some_and(is_word_char) && next.is_some_and(is_word_char)
-}
-
-fn last_visible_char_before(rendered: &[RenderedEvent], index: usize) -> Option<char> {
-    rendered
-        .iter()
-        .take(index + 1)
-        .rev()
-        .find_map(|rendered| event_text(&rendered.event).and_then(|text| text.chars().next_back()))
-}
-
-fn first_visible_char_after(rendered: &[RenderedEvent], index: usize) -> Option<char> {
-    rendered
-        .iter()
-        .skip(index)
-        .find_map(|rendered| event_text(&rendered.event).and_then(|text| text.chars().next()))
-}
-
-fn event_text(event: &Event<'static>) -> Option<String> {
+fn event_text<'a>(event: &'a Event<'static>) -> Option<std::borrow::Cow<'a, str>> {
     match event {
-        Event::Text(text) => text.decode().ok().map(|text| text.into_owned()),
-        Event::CData(text) => text.decode().ok().map(|text| text.into_owned()),
+        Event::Text(text) => text.decode().ok(),
+        Event::CData(text) => text.decode().ok(),
         _ => None,
     }
 }
@@ -2156,7 +2145,7 @@ fn push_marked_fragment(
     templates: &HashMap<String, InlineTemplate>,
     raw_events: &HashMap<String, Vec<Event<'static>>>,
     output: &mut Vec<RenderedEvent>,
-    used: &mut Vec<String>,
+    used: &mut HashSet<String>,
     depth: usize,
 ) -> Result<()> {
     if depth >= MAX_MARKER_DEPTH {
@@ -2172,7 +2161,7 @@ fn push_marked_fragment(
         if let Some(open) = parse_paired_marker_open(tag) {
             let tag_name = open.tag_name;
             let id = open.id;
-            if used.iter().any(|seen| seen == &id) {
+            if used.contains(&id) {
                 return Err(BookforgeError::InvalidInput(format!(
                     "translation contains a duplicate formatting marker '{id}'. The LLM copied the marker twice."
                 )));
@@ -2190,7 +2179,7 @@ fn push_marked_fragment(
                         start.clone(),
                         MarkerEdge::Start(id.clone()),
                     ));
-                    used.push(id.clone());
+                    used.insert(id.clone());
                     push_marked_fragment(inner, templates, raw_events, output, used, depth + 1)?;
                     output.push(RenderedEvent::marker(
                         Event::End(end.clone()),
@@ -2210,7 +2199,7 @@ fn push_marked_fragment(
                         for event in events {
                             output.push(RenderedEvent::verbatim(event.clone()));
                         }
-                        used.push(id);
+                        used.insert(id);
                     } else {
                         return Err(BookforgeError::InvalidInput(format!(
                             "translation contains unknown inline marker '{id}'"
@@ -2222,7 +2211,7 @@ fn push_marked_fragment(
             text = after_close;
         } else if let Some(empty) = parse_empty_marker(tag) {
             let id = empty.id;
-            if used.iter().any(|seen| seen == &id) {
+            if used.contains(&id) {
                 return Err(BookforgeError::InvalidInput(format!(
                     "translation contains a duplicate formatting marker '{id}'. The LLM copied the marker twice."
                 )));
@@ -2230,7 +2219,7 @@ fn push_marked_fragment(
 
             match templates.get(&id) {
                 Some(InlineTemplate::Empty(event)) => {
-                    used.push(id.clone());
+                    used.insert(id.clone());
                     output.push(RenderedEvent::plain(event.clone()));
                 }
                 Some(InlineTemplate::Paired { .. }) => {
@@ -2281,8 +2270,11 @@ fn find_matching_marker_close(text: &str, tag_name: &str) -> Result<usize> {
 
     loop {
         let remaining = &text[offset..];
-        let next_open = remaining.find(&open_needle);
         let next_close = remaining.find(&close);
+        // Only openings before this close can affect its nesting depth.
+        // Searching the entire suffix rescans all later siblings for every
+        // marker, even when this marker closes immediately.
+        let next_open = remaining[..next_close.unwrap_or(remaining.len())].find(&open_needle);
 
         match (next_open, next_close) {
             (_, Some(close_index))
@@ -2373,6 +2365,133 @@ fn next_child_path(stack: &mut [ElementFrame]) -> Vec<usize> {
 mod tests {
     use super::*;
     use bookforge_core::ir::{BlockId, BlockKind, InlineMark, ProtectedSpan, SectionId, TextRun};
+
+    fn marker_stress_fixture(count: usize) -> (Vec<Event<'static>>, String) {
+        let mut events = Vec::new();
+        let mut translation = String::new();
+        for id in 1..=count {
+            if id > 1 {
+                events.push(Event::Text(BytesText::new(" ")));
+            }
+            events.push(Event::Start(quick_xml::events::BytesStart::new("span")));
+            events.push(Event::Text(BytesText::new("source")));
+            events.push(Event::End(BytesEnd::new("span")));
+            translation.push_str(&format!("<m{id}>word</m{id}>"));
+        }
+        (events, translation)
+    }
+
+    #[test]
+    fn matching_marker_close_respects_nesting_and_malformed_openings() {
+        for (text, tag) in [
+            ("<m1>inner</m1>outer</m1>", "m1"),
+            ("<m id=\"m2\">inner</m>outer</m>", "m"),
+            ("<keep id=\"m2\">inner</keep>outer</keep>", "keep"),
+        ] {
+            assert_eq!(
+                find_matching_marker_close(text, tag).unwrap(),
+                text.rfind(&format!("</{tag}>")).unwrap()
+            );
+        }
+        assert_eq!(
+            find_matching_marker_close("é</m1><m1>later", "m1").unwrap(),
+            2
+        );
+        assert!(
+            find_matching_marker_close("<m id=\"broken\"", "m")
+                .unwrap_err()
+                .to_string()
+                .contains("missing a closing '>'")
+        );
+        assert!(
+            find_matching_marker_close("<m1>inner</m1>", "m1")
+                .unwrap_err()
+                .to_string()
+                .contains("missing closing tag")
+        );
+    }
+
+    #[test]
+    fn inline_spacing_across_empty_and_nonword_spans_is_preserved() {
+        let (events, _) = marker_stress_fixture(3);
+        for (words, expected) in [
+            (
+                ["one", "", "two"],
+                "<span>one</span> <span></span><span>two</span>",
+            ),
+            (
+                ["", "one", "two"],
+                "<span></span><span>one</span> <span>two</span>",
+            ),
+            (
+                ["one", "!", "two"],
+                "<span>one</span><span>!</span><span>two</span>",
+            ),
+            (
+                ["é", "中", "two"],
+                "<span>é</span> <span>中</span> <span>two</span>",
+            ),
+            (
+                ["one ", "two", ""],
+                "<span>one </span><span>two</span><span></span>",
+            ),
+        ] {
+            let translation = words
+                .iter()
+                .enumerate()
+                .map(|(i, word)| format!("<m{}>{word}</m{}>", i + 1, i + 1))
+                .collect::<String>();
+            let rendered = marked_translation_rendered(&translation, &events).unwrap();
+            let mut writer = Writer::new(Vec::new());
+            for item in rendered {
+                writer.write_event(item.event).unwrap();
+            }
+            assert_eq!(String::from_utf8(writer.into_inner()).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn dense_inline_markers_preserve_order_and_spacing() {
+        let (events, translation) = marker_stress_fixture(512);
+        let rendered = marked_translation_rendered(&translation, &events).unwrap();
+        let mut writer = Writer::new(Vec::new());
+        for item in rendered {
+            writer.write_event(item.event).unwrap();
+        }
+        assert_eq!(
+            String::from_utf8(writer.into_inner()).unwrap(),
+            vec!["<span>word</span>"; 512].join(" ")
+        );
+        let duplicate = format!("{translation}<m512>again</m512>");
+        assert!(
+            marked_translation_rendered(&duplicate, &events)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate formatting marker 'm512'")
+        );
+    }
+
+    #[test]
+    #[ignore = "manual timing probe; no machine-speed assertion"]
+    fn benchmark_dense_inline_markers() {
+        for count in [32, 256, 2048] {
+            let (events, translation) = marker_stress_fixture(count);
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                let rendered = marked_translation_rendered(
+                    std::hint::black_box(&translation),
+                    std::hint::black_box(&events),
+                )
+                .unwrap();
+                assert_eq!(rendered.len(), count * 4 - 1);
+                std::hint::black_box(rendered);
+            }
+            eprintln!(
+                "markers={count} iterations=20 elapsed_us={}",
+                start.elapsed().as_micros()
+            );
+        }
+    }
 
     #[test]
     fn patch_opf_language_sets_target_language_tag() {
