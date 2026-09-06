@@ -554,9 +554,7 @@ fn mode_target_tokens(base: usize) -> HashMap<BatchMode, usize> {
     map
 }
 
-pub(super) fn token_estimate(text: &str) -> usize {
-    bookforge_core::segment::estimate_tokens(text)
-}
+pub(super) use bookforge_core::segment::estimate_tokens as token_estimate;
 
 /// Fixed prompt-scaffold overhead for one batch request, measured over the
 /// built-in templates (`translate_batch_plain.v3.md`, `_marker_safe_`,
@@ -894,15 +892,4 @@ fn with_configured_token_estimate(
 ) -> TranslationBatch {
     batch.token_estimate = batch_token_estimate(&batch.items, config);
     batch
-}
-
-#[cfg(test)]
-mod script_estimate_tests {
-    use super::token_estimate;
-
-    #[test]
-    fn caseless_source_text_is_not_divided_by_four() {
-        assert_eq!(token_estimate("矛盾是普遍存在的"), 8);
-        assert_eq!(token_estimate("The quick brown fox."), 5);
-    }
 }

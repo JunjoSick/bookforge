@@ -49,17 +49,8 @@ pub const SEGMENT_UNIT_NAME: &str = "scheduler_segment";
 /// between marker tokens instead of moving inside the preceding marker.
 pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 4;
 
-/// Estimate model tokens from the dominant script in `text`.
-///
-/// Thin delegating wrapper kept at its historical path for callers across
-/// the workspace. The canonical implementation and its coefficient
-/// rationale live in [`crate::token_estimate::estimate_tokens`], which
-/// weights every character by its own script (unspaced CJK scripts weigh
-/// one token per character, everything else four characters per token)
-/// instead of routing the whole text through a dominant-case class.
-pub fn estimate_tokens(text: &str) -> usize {
-    crate::token_estimate::estimate_tokens(text)
-}
+/// Historical path for the canonical script-aware token estimator.
+pub use crate::token_estimate::estimate_tokens;
 
 /// Compute a cache namespace that scopes lookups to a single set of
 /// schema and segmentation parameters. Cached rows from a different

@@ -1,3 +1,4 @@
+use crate::marker::strip_marker_tokens;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -1113,10 +1114,6 @@ fn marked_block_text(block: &Block) -> String {
 
 fn block_visible_text(block: &Block) -> String {
     normalize_candidate_text(&strip_marker_tokens(&marked_block_text(block)))
-}
-
-fn strip_marker_tokens(text: &str) -> String {
-    crate::marker::strip_marker_tokens(text)
 }
 
 fn previous_visible_char(text: &str) -> Option<char> {

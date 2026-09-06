@@ -330,6 +330,41 @@ fn resolved_entity_prefix(entity: &str) -> Option<(String, usize)> {
     Some((decoded.to_string(), name_end + 1))
 }
 
+pub(crate) fn is_block_level_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"p" | b"div"
+            | b"blockquote"
+            | b"li"
+            | b"ul"
+            | b"ol"
+            | b"dl"
+            | b"dt"
+            | b"dd"
+            | b"table"
+            | b"thead"
+            | b"tbody"
+            | b"tfoot"
+            | b"tr"
+            | b"td"
+            | b"th"
+            | b"caption"
+            | b"h1"
+            | b"h2"
+            | b"h3"
+            | b"h4"
+            | b"h5"
+            | b"h6"
+            | b"section"
+            | b"article"
+            | b"aside"
+            | b"figure"
+            | b"figcaption"
+            | b"pre"
+            | b"hr"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

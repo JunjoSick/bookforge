@@ -52,6 +52,7 @@ impl RunView {
     }
 
     /// Gauge ratio clamped to `[0, 1]`; 0 before segmentation is known.
+    #[cfg(any(feature = "tui", test))]
     pub(crate) fn progress_ratio(&self) -> f64 {
         if self.state.total_segments > 0 {
             (self.state.done_segments as f64 / self.state.total_segments as f64).clamp(0.0, 1.0)
@@ -62,6 +63,7 @@ impl RunView {
 
     /// Consume the view, returning the folded [`RunState`] (for callers that
     /// hand the state onward, e.g. serialized into an SSE payload).
+    #[cfg(feature = "serve")]
     pub(crate) fn into_state(self) -> RunState {
         self.state
     }
@@ -110,6 +112,7 @@ pub(crate) fn format_rate(segments_per_minute: f64) -> String {
 
 /// Compact token counter shared by token-bearing surfaces: `999`, `12.3k`,
 /// `2.0M`.
+#[cfg(any(feature = "tui", test))]
 pub(crate) fn format_count(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)

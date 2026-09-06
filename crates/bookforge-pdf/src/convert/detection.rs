@@ -1182,7 +1182,7 @@ fn chart_label_fragments<'a>(
         }
     } else if two_column
         && !fragments_span_columns(page, &fragments)
-        && let Some((left, right)) = column_bounds_for_labels(page, &fragments)
+        && let Some((left, right)) = column_bounds_for_fragments(page, &fragments)
     {
         fragments.retain(|fragment| {
             let center = fragment.left + fragment.width / 2;
@@ -1230,7 +1230,7 @@ fn vector_region_rect(
         && !fragment_spans_columns(page, caption)
         && !fragments_span_columns(page, chart_fragments)
     {
-        let (left, right) = column_bounds_for_labels(page, chart_fragments)?;
+        let (left, right) = column_bounds_for_fragments(page, chart_fragments)?;
         rect = clamp_rect_horizontally(rect, left, right)?;
     }
     Some(rect)
@@ -1316,10 +1316,6 @@ fn content_bounds(page: &Page) -> Option<(i32, i32)> {
         .max()
         .unwrap_or(page.width);
     Some((content_left, content_right))
-}
-
-fn column_bounds_for_labels(page: &Page, chart_fragments: &[&Fragment]) -> Option<(i32, i32)> {
-    column_bounds_for_fragments(page, chart_fragments)
 }
 
 fn column_bounds_for_fragments(page: &Page, fragments: &[&Fragment]) -> Option<(i32, i32)> {

@@ -25,11 +25,14 @@
 //! The API key is never a CLI value. `--api-key-env` accepts only the name of
 //! the environment variable that the provider should read at request time.
 
+mod support;
+use bookforge_core::providers::load_pricing;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use support::{Endpoint, resolve_endpoint, strip_json_code_fence};
 
 use anyhow::{Context, Result, bail};
 use bookforge_core::{
@@ -1097,70 +1100,9 @@ fn contains_word_sequence(words: &[String], phrase: &[&str]) -> bool {
         .any(|window| window.iter().map(String::as_str).eq(phrase.iter().copied()))
 }
 
-/// Deterministically unwrap a whole-response JSON fence. Contents are not
-/// rewritten; a still-invalid payload remains unparseable.
-fn strip_json_code_fence(body: &str) -> &str {
-    let Some(inner) = body.strip_prefix("```") else {
-        return body;
-    };
-    let Some(inner) = inner.strip_suffix("```") else {
-        return body;
-    };
-    let Some((tag, payload)) = inner.split_once('\n') else {
-        return body;
-    };
-    let tag = tag.trim();
-    if tag.is_empty() || tag.eq_ignore_ascii_case("json") {
-        payload.trim()
-    } else {
-        body
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Provider, cache, and pricing
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct Endpoint {
-    provider: String,
-    base_url: String,
-    /// Environment-variable name only. Its value is never read by this tool.
-    api_key_env: String,
-    model: String,
-}
-
-fn resolve_endpoint(args: &Args) -> Result<Endpoint> {
-    let defaults = match args.provider.as_str() {
-        "deepseek" | "openrouter" | "openai-compatible" => {
-            bookforge_core::providers::provider_defaults(&args.provider)
-                .expect("allow-list above matches registry entries")
-        }
-        other => {
-            bail!("unsupported provider '{other}'; use deepseek, openrouter, or openai-compatible")
-        }
-    };
-    if defaults.base_url.is_none() && args.base_url.is_none() {
-        bail!("--provider openai-compatible requires --base-url");
-    }
-    Ok(Endpoint {
-        provider: args.provider.clone(),
-        base_url: args
-            .base_url
-            .clone()
-            .unwrap_or_else(|| defaults.base_url.unwrap_or_default().to_string()),
-        api_key_env: args
-            .api_key_env
-            .clone()
-            .unwrap_or_else(|| defaults.api_key_env.to_string()),
-        model: args.model.clone().unwrap_or_else(|| {
-            defaults
-                .default_model
-                .unwrap_or(bookforge_core::providers::LOCAL_MODEL_PLACEHOLDER)
-                .to_string()
-        }),
-    })
-}
 
 fn build_text_scorer(args: &Args, endpoint: &Endpoint) -> Result<TextScorer> {
     let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
@@ -1276,12 +1218,6 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 // Pricing routes through the shared core catalog; the judge tools keep no
 // local copy of the schema or embedded JSON.
-
-type PricingCatalog = bookforge_core::providers::PricingCatalog;
-
-fn load_pricing(path: Option<&Path>) -> Result<PricingCatalog> {
-    bookforge_core::providers::load_pricing(path).map_err(anyhow::Error::from)
-}
 
 fn estimate_tokens(text: &str) -> u64 {
     bookforge_core::segment::estimate_tokens(text) as u64
@@ -1776,7 +1712,12 @@ async fn main() -> Result<()> {
         bail!("--baseline applies to a completed measurement, not --dry-run");
     }
 
-    let endpoint = resolve_endpoint(&args)?;
+    let endpoint = resolve_endpoint(
+        &args.provider,
+        &args.base_url,
+        &args.api_key_env,
+        &args.model,
+    )?;
     let copied = open_copied_store(&args.db)?;
     let (blocks, corpus) = load_evaluation_blocks(&copied.store, &args.db, &args)?;
     let passages = assemble_passages(&blocks, args.passage_chars);

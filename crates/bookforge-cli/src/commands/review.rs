@@ -1,3 +1,4 @@
+use super::resolve_job_input;
 use std::{
     collections::HashMap,
     fs,
@@ -149,7 +150,7 @@ pub(crate) fn generate_review_document(store: &JobStore, job_id: &str) -> Result
         );
     };
 
-    let input = resolve_review_input(&job, &snapshot)?;
+    let input = resolve_job_input(&job, &snapshot)?;
     let book = read_epub(&input)?;
     let settings = snapshot.settings.to_settings();
     let segments = build_segments(&book, &settings.segmentation)?;
@@ -214,47 +215,6 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-pub(crate) fn resolve_review_input(
-    job: &JobRecord,
-    snapshot: &RunConfigSnapshot,
-) -> Result<PathBuf> {
-    if let Some(path) = snapshot
-        .input_snapshot_path
-        .as_ref()
-        .or(job.input_snapshot_path.as_ref())
-        && path.exists()
-    {
-        return Ok(path.clone());
-    }
-
-    if snapshot.input_snapshot_path.is_none() && job.input_snapshot_path.is_none() {
-        tracing::warn!(
-            "job '{}' predates input EPUB snapshots; falling back to original input path",
-            job.id
-        );
-        if snapshot.input_path.exists() {
-            return Ok(snapshot.input_path.clone());
-        }
-        anyhow::bail!(
-            "job '{}' does not have an input snapshot and the original input path no longer exists: {}",
-            job.id,
-            snapshot.input_path.display()
-        );
-    }
-
-    let snapshot_path = snapshot
-        .input_snapshot_path
-        .as_ref()
-        .or(job.input_snapshot_path.as_ref())
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "<missing>".to_string());
-    anyhow::bail!(
-        "job '{}' input snapshot is missing: {}",
-        job.id,
-        snapshot_path
-    )
 }
 
 #[allow(clippy::too_many_arguments)]

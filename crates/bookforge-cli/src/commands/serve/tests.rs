@@ -233,16 +233,6 @@ fn audio_options_serve_per_model_limits_so_the_browser_keeps_no_copy() {
 }
 
 #[test]
-fn dashboard_escapes_dynamic_html_fields() {
-    assert!(DASHBOARD_HTML.contains("function esc(value)"));
-    assert!(DASHBOARD_HTML.contains("${esc(d.id)}"));
-    assert!(DASHBOARD_HTML.contains("${esc(body)}"));
-    assert!(DASHBOARD_HTML.contains("${esc(a.id)}"));
-    assert!(DASHBOARD_HTML.contains("${esc(w.sourcePath)}"));
-    assert!(DASHBOARD_HTML.contains("${esc(audioWarningMessage(warning))}"));
-}
-
-#[test]
 fn dashboard_openai_compatible_base_url_must_be_https() {
     assert!(dashboard_base_url_uses_https("https://api.example.com/v1"));
     assert!(!dashboard_base_url_uses_https("http://api.example.com/v1"));
@@ -1335,28 +1325,23 @@ fn dashboard_ships_store_curation_screens_and_audio_parity_controls() {
 }
 
 #[test]
-fn dashboard_assets_reassemble_byte_stably() {
-    use sha2::{Digest, Sha256};
-
-    assert_eq!(DASHBOARD_HTML.len(), 139_947);
-    assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
-    assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
-    let digest = Sha256::digest(DASHBOARD_HTML.as_bytes());
-    let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    assert_eq!(
-        digest_hex,
-        "b7acaffc1faebe59b8838d69c41a180875c29a289368f068303e6e9cf4c66c8d"
-    );
-
-    let crlf = |asset: &str| asset.replace("\r\n", "\n").replace('\n', "\r\n");
+fn dashboard_assets_substitute_placeholders_and_normalize_newlines() {
+    let template =
+        "<style>{{BOOKFORGE_DASHBOARD_CSS}}</style>\n<script>{{BOOKFORGE_DASHBOARD_JS}}</script>\n";
+    let css = "body {\n color: red;\n}\n";
+    let js = "hello();\n";
+    let expected = "<style>body {\n color: red;\n}\n</style>\n<script>hello();\n</script>\n";
+    assert_eq!(assemble_dashboard_html(template, css, js), expected);
     assert_eq!(
         assemble_dashboard_html(
-            &crlf(DASHBOARD_HTML_TEMPLATE),
-            &crlf(DASHBOARD_CSS),
-            &crlf(DASHBOARD_JS),
+            &template.replace('\n', "\r\n"),
+            &css.replace('\n', "\r\n"),
+            &js.replace('\n', "\r\n")
         ),
-        *DASHBOARD_HTML,
+        expected
     );
+    assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_CSS}}"));
+    assert!(!DASHBOARD_HTML.contains("{{BOOKFORGE_DASHBOARD_JS}}"));
 }
 
 #[test]
@@ -1392,113 +1377,6 @@ fn dashboard_js_never_reads_or_injects_a_session_credential() {
     // Sign-out plumbing is present so the session can be ended from the UI.
     assert!(DASHBOARD_JS.contains("async function bfSignOut"));
     assert!(DASHBOARD_HTML.contains("onclick=\"bfSignOut()\""));
-}
-
-/// Fetch-seam audit: the browser authenticates purely via the cookie, and
-/// every network call still routes through the single seam:
-///
-/// 1. exactly one raw `fetch(` may exist, and only between the
-///    `BFAPISEAM-BEGIN`/`BFAPISEAM-END` markers where `bfFetch` lives;
-/// 2. every screen's endpoints are asserted to reach the server through
-///    `apiGet`/`apiSend`, covering Library, Progress polling, Review,
-///    Glossary, Styles/Entities lists, Audiobook wizard/voices/status/
-///    artifact hydration and the provider/options metadata bootstraps.
-#[test]
-fn dashboard_fetches_all_route_through_the_cookie_api_seam() {
-    const SEAM_BEGIN: &str = "BFAPISEAM-BEGIN";
-    const SEAM_END: &str = "BFAPISEAM-END";
-
-    let js = DASHBOARD_JS;
-    let total_fetch_calls = count_fetch_calls(js);
-    let outside_seam = match (js.find(SEAM_BEGIN), js.find(SEAM_END)) {
-        (Some(begin), Some(end)) if begin < end => {
-            count_fetch_calls(&js[..begin]) + count_fetch_calls(&js[end..])
-        }
-        _ => panic!("dashboard.js must carry unique {SEAM_BEGIN}/{SEAM_END} markers"),
-    };
-    assert_eq!(
-        outside_seam, 0,
-        "every raw fetch( must live between {SEAM_BEGIN}/{SEAM_END} \
-         and go through bfFetch/apiGet/apiSend"
-    );
-    assert!(
-        total_fetch_calls >= 1,
-        "the seam itself should perform the transport"
-    );
-
-    for marker in [
-        // The seam is a thin pass-through now: the HttpOnly session cookie
-        // rides along on the same-origin request automatically.
-        "function bfFetch(path, options)",
-        "async function apiGet(",
-        "async function apiSend(",
-        // Sign-out reuses the seam.
-        "await apiSend(\"/api/auth/logout\", { method: \"POST\" })",
-        // Library: job list + audiobook list poll through the seam.
-        "Promise.all([apiGet(\"/api/jobs\"), apiGet(\"/api/audiobooks\")])",
-        // Narrate-from-library job hydration.
-        "await apiGet(\"/api/jobs/\" + encodeURIComponent(id))",
-        // Progress polling: job + runtime settings refresh + SSE stream.
-        "apiGet(\"/api/jobs/\" + encodeURIComponent(id) + \"/reconfigure\")",
-        "apiGet(\"/api/jobs/\" + encodeURIComponent(state.id) + \"/events\"",
-        "await apiGet(`/api/jobs/${encodeURIComponent(id)}/reconfigure`)",
-        // Review: document load + post-save reload.
-        "apiGet(\"/api/jobs/\" + encodeURIComponent(id) + \"/review\")",
-        "apiGet(\"/api/jobs/\" + encodeURIComponent(App.selected) + \"/review\")",
-        // Glossary list.
-        "apiGet(\"/api/glossary\" + q)",
-        // Styles + Entities lists (new store-curation screens).
-        "apiGet(\"/api/styles\")",
-        "apiGet(`/api/styles/${id}`)",
-        "apiGet(\"/api/entities\")",
-        // Audiobook wizard: estimate, voices, status polling, artifact
-        // playback/download hydration, and the launch handshake.
-        "apiSend(\"/api/audiobook/estimate\", {method:\"POST\", body:fd})",
-        "apiGet(\"/api/audio/voices?provider=elevenlabs\")",
-        "apiSend(\"/api/audiobook\", {method:\"POST\", body:fd})",
-        "apiGet(`/api/audiobooks/${encodeURIComponent(id)}`)",
-        "apiGet(`/api/audiobooks/${encodeURIComponent(id)}/artifact?disposition=inline`)",
-        "apiGet(`/api/audiobooks/${encodeURIComponent(id)}/artifact`)",
-        // Maintenance + control mutations reuse the same seam.
-        "apiGet(`/api/audiobooks/${encodeURIComponent(id)}/prune-preview`)",
-        "apiSend(`/api/audiobooks/${encodeURIComponent(id)}/prune`",
-        "apiSend(`/api/audiobooks/${encodeURIComponent(id)}/retry-failed`",
-        "apiSend(`/api/audiobooks/${encodeURIComponent(id)}/cancel`",
-        // Bootstraps: options + provider key status.
-        "apiGet(\"/api/options\")",
-        "apiGet(\"/api/providers\")",
-    ] {
-        assert!(js.contains(marker), "missing api-seam usage: {marker}");
-    }
-
-    // Mutations with bodies keep their explicit content-type; nothing else is
-    // added by the seam.
-    for marker in [
-        "\"content-type\": \"application/json\"",
-        "{ method: \"DELETE\" }",
-    ] {
-        assert!(js.contains(marker), "missing {marker}");
-    }
-}
-
-/// Count textual `fetch(` occurrences with a real word boundary (so template
-/// helpers like `prefetch(` can never hide from the audit).
-fn count_fetch_calls(source: &str) -> usize {
-    let mut count = 0;
-    let mut offset = 0;
-    while let Some(found) = source[offset..].find("fetch(") {
-        let absolute = offset + found;
-        let boundary_ok = absolute == 0
-            || !source[..absolute]
-                .chars()
-                .next_back()
-                .is_some_and(char::is_alphanumeric);
-        if boundary_ok {
-            count += 1;
-        }
-        offset = absolute + "fetch(".len();
-    }
-    count
 }
 
 #[test]

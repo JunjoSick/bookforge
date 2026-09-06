@@ -80,6 +80,7 @@ pub(crate) struct EstimateResult {
 ///
 /// The dashboard calls this entry point without exposing profile controls, so
 /// keep its default in lockstep with the translate command's CLI default.
+#[cfg(feature = "serve")]
 pub(crate) fn estimate_epub(
     input: &Path,
     target_language: &str,
@@ -338,12 +339,14 @@ fn build_pass_cost_breakdown(
 
 /// One pass label plus its planning surcharge (`None` when that pass priced
 /// as unavailable for the provider/model).
+#[cfg(feature = "serve")]
 pub(crate) type PassSurchargeList = Vec<(&'static str, Option<f64>)>;
 
 /// Per-pass planning surcharges for an already-computed primary estimate,
 /// plus the pass surcharge total. Shared by `estimate --pass-costs` (text)
 /// and the dashboard's `/api/estimate` JSON so both surfaces never drift.
 /// The surcharge total is `None` unless every pass priced.
+#[cfg(feature = "serve")]
 pub(crate) fn pass_cost_surcharges(
     provider: &str,
     result: &EstimateResult,

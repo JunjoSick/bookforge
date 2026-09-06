@@ -28,3 +28,7 @@ merged_bookforge.txt
 !/tests/corpus/standard-ebooks/
 /tests/corpus/standard-ebooks/*
 !/tests/corpus/standard-ebooks/manifest.toml
+
+# Isolated QA state and browser dependencies.
+/.qa/
+/qa/browser/node_modules/

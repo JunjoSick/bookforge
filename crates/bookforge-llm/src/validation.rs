@@ -1,3 +1,7 @@
+use bookforge_core::numeric::{
+    canonical_decimal_number, compact_ascii_whitespace, compact_numeric_punctuation_span,
+    dangling_numeric_span, normalize_number_sign, normalize_number_signs,
+};
 use std::collections::HashMap;
 
 use bookforge_core::marker::{marker_inner_texts, marker_reference_token, strip_marker_tokens};
@@ -312,7 +316,11 @@ pub(crate) fn source_copy_validation_error(
     }
 
     let source_normalized = normalized_prose(source);
-    if looks_like_page_reference(&source_normalized)
+    // Identifiers, numeric headings, and ornamental separators have no
+    // source-language prose to translate. Their preservation is checked by
+    // the structural/protected-span validators, not the language-copy gate.
+    if !source_normalized.chars().any(char::is_alphabetic)
+        || looks_like_page_reference(&source_normalized)
         || looks_like_bilingual_gloss(&source_normalized)
     {
         return None;
@@ -1188,96 +1196,6 @@ fn looks_like_bilingual_gloss(text: &str) -> bool {
     text.contains("or in english:") || text.contains("in english:")
 }
 
-fn dangling_numeric_span(value: &str) -> bool {
-    let normalized = normalize_number_signs(value);
-    let trimmed = normalized.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
-        )
-    });
-    trimmed.ends_with('-') && trimmed.chars().any(|ch| ch.is_ascii_digit())
-}
-
-fn compact_numeric_punctuation_span(value: &str) -> Option<String> {
-    let normalized = normalize_number_signs(value);
-    let trimmed = normalized.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
-        )
-    });
-    let digits = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
-    if digits < 2 {
-        return None;
-    }
-    if !trimmed.chars().all(|ch| {
-        ch.is_ascii_digit()
-            || ch.is_ascii_whitespace()
-            || matches!(
-                ch,
-                '.' | ',' | ';' | ':' | '/' | '-' | '+' | '%' | '$' | '(' | ')'
-            )
-    }) {
-        return None;
-    }
-    Some(compact_ascii_whitespace(trimmed))
-}
-
-fn compact_ascii_whitespace(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace())
-        .collect()
-}
-
-fn canonical_decimal_number(value: &str) -> Option<String> {
-    let normalized = normalize_number_signs(value);
-    let trimmed = normalized.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''
-        )
-    });
-    if trimmed.is_empty() || !trimmed.chars().any(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    let percent = trimmed.ends_with('%');
-    let numeric = trimmed.strip_suffix('%').unwrap_or(trimmed);
-    if !numeric
-        .chars()
-        .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+'))
-    {
-        return None;
-    }
-    if numeric.matches('.').count() + numeric.matches(',').count() > 1 {
-        return None;
-    }
-    let separator = numeric.find('.').or_else(|| numeric.find(','));
-    let mut canonical = match separator {
-        Some(index) => {
-            let (whole, fractional_with_separator) = numeric.split_at(index);
-            let fractional = &fractional_with_separator[1..];
-            if whole.is_empty()
-                || fractional.is_empty()
-                || !whole
-                    .trim_start_matches(['-', '+'])
-                    .chars()
-                    .all(|ch| ch.is_ascii_digit())
-                || !fractional.chars().all(|ch| ch.is_ascii_digit())
-            {
-                return None;
-            }
-            format!("{whole}.{fractional}")
-        }
-        None => numeric.to_string(),
-    };
-    if percent {
-        canonical.push('%');
-    }
-    Some(canonical)
-}
-
 fn numeric_runs(text: &str) -> Vec<String> {
     let mut runs = Vec::new();
     let mut current = String::new();
@@ -1293,17 +1211,6 @@ fn numeric_runs(text: &str) -> Vec<String> {
         runs.push(current);
     }
     runs
-}
-
-fn normalize_number_signs(value: &str) -> String {
-    value.chars().map(normalize_number_sign).collect()
-}
-
-fn normalize_number_sign(ch: char) -> char {
-    match ch {
-        '−' | '–' | '—' => '-',
-        _ => ch,
-    }
 }
 
 #[cfg(test)]
@@ -1428,6 +1335,25 @@ mod tests {
             error.as_deref(),
             Some("translation is unchanged from the source-language prose")
         );
+    }
+
+    #[test]
+    fn allows_unchanged_nonlinguistic_blocks() {
+        for text in [
+            "9780795707711",
+            "9780795707711-2",
+            "* * *",
+            "1983",
+            "<m1>1</m1>",
+        ] {
+            assert!(
+                source_copy_validation_error(text, text, None).is_none(),
+                "{text}"
+            );
+        }
+        // A numerical prefix must not exempt the prose that follows it.
+        let prose = "1983: The revolution begins";
+        assert!(source_copy_validation_error(prose, prose, None).is_some());
     }
 
     #[test]

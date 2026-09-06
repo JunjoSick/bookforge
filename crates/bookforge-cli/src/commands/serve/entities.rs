@@ -1,3 +1,4 @@
+use super::glossary::parse_glossary_scope;
 use super::*;
 
 use bookforge_core::EntityGender;
@@ -23,10 +24,6 @@ pub(super) fn routes() -> Router<AppState> {
 // the earlier snapshot-clear-restore strategy (and its sibling-renumbering
 // caveat) is retired.
 // ---------------------------------------------------------------------------
-
-fn parse_entity_scope(value: &str) -> GlossaryScopeKind {
-    super::glossary::parse_glossary_scope(value)
-}
 
 fn parse_entity_gender(value: &str) -> Option<EntityGender> {
     match value.trim() {
@@ -94,7 +91,7 @@ fn resolved_entity_scope(
     scope_id: Option<&str>,
 ) -> std::result::Result<(GlossaryScopeKind, Option<String>), String> {
     let scope_kind = scope
-        .map(parse_entity_scope)
+        .map(parse_glossary_scope)
         .unwrap_or(GlossaryScopeKind::Global);
     let scope_id = if scope_kind == GlossaryScopeKind::Global {
         None
@@ -193,7 +190,7 @@ async fn list_entities_route(
                 .get("scope")
                 .map(String::as_str)
                 .filter(|value| !value.is_empty())
-                .map(parse_entity_scope),
+                .map(parse_glossary_scope),
             params
                 .get("scope_id")
                 .map(String::as_str)
