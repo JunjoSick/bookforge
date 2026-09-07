@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Split packed EPUB endnotes at consecutive anchored note backlinks during
+  reading and rebuilding, keeping note text, formatting, and link targets intact.
+  Converted books no longer send an entire multi-note paragraph as one oversized
+  translation block.
+
 Dogfooding round on a real 400-page-scale EPUB (English→Italian, DeepSeek):
 fixes for every issue the live run surfaced.
 

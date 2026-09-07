@@ -928,6 +928,8 @@ fn extract_blocks(
     section_id: &SectionId,
     initial_block_count: usize,
 ) -> Result<Vec<Block>> {
+    let normalized = crate::packed_notes::normalize_packed_notes(xhtml)?;
+    let xhtml = normalized.as_ref();
     let mut reader = Reader::from_str(xhtml);
     reader.config_mut().trim_text(false);
 

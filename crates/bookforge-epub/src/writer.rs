@@ -1095,6 +1095,8 @@ fn patch_xhtml_with_specs(
     patches: &[PatchSpec<'_>],
     options: &RebuildOptions,
 ) -> Result<PatchOutcome> {
+    let normalized = crate::packed_notes::normalize_packed_notes(xhtml)?;
+    let xhtml = normalized.as_ref();
     let patch_map = patches
         .iter()
         .map(|patch| (patch.dom_path.0.as_slice(), *patch))
