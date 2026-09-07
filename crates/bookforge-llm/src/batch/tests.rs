@@ -4441,3 +4441,199 @@ fn invalid_response_errors_persist_friendly_text_not_serde_internals() {
         "HTTP status 429: slow down"
     );
 }
+
+#[test]
+#[ignore]
+fn benchmark_batch_planning() {
+    let config = BatchConfig {
+        enabled: true,
+        target_tokens: 16_000,
+        max_items: 64,
+        adaptive_sizing: true,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let mut run_config = test_run_config();
+    run_config.batch_max_output_tokens = Some(8_000);
+    for count in [1_000, 4_000] {
+        let segments = (0..count)
+            .map(|i| {
+                make_segment_in_section(
+                    &format!("seg{i}"),
+                    "chapter",
+                    i,
+                    vec![plain_block(&"Ordinary prose for translation. ".repeat(24))],
+                    vec![],
+                )
+            })
+            .collect::<Vec<_>>();
+        let initial = build_translation_batches(&segments, &config, TranslationProfile::Balanced);
+        let sizer = BatchSizer::new(8_000, 32);
+        let mut elapsed = std::time::Duration::ZERO;
+        for _ in 0..3 {
+            let mut pending = initial.clone().into();
+            let start = std::time::Instant::now();
+            repartition_pending_batches(&mut pending, &sizer, Some(&run_config), 2);
+            elapsed += start.elapsed();
+            assert_eq!(
+                pending.iter().map(|batch| batch.items.len()).sum::<usize>(),
+                count
+            );
+            std::hint::black_box(pending);
+        }
+        eprintln!("batch runtime items={count} iterations=3 elapsed={elapsed:?}");
+        let mut elapsed = std::time::Duration::ZERO;
+        for _ in 0..3 {
+            let batches = initial.clone();
+            let start = std::time::Instant::now();
+            let packed = account_for_batch_prompt_overhead(batches, &config, &run_config);
+            elapsed += start.elapsed();
+            assert_eq!(
+                packed.iter().map(|batch| batch.items.len()).sum::<usize>(),
+                count
+            );
+            std::hint::black_box(packed);
+        }
+        eprintln!("batch repack items={count} iterations=3 elapsed={elapsed:?}");
+    }
+}
+
+#[test]
+fn repacking_preserves_limits_estimates_and_item_order() {
+    for mode in [
+        BatchMode::Plain,
+        BatchMode::MarkerSafe,
+        BatchMode::RunPreserving,
+        BatchMode::TurboTextOnly,
+    ] {
+        for seed in 0..20 {
+            let mut config = test_run_config();
+            config.batch_max_output_tokens = [None, Some(128), Some(800)][seed % 3];
+            config.glossary.format = if seed % 2 == 0 {
+                GlossaryFormat::Json
+            } else {
+                GlossaryFormat::Prose
+            };
+            config.glossary.prompt_extra = Some("Consistent terminology".repeat(seed % 4));
+            let mut batch = make_two_item_batch();
+            batch.mode = mode;
+            batch.kind = if seed % 2 == 0 {
+                BatchKind::Repair
+            } else {
+                BatchKind::Translation
+            };
+            batch.ordinal = 7;
+            batch.items = (0..18)
+                .map(|i| {
+                    let mut item = batch_item(
+                        &format!("item{i}"),
+                        &["", "短い文章", "A longer paragraph. ", "İ ΟΣ Straße"][i % 4]
+                            .repeat(1 + (i * 7 + seed) % 20),
+                    );
+                    item.section_id = batch.section_id.clone();
+                    item.ordinal = i;
+                    item.text_runs = (0..i % 4)
+                        .map(|j| SegmentTextRun {
+                            id: format!("r{j}"),
+                            text: "text".into(),
+                        })
+                        .collect();
+                    config
+                        .glossary
+                        .guidance_by_segment
+                        .insert(item.segment_id.0.clone(), "Retry guidance".repeat(i % 3));
+                    config.glossary.entries_by_segment.insert(
+                        item.segment_id.0.clone(),
+                        vec![bookforge_core::GlossaryPromptTerm {
+                            source: format!("Term{}", i % 3),
+                            target: "Termine".into(),
+                            category: bookforge_core::GlossaryCategory::Phrase,
+                            note: None,
+                            term_id: None,
+                            case_sensitive: false,
+                        }],
+                    );
+                    item
+                })
+                .collect();
+            for target in [0, 1, 80, 512, 16_000] {
+                let batch_config = BatchConfig {
+                    enabled: true,
+                    target_tokens: target,
+                    max_items: seed % 7,
+                    adaptive_sizing: true,
+                    split_on_json_failure: true,
+                    repair_invalid_items: true,
+                };
+                let parts =
+                    account_for_batch_prompt_overhead(vec![batch.clone()], &batch_config, &config);
+                assert_eq!(
+                    parts
+                        .iter()
+                        .flat_map(|part| part.items.iter().map(|item| &item.item_id))
+                        .collect::<Vec<_>>(),
+                    batch
+                        .items
+                        .iter()
+                        .map(|item| &item.item_id)
+                        .collect::<Vec<_>>()
+                );
+                for (index, part) in parts.iter().enumerate() {
+                    assert_eq!(part.id, format!("{}_adaptive_{index}", batch.id));
+                    assert_eq!(part.ordinal, batch.ordinal * 1000 + index);
+                    assert_eq!(part.kind, batch.kind);
+                    assert_eq!(part.mode, mode);
+                    assert_eq!(part.section_id, batch.section_id);
+                    let source_tokens = part
+                        .items
+                        .iter()
+                        .map(|item| token_estimate(&item.source_text).max(1))
+                        .sum::<usize>();
+                    let guidance_tokens = part
+                        .items
+                        .iter()
+                        .map(|item| {
+                            token_estimate("retry_guidance")
+                                + token_estimate(
+                                    &config.glossary.guidance_by_segment[&item.segment_id.0],
+                                )
+                        })
+                        .sum::<usize>();
+                    assert_eq!(
+                        part.token_estimate,
+                        source_tokens
+                            + guidance_tokens
+                            + token_estimate(&render_batch_prompt_extra(&part.items, &config))
+                    );
+                    if part.items.len() > 1 {
+                        let target = match mode {
+                            BatchMode::MarkerSafe => target.min(10_000),
+                            BatchMode::RunPreserving => target.min(4_000),
+                            _ => target,
+                        }
+                        .max(1);
+                        assert!(part.token_estimate <= target);
+                        assert!(part.items.len() <= batch_config.max_items.max(1));
+                        let run_tokens = if mode == BatchMode::RunPreserving {
+                            part.items
+                                .iter()
+                                .map(|item| item.text_runs.len() * 16)
+                                .sum()
+                        } else {
+                            0
+                        };
+                        assert!(
+                            config
+                                .batch_max_output_tokens
+                                .is_none_or(|cap| source_tokens
+                                    + 128
+                                    + part.items.len() * 64
+                                    + run_tokens
+                                    <= cap as usize)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
