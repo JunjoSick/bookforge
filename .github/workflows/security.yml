@@ -15,16 +15,16 @@ jobs:
   rustsec:
     name: RustSec advisory audit
     runs-on: ubuntu-22.04
-    permissions:
-      checks: write
-      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      - uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit@0.22.2
+      # The CLI reports consistently for PRs and schedules, without attempting
+      # to create issues. Soundness and yanked-package warnings fail the check.
+      - run: cargo audit --deny warnings
 
   codeql:
     name: CodeQL (Rust)
