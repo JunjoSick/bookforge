@@ -505,7 +505,8 @@ impl JobStore {
                     COALESCE(SUM(CASE WHEN NOT EXISTS (
                         SELECT 1 FROM translation_attempts a
                         WHERE a.job_id = s.job_id AND a.segment_id = s.id
-                    ) THEN COALESCE(s.tokens_output, s.output_tokens) ELSE 0 END), 0)
+                    ) THEN COALESCE(s.tokens_output, s.output_tokens) ELSE 0 END), 0),
+                    SUM(CASE WHEN s.attempts > 1 THEN 1 ELSE 0 END)
              FROM segments s WHERE s.job_id = ?1 GROUP BY status",
         )?;
         let rows = stmt.query_map(params![job_id], |row| {
@@ -515,13 +516,15 @@ impl JobStore {
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?;
 
         for row in rows {
-            let (status, count, input_tokens, input_cached_tokens, output_tokens) = row?;
+            let (status, count, input_tokens, input_cached_tokens, output_tokens, retried) = row?;
             let count = count as usize;
             summary.total_segments += count;
+            summary.retried += retried as usize;
             summary.input_tokens += input_tokens as u64;
             summary.input_cached_tokens += input_cached_tokens as u64;
             summary.output_tokens += output_tokens as u64;
@@ -536,12 +539,6 @@ impl JobStore {
                 SegmentStatus::Unknown(_) | SegmentStatus::Queued => {}
             }
         }
-
-        summary.retried = conn.query_row(
-            "SELECT COUNT(*) FROM segments WHERE job_id = ?1 AND attempts > 1",
-            params![job_id],
-            |row| row.get::<_, i64>(0),
-        )? as usize;
 
         Ok(Some(summary))
     }
@@ -562,8 +559,9 @@ impl JobStore {
     /// first. Powers the `watch` job picker and any dashboard job list.
     ///
     /// Runs in three queries total (jobs, per-`(job, status)` segment
-    /// aggregates, retried counts) rather than a per-job N+1 of `get_job` +
-    /// `summary`, which each scanned the segments table again for every job.
+    /// aggregates including retries, attempt-ledger totals) rather than a
+    /// per-job N+1 of `get_job` + `summary`, which each scanned the segments
+    /// table again for every job.
     pub fn list_job_summaries(&self) -> Result<Vec<(JobRecord, JobSummary)>> {
         let conn = self.conn.borrow();
 
@@ -596,7 +594,8 @@ impl JobStore {
                     COALESCE(SUM(CASE WHEN NOT EXISTS (
                         SELECT 1 FROM translation_attempts a
                         WHERE a.job_id = s.job_id AND a.segment_id = s.id
-                    ) THEN COALESCE(s.tokens_output, s.output_tokens) ELSE 0 END), 0)
+                    ) THEN COALESCE(s.tokens_output, s.output_tokens) ELSE 0 END), 0),
+                    SUM(CASE WHEN s.attempts > 1 THEN 1 ELSE 0 END)
              FROM segments s GROUP BY job_id, status",
         )?;
         let seg_rows = seg_stmt.query_map([], |row| {
@@ -607,13 +606,16 @@ impl JobStore {
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
         for row in seg_rows {
-            let (job_id, status, count, input_tokens, input_cached_tokens, output_tokens) = row?;
+            let (job_id, status, count, input_tokens, input_cached_tokens, output_tokens, retried) =
+                row?;
             let summary = aggregates.entry(job_id).or_default();
             let count = count as usize;
             summary.total_segments += count;
+            summary.retried += retried as usize;
             summary.input_tokens += input_tokens as u64;
             summary.input_cached_tokens += input_cached_tokens as u64;
             summary.output_tokens += output_tokens as u64;
@@ -627,17 +629,6 @@ impl JobStore {
                 // they just cannot be bucketed into a lifecycle column.
                 SegmentStatus::Unknown(_) | SegmentStatus::Queued => {}
             }
-        }
-
-        // Retried counts, again in one grouped pass.
-        let mut retried_stmt = conn
-            .prepare("SELECT job_id, COUNT(*) FROM segments WHERE attempts > 1 GROUP BY job_id")?;
-        let retried_rows = retried_stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in retried_rows {
-            let (job_id, retried) = row?;
-            aggregates.entry(job_id).or_default().retried = retried as usize;
         }
 
         // Append the attempt ledger for jobs that have one, ADDING it to the

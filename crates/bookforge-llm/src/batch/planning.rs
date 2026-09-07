@@ -453,20 +453,13 @@ fn group_batches(
     // on this to dispatch earlier sections first.
     let mut ordered_keys: Vec<(bookforge_core::ir::SectionId, BatchMode)> =
         section_mode_groups.keys().cloned().collect();
-    ordered_keys.sort_by(|a, b| {
-        let section_a = section_mode_groups[a]
+    ordered_keys.sort_by_cached_key(|key| {
+        let first_ordinal = section_mode_groups[key]
             .iter()
             .map(|item| item.ordinal)
             .min()
             .unwrap_or(usize::MAX);
-        let section_b = section_mode_groups[b]
-            .iter()
-            .map(|item| item.ordinal)
-            .min()
-            .unwrap_or(usize::MAX);
-        section_a
-            .cmp(&section_b)
-            .then_with(|| (a.1 as u8).cmp(&(b.1 as u8)))
+        (first_ordinal, key.1 as u8)
     });
 
     let target_tokens = mode_target_tokens(config.target_tokens);
@@ -578,15 +571,17 @@ fn item_token_estimate(
     item: &TranslationBatchItem,
     config: Option<&TranslationRunConfig>,
 ) -> usize {
-    let mut estimate = token_estimate(&item.source_text).max(1);
-    let Some(config) = config else {
-        return estimate;
-    };
+    token_estimate(&item.source_text).max(1) + retry_guidance_token_estimate(item, config)
+}
 
-    if let Some(guidance) = config.glossary.guidance_by_segment.get(&item.segment_id.0) {
-        estimate += token_estimate("retry_guidance") + token_estimate(guidance);
-    }
-    estimate
+fn retry_guidance_token_estimate(
+    item: &TranslationBatchItem,
+    config: Option<&TranslationRunConfig>,
+) -> usize {
+    config
+        .and_then(|config| config.glossary.guidance_by_segment.get(&item.segment_id.0))
+        .map(|guidance| token_estimate("retry_guidance") + token_estimate(guidance))
+        .unwrap_or(0)
 }
 
 fn batch_fixed_token_estimate(
@@ -614,7 +609,6 @@ fn expected_batch_output_tokens(mode: BatchMode, items: &[TranslationBatchItem])
         .iter()
         .map(|item| token_estimate(&item.source_text).max(1))
         .sum::<usize>();
-    let json_envelope = 128usize.saturating_add(items.len().saturating_mul(64));
     let run_envelope = if mode == BatchMode::RunPreserving {
         items
             .iter()
@@ -623,9 +617,14 @@ fn expected_batch_output_tokens(mode: BatchMode, items: &[TranslationBatchItem])
     } else {
         0
     };
-    translated_text
+    output_token_estimate(translated_text, items.len(), run_envelope)
+}
+
+fn output_token_estimate(text_tokens: usize, item_count: usize, run_tokens: usize) -> usize {
+    let json_envelope = 128usize.saturating_add(item_count.saturating_mul(64));
+    text_tokens
         .saturating_add(json_envelope)
-        .saturating_add(run_envelope)
+        .saturating_add(run_tokens)
 }
 
 /// The configured provider timeout, when the run surfaces one through its
@@ -794,7 +793,6 @@ pub(super) fn repartition_pending_batches(
             && group.section_id == batch.section_id
         {
             group.items.extend(batch.items);
-            group.token_estimate = batch_token_estimate(&group.items, config);
             continue;
         }
         groups.push(batch);
@@ -803,7 +801,6 @@ pub(super) fn repartition_pending_batches(
     let mut rebuilt = VecDeque::new();
     for (group_index, mut group) in groups.into_iter().enumerate() {
         group.id = format!("runtime_r{revision}_{group_index}");
-        group.token_estimate = batch_token_estimate(&group.items, config);
         let target_tokens = sizer.target_tokens_for_mode(group.mode);
         let max_items = sizer.max_items_for_mode(group.mode);
         rebuilt.extend(repack_batch_with_config(
@@ -836,6 +833,9 @@ fn repack_batch_with_config(
     let mut out = Vec::new();
     let mut current_items = Vec::new();
     let mut current_tokens = 0usize;
+    let mut current_item_tokens = 0usize;
+    let mut current_source_tokens = 0usize;
+    let mut current_run_tokens = 0usize;
     let mut part = 0usize;
     let base_id = batch.id;
     let base_ordinal = batch.ordinal;
@@ -844,13 +844,28 @@ fn repack_batch_with_config(
     let section_id = batch.section_id;
 
     for item in batch.items {
+        let source_tokens = token_estimate(&item.source_text).max(1);
+        let item_tokens = source_tokens + retry_guidance_token_estimate(&item, config);
+        let run_tokens = if mode == BatchMode::RunPreserving {
+            item.text_runs.len().saturating_mul(16)
+        } else {
+            0
+        };
         let would_exceed_items = current_items.len() >= max_items;
         current_items.push(item);
-        let candidate_tokens = batch_token_estimate(&current_items, config);
+        // Text and guidance are additive; glossary overhead is not, since
+        // entries are deduplicated across the candidate batch.
+        let candidate_tokens =
+            current_item_tokens + item_tokens + batch_fixed_token_estimate(&current_items, config);
         let would_exceed_tokens = current_items.len() > 1 && candidate_tokens > target_tokens;
         let would_exceed_output = current_items.len() > 1
-            && configured_batch_output_limit(config)
-                .is_some_and(|limit| expected_batch_output_tokens(mode, &current_items) > limit);
+            && configured_batch_output_limit(config).is_some_and(|limit| {
+                output_token_estimate(
+                    current_source_tokens + source_tokens,
+                    current_items.len(),
+                    current_run_tokens + run_tokens,
+                ) > limit
+            });
         if would_exceed_items || would_exceed_tokens || would_exceed_output {
             let item = current_items
                 .pop()
@@ -865,9 +880,15 @@ fn repack_batch_with_config(
                 section_id: section_id.clone(),
             });
             current_items.push(item);
-            current_tokens = batch_token_estimate(&current_items, config);
+            current_item_tokens = item_tokens;
+            current_source_tokens = source_tokens;
+            current_run_tokens = run_tokens;
+            current_tokens = item_tokens + batch_fixed_token_estimate(&current_items, config);
             part += 1;
         } else {
+            current_item_tokens += item_tokens;
+            current_source_tokens += source_tokens;
+            current_run_tokens += run_tokens;
             current_tokens = candidate_tokens;
         }
     }
