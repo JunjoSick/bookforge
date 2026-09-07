@@ -6920,7 +6920,7 @@ fn benchmark_job_summaries() {
 
 #[test]
 fn summary_retries_include_all_statuses_without_crossing_jobs() {
-    let store = JobStore::open(&temp_path("summary_retry_counts.sqlite")).unwrap();
+    let store = JobStore::open(temp_path("summary_retry_counts.sqlite")).unwrap();
     let first = prune_fixture_job(&store, "summary_retries_first");
     let second = prune_fixture_job(&store, "summary_retries_second");
     let empty = prune_fixture_job(&store, "summary_retries_empty");
