@@ -127,6 +127,64 @@ fn rebuilds_epub_with_patched_xhtml_and_preserved_resources() {
 }
 
 #[test]
+fn packed_notes_extract_and_rebuild_at_matching_dom_paths() {
+    let fixture = create_epub_fixture(
+        "packed-notes",
+        r#"<p id="notes" class="notes"><a id="n1"/><a href="chapter1.xhtml#r1">1</a> First <em>note</em>. <a id="n2"/><a href="chapter1.xhtml#r2">2</a> Second note.</p><p>After notes.</p>"#,
+    );
+    let book = read_epub(&fixture).unwrap();
+    let notes: Vec<_> = book
+        .blocks
+        .iter()
+        .filter(|block| {
+            let text = block_text(block);
+            text.contains("First") || text.contains("Second")
+        })
+        .collect();
+    assert_eq!(notes.len(), 2);
+    let translations: Vec<_> = notes
+        .iter()
+        .map(|block| BlockTranslation {
+            block_id: block.id.clone(),
+            text: block_text(block)
+                .replace("First", "Primo")
+                .replace("Second", "Secondo"),
+        })
+        .collect();
+    let output = fixture.with_extension("rebuilt.epub");
+    rebuild_epub(&book, &translations, &output).unwrap();
+    let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+    let mut chapter = String::new();
+    archive
+        .by_name("OEBPS/chapter1.xhtml")
+        .unwrap()
+        .read_to_string(&mut chapter)
+        .unwrap();
+    assert!(chapter.contains("Primo"));
+    assert!(chapter.contains("Secondo"));
+    assert!(chapter.contains("<em>note</em>"));
+    assert!(chapter.contains("After notes."));
+    for id in ["notes", "n1", "n2"] {
+        assert_eq!(chapter.matches(&format!("id=\"{id}\"")).count(), 1);
+    }
+    for href in ["chapter1.xhtml#r1", "chapter1.xhtml#r2"] {
+        assert!(chapter.contains(href));
+    }
+    let rebuilt = read_epub(&output).unwrap();
+    assert_eq!(book.blocks.len(), rebuilt.blocks.len());
+    for translation in translations {
+        assert!(
+            rebuilt
+                .blocks
+                .iter()
+                .any(|block| block_text(block) == translation.text)
+        );
+    }
+    std::fs::remove_file(fixture).unwrap();
+    std::fs::remove_file(output).unwrap();
+}
+
+#[test]
 fn rebuild_can_safely_replace_the_source_path() {
     let fixture = create_minimal_epub();
     let book = read_epub(&fixture).expect("fixture should parse into IR");
