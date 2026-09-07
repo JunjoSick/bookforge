@@ -78,3 +78,43 @@ These are local writer microbenchmarks, not whole-book or provider-throughput
 claims. Typical prose with few markers improves less; live translation time may
 still be dominated by the provider. Use supplied-book runs to assess practical
 end-to-end impact.
+
+## Glossary selection (2026-09-07)
+
+```bash
+cargo test --release -p bookforge-core --lib benchmark_glossary_selection --locked -- --ignored --nocapture
+```
+
+The fixture uses 128 case-insensitive person terms, two matching names per
+segment, roughly 750 bytes of prose per segment, a section boundary every 25
+segments, and an 800-token glossary budget. Each trial includes three complete
+selections (scope merging, counts, rule selection, budgeting, and output
+allocation/destruction); fixture construction is outside the timer.
+
+Local Linux x86-64 / Rust 1.98.0 release-build medians from five trials per
+implementation, alternating before/after order:
+
+| Segments | Before, three selections | After, three selections | Speedup |
+| --- | ---: | ---: | ---: |
+| 100 | 45.907 ms | 12.651 ms | 3.63× |
+| 1,000 | 468.476 ms | 113.914 ms | 4.11× |
+
+The baseline is `313e4b5` (glossary source unchanged from `e020e2e`). The candidate
+prepares lowercase term strings once, lowercases each segment once per pass,
+and retains only the previous five segments' ordered matching term indices.
+It scans each segment twice for global counts and direct selection instead of
+rescanning previous text for recent-term selection. Scratch storage for recent
+matches is bounded by five segments, rather than the whole book.
+
+A development differential probe compared complete selection structures with
+the original implementation in 960 cases: 160 deterministic fixtures across six
+token budgets. These cover Unicode casing, empty sources, mixed case policies,
+repeated IDs, scope precedence, section transitions, always-active terms, and
+frequency anchors. All matched. Permanent regressions check Unicode matching
+and the ordered five-position recent window alongside existing scope/rule/budget
+tests. The benchmark has no machine-speed assertion.
+
+Glossary selection is used by prompt preparation and cache identity context
+loading. These results measure that shared operation, not database I/O, provider
+latency, or end-to-end book translation. Baseline and candidate test executables
+were saved separately before alternating runs.

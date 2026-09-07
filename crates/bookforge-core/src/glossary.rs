@@ -1,5 +1,5 @@
 use crate::marker::strip_marker_tokens;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -619,25 +619,26 @@ pub fn select_glossary_for_segments(
     budget_tokens: usize,
 ) -> SegmentGlossarySelections {
     let terms = merge_scope_terms(terms);
-    let computed_counts = source_counts(segments, &terms);
+    let matcher = GlossaryMatcher::new(&terms);
+    let computed_counts = source_counts(segments, &matcher);
     let high_frequency = high_frequency_anchors(&terms, &computed_counts, 20);
     let mut entries_by_segment = HashMap::new();
     let mut rules_by_segment = HashMap::new();
     let mut truncated_authoritative_entries = 0usize;
 
+    let mut recent_matches = VecDeque::<Vec<usize>>::with_capacity(5);
     for (index, segment) in segments.iter().enumerate() {
         let mut selected = Vec::<(&GlossaryTerm, GlossarySelectionRule)>::new();
         let mut seen = HashSet::<i64>::new();
 
-        for term in &terms {
-            if term_matches(&segment.source.text, term) {
-                push_term(
-                    &mut selected,
-                    &mut seen,
-                    term,
-                    GlossarySelectionRule::SegmentMatched,
-                );
-            }
+        let matches = matcher.matching_indices(&segment.source.text);
+        for &term_index in &matches {
+            push_term(
+                &mut selected,
+                &mut seen,
+                &terms[term_index],
+                GlossarySelectionRule::SegmentMatched,
+            );
         }
 
         for term in terms.iter().filter(|term| term.always_active) {
@@ -650,21 +651,25 @@ pub fn select_glossary_for_segments(
         }
 
         let start = index.saturating_sub(5);
-        for previous in &segments[start..index] {
+        for (previous, previous_matches) in segments[start..index].iter().zip(&recent_matches) {
             if previous.section_id != segment.section_id {
                 continue;
             }
-            for term in &terms {
-                if term_matches(&previous.source.text, term) {
-                    push_term(
-                        &mut selected,
-                        &mut seen,
-                        term,
-                        GlossarySelectionRule::RecentlyActive,
-                    );
-                }
+            for &term_index in previous_matches {
+                push_term(
+                    &mut selected,
+                    &mut seen,
+                    &terms[term_index],
+                    GlossarySelectionRule::RecentlyActive,
+                );
             }
         }
+        // The window counts all preceding segments, including other sections.
+        // Keep their ordered matches rather than rescanning their source text.
+        if recent_matches.len() == 5 {
+            recent_matches.pop_front();
+        }
+        recent_matches.push_back(matches);
 
         for term in &high_frequency {
             push_term(
@@ -776,16 +781,65 @@ fn estimate_prompt_tokens(term: &GlossaryTerm) -> usize {
     .max(1)
 }
 
-fn source_counts(segments: &[Segment], terms: &[GlossaryTerm]) -> HashMap<i64, usize> {
-    let mut counts = HashMap::new();
-    for term in terms {
-        let count = segments
+/// Prepared source strings preserve the public matcher's Unicode lowercase
+/// semantics while folding each segment only once per pass.
+struct GlossaryMatcher<'a> {
+    terms: &'a [GlossaryTerm],
+    folded_sources: Vec<Option<String>>,
+    needs_folded_text: bool,
+}
+
+impl<'a> GlossaryMatcher<'a> {
+    fn new(terms: &'a [GlossaryTerm]) -> Self {
+        let folded_sources = terms
             .iter()
-            .filter(|segment| term_matches(&segment.source.text, term))
-            .count();
-        counts.insert(term.synthetic_id(), count);
+            .map(|term| {
+                (!term.case_sensitive && !term.source_text.is_empty())
+                    .then(|| term.source_text.to_lowercase())
+            })
+            .collect::<Vec<_>>();
+        let needs_folded_text = folded_sources.iter().any(Option::is_some);
+        Self {
+            terms,
+            folded_sources,
+            needs_folded_text,
+        }
     }
-    counts
+
+    fn matching_indices(&self, text: &str) -> Vec<usize> {
+        let folded_text = self.needs_folded_text.then(|| text.to_lowercase());
+        self.terms
+            .iter()
+            .zip(&self.folded_sources)
+            .enumerate()
+            .filter_map(|(index, (term, folded_source))| {
+                let matched = if term.source_text.is_empty() {
+                    false
+                } else if let Some(source) = folded_source {
+                    folded_text.as_deref().unwrap_or_default().contains(source)
+                } else {
+                    text.contains(&term.source_text)
+                };
+                matched.then_some(index)
+            })
+            .collect()
+    }
+}
+
+fn source_counts(segments: &[Segment], matcher: &GlossaryMatcher<'_>) -> HashMap<i64, usize> {
+    let mut counts = vec![0; matcher.terms.len()];
+    for segment in segments {
+        for index in matcher.matching_indices(&segment.source.text) {
+            counts[index] += 1;
+        }
+    }
+    // Preserve last-term precedence if callers supply duplicate IDs.
+    matcher
+        .terms
+        .iter()
+        .zip(counts)
+        .map(|(term, count)| (term.synthetic_id(), count))
+        .collect()
 }
 
 fn high_frequency_anchors<'a>(
@@ -1225,6 +1279,111 @@ mod tests {
             SegmentSource,
         },
     };
+
+    #[test]
+    fn prepared_matches_preserve_unicode_case_and_empty_source_behavior() {
+        let terms = [
+            "", "ΟΣ", "οσ", "ος", "İ", "i", "Straße", "STRASSE", "É", "東京",
+        ]
+        .into_iter()
+        .flat_map(|source| {
+            [false, true].map(|case_sensitive| {
+                let mut value = term(source, source, GlossaryScopeKind::Book);
+                value.case_sensitive = case_sensitive;
+                value
+            })
+        })
+        .collect::<Vec<_>>();
+        let matcher = GlossaryMatcher::new(&terms);
+        for text in [
+            "",
+            "ΟΣ",
+            "ΟΣΑ",
+            "ος οσ",
+            "İ i I ı",
+            "Straße STRASSE",
+            "É e\u{301}",
+            "東京",
+        ] {
+            let expected = terms
+                .iter()
+                .enumerate()
+                .filter_map(|(i, term)| term_matches(text, term).then_some(i))
+                .collect::<Vec<_>>();
+            assert_eq!(matcher.matching_indices(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn recent_selection_preserves_order_sections_and_five_position_window() {
+        let terms = ["Alpha", "Beta"].map(|source| {
+            let mut value = term(source, source, GlossaryScopeKind::Book);
+            value.category = GlossaryCategory::Phrase;
+            value
+        });
+        let mut segments = (0..8)
+            .map(|i| segment(&format!("seg_{i}"), i, "nothing"))
+            .collect::<Vec<_>>();
+        segments[0].source.text = "Beta".into();
+        segments[1].source.text = "Alpha".into();
+        segments[3].section_id = SectionId("other".into());
+        let selected = select_glossary_for_segments(&segments, &terms, 800);
+        let sources = |i| {
+            selected.entries_by_segment[&format!("seg_{i}")]
+                .iter()
+                .map(|entry| entry.source.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sources(2), ["Beta", "Alpha"]);
+        assert!(sources(3).is_empty());
+        assert_eq!(sources(5), ["Beta", "Alpha"]);
+        assert_eq!(sources(6), ["Alpha"]);
+        assert!(sources(7).is_empty());
+        assert_eq!(
+            selected.rules_by_segment["seg_5"],
+            [GlossarySelectionRule::RecentlyActive; 2]
+        );
+    }
+
+    // Opt-in timing probe; correctness tests below have no machine-speed gate.
+    #[test]
+    #[ignore]
+    fn benchmark_glossary_selection() {
+        for segment_count in [100, 1_000] {
+            let terms = (0..128)
+                .map(|i| {
+                    term(
+                        &format!("Name{i:03}"),
+                        &format!("Nome{i:03}"),
+                        GlossaryScopeKind::Book,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let segments = (0..segment_count)
+                .map(|i| {
+                    let text = format!(
+                        "{} NAME{:03} meets Name{:03}.",
+                        "Ordinary prose fills the page. ".repeat(24),
+                        i % 128,
+                        (i + 17) % 128
+                    );
+                    let mut value = segment(&format!("seg_{i}"), i, &text);
+                    value.section_id = SectionId(format!("sec_{}", i / 25));
+                    value
+                })
+                .collect::<Vec<_>>();
+            let start = std::time::Instant::now();
+            for _ in 0..3 {
+                let selected =
+                    std::hint::black_box(select_glossary_for_segments(&segments, &terms, 800));
+                assert_eq!(selected.entries_by_segment.len(), segment_count);
+            }
+            eprintln!(
+                "glossary segments={segment_count} terms=128 iterations=3 elapsed={:?}",
+                start.elapsed()
+            );
+        }
+    }
 
     #[test]
     fn book_scope_overrides_series_scope() {
