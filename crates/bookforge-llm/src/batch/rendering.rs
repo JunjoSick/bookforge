@@ -169,7 +169,7 @@ pub fn batch_item_validation_error(
     }
     violations.extend(protected_span_violations(item, translation));
     if let Some(error) = source_copy_error(item, translation, validate_source_copy, section_title) {
-        violations.push(hard_violation(error));
+        violations.push(source_copy_violation(item, translation, error));
     }
     let protected_spans = protected_span_texts(item);
     if let Some(error) = target_language.and_then(|target_language| {
@@ -194,7 +194,7 @@ fn turbo_batch_item_validation_error(
 ) -> Option<BatchItemValidationError> {
     let mut violations = protected_span_violations(item, translation);
     if let Some(error) = source_copy_error(item, translation, validate_source_copy, section_title) {
-        violations.push(hard_violation(error));
+        violations.push(source_copy_violation(item, translation, error));
     }
     let protected_spans = protected_span_texts(item);
     if let Some(error) = target_language.and_then(|target_language| {
@@ -208,6 +208,18 @@ fn turbo_batch_item_validation_error(
         violations.push(hard_violation(error));
     }
     BatchItemValidationError::new(violations)
+}
+
+fn source_copy_violation(
+    item: &TranslationBatchItem,
+    translation: &str,
+    message: String,
+) -> BatchItemValidationViolation {
+    let mut violation = hard_violation(message);
+    if intentionally_unchanged_block(&item.kind, &item.source_text, translation) {
+        violation.severity = QaFindingSeverity::Warning;
+    }
+    violation
 }
 
 fn hard_violation(message: String) -> BatchItemValidationViolation {
@@ -1275,20 +1287,60 @@ mod finding_attribution_tests {
         let item = item_with_kind("title", "Cannibal Capitalism");
         let validation =
             batch_item_validation_error(&item, "Cannibal Capitalism", true, None, None)
-                .expect("an unchanged title must still fail validation as before");
+                .expect("an unchanged title remains visible for editorial review");
         assert!(
-            validation.has_errors(),
-            "error-string behavior is unchanged"
+            !validation.has_errors(),
+            "an editorial warning must not reject the translation"
         );
 
         let findings = validation.engine_findings(&item, "Cannibal Capitalism");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].kind, QaFindingKind::SourceCopyUnchanged);
         // Kind-aware severity: an intentionally unchanged title is editorially
-        // expected, so the finding is a warning even though the legacy
-        // violation (and thus the item failure) stays an error.
+        // expected, so both the finding and acceptance use warning severity.
         assert_eq!(findings[0].severity, QaFindingSeverity::Warning);
         assert_eq!(findings[0].block_id.as_deref(), Some("block_title_001"));
+    }
+
+    #[test]
+    fn batch_accepts_reference_warnings_but_rejects_copied_prose() {
+        for mode in [
+            BatchMode::Plain,
+            BatchMode::MarkerSafe,
+            BatchMode::TurboTextOnly,
+        ] {
+            for (kind, source, accepted) in [
+                ("title", "Cannibal Capitalism", true),
+                ("paragraph", "Nancy Fraser", true),
+                ("paragraph", LONG_PROSE, false),
+            ] {
+                let item = item_with_kind(kind, source);
+                let batch = TranslationBatch {
+                    id: "batch".into(),
+                    ordinal: 0,
+                    mode,
+                    kind: BatchKind::Translation,
+                    section_id: item.section_id.clone(),
+                    items: vec![item],
+                    token_estimate: 1,
+                };
+                let response =
+                    serde_json::json!({"items": [{"id": "item", "translation": source}]})
+                        .to_string();
+                let result =
+                    parse_batch_response_with_validation(&batch, &response, true, None, None)
+                        .unwrap();
+                if accepted {
+                    assert!(result.failures.is_empty(), "{mode:?}: {kind}");
+                    assert_eq!(result.translations.len(), 1);
+                    assert_eq!(result.translations[0].text, source);
+                    assert!(result.translations[0].warning.is_some());
+                } else {
+                    assert!(result.translations.is_empty());
+                    assert_eq!(result.failures.len(), 1);
+                }
+            }
+        }
     }
 
     #[test]
