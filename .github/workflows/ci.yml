@@ -101,7 +101,7 @@ jobs:
         run: |
           for ($iteration = 1; $iteration -le 30; $iteration++) {
             Write-Host "Launch-claim diagnostic iteration $iteration/30"
-            cargo test -p bookforge-cli --bin bookforge --locked commands:: -- --test-threads=32
+            cargo test -p bookforge-cli --bin bookforge --locked commands:: -- --test-threads=32 --show-output
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
