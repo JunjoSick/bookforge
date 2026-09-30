@@ -1615,6 +1615,11 @@ fn build_mutation_fixture_for_provider(
         .update_job_config_snapshot(&job.id, &snapshot)
         .expect("snapshot should persist");
 
+    eprintln!(
+        "FIXTURE thread={:?} job={}",
+        std::thread::current().name(),
+        job.id
+    );
     MutationFixture {
         store_path,
         output_path,

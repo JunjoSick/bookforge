@@ -769,6 +769,13 @@ impl RuntimeLaunchClaim {
                 ReplaceMode::CreateExclusive,
             ) {
                 Ok(()) => {
+                    #[cfg(test)]
+                    eprintln!(
+                        "CLAIM ACQUIRED thread={:?} job={} nonce={}",
+                        std::thread::current().name(),
+                        job_id,
+                        nonce
+                    );
                     return Ok(Some(Self {
                         path: path.clone(),
                         job_id: job_id.to_string(),
@@ -778,6 +785,15 @@ impl RuntimeLaunchClaim {
                     }));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    #[cfg(test)]
+                    eprintln!(
+                        "CLAIM BLOCKED thread={:?} job={} path={} error={:?} contents={:?}",
+                        std::thread::current().name(),
+                        job_id,
+                        path.display(),
+                        error,
+                        fs::read_to_string(&path)
+                    );
                     match read_launch_claim_document(&path) {
                         Some(doc) if !launch_claim_is_reclaimable(&doc, stale_after, now_ms()) => {
                             return Ok(None);
