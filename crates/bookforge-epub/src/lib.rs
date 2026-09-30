@@ -6,6 +6,7 @@
 // `DEFAULT_ARCHIVE_LIMITS` is unchanged; see `archive_limits` module docs.
 #[doc(hidden)]
 pub mod archive_limits;
+mod packed_notes;
 pub mod reader;
 pub mod reflow;
 pub(crate) mod util;

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Accept batch translations whose only source-copy finding is an editorial
+  warning for a title, heading, or short proper-name line. Previously the
+  report called these warnings while the parser still rejected the blocks.
+  Unchanged prose and structural violations continue to fail validation.
+
+- Split packed EPUB endnotes at consecutive anchored note backlinks during
+  reading and rebuilding, keeping note text, formatting, and link targets intact.
+  Converted books no longer send an entire multi-note paragraph as one oversized
+  translation block.
+
 Dogfooding round on a real 400-page-scale EPUB (English→Italian, DeepSeek):
 fixes for every issue the live run surfaced.
 

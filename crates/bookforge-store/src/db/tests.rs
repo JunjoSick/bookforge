@@ -3927,10 +3927,22 @@ fn unknown_segment_status_counts_toward_totals_but_no_bucket() {
     let store = JobStore::open(&db_path).expect("store opens with warning");
     assert!(!store.take_diagnostics().is_empty());
 
+    store
+        .conn
+        .borrow()
+        .execute("UPDATE segments SET attempts = 2 WHERE id = 's2'", [])
+        .unwrap();
     let summary = store.summary("j").expect("summary").expect("job exists");
     assert_eq!(summary.total_segments, 2, "unknown still counts");
     assert_eq!(summary.succeeded, 1);
     assert_eq!(summary.failed, 0, "unbucketed values stay unbucketed");
+    assert_eq!(
+        summary.retried, 1,
+        "unknown statuses still count as retried"
+    );
+    let listed = store.list_job_summaries().unwrap();
+    assert_eq!(listed[0].1.retried, 1);
+    assert_eq!(listed[0].1.total_segments, 2);
 
     let records = store.segment_records("j").expect("records");
     assert_eq!(
@@ -6860,4 +6872,114 @@ fn resume_identity_uses_full_ordered_neighborhood_for_glossary_selection() {
 
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_file(input_path);
+}
+
+#[test]
+#[ignore]
+fn benchmark_job_summaries() {
+    for job_count in [8, 64] {
+        let db_path = temp_path("summary_benchmark.sqlite");
+        let store = JobStore::open(&db_path).unwrap();
+        let segments = (0..1_000)
+            .map(|i| segment(&format!("seg{i}"), i))
+            .collect::<Vec<_>>();
+        for i in 0..job_count {
+            let job = prune_fixture_job(&store, &format!("summary_bench_{i}"));
+            store
+                .insert_segments(&job.id, &segments, "v1", "mock", "mock-prefix", "bench")
+                .unwrap();
+        }
+        store.conn.borrow().execute_batch(
+            "UPDATE segments SET attempts = ordinal % 4,
+                status = CASE ordinal % 3 WHEN 0 THEN 'succeeded' WHEN 1 THEN 'failed' ELSE 'queued' END,
+                input_tokens = 11, tokens_input_cached = 2, output_tokens = 7;
+             INSERT INTO translation_attempts (job_id, segment_id, phase, attempt_ordinal,
+                 provider, model, outcome, input_tokens, input_cached_tokens, output_tokens, created_at)
+             SELECT job_id, id, 'primary', 1, 'mock', 'mock-prefix', 'success', 17, 3, 9, '2026-09-07'
+             FROM segments WHERE ordinal % 2 = 0;"
+        ).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..3 {
+            let summaries = std::hint::black_box(store.list_job_summaries().unwrap());
+            assert_eq!(summaries.len(), job_count);
+            for (_, summary) in &summaries {
+                assert_eq!(summary.total_segments, 1_000);
+                assert_eq!(summary.retried, 500);
+                assert_eq!(summary.input_tokens, 14_000);
+                assert_eq!(summary.input_cached_tokens, 2_500);
+                assert_eq!(summary.output_tokens, 8_000);
+            }
+        }
+        eprintln!(
+            "db summaries jobs={job_count} segments={} iterations=3 elapsed={:?}",
+            job_count * 1_000,
+            start.elapsed()
+        );
+    }
+}
+
+#[test]
+fn summary_retries_include_all_statuses_without_crossing_jobs() {
+    let store = JobStore::open(temp_path("summary_retry_counts.sqlite")).unwrap();
+    let first = prune_fixture_job(&store, "summary_retries_first");
+    let second = prune_fixture_job(&store, "summary_retries_second");
+    let empty = prune_fixture_job(&store, "summary_retries_empty");
+    let statuses = [
+        "succeeded",
+        "failed",
+        "needs_review",
+        "retry_pending",
+        "skipped_cached",
+        "queued",
+        "queued",
+    ];
+    let segments = (0..statuses.len())
+        .map(|i| segment(&format!("seg{i}"), i))
+        .collect::<Vec<_>>();
+    store
+        .insert_segments(
+            &first.id,
+            &segments,
+            "v1",
+            "mock",
+            "mock-prefix",
+            "retry_counts",
+        )
+        .unwrap();
+    store
+        .insert_segments(
+            &second.id,
+            &segments[..1],
+            "v1",
+            "mock",
+            "mock-prefix",
+            "retry_counts",
+        )
+        .unwrap();
+    for (i, status) in statuses.iter().enumerate() {
+        store
+            .conn
+            .borrow()
+            .execute(
+                "UPDATE segments SET status = ?1, attempts = ?2 WHERE job_id = ?3 AND id = ?4",
+                params![status, i as i64, first.id, segments[i].id.0],
+            )
+            .unwrap();
+    }
+    let summaries = store.list_job_summaries().unwrap();
+    assert_eq!(summaries.len(), 3);
+    for (job, total, retried) in [(&first, 7, 5), (&second, 1, 0), (&empty, 0, 0)] {
+        let single = store.summary(&job.id).unwrap().unwrap();
+        let listed = &summaries
+            .iter()
+            .find(|(record, _)| record.id == job.id)
+            .unwrap()
+            .1;
+        assert_eq!(single.total_segments, total);
+        assert_eq!(single.retried, retried);
+        assert_eq!(listed.total_segments, total);
+        assert_eq!(listed.retried, retried);
+        assert_eq!(format!("{single:?}"), format!("{listed:?}"));
+    }
+    assert!(store.summary("missing_job").unwrap().is_none());
 }
