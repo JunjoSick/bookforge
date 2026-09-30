@@ -96,6 +96,14 @@ jobs:
         with:
           key: windows-msvc
       - run: cargo test --workspace --locked
+      - name: Diagnose launch-claim contention (temporary)
+        shell: pwsh
+        run: |
+          for ($iteration = 1; $iteration -le 30; $iteration++) {
+            Write-Host "Launch-claim diagnostic iteration $iteration/30"
+            cargo test -p bookforge-cli --bin bookforge --locked commands:: -- --test-threads=32
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
   msrv:
     name: msrv (1.88.0)
