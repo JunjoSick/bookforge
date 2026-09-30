@@ -415,29 +415,25 @@ fn visible_body_chars(xhtml: &str) -> Result<usize> {
     loop {
         let counting = (in_body || in_title) && skip_depth == 0;
         match reader.read_event()? {
-            Event::Start(element) => match local_name(element.name().as_ref()) {
+            Event::Start(element) => match local_name(element.name().as_ref().as_bytes()) {
                 b"body" => in_body = true,
                 b"title" if !in_body => in_title = true,
                 b"script" | b"style" if in_body => skip_depth += 1,
                 _ => {}
             },
-            Event::End(element) => match local_name(element.name().as_ref()) {
+            Event::End(element) => match local_name(element.name().as_ref().as_bytes()) {
                 b"body" => in_body = false,
                 b"title" => in_title = false,
                 b"script" | b"style" if skip_depth > 0 => skip_depth -= 1,
                 _ => {}
             },
             Event::Text(text) if counting => {
-                let value = text
-                    .html_content()
-                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                let value = text.html_content();
                 count += non_whitespace_chars(&value);
             }
             Event::CData(text) if counting => {
-                let value = text
-                    .decode()
-                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-                count += non_whitespace_chars(&value);
+                let value = text.as_ref();
+                count += non_whitespace_chars(value);
             }
             Event::GeneralRef(reference) if counting => {
                 count += non_whitespace_chars(&resolve_general_ref(&reference)?);
@@ -488,7 +484,7 @@ fn locate_package(
     loop {
         match reader.read_event()? {
             Event::Empty(element) | Event::Start(element)
-                if local_name(element.name().as_ref()) == b"rootfile" =>
+                if local_name(element.name().as_ref().as_bytes()) == b"rootfile" =>
             {
                 if let Some(path) = attr_value(&reader, &element, b"full-path")? {
                     return Ok(path);
@@ -520,9 +516,10 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
 
     loop {
         match reader.read_event()? {
-            Event::Start(element) => match local_name(element.name().as_ref()) {
+            Event::Start(element) => match local_name(element.name().as_ref().as_bytes()) {
                 b"title" | b"creator" | b"language" => {
-                    current_text_element = Some(local_name(element.name().as_ref()).to_vec());
+                    current_text_element =
+                        Some(local_name(element.name().as_ref().as_bytes()).to_vec());
                 }
                 b"item" => {
                     parse_manifest_item(&reader, &element, &mut seen_manifest_ids, &mut manifest)?
@@ -535,7 +532,7 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
                 }
                 _ => {}
             },
-            Event::Empty(element) => match local_name(element.name().as_ref()) {
+            Event::Empty(element) => match local_name(element.name().as_ref().as_bytes()) {
                 b"item" => {
                     parse_manifest_item(&reader, &element, &mut seen_manifest_ids, &mut manifest)?
                 }
@@ -544,11 +541,7 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
             },
             Event::Text(text) => {
                 if let Some(name) = current_text_element.as_deref() {
-                    let value = text
-                        .html_content()
-                        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?
-                        .trim()
-                        .to_string();
+                    let value = text.html_content().trim().to_string();
                     if !value.is_empty() {
                         match name {
                             b"title" if metadata.title.is_none() => metadata.title = Some(value),
@@ -564,7 +557,7 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
             Event::End(element)
                 if current_text_element
                     .as_deref()
-                    .is_some_and(|name| name == local_name(element.name().as_ref())) =>
+                    .is_some_and(|name| name == local_name(element.name().as_ref().as_bytes())) =>
             {
                 current_text_element = None;
             }
@@ -649,19 +642,16 @@ fn required_attr(
 }
 
 fn attr_value(
-    reader: &Reader<&[u8]>,
+    _reader: &Reader<&[u8]>,
     element: &BytesStart<'_>,
     attr_name: &[u8],
 ) -> Result<Option<String>> {
     for attr in element.attributes() {
         let attr = attr.map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-        if local_name(attr.key.as_ref()) == attr_name {
+        if local_name(attr.key.as_ref().as_bytes()) == attr_name {
             return Ok(Some(
-                attr.decoded_and_normalized_value(
-                    quick_xml::XmlVersion::Implicit1_0,
-                    reader.decoder(),
-                )?
-                .into_owned(),
+                attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                    .into_owned(),
             ));
         }
     }
@@ -722,7 +712,7 @@ fn extract_xml_text_element_blocks(
     loop {
         match reader.read_event()? {
             Event::Start(element) => {
-                let name = local_name(element.name().as_ref()).to_vec();
+                let name = local_name(element.name().as_ref().as_bytes()).to_vec();
                 if element_stack.len() >= MAX_READER_NESTING_DEPTH {
                     return Err(BookforgeError::InvalidInput(format!(
                         "EPUB XML nesting exceeds the supported depth of {MAX_READER_NESTING_DEPTH}"
@@ -742,18 +732,14 @@ fn extract_xml_text_element_blocks(
             }
             Event::Text(text) => {
                 if let Some(capture) = active_capture.as_mut() {
-                    let value = text
-                        .html_content()
-                        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                    let value = text.html_content();
                     capture.text.push_str(&value);
                 }
             }
             Event::CData(text) => {
                 if let Some(capture) = active_capture.as_mut() {
-                    let value = text
-                        .decode()
-                        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-                    capture.text.push_str(&value);
+                    let value = text.as_ref();
+                    capture.text.push_str(value);
                 }
             }
             Event::GeneralRef(reference) => {
@@ -944,7 +930,7 @@ fn extract_blocks(
     loop {
         match reader.read_event()? {
             Event::Start(element) => {
-                let name = local_name(element.name().as_ref()).to_vec();
+                let name = local_name(element.name().as_ref().as_bytes()).to_vec();
                 if element_stack.len() >= MAX_READER_NESTING_DEPTH {
                     return Err(BookforgeError::InvalidInput(format!(
                         "EPUB XML nesting exceeds the supported depth of {MAX_READER_NESTING_DEPTH}"
@@ -990,7 +976,7 @@ fn extract_blocks(
                 }
             }
             Event::Empty(element) => {
-                let name = local_name(element.name().as_ref()).to_vec();
+                let name = local_name(element.name().as_ref().as_bytes()).to_vec();
                 // Sibling bookkeeping must advance even though self-closing
                 // block elements (<p/>, <td/>) carry no text and therefore
                 // produce no block — emitting one would send an empty
@@ -1004,9 +990,7 @@ fn extract_blocks(
                 }
             }
             Event::Text(text) => {
-                let value = text
-                    .html_content()
-                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                let value = text.html_content();
                 handle_text(
                     &value,
                     &mut active_block,
@@ -1020,11 +1004,9 @@ fn extract_blocks(
                 );
             }
             Event::CData(text) => {
-                let value = text
-                    .decode()
-                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                let value = text.as_ref();
                 handle_text(
-                    &value,
+                    value,
                     &mut active_block,
                     &mut element_stack,
                     &current_path,
@@ -1236,7 +1218,7 @@ fn block_kind(name: &[u8], element: &BytesStart<'_>) -> Result<Option<BlockKind>
 fn has_epub_type(element: &BytesStart<'_>, expected: &[u8]) -> Result<bool> {
     for attr in element.attributes() {
         let attr = attr.map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-        if local_name(attr.key.as_ref()) == b"type" {
+        if local_name(attr.key.as_ref().as_bytes()) == b"type" {
             let value = attr
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
                 .into_owned();
