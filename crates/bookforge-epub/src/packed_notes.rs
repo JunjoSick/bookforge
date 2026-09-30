@@ -20,7 +20,7 @@ struct Child {
 
 impl Child {
     fn new(element: &BytesStart<'_>, offset: usize) -> Result<Self> {
-        let anchor = local_name(element.name().as_ref()) == b"a";
+        let anchor = local_name(element.name().as_ref().as_bytes()) == b"a";
         let id = anchor && attr_value_unescaped(element, b"id")?.is_some_and(|id| !id.is_empty());
         let backlink = anchor
             && attr_value_unescaped(element, b"href")?.is_some_and(|href| {
@@ -104,7 +104,7 @@ impl Paragraph {
         for attribute in self.opening.attributes() {
             let attribute =
                 attribute.map_err(|error| BookforgeError::InvalidInput(error.to_string()))?;
-            if !matches!(attribute.key.as_ref(), b"id" | b"xml:id") {
+            if !matches!(attribute.key.as_ref().as_bytes(), b"id" | b"xml:id") {
                 repeated.push_attribute(attribute);
             }
         }
@@ -140,7 +140,7 @@ pub(crate) fn normalize_packed_notes(xhtml: &str) -> Result<Cow<'_, str>> {
             Event::Start(element) => {
                 depth += 1;
                 if suppressed_at.is_none()
-                    && never_translate_element(local_name(element.name().as_ref()))
+                    && never_translate_element(local_name(element.name().as_ref().as_bytes()))
                 {
                     suppressed_at = Some(depth);
                 }
@@ -148,7 +148,9 @@ pub(crate) fn normalize_packed_notes(xhtml: &str) -> Result<Cow<'_, str>> {
                     if depth == p.depth + 1 {
                         p.child = Some(Child::new(&element, offset)?);
                     }
-                } else if suppressed_at.is_none() && local_name(element.name().as_ref()) == b"p" {
+                } else if suppressed_at.is_none()
+                    && local_name(element.name().as_ref().as_bytes()) == b"p"
+                {
                     paragraph = Some(Paragraph {
                         depth,
                         opening: element.into_owned(),
@@ -189,20 +191,12 @@ pub(crate) fn normalize_packed_notes(xhtml: &str) -> Result<Cow<'_, str>> {
             }
             Event::Text(text) => {
                 if let Some(p) = &mut paragraph {
-                    p.text(
-                        &text
-                            .html_content()
-                            .map_err(|error| BookforgeError::InvalidInput(error.to_string()))?,
-                    );
+                    p.text(&text.html_content());
                 }
             }
             Event::CData(text) => {
                 if let Some(p) = &mut paragraph {
-                    p.text(
-                        &text
-                            .decode()
-                            .map_err(|error| BookforgeError::InvalidInput(error.to_string()))?,
-                    );
+                    p.text(text.as_ref());
                 }
             }
             Event::GeneralRef(reference) => {

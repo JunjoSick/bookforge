@@ -408,18 +408,18 @@ fn pre_texts(epub: &Path, member: &str) -> Vec<String> {
     let mut out = Vec::new();
     loop {
         match reader.read_event().expect("fixture XHTML should parse") {
-            Event::Start(e) if e.local_name().as_ref() == b"pre" => {
+            Event::Start(e) if e.local_name().as_ref().as_bytes() == b"pre" => {
                 depth += 1;
             }
-            Event::End(e) if e.local_name().as_ref() == b"pre" => {
+            Event::End(e) if e.local_name().as_ref().as_bytes() == b"pre" => {
                 depth -= 1;
                 if depth == 0 {
                     out.push(std::mem::take(&mut current));
                 }
             }
-            Event::Text(t) if depth > 0 => current.push_str(&t.decode().unwrap()),
+            Event::Text(t) if depth > 0 => current.push_str(t.as_ref()),
             Event::CData(t) if depth > 0 => {
-                current.push_str(&t.decode().unwrap());
+                current.push_str(t.as_ref());
             }
             Event::Eof => break,
             _ => {}
@@ -436,10 +436,10 @@ fn extract_text(xhtml: &str, within: Option<&[u8]>) -> String {
     let mut text = String::new();
     loop {
         match reader.read_event().expect("XHTML should parse") {
-            Event::Start(e) if e.local_name().as_ref() == scope => in_scope = true,
-            Event::End(e) if e.local_name().as_ref() == scope => in_scope = false,
-            Event::Text(t) if in_scope => text.push_str(&t.decode().unwrap()),
-            Event::CData(t) if in_scope => text.push_str(&t.decode().unwrap()),
+            Event::Start(e) if e.local_name().as_ref().as_bytes() == scope => in_scope = true,
+            Event::End(e) if e.local_name().as_ref().as_bytes() == scope => in_scope = false,
+            Event::Text(t) if in_scope => text.push_str(t.as_ref()),
+            Event::CData(t) if in_scope => text.push_str(t.as_ref()),
             Event::Eof => break,
             _ => {}
         }

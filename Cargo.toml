@@ -31,7 +31,7 @@ console = "0.16"
 indicatif = "0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-quick-xml = { version = "0.41", features = ["escape-html"] }
+quick-xml = { version = "0.42", features = ["escape-html"] }
 # Trimmed to deflate only: EPUBs need Deflated + Stored (built-in), so avoid
 # pulling every codec (bzip2/zstd/lzma/aes-crypto chains incl. zstd-sys's C
 # build) and zip's optional `time`. The zlib-rs backend keeps flate2 pure-Rust

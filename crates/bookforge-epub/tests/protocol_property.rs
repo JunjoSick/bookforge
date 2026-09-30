@@ -686,8 +686,8 @@ fn resolve_reference(reference: &quick_xml::events::BytesRef<'_>) -> String {
     if let Ok(Some(ch)) = reference.resolve_char_ref() {
         return ch.to_string();
     }
-    let name = reference.decode().expect("reference should decode");
-    match quick_xml::escape::resolve_html5_entity(&name) {
+    let name = reference.as_ref();
+    match quick_xml::escape::resolve_html5_entity(name) {
         Some(resolved) => resolved.to_string(),
         None => format!("&{name};"),
     }
@@ -703,14 +703,10 @@ fn decoded_visible_text(xhtml: &str) -> String {
     loop {
         match reader.read_event().expect("fixture XHTML should parse") {
             Event::Text(text) => {
-                collected.push(
-                    text.html_content()
-                        .expect("text should decode")
-                        .into_owned(),
-                );
+                collected.push(text.html_content().into_owned());
             }
             Event::CData(text) => {
-                collected.push(text.decode().expect("cdata should decode").into_owned());
+                collected.push(text.to_string());
             }
             Event::GeneralRef(reference) => {
                 collected.push(resolve_reference(&reference));
@@ -741,7 +737,7 @@ fn is_well_formed(xhtml: &str) -> bool {
 }
 
 fn local_tag(element: &BytesStart<'_>) -> String {
-    let qualified = String::from_utf8_lossy(element.name().as_ref()).into_owned();
+    let qualified = String::from_utf8_lossy(element.name().as_ref().as_bytes()).into_owned();
     qualified.rsplit(':').next().unwrap_or_default().to_string()
 }
 

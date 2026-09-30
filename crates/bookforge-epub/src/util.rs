@@ -54,7 +54,7 @@ pub(crate) fn attr_value_unescaped(
 ) -> Result<Option<String>> {
     for attr in element.attributes() {
         let attr = attr.map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-        if local_name(attr.key.as_ref()) == attr_name {
+        if local_name(attr.key.as_ref().as_bytes()) == attr_name {
             return Ok(Some(
                 attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?
                     .into_owned(),
@@ -76,10 +76,8 @@ pub(crate) fn resolve_general_ref(reference: &quick_xml::events::BytesRef<'_>) -
     {
         return Ok(ch.to_string());
     }
-    let name = reference
-        .decode()
-        .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-    if let Some(resolved) = quick_xml::escape::resolve_html5_entity(&name) {
+    let name = reference.as_ref();
+    if let Some(resolved) = quick_xml::escape::resolve_html5_entity(name) {
         return Ok(resolved.to_string());
     }
     tracing::warn!(entity = %name, "preserving unresolvable entity reference literally");

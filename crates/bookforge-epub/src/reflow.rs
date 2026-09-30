@@ -310,7 +310,7 @@ fn cleanup_pdf_nodes(nodes: &mut Vec<XmlNode>) -> Result<usize> {
     for node in nodes.iter_mut() {
         if let XmlNode::Element(element) = node {
             removed += cleanup_pdf_nodes(&mut element.children)?;
-            if local_name(element.start.name().as_ref()) == b"p" {
+            if local_name(element.start.name().as_ref().as_bytes()) == b"p" {
                 removed += remove_trailing_pdf_folio(&mut element.children)?;
             }
         }
@@ -358,7 +358,9 @@ fn cleanup_pdf_nodes(nodes: &mut Vec<XmlNode>) -> Result<usize> {
 
 fn paragraph_text(node: &XmlNode) -> Result<Option<String>> {
     match node {
-        XmlNode::Element(element) if local_name(element.start.name().as_ref()) == b"p" => {
+        XmlNode::Element(element)
+            if local_name(element.start.name().as_ref().as_bytes()) == b"p" =>
+        {
             Ok(Some(visible_text(&element.children)?))
         }
         _ => Ok(None),
@@ -379,7 +381,7 @@ fn is_numeric_heading(node: &XmlNode) -> Result<bool> {
         return Ok(false);
     };
     if !matches!(
-        local_name(element.start.name().as_ref()),
+        local_name(element.start.name().as_ref().as_bytes()),
         b"h1" | b"h2" | b"h3"
     ) {
         return Ok(false);
@@ -401,7 +403,7 @@ fn is_pdf_whitespace_paragraph(node: &XmlNode) -> Result<bool> {
     let XmlNode::Element(element) = node else {
         return Ok(false);
     };
-    if local_name(element.start.name().as_ref()) != b"p" {
+    if local_name(element.start.name().as_ref().as_bytes()) != b"p" {
         return Ok(false);
     }
     let class = attr_value_unescaped(&element.start, b"class")?.unwrap_or_default();
@@ -413,7 +415,7 @@ fn is_page_anchor_paragraph(node: &XmlNode) -> Result<bool> {
     let XmlNode::Element(element) = node else {
         return Ok(false);
     };
-    Ok(local_name(element.start.name().as_ref()) == b"p"
+    Ok(local_name(element.start.name().as_ref().as_bytes()) == b"p"
         && contains_page_anchor(&element.children)?)
 }
 
@@ -425,7 +427,7 @@ fn contains_page_anchor(nodes: &[XmlNode]) -> Result<bool> {
             XmlNode::Leaf(_) => None,
         };
         if let Some(start) = start
-            && local_name(start.name().as_ref()) == b"a"
+            && local_name(start.name().as_ref().as_bytes()) == b"a"
             && attr_value_unescaped(start, b"id")?
                 .as_deref()
                 .is_some_and(is_pdf_page_anchor_id)
@@ -456,7 +458,7 @@ fn remove_trailing_pdf_folio(nodes: &mut Vec<XmlNode>) -> Result<usize> {
     let XmlNode::Element(element) = &nodes[index] else {
         return Ok(0);
     };
-    if local_name(element.start.name().as_ref()) != b"b"
+    if local_name(element.start.name().as_ref().as_bytes()) != b"b"
         || attr_value_unescaped(&element.start, b"class")?.as_deref() != Some("calibre7")
     {
         return Ok(0);
@@ -568,7 +570,7 @@ fn parse_xml(xml: &str) -> Result<(Vec<XmlNode>, usize)> {
 }
 
 fn paragraph_index_for(start: &BytesStart<'_>, paragraph_count: &mut usize) -> Option<usize> {
-    if local_name(start.name().as_ref()) == b"p" {
+    if local_name(start.name().as_ref().as_bytes()) == b"p" {
         let index = *paragraph_count;
         *paragraph_count += 1;
         Some(index)
@@ -778,7 +780,7 @@ fn append_merged_children(
 }
 
 fn is_paragraph_element(node: &XmlNode) -> bool {
-    matches!(node, XmlNode::Element(element) if local_name(element.start.name().as_ref()) == b"p")
+    matches!(node, XmlNode::Element(element) if local_name(element.start.name().as_ref().as_bytes()) == b"p")
 }
 
 fn count_paragraphs(nodes: &[XmlNode]) -> usize {
@@ -788,10 +790,12 @@ fn count_paragraphs(nodes: &[XmlNode]) -> usize {
 fn count_paragraphs_in_node(node: &XmlNode) -> usize {
     match node {
         XmlNode::Element(element) => {
-            usize::from(local_name(element.start.name().as_ref()) == b"p")
+            usize::from(local_name(element.start.name().as_ref().as_bytes()) == b"p")
                 + count_paragraphs(&element.children)
         }
-        XmlNode::Empty { start } => usize::from(local_name(start.name().as_ref()) == b"p"),
+        XmlNode::Empty { start } => {
+            usize::from(local_name(start.name().as_ref().as_bytes()) == b"p")
+        }
         XmlNode::Leaf(_) => 0,
     }
 }
@@ -816,18 +820,10 @@ fn append_visible_text(nodes: &[XmlNode], text: &mut String) -> Result<()> {
 fn append_event_text(event: &Event<'static>, text: &mut String) -> Result<()> {
     match event {
         Event::Text(value) => {
-            text.push_str(
-                &value
-                    .html_content()
-                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?,
-            );
+            text.push_str(&value.html_content());
         }
         Event::CData(value) => {
-            text.push_str(
-                &value
-                    .decode()
-                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?,
-            );
+            text.push_str(value.as_ref());
         }
         Event::GeneralRef(reference) => {
             text.push_str(&resolve_general_ref(reference)?);
@@ -839,16 +835,10 @@ fn append_event_text(event: &Event<'static>, text: &mut String) -> Result<()> {
 
 fn is_whitespace_node(node: &XmlNode) -> Result<bool> {
     match node {
-        XmlNode::Leaf(Event::Text(text)) => Ok(text
-            .html_content()
-            .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?
-            .chars()
-            .all(char::is_whitespace)),
-        XmlNode::Leaf(Event::CData(text)) => Ok(text
-            .decode()
-            .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?
-            .chars()
-            .all(char::is_whitespace)),
+        XmlNode::Leaf(Event::Text(text)) => {
+            Ok(text.html_content().chars().all(char::is_whitespace))
+        }
+        XmlNode::Leaf(Event::CData(text)) => Ok(text.as_ref().chars().all(char::is_whitespace)),
         XmlNode::Leaf(Event::GeneralRef(reference)) => Ok(resolve_general_ref(reference)?
             .chars()
             .all(char::is_whitespace)),
@@ -860,14 +850,14 @@ fn contains_nested_block_or_replaced(nodes: &[XmlNode]) -> bool {
     nodes.iter().any(|node| match node {
         XmlNode::Element(element) => {
             let raw_name = element.start.name();
-            let name = local_name(raw_name.as_ref());
+            let name = local_name(raw_name.as_ref().as_bytes());
             is_block_level_name(name)
                 || is_replaced_content_name(name)
                 || contains_nested_block_or_replaced(&element.children)
         }
         XmlNode::Empty { start } => {
             let raw_name = start.name();
-            let name = local_name(raw_name.as_ref());
+            let name = local_name(raw_name.as_ref().as_bytes());
             is_block_level_name(name) || is_replaced_content_name(name)
         }
         XmlNode::Leaf(_) => false,
@@ -944,9 +934,7 @@ fn trim_trailing_whitespace_node(node: &mut XmlNode) -> Result<TrimResult> {
             Ok(TrimResult::Done)
         }
         XmlNode::Leaf(Event::Text(text)) => {
-            let value = text
-                .html_content()
-                .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+            let value = text.html_content();
             let trimmed = value.trim_end();
             if trimmed.is_empty() {
                 Ok(TrimResult::RemoveNode)
@@ -958,9 +946,7 @@ fn trim_trailing_whitespace_node(node: &mut XmlNode) -> Result<TrimResult> {
             }
         }
         XmlNode::Leaf(Event::CData(text)) => {
-            let value = text
-                .decode()
-                .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+            let value = text.as_ref();
             let trimmed = value.trim_end();
             if trimmed.is_empty() {
                 Ok(TrimResult::RemoveNode)
@@ -996,9 +982,7 @@ fn trim_leading_whitespace_node(node: &mut XmlNode) -> Result<TrimResult> {
             Ok(TrimResult::Done)
         }
         XmlNode::Leaf(Event::Text(text)) => {
-            let value = text
-                .html_content()
-                .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+            let value = text.html_content();
             let trimmed = value.trim_start();
             if trimmed.is_empty() {
                 Ok(TrimResult::RemoveNode)
@@ -1010,9 +994,7 @@ fn trim_leading_whitespace_node(node: &mut XmlNode) -> Result<TrimResult> {
             }
         }
         XmlNode::Leaf(Event::CData(text)) => {
-            let value = text
-                .decode()
-                .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+            let value = text.as_ref();
             let trimmed = value.trim_start();
             if trimmed.is_empty() {
                 Ok(TrimResult::RemoveNode)
@@ -1045,9 +1027,7 @@ fn remove_trailing_hyphen(nodes: &mut [XmlNode]) -> Result<bool> {
                 }
             }
             XmlNode::Leaf(Event::Text(text)) => {
-                let value = text
-                    .html_content()
-                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                let value = text.html_content();
                 if value.trim().is_empty() {
                     continue;
                 }
@@ -1058,13 +1038,11 @@ fn remove_trailing_hyphen(nodes: &mut [XmlNode]) -> Result<bool> {
                 return Ok(false);
             }
             XmlNode::Leaf(Event::CData(text)) => {
-                let value = text
-                    .decode()
-                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                let value = text.as_ref();
                 if value.trim().is_empty() {
                     continue;
                 }
-                if let Some(stripped) = strip_trailing_hyphen(&value) {
+                if let Some(stripped) = strip_trailing_hyphen(value) {
                     *text = BytesCData::new(&stripped).into_owned();
                     return Ok(true);
                 }
