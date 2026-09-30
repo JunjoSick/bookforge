@@ -35,7 +35,7 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
     loop {
         match reader.read_event()? {
             Event::Start(element) | Event::Empty(element)
-                if local(element.name().as_ref()) == b"page" =>
+                if local(element.name().as_ref().as_bytes()) == b"page" =>
             {
                 if let Some(page) = current_page.take() {
                     pages.push(page);
@@ -46,12 +46,9 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                 for attr in element.attributes() {
                     let attr = attr.map_err(|err| PdfError::InvalidInput(err.to_string()))?;
                     let value = attr
-                        .decoded_and_normalized_value(
-                            quick_xml::XmlVersion::Implicit1_0,
-                            reader.decoder(),
-                        )
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map_err(|err| PdfError::InvalidInput(err.to_string()))?;
-                    match local(attr.key.as_ref()) {
+                    match local(attr.key.as_ref().as_bytes()) {
                         b"number" => number = value.parse().unwrap_or(0),
                         b"width" => width = parse_coord(&value),
                         b"height" => height = parse_coord(&value),
@@ -67,7 +64,7 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                     font_sizes: HashMap::new(),
                 });
             }
-            Event::Empty(element) if local(element.name().as_ref()) == b"fontspec" => {
+            Event::Empty(element) if local(element.name().as_ref().as_bytes()) == b"fontspec" => {
                 let Some(page) = current_page.as_mut() else {
                     continue;
                 };
@@ -76,12 +73,9 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                 for attr in element.attributes() {
                     let attr = attr.map_err(|err| PdfError::InvalidInput(err.to_string()))?;
                     let value = attr
-                        .decoded_and_normalized_value(
-                            quick_xml::XmlVersion::Implicit1_0,
-                            reader.decoder(),
-                        )
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map_err(|err| PdfError::InvalidInput(err.to_string()))?;
-                    match local(attr.key.as_ref()) {
+                    match local(attr.key.as_ref().as_bytes()) {
                         b"id" => id = value.parse::<u32>().ok(),
                         b"size" => size = Some(parse_coord(&value).unsigned_abs()),
                         _ => {}
@@ -91,7 +85,7 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                     page.font_sizes.insert(id, size);
                 }
             }
-            Event::Start(element) if local(element.name().as_ref()) == b"text" => {
+            Event::Start(element) if local(element.name().as_ref().as_bytes()) == b"text" => {
                 let mut fragment = Fragment {
                     top: 0,
                     left: 0,
@@ -103,12 +97,9 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                 for attr in element.attributes() {
                     let attr = attr.map_err(|err| PdfError::InvalidInput(err.to_string()))?;
                     let value = attr
-                        .decoded_and_normalized_value(
-                            quick_xml::XmlVersion::Implicit1_0,
-                            reader.decoder(),
-                        )
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map_err(|err| PdfError::InvalidInput(err.to_string()))?;
-                    match local(attr.key.as_ref()) {
+                    match local(attr.key.as_ref().as_bytes()) {
                         b"top" => fragment.top = parse_coord(&value),
                         b"left" => fragment.left = parse_coord(&value),
                         b"width" => fragment.width = parse_coord(&value),
@@ -122,7 +113,7 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                 italic_depth = 0;
             }
             Event::Start(element) | Event::Empty(element)
-                if local(element.name().as_ref()) == b"image" =>
+                if local(element.name().as_ref().as_bytes()) == b"image" =>
             {
                 let Some(page) = current_page.as_mut() else {
                     continue;
@@ -137,12 +128,9 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                 for attr in element.attributes() {
                     let attr = attr.map_err(|err| PdfError::InvalidInput(err.to_string()))?;
                     let value = attr
-                        .decoded_and_normalized_value(
-                            quick_xml::XmlVersion::Implicit1_0,
-                            reader.decoder(),
-                        )
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map_err(|err| PdfError::InvalidInput(err.to_string()))?;
-                    match local(attr.key.as_ref()) {
+                    match local(attr.key.as_ref().as_bytes()) {
                         b"top" => region.top = parse_coord(&value),
                         b"left" => region.left = parse_coord(&value),
                         b"width" => region.width = parse_coord(&value),
@@ -154,14 +142,14 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                 page.images.push(region);
             }
             Event::Start(element) if current_fragment.is_some() => {
-                match local(element.name().as_ref()) {
+                match local(element.name().as_ref().as_bytes()) {
                     b"b" => bold_depth += 1,
                     b"i" => italic_depth += 1,
                     _ => {}
                 }
             }
             Event::End(element) if current_fragment.is_some() => {
-                match local(element.name().as_ref()) {
+                match local(element.name().as_ref().as_bytes()) {
                     b"text" => {
                         let fragment = current_fragment.take().expect("checked above");
                         if let Some(page) = current_page.as_mut()
@@ -177,9 +165,7 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
             }
             Event::Text(text) => {
                 if let Some(fragment) = current_fragment.as_mut() {
-                    let value = text
-                        .html_content()
-                        .map_err(|err| PdfError::InvalidInput(err.to_string()))?;
+                    let value = text.html_content();
                     push_span(fragment, &value, bold_depth > 0, italic_depth > 0);
                 }
             }
@@ -191,16 +177,14 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                     {
                         push_span(fragment, &ch.to_string(), bold_depth > 0, italic_depth > 0);
                     } else {
-                        let name = reference
-                            .decode()
-                            .map_err(|err| PdfError::InvalidInput(err.to_string()))?;
-                        if let Some(value) = quick_xml::escape::resolve_html5_entity(&name) {
+                        let name = reference.as_ref();
+                        if let Some(value) = quick_xml::escape::resolve_html5_entity(name) {
                             push_span(fragment, value, bold_depth > 0, italic_depth > 0);
                         }
                     }
                 }
             }
-            Event::End(element) if local(element.name().as_ref()) == b"page" => {
+            Event::End(element) if local(element.name().as_ref().as_bytes()) == b"page" => {
                 if let Some(page) = current_page.take() {
                     pages.push(page);
                 }
@@ -302,5 +286,44 @@ mod tests {
 
         let right = &page.fragments[2];
         assert_eq!(right.spans[0].text, "Right column & more.");
+    }
+
+    #[test]
+    fn string_events_preserve_entities_coordinates_and_nested_styles() {
+        let xml = r#"<pdf2xml xmlns:p="urn:pdf"><p:page number="2" width="918.4" height="1188.6">
+          <p:fontspec id="3" size="11.5"/>
+          <p:text top="10.6" left="-2.5" width="40.2" height="12.8" font="3">Café &#x6771;&#20140; &amp; <b>bold <i>&eacute;</i></b> tail</p:text>
+          <p:image top="1.6" left="2.4" width="3.5" height="4.4" src="fig&#45;1&amp;2.png"/>
+        </p:page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).unwrap();
+        let page = &pages[0];
+        assert_eq!((page.number, page.width, page.height), (2, 918, 1189));
+        assert_eq!(page.font_sizes.get(&3), Some(&12));
+        let fragment = &page.fragments[0];
+        assert_eq!(
+            (
+                fragment.top,
+                fragment.left,
+                fragment.width,
+                fragment.height,
+                fragment.font
+            ),
+            (11, -3, 40, 13, 3)
+        );
+        assert_eq!(
+            fragment
+                .spans
+                .iter()
+                .map(|span| (span.text.as_str(), span.bold, span.italic))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Café 東京 & ", false, false),
+                ("bold ", true, false),
+                ("é", true, true),
+                (" tail", false, false),
+            ]
+        );
+        assert_eq!(page.images[0].src.as_deref(), Some("fig-1&2.png"));
+        assert!(parse_pdf2xml("<pdf2xml><page><text>broken</page></text></pdf2xml>").is_err());
     }
 }

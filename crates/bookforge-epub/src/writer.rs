@@ -528,7 +528,8 @@ fn patch_opf_language(opf: &str, target_language: &str) -> Result<String> {
     loop {
         match reader.read_event()? {
             Event::Start(element)
-                if !found_language && local_name(element.name().as_ref()) == b"language" =>
+                if !found_language
+                    && local_name(element.name().as_ref().as_bytes()) == b"language" =>
             {
                 found_language = true;
                 in_language = true;
@@ -536,7 +537,8 @@ fn patch_opf_language(opf: &str, target_language: &str) -> Result<String> {
                 writer.write_event(Event::Start(element))?;
             }
             Event::Empty(element)
-                if !found_language && local_name(element.name().as_ref()) == b"language" =>
+                if !found_language
+                    && local_name(element.name().as_ref().as_bytes()) == b"language" =>
             {
                 found_language = true;
                 writer.write_event(Event::Start(element.to_owned()))?;
@@ -550,7 +552,7 @@ fn patch_opf_language(opf: &str, target_language: &str) -> Result<String> {
                 }
             }
             Event::End(element)
-                if in_language && local_name(element.name().as_ref()) == b"language" =>
+                if in_language && local_name(element.name().as_ref().as_bytes()) == b"language" =>
             {
                 if !wrote_language {
                     writer.write_event(Event::Text(BytesText::new(&language_tag)))?;
@@ -591,16 +593,20 @@ fn patch_opf_bilingual_language(opf: &str, target_language: &str) -> Result<Stri
 
     loop {
         match reader.read_event()? {
-            Event::Start(element) if local_name(element.name().as_ref()) == b"language" => {
+            Event::Start(element)
+                if local_name(element.name().as_ref().as_bytes()) == b"language" =>
+            {
                 found_language = true;
                 in_language = true;
-                language_end_name = Some(element.name().as_ref().to_vec());
+                language_end_name = Some(element.name().as_ref().as_bytes().to_vec());
                 writer.write_event(Event::Start(element))?;
             }
-            Event::Empty(element) if local_name(element.name().as_ref()) == b"language" => {
+            Event::Empty(element)
+                if local_name(element.name().as_ref().as_bytes()) == b"language" =>
+            {
                 found_language = true;
                 let end = element.to_end();
-                let end_name = end.name().as_ref().to_vec();
+                let end_name = end.name().as_ref().as_bytes().to_vec();
                 writer.write_event(Event::Start(element.to_owned()))?;
                 writer.write_event(Event::End(end))?;
                 if !inserted {
@@ -609,12 +615,12 @@ fn patch_opf_bilingual_language(opf: &str, target_language: &str) -> Result<Stri
                 }
             }
             Event::End(element)
-                if in_language && local_name(element.name().as_ref()) == b"language" =>
+                if in_language && local_name(element.name().as_ref().as_bytes()) == b"language" =>
             {
                 in_language = false;
                 let end_name = language_end_name
                     .take()
-                    .unwrap_or_else(|| element.name().as_ref().to_vec());
+                    .unwrap_or_else(|| element.name().as_ref().as_bytes().to_vec());
                 writer.write_event(Event::End(element))?;
                 if !inserted {
                     write_language_element(&mut writer, &end_name, &language_tag)?;
@@ -645,28 +651,28 @@ fn opf_language_tags(opf: &str) -> Result<Vec<String>> {
 
     loop {
         match reader.read_event()? {
-            Event::Start(element) if local_name(element.name().as_ref()) == b"language" => {
+            Event::Start(element)
+                if local_name(element.name().as_ref().as_bytes()) == b"language" =>
+            {
                 in_language = true;
             }
             Event::Text(text) if in_language => {
-                let value = text
-                    .html_content()
-                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                let value = text.html_content();
                 let value = value.trim();
                 if !value.is_empty() {
                     tags.push(value.to_string());
                 }
             }
             Event::CData(text) if in_language => {
-                let value = text
-                    .decode()
-                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
+                let value = text.as_ref();
                 let value = value.trim();
                 if !value.is_empty() {
                     tags.push(value.to_string());
                 }
             }
-            Event::End(element) if local_name(element.name().as_ref()) == b"language" => {
+            Event::End(element)
+                if local_name(element.name().as_ref().as_bytes()) == b"language" =>
+            {
                 in_language = false;
             }
             Event::Eof => break,
@@ -705,12 +711,14 @@ fn patch_opf_stylesheet_manifest(opf: &str, href: &str) -> Result<String> {
 
     loop {
         match reader.read_event()? {
-            Event::Start(element) if local_name(element.name().as_ref()) == b"manifest" => {
+            Event::Start(element)
+                if local_name(element.name().as_ref().as_bytes()) == b"manifest" =>
+            {
                 in_manifest = true;
                 writer.write_event(Event::Start(element))?;
             }
             Event::End(element)
-                if in_manifest && local_name(element.name().as_ref()) == b"manifest" =>
+                if in_manifest && local_name(element.name().as_ref().as_bytes()) == b"manifest" =>
             {
                 write_stylesheet_manifest_item(&mut writer, &item_id, href)?;
                 inserted = true;
@@ -738,7 +746,7 @@ fn opf_manifest_has_href(opf: &str, href: &str) -> Result<bool> {
     loop {
         match reader.read_event()? {
             Event::Start(element) | Event::Empty(element)
-                if local_name(element.name().as_ref()) == b"item" =>
+                if local_name(element.name().as_ref().as_bytes()) == b"item" =>
             {
                 if attr_value_unescaped(&element, b"href")?.as_deref() == Some(href) {
                     return Ok(true);
@@ -760,7 +768,7 @@ fn unique_manifest_id(opf: &str, base: &str) -> Result<String> {
     loop {
         match reader.read_event()? {
             Event::Start(element) | Event::Empty(element)
-                if local_name(element.name().as_ref()) == b"item" =>
+                if local_name(element.name().as_ref().as_bytes()) == b"item" =>
             {
                 if let Some(id) = attr_value_unescaped(&element, b"id")? {
                     ids.insert(id);
@@ -852,7 +860,8 @@ fn patch_opf_creator(opf: &str, creator: &str) -> Result<String> {
     loop {
         match reader.read_event()? {
             Event::Start(element)
-                if !found_creator && local_name(element.name().as_ref()) == b"creator" =>
+                if !found_creator
+                    && local_name(element.name().as_ref().as_bytes()) == b"creator" =>
             {
                 found_creator = true;
                 in_creator = true;
@@ -860,7 +869,8 @@ fn patch_opf_creator(opf: &str, creator: &str) -> Result<String> {
                 writer.write_event(Event::Start(element))?;
             }
             Event::Empty(element)
-                if !found_creator && local_name(element.name().as_ref()) == b"creator" =>
+                if !found_creator
+                    && local_name(element.name().as_ref().as_bytes()) == b"creator" =>
             {
                 found_creator = true;
                 writer.write_event(Event::Start(element.to_owned()))?;
@@ -874,7 +884,7 @@ fn patch_opf_creator(opf: &str, creator: &str) -> Result<String> {
                 }
             }
             Event::End(element)
-                if in_creator && local_name(element.name().as_ref()) == b"creator" =>
+                if in_creator && local_name(element.name().as_ref().as_bytes()) == b"creator" =>
             {
                 if !wrote_creator {
                     writer.write_event(Event::Text(BytesText::new(creator)))?;
@@ -885,7 +895,7 @@ fn patch_opf_creator(opf: &str, creator: &str) -> Result<String> {
             Event::End(element)
                 if !found_creator
                     && !inserted_creator
-                    && local_name(element.name().as_ref()) == b"metadata" =>
+                    && local_name(element.name().as_ref().as_bytes()) == b"metadata" =>
             {
                 let mut creator_element = quick_xml::events::BytesStart::new("dc:creator");
                 creator_element.push_attribute(("xmlns:dc", "http://purl.org/dc/elements/1.1/"));
@@ -916,10 +926,10 @@ fn patch_xhtml_language(xhtml: &str, target_language: &str) -> Result<String> {
 
     loop {
         match reader.read_event()? {
-            Event::Start(element) if local_name(element.name().as_ref()) == b"html" => {
+            Event::Start(element) if local_name(element.name().as_ref().as_bytes()) == b"html" => {
                 write_xhtml_root_with_language(&mut writer, &element, &language_tag, false)?;
             }
-            Event::Empty(element) if local_name(element.name().as_ref()) == b"html" => {
+            Event::Empty(element) if local_name(element.name().as_ref().as_bytes()) == b"html" => {
                 write_xhtml_root_with_language(&mut writer, &element, &language_tag, true)?;
             }
             Event::Eof => break,
@@ -939,12 +949,12 @@ fn write_xhtml_root_with_language(
     empty: bool,
 ) -> Result<()> {
     let source_name = source.name();
-    let name = String::from_utf8_lossy(source_name.as_ref()).into_owned();
+    let name = source_name.as_ref().to_owned();
     let mut element = quick_xml::events::BytesStart::new(name.as_str());
     let mut attributes = Vec::<(String, String)>::new();
     for attr in source.attributes() {
         let attr = attr.map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+        let key = String::from_utf8_lossy(attr.key.as_ref().as_bytes()).into_owned();
         if key == "lang" || key == "xml:lang" {
             continue;
         }
@@ -980,7 +990,7 @@ fn inject_stylesheet_link(xhtml: &str, href: &str) -> Result<String> {
 
     loop {
         match reader.read_event()? {
-            Event::End(element) if local_name(element.name().as_ref()) == b"head" => {
+            Event::End(element) if local_name(element.name().as_ref().as_bytes()) == b"head" => {
                 write_stylesheet_link(&mut writer, href)?;
                 inserted = true;
                 writer.write_event(Event::End(element))?;
@@ -1006,7 +1016,7 @@ fn xhtml_has_stylesheet_href(xhtml: &str, href: &str) -> Result<bool> {
     loop {
         match reader.read_event()? {
             Event::Start(element) | Event::Empty(element)
-                if local_name(element.name().as_ref()) == b"link" =>
+                if local_name(element.name().as_ref().as_bytes()) == b"link" =>
             {
                 if attr_value_unescaped(&element, b"href")?.as_deref() == Some(href) {
                     return Ok(true);
@@ -1110,7 +1120,7 @@ fn patch_xhtml_with_specs(
     loop {
         match reader.read_event()? {
             Event::Start(element) => {
-                let name = local_name(element.name().as_ref()).to_vec();
+                let name = local_name(element.name().as_ref().as_bytes()).to_vec();
                 let path = enter_element(&mut stack, &name);
                 writer.write_event(Event::Start(element.borrow()))?;
 
@@ -1154,7 +1164,7 @@ fn patch_xhtml_with_specs(
                     match options.mode {
                         BilingualMode::Replace => {
                             let name = element.name();
-                            let name_str = String::from_utf8_lossy(name.as_ref()).into_owned();
+                            let name_str = name.as_ref().to_owned();
                             writer.write_event(Event::Start(element.borrow()))?;
                             writer.write_event(translation_text_event(patch.translation))?;
                             writer.write_event(Event::End(BytesEnd::new(name_str)))?;
@@ -1178,10 +1188,7 @@ fn patch_xhtml_with_specs(
             // every text node that is non-whitespace after entity
             // decoding consumes one index in its parent frame.
             Event::Text(text) => {
-                let non_whitespace = text
-                    .html_content()
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(true);
+                let non_whitespace = !text.html_content().trim().is_empty();
                 match text_node_patch(&patch_map, &mut stack, non_whitespace) {
                     Some(patch) => match options.mode {
                         BilingualMode::Replace => {
@@ -1207,10 +1214,7 @@ fn patch_xhtml_with_specs(
                 }
             }
             Event::CData(text) => {
-                let non_whitespace = text
-                    .decode()
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(true);
+                let non_whitespace = !text.trim().is_empty();
                 match text_node_patch(&patch_map, &mut stack, non_whitespace) {
                     Some(patch) => match options.mode {
                         BilingualMode::Replace => {
@@ -1472,7 +1476,7 @@ fn append_action(
     }
 
     let element_name = original_start.name();
-    let name = local_name(element_name.as_ref());
+    let name = local_name(element_name.as_ref().as_bytes());
     match mode {
         BilingualMode::Replace => AppendAction::Skip,
         BilingualMode::AppendBlock => match name {
@@ -1529,14 +1533,8 @@ fn write_events(writer: &mut Writer<Vec<u8>>, events: &[Event<'static>]) -> Resu
 
 fn source_has_visible_text(events: &[Event<'static>]) -> bool {
     events.iter().any(|event| match event {
-        Event::Text(text) => text
-            .html_content()
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(true),
-        Event::CData(text) => text
-            .decode()
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(true),
+        Event::Text(text) => !text.html_content().trim().is_empty(),
+        Event::CData(text) => !text.trim().is_empty(),
         _ => false,
     })
 }
@@ -1550,7 +1548,7 @@ fn write_events_with_inline_in_last_paragraph(
     path: &[usize],
 ) -> Result<()> {
     let insert_at = events.iter().rposition(
-        |event| matches!(event, Event::End(end) if local_name(end.name().as_ref()) == b"p"),
+        |event| matches!(event, Event::End(end) if local_name(end.name().as_ref().as_bytes()) == b"p"),
     );
 
     if let Some(insert_at) = insert_at {
@@ -1639,9 +1637,11 @@ fn flatten_block_level_events(events: Vec<RenderedEvent>) -> Vec<Event<'static>>
         }
         let block_level = match &rendered.event {
             Event::Start(element) | Event::Empty(element) => {
-                is_block_level_name(local_name(element.name().as_ref()))
+                is_block_level_name(local_name(element.name().as_ref().as_bytes()))
             }
-            Event::End(element) => is_block_level_name(local_name(element.name().as_ref())),
+            Event::End(element) => {
+                is_block_level_name(local_name(element.name().as_ref().as_bytes()))
+            }
             _ => false,
         };
         if block_level {
@@ -1658,9 +1658,7 @@ fn flatten_block_level_events(events: Vec<RenderedEvent>) -> Vec<Event<'static>>
         while let Some(last) = output.last() {
             let trims = !last.verbatim
                 && match &last.event {
-                    Event::Text(text) => text
-                        .html_content()
-                        .is_ok_and(|value| value.trim().is_empty()),
+                    Event::Text(text) => text.html_content().trim().is_empty(),
                     _ => false,
                 };
             if !trims {
@@ -1690,7 +1688,9 @@ fn last_event_ends_with_whitespace(events: &[RenderedEvent]) -> bool {
 
 fn text_ends_with_whitespace(text: &BytesText<'_>) -> bool {
     text.html_content()
-        .is_ok_and(|value| value.chars().next_back().is_some_and(char::is_whitespace))
+        .chars()
+        .next_back()
+        .is_some_and(char::is_whitespace)
 }
 
 fn write_translation_element(
@@ -1924,7 +1924,8 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
                 Event::End(end) => {
                     capture.events.push(event.clone());
                     if capture.child_depth == 0
-                        && local_name(end.name().as_ref()) == capture.root_name.as_slice()
+                        && local_name(end.name().as_ref().as_bytes())
+                            == capture.root_name.as_slice()
                     {
                         let capture = raw_capture.take().expect("checked above");
                         scan.raw_events.insert(capture.id.clone(), capture.events);
@@ -1946,7 +1947,7 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
 
         match event {
             Event::Start(element) => {
-                let name = local_name(element.name().as_ref()).to_vec();
+                let name = local_name(element.name().as_ref().as_bytes()).to_vec();
                 let id = marker_id("m", marker_ordinal);
                 marker_ordinal += 1;
                 insert_pending_boundary(
@@ -2051,14 +2052,8 @@ fn insert_pending_boundary(
 
 fn event_text_is_whitespace(event: &Event<'static>) -> Result<Option<bool>> {
     let value = match event {
-        Event::Text(text) => text
-            .html_content()
-            .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?
-            .into_owned(),
-        Event::CData(text) => text
-            .decode()
-            .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?
-            .into_owned(),
+        Event::Text(text) => text.html_content().into_owned(),
+        Event::CData(text) => text.to_string(),
         Event::GeneralRef(reference) => {
             if let Some(ch) = reference
                 .resolve_char_ref()
@@ -2066,11 +2061,9 @@ fn event_text_is_whitespace(event: &Event<'static>) -> Result<Option<bool>> {
             {
                 ch.to_string()
             } else {
-                let name = reference
-                    .decode()
-                    .map_err(|err| BookforgeError::InvalidInput(err.to_string()))?;
-                quick_xml::escape::resolve_html5_entity(&name)
-                    .unwrap_or(&name)
+                let name = reference.as_ref();
+                quick_xml::escape::resolve_html5_entity(name)
+                    .unwrap_or(name)
                     .to_string()
             }
         }
@@ -2131,8 +2124,8 @@ fn restore_inline_boundary_spaces(
 
 fn event_text<'a>(event: &'a Event<'static>) -> Option<std::borrow::Cow<'a, str>> {
     match event {
-        Event::Text(text) => text.decode().ok(),
-        Event::CData(text) => text.decode().ok(),
+        Event::Text(text) => Some(std::borrow::Cow::Borrowed(text.as_ref())),
+        Event::CData(text) => Some(std::borrow::Cow::Borrowed(text.as_ref())),
         _ => None,
     }
 }

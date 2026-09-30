@@ -21,7 +21,7 @@ use bookforge_core::{config::BilingualMode, segment::BlockTranslation};
 use bookforge_epub::{
     RebuildOptions,
     archive_limits::{ArchiveLimits, read_archive_text, validate_archive_metadata},
-    inspect_epub, read_epub, rebuild_epub_with_options, text_coverage,
+    inspect_epub, read_epub, rebuild_epub, rebuild_epub_with_options, text_coverage,
 };
 use quick_xml::{Reader, events::Event};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
@@ -1146,4 +1146,93 @@ fn epub3_twin_has_identical_coverage_metric_independent_of_nav() {
         b"EPUB2Fixture".len() + b"Omega".len() + b"Alphabeta.".len(),
         "captured == title + heading + paragraph non-whitespace chars"
     );
+}
+
+/// The 0.42 string-backed event API must preserve the existing EPUB contract:
+/// UTF-8 metadata/prose, namespace-qualified tags, entity semantics, CDATA,
+/// exact whitespace in protected preformatted text, and opaque ZIP resources.
+#[test]
+fn xml_string_api_preserves_unicode_entities_namespaces_and_archive_members() {
+    let dir = tmp_dir("xml-string-api");
+    let input = dir.join("in.epub");
+    let output = dir.join("out.epub");
+    let xhtml = chapter(
+        "Unicode",
+        "<x:p xmlns:x=\"http://www.w3.org/1999/xhtml\" id=\"café\" title=\"A &amp; B\">Café 東京 &#x1F642; &amp; &nbsp; &unknown; <![CDATA[<raw>& content]]></x:p><pre>  keep\tthese\n  spaces  </pre>",
+    );
+    let image = vec![0, 255, 128, 42, 0, 13, 10];
+    write_archive(
+        &input,
+        &[
+            ("META-INF/container.xml", utf8(CONTAINER)),
+            ("OEBPS/content.opf", utf8(&opf_single("Unicode"))),
+            ("OEBPS/ch1.xhtml", utf8(&xhtml)),
+            ("OEBPS/image.bin", image.clone()),
+        ],
+    );
+    let book = read_epub(&input).expect("UTF-8 chapter should parse");
+    let block = book
+        .blocks
+        .iter()
+        .find(|block| marked(block).contains("Café"))
+        .unwrap();
+    let text = marked(block);
+    assert!(text.contains("Café 東京 🙂 &"), "{text}");
+    assert!(
+        text.contains("&unknown;"),
+        "unknown references must remain visible: {text}"
+    );
+    assert!(
+        text.contains("<raw>& content"),
+        "CDATA must remain literal: {text}"
+    );
+    rebuild_epub(
+        &book,
+        &[BlockTranslation {
+            block_id: block.id.clone(),
+            text: "Tradotto 東京 🙂 & completo".to_string(),
+        }],
+        &output,
+    )
+    .unwrap();
+    let rebuilt = entry_text(&output, "OEBPS/ch1.xhtml");
+    assert!(is_well_formed(&rebuilt));
+    assert!(
+        rebuilt.contains(
+            "<x:p xmlns:x=\"http://www.w3.org/1999/xhtml\" id=\"café\" title=\"A &amp; B\">"
+        ),
+        "{rebuilt}"
+    );
+    assert!(
+        rebuilt.contains("Tradotto 東京 🙂 &amp; completo"),
+        "{rebuilt}"
+    );
+    assert!(
+        rebuilt.contains("<pre>  keep\tthese\n  spaces  </pre>"),
+        "{rebuilt}"
+    );
+    assert_eq!(entry_bytes(&output, "OEBPS/image.bin"), image);
+    assert_eq!(entry_bytes(&output, "mimetype"), MIMETYPE);
+    let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+    let first = archive.by_index(0).unwrap();
+    assert_eq!(first.name(), "mimetype");
+    assert_eq!(first.compression(), CompressionMethod::Stored);
+}
+
+#[test]
+fn xml_string_api_keeps_non_utf8_epub_text_rejected() {
+    let dir = tmp_dir("xml-encoding");
+    for (label, document) in [
+        ("latin1", b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><html><body><p>caf\xe9</p></body></html>".to_vec()),
+        ("utf16", [vec![0xff, 0xfe], "<html><body><p>text</p></body></html>".encode_utf16().flat_map(u16::to_le_bytes).collect()].concat()),
+        ("invalid_utf8", b"<html><body><p>bad\xff</p></body></html>".to_vec()),
+    ] {
+        let input = dir.join(format!("{label}.epub"));
+        write_archive(&input, &[
+            ("META-INF/container.xml", utf8(CONTAINER)),
+            ("OEBPS/content.opf", utf8(&opf_single("Encoding"))),
+            ("OEBPS/ch1.xhtml", document),
+        ]);
+        assert!(expect_read_error(&input).contains("not UTF-8"), "{label}");
+    }
 }
