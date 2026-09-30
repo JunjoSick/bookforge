@@ -721,11 +721,6 @@ mod supervisor_tests {
                 series_id: None,
             })
             .expect("job created");
-        eprintln!(
-            "FIXTURE thread={:?} job={}",
-            std::thread::current().name(),
-            job.id
-        );
         (store, db_path, job.id)
     }
 
