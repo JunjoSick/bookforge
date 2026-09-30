@@ -12,9 +12,25 @@ pub(super) fn job_exists_on(conn: &Connection, job_id: &str) -> Result<bool> {
 
 impl JobStore {
     pub fn create_job(&self, request: CreateJob<'_>) -> Result<JobRecord> {
+        self.create_job_with_clock(request, unix_timestamp_nanos)
+    }
+
+    fn create_job_with_clock(
+        &self,
+        request: CreateJob<'_>,
+        clock: impl FnOnce() -> u128,
+    ) -> Result<JobRecord> {
         let input_hash = file_hash(request.input)?;
-        let id = format!("job_{}_{}", unix_timestamp_nanos(), &input_hash[..12]);
-        let now = timestamp_string();
+        let now_nanos = clock();
+        // Runtime sidecars are keyed by job id even across separate stores.
+        // Wall clocks can repeat (coarse resolution or a backwards adjustment),
+        // so timestamp + input hash can make unrelated jobs share a launch claim.
+        let mut identity = [0u8; 16];
+        getrandom::fill(&mut identity).map_err(|error| {
+            std::io::Error::other(format!("failed to generate job identity: {error}"))
+        })?;
+        let id = format!("job_{:032x}", u128::from_be_bytes(identity));
+        let now = (now_nanos / 1_000_000_000).to_string();
         let input_path = request.input.to_path_buf();
         let output_path = request.output.to_path_buf();
         let conn = self.conn.borrow();
@@ -762,4 +778,57 @@ pub(super) fn touch_job_unless_status_on(
     }
     conn.execute(&sql, params.as_slice())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn identical_inputs_at_the_same_clock_tick_have_distinct_runtime_paths() {
+        // Distinct stores still publish sidecars in the same .bookforge/runs
+        // namespace. A clock tick plus input hash cannot identify both jobs.
+        let input = std::env::temp_dir().join(format!(
+            "bookforge-job-identity-{}-{}.epub",
+            std::process::id(),
+            unix_timestamp_nanos()
+        ));
+        fs::write(&input, b"same input").unwrap();
+        let stores = [
+            JobStore::open(":memory:").unwrap(),
+            JobStore::open(":memory:").unwrap(),
+        ];
+        let create = |store: &JobStore| {
+            store
+                .create_job_with_clock(
+                    CreateJob {
+                        input: &input,
+                        output: Path::new("output.epub"),
+                        source_lang: Some("English"),
+                        target_lang: "Italian",
+                        provider: "mock",
+                        model: "mock-prefix",
+                        base_url: None,
+                        api_key_env: None,
+                        book_id: None,
+                        series_id: None,
+                    },
+                    || 1_790_000_000_123_456_700,
+                )
+                .unwrap()
+        };
+        let first = create(&stores[0]);
+        let second = create(&stores[1]);
+        assert_eq!(first.input_hash, second.input_hash);
+        assert_ne!(
+            bookforge_core::run_dir_for_job(&first.id),
+            bookforge_core::run_dir_for_job(&second.id)
+        );
+        // A repeated tick in one store must also remain insertable.
+        let third = create(&stores[0]);
+        assert_ne!(first.id, third.id);
+        assert!(stores[0].get_job(&first.id).unwrap().is_some());
+        assert!(stores[0].get_job(&third.id).unwrap().is_some());
+        fs::remove_file(input).unwrap();
+    }
 }

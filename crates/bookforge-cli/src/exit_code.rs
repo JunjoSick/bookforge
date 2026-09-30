@@ -46,7 +46,10 @@ pub(crate) fn requested_code() -> i32 {
 
 /// Combine the command result with any explicit request into a final code.
 pub(crate) fn resolve(run_failed: bool) -> i32 {
-    let requested = requested();
+    resolve_requested(requested(), run_failed)
+}
+
+fn resolve_requested(requested: i32, run_failed: bool) -> i32 {
     if requested == INTERRUPTED {
         return INTERRUPTED;
     }
@@ -60,36 +63,31 @@ pub(crate) fn resolve(run_failed: bool) -> i32 {
 mod tests {
     use super::*;
 
-    fn reset() {
-        REQUESTED.store(SUCCESS, Ordering::SeqCst);
-    }
+    // Test precedence with explicit inputs: mutating REQUESTED here races
+    // other unit tests and the retry supervisor's exit-code propagation test.
 
     #[test]
     fn default_is_success() {
-        reset();
-        assert_eq!(resolve(false), SUCCESS);
+        assert_eq!(resolve_requested(SUCCESS, false), SUCCESS);
     }
 
     #[test]
     fn runtime_errors_exit_one_even_with_an_earlier_request() {
-        reset();
-        request(COMPLETED_WITH_FAILURES);
-        assert_eq!(resolve(true), FAILURE);
+        assert_eq!(resolve_requested(COMPLETED_WITH_FAILURES, true), FAILURE);
     }
 
     #[test]
     fn completed_with_unresolved_segments_reports_three() {
-        reset();
-        request(COMPLETED_WITH_FAILURES);
-        assert_eq!(resolve(false), COMPLETED_WITH_FAILURES);
+        assert_eq!(
+            resolve_requested(COMPLETED_WITH_FAILURES, false),
+            COMPLETED_WITH_FAILURES
+        );
     }
 
     #[test]
     fn interruption_beats_everything() {
-        reset();
-        request(INTERRUPTED);
-        assert_eq!(resolve(false), INTERRUPTED);
-        assert_eq!(resolve(true), INTERRUPTED);
+        assert_eq!(resolve_requested(INTERRUPTED, false), INTERRUPTED);
+        assert_eq!(resolve_requested(INTERRUPTED, true), INTERRUPTED);
     }
 
     #[test]

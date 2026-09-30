@@ -364,6 +364,7 @@ name = "bookforge-store"
 version = "3.0.0"
 dependencies = [
  "bookforge-core",
+ "getrandom 0.4.3",
  "rusqlite",
  "serde_json",
  "sha2",
