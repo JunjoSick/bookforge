@@ -663,9 +663,9 @@ fn is_unauthenticated_dashboard_route(request: &Request) -> bool {
 
 /// Strict allowlist for job ids before they touch filesystem paths
 /// (SERVE-4; mirrors [`crate::commands::serve::audio`]'s audiobook-id check).
-/// Real ids look like `job_<unix-nanos>_<12 hex>`, so alphanumerics plus `-`
-/// and `_` accept everything legitimate while rejecting traversal, slashes,
-/// and percent-decoded junk outright.
+/// Current ids look like `job_<32 hex>`; legacy ids contain a timestamp and
+/// input hash. Alphanumerics plus `-` and `_` accept both while rejecting
+/// traversal, slashes, and percent-decoded junk outright.
 pub(super) fn valid_job_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 160
