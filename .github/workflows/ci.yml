@@ -131,6 +131,9 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+          # Exercise the fail-closed signature check instead of a cached JDK.
+          force-download: true
+          verify-signature: true
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install EPUBCheck 5.3.0
         run: |
@@ -161,6 +164,7 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+          verify-signature: true
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install EPUBCheck 5.3.0
         run: |
