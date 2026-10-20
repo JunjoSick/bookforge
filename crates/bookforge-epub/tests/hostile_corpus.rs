@@ -20,7 +20,9 @@ use std::{
 use bookforge_core::{config::BilingualMode, segment::BlockTranslation};
 use bookforge_epub::{
     RebuildOptions,
-    archive_limits::{ArchiveLimits, read_archive_text, validate_archive_metadata},
+    archive_limits::{
+        ArchiveLimits, ArchiveReadBudget, read_archive_text, validate_archive_metadata,
+    },
     inspect_epub, read_epub, rebuild_epub, rebuild_epub_with_options, text_coverage,
 };
 use quick_xml::{Reader, events::Event};
@@ -236,8 +238,9 @@ fn injectable_limits_catch_declared_size_and_ratio_lies() {
 fn bounded_read_catches_declared_sizes_that_lie_about_expansion() {
     let dir = tmp_dir("bomb-read");
     let epub = dir.join("lie.epub");
-    // Stored payload expands far beyond what the central directory claims;
-    // with an injected 1 KiB cap the bounded read stops after 1 KiB + 1.
+    // Stored payload expands far beyond what the central directory claims.
+    // zip refuses to inflate past the declared 16 bytes, before the injected
+    // 1 KiB cap; the rejection must still name the entry.
     let big = vec![b'x'; 64 * 1024];
     write_deflated_fixture(&dir.join("liar-src.zip"), "liar.bin", &big);
     relabel_declared_sizes(&dir.join("liar-src.zip"), &epub);
@@ -255,9 +258,11 @@ fn bounded_read_catches_declared_sizes_that_lie_about_expansion() {
     let error = budget
         .read_entry(&mut file, "liar.bin", compressed)
         .expect_err("actual 64 KiB expansion must be caught");
+    let message = error.to_string();
     assert!(
-        error.to_string().contains("expanded data exceeds"),
-        "unexpected error: {error}"
+        message.contains("EPUB decompression failed for 'liar.bin'")
+            && message.contains("declared uncompressed size"),
+        "unexpected error: {message}"
     );
 }
 
@@ -293,10 +298,11 @@ fn relabel_declared_sizes(source: &Path, target: &Path) {
 
 #[test]
 fn bounded_budget_tracks_total_expansion_across_entries() {
-    // Two deflated entries whose central declarations say 16 bytes but that
-    // actually expand to 48 KiB each. The metadata stage passes (declared
-    // totals fit the tiny caps), so the running total is enforced at READ
-    // time: entry one fits, entry two crosses the remaining budget.
+    // Two deflated entries that expand to 48 KiB each against an 80 KiB
+    // running total, enforced at READ time: entry one fits, entry two crosses
+    // the remaining budget. zip rejects entries that inflate past their
+    // declared size, so these are honest and the budget is built directly;
+    // validate_archive_metadata would reject the declared 96 KiB upfront.
     let half: Vec<u8> = vec![b'z'; 48 * 1024];
     let dir = tmp_dir("bomb-total");
     let source = dir.join("half-src.zip");
@@ -308,10 +314,8 @@ fn bounded_budget_tracks_total_expansion_across_entries() {
     zip.start_file("b.bin", deflated).expect("start");
     zip.write_all(&half).expect("write");
     zip.finish().expect("finish");
-    let epub = dir.join("liars.epub");
-    relabel_declared_sizes(&source, &epub);
 
-    let mut archive = ZipArchive::new(File::open(&epub).expect("open")).expect("zip");
+    let mut archive = ZipArchive::new(File::open(&source).expect("open")).expect("zip");
     let limits = ArchiveLimits {
         max_entry_uncompressed_size: 64 * 1024,
         max_total_uncompressed_size: 80 * 1024,
@@ -321,8 +325,7 @@ fn bounded_budget_tracks_total_expansion_across_entries() {
             ..tiny_limits(true)
         }
     };
-    let mut budget =
-        validate_archive_metadata(&mut archive, limits).expect("16-byte declarations fit");
+    let mut budget = ArchiveReadBudget::new(limits);
 
     for name in ["a.bin", "b.bin"] {
         let mut file = archive.by_name(name).expect("entry exists");
@@ -1215,7 +1218,7 @@ fn xml_string_api_preserves_unicode_entities_namespaces_and_archive_members() {
     assert_eq!(entry_bytes(&output, "mimetype"), MIMETYPE);
     let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
     let first = archive.by_index(0).unwrap();
-    assert_eq!(first.name(), "mimetype");
+    assert_eq!(first.name().unwrap(), "mimetype");
     assert_eq!(first.compression(), CompressionMethod::Stored);
 }
 
