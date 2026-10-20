@@ -52,6 +52,7 @@ use planning::{
     set_batch_output_override, split_batch_with_config, take_batch_output_override, token_estimate,
 };
 pub use rendering::batch_item_validation_error;
+pub use rendering::blocking_source_copy_error;
 pub use rendering::parse_batch_response;
 use rendering::{
     batch_prompt_template, batch_response_item_count, parse_batch_response_with_validation,

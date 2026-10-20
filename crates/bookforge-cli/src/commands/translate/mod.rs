@@ -57,7 +57,10 @@ mod settings;
 mod snapshot;
 
 pub use args::TranslateArgs;
-pub(crate) use cache::{CacheContext, apply_cached_translations, pending_segments_for_job};
+pub(crate) use cache::{
+    CacheContext, apply_cached_translations, pending_segments_for_job,
+    revalidate_stored_translations,
+};
 use checkpointing::finalize_writer;
 pub(crate) use engine::{CheckpointRunContext, run_checkpointed_translation};
 use engine::{record_glossary_telemetry, run_checkpointed_translation_instrumented};

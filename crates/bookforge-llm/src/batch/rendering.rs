@@ -117,6 +117,21 @@ pub(crate) fn intentionally_unchanged_block(
             > PROPER_NOUN_TOKEN_SHARE
 }
 
+/// A source-copy error that blocks acceptance: the deterministic copy check
+/// fired and the block is not one a translator would intentionally leave
+/// unchanged. Warning-only copies (titles, headings, short proper-noun lines)
+/// return `None`, exactly as batch acceptance treats them, so cache reuse and
+/// resume revalidation hold stored output to the rule fresh output passed.
+pub fn blocking_source_copy_error(
+    block_kind: &str,
+    source: &str,
+    translation: &str,
+    section_title: Option<&str>,
+) -> Option<String> {
+    crate::validation::source_copy_validation_error(source, translation, section_title)
+        .filter(|_| !intentionally_unchanged_block(block_kind, source, translation))
+}
+
 /// Whitespace-collapsed text with marker tokens stripped, for length checks.
 fn normalized_line(text: &str) -> String {
     bookforge_core::marker::strip_marker_tokens(text)

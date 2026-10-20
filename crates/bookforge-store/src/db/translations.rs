@@ -272,6 +272,65 @@ impl JobStore {
         Ok(())
     }
 
+    /// Move an accepted provider result to `needs_review` after a stricter
+    /// validation rule rejects it, appending `findings` to the segment's
+    /// existing ones. Saved text, block rows, attempts, usage and provenance
+    /// are untouched. The expected-text and human-correction guards stop a
+    /// stale reader from overriding a newer correction. Returns whether the
+    /// segment was reclassified.
+    pub fn mark_stored_translation_for_review(
+        &self,
+        job_id: &str,
+        segment_id: &str,
+        expected_text: &str,
+        error: &str,
+        findings: &[EngineFinding],
+    ) -> Result<bool> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            &format!(
+                "UPDATE segments SET status = '{}', error = ?3
+                 WHERE job_id = ?1 AND id = ?2 AND status IN ({})
+                   AND EXISTS (SELECT 1 FROM translations t
+                               WHERE t.job_id = ?1 AND t.segment_id = ?2
+                                 AND t.human_corrected = 0
+                                 AND t.translated_text = ?4)",
+                SegmentStatus::NeedsReview.as_db_text(),
+                SegmentStatus::sql_set(&[SegmentStatus::Succeeded, SegmentStatus::SkippedCached])
+            ),
+            params![job_id, segment_id, error, expected_text],
+        )? != 0;
+        if changed {
+            for (index, finding) in findings.iter().enumerate() {
+                let hash = stable_hash(&format!(
+                    "{job_id}\u{1f}revalidation\u{1f}{segment_id}\u{1f}{index}"
+                ));
+                // Findings are instrumentation, as in the checkpoint paths.
+                let _ = insert_qa_finding_row(
+                    &tx,
+                    NewQaFindingRow {
+                        id: &format!("qaf_{}", &hash[..24]),
+                        segment_id,
+                        job_id,
+                        severity: finding.severity.as_str(),
+                        kind: finding.kind.as_str(),
+                        message: &finding.message,
+                        block_id: finding.block_id.as_deref(),
+                    },
+                );
+            }
+            touch_job_unless_status_on(
+                &tx,
+                job_id,
+                JobStatus::NeedsReview,
+                &[JobStatus::Paused, JobStatus::Stopped],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
     /// Save a cache-hit translation. Like the other model-write paths, this
     /// is one `IMMEDIATE` transaction that yields to frozen human corrections.
     pub fn save_cached_translation(&self, request: SaveCachedTranslation<'_>) -> Result<()> {
