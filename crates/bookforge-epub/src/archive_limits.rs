@@ -12,7 +12,7 @@
 
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{ErrorKind, Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -256,7 +256,16 @@ impl ArchiveReadBudget {
         // without allowing the decompressor or Vec to consume the rest of an attacker stream.
         let mut bounded = reader.take(read_limit.saturating_add(1));
         let mut bytes = Vec::with_capacity(read_limit.min(64 * 1024) as usize);
-        bounded.read_to_end(&mut bytes)?;
+        bounded.read_to_end(&mut bytes).map_err(|error| {
+            // zip itself refuses to inflate an entry past its declared
+            // uncompressed size, reporting InvalidData before this budget
+            // trips. Name the entry, as the budget's own limit errors do.
+            if error.kind() == ErrorKind::InvalidData {
+                limit_error(format!("failed for '{name}': {error}"))
+            } else {
+                error.into()
+            }
+        })?;
         let bytes_read = bytes.len() as u64;
 
         if bytes_read > read_limit {
@@ -304,7 +313,7 @@ pub fn validate_archive_metadata<R: Read + Seek>(
     let mut total_compressed = 0u64;
     for index in 0..archive.len() {
         let file = archive.by_index_raw(index)?;
-        let name = file.name().to_string();
+        let name = file.name()?.into_owned();
         let uncompressed = file.size();
         let compressed = file.compressed_size();
         if uncompressed > limits.max_entry_uncompressed_size {
@@ -434,10 +443,12 @@ mod tests {
             .read_entry(&mut file, "liar.xhtml", compressed_size)
             .expect_err("bounded read must catch actual expansion");
 
+        // zip stops at the declared 1 KiB, before the per-entry limit.
+        let message = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("per-entry uncompressed size limit exceeded for 'liar.xhtml'")
+            message.contains("EPUB decompression failed for 'liar.xhtml'")
+                && message.contains("declared uncompressed size"),
+            "{message}"
         );
     }
 

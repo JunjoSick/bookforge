@@ -150,7 +150,7 @@ fn write_rebuilt_epub(
         // A raw (metadata-only) handle answers cheap questions — name,
         // directory-ness, declared compression — before any bytes move.
         let raw = archive.by_index_raw(index)?;
-        let name = raw.name().to_string();
+        let name = raw.name()?.into_owned();
 
         if name == "mimetype" {
             continue;
@@ -324,7 +324,7 @@ fn normalized_entry_options(compression_method: CompressionMethod) -> SimpleFile
 fn archive_entry_names(archive: &mut ZipArchive<File>) -> Result<HashSet<String>> {
     let mut names = HashSet::new();
     for index in 0..archive.len() {
-        names.insert(archive.by_index_raw(index)?.name().to_string());
+        names.insert(archive.by_index_raw(index)?.name()?.into_owned());
     }
     Ok(names)
 }

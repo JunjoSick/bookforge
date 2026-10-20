@@ -177,7 +177,7 @@ fn write_archive_entries(
 ) -> Result<()> {
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
-        let name = file.name().to_string();
+        let name = file.name()?.into_owned();
 
         if name == "mimetype" {
             continue;

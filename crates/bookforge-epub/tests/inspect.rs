@@ -127,6 +127,50 @@ fn rebuilds_epub_with_patched_xhtml_and_preserved_resources() {
 }
 
 #[test]
+fn non_ascii_entry_names_resolve_through_inspect_read_and_rebuild() {
+    // zip 9 decodes entry names on access instead of at parse time; a UTF-8
+    // name must still match its manifest href on every archive path.
+    let href = "capítulo-東京.xhtml";
+    let fixture =
+        create_epub_fixture_with_chapter("non-ascii-name", href, "<p>Hello from chapter 1.</p>");
+
+    let inspection = inspect_epub(&fixture).expect("non-ASCII spine entry should be found");
+    assert_eq!(inspection.xhtml_spine_count, 1);
+
+    let book = read_epub(&fixture).expect("non-ASCII entry should parse into IR");
+    let body_block = book
+        .blocks
+        .iter()
+        .find(|block| block_text(block) == "Hello from chapter 1.")
+        .expect("body paragraph should be extracted");
+
+    let output = std::env::temp_dir().join(format!(
+        "bookforge-rebuilt-non-ascii-{}.epub",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&output);
+    rebuild_epub(
+        &book,
+        &[BlockTranslation {
+            block_id: body_block.id.clone(),
+            text: "Ciao da un capitolo non ASCII.".to_string(),
+        }],
+        &output,
+    )
+    .expect("EPUB with a non-ASCII entry should rebuild");
+
+    let mut archive = ZipArchive::new(File::open(&output).expect("rebuilt EPUB should exist"))
+        .expect("rebuilt EPUB should be a zip");
+    let mut chapter = String::new();
+    archive
+        .by_name(&format!("OEBPS/{href}"))
+        .expect("non-ASCII entry name should survive the rebuild")
+        .read_to_string(&mut chapter)
+        .expect("chapter should be UTF-8");
+    assert!(chapter.contains("Ciao da un capitolo non ASCII."));
+}
+
+#[test]
 fn packed_notes_extract_and_rebuild_at_matching_dom_paths() {
     let fixture = create_epub_fixture(
         "packed-notes",
@@ -434,6 +478,10 @@ fn block_text(block: &bookforge_core::ir::Block) -> String {
 }
 
 fn create_epub_fixture(name: &str, body: &str) -> PathBuf {
+    create_epub_fixture_with_chapter(name, "chapter1.xhtml", body)
+}
+
+fn create_epub_fixture_with_chapter(name: &str, chapter_href: &str, body: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")
@@ -463,16 +511,20 @@ fn create_epub_fixture(name: &str, body: &str) -> PathBuf {
         .start_file("OEBPS/content.opf", deflated)
         .expect("package entry should start");
     writer
-        .write_all(CONTENT_OPF.as_bytes())
+        .write_all(
+            CONTENT_OPF
+                .replace("chapter1.xhtml", chapter_href)
+                .as_bytes(),
+        )
         .expect("package should write");
     writer
         .start_file("OEBPS/nav.xhtml", deflated)
         .expect("nav entry should start");
     writer
-        .write_all(NAV_XHTML.as_bytes())
+        .write_all(NAV_XHTML.replace("chapter1.xhtml", chapter_href).as_bytes())
         .expect("nav should write");
     writer
-        .start_file("OEBPS/chapter1.xhtml", deflated)
+        .start_file(format!("OEBPS/{chapter_href}"), deflated)
         .expect("chapter entry should start");
     writer
         .write_all(chapter_xhtml(body).as_bytes())

@@ -308,8 +308,8 @@ pub fn inspect_epub(path: &Path) -> Result<EpubInspection> {
     // covers hostile archives).
     let archive_names = archive
         .file_names()
-        .map(|name| name.to_string())
-        .collect::<HashSet<_>>();
+        .map(|name| name.map(String::from))
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
 
     let mut xhtml_spine_count = 0;
     for item in &package.spine {

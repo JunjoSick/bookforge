@@ -82,7 +82,9 @@ pub fn validate_translated_epub(
                         let Ok(mut entry) = archive.by_index(index) else {
                             continue;
                         };
-                        let name = entry.name().to_string();
+                        let Ok(name) = entry.name().map(|name| name.into_owned()) else {
+                            continue;
+                        };
                         if !is_validatable_resource_name(&name) {
                             file_names.push(name);
                             continue;

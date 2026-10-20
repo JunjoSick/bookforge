@@ -29,7 +29,7 @@ pub fn replace_file(staged: &Path, destination: &Path) -> io::Result<()> {
                 Err(_) => {}
             }
         }
-        return replace_file_windows(staged, destination);
+        replace_file_windows(staged, destination)
     }
 
     #[cfg(not(windows))]

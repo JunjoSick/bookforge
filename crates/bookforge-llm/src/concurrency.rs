@@ -120,17 +120,28 @@ impl Drop for AdaptivePermit {
         // Atomically claim a burn slot iff one is pending. If none is
         // pending, fetch_update returns Err and we fall through to the
         // normal Drop, which releases the permit back into the pool.
-        let claimed = self
-            .permits_to_burn
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                if n > 0 { Some(n - 1) } else { None }
-            })
-            .is_ok();
+        let claimed = fetch_update(&self.permits_to_burn, |n| {
+            if n > 0 { Some(n - 1) } else { None }
+        })
+        .is_ok();
 
         if claimed && let Some(permit) = self.permit.take() {
             permit.forget();
         }
     }
+}
+
+/// `AtomicUsize::fetch_update` with the orderings every caller here uses.
+///
+/// Rust 1.99 deprecates `fetch_update` in favor of `try_update`, but
+/// `try_update` is unstable on the 1.88 MSRV, so the deprecated method stays
+/// behind this single allow until the MSRV can use the new name.
+#[allow(deprecated)]
+fn fetch_update(
+    atomic: &AtomicUsize,
+    update: impl FnMut(usize) -> Option<usize>,
+) -> Result<usize, usize> {
+    atomic.fetch_update(Ordering::AcqRel, Ordering::Acquire, update)
 }
 
 impl AdaptiveLimiter {
@@ -235,18 +246,14 @@ impl AdaptiveLimiter {
             let mut remaining = new - previous;
             *state = new;
             while remaining > 0 {
-                match self.permits_to_burn.fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |burn| {
-                        if burn == 0 {
-                            None
-                        } else {
-                            let cancel = burn.min(remaining);
-                            Some(burn - cancel)
-                        }
-                    },
-                ) {
+                match fetch_update(&self.permits_to_burn, |burn| {
+                    if burn == 0 {
+                        None
+                    } else {
+                        let cancel = burn.min(remaining);
+                        Some(burn - cancel)
+                    }
+                }) {
                     Ok(prev_burn) => {
                         let cancelled = prev_burn.min(remaining);
                         remaining -= cancelled;
