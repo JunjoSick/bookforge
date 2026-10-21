@@ -82,7 +82,9 @@ impl ConversionReport {
                     "page {}: low-confidence reconstruction ({page_coverage:.1}% of pdftotext baseline, {} reconstructed / {} baseline characters); action={action}",
                     page.page, page.chars, page.baseline_chars
                 ));
-            } else if page.chars == 0 && page.baseline_chars > 0 {
+            } else if page.chars == 0 && page.baseline_chars > page.running_header_chars {
+                // A page whose only text was its folio and running header
+                // (a chapter-opening plate) lost nothing worth flagging.
                 warnings.push(format!(
                     "page {}: no text reconstructed, but pdftotext found {} baseline characters",
                     page.page, page.baseline_chars
@@ -252,6 +254,38 @@ mod tests {
         assert!(
             report.warnings[1].contains("page 7: no text reconstructed, but pdftotext found 42")
         );
+    }
+
+    #[test]
+    fn pages_holding_only_removed_margins_do_not_warn() {
+        let report = ConversionReport::build(
+            "in.pdf",
+            "out.epub",
+            vec![PageStats {
+                page: 36,
+                lines: 0,
+                chars: 0,
+                baseline_chars: 13,
+                running_header_chars: 13,
+                two_column: false,
+                rtl_dominant: false,
+                low_confidence: false,
+                low_confidence_action: None,
+            }],
+            ReportMetrics {
+                blocks: 0,
+                reconstructed_chars: 0,
+                media_preserved_chars: 0,
+                baseline_chars: 0,
+                images: 0,
+                figures: 0,
+                tables: 0,
+                equations: 0,
+                layout_warnings: Vec::new(),
+            },
+        );
+
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
     #[test]

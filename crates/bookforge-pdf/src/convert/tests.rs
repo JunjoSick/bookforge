@@ -132,6 +132,7 @@ fn span(text: &str) -> Span {
         text: text.to_string(),
         bold: false,
         italic: false,
+        superscript: false,
     }
 }
 
@@ -180,6 +181,46 @@ XML
 "#
         ),
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn pdftohtml_page_images_stay_out_of_the_source_directory() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let source_dir = root.path().join("source");
+    fs::create_dir(&source_dir).expect("source dir");
+    let pdf = source_dir.join("book.pdf");
+    fs::write(&pdf, b"%PDF-1.4").expect("pdf fixture");
+    let pdftohtml = root.path().join("pdftohtml");
+    // Mirrors poppler: page images go to `<base>-<page>_<n>.png`, the base
+    // being the argument after the PDF, or the PDF path minus `.pdf`.
+    write_executable(
+        &pdftohtml,
+        r#"#!/bin/sh
+pdf=""; base=""
+for arg do
+  if [ -n "$pdf" ]; then base="$arg"; fi
+  case "$arg" in *.pdf) pdf="$arg" ;; esac
+done
+[ -n "$base" ] || base="${pdf%.pdf}"
+printf 'png' > "$base-1_1.png"
+echo '<pdf2xml></pdf2xml>'
+"#,
+    );
+    let tools = PopplerTools {
+        pdftohtml,
+        pdftotext: PathBuf::from("pdftotext"),
+        pdfimages: None,
+        pdftoppm: None,
+    };
+
+    tools.pdf_to_xml(&pdf).expect("fake pdftohtml runs");
+
+    let left: Vec<_> = fs::read_dir(&source_dir)
+        .expect("source dir lists")
+        .map(|entry| entry.expect("dir entry").file_name())
+        .collect();
+    assert_eq!(left, vec![std::ffi::OsString::from("book.pdf")]);
 }
 
 #[cfg(unix)]
@@ -2132,6 +2173,49 @@ fn running_header_removal_does_not_push_pages_below_the_confidence_threshold() {
         genuinely_missing.low_confidence,
         "real deficits must still flag"
     );
+}
+
+#[test]
+fn text_carried_onto_a_later_page_is_credited_to_that_page() {
+    // A page filled by the continuation of a paragraph anchored earlier
+    // used to report no text at all.
+    let stats = |page| PageStats {
+        page,
+        lines: 0,
+        chars: 0,
+        baseline_chars: 0,
+        running_header_chars: 0,
+        two_column: false,
+        rtl_dominant: false,
+        low_confidence: false,
+        low_confidence_action: None,
+    };
+    let mut page_stats = vec![stats(1), stats(2)];
+    let blocks = vec![AnchoredBlock {
+        block: DocBlock::Paragraph {
+            spans: vec![Span {
+                text: "Begun on one page and ended on the next.".to_string(),
+                bold: false,
+                italic: false,
+                superscript: false,
+            }],
+        },
+        anchor: BlockAnchor {
+            page: 1,
+            top: 700,
+            left: 80,
+            width: 440,
+        },
+    }];
+    let carried = [CarriedText {
+        page: 2,
+        anchor_page: 1,
+        chars: 15,
+    }];
+
+    refresh_page_char_counts(&mut page_stats, &blocks, &carried);
+
+    assert_eq!((page_stats[0].chars, page_stats[1].chars), (17, 15));
 }
 
 #[test]

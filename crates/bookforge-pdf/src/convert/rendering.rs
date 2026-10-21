@@ -93,6 +93,7 @@ fn replace_page_with_ocr_text(blocks: &mut Vec<AnchoredBlock>, page_number: u32,
                         text: paragraph,
                         bold: false,
                         italic: false,
+                        superscript: false,
                     }],
                 },
                 anchor: BlockAnchor {
@@ -459,6 +460,7 @@ mod ocr_tests {
                     text: text.to_string(),
                     bold: false,
                     italic: false,
+                    superscript: false,
                 }],
             },
             anchor: BlockAnchor {
@@ -488,6 +490,7 @@ mod ocr_tests {
                     text: "Figure 1. Captured raster.".to_string(),
                     bold: false,
                     italic: false,
+                    superscript: false,
                 }]),
             },
             anchor: BlockAnchor {

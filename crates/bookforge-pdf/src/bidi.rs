@@ -170,6 +170,7 @@ pub fn reorder_line_spans(spans: &[Span]) -> Option<Vec<Span>> {
         if let Some(last) = out.last_mut()
             && last.bold == style.bold
             && last.italic == style.italic
+            && last.superscript == style.superscript
         {
             last.text.push(' ');
             last.text.push_str(&text);
@@ -179,6 +180,7 @@ pub fn reorder_line_spans(spans: &[Span]) -> Option<Vec<Span>> {
             text,
             bold: style.bold,
             italic: style.italic,
+            superscript: style.superscript,
         });
     }
     (!out.is_empty()).then_some(out)
@@ -204,6 +206,7 @@ mod tests {
             text: text.to_string(),
             bold: false,
             italic: false,
+            superscript: false,
         }
     }
 
@@ -290,6 +293,7 @@ mod tests {
                 text: "מודגש".to_string(),
                 bold: true,
                 italic: false,
+                superscript: false,
             },
             plain(" התחלה"),
         ];

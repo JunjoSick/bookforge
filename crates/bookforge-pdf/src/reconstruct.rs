@@ -11,7 +11,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::bidi;
 use crate::model::{
-    ColumnMode, DocBlock, Fragment, Line, Page, Span, normalize_text_key, spans_text,
+    ColumnMode, DocBlock, Fragment, Line, Page, Span, count_visible_chars, normalize_text_key,
+    spans_text,
 };
 
 /// Per-page reconstruction diagnostics for the conversion report.
@@ -22,11 +23,11 @@ pub struct PageStats {
     pub chars: usize,
     pub baseline_chars: usize,
     /// Non-whitespace characters removed as repeated running
-    /// headers/footers. The low-confidence coverage threshold is judged
-    /// against `chars + running_header_chars` (the pre-removal view) so
-    /// legitimate pages with recurring headers are not rasterized into
-    /// OCR just because the header text dominates the deficit
-    /// (docs/report.md §4.5 PDF-6).
+    /// headers/footers and page-number folios. The low-confidence coverage
+    /// threshold is judged against `chars + running_header_chars` (the
+    /// pre-removal view) so legitimate pages with recurring headers are not
+    /// rasterized into OCR just because the header text dominates the
+    /// deficit (docs/report.md §4.5 PDF-6).
     #[serde(default)]
     pub running_header_chars: usize,
     pub two_column: bool,
@@ -45,6 +46,23 @@ pub struct Reconstruction {
     /// Rotated/zero-width fragments excluded from the reading flow,
     /// reported (not silenced) per docs/report.md §4.5.
     pub rotated_dropped_fragments: usize,
+    /// Fragments lying wholly outside their page box, excluded from the
+    /// reading flow. A title set across a two-page spread is reported on
+    /// both pages, its other half shifted past the page edge.
+    pub offpage_dropped_fragments: usize,
+    /// Text read at the head of a page that continued a paragraph
+    /// anchored on an earlier page.
+    pub carried: Vec<CarriedText>,
+}
+
+/// The opening text of `page` joined onto a paragraph anchored on
+/// `anchor_page`. A block's characters all count toward its anchor, so
+/// per-page accounting moves this share back to the page it was read on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarriedText {
+    pub page: u32,
+    pub anchor_page: u32,
+    pub chars: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,13 +104,21 @@ pub fn reconstruct_with_chapter_guard(
     let body_size = body_font_size(pages);
     let heading_levels = heading_levels(pages, body_size);
     let running_margin_texts = running_margin_texts(pages, body_size);
+    let folios = folio_lines(pages, body_size);
 
     let mut blocks: Vec<AnchoredBlock> = Vec::new();
     let mut stats = Vec::new();
     let mut rotated_dropped_fragments = 0usize;
+    let mut offpage_dropped_fragments = 0usize;
+    let mut carried = Vec::new();
 
     for page in pages {
         rotated_dropped_fragments += rotated_fragment_count(page);
+        offpage_dropped_fragments += page
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.width > 0 && !is_on_page(page, fragment))
+            .count();
         let lines = merge_fragments_into_lines(page);
         let two_column = match columns {
             ColumnMode::Single => false,
@@ -108,7 +134,9 @@ pub fn reconstruct_with_chapter_guard(
         };
         let mut running_header_chars = 0usize;
         ordered.retain(|line| {
-            if is_running_margin_line(page, line, body_size, &running_margin_texts) {
+            if is_running_margin_line(page, line, body_size, &running_margin_texts)
+                || folios.contains(&(page.number, line.top, line.left))
+            {
                 running_header_chars += line.char_count();
                 return false;
             }
@@ -139,13 +167,21 @@ pub fn reconstruct_with_chapter_guard(
         });
 
         let page_blocks = cluster_paragraphs(&ordered, body_size, &heading_levels);
-        append_with_continuation(&mut blocks, page.number, page_blocks, chapter_prefix);
+        append_with_continuation(
+            &mut blocks,
+            &mut carried,
+            page.number,
+            page_blocks,
+            chapter_prefix,
+        );
     }
 
     Reconstruction {
         blocks,
         pages: stats,
         rotated_dropped_fragments,
+        offpage_dropped_fragments,
+        carried,
     }
 }
 
@@ -171,6 +207,12 @@ fn rotated_fragment_count(page: &Page) -> usize {
         .iter()
         .filter(|fragment| fragment.width <= 0 && !spans_text(&fragment.spans).trim().is_empty())
         .count()
+}
+
+/// Whether any of the fragment lies inside the page box. A page without a
+/// declared width keeps everything.
+fn is_on_page(page: &Page, fragment: &Fragment) -> bool {
+    page.width <= 0 || (fragment.left < page.width && fragment.right() > 0)
 }
 
 fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<String> {
@@ -211,32 +253,123 @@ fn is_running_margin_line(
         && running_margin_texts.contains(&normalize_text_key(&line.text()))
 }
 
+/// How many pages apart two margin numbers may be and still corroborate each
+/// other as folios (recto-only numbering skips every other page).
+const FOLIO_NEIGHBOUR_PAGES: u32 = 3;
+
+/// Page numbers printed in the top or bottom margin, keyed by
+/// `(page, top, left)`. A folio's text changes on every page, so
+/// [`running_margin_texts`] never matches it, and left in place it becomes a
+/// paragraph of its own that also blocks the cross-page merge, splitting
+/// every sentence that runs over a page break. A bare number in the margin
+/// band counts as a folio only when another page within
+/// [`FOLIO_NEIGHBOUR_PAGES`] carries one whose value differs by exactly the
+/// page distance; an isolated margin number is kept as text.
+fn folio_lines(pages: &[Page], body_size: u32) -> HashSet<(u32, i32, i32)> {
+    let mut candidates = Vec::new();
+    for page in pages {
+        for line in merge_fragments_into_lines(page) {
+            // Folios are often set a little larger or bolder than the body;
+            // the window still excludes superscript note markers and large
+            // display numerals such as chapter numbers.
+            let size = line.font_size * 10;
+            if size < body_size * 7 || size > body_size * 15 || !near_vertical_margin(page, &line) {
+                continue;
+            }
+            if let Some((roman, value)) = folio_value(&line.text()) {
+                candidates.push((page.number, roman, value, line.top, line.left));
+            }
+        }
+    }
+    candidates
+        .iter()
+        .filter(|(page, roman, value, ..)| {
+            candidates
+                .iter()
+                .any(|(other_page, other_roman, other_value, ..)| {
+                    other_page != page
+                        && other_roman == roman
+                        && other_page.abs_diff(*page) <= FOLIO_NEIGHBOUR_PAGES
+                        && other_value - value == i64::from(*other_page) - i64::from(*page)
+                })
+        })
+        .map(|(page, _, _, top, left)| (*page, *top, *left))
+        .collect()
+}
+
+/// Value of a bare folio: up to four ASCII digits, or a single-case roman
+/// numeral as used in front matter. `true` marks roman values, which only
+/// corroborate other roman folios.
+fn folio_value(text: &str) -> Option<(bool, i64)> {
+    let text = text.trim();
+    if !text.is_empty() && text.len() <= 4 && text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return text.parse().ok().map(|value| (false, value));
+    }
+    if text.is_empty()
+        || text.len() > 8
+        || (text != text.to_ascii_lowercase() && text != text.to_ascii_uppercase())
+    {
+        return None;
+    }
+    let digits = text
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| match ch {
+            'i' => Some(1),
+            'v' => Some(5),
+            'x' => Some(10),
+            'l' => Some(50),
+            'c' => Some(100),
+            _ => None,
+        })
+        .collect::<Option<Vec<i64>>>()?;
+    let value = digits.iter().enumerate().fold(0, |total, (index, digit)| {
+        if digits.get(index + 1).is_some_and(|next| next > digit) {
+            total - digit
+        } else {
+            total + digit
+        }
+    });
+    (value > 0).then_some((true, value))
+}
+
 fn near_vertical_margin(page: &Page, line: &Line) -> bool {
     let margin = (page.height / 8).max(line.height * 3);
     line.top <= margin || line.top + line.height >= page.height - margin
 }
 
+/// Most visible characters a note reference mark can have ("123", "†").
+const RAISED_MARK_MAX_CHARS: usize = 4;
+
+/// A visual line under construction: its geometry plus member fragments.
+struct LineGroup<'a> {
+    line: Line,
+    members: Vec<&'a Fragment>,
+}
+
 /// Group fragments that share a baseline into one visual line, joining
-/// fragment gaps with a space when they are visually separated.
+/// fragment gaps with a space when they are visually separated. A note
+/// reference mark (short, much smaller, raised) joins the line it sits on
+/// at its horizontal position as a superscript, even mid-line: pdftohtml
+/// reports such a mark as its own line, which used to become a paragraph of
+/// its own and cut the sentence around it in two.
 fn merge_fragments_into_lines(page: &Page) -> Vec<Line> {
     // poppler reports rotated text (arXiv margin watermarks, sidebar
     // decorations) with zero width. It is not part of the reading flow
-    // and, left in, it skews the column-midline estimate.
+    // and, left in, it skews the column-midline estimate. Text wholly off
+    // the page is the other half of a spread and is read on its own page.
     let mut fragments: Vec<&Fragment> = page
         .fragments
         .iter()
-        .filter(|fragment| fragment.width > 0)
+        .filter(|fragment| fragment.width > 0 && is_on_page(page, fragment))
         .collect();
     fragments.sort_by_key(|fragment| (fragment.top, fragment.left));
 
-    let mut lines: Vec<Line> = Vec::new();
+    let mut groups: Vec<LineGroup> = Vec::new();
     for fragment in fragments {
-        let size = page
-            .font_sizes
-            .get(&fragment.font)
-            .copied()
-            .unwrap_or(fragment.height.unsigned_abs());
-        let same_line = lines.last().is_some_and(|line| {
+        let size = fragment_font_size(page, fragment);
+        let same_line = groups.last().is_some_and(|group| {
+            let line = &group.line;
             let tolerance = (line.height.max(fragment.height) as f32 * 0.5) as i32;
             // The gap cap keeps same-baseline lines in *different columns*
             // from merging. Style-split fragments sit flush and justified
@@ -250,49 +383,151 @@ fn merge_fragments_into_lines(page: &Page) -> Vec<Line> {
         });
 
         if same_line {
-            let line = lines.last_mut().expect("checked above");
-            let gap = fragment.left - line.right;
-            if gap > 1 && !line.spans.last().is_some_and(|s| s.text.ends_with(' ')) {
-                push_joined(&mut line.spans, " ", false, false);
-            }
-            for span in &fragment.spans {
-                push_joined(&mut line.spans, &span.text, span.bold, span.italic);
-            }
-            line.right = line.right.max(fragment.right());
-            line.height = line.height.max(fragment.height);
-            line.font_size = line.font_size.max(size);
+            let group = groups.last_mut().expect("checked above");
+            group.line.right = group.line.right.max(fragment.right());
+            group.line.height = group.line.height.max(fragment.height);
+            group.line.font_size = group.line.font_size.max(size);
+            group.members.push(fragment);
         } else {
-            lines.push(Line {
-                top: fragment.top,
-                left: fragment.left,
-                right: fragment.right(),
-                height: fragment.height,
-                font_size: size,
-                spans: fragment.spans.clone(),
+            groups.push(LineGroup {
+                line: Line {
+                    top: fragment.top,
+                    left: fragment.left,
+                    right: fragment.right(),
+                    height: fragment.height,
+                    font_size: size,
+                    spans: Vec::new(),
+                },
+                members: vec![fragment],
             });
         }
     }
 
+    attach_raised_marks(page, &mut groups);
+
+    let mut lines: Vec<Line> = groups
+        .into_iter()
+        .filter(|group| !group.members.is_empty())
+        .map(|group| build_line(page, group))
+        .collect();
     lines.retain(|line| !line.text().trim().is_empty());
     lines
 }
 
+fn fragment_font_size(page: &Page, fragment: &Fragment) -> u32 {
+    page.font_sizes
+        .get(&fragment.font)
+        .copied()
+        .unwrap_or(fragment.height.unsigned_abs())
+}
+
+/// A short fragment at most 70% of `host`'s size whose bottom sits above the
+/// lower quarter of `host`: a superscript mark, not a subscript, small
+/// capitals or a same-baseline word.
+fn is_raised_mark(page: &Page, fragment: &Fragment, host: &Line) -> bool {
+    let visible = fragment
+        .spans
+        .iter()
+        .flat_map(|span| span.text.chars())
+        .filter(|ch| !ch.is_whitespace())
+        .count();
+    (1..=RAISED_MARK_MAX_CHARS).contains(&visible)
+        && fragment_font_size(page, fragment) * 10 <= host.font_size * 7
+        && fragment.top + fragment.height > host.top
+        && fragment.top < host.top + host.height
+        && fragment.top + fragment.height <= host.top + host.height * 3 / 4
+}
+
+/// Move each single-fragment group that is a raised mark into the nearest
+/// line it overlaps horizontally, leaving its own group empty.
+fn attach_raised_marks(page: &Page, groups: &mut [LineGroup]) {
+    for mark_index in 0..groups.len() {
+        let [fragment] = groups[mark_index].members[..] else {
+            continue;
+        };
+        let host_index = groups
+            .iter()
+            .enumerate()
+            .filter(|(index, group)| {
+                let host = &group.line;
+                *index != mark_index
+                    && !group.members.is_empty()
+                    && fragment.left >= host.left - host.height
+                    && fragment.left <= host.right + host.height * 5 / 4
+                    && is_raised_mark(page, fragment, host)
+            })
+            .min_by_key(|(_, group)| (group.line.top - fragment.top).abs())
+            .map(|(index, _)| index);
+        if let Some(host_index) = host_index {
+            groups[mark_index].members.clear();
+            let host = &mut groups[host_index];
+            host.line.right = host.line.right.max(fragment.right());
+            host.members.push(fragment);
+        }
+    }
+}
+
+/// Spans of `group`'s members in left-to-right order, with a space at each
+/// visible gap. Raised marks attach to the preceding text with no space.
+fn build_line(page: &Page, mut group: LineGroup) -> Line {
+    group.members.sort_by_key(|fragment| fragment.left);
+    let mut line = group.line;
+    let mut right: Option<i32> = None;
+    for fragment in group.members {
+        let raised = right.is_some() && is_raised_mark(page, fragment, &line);
+        if raised {
+            if let Some(last) = line.spans.last_mut() {
+                let trimmed = last.text.trim_end().len();
+                last.text.truncate(trimmed);
+            }
+        } else if right.is_some_and(|right| fragment.left - right > 1)
+            && !line
+                .spans
+                .last()
+                .is_some_and(|span| span.text.ends_with(' '))
+        {
+            push_joined(&mut line.spans, " ", false, false);
+        }
+        for span in &fragment.spans {
+            push_styled(
+                &mut line.spans,
+                Span {
+                    superscript: raised || span.superscript,
+                    ..span.clone()
+                },
+            );
+        }
+        right = Some(right.map_or(fragment.right(), |right| right.max(fragment.right())));
+    }
+    line
+}
+
 fn push_joined(spans: &mut Vec<Span>, text: &str, bold: bool, italic: bool) {
-    if text.is_empty() {
+    push_styled(
+        spans,
+        Span {
+            text: text.to_string(),
+            bold,
+            italic,
+            superscript: false,
+        },
+    );
+}
+
+/// Append `span`, extending the last span when its whole style matches.
+fn push_styled(spans: &mut Vec<Span>, span: Span) {
+    if span.text.is_empty() {
         return;
     }
     if let Some(last) = spans.last_mut()
-        && last.bold == bold
-        && last.italic == italic
+        && last.bold == span.bold
+        && last.italic == span.italic
+        && last.superscript == span.superscript
     {
-        last.text.push_str(text);
+        last.text.push_str(&span.text);
         return;
     }
-    spans.push(Span {
-        text: text.to_string(),
-        bold,
-        italic,
-    });
+    spans.push(span);
 }
 
 /// A page is two-column when most non-full-width lines sit entirely in
@@ -404,27 +639,49 @@ fn body_font_size(pages: &[Page]) -> u32 {
 /// declared for every page while never being referenced by any `<text>`
 /// element, and mapping such a phantom size to a heading level would
 /// shift real headings down a rank (docs/report.md §4.5 PDF-8).
+///
+/// When there are more such sizes than levels, sizes that recur on two or
+/// more pages win the levels over sizes seen on one page only: those are
+/// display type on a cover or title page, and a book whose title pages
+/// used two one-off sizes above its chapter titles had every section
+/// heading demoted to a paragraph. A one-page size larger than every
+/// ranked size still reads as a heading, at h1.
 fn heading_levels(pages: &[Page], body_size: u32) -> HashMap<u32, u8> {
-    let mut sizes: Vec<u32> = pages
-        .iter()
-        .flat_map(|page| {
-            page.fragments.iter().map(move |fragment| {
-                page.font_sizes
-                    .get(&fragment.font)
-                    .copied()
-                    .unwrap_or_else(|| fragment.height.unsigned_abs())
-            })
-        })
-        .filter(|size| *size as f32 >= body_size as f32 * 1.15 && *size >= body_size + 2)
-        .collect();
+    const LEVELS: usize = 3;
+    let mut page_counts: HashMap<u32, usize> = HashMap::new();
+    for page in pages {
+        let sizes: HashSet<u32> = page
+            .fragments
+            .iter()
+            .filter(|fragment| is_on_page(page, fragment))
+            .map(|fragment| fragment_font_size(page, fragment))
+            .filter(|size| *size as f32 >= body_size as f32 * 1.15 && *size >= body_size + 2)
+            .collect();
+        for size in sizes {
+            *page_counts.entry(size).or_default() += 1;
+        }
+    }
+    let mut sizes: Vec<u32> = page_counts.keys().copied().collect();
     sizes.sort_unstable_by(|a, b| b.cmp(a));
-    sizes.dedup();
-    sizes
-        .into_iter()
-        .take(3)
-        .enumerate()
-        .map(|(rank, size)| (size, rank as u8 + 1))
-        .collect()
+    let (recurring, one_page): (Vec<u32>, Vec<u32>) = sizes
+        .iter()
+        .copied()
+        .partition(|size| page_counts[size] >= 2);
+    let mut ranked: Vec<u32> = recurring.into_iter().chain(one_page).take(LEVELS).collect();
+    ranked.sort_unstable_by(|a, b| b.cmp(a));
+    let top = ranked.first().copied().unwrap_or(u32::MAX);
+    let mut levels: HashMap<u32, u8> = sizes
+        .iter()
+        .filter(|size| **size > top)
+        .map(|size| (*size, 1))
+        .collect();
+    levels.extend(
+        ranked
+            .into_iter()
+            .enumerate()
+            .map(|(rank, size)| (size, rank as u8 + 1)),
+    );
+    levels
 }
 
 /// Cluster ordered lines into paragraphs and headings.
@@ -470,6 +727,14 @@ fn cluster_paragraphs(
         let heading = heading_levels.get(&line.font_size).copied();
         let new_block = match previous {
             None => true,
+            Some(prev) if heading.is_some() && line.font_size == prev.font_size => {
+                // A wrapped heading: centred lines start at different offsets
+                // and its leading exceeds body spacing, so neither the indent
+                // nor the body-gap rule applies. Only a break of more than
+                // twice the line's own height starts a new heading.
+                let gap = line.top - prev.top;
+                gap < 0 || gap > prev.height.max(1) * 2
+            }
             Some(prev) => {
                 let gap = line.top - prev.top;
                 let size_changed = line.font_size != prev.font_size
@@ -715,7 +980,7 @@ fn join_line_into(buffer: &mut Vec<Span>, line: &Line) {
         }
     }
     for span in &line.spans {
-        push_joined(buffer, &span.text, span.bold, span.italic);
+        push_styled(buffer, span.clone());
     }
 }
 
@@ -750,6 +1015,7 @@ fn median_line_gap(lines: &[Line]) -> i32 {
 /// boundary opened by the configured prefix.
 fn append_with_continuation(
     blocks: &mut Vec<AnchoredBlock>,
+    carried: &mut Vec<CarriedText>,
     page: u32,
     mut incoming: Vec<PendingBlock>,
     chapter_prefix: Option<&str>,
@@ -757,7 +1023,7 @@ fn append_with_continuation(
     if let (
         Some(AnchoredBlock {
             block: DocBlock::Paragraph { spans: tail },
-            ..
+            anchor,
         }),
         Some(PendingBlock {
             block: DocBlock::Paragraph { spans: head },
@@ -783,8 +1049,16 @@ fn append_with_continuation(
             {
                 push_joined(tail, " ", false, false);
             }
+            carried.push(CarriedText {
+                page,
+                anchor_page: anchor.page,
+                chars: head
+                    .iter()
+                    .map(|span| count_visible_chars(&span.text))
+                    .sum(),
+            });
             for span in head.drain(..) {
-                push_joined(tail, &span.text, span.bold, span.italic);
+                push_styled(tail, span);
             }
             incoming.remove(0);
         }
@@ -981,6 +1255,267 @@ mod tests {
         );
     }
 
+    fn texts(result: &Reconstruction) -> Vec<String> {
+        result
+            .blocks
+            .iter()
+            .map(|anchored| anchored.block.text())
+            .collect()
+    }
+
+    /// Pages whose `(folio, body, top)` sit as in a typeset book: the folio
+    /// alone in a margin, set a little larger than the body, which sits
+    /// below the margin band.
+    fn single_line_pages_xml(pages: &[(&str, &str, i32)]) -> String {
+        let mut xml = String::from("<?xml version=\"1.0\"?>\n<pdf2xml>\n");
+        for (index, (folio, body, folio_top)) in pages.iter().enumerate() {
+            xml.push_str(&format!(
+                "<page number=\"{}\" width=\"600\" height=\"800\">\n\
+                 <fontspec id=\"0\" size=\"11\" family=\"T\"/>\n\
+                 <fontspec id=\"1\" size=\"13\" family=\"T\"/>\n\
+                 <text top=\"{folio_top}\" left=\"295\" width=\"16\" height=\"14\" font=\"1\">{folio}</text>\n\
+                 <text top=\"120\" left=\"80\" width=\"440\" height=\"12\" font=\"0\">{body}</text>\n\
+                 </page>\n",
+                index + 1
+            ));
+        }
+        xml.push_str("</pdf2xml>");
+        xml
+    }
+
+    #[test]
+    fn page_folios_are_dropped_and_sentences_join_across_them() {
+        // A folio at the top of each page used to become the next page's
+        // first block, so the sentence below it was cut at every page break
+        // and a word hyphenated across the break stayed split.
+        let xml = single_line_pages_xml(&[
+            (
+                "11",
+                "The opening sentence of this invented book runs past the con-",
+                40,
+            ),
+            (
+                "12",
+                "figurations of its first page and has not stopped at the end of a",
+                40,
+            ),
+            ("13", "second page, ending only here.", 40),
+        ]);
+        let pages = parse_pdf2xml(&xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert_eq!(
+            texts(&result),
+            vec![
+                "The opening sentence of this invented book runs past the configurations of \
+                 its first page and has not stopped at the end of a second page, ending only \
+                 here."
+                    .to_string()
+            ]
+        );
+        let removed: Vec<usize> = result
+            .pages
+            .iter()
+            .map(|stats| stats.running_header_chars)
+            .collect();
+        assert_eq!(removed, vec![2, 2, 2], "folios count as margin furniture");
+    }
+
+    #[test]
+    fn roman_front_matter_folios_are_dropped() {
+        let xml = single_line_pages_xml(&[
+            ("i", "Preface page one.", 760),
+            ("ii", "Preface page two.", 760),
+            ("iii", "Preface page three.", 760),
+        ]);
+        let pages = parse_pdf2xml(&xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert_eq!(
+            texts(&result),
+            vec![
+                "Preface page one.",
+                "Preface page two.",
+                "Preface page three."
+            ]
+        );
+    }
+
+    #[test]
+    fn margin_numbers_without_a_page_sequence_stay_text() {
+        // Margin numbers whose values do not track the page distance, and a
+        // bare year in the body, are content rather than folios.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="40" left="295" width="12" height="12" font="0">7</text>
+<text top="120" left="80" width="440" height="12" font="0">First page prose ends here.</text>
+<text top="400" left="80" width="40" height="12" font="0">1984</text>
+</page>
+<page number="2" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="40" left="295" width="12" height="12" font="0">42</text>
+<text top="120" left="80" width="440" height="12" font="0">Second page prose ends here.</text>
+</page>
+</pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let texts = texts(&reconstruct(&pages, ColumnMode::Auto));
+
+        for kept in ["7", "1984", "42"] {
+            assert!(
+                texts.iter().any(|text| text == kept),
+                "{kept} must stay: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn centred_heading_lines_form_one_heading() {
+        // A title wrapped over three centred lines with heading leading used
+        // to become three headings, translated and listed in the navigation
+        // one fragment at a time. Same-size headings far apart stay separate.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<fontspec id="1" size="22" family="T"/>
+<text top="120" left="110" width="380" height="22" font="1">AN INVENTED TITLE THAT</text>
+<text top="148" left="200" width="200" height="22" font="1">WRAPS ACROSS</text>
+<text top="176" left="160" width="280" height="22" font="1">THREE CENTRED LINES</text>
+<text top="260" left="80" width="440" height="12" font="0">Body prose follows the title and runs long enough to</text>
+<text top="275" left="80" width="440" height="12" font="0">make eleven points the body size, as it is in any book.</text>
+<text top="420" left="200" width="200" height="22" font="1">A LATER HEADING</text>
+<text top="520" left="200" width="200" height="22" font="1">ANOTHER HEADING</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert_eq!(
+            texts(&result),
+            vec![
+                "AN INVENTED TITLE THAT WRAPS ACROSS THREE CENTRED LINES",
+                "Body prose follows the title and runs long enough to make eleven points the \
+                 body size, as it is in any book.",
+                "A LATER HEADING",
+                "ANOTHER HEADING",
+            ]
+        );
+        assert!(matches!(result.blocks[0].block, DocBlock::Heading { .. }));
+    }
+
+    fn superscripts(result: &Reconstruction) -> Vec<String> {
+        result
+            .blocks
+            .iter()
+            .flat_map(|anchored| match &anchored.block {
+                DocBlock::Paragraph { spans } | DocBlock::Heading { spans, .. } => spans.clone(),
+                _ => Vec::new(),
+            })
+            .filter(|span| span.superscript)
+            .map(|span| span.text)
+            .collect()
+    }
+
+    #[test]
+    fn mid_line_note_marks_stay_in_their_sentence_as_superscripts() {
+        // pdftohtml reports a raised note mark as its own line, below the
+        // line's top; it used to become a paragraph of its own and cut the
+        // sentence in two.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<fontspec id="1" size="7" family="T"/>
+<text top="120" left="80" width="440" height="12" font="0">A long invented sentence keeps going so that the</text>
+<text top="135" left="80" width="200" height="12" font="0">body size is clear, and here it cites</text>
+<text top="136" left="282" width="8" height="7" font="1">87</text>
+<text top="135" left="292" width="200" height="12" font="0">and then carries on.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert_eq!(
+            texts(&result),
+            vec![
+                "A long invented sentence keeps going so that the body size is clear, and here \
+                 it cites87 and then carries on."
+            ]
+        );
+        assert_eq!(superscripts(&result), vec!["87"]);
+    }
+
+    #[test]
+    fn line_end_note_marks_attach_without_trailing_space() {
+        // The host line's reported width includes trailing spaces, so the
+        // mark lies "inside" it; the spaces must not separate the mark.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<fontspec id="1" size="7" family="T"/>
+<text top="120" left="80" width="440" height="12" font="0">Another invented line ends on a quotation.”  </text>
+<text top="121" left="330" width="8" height="7" font="1">83</text>
+<text top="135" left="80" width="440" height="12" font="0">The next line continues the very same paragraph.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert_eq!(
+            texts(&result),
+            vec![
+                "Another invented line ends on a quotation.”83 The next line continues the very \
+                 same paragraph."
+            ]
+        );
+        assert_eq!(superscripts(&result), vec!["83"]);
+    }
+
+    #[test]
+    fn lowered_small_digits_are_not_superscripts() {
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<fontspec id="1" size="7" family="T"/>
+<text top="100" left="80" width="440" height="12" font="0">Body text sets the size of this invented page well.</text>
+<text top="120" left="80" width="200" height="12" font="0">Water is written H</text>
+<text top="126" left="282" width="6" height="7" font="1">2</text>
+<text top="120" left="290" width="230" height="12" font="0">O in this invented line.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert!(superscripts(&result).is_empty(), "{:?}", result.blocks);
+    }
+
+    #[test]
+    fn a_font_first_declared_mid_paragraph_does_not_split_it() {
+        // Page 2 mixes a body font declared on page 1 with a same-size font
+        // (say, the ligature subset) first declared on page 2. Fragment
+        // heights differ from the declared size, as pdftohtml reports them.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+<fontspec id="0" size="15" family="Body"/>
+<text top="120" left="80" width="440" height="18" font="0">The invented book opens with a finished sentence.</text>
+</page>
+<page number="2" width="600" height="800">
+<fontspec id="1" size="15" family="BodyLigatures"/>
+<text top="120" left="80" width="440" height="18" font="0">A paragraph on the second page runs into a</text>
+<text top="138" left="80" width="440" height="18" font="1">line set in the newly declared font and then</text>
+<text top="156" left="80" width="440" height="18" font="0">returns to the first font to finish.</text>
+</page>
+</pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert_eq!(
+            texts(&result),
+            vec![
+                "The invented book opens with a finished sentence.",
+                "A paragraph on the second page runs into a line set in the newly declared font \
+                 and then returns to the first font to finish.",
+            ]
+        );
+    }
+
     #[test]
     fn running_header_chars_are_tracked_for_the_coverage_threshold() {
         // PDF-6: pages whose deficit is exactly the removed running
@@ -1035,6 +1570,106 @@ mod tests {
             panic!("heading expected, got {:?}", result.blocks[0].block);
         };
         assert_eq!(*level, 1, "the largest USED size ranks first, got {level}");
+    }
+
+    #[test]
+    fn one_page_display_sizes_do_not_take_levels_from_recurring_headings() {
+        // A title page set in two one-off sizes above the chapter size used
+        // to claim h1 and h2, leaving the section and subsection sizes with
+        // no level: every section heading became a paragraph.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<fontspec id="1" size="40" family="T"/>
+<fontspec id="2" size="32" family="T"/>
+<fontspec id="3" size="26" family="T"/>
+<fontspec id="4" size="20" family="T"/>
+<fontspec id="5" size="16" family="T"/>
+<text top="200" left="100" width="400" height="40" font="1">An Invented Book</text>
+<text top="300" left="100" width="400" height="32" font="2">Its Invented Subtitle</text>
+</page>
+<page number="2" width="600" height="800">
+<text top="150" left="80" width="440" height="26" font="3">First Chapter</text>
+<text top="200" left="80" width="440" height="20" font="4">1.1 A Section</text>
+<text top="240" left="80" width="440" height="16" font="5">A Subsection</text>
+<text top="280" left="80" width="440" height="12" font="0">Body prose runs long enough here to make eleven points the body size.</text>
+</page>
+<page number="3" width="600" height="800">
+<text top="150" left="80" width="440" height="26" font="3">Second Chapter</text>
+<text top="200" left="80" width="440" height="20" font="4">2.1 Another Section</text>
+<text top="240" left="80" width="440" height="16" font="5">Another Subsection</text>
+<text top="280" left="80" width="440" height="12" font="0">More body prose follows, again long enough to outweigh the headings.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        // Heading level per block in reading order; 0 marks a paragraph.
+        let levels: Vec<u8> = result
+            .blocks
+            .iter()
+            .map(|anchored| match &anchored.block {
+                DocBlock::Heading { level, .. } => *level,
+                _ => 0,
+            })
+            .collect();
+        assert_eq!(texts(&result)[1], "Its Invented Subtitle");
+        assert_eq!(levels, [1, 1, 1, 2, 3, 0, 1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn text_carried_onto_a_later_page_is_recorded_against_it() {
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<text top="400" left="80" width="440" height="12" font="0">A sentence that runs on past the</text>
+</page>
+<page number="2" width="600" height="800">
+<text top="400" left="80" width="440" height="12" font="0">end of its page.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert_eq!(
+            texts(&result),
+            vec!["A sentence that runs on past the end of its page."]
+        );
+        assert_eq!(
+            result.carried,
+            vec![CarriedText {
+                page: 2,
+                anchor_page: 1,
+                chars: 13,
+            }]
+        );
+    }
+
+    #[test]
+    fn text_past_the_page_edge_is_read_once() {
+        // A title set across a two-page spread is reported on both pages,
+        // shifted past the edge of the first, and was translated twice.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<fontspec id="1" size="30" family="T"/>
+<text top="200" left="80" width="440" height="12" font="0">The verso page closes its chapter here.</text>
+<text top="300" left="690" width="400" height="30" font="1">A SPREAD TITLE</text>
+</page>
+<page number="2" width="600" height="800">
+<text top="300" left="90" width="400" height="30" font="1">A SPREAD TITLE</text>
+<text top="400" left="80" width="440" height="12" font="0">The recto page opens the next chapter.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert_eq!(
+            texts(&result),
+            vec![
+                "The verso page closes its chapter here.",
+                "A SPREAD TITLE",
+                "The recto page opens the next chapter.",
+            ]
+        );
+        assert_eq!(result.offpage_dropped_fragments, 1);
     }
 
     #[test]
