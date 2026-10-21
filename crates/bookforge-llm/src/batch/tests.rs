@@ -2169,6 +2169,48 @@ impl LlmProviderTrait for Arc<AlwaysTransientProvider> {
     }
 }
 
+/// Fails its first call with a real connection error (nothing listens on
+/// `refused_url`), then echoes the batch prompt.
+struct ConnectFailsOnceProvider {
+    calls: AtomicUsize,
+    refused_url: String,
+}
+
+impl LlmProviderTrait for Arc<ConnectFailsOnceProvider> {
+    async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            reqwest::get(&self.refused_url).await?;
+            unreachable!("nothing listens on the refused port");
+        }
+        let item_ids = item_ids_from_batch_prompt(&request.user);
+        Ok(CompletionResponse {
+            content: serde_json::json!({
+                "items": item_ids
+                    .into_iter()
+                    .map(|id| serde_json::json!({
+                        "translation": format!("[it] {id}"),
+                        "id": id,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+            .to_string(),
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            finish_reason: FinishReason::Stop,
+            provider_latency_ms: 0,
+            raw: serde_json::json!({}),
+        })
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_response_format: true,
+            supports_usage_tokens: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DecodeFailureMode {
     FirstRequest,
@@ -2807,6 +2849,54 @@ async fn single_item_invalid_response_retries_before_needs_review() {
     assert_eq!(translations.len(), 1);
     assert_eq!(translations[0].status, SegmentStatus::Succeeded);
     assert_eq!(translations[0].joined_text(), "[it] Hello");
+}
+
+#[tokio::test]
+async fn connect_errors_are_retried_even_when_one_attempt_is_configured() {
+    // A refused connection never reaches the provider. With the single
+    // attempt the default profile allows, it used to fail the whole batch.
+    // Port 1 is privileged and never bound by tests; a port freed after
+    // binding it could be handed to another test's server in the meantime.
+    let refused_url = "http://127.0.0.1:1".to_string();
+    let segment = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+    let segments = vec![segment];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1000,
+        max_items: 1,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let provider = Arc::new(ConnectFailsOnceProvider {
+        calls: AtomicUsize::new(0),
+        refused_url,
+    });
+    let mut config = test_run_config();
+    config.scheduler.max_attempts = 1;
+
+    let translations = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        translate_batches_with_callback(
+            provider.clone(),
+            batches,
+            &segments,
+            &config,
+            Arc::new(TelemetryLog::new()),
+            None,
+            None,
+            Arc::new(bookforge_core::NullProgressSink),
+            None,
+            |_| Ok(()),
+        ),
+    )
+    .await
+    .expect("a refused connection fails fast")
+    .expect("a connect error should be retried");
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
 }
 
 #[tokio::test]

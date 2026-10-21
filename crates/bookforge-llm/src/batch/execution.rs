@@ -373,9 +373,17 @@ fn is_empty_content_error(message: &str) -> bool {
     message.starts_with("the model produced no content")
 }
 
+/// Batch-level attempts a connection failure always gets. The request never
+/// reached the provider, so a retry costs nothing; with the one attempt the
+/// default profile allows, a momentary TLS or connect hiccup used to fail
+/// every item of the batch.
+const CONNECT_ERROR_MIN_ATTEMPTS: usize = 3;
+
 fn transient_batch_attempt_limit(configured_limit: usize, error: &LlmError) -> usize {
     let configured_limit = configured_limit.max(1);
-    if is_response_transport_error(error)
+    if matches!(error, LlmError::Http(error) if error.is_connect()) {
+        configured_limit.max(CONNECT_ERROR_MIN_ATTEMPTS)
+    } else if is_response_transport_error(error)
         || matches!(error, LlmError::InvalidResponse(message) if is_empty_content_error(message))
     {
         configured_limit.max(2)
