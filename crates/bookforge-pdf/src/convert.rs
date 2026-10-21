@@ -21,7 +21,9 @@ use crate::{
     },
     ocr::OcrEngine,
     parse::parse_pdf2xml,
-    reconstruct::{AnchoredBlock, BlockAnchor, PageStats, reconstruct_with_chapter_guard},
+    reconstruct::{
+        AnchoredBlock, BlockAnchor, CarriedText, PageStats, reconstruct_with_chapter_guard,
+    },
     report::{ConversionReport, LOW_CONFIDENCE_COVERAGE_RATIO, ReportMetrics},
     tools::{
         ExtractedImage, PDF_RENDER_DPI, PDF_XML_ZOOM_DEN, PDF_XML_ZOOM_NUM, PageCrop,
@@ -169,6 +171,12 @@ fn convert_pdf_with_tools(
             reconstruction.rotated_dropped_fragments
         ));
     }
+    if reconstruction.offpage_dropped_fragments > 0 {
+        layout_warnings.push(format!(
+            "{} text fragment(s) lying wholly outside their page were excluded from the reading flow (typically the far half of a title set across a two-page spread)",
+            reconstruction.offpage_dropped_fragments
+        ));
+    }
     if let Some(caption_warning) = skipped_foreign_caption_warning(&pages) {
         layout_warnings.push(caption_warning);
     }
@@ -218,7 +226,7 @@ fn convert_pdf_with_tools(
         )?);
     }
     layout_warnings.extend(media_layout_warnings(&blocks));
-    refresh_page_char_counts(&mut page_stats, &blocks);
+    refresh_page_char_counts(&mut page_stats, &blocks, &reconstruction.carried);
     let reconstructed_chars: usize = blocks
         .iter()
         .map(|anchored| anchored.block.char_count())
@@ -339,8 +347,16 @@ fn max_ocr_render_dpi(width_pts: f64, height_pts: f64, cap_pixels: u64) -> u32 {
 /// Refresh per-page character counts from the final block list so OCR
 /// replacement and image preservation are reflected in the report
 /// instead of leaving stale pre-replacement numbers behind.
-fn refresh_page_char_counts(page_stats: &mut [PageStats], blocks: &[AnchoredBlock]) {
-    for stats in page_stats {
+///
+/// A paragraph running on from an earlier page counts toward its anchor,
+/// so the share read on each later page is moved back to it: otherwise a
+/// page filled by one paragraph's continuation reports no text at all.
+fn refresh_page_char_counts(
+    page_stats: &mut [PageStats],
+    blocks: &[AnchoredBlock],
+    carried: &[CarriedText],
+) {
+    for stats in page_stats.iter_mut() {
         stats.chars = blocks
             .iter()
             .filter(|anchored| anchored.anchor.page == stats.page)
@@ -355,6 +371,17 @@ fn refresh_page_char_counts(page_stats: &mut [PageStats], blocks: &[AnchoredBloc
             .iter()
             .filter(|anchored| anchored.anchor.page == stats.page)
             .count();
+    }
+    for text in carried {
+        if let Some(anchor) = page_stats
+            .iter_mut()
+            .find(|stats| stats.page == text.anchor_page)
+        {
+            anchor.chars = anchor.chars.saturating_sub(text.chars);
+        }
+        if let Some(source) = page_stats.iter_mut().find(|stats| stats.page == text.page) {
+            source.chars += text.chars;
+        }
     }
 }
 

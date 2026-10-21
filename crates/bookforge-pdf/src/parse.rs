@@ -27,6 +27,12 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
     reader.config_mut().trim_text(false);
 
     let mut pages = Vec::new();
+    // pdftohtml declares each <fontspec> once, on the first page that uses
+    // the font, and later pages reference the id without redeclaring it.
+    // Sizes are therefore document-wide; resolving them per page fell back
+    // to fragment heights (another unit) on every later page, so one font
+    // read as two sizes and paragraphs split where a new font appeared.
+    let mut declared_font_sizes: HashMap<u32, u32> = HashMap::new();
     let mut current_page: Option<Page> = None;
     let mut current_fragment: Option<Fragment> = None;
     let mut bold_depth = 0usize;
@@ -61,7 +67,7 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                     height,
                     fragments: Vec::new(),
                     images: Vec::new(),
-                    font_sizes: HashMap::new(),
+                    font_sizes: declared_font_sizes.clone(),
                 });
             }
             Event::Empty(element) if local(element.name().as_ref().as_bytes()) == b"fontspec" => {
@@ -83,6 +89,7 @@ pub fn parse_pdf2xml(xml: &str) -> Result<Vec<Page>> {
                 }
                 if let (Some(id), Some(size)) = (id, size) {
                     page.font_sizes.insert(id, size);
+                    declared_font_sizes.insert(id, size);
                 }
             }
             Event::Start(element) if local(element.name().as_ref().as_bytes()) == b"text" => {
@@ -216,6 +223,7 @@ fn push_span(fragment: &mut Fragment, text: &str, bold: bool, italic: bool) {
         text: text.to_string(),
         bold,
         italic,
+        superscript: false,
     });
 }
 
@@ -249,6 +257,26 @@ mod tests {
 </pdf2xml>"##;
 
     #[test]
+    fn font_sizes_declared_on_an_earlier_page_apply_to_later_pages() {
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml>
+<page number="1" width="600" height="800">
+  <fontspec id="0" size="15" family="Body"/>
+  <text top="100" left="80" width="400" height="18" font="0">First page.</text>
+</page>
+<page number="2" width="600" height="800">
+  <fontspec id="1" size="15" family="BodyLigatures"/>
+  <text top="100" left="80" width="400" height="18" font="0">Second page.</text>
+</page>
+</pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+
+        assert_eq!(pages[1].font_sizes.get(&0), Some(&15));
+        assert_eq!(pages[1].font_sizes.get(&1), Some(&15));
+        assert_eq!(pages[0].font_sizes.get(&1), None, "no font from the future");
+    }
+
+    #[test]
     fn parses_pages_fonts_and_styled_fragments() {
         let pages = parse_pdf2xml(SAMPLE).expect("sample should parse");
         assert_eq!(pages.len(), 1);
@@ -269,17 +297,20 @@ mod tests {
                 Span {
                     text: "A ".into(),
                     bold: false,
-                    italic: false
+                    italic: false,
+                    superscript: false,
                 },
                 Span {
                     text: "Bold".into(),
                     bold: true,
-                    italic: false
+                    italic: false,
+                    superscript: false,
                 },
                 Span {
                     text: " Title".into(),
                     bold: false,
-                    italic: false
+                    italic: false,
+                    superscript: false,
                 },
             ]
         );

@@ -708,11 +708,16 @@ fn render_spans(spans: &[Span]) -> String {
     let mut out = String::new();
     for span in spans {
         let text = escape_text(span.text.trim_matches('\u{0}'));
-        match (span.bold, span.italic) {
-            (true, true) => out.push_str(&format!("<b><i>{text}</i></b>")),
-            (true, false) => out.push_str(&format!("<b>{text}</b>")),
-            (false, true) => out.push_str(&format!("<i>{text}</i>")),
-            (false, false) => out.push_str(&text),
+        let styled = match (span.bold, span.italic) {
+            (true, true) => format!("<b><i>{text}</i></b>"),
+            (true, false) => format!("<b>{text}</b>"),
+            (false, true) => format!("<i>{text}</i>"),
+            (false, false) => text,
+        };
+        if span.superscript {
+            out.push_str(&format!("<sup>{styled}</sup>"));
+        } else {
+            out.push_str(&styled);
         }
     }
     out.trim().to_string()
@@ -758,6 +763,7 @@ mod tests {
             text: text.to_string(),
             bold: false,
             italic: false,
+            superscript: false,
         }
     }
 
@@ -779,6 +785,20 @@ mod tests {
     }
 
     #[test]
+    fn superscript_spans_render_as_sup() {
+        let mark = Span {
+            text: "87".to_string(),
+            bold: false,
+            italic: true,
+            superscript: true,
+        };
+        assert_eq!(
+            render_spans(&[span("it cites"), mark, span(" and goes on.")]),
+            "it cites<sup><i>87</i></sup> and goes on."
+        );
+    }
+
+    #[test]
     fn produced_epub_is_readable_by_the_bookforge_reader() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("converted.epub");
@@ -794,6 +814,7 @@ mod tests {
                         text: "emphasis".into(),
                         bold: false,
                         italic: true,
+                        superscript: false,
                     },
                     span(" & escapes <ok>."),
                 ],
