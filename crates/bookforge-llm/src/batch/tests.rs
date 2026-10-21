@@ -2829,7 +2829,9 @@ async fn single_item_invalid_response_retries_before_needs_review() {
     ]);
     let telemetry = Arc::new(TelemetryLog::new());
     let mut config = test_run_config();
-    config.scheduler.max_attempts = 2;
+    // One configured attempt still allows a fresh sample for an item that
+    // cannot be bisected.
+    config.scheduler.max_attempts = 1;
 
     let translations = translate_batches_with_callback(
         provider,

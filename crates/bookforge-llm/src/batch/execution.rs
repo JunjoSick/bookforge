@@ -1448,7 +1448,11 @@ where
                         {
                             4
                         } else {
-                            config.scheduler.max_attempts.max(1)
+                            // An item that can no longer be bisected gets one
+                            // fresh sample even when the profile allows a single
+                            // attempt: bisection already gave the rest of its
+                            // batch several, and malformed JSON rarely repeats.
+                            config.scheduler.max_attempts.max(2)
                         };
                     if attempts < compact_retry_limit {
                         for item in &batch.items {
