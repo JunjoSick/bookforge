@@ -4342,14 +4342,17 @@ fn latency_planning_leaves_batches_alone_without_a_timeout() {
     assert_eq!(parts.len(), 1);
 }
 
-/// A request whose computed output budget implies more generation time than
-/// the latency share of the configured timeout is split *before dispatch*,
+/// A batch whose expected output implies more generation time than the
+/// latency share of the configured timeout is split *before dispatch*,
 /// instead of being sent with a budget that can only succeed by luck.
 #[tokio::test]
-async fn latency_aware_dispatch_splits_oversized_output_budgets() {
+async fn latency_aware_dispatch_splits_oversized_expected_output() {
     let seg = make_segment(
         "seg_dispatch",
-        vec![plain_block("Hello"), plain_block("Goodbye")],
+        ["One", "Two", "Three", "Four", "Five", "Six"]
+            .into_iter()
+            .map(plain_block)
+            .collect(),
         vec![],
     );
     let segments = vec![seg];
@@ -4363,16 +4366,16 @@ async fn latency_aware_dispatch_splits_oversized_output_budgets() {
     };
     let batches = build_translation_batches(&segments, &batch_config, TranslationProfile::Balanced);
     assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].items.len(), 2);
+    assert_eq!(batches[0].items.len(), 6);
 
     let provider = GatedPromptEchoProvider::new();
     let events = Arc::new(Mutex::new(Vec::new()));
     let mut config = test_run_config();
     config.scheduler.concurrency = 1;
-    // 20s timeout: the planning output cap (480 tokens) still admits the
-    // two-item batch (expected output ~260), but the computed 512-token
-    // request budget implies ~17s of generation at the conservative 30 tok/s
-    // floor — beyond 0.8 * 20s — so the batch must be split before dispatch.
+    // 20s timeout: ~16s of generation at the conservative 30 tok/s floor
+    // allows 480 output tokens. Six items carry ~520 expected tokens of JSON
+    // envelope alone, so the batch must be split before dispatch; each half
+    // of three (~330) fits.
     config.runtime_settings = Some(
         EngineRuntimeSettings {
             revision: 1,
@@ -4404,30 +4407,83 @@ async fn latency_aware_dispatch_splits_oversized_output_budgets() {
     .await
     .expect("latency split should complete successfully");
 
-    // Both items still translated, via two single-item requests.
+    // Every item still translated, via two three-item requests. The batch
+    // sizer's normalization makes this split; the dispatch check applies the
+    // same expected-output rule where no sizer runs.
     assert_eq!(translations.len(), 1);
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
     assert_eq!(provider.started.load(Ordering::Acquire), 2);
-    let mut budgets = provider.budgets.lock().unwrap().clone();
-    budgets.sort_by_key(|(index, _)| *index);
-    assert_eq!(
-        budgets,
-        vec![(0, Some(512)), (1, Some(512))],
-        "each single-item child dispatches with the floored budget"
+}
+
+/// A batch the planner sized to fit is dispatched whole even when its
+/// truncation budget alone, at the throughput floor, would exceed the
+/// latency share: the budget runs several times the expected output, and
+/// judging by it split one book's planned batches into 376 tiny requests.
+#[tokio::test]
+async fn latency_check_judges_expected_output_not_the_budget() {
+    let seg = make_segment(
+        "seg_dispatch",
+        vec![plain_block("Hello"), plain_block("Goodbye")],
+        vec![],
+    );
+    let segments = vec![seg];
+    let batch_config = BatchConfig {
+        enabled: true,
+        target_tokens: 16_000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &batch_config, TranslationProfile::Balanced);
+    assert_eq!(batches.len(), 1);
+
+    let provider = GatedPromptEchoProvider::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut config = test_run_config();
+    config.scheduler.concurrency = 1;
+    // 20s timeout: the 512-token floor budget implies ~17s at 30 tok/s,
+    // beyond 0.8 * 20s, but the ~260 tokens expected fit comfortably.
+    config.runtime_settings = Some(
+        EngineRuntimeSettings {
+            revision: 1,
+            batch: batch_config,
+            batch_max_output_tokens: None,
+            concurrency: 1,
+            provider_max_attempts: 1,
+            adaptive_concurrency: false,
+            timeout_seconds: 20,
+        }
+        .frozen_receiver(),
     );
 
-    let split_emitted = events
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|event| matches!(event, bookforge_core::ProgressEvent::BatchSplit { .. }));
-    assert!(split_emitted, "the latency split must be observable");
+    provider.release.add_permits(2);
+    let translations = translate_batches_with_callback(
+        provider.clone(),
+        batches,
+        &segments,
+        &config,
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(RecordingProgress {
+            events: events.clone(),
+        }),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("the batch should translate in one request");
+
+    assert_eq!(translations.len(), 1);
+    assert_eq!(provider.started.load(Ordering::Acquire), 1);
     let latency_warning = events.lock().unwrap().iter().any(|event| {
         matches!(
             event,
             bookforge_core::ProgressEvent::Warning { kind, .. } if kind == "batch_latency_split"
         )
     });
-    assert!(latency_warning, "the split reason must be surfaced");
+    assert!(!latency_warning, "nothing should be split for latency");
 }
 
 /// The watchdog emits RequestProgress heartbeats while a batch request is in

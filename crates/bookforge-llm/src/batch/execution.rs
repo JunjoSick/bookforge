@@ -397,19 +397,29 @@ fn should_bisect_transient_batch(error: &LlmError) -> bool {
         || matches!(error, LlmError::InvalidResponse(message) if is_empty_content_error(message))
 }
 
-/// Whether the request a batch would produce implies a generation time
-/// beyond the latency-planning share of the configured timeout. Mirrors the
-/// budget computation the worker itself performs (the frozen runtime snapshot
-/// may adjust it by a revision in rare races; the check is a planning
-/// heuristic, not a hard guarantee).
+/// Whether the output a batch is expected to produce implies a generation
+/// time beyond the latency-planning share of the configured timeout.
+///
+/// Judged on the planner's own expected-output estimate, not on the
+/// request's truncation budget, which runs three to five times larger.
+/// Pairing that budget with the throughput floor split every batch the
+/// planner had just sized to fit: one book's 114 planned batches went out as
+/// 376 requests of about two paragraphs each, and the repeated prompt
+/// scaffold more than doubled input tokens. The budget itself is unchanged,
+/// and the provider extends the timeout of any request whose budget needs it.
 fn latency_split_warranted(
     batch: &TranslationBatch,
-    config: &TranslationRunConfig,
     reasoning: bool,
     timeout_seconds: u64,
 ) -> bool {
-    let budget = capped_batch_max_output_tokens(batch, config, reasoning);
-    crate::latency::expected_generation_seconds(budget)
+    let expected = expected_batch_output_tokens(batch.mode, &batch.items);
+    // Visible reasoning is generated ahead of the answer, at the same rate.
+    let expected = if reasoning {
+        expected.saturating_mul(3)
+    } else {
+        expected
+    };
+    crate::latency::expected_generation_seconds(u32::try_from(expected).unwrap_or(u32::MAX))
         > crate::latency::PLANNING_TIMEOUT_SHARE
             * f64::from(u32::try_from(timeout_seconds).unwrap_or(u32::MAX))
 }
@@ -675,7 +685,7 @@ where
                 let output_override =
                     take_batch_output_override(&mut escalated_output_tokens_by_item, &batch);
                 // Latency-aware request shaping (#3a): before dispatching,
-                // check that the request's own output budget implies a
+                // check that the batch's expected output implies a
                 // generation time that fits under the effective timeout. If
                 // not, prefer splitting — the same bisection the invalid-
                 // response path uses — instead of sending a request that can
@@ -686,12 +696,7 @@ where
                 if output_override.is_none()
                     && batch.items.len() > 1
                     && let Some(timeout_seconds) = configured_timeout_seconds(Some(config.as_ref()))
-                    && latency_split_warranted(
-                        &batch,
-                        config.as_ref(),
-                        provider.is_reasoning(),
-                        timeout_seconds,
-                    )
+                    && latency_split_warranted(&batch, provider.is_reasoning(), timeout_seconds)
                 {
                     let split = split_batch_with_config(&batch, Some(config.as_ref()));
                     if split.len() == 2 {
