@@ -519,10 +519,9 @@ fn write_overrides_atomically(path: &Path, loaded: &LoadedOverrides) -> Result<(
         overrides: loaded.overrides.clone(),
     };
     let json = serde_json::to_string_pretty(&envelope)?;
-    // The shared atomic writer: staged temp + atomic install. On Windows this
-    // is `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` — never a remove/rename-aside
-    // dance — so the previous revision survives any crash/power loss until the
-    // new one is durably published.
+    // The shared atomic writer: staged temp + atomic rename over the target,
+    // never a remove/rename-aside dance, so the previous revision survives any
+    // crash/power loss until the new one is durably published.
     crate::control::atomic_replace(
         path,
         format!("{json}\n").as_bytes(),
