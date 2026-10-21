@@ -48,8 +48,9 @@ use planning::repack_batch;
 pub use planning::{account_for_batch_prompt_overhead, build_translation_batches, split_batch};
 use planning::{
     adaptive_sizer_mut, batch_prompt_estimate, configured_timeout_seconds,
-    increment_batch_item_attempts, normalize_batch_for_current_sizer, repartition_pending_batches,
-    set_batch_output_override, split_batch_with_config, take_batch_output_override, token_estimate,
+    expected_batch_output_tokens, increment_batch_item_attempts, normalize_batch_for_current_sizer,
+    repartition_pending_batches, set_batch_output_override, split_batch_with_config,
+    take_batch_output_override, token_estimate,
 };
 pub use rendering::batch_item_validation_error;
 pub use rendering::blocking_source_copy_error;

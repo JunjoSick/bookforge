@@ -25,6 +25,25 @@
   denied (os error 5)". The resume signal replaced the worker's control file
   while the paused worker was reading it; control and sidecar files are now
   replaced with POSIX rename semantics, which succeed during such reads.
+- Fix `translate --validate-output` failing after the translation whenever
+  `--out` was a bare file name such as `book.it.epub`. The output and its
+  validation report were compared through their parent directory, and a bare
+  name's parent is the empty path, which could not be resolved. The EPUB was
+  written, but the run exited 1 without its validation and report files.
+- Retry batch requests that fail to connect at least three times, whatever the
+  profile allows. A connection error never reaches the provider and is never
+  billed, but under the default one-attempt profile it failed every item of
+  its batch; on one book that left 15 paragraphs untranslated.
+- Stop splitting batches the planner has already sized to fit the timeout.
+  The check before sending judged a batch by its truncation budget, about
+  three times its expected output, so batches went out a few paragraphs at a
+  time: one book's 114 planned batches became 376 requests. The check now
+  uses the planner's own expected-output estimate; output budgets and the
+  per-request timeout extension are unchanged. On the same book requests fell
+  to 164 and untranslated paragraphs from 25 to 2.
+- Give a single paragraph that came back as malformed JSON one more attempt,
+  even when the profile allows only one. Larger batches already got several
+  through bisection.
 - Stop untranslated prose from hiding behind reference context. A Notes,
   Bibliography, References, Works Cited or Index section title, a leading
   `p. 12.`, or an `in English:` gloss now only excuses an unchanged block
