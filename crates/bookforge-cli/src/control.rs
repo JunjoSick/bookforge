@@ -128,10 +128,9 @@ pub(crate) enum ReplaceMode {
 /// Content is staged into a uniquely named temp file inside the destination
 /// directory, fsynced, and only then installed, so a crash or failed write can
 /// never leave a truncated sidecar at the canonical path:
-/// - [`ReplaceMode::Replace`] renames over the destination (atomic on Unix;
-///   Windows uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` which atomically
-///   replaces without ever removing the previous file first, so a crash or
-///   power loss never destroys the only good state before publication).
+/// - [`ReplaceMode::Replace`] renames over the destination in one atomic step
+///   on every platform, never removing the previous file first, so a crash or
+///   power loss never destroys the only good state before publication.
 /// - [`ReplaceMode::CreateExclusive`] installs through a hard link so exactly
 ///   one caller wins and no rival's freshly written claim is ever overwritten;
 ///   filesystems without hard-link support fall back to an exclusive
@@ -193,43 +192,14 @@ fn sync_parent_dir(path: &Path) {
     }
 }
 
-/// Atomic rename over `path`. Unix `rename(2)` replaces atomically.
-#[cfg(not(windows))]
+/// Atomic rename over `path`, replacing it in one step with no window in
+/// which it is missing; on failure the destination is left byte-for-byte
+/// intact. On Windows `fs::rename` uses POSIX rename semantics, so it also
+/// succeeds while another process is reading the destination (a paused
+/// worker polls its control file). A direct `MoveFileExW` failed with
+/// ERROR_ACCESS_DENIED in that case, so resuming a paused job could fail.
 fn rename_replacing(staged: &Path, path: &Path) -> std::io::Result<()> {
     fs::rename(staged, path)
-}
-
-/// Atomic replace over an existing `path` on Windows, where `rename` refuses
-/// to overwrite. `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` replaces the
-/// destination in one atomic operation with no window in which the destination
-/// is missing, and on failure leaves the previous file byte-for-byte intact.
-/// The caller cleans the staged temp; the destination is never touched when
-/// the API fails, so a crash/power loss can never destroy the only good state
-/// before publication.
-#[cfg(windows)]
-fn rename_replacing(staged: &Path, path: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    let from: Vec<u16> = staged.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: both arguments are NUL-terminated wide strings that outlive the
-    // call, and the path arguments are independently validated by the OS.
-    let replaced = unsafe {
-        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING,
-        )
-    };
-    if replaced != 0 {
-        return Ok(());
-    }
-    // MoveFileExW failed: surface the OS error. No rename-aside fallback is
-    // attempted — it would briefly remove the destination (widening the crash
-    // window and risking the only good state on power loss), which is exactly
-    // what the fail-closed writer exists to prevent.
-    Err(std::io::Error::last_os_error())
 }
 
 /// Exclusive install of `staged` at `path`. A hard link is atomic and fails
@@ -2057,6 +2027,24 @@ mod tests {
             !staged_left,
             "a failed replace must clean up its staged temp file"
         );
+    }
+
+    /// Resuming a paused job rewrites its control file while the paused worker
+    /// polls it. The replace must succeed even if that read holds the file
+    /// open; a direct `MoveFileExW` failed here with "Access is denied".
+    #[cfg(windows)]
+    #[test]
+    fn atomic_replace_succeeds_while_a_reader_holds_the_file_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control");
+        std::fs::write(&path, b"pause\n").unwrap();
+        let reader = std::fs::File::open(&path).unwrap();
+
+        atomic_replace(&path, b"resume\n", ReplaceMode::Replace)
+            .expect("replace must not fail while a poller holds the file open");
+
+        drop(reader);
+        assert_eq!(std::fs::read(&path).unwrap(), b"resume\n");
     }
 
     /// The exclusive create mode installs a fresh file and refuses to clobber

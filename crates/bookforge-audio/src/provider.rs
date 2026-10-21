@@ -817,17 +817,20 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_audio_response_with_oversized_content_length_before_buffering_body() {
-        let (base_url, _) = test_support::one_request_server_with_content_length(
-            b"ID3small-body".to_vec(),
-            "audio/mpeg",
-            MAX_AUDIO_RESPONSE_BODY_BYTES as u64 + 1,
-        );
-        let client = build_http_client(5).unwrap();
+        // The limit check is independent of the timeout; a generous one keeps
+        // a busy test machine from turning a slow fixture into a failure.
+        let client = build_http_client(60).unwrap();
         let cancel_token = CancellationToken::new();
         let error = match test_support::retry_transient_transport(|| {
+            // A one-request server per attempt, so a retried transient error
+            // reaches a live listener instead of a closed port.
+            let (base_url, _) = test_support::one_request_server_with_content_length(
+                b"ID3small-body".to_vec(),
+                "audio/mpeg",
+                MAX_AUDIO_RESPONSE_BODY_BYTES as u64 + 1,
+            );
             let client = client.clone();
             let cancel_token = cancel_token.clone();
-            let base_url = base_url.clone();
             async move {
                 send_with_retry(&cancel_token, 1, MAX_AUDIO_RESPONSE_BODY_BYTES, || {
                     client.get(&base_url)

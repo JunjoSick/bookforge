@@ -2300,8 +2300,18 @@ async fn invalid_json_endpoint(
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
-            let mut request = vec![0_u8; 8_192];
-            let _ = stream.read(&mut request).await;
+            // Read the whole request head, and drain after answering: a
+            // Windows socket closed with unread input sends RST, which can
+            // discard the response before the client reads it and turn the
+            // decode failure under test into a transport error.
+            let mut request = Vec::new();
+            let mut scratch = [0_u8; 4_096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut scratch).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&scratch[..read]),
+                }
+            }
             let body = b"{not-json";
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2310,6 +2320,10 @@ async fn invalid_json_endpoint(
             let _ = stream.write_all(header.as_bytes()).await;
             let _ = stream.write_all(body).await;
             let _ = stream.shutdown().await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while matches!(stream.read(&mut scratch).await, Ok(read) if read > 0) {}
+            })
+            .await;
         }
     });
     Some((format!("http://{address}"), handle))
@@ -2966,7 +2980,11 @@ async fn decode_error_retries_the_same_batch_before_response_validation() {
     .await
     .expect("decode retry should recover");
 
-    server.await.expect("invalid JSON server should finish");
+    // Bounded: a request the provider never makes must fail, not hang CI.
+    tokio::time::timeout(std::time::Duration::from_secs(30), server)
+        .await
+        .expect("invalid JSON server should receive every expected request")
+        .expect("invalid JSON server should finish");
     assert_eq!(*requested_item_counts.lock().unwrap(), [2, 2]);
     assert_eq!(translations[0].status, SegmentStatus::Succeeded);
     assert!(
@@ -3023,7 +3041,11 @@ async fn persistent_decode_error_bisects_an_oversized_batch_after_retry() {
     .await
     .expect("decode bisection should recover");
 
-    server.await.expect("invalid JSON server should finish");
+    // Bounded: a request the provider never makes must fail, not hang CI.
+    tokio::time::timeout(std::time::Duration::from_secs(30), server)
+        .await
+        .expect("invalid JSON server should receive every expected request")
+        .expect("invalid JSON server should finish");
     assert_eq!(*requested_item_counts.lock().unwrap(), [2, 2, 1, 1]);
     assert_eq!(translations[0].status, SegmentStatus::Succeeded);
     assert_eq!(translations[0].blocks.len(), 2);

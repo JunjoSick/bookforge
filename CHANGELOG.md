@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix resuming a paused job on Windows intermittently failing with "Access is
+  denied (os error 5)". The resume signal replaced the worker's control file
+  while the paused worker was reading it; control and sidecar files are now
+  replaced with POSIX rename semantics, which succeed during such reads.
 - Stop untranslated prose from hiding behind reference context. A Notes,
   Bibliography, References, Works Cited or Index section title, a leading
   `p. 12.`, or an `in English:` gloss now only excuses an unchanged block
