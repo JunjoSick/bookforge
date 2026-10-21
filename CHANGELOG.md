@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Rebuild typeset books from PDF with far fewer broken paragraphs. Page
+  numbers are recognised from their page-to-page sequence and dropped, so a
+  sentence running over a page break stays one paragraph instead of being
+  cut by the folio. Note reference marks stay inline in their sentence as
+  `<sup>` instead of becoming paragraphs of their own, a title wrapped over
+  several centred lines becomes one heading, and font sizes declared on an
+  earlier page apply to later ones. On one 213-page book the paragraph count
+  fell from 1,604 to 885 and stray note numbers from 416 to 8.
+- Rank PDF heading sizes that recur across pages ahead of one-off title-page
+  type. A cover and title page set in two large sizes used to take two of the
+  three heading levels, leaving section headings as plain paragraphs.
+- Read a title set across a two-page spread once. Text lying wholly outside
+  its page is skipped and counted in the conversion report.
+- Stop `convert` from leaving pdftohtml's page images next to the source
+  PDF. They were never used and stayed behind after every conversion.
+- Credit text that continues a paragraph from an earlier page to the page it
+  was read on, and stop warning about pages whose only text was a page number
+  or running header. The conversion report no longer calls a page full of
+  text "no text reconstructed".
 - Fix resuming a paused job on Windows intermittently failing with "Access is
   denied (os error 5)". The resume signal replaced the worker's control file
   while the paused worker was reading it; control and sidecar files are now

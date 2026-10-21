@@ -8,6 +8,9 @@ pub struct Span {
     pub text: String,
     pub bold: bool,
     pub italic: bool,
+    /// A raised, much smaller run inside a line, such as a note reference
+    /// mark; rendered as `<sup>`.
+    pub superscript: bool,
 }
 
 /// One `<text>` fragment from pdftohtml, already a visual line or part
