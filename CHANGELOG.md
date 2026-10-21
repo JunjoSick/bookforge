@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Stop untranslated prose from hiding behind reference context. A Notes,
+  Bibliography, References, Works Cited or Index section title, a leading
+  `p. 12.`, or an `in English:` gloss now only excuses an unchanged block
+  shorter than 120 characters; longer unchanged or near-copied text is checked
+  like any other prose. A long citation that should stay verbatim needs
+  explicit acceptance with `bookforge correct`.
+- Hold saved and cached results to the same source-copy rule as fresh output.
+  A cache hit that fresh output could not pass is treated as a miss. On
+  resume, previously accepted provider output that contains a blocking copy
+  moves to `needs_review` with its text, usage and provenance unchanged, and
+  is not retranslated automatically. Human-accepted segments are never
+  rechecked and are never shared across jobs.
+- Keep human corrections out of the double-check pass on resume. The stored
+  correction was protected, but the rebuilt EPUB could still pick up an
+  automated rewrite of the same segment.
+
 - Accept batch translations whose only source-copy finding is an editorial
   warning for a title, heading, or short proper-name line. Previously the
   report called these warnings while the parser still rejected the blocks.

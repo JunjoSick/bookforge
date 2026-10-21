@@ -6983,3 +6983,123 @@ fn summary_retries_include_all_statuses_without_crossing_jobs() {
     }
     assert!(store.summary("missing_job").unwrap().is_none());
 }
+
+#[test]
+fn revalidation_preserves_checkpoint_rows_and_does_not_override_newer_or_manual_results() {
+    let db_path = temp_path("revalidation.sqlite");
+    let (store, job, _) =
+        build_seeded_store_with_translation(&db_path, "revalidation_ns", &["b_000000"]);
+    let evidence = || {
+        let conn = store.conn.borrow();
+        [
+            "SELECT * FROM translations WHERE job_id = ?1",
+            "SELECT * FROM translation_blocks WHERE job_id = ?1",
+            "SELECT attempts, tokens_input, tokens_input_cached, tokens_output, \
+             tokens_estimated, translated_hash FROM segments WHERE job_id = ?1",
+        ]
+        .iter()
+        .map(|sql| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map(params![job.id], |row| {
+                (0..columns)
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        })
+        .collect::<Vec<_>>()
+    };
+    store
+        .record_segment_engine_findings(
+            &job.id,
+            "seg_a",
+            &[
+                EngineFinding::new(QaFindingKind::SourceCopyUnchanged, "title unchanged")
+                    .with_block_id("b_000000")
+                    .with_severity(QaFindingSeverity::Warning),
+            ],
+        )
+        .unwrap();
+    let copy = [EngineFinding::new(
+        QaFindingKind::SourceCopyUnchanged,
+        "translation is unchanged from the source-language prose",
+    )
+    .with_block_id("b_000000")
+    .with_severity(QaFindingSeverity::Error)];
+    let error = "saved translation failed source-copy revalidation";
+    let before = evidence();
+
+    assert!(
+        !store
+            .mark_stored_translation_for_review(&job.id, "seg_a", "stale output", error, &copy)
+            .unwrap(),
+        "a stale reader must not reclassify newer output"
+    );
+    assert!(
+        store
+            .mark_stored_translation_for_review(&job.id, "seg_a", "Tradotto", error, &copy)
+            .unwrap()
+    );
+    assert_eq!(
+        evidence(),
+        before,
+        "only review status, reason and findings may change"
+    );
+    assert!(
+        !store
+            .mark_stored_translation_for_review(&job.id, "seg_a", "Tradotto", error, &copy)
+            .unwrap(),
+        "reclassification happens once"
+    );
+    let record = &store.segment_records(&job.id).unwrap()[0];
+    assert_eq!(
+        (record.status.as_str(), record.error.as_deref()),
+        ("needs_review", Some(error))
+    );
+    assert!(store.resumable_segment_ids(&job.id).unwrap().is_empty());
+    let findings = store.segment_qa_findings(&job.id).unwrap();
+    let mut kept = findings
+        .iter()
+        .map(|finding| (finding.severity.as_str(), finding.message.as_str()))
+        .collect::<Vec<_>>();
+    kept.sort_unstable();
+    assert_eq!(
+        kept,
+        [
+            (
+                "error",
+                "translation is unchanged from the source-language prose"
+            ),
+            ("warning", "title unchanged"),
+        ],
+        "revalidation appends to, never replaces, the segment's findings"
+    );
+
+    store
+        .save_manual_correction(SaveManualCorrection {
+            job_id: &job.id,
+            segment_id: "seg_a",
+            translated_text: "Tradotto",
+            blocks: &[BlockTranslation {
+                block_id: BlockId("b_000000".into()),
+                text: "Tradotto".into(),
+            }],
+        })
+        .unwrap();
+    let accepted = evidence();
+    assert!(
+        !store
+            .mark_stored_translation_for_review(&job.id, "seg_a", "Tradotto", error, &copy)
+            .unwrap(),
+        "human acceptance is authoritative"
+    );
+    assert_eq!(evidence(), accepted);
+    assert_eq!(
+        store.segment_records(&job.id).unwrap()[0].status,
+        "succeeded"
+    );
+    let _ = fs::remove_file(db_path);
+}

@@ -565,6 +565,20 @@ async fn run_inner(
         }
     };
     glossary.run_config.guidance_by_segment = store.load_retry_guidance(&job.id)?;
+    // Recheck accepted provider output only after the saved input and prompt
+    // contract passed preflight, and before it can seed translation context.
+    let revalidated = super::translate::revalidate_stored_translations(
+        store,
+        &job.id,
+        &segments,
+        snapshot.source_language.as_deref(),
+        &snapshot.target_language,
+    )?;
+    if print_stdout && revalidated > 0 {
+        println!(
+            "Review: {revalidated} saved segment(s) contain untranslated source-language prose; kept for review."
+        );
+    }
     let context_cfg = snapshot_context_run_config(snapshot);
     let context_registry: Option<Arc<ContextRegistry>> = if context_cfg.enabled() {
         let registry = Arc::new(ContextRegistry::new(&segments));
@@ -820,9 +834,24 @@ async fn run_inner(
     if double_check_runtime.settings.double_check.mode != DoubleCheckMode::Off
         && !snapshot.finalize.double_check_complete
     {
+        // Human acceptance stays authoritative during optional automated
+        // correction. The store refuses to overwrite a corrected row, but the
+        // EPUB is rebuilt from in-memory translations, so corrected segments
+        // must never enter the double-check pass at all.
+        let human_corrected = store
+            .load_terminal_segment_translations(&job.id)?
+            .into_iter()
+            .filter(|saved| saved.human_corrected)
+            .map(|saved| saved.segment_id)
+            .collect::<HashSet<_>>();
+        let reviewable_segments = segments
+            .iter()
+            .filter(|segment| !human_corrected.contains(&segment.id.0))
+            .cloned()
+            .collect::<Vec<_>>();
         let changed_segment_ids = match double_check_after_resume(
             &job,
-            &segments,
+            &reviewable_segments,
             &mut translations,
             &double_check_run_config,
             snapshot,
@@ -1229,6 +1258,11 @@ async fn double_check_after_resume(
     progress: Arc<dyn ProgressSink>,
     stop_cancel_token: tokio_util::sync::CancellationToken,
 ) -> Result<Vec<String>> {
+    // Nothing reviewable (e.g. every segment is human-accepted): construct no
+    // provider and spend nothing.
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
     let double_check = &settings.double_check;
     let provider_name = double_check
         .provider
@@ -1518,7 +1552,7 @@ mod tests {
             SegmentSource, SegmentTextRun,
         },
     };
-    use bookforge_store::{CreateJob, SaveNeedsReview, SaveTranslation};
+    use bookforge_store::{CreateJob, SaveManualCorrection, SaveNeedsReview, SaveTranslation};
     use std::{
         io::Write,
         path::{Path, PathBuf},
@@ -2325,9 +2359,129 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resume_revalidates_saved_copies_and_keeps_explicit_acceptance() {
+        let chapter = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Endnotes</title></head>
+<body>
+<h1>Endnotes</h1>
+<p>This deliberately long English paragraph explains why the narrator returned to the village after the winter. The people had kept every letter and remembered the promises, but their circumstances had changed and they needed an answer before the next meeting.</p>
+</body>
+</html>"#;
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.batch.enabled = false;
+        settings.segmentation.max_segment_tokens = 1000;
+        settings.double_check.mode = DoubleCheckMode::Off;
+        let mut fixture = resume_fixture_with_chapter(settings, 1, chapter, |segment| {
+            segment
+                .source
+                .blocks
+                .iter()
+                .any(|block| block.text.chars().count() > 120)
+        });
+        let segment = fixture.segments[0].clone();
+        let blocks = segment
+            .source
+            .blocks
+            .iter()
+            .map(|block| BlockTranslation {
+                block_id: block.block_id.clone(),
+                text: block.text.clone(),
+            })
+            .collect::<Vec<_>>();
+        fixture
+            .store
+            .save_translation(SaveTranslation {
+                job_id: &fixture.job.id,
+                segment_id: &segment.id.0,
+                translated_text: &segment.source.text,
+                blocks: &blocks,
+                // Revalidation follows the saved provider, which can differ
+                // from the job's primary provider after a fallback.
+                provider: "deepseek",
+                model: "legacy-provider",
+                prompt_version: "v1",
+                input_tokens: Some(91),
+                input_cached_tokens: Some(17),
+                output_tokens: Some(61),
+                tokens_estimated: false,
+            })
+            .unwrap();
+
+        run_fixture(&mut fixture).await.unwrap();
+
+        let records = fixture
+            .store
+            .load_terminal_segment_translations(&fixture.job.id)
+            .unwrap();
+        assert_eq!(records[0].status, "needs_review");
+        assert_eq!(records[0].blocks, blocks);
+        assert_eq!(records[0].provider, "deepseek");
+        let summary = fixture.store.summary(&fixture.job.id).unwrap().unwrap();
+        assert_eq!(
+            (
+                summary.needs_review,
+                summary.input_tokens,
+                summary.output_tokens
+            ),
+            (1, 91, 61)
+        );
+        assert_eq!(
+            fixture.store.segment_records(&fixture.job.id).unwrap()[0].attempts,
+            1,
+            "a flagged copy is kept for review, not retranslated"
+        );
+        assert!(fixture.snapshot.output_path.exists());
+
+        fixture
+            .store
+            .save_manual_correction(SaveManualCorrection {
+                job_id: &fixture.job.id,
+                segment_id: &segment.id.0,
+                translated_text: &segment.source.text,
+                blocks: &blocks,
+            })
+            .unwrap();
+        let accepted = fixture
+            .store
+            .load_terminal_segment_translations(&fixture.job.id)
+            .unwrap();
+        // Every segment is human-accepted, so optional double-check must not
+        // build its provider. This one points at a closed local port with no
+        // API key: reaching it at all would fail the resume.
+        let double_check = &mut fixture.snapshot.settings.double_check;
+        double_check.mode = DoubleCheckMode::Full;
+        double_check.provider = Some("openai-compatible".into());
+        double_check.base_url = Some("http://127.0.0.1:9/v1".into());
+        double_check.api_key_env = Some("BOOKFORGE_TEST_UNSET_DOUBLE_CHECK_KEY".into());
+        fixture.snapshot.finalize.double_check_complete = false;
+        run_fixture(&mut fixture).await.unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .load_terminal_segment_translations(&fixture.job.id)
+                .unwrap(),
+            accepted
+        );
+        assert!(accepted[0].human_corrected);
+        assert_eq!(accepted[0].status, "succeeded");
+    }
+
     fn resume_fixture(settings: ResolvedRunSettings, segment_count: usize) -> ResumeFixture {
+        resume_fixture_with_chapter(settings, segment_count, RESUME_CHAPTER_ONE, |_| true)
+    }
+
+    /// [`resume_fixture`] with a custom first chapter, keeping the first
+    /// `segment_count` segments that `select` accepts.
+    fn resume_fixture_with_chapter(
+        settings: ResolvedRunSettings,
+        segment_count: usize,
+        chapter_one: &str,
+        select: impl Fn(&Segment) -> bool,
+    ) -> ResumeFixture {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let input = fixture_input();
+        let input = fixture_input_with_chapter(chapter_one);
         let output = tempdir.path().join("translated.epub");
         let events = tempdir.path().join("events.jsonl");
         let store = JobStore::open(tempdir.path().join("jobs.sqlite")).expect("store should open");
@@ -2354,6 +2508,7 @@ mod tests {
         );
         let segments = all_segments
             .into_iter()
+            .filter(|segment| select(segment))
             .take(segment_count)
             .collect::<Vec<_>>();
         let prompt_version = "v1";
@@ -2644,6 +2799,10 @@ mod tests {
     // Builds a synthetic EPUB so resume tests exercise the EPUB path in CI
     // without relying on local, gitignored book fixtures.
     fn fixture_input() -> PathBuf {
+        fixture_input_with_chapter(RESUME_CHAPTER_ONE)
+    }
+
+    fn fixture_input_with_chapter(chapter_one: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
@@ -2652,11 +2811,11 @@ mod tests {
             "bookforge-resume-fixture-{}-{nanos}.epub",
             std::process::id()
         ));
-        build_resume_epub(&path);
+        build_resume_epub(&path, chapter_one);
         path
     }
 
-    fn build_resume_epub(path: &Path) {
+    fn build_resume_epub(path: &Path, chapter_one: &str) {
         let file = std::fs::File::create(path).expect("fixture EPUB should be creatable");
         let mut zip = ZipWriter::new(file);
         let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
@@ -2669,7 +2828,7 @@ mod tests {
         zip.start_file("content.opf", deflated).unwrap();
         zip.write_all(RESUME_OPF.as_bytes()).unwrap();
         zip.start_file("chapter1.xhtml", deflated).unwrap();
-        zip.write_all(RESUME_CHAPTER_ONE.as_bytes()).unwrap();
+        zip.write_all(chapter_one.as_bytes()).unwrap();
         zip.start_file("chapter2.xhtml", deflated).unwrap();
         zip.write_all(RESUME_CHAPTER_TWO.as_bytes()).unwrap();
         zip.finish().unwrap();

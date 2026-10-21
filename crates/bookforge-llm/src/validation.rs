@@ -293,7 +293,7 @@ const ITALIAN_STOP_WORDS: &[&str] = &[
     "una", "uno", "voi",
 ];
 
-pub(crate) fn should_validate_source_copy(
+pub fn should_validate_source_copy(
     provider: &str,
     source_language: Option<&str>,
     target_language: &str,
@@ -311,17 +311,22 @@ pub(crate) fn source_copy_validation_error(
     translation: &str,
     section_title: Option<&str>,
 ) -> Option<String> {
-    if is_reference_section(section_title) {
-        return None;
-    }
-
     let source_normalized = normalized_prose(source);
     // Identifiers, numeric headings, and ornamental separators have no
     // source-language prose to translate. Their preservation is checked by
     // the structural/protected-span validators, not the language-copy gate.
-    if !source_normalized.chars().any(char::is_alphabetic)
-        || looks_like_page_reference(&source_normalized)
-        || looks_like_bilingual_gloss(&source_normalized)
+    if !source_normalized.chars().any(char::is_alphabetic) {
+        return None;
+    }
+    // Reference context (a Notes/Bibliography/Index section, a `p. 12.`
+    // prefix, an `in English:` gloss) can justify leaving a short citation
+    // unchanged, but never substantial prose: from MIN_SOURCE_CHARS up the
+    // copy checks always run, so an untranslated paragraph cannot hide behind
+    // a heading. Long verbatim citations need explicit reviewer acceptance.
+    if source_normalized.chars().count() < MIN_SOURCE_CHARS
+        && (is_reference_section(section_title)
+            || looks_like_page_reference(&source_normalized)
+            || looks_like_bilingual_gloss(&source_normalized))
     {
         return None;
     }
@@ -1381,9 +1386,47 @@ mod tests {
     }
 
     #[test]
-    fn allows_reference_sections() {
-        assert!(source_copy_validation_error(SOURCE, SOURCE, Some("Endnotes")).is_none());
-        assert!(source_copy_validation_error(SOURCE, SOURCE, Some("Bibliography")).is_none());
+    fn reference_context_never_exempts_substantial_prose() {
+        for heading in [
+            None,
+            Some("Notes"),
+            Some("Endnotes"),
+            Some("Bibliography"),
+            Some("References"),
+            Some("Works Cited"),
+            Some("Index"),
+            Some("Author's Note"),
+            Some("Notes to Chapter 1"),
+        ] {
+            for prefix in ["", "p. 12. ", "The author explains in English: "] {
+                let source = format!("{prefix}{SOURCE}");
+                assert!(
+                    source_copy_validation_error(&source, &source, heading).is_some(),
+                    "{heading:?}: {prefix}"
+                );
+                let near_copy = format!("{source} Traduzione.");
+                assert!(
+                    source_copy_validation_error(&source, &near_copy, heading).is_some(),
+                    "{heading:?}: {prefix}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reference_context_still_exempts_short_citations() {
+        let citation = "Example Author, A Published Title, p. 12.";
+        for heading in ["Notes", "Endnotes", "Bibliography", "Works Cited", "Index"] {
+            assert!(
+                source_copy_validation_error(citation, citation, Some(heading)).is_none(),
+                "{heading}"
+            );
+        }
+        // Outside reference context the short line is still reported; batch
+        // acceptance then grades it by severity.
+        assert!(source_copy_validation_error(citation, citation, Some("Chapter 1")).is_some());
+        let page = "p. 28. Brick by brick.";
+        assert!(source_copy_validation_error(page, page, None).is_none());
     }
 
     /// Unspaced prose of a length the detector is meant to cover. `words`
@@ -1426,19 +1469,29 @@ mod tests {
     }
 
     #[test]
-    fn allows_page_references_without_section_metadata() {
+    fn page_reference_prefix_does_not_exempt_untranslated_commentary() {
         let reference = "p. 28. Brick by brick, the fireplaces. For an overview of how this works, \
             see Example Author, 'A Long Article Title That Should Remain in Its Published Language', \
             Journal of Example Studies 41 (2016): 425-452.";
-        assert!(source_copy_validation_error(reference, reference, None).is_none());
+        assert!(source_copy_validation_error(reference, reference, None).is_some());
+        // Translating the commentary while keeping the cited title passes.
+        let translated = "p. 28. Mattone dopo mattone, i camini. Per una panoramica di come \
+            funziona, si veda Example Author, 'A Long Article Title That Should Remain in Its \
+            Published Language', Journal of Example Studies 41 (2016): 425-452.";
+        assert!(source_copy_validation_error(reference, translated, None).is_none());
     }
 
     #[test]
-    fn allows_explicit_bilingual_glosses() {
+    fn bilingual_gloss_does_not_exempt_an_untranslated_paragraph() {
         let gloss = "“todo lugar é são paulo—em todo lugar resistência—resista brasil—a turquia \
             está ao seu lado!” Or in English: “the whole world is São Paulo—resistance everywhere—\
             Brazil, resist!—Turkey is by your side.”";
-        assert!(source_copy_validation_error(gloss, gloss, Some("Chapter 8")).is_none());
+        assert!(source_copy_validation_error(gloss, gloss, Some("Chapter 8")).is_some());
+        // Keeping the Portuguese quotation while translating the English gloss passes.
+        let translated = "“todo lugar é são paulo—em todo lugar resistência—resista brasil—a \
+            turquia está ao seu lado!” O in italiano: “il mondo intero è San Paolo—resistenza \
+            ovunque—Brasile, resisti!—la Turchia è al tuo fianco.”";
+        assert!(source_copy_validation_error(gloss, translated, Some("Chapter 8")).is_none());
     }
 
     #[test]

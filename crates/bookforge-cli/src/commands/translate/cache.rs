@@ -1,7 +1,11 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
-use bookforge_core::segment::{Segment, SegmentStatus};
-use bookforge_llm::SegmentTranslation;
-use bookforge_store::{JobStore, SaveCachedTranslation};
+use bookforge_core::finding::{EngineFinding, QaFindingKind};
+use bookforge_core::ir::QaFindingSeverity;
+use bookforge_core::segment::{BlockTranslation, Segment, SegmentStatus};
+use bookforge_llm::{SegmentTranslation, blocking_source_copy_error, should_validate_source_copy};
+use bookforge_store::{JobStore, SaveCachedTranslation, SegmentStatus as StoredStatus};
 
 #[derive(Clone, Copy)]
 pub struct CacheContext<'a> {
@@ -62,6 +66,21 @@ pub fn apply_cached_translations(
         let Some(hit) = hits.get(&segment.id.0) else {
             continue;
         };
+        // Cached output may predate the current source-copy rule. A hit that
+        // fresh batch output could not pass becomes an ordinary miss; the job
+        // that produced it is untouched. The lookup never offers manual
+        // corrections, so this only ever rejects provider output.
+        if !stored_source_copies(
+            segment,
+            &hit.blocks,
+            cache.provider,
+            cache.source_lang,
+            cache.target_lang,
+        )
+        .is_empty()
+        {
+            continue;
+        }
         cache.store.save_cached_translation(SaveCachedTranslation {
             job_id: cache.job_id,
             segment_id: &segment.id.0,
@@ -90,6 +109,105 @@ pub fn apply_cached_translations(
     Ok(cached)
 }
 
+/// Blocking source copies among a stored result's `blocks`, judged by the
+/// rule batch acceptance applies to fresh output.
+fn stored_source_copies(
+    segment: &Segment,
+    blocks: &[BlockTranslation],
+    provider: &str,
+    source_lang: Option<&str>,
+    target_lang: &str,
+) -> Vec<EngineFinding> {
+    if !should_validate_source_copy(provider, source_lang, target_lang) {
+        return Vec::new();
+    }
+    let by_id = blocks
+        .iter()
+        .map(|block| (&block.block_id, block.text.as_str()))
+        .collect::<HashMap<_, _>>();
+    segment
+        .source
+        .blocks
+        .iter()
+        .filter_map(|source| {
+            let translation = by_id.get(&source.block_id)?;
+            let message = blocking_source_copy_error(
+                &source.kind,
+                &source.text,
+                translation,
+                segment.metadata.section_title.as_deref(),
+            )?;
+            Some(
+                EngineFinding::new(QaFindingKind::SourceCopyUnchanged, message)
+                    .with_block_id(source.block_id.0.clone())
+                    .with_severity(QaFindingSeverity::Error),
+            )
+        })
+        .collect()
+}
+
+/// Recheck provider output accepted by an earlier run against the current
+/// source-copy rule. A blocking copy moves its segment to `needs_review`
+/// with the saved text, blocks, usage and provenance untouched; ordinary
+/// resume does not retranslate it. Human-corrected segments are
+/// authoritative and never rechecked. Returns how many were reclassified.
+pub(crate) fn revalidate_stored_translations(
+    store: &JobStore,
+    job_id: &str,
+    segments: &[Segment],
+    source_lang: Option<&str>,
+    target_lang: &str,
+) -> Result<usize> {
+    let by_id = segments
+        .iter()
+        .map(|segment| (segment.id.0.as_str(), segment))
+        .collect::<HashMap<_, _>>();
+    let mut reclassified = 0;
+    for saved in store.load_terminal_segment_translations(job_id)? {
+        if saved.human_corrected
+            || !matches!(
+                saved.segment_status(),
+                StoredStatus::Succeeded | StoredStatus::SkippedCached
+            )
+        {
+            continue;
+        }
+        let Some(segment) = by_id.get(saved.segment_id.as_str()) else {
+            continue;
+        };
+        let copies = stored_source_copies(
+            segment,
+            &saved.blocks,
+            &saved.provider,
+            source_lang,
+            target_lang,
+        );
+        if copies.is_empty() {
+            continue;
+        }
+        let error = format!(
+            "saved translation failed source-copy revalidation: {}",
+            copies
+                .iter()
+                .map(|finding| format!(
+                    "block {}: {}",
+                    finding.block_id.as_deref().unwrap_or_default(),
+                    finding.message
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        reclassified += usize::from(store.mark_stored_translation_for_review(
+            job_id,
+            &saved.segment_id,
+            &saved.translated_text,
+            &error,
+            &copies,
+        )?);
+    }
+    Ok(reclassified)
+}
+
 pub fn pending_segments_for_job(
     store: &JobStore,
     job_id: &str,
@@ -106,3 +224,6 @@ pub fn pending_segments_for_job(
         .cloned()
         .collect())
 }
+
+#[cfg(test)]
+mod tests;
