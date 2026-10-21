@@ -183,6 +183,46 @@ XML
 }
 
 #[cfg(unix)]
+#[test]
+fn pdftohtml_page_images_stay_out_of_the_source_directory() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let source_dir = root.path().join("source");
+    fs::create_dir(&source_dir).expect("source dir");
+    let pdf = source_dir.join("book.pdf");
+    fs::write(&pdf, b"%PDF-1.4").expect("pdf fixture");
+    let pdftohtml = root.path().join("pdftohtml");
+    // Mirrors poppler: page images go to `<base>-<page>_<n>.png`, the base
+    // being the argument after the PDF, or the PDF path minus `.pdf`.
+    write_executable(
+        &pdftohtml,
+        r#"#!/bin/sh
+pdf=""; base=""
+for arg do
+  if [ -n "$pdf" ]; then base="$arg"; fi
+  case "$arg" in *.pdf) pdf="$arg" ;; esac
+done
+[ -n "$base" ] || base="${pdf%.pdf}"
+printf 'png' > "$base-1_1.png"
+echo '<pdf2xml></pdf2xml>'
+"#,
+    );
+    let tools = PopplerTools {
+        pdftohtml,
+        pdftotext: PathBuf::from("pdftotext"),
+        pdfimages: None,
+        pdftoppm: None,
+    };
+
+    tools.pdf_to_xml(&pdf).expect("fake pdftohtml runs");
+
+    let left: Vec<_> = fs::read_dir(&source_dir)
+        .expect("source dir lists")
+        .map(|entry| entry.expect("dir entry").file_name())
+        .collect();
+    assert_eq!(left, vec![std::ffi::OsString::from("book.pdf")]);
+}
+
+#[cfg(unix)]
 fn fake_pdftotext_with_text(path: &Path, text: &str) {
     write_executable(
         path,

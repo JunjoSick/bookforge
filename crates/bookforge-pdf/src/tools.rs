@@ -183,7 +183,10 @@ impl PopplerTools {
             "-zoom",
             PDF_XML_ZOOM,
         ]);
-        command.arg(pdf);
+        // pdftohtml writes each page image beside its output base, which
+        // defaults to the input path even with -stdout: every conversion
+        // left PNGs next to the user's PDF. Name a base in the scratch dir.
+        command.arg(pdf).arg(work_dir.path().join("page"));
         let output = command_output(&mut command, "pdftohtml", timeout)?;
         if !output.status.success() {
             return Err(ToolError::Failed {
