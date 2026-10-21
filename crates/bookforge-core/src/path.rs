@@ -122,7 +122,12 @@ fn comparison_path(path: &Path) -> io::Result<Comparison> {
                 });
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let parent = current.parent().unwrap_or_else(|| Path::new("."));
+                // A bare file name's parent is the empty path, which
+                // canonicalize rejects: it means the working directory.
+                let parent = current
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
                 let file_name = current.file_name().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -184,6 +189,17 @@ mod tests {
         let plain = dir.path().join("out.epub");
         let dotted = dir.path().join(".").join("out.epub");
         assert!(paths_are_aliases(&plain, &dotted).expect("compare"));
+    }
+
+    #[test]
+    fn missing_bare_file_names_resolve_against_the_working_directory() {
+        // `translate --out book.it.epub --validate-output` compared the
+        // output with its `book.it.validation.json` report; both bare names
+        // have an empty parent, and resolving it failed the whole run.
+        let report = Path::new("bookforge-missing-report-7f3a.json");
+        let output = Path::new("bookforge-missing-output-7f3a.epub");
+        assert!(!paths_are_aliases(output, report).expect("compare"));
+        assert!(paths_are_aliases(report, &Path::new(".").join(report)).expect("compare"));
     }
 
     #[cfg(unix)]
