@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Split converted PDFs into one XHTML file per chapter by default, starting
+  a chapter at each level-1 heading. A typical book now produces one file per
+  chapter plus front matter: a 213-page book that used to be one 600 KB
+  `content.xhtml` now converts to 5 files, the largest 250 KB (a cover, the
+  title pages with the introduction, and three chapter files; its fourth
+  chapter's title is set as an image, so that chapter shares the third's
+  file). A half-title page or part title with nothing but headings merges
+  into the next chapter, so no file is empty or heading-only. A document
+  with fewer than two chapters of body text, such as a paper whose only
+  level-1 heading is its title, keeps the single `content.xhtml` byte for
+  byte, and so does a book where level-1 headings are more than 256 or more
+  than half of its text blocks, with a conversion warning.
+  `--chapter-prefix` works as before.
+- List each chapter's own sections under it in the contents of a
+  multi-file EPUB, linked into that chapter's file. Heading ids now count
+  across the whole book, so they stay unique between files.
+- Keep sections of the same rank as siblings in the PDF-derived contents
+  when a rank is skipped. A chapter heading followed by numbered `h3`
+  sections listed each section inside the one before it.
 - Rebuild typeset books from PDF with far fewer broken paragraphs. Page
   numbers are recognised from their page-to-page sequence and dropped, so a
   sentence running over a page break stays one paragraph instead of being

@@ -2452,3 +2452,87 @@ fn invisible_formatting_marks_do_not_skew_rtl_page_coverage() {
         page_stats[0]
     );
 }
+
+/// Three synthetic chapters, one per page, each opening with a title set
+/// in a size that recurs across pages (so it ranks as h1) over body text.
+const THREE_CHAPTER_XML: &str = r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <fontspec id="0" size="24" family="Times" color="#000000"/>
+    <fontspec id="1" size="12" family="Times" color="#000000"/>
+    <text top="100" left="100" width="200" height="24" font="0">Opening Chapter</text>
+    <text top="200" left="100" width="400" height="12" font="1">The first chapter begins with a sentence.</text>
+    <text top="240" left="100" width="400" height="12" font="1">Another paragraph closes the first chapter.</text>
+  </page>
+  <page number="2" width="600" height="800">
+    <fontspec id="0" size="24" family="Times" color="#000000"/>
+    <fontspec id="1" size="12" family="Times" color="#000000"/>
+    <text top="100" left="100" width="200" height="24" font="0">Middle Chapter</text>
+    <text top="200" left="100" width="400" height="12" font="1">The second chapter carries on the story.</text>
+    <text top="240" left="100" width="400" height="12" font="1">More words fill the second chapter here.</text>
+  </page>
+  <page number="3" width="600" height="800">
+    <fontspec id="0" size="24" family="Times" color="#000000"/>
+    <fontspec id="1" size="12" family="Times" color="#000000"/>
+    <text top="100" left="100" width="200" height="24" font="0">Closing Chapter</text>
+    <text top="200" left="100" width="400" height="12" font="1">The third chapter brings things to an end.</text>
+    <text top="240" left="100" width="400" height="12" font="1">A final paragraph finishes the whole book.</text>
+  </page>
+</pdf2xml>"##;
+
+const THREE_CHAPTER_BASELINE: &str = "Opening Chapter\nThe first chapter begins with a sentence.\nAnother paragraph closes the first chapter.\n\x0cMiddle Chapter\nThe second chapter carries on the story.\nMore words fill the second chapter here.\n\x0cClosing Chapter\nThe third chapter brings things to an end.\nA final paragraph finishes the whole book.\n";
+
+#[test]
+fn convert_pdf_splits_chapters_at_level_one_headings_by_default() {
+    use std::io::Read;
+    use zip::ZipArchive;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = write_input_pdf(dir.path());
+    let output = dir.path().join("output.epub");
+    let fake = FakePoppler::new(THREE_CHAPTER_XML, THREE_CHAPTER_BASELINE).without_image_tool();
+
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &fake, None)
+        .expect("conversion succeeds");
+
+    assert_eq!(outcome.chapters, 3, "{}", outcome.report.summary());
+    // Each chapter is its heading plus one paragraph (the two body lines join).
+    assert_eq!(outcome.blocks_per_chapter, vec![2, 2, 2]);
+    assert!(
+        !outcome
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("split guard")),
+        "{:?}",
+        outcome.report.warnings
+    );
+    let mut archive = ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip");
+    assert!(archive.by_name("content.xhtml").is_err());
+    let mut read = |name: &str| {
+        let mut value = String::new();
+        archive
+            .by_name(name)
+            .unwrap_or_else(|_| panic!("{name} exists"))
+            .read_to_string(&mut value)
+            .expect("entry reads");
+        value
+    };
+    let second = read("chapter-0002.xhtml");
+    assert!(
+        second.contains("<h1 id=\"head-0001\">Middle Chapter</h1>"),
+        "{second}"
+    );
+    assert!(second.contains("The second chapter carries on the story."));
+    assert!(!second.contains("first chapter"));
+    let nav = read("nav.xhtml");
+    for (file, title) in [
+        ("chapter-0001.xhtml", "Opening Chapter"),
+        ("chapter-0002.xhtml", "Middle Chapter"),
+        ("chapter-0003.xhtml", "Closing Chapter"),
+    ] {
+        assert!(
+            nav.contains(&format!("<a href=\"{file}\">{title}</a>")),
+            "{nav}"
+        );
+    }
+}

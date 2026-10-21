@@ -31,7 +31,8 @@ pub struct ConvertArgs {
     pub title: Option<String>,
 
     /// Start chapters at text blocks beginning with this case-insensitive
-    /// literal prefix after whitespace normalization. Omit for one chapter.
+    /// literal prefix after whitespace normalization. Omit to start
+    /// chapters at level-1 headings.
     #[arg(long)]
     pub chapter_prefix: Option<String>,
 
@@ -230,7 +231,7 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
 
     println!("Input: {}", input.display());
     println!("Output: {}", outcome.output.display());
-    if args.chapter_prefix.is_some() {
+    if args.chapter_prefix.is_some() || outcome.chapters > 1 {
         println!("Chapters: {}", outcome.chapters);
         println!(
             "Blocks per chapter: {}",

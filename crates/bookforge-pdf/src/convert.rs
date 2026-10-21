@@ -13,7 +13,7 @@ use crate::{
     Result,
     epub::{
         ChapterSplitOutcome, MAX_CHAPTER_MATCHES, MIN_TEXT_BLOCKS_PER_MATCH, publication_timestamp,
-        write_epub_with_chapter_prefix,
+        write_chaptered_epub,
     },
     model::{
         ColumnMode, DocBlock, Fragment, ImageAsset, ImageRegion, LowConfidenceMode, Page, Span,
@@ -76,7 +76,7 @@ pub struct ConvertOptions {
     /// dc:title; defaults to the input file stem when empty.
     pub title: String,
     /// Case-insensitive literal prefix that starts a new EPUB chapter after
-    /// whitespace normalization. `None` preserves the legacy single chapter.
+    /// whitespace normalization. `None` starts chapters at level-1 headings.
     pub chapter_prefix: Option<String>,
 }
 
@@ -250,7 +250,7 @@ fn convert_pdf_with_tools(
     };
     let source_id = pdf_source_identifier(input)?;
     let modified = publication_timestamp();
-    let chapter_outcome = write_epub_with_chapter_prefix(
+    let chapter_outcome = write_chaptered_epub(
         &output_blocks,
         &title,
         &options.language,
@@ -266,8 +266,13 @@ fn convert_pdf_with_tools(
             matches,
             text_blocks,
         } => {
+            let matched = if options.chapter_prefix.is_some() {
+                "chapter prefix matched"
+            } else {
+                "level-1 headings were"
+            };
             layout_warnings.push(format!(
-                "chapter prefix matched {matches} of {text_blocks} text blocks; kept the legacy single chapter because the split guard allows at most {MAX_CHAPTER_MATCHES} matches and requires at least {MIN_TEXT_BLOCKS_PER_MATCH} text blocks per match"
+                "{matched} {matches} of {text_blocks} text blocks; kept the legacy single chapter because the split guard allows at most {MAX_CHAPTER_MATCHES} matches and requires at least {MIN_TEXT_BLOCKS_PER_MATCH} text blocks per match"
             ));
             vec![output_blocks.len()]
         }

@@ -15,19 +15,33 @@ The reader suppresses `script`, `style`, `svg`, and `math`. It preserves package
 
 ## PDF-derived chapter boundaries
 
-`bookforge convert` normally preserves its historical synthetic EPUB shape: one
-`content.xhtml` spine item containing every reconstructed PDF block. The opt-in
-`--chapter-prefix <TEXT>` surface instead creates one spine item per detected
-chapter boundary. Matching is case-insensitive against the literal prefix of a
-block's complete whitespace-normalized visible text. It is not limited to
-blocks classified as headings because noisy PDF extraction can reconstruct a
-visually obvious chapter label as a paragraph.
+`bookforge convert` writes one spine item (`chapter-NNNN.xhtml`) per chapter,
+starting a chapter at each reconstructed level-1 heading. A chapter that would
+hold nothing but headings, such as a half-title page ahead of the title page or
+a part title ahead of its first chapter, merges into the next one, and a
+heading-only tail merges into the one before, so no file is empty or
+heading-only. When fewer than two chapters with body text remain (a paper whose
+only level-1 heading is its title, say), the output keeps the single
+`content.xhtml` spine item, byte for byte as before.
 
-Blocks before the first match become a front-matter spine item, so title pages,
-introductions, and prefaces are not dropped. A prefix matching nothing uses the
-legacy single-chapter writer. A prefix matching more than 256 text blocks, or
-matching so densely that there are fewer than two text blocks per match on
-average, also falls back to that writer and adds a conversion warning.
+`--chapter-prefix <TEXT>` replaces the heading rule with a literal one.
+Matching is case-insensitive against the literal prefix of a block's complete
+whitespace-normalized visible text. It is not limited to blocks classified as
+headings because noisy PDF extraction can reconstruct a visually obvious
+chapter label as a paragraph.
+
+In both modes, blocks before the first boundary become a front-matter spine
+item, so title pages, introductions, and prefaces are not dropped; with the
+heading rule, front matter holding only headings opens the first chapter
+instead. Boundaries matching nothing use the single-file writer. More than 256
+boundaries, or boundaries so dense that there are fewer than two text blocks
+per boundary on average, also fall back to that writer and add a conversion
+warning.
+
+The navigation document lists each chapter file with that chapter's own h1–h3
+headings nested under it. Heading ids (`head-NNNN`) are numbered across the
+whole book rather than per file, so they are unique in the EPUB and match the
+single-file numbering.
 
 The resulting structural sections are scheduler boundaries: segments never
 cross from one spine section into another. This removes single-chapter

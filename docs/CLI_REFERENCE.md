@@ -508,8 +508,16 @@ Review the conversion report before translating. It records text coverage,
 layout decisions, preserved media, and low-confidence pages. See
 [EPUB_PIPELINE.md](EPUB_PIPELINE.md) for pipeline details.
 
-PDF conversion keeps the historical single-spine-section output unless an
-explicit chapter prefix is supplied:
+PDF conversion writes one EPUB file per chapter, starting a chapter at each
+reconstructed level-1 heading. Chapters that would hold only headings (a
+half-title page, a part title) merge into the next chapter, and content before
+the first chapter is kept as front matter. A document with fewer than two
+chapters of body text, such as a paper whose only level-1 heading is its
+title, keeps the single `content.xhtml` file. The navigation document lists
+every chapter with its own h1–h3 headings nested under it.
+
+When chapter titles are not detected as headings, an explicit prefix replaces
+the heading rule:
 
 ```bash
 bookforge convert book.pdf --out book.epub --chapter-prefix "CHAPTER "
@@ -520,13 +528,13 @@ text-bearing block whose whitespace-normalized visible text begins with the
 literal prefix, compared case-insensitively. It checks complete block text, not
 raw Poppler lines or a fixed character window, so a chapter label reconstructed
 as a paragraph can still form a boundary. Content before the first match is
-retained as its own front-matter chapter. No matches preserve the legacy
-single-chapter EPUB byte for byte.
+retained as its own front-matter chapter. No matches preserve the single-file
+EPUB byte for byte.
 
-To prevent a broad prefix from producing thousands of tiny spine items, the
-split falls back to the legacy single chapter when it finds more than 256
-matches or fewer than two text blocks per match on average. The conversion
-report records a warning when that guard fires.
+To prevent a broad prefix or runaway heading detection from producing
+thousands of tiny spine items, either split falls back to the single file when
+it finds more than 256 boundaries or fewer than two text blocks per boundary on
+average. The conversion report records a warning when that guard fires.
 
 A literal prefix cannot express headings that vary in their leading text, which
 is a real limit for some languages: Chinese chapter labels such as 第一章 and
