@@ -67,6 +67,13 @@ separate MinGW toolchain including `dlltool.exe` and is not the contributor
 baseline. Verify the active host with `rustc -vV` before diagnosing a project
 build failure.
 
+CI builds with `RUSTFLAGS=-D warnings` on the exact Rust version in
+`RUST_TOOLCHAIN` (`.github/workflows/ci.yml`); only the `msrv` job uses 1.88.
+Run your checks on that version, for example
+`RUSTUP_TOOLCHAIN=<version> bash scripts/verify.sh full`: an older or newer
+local stable can disagree with CI in either direction. Raise the pin in its own
+PR once the full verification passes on the new version.
+
 Add tests for any behaviour change, especially around:
 
 - EPUB segmentation and rebuild (`bookforge-epub`).
