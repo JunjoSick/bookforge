@@ -684,6 +684,115 @@ fn heading_levels(pages: &[Page], body_size: u32) -> HashMap<u32, u8> {
     levels
 }
 
+/// Most digits a note label can have: a year opening a line is prose, not
+/// note 1984.
+const NOTE_LABEL_MAX_DIGITS: usize = 3;
+
+/// Lines that open an entry in a run of numbered notes. Each note starts on
+/// its own line, but one-line notes share a left edge and the ordinary
+/// leading, so neither the gap nor the indent rule separated them and a
+/// page's notes read as one paragraph. A label counts when the next label,
+/// or the one after it (a wrapped note line can open with a number too),
+/// continues its sequence at the same left edge and size; and only where
+/// the line before it ends early, since prose that wraps onto a number at
+/// line start runs on to the measure.
+fn numbered_note_starts(lines: &[Line], heading_levels: &HashMap<u32, u8>) -> HashSet<usize> {
+    let labels: Vec<(usize, u32)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| !heading_levels.contains_key(&line.font_size))
+        .filter_map(|(index, line)| note_label_number(line).map(|number| (index, number)))
+        .collect();
+    let mut starts = HashSet::new();
+    for (position, &(first, number)) in labels.iter().enumerate() {
+        for &(second, next) in labels.iter().skip(position + 1).take(2) {
+            if next == number + 1
+                && lines[first].font_size == lines[second].font_size
+                && lines[first].left.abs_diff(lines[second].left) <= 2
+            {
+                starts.extend([first, second]);
+            }
+        }
+    }
+    starts.retain(|&index| index == 0 || ends_early(lines, index - 1));
+    starts
+}
+
+/// The number a line opens with when it reads as a note label: "12. ",
+/// "12: " or "12) ", "[12]", a raised "12" (a superscript span or
+/// superscript digits), or "(12)" or a bare "12 " before a word that is not
+/// lowercase, the forms running prose also uses. Text must follow the label,
+/// so "1.1 Scope" and "3.14 is" are not labels.
+fn note_label_number(line: &Line) -> Option<u32> {
+    let text = line.text();
+    let text = text.trim_start();
+    let raised = line
+        .spans
+        .iter()
+        .find(|span| !span.text.trim().is_empty())
+        .is_some_and(|span| span.superscript);
+    let (open, text) = match text.strip_prefix(['[', '(']) {
+        Some(rest) => (text.chars().next(), rest),
+        None => (None, text),
+    };
+    let label_len = text
+        .find(|ch: char| label_digit(ch).is_none())
+        .unwrap_or(text.len());
+    let label = &text[..label_len];
+    if !(1..=NOTE_LABEL_MAX_DIGITS).contains(&label.chars().count()) {
+        return None;
+    }
+    let rest = &text[label_len..];
+    let reads_as_prose = |text: &str| {
+        text.trim_start()
+            .starts_with(|ch: char| ch.is_lowercase() || ch.is_ascii_digit())
+    };
+    let entry = match open {
+        Some('[') => rest.strip_prefix(']')?,
+        Some(_) => rest
+            .strip_prefix(')')
+            .filter(|rest| !reads_as_prose(rest))?,
+        None if raised || !label.chars().all(|ch| ch.is_ascii_digit()) => rest,
+        None => match rest.strip_prefix(['.', ':', ')']) {
+            Some(rest) => rest.strip_prefix(char::is_whitespace)?,
+            None => rest
+                .strip_prefix(char::is_whitespace)
+                .filter(|rest| !reads_as_prose(rest))?,
+        },
+    };
+    if entry.trim().is_empty() {
+        return None;
+    }
+    label
+        .chars()
+        .try_fold(0, |number, ch| Some(number * 10 + label_digit(ch)?))
+}
+
+/// The value of an ASCII or superscript digit.
+fn label_digit(ch: char) -> Option<u32> {
+    match ch {
+        '\u{00b9}' => Some(1),
+        '\u{00b2}' => Some(2),
+        '\u{00b3}' => Some(3),
+        '\u{2070}' | '\u{2074}'..='\u{2079}' => Some(ch as u32 - 0x2070),
+        _ => ch.to_digit(10),
+    }
+}
+
+/// Whether `lines[index]` stops more than its own height short of the
+/// measure (the furthest right edge among lines starting no further right
+/// than it, so a column is measured on its own) or closes a sentence.
+fn ends_early(lines: &[Line], index: usize) -> bool {
+    let line = &lines[index];
+    let measure = lines
+        .iter()
+        .filter(|other| other.left <= line.left + line.height)
+        .map(|other| other.right)
+        .max()
+        .unwrap_or(line.right);
+    line.right < measure - line.height || ends_sentence_terminal(&line.text())
+}
+
 /// Cluster ordered lines into paragraphs and headings.
 fn cluster_paragraphs(
     lines: &[Line],
@@ -691,6 +800,7 @@ fn cluster_paragraphs(
     heading_levels: &HashMap<u32, u8>,
 ) -> Vec<PendingBlock> {
     let median_gap = median_line_gap(lines);
+    let note_starts = numbered_note_starts(lines, heading_levels);
     let mut blocks = Vec::new();
     let mut current: Vec<Span> = Vec::new();
     let mut current_heading: Option<u8> = None;
@@ -723,7 +833,7 @@ fn cluster_paragraphs(
         });
     };
 
-    for line in lines {
+    for (index, line) in lines.iter().enumerate() {
         let heading = heading_levels.get(&line.font_size).copied();
         let new_block = match previous {
             None => true,
@@ -744,7 +854,7 @@ fn cluster_paragraphs(
                 let large_gap = gap > (median_gap as f32 * 1.8) as i32 || gap < 0;
                 let indented =
                     line.left > prev.left + (body_size as i32) / 2 && prev.left <= line.left; // fresh indent, not a continuation of one
-                size_changed || large_gap || indented
+                size_changed || large_gap || indented || note_starts.contains(&index)
             }
         };
 
@@ -1483,6 +1593,242 @@ mod tests {
         let result = reconstruct(&pages, ColumnMode::Auto);
 
         assert!(superscripts(&result).is_empty(), "{:?}", result.blocks);
+    }
+
+    fn visible(texts: &[String]) -> String {
+        texts
+            .concat()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn a_run_of_numbered_notes_keeps_one_paragraph_per_note() {
+        // Geometry follows a real book's page-foot notes: a point smaller
+        // than the body, first lines indented, ordinary leading. Only an
+        // entry followed by a wrapped line was split off (by the indent of
+        // the next entry); one-line entries ran together into one paragraph.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="594" height="918">
+<fontspec id="0" size="15" family="T"/>
+<fontspec id="1" size="14" family="T"/>
+<text top="100" left="54" width="490" height="18" font="0">The body of this invented page runs for several lines so that its type is</text>
+<text top="118" left="54" width="490" height="18" font="0">plainly the body size, with an ordinary measure and ordinary leading, and</text>
+<text top="136" left="54" width="490" height="18" font="0">enough words that the notes below cannot outweigh it when the size of the</text>
+<text top="154" left="54" width="490" height="18" font="0">body is decided, which is all it has to do here; it then ends a little short</text>
+<text top="172" left="54" width="300" height="18" font="0">of the right margin, as a paragraph does.</text>
+<text top="700" left="72" width="70" height="16" font="1">11. A. Writer, </text>
+<text top="700" left="142" width="110" height="16" font="1"><i>An Invented Title</i></text>
+<text top="700" left="252" width="270" height="16" font="1">, London: Nowhere Press, 1990, 41, and</text>
+<text top="715" left="54" width="210" height="16" font="1">again in the second edition, 77</text>
+<text top="733" left="72" width="100" height="16" font="1">12. See Writer, </text>
+<text top="733" left="172" width="110" height="16" font="1"><i>Another Title</i></text>
+<text top="733" left="282" width="74" height="16" font="1">, esp 170-182</text>
+<text top="751" left="72" width="100" height="16" font="1">13. See Writer, </text>
+<text top="751" left="172" width="110" height="16" font="1"><i>Another Title</i></text>
+<text top="751" left="282" width="74" height="16" font="1">, esp 170-182</text>
+<text top="769" left="72" width="80" height="16" font="1">14. Ibid., 9</text>
+<text top="787" left="72" width="35" height="16" font="1">15. In </text>
+<text top="787" left="107" width="256" height="16" font="1"><i>A Long Invented History of Things</i></text>
+<text top="787" left="363" width="172" height="16" font="1">, Elsewhere: Small House, the</text>
+<text top="802" left="54" width="270" height="16" font="1">author compares the two (224).</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+        let texts = texts(&result);
+
+        assert_eq!(
+            texts[1..],
+            [
+                "11. A. Writer, An Invented Title, London: Nowhere Press, 1990, 41, and again \
+                 in the second edition, 77",
+                "12. See Writer, Another Title, esp 170-182",
+                "13. See Writer, Another Title, esp 170-182",
+                "14. Ibid., 9",
+                "15. In A Long Invented History of Things, Elsewhere: Small House, the author \
+                 compares the two (224).",
+            ],
+            "{texts:?}"
+        );
+        assert!(texts[0].starts_with("The body of this invented page"));
+        let DocBlock::Paragraph { spans } = &result.blocks[3].block else {
+            panic!("note 13 is a paragraph: {:?}", result.blocks[3]);
+        };
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.italic && span.text == "Another Title")
+        );
+        let source: String = pages[0]
+            .fragments
+            .iter()
+            .flat_map(|fragment| &fragment.spans)
+            .flat_map(|span| span.text.chars())
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert_eq!(visible(&texts), source);
+    }
+
+    #[test]
+    fn bracketed_notes_at_body_size_without_indents_split_too() {
+        // A chapter-end note list in body type, every line on one margin:
+        // only the labels' sequence and the short line before each one
+        // mark the entries. A wrapped entry keeps its full first line.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="594" height="918">
+<fontspec id="0" size="15" family="T"/>
+<text top="100" left="54" width="250" height="18" font="0">[1] A. Writer, First Title, 12</text>
+<text top="118" left="54" width="490" height="18" font="0">[2] B. Writer, Second Title, 1990, an entry that wraps onto a second line as</text>
+<text top="136" left="54" width="120" height="18" font="0">it goes on, 33</text>
+<text top="154" left="54" width="120" height="18" font="0">[3] Ibid., 34</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert_eq!(
+            texts(&result),
+            vec![
+                "[1] A. Writer, First Title, 12",
+                "[2] B. Writer, Second Title, 1990, an entry that wraps onto a second line as \
+                 it goes on, 33",
+                "[3] Ibid., 34",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_note_stays_whole_even_when_a_wrapped_line_opens_with_a_number() {
+        // One note, no first-line indent. Its second line opens with "8.",
+        // the next number, but follows a full line, so it continues note 7.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="594" height="918">
+<fontspec id="0" size="15" family="T"/>
+<fontspec id="1" size="14" family="T"/>
+<text top="100" left="54" width="490" height="18" font="0">The body of this invented page runs for several lines so that its type is</text>
+<text top="118" left="54" width="490" height="18" font="0">plainly the body size, with an ordinary measure and ordinary leading, and</text>
+<text top="136" left="54" width="300" height="18" font="0">then it stops short of the margin.</text>
+<text top="700" left="54" width="486" height="16" font="1">7. See the long discussion of this argument in the third chapter, sections</text>
+<text top="715" left="54" width="300" height="16" font="1">8. and 9., where the same claim returns.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let texts = texts(&reconstruct(&pages, ColumnMode::Auto));
+
+        assert_eq!(
+            texts[1..],
+            [
+                "7. See the long discussion of this argument in the third chapter, sections 8. \
+              and 9., where the same claim returns."
+            ],
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn years_opening_lines_do_not_split_a_paragraph() {
+        // Each year follows a closed sentence on a short line, so only the
+        // three-digit limit on labels keeps this paragraph whole.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="594" height="918">
+<fontspec id="0" size="15" family="T"/>
+<text top="100" left="54" width="430" height="18" font="0">Its first books came out slowly, and nobody kept records.</text>
+<text top="118" left="54" width="490" height="18" font="0">1984. That changed when a second editor arrived and began to keep lists</text>
+<text top="136" left="54" width="300" height="18" font="0">of everything printed that year.</text>
+<text top="154" left="54" width="490" height="18" font="0">1985. The lists stop there, and nobody now knows why they were kept for</text>
+<text top="172" left="54" width="120" height="18" font="0">one year only.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let texts = texts(&reconstruct(&pages, ColumnMode::Auto));
+
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].contains("records. 1984. That changed"));
+        assert!(texts[0].contains("that year. 1985. The lists"));
+    }
+
+    #[test]
+    fn a_numbered_list_running_through_prose_does_not_split_it() {
+        // Justified prose wraps onto "1." and then "2.": consecutive labels
+        // on one margin, but each follows a line that runs to the measure.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="594" height="918">
+<fontspec id="0" size="15" family="T"/>
+<text top="100" left="54" width="490" height="18" font="0">Before a book is sent out, the editor confirms three things, in this order,</text>
+<text top="118" left="54" width="490" height="18" font="0">1. that every page is present and in the right order, with nothing left out,</text>
+<text top="136" left="54" width="430" height="18" font="0">2. that the notes match their marks, and 3. that the index is right.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let texts = texts(&reconstruct(&pages, ColumnMode::Auto));
+
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].contains("in this order, 1. that every page"));
+        assert!(texts[0].contains("left out, 2. that the notes"));
+    }
+
+    #[test]
+    fn note_labels_need_a_short_number_and_following_text() {
+        let label = |spans: Vec<Span>| {
+            note_label_number(&Line {
+                top: 0,
+                left: 0,
+                right: 100,
+                height: 12,
+                font_size: 11,
+                spans,
+            })
+        };
+        let plain = |text: &str| {
+            label(vec![Span {
+                text: text.to_string(),
+                bold: false,
+                italic: false,
+                superscript: false,
+            }])
+        };
+        for (text, number) in [
+            ("12. Author", 12),
+            ("12: Author", 12),
+            ("12) Author", 12),
+            ("[12] Author", 12),
+            ("[12]Author", 12),
+            ("(12) Author", 12),
+            ("12 Author", 12),
+            ("12 “Title”", 12),
+            ("¹² Author", 12),
+            ("³Author", 3),
+            ("  5. ibid.", 5),
+        ] {
+            assert_eq!(plain(text), Some(number), "{text}");
+        }
+        for text in [
+            "1984. It was",
+            "1.1 Scope",
+            "3.14 is a decimal",
+            "12:30 is a time",
+            "12 of them",
+            "12 34",
+            "(2) the second",
+            "12.",
+            "12. ",
+            "[12",
+            "12th",
+            "Chapter 12",
+        ] {
+            assert_eq!(plain(text), None, "{text}");
+        }
+        let raised = Span {
+            text: "12".to_string(),
+            bold: false,
+            italic: false,
+            superscript: true,
+        };
+        let entry = Span {
+            text: "Author".to_string(),
+            bold: false,
+            italic: false,
+            superscript: false,
+        };
+        assert_eq!(label(vec![raised.clone(), entry]), Some(12));
+        assert_eq!(label(vec![raised]), None);
     }
 
     #[test]
