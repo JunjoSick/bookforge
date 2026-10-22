@@ -24,11 +24,13 @@ use crate::{
     concurrency::{AdaptiveLimiter, AdaptivePermit, PauseSignal, PauseState},
 };
 
+mod capture;
 mod escalation;
 mod execution;
 mod planning;
 mod rendering;
 
+use capture::{capture_failed_batch_response, prompt_for_capture};
 #[cfg(test)]
 use escalation::batch_max_output_tokens;
 use escalation::{
@@ -57,7 +59,7 @@ pub use rendering::blocking_source_copy_error;
 pub use rendering::parse_batch_response;
 use rendering::{
     batch_prompt_template, batch_response_item_count, parse_batch_response_with_validation,
-    render_batch_prompt,
+    prompt_item_ids, render_batch_prompt,
 };
 #[cfg(test)]
 use rendering::{render_batch_items, render_batch_prompt_extra};

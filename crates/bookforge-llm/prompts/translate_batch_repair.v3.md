@@ -8,7 +8,8 @@ Return JSON only.
 
 For each item:
 - fix only the listed validation errors;
-- preserve item IDs exactly;
+- return one item for every item to repair, and preserve item IDs exactly;
+- escape every straight double quote inside a JSON string as \";
 - preserve required markers exactly;
 - preserve protected spans exactly;
 - do not add explanations.

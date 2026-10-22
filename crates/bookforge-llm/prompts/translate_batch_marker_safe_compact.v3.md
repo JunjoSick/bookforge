@@ -8,7 +8,9 @@ CRITICAL: Preserve every XML marker (<m1>, </m1>, <r1/>, etc.) EXACTLY — same 
 
 Rules:
 - Return JSON only.
-- Preserve item IDs, markers, protected spans, tone, register, style.
+- Return one item per input item, in input order, with its ID copied exactly; never leave one out, even if its text stays unchanged.
+- Preserve markers, protected spans, tone, register, style.
+- Escape straight double quotes inside JSON strings as \".
 - Translate prose naturally around markers.
 
 Return exactly:
@@ -22,4 +24,4 @@ Entities: {{entity_agreement_block}}
 Prior context: {{context_translation_pairs}}
 Extra: {{prompt_extra}}
 {{items_json}}
-Return JSON only.
+Return JSON only. Include every input item.

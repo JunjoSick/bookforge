@@ -239,9 +239,15 @@ where
     P: LlmProvider,
 {
     let mut vars = Substitutions::new();
-    vars.string("source_language", source_language)
-        .string("target_language", target_language)
-        .json_compact("items_json", &items);
+    vars.string(
+        "source_language",
+        bookforge_core::language::prompt_language_name(source_language),
+    )
+    .string(
+        "target_language",
+        bookforge_core::language::prompt_language_name(target_language),
+    )
+    .json_compact("items_json", &items);
     let rendered = template
         .render(&vars)
         .map_err(|error| ProposalBatchRequestError {

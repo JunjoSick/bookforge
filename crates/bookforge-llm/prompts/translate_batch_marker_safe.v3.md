@@ -23,7 +23,9 @@ will be corrupted and the translation will be REJECTED.
 
 Rules:
 - Return JSON only. No explanations, notes, or Markdown.
-- Preserve every item ID exactly.
+- Return one output item for every input item, in the same order, and copy each item ID exactly.
+- Never leave an item out. An item that needs no translation, such as a bare citation, a bibliography entry, or a number, is returned with its text unchanged.
+- Escape every straight double quote inside a JSON string as \". Typographic quotes such as “ ” and « » need no escaping.
 - PRESERVE EVERY MARKER EXACTLY — same tag name and same position.
 - Do not rename markers (e.g. <m1> must stay <m1> and close as </m1>).
 - Do not delete markers.
@@ -47,6 +49,7 @@ BEFORE RETURNING YOUR RESPONSE, verify internally:
 3. Are all marker close tags correct (</m1> not </ m1>)?
 4. Did I accidentally delete, rename, or duplicate any marker?
 5. Does the output contain ONLY valid JSON with no commentary?
+6. Is there exactly one output item for every input item, in input order?
 
 Return exactly:
 {"items":[{"id":"...","translation":"..."}]}
@@ -85,4 +88,4 @@ Additional instructions:
 Input:
 {{items_json}}
 
-Return JSON only. Markers are CRITICAL — missing markers will corrupt the EPUB.
+Return JSON only. Include every input item. Markers are CRITICAL — missing markers will corrupt the EPUB.

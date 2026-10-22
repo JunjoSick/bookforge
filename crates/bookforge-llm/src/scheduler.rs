@@ -845,9 +845,14 @@ fn render_qa_prompt(
     let mut vars = Substitutions::new();
     vars.string(
         "source_language",
-        config.source_language.as_deref().unwrap_or("auto"),
+        bookforge_core::language::prompt_language_name(
+            config.source_language.as_deref().unwrap_or("auto"),
+        ),
     )
-    .string("target_language", &config.target_language)
+    .string(
+        "target_language",
+        bookforge_core::language::prompt_language_name(&config.target_language),
+    )
     .string("segment_id", &segment.id.0)
     .string(
         "book_title",
@@ -1258,9 +1263,14 @@ fn render_prompt(
     let mut vars = Substitutions::new();
     vars.string(
         "source_language",
-        config.source_language.as_deref().unwrap_or("auto"),
+        bookforge_core::language::prompt_language_name(
+            config.source_language.as_deref().unwrap_or("auto"),
+        ),
     )
-    .string("target_language", &config.target_language)
+    .string(
+        "target_language",
+        bookforge_core::language::prompt_language_name(&config.target_language),
+    )
     .string("segment_id", &segment.id.0)
     .string(
         "book_title",

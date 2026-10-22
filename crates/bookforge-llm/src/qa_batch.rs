@@ -295,12 +295,17 @@ where
     let mut vars = Substitutions::new();
     vars.string(
         "source_language",
-        config
-            .source_language
-            .as_deref()
-            .unwrap_or("the source language"),
+        bookforge_core::language::prompt_language_name(
+            config
+                .source_language
+                .as_deref()
+                .unwrap_or("the source language"),
+        ),
     )
-    .string("target_language", &config.target_language)
+    .string(
+        "target_language",
+        bookforge_core::language::prompt_language_name(&config.target_language),
+    )
     .raw(
         "style_guide_block",
         config
