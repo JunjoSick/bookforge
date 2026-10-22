@@ -21,6 +21,43 @@
 - Keep sections of the same rank as siblings in the PDF-derived contents
   when a rank is skipped. A chapter heading followed by numbered `h3`
   sections listed each section inside the one before it.
+- Stop rejecting complete batch responses as incomplete. Batch prompts gave
+  each item its internal ID, such as
+  `seg_sec_000000_b_000070_be51253472d4:b_000130`, and models copied these
+  long, look-alike IDs back mangled: in two runs of one book, 139 of the 142
+  items reported missing had come back translated and in order under a
+  mangled ID, and each such response was split and sent again. Prompts now
+  number items `i1`, `i2`, ... and responses are mapped back to the real
+  items; a response that echoes the full ID is still accepted.
+- Name the languages in prompts. A target given as a code reached the model
+  as "Translate from the source language to it.", and on some batches the
+  model returned every paragraph untranslated; replaying those prompts gave
+  the same result every time, and none once the prompt said Italian. Prompts
+  now name a known ISO 639-1 code with the code kept, such as `Italian (it)`;
+  full names and other values are used as given. On that book the items
+  rejected and sent to repair fell from 72 and 90 per run to 13.
+- Repair batch responses whose translations contain unescaped straight double
+  quotes, the cause of the `expected , or } at line 1 column N` failures: the
+  source used typographic quotes and the model wrote them back as bare `"`.
+  The repair runs only after a strict parse fails, reads a quote as closing a
+  string only where a batch response can continue, and must yield a response
+  with no keys a batch response lacks; the items are then validated as before.
+  It repairs five of the six malformed responses captured on that book; the
+  sixth stops mid-string and is still rejected.
+- Batch prompts now ask for one output item per input item in input order,
+  including items whose text stays unchanged, and for straight double quotes
+  to be escaped. The prompt version is unchanged, so cached translations
+  remain valid.
+- Together, on one English-to-Italian book with DeepSeek v4-flash and the
+  default profile, two runs before and three after: requests 164 and 169
+  became 116 to 127, incomplete responses 24 and 21 became 0 or 1, batch
+  splits 22 became 0 to 4, and input tokens 316k and 327k became 284k to 285k.
+- Add `BOOKFORGE_DEBUG_BATCH_RESPONSE_DIR`. When set, each batch response that
+  fails to parse or has items rejected is written there with the prompt, the
+  requested items, each rejected item's error and the provider's content, so
+  the request can be read and replayed after the run. Nothing is written or
+  logged otherwise; the files contain book text.
+
 - Rebuild typeset books from PDF with far fewer broken paragraphs. Page
   numbers are recognised from their page-to-page sequence and dropped, so a
   sentence running over a page break stays one paragraph instead of being
