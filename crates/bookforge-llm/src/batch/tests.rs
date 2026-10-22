@@ -2169,6 +2169,48 @@ impl LlmProviderTrait for Arc<AlwaysTransientProvider> {
     }
 }
 
+/// Fails its first call with a real connection error (nothing listens on
+/// `refused_url`), then echoes the batch prompt.
+struct ConnectFailsOnceProvider {
+    calls: AtomicUsize,
+    refused_url: String,
+}
+
+impl LlmProviderTrait for Arc<ConnectFailsOnceProvider> {
+    async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            reqwest::get(&self.refused_url).await?;
+            unreachable!("nothing listens on the refused port");
+        }
+        let item_ids = item_ids_from_batch_prompt(&request.user);
+        Ok(CompletionResponse {
+            content: serde_json::json!({
+                "items": item_ids
+                    .into_iter()
+                    .map(|id| serde_json::json!({
+                        "translation": format!("[it] {id}"),
+                        "id": id,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+            .to_string(),
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            finish_reason: FinishReason::Stop,
+            provider_latency_ms: 0,
+            raw: serde_json::json!({}),
+        })
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_response_format: true,
+            supports_usage_tokens: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DecodeFailureMode {
     FirstRequest,
@@ -2787,7 +2829,9 @@ async fn single_item_invalid_response_retries_before_needs_review() {
     ]);
     let telemetry = Arc::new(TelemetryLog::new());
     let mut config = test_run_config();
-    config.scheduler.max_attempts = 2;
+    // One configured attempt still allows a fresh sample for an item that
+    // cannot be bisected.
+    config.scheduler.max_attempts = 1;
 
     let translations = translate_batches_with_callback(
         provider,
@@ -2807,6 +2851,54 @@ async fn single_item_invalid_response_retries_before_needs_review() {
     assert_eq!(translations.len(), 1);
     assert_eq!(translations[0].status, SegmentStatus::Succeeded);
     assert_eq!(translations[0].joined_text(), "[it] Hello");
+}
+
+#[tokio::test]
+async fn connect_errors_are_retried_even_when_one_attempt_is_configured() {
+    // A refused connection never reaches the provider. With the single
+    // attempt the default profile allows, it used to fail the whole batch.
+    // Port 1 is privileged and never bound by tests; a port freed after
+    // binding it could be handed to another test's server in the meantime.
+    let refused_url = "http://127.0.0.1:1".to_string();
+    let segment = make_segment("seg1", vec![plain_block("Hello")], vec![]);
+    let segments = vec![segment];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1000,
+        max_items: 1,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let provider = Arc::new(ConnectFailsOnceProvider {
+        calls: AtomicUsize::new(0),
+        refused_url,
+    });
+    let mut config = test_run_config();
+    config.scheduler.max_attempts = 1;
+
+    let translations = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        translate_batches_with_callback(
+            provider.clone(),
+            batches,
+            &segments,
+            &config,
+            Arc::new(TelemetryLog::new()),
+            None,
+            None,
+            Arc::new(bookforge_core::NullProgressSink),
+            None,
+            |_| Ok(()),
+        ),
+    )
+    .await
+    .expect("a refused connection fails fast")
+    .expect("a connect error should be retried");
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
 }
 
 #[tokio::test]
@@ -4250,14 +4342,17 @@ fn latency_planning_leaves_batches_alone_without_a_timeout() {
     assert_eq!(parts.len(), 1);
 }
 
-/// A request whose computed output budget implies more generation time than
-/// the latency share of the configured timeout is split *before dispatch*,
+/// A batch whose expected output implies more generation time than the
+/// latency share of the configured timeout is split *before dispatch*,
 /// instead of being sent with a budget that can only succeed by luck.
 #[tokio::test]
-async fn latency_aware_dispatch_splits_oversized_output_budgets() {
+async fn latency_aware_dispatch_splits_oversized_expected_output() {
     let seg = make_segment(
         "seg_dispatch",
-        vec![plain_block("Hello"), plain_block("Goodbye")],
+        ["One", "Two", "Three", "Four", "Five", "Six"]
+            .into_iter()
+            .map(plain_block)
+            .collect(),
         vec![],
     );
     let segments = vec![seg];
@@ -4271,16 +4366,16 @@ async fn latency_aware_dispatch_splits_oversized_output_budgets() {
     };
     let batches = build_translation_batches(&segments, &batch_config, TranslationProfile::Balanced);
     assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].items.len(), 2);
+    assert_eq!(batches[0].items.len(), 6);
 
     let provider = GatedPromptEchoProvider::new();
     let events = Arc::new(Mutex::new(Vec::new()));
     let mut config = test_run_config();
     config.scheduler.concurrency = 1;
-    // 20s timeout: the planning output cap (480 tokens) still admits the
-    // two-item batch (expected output ~260), but the computed 512-token
-    // request budget implies ~17s of generation at the conservative 30 tok/s
-    // floor — beyond 0.8 * 20s — so the batch must be split before dispatch.
+    // 20s timeout: ~16s of generation at the conservative 30 tok/s floor
+    // allows 480 output tokens. Six items carry ~520 expected tokens of JSON
+    // envelope alone, so the batch must be split before dispatch; each half
+    // of three (~330) fits.
     config.runtime_settings = Some(
         EngineRuntimeSettings {
             revision: 1,
@@ -4312,30 +4407,83 @@ async fn latency_aware_dispatch_splits_oversized_output_budgets() {
     .await
     .expect("latency split should complete successfully");
 
-    // Both items still translated, via two single-item requests.
+    // Every item still translated, via two three-item requests. The batch
+    // sizer's normalization makes this split; the dispatch check applies the
+    // same expected-output rule where no sizer runs.
     assert_eq!(translations.len(), 1);
+    assert_eq!(translations[0].status, SegmentStatus::Succeeded);
     assert_eq!(provider.started.load(Ordering::Acquire), 2);
-    let mut budgets = provider.budgets.lock().unwrap().clone();
-    budgets.sort_by_key(|(index, _)| *index);
-    assert_eq!(
-        budgets,
-        vec![(0, Some(512)), (1, Some(512))],
-        "each single-item child dispatches with the floored budget"
+}
+
+/// A batch the planner sized to fit is dispatched whole even when its
+/// truncation budget alone, at the throughput floor, would exceed the
+/// latency share: the budget runs several times the expected output, and
+/// judging by it split one book's planned batches into 376 tiny requests.
+#[tokio::test]
+async fn latency_check_judges_expected_output_not_the_budget() {
+    let seg = make_segment(
+        "seg_dispatch",
+        vec![plain_block("Hello"), plain_block("Goodbye")],
+        vec![],
+    );
+    let segments = vec![seg];
+    let batch_config = BatchConfig {
+        enabled: true,
+        target_tokens: 16_000,
+        max_items: 64,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &batch_config, TranslationProfile::Balanced);
+    assert_eq!(batches.len(), 1);
+
+    let provider = GatedPromptEchoProvider::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut config = test_run_config();
+    config.scheduler.concurrency = 1;
+    // 20s timeout: the 512-token floor budget implies ~17s at 30 tok/s,
+    // beyond 0.8 * 20s, but the ~260 tokens expected fit comfortably.
+    config.runtime_settings = Some(
+        EngineRuntimeSettings {
+            revision: 1,
+            batch: batch_config,
+            batch_max_output_tokens: None,
+            concurrency: 1,
+            provider_max_attempts: 1,
+            adaptive_concurrency: false,
+            timeout_seconds: 20,
+        }
+        .frozen_receiver(),
     );
 
-    let split_emitted = events
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|event| matches!(event, bookforge_core::ProgressEvent::BatchSplit { .. }));
-    assert!(split_emitted, "the latency split must be observable");
+    provider.release.add_permits(2);
+    let translations = translate_batches_with_callback(
+        provider.clone(),
+        batches,
+        &segments,
+        &config,
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(RecordingProgress {
+            events: events.clone(),
+        }),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("the batch should translate in one request");
+
+    assert_eq!(translations.len(), 1);
+    assert_eq!(provider.started.load(Ordering::Acquire), 1);
     let latency_warning = events.lock().unwrap().iter().any(|event| {
         matches!(
             event,
             bookforge_core::ProgressEvent::Warning { kind, .. } if kind == "batch_latency_split"
         )
     });
-    assert!(latency_warning, "the split reason must be surfaced");
+    assert!(!latency_warning, "nothing should be split for latency");
 }
 
 /// The watchdog emits RequestProgress heartbeats while a batch request is in

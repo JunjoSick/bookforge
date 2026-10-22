@@ -604,7 +604,10 @@ fn batch_token_estimate(
             .sum::<usize>()
 }
 
-fn expected_batch_output_tokens(mode: BatchMode, items: &[TranslationBatchItem]) -> usize {
+pub(super) fn expected_batch_output_tokens(
+    mode: BatchMode,
+    items: &[TranslationBatchItem],
+) -> usize {
     let translated_text = items
         .iter()
         .map(|item| token_estimate(&item.source_text).max(1))
