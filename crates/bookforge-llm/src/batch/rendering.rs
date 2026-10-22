@@ -619,16 +619,101 @@ pub(super) fn parse_batch_response_with_validation(
 /// occasionally wrap the payload in markdown fences or append trailing
 /// commentary, which a strict parse turns into split/retry churn; when a
 /// direct parse fails, fall back to parsing just the balanced outermost
-/// JSON value. Only the transport wrapper is stripped — the item schema is
+/// JSON value, and then to [`decode_with_escaped_inner_quotes`]. Only the
+/// transport wrapper and unescaped quotes are repaired — the item schema is
 /// never loosened.
 fn decode_batch_json<T: serde::de::DeserializeOwned>(content: &str) -> Result<T, String> {
     match serde_json::from_str(content) {
         Ok(parsed) => Ok(parsed),
         Err(direct_error) => {
-            let recovered =
-                outermost_json_value(content).and_then(|span| serde_json::from_str(span).ok());
+            let recovered = outermost_json_value(content)
+                .and_then(|span| serde_json::from_str(span).ok())
+                .or_else(|| decode_with_escaped_inner_quotes(content));
             recovered.ok_or_else(|| format!("invalid batch JSON: {direct_error}"))
         }
+    }
+}
+
+/// Keys a batch response may use at any depth: `{"items":[{"id",
+/// "translation"}]}` for text batches, `{"items":[{"id","runs":[{"id",
+/// "text"}]}]}` for run-preserving ones.
+const BATCH_RESPONSE_KEYS: [&str; 5] = ["items", "id", "translation", "runs", "text"];
+
+/// Parse a batch response whose translations contain straight double quotes
+/// the model did not escape (`"translation":"un "esempio" qui"`), the
+/// cause of the malformed batch JSON seen on real books: the source used
+/// typographic quotes and the model wrote them back as bare `"`.
+///
+/// Inside a string, a quote is taken to close it only when what follows can
+/// continue the JSON (`:`, `}`, `]`, the end, or `,` before another string,
+/// object or array); any other quote is escaped. The result must parse, and
+/// it may use no key a batch response does not have, so a misjudged quote
+/// fails the parse instead of reshaping the response; the caller then
+/// validates the items as usual. Returns `None` when nothing was escaped or
+/// the repair does not produce such a response.
+fn decode_with_escaped_inner_quotes<T: serde::de::DeserializeOwned>(content: &str) -> Option<T> {
+    let start = content.find('{')?;
+    let (repaired, escaped) = escape_inner_quotes(&content[start..]);
+    if escaped == 0 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&repaired).ok().or_else(|| {
+        outermost_json_value(&repaired).and_then(|span| serde_json::from_str(span).ok())
+    })?;
+    if !uses_only_batch_response_keys(&value) {
+        return None;
+    }
+    let parsed = serde_json::from_value(value).ok()?;
+    tracing::info!(
+        escaped_quotes = escaped,
+        "repaired unescaped quotes in a batch response"
+    );
+    Some(parsed)
+}
+
+fn escape_inner_quotes(json: &str) -> (String, usize) {
+    let mut repaired = String::with_capacity(json.len() + 16);
+    let mut escaped_quotes = 0;
+    let mut in_string = false;
+    let mut after_backslash = false;
+    for (index, ch) in json.char_indices() {
+        if in_string {
+            if after_backslash {
+                after_backslash = false;
+            } else if ch == '\\' {
+                after_backslash = true;
+            } else if ch == '"' {
+                if quote_closes_string(&json[index + 1..]) {
+                    in_string = false;
+                } else {
+                    repaired.push('\\');
+                    escaped_quotes += 1;
+                }
+            }
+        } else if ch == '"' {
+            in_string = true;
+        }
+        repaired.push(ch);
+    }
+    (repaired, escaped_quotes)
+}
+
+fn quote_closes_string(rest: &str) -> bool {
+    let rest = rest.trim_start();
+    match rest.chars().next() {
+        None | Some(':' | '}' | ']') => true,
+        Some(',') => matches!(rest[1..].trim_start().chars().next(), Some('"' | '{' | '[')),
+        Some(_) => false,
+    }
+}
+
+fn uses_only_batch_response_keys(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().all(|(key, value)| {
+            BATCH_RESPONSE_KEYS.contains(&key.as_str()) && uses_only_batch_response_keys(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().all(uses_only_batch_response_keys),
+        _ => true,
     }
 }
 
@@ -681,20 +766,23 @@ fn parse_text_batch_response(
 ) -> Result<BatchTranslationResult, String> {
     let parsed: BatchTextResponse = decode_batch_json(content)?;
 
-    let requested_ids: HashMap<&str, &TranslationBatchItem> = batch
-        .items
-        .iter()
-        .map(|item| (item.item_id.as_str(), item))
-        .collect();
+    let requested_ids = response_item_lookup(batch);
 
     let mut seen = HashMap::new();
+    let mut seen_unrequested = HashSet::new();
     let mut translations = Vec::new();
     let mut failures = Vec::new();
 
     for item in &parsed.items {
-        if seen.contains_key(item.id.as_str()) {
+        let Some(request_item) = requested_ids.get(item.id.as_str()).copied() else {
+            if !seen_unrequested.insert(item.id.as_str()) {
+                failures.push(duplicate_unrequested_item_failure(&item.id));
+            }
+            continue;
+        };
+        if seen.contains_key(request_item.item_id.as_str()) {
             failures.push(BatchItemFailure {
-                item_id: item.id.clone(),
+                item_id: request_item.item_id.clone(),
                 segment_id: SegmentId("unknown".to_string()),
                 error: "duplicate item ID in batch response".to_string(),
                 input_tokens: None,
@@ -708,11 +796,7 @@ fn parse_text_batch_response(
             });
             continue;
         }
-        seen.insert(item.id.as_str(), ());
-
-        let Some(request_item) = requested_ids.get(item.id.as_str()) else {
-            continue;
-        };
+        seen.insert(request_item.item_id.as_str(), ());
 
         let translation = if turbo {
             item.translation.clone()
@@ -726,7 +810,7 @@ fn parse_text_batch_response(
             &translation,
         ) {
             failures.push(BatchItemFailure {
-                item_id: item.id.clone(),
+                item_id: request_item.item_id.clone(),
                 segment_id: request_item.segment_id.clone(),
                 error: error.to_string(),
                 input_tokens: None,
@@ -769,7 +853,7 @@ fn parse_text_batch_response(
             let findings = report.engine_findings(request_item, &translation);
             let error = report.persistence_message();
             failures.push(BatchItemFailure {
-                item_id: item.id.clone(),
+                item_id: request_item.item_id.clone(),
                 segment_id: request_item.segment_id.clone(),
                 error,
                 input_tokens: None,
@@ -787,7 +871,7 @@ fn parse_text_batch_response(
             translation
         };
         translations.push(BatchItemTranslation {
-            item_id: item.id.clone(),
+            item_id: request_item.item_id.clone(),
             segment_id: request_item.segment_id.clone(),
             text: translation,
             warning: validation_error.map(|report| report.persistence_message()),
@@ -827,20 +911,23 @@ fn parse_run_batch_response(
 ) -> Result<BatchTranslationResult, String> {
     let parsed: BatchRunResponse = decode_batch_json(content)?;
 
-    let requested_ids: HashMap<&str, &TranslationBatchItem> = batch
-        .items
-        .iter()
-        .map(|item| (item.item_id.as_str(), item))
-        .collect();
+    let requested_ids = response_item_lookup(batch);
 
     let mut seen = HashMap::new();
+    let mut seen_unrequested = HashSet::new();
     let mut translations = Vec::new();
     let mut failures = Vec::new();
 
     for item in &parsed.items {
-        if seen.contains_key(item.id.as_str()) {
+        let Some(request_item) = requested_ids.get(item.id.as_str()).copied() else {
+            if !seen_unrequested.insert(item.id.as_str()) {
+                failures.push(duplicate_unrequested_item_failure(&item.id));
+            }
+            continue;
+        };
+        if seen.contains_key(request_item.item_id.as_str()) {
             failures.push(BatchItemFailure {
-                item_id: item.id.clone(),
+                item_id: request_item.item_id.clone(),
                 segment_id: SegmentId("unknown".to_string()),
                 error: "duplicate item ID in batch response".to_string(),
                 input_tokens: None,
@@ -854,11 +941,7 @@ fn parse_run_batch_response(
             });
             continue;
         }
-        seen.insert(item.id.as_str(), ());
-
-        let Some(request_item) = requested_ids.get(item.id.as_str()) else {
-            continue;
-        };
+        seen.insert(request_item.item_id.as_str(), ());
         let (projected_item, projection) = prompt_projected_item(request_item);
 
         let expected_run_count = projected_item.text_runs.len();
@@ -868,7 +951,7 @@ fn parse_run_batch_response(
                 item.runs.len()
             );
             failures.push(BatchItemFailure {
-                item_id: item.id.clone(),
+                item_id: request_item.item_id.clone(),
                 segment_id: request_item.segment_id.clone(),
                 error: error.clone(),
                 input_tokens: None,
@@ -919,7 +1002,7 @@ fn parse_run_batch_response(
         }
         if let Some(error) = run_error {
             failures.push(BatchItemFailure {
-                item_id: item.id.clone(),
+                item_id: request_item.item_id.clone(),
                 segment_id: request_item.segment_id.clone(),
                 error: error.clone(),
                 input_tokens: None,
@@ -952,7 +1035,7 @@ fn parse_run_batch_response(
             &translation,
         ) {
             failures.push(BatchItemFailure {
-                item_id: item.id.clone(),
+                item_id: request_item.item_id.clone(),
                 segment_id: request_item.segment_id.clone(),
                 error: error.to_string(),
                 input_tokens: None,
@@ -984,7 +1067,7 @@ fn parse_run_batch_response(
             let findings = report.engine_findings(request_item, &translation);
             let error = report.persistence_message();
             failures.push(BatchItemFailure {
-                item_id: item.id.clone(),
+                item_id: request_item.item_id.clone(),
                 segment_id: request_item.segment_id.clone(),
                 error,
                 input_tokens: None,
@@ -996,7 +1079,7 @@ fn parse_run_batch_response(
             continue;
         }
         translations.push(BatchItemTranslation {
-            item_id: item.id.clone(),
+            item_id: request_item.item_id.clone(),
             segment_id: request_item.segment_id.clone(),
             text: translation,
             warning: validation_error.map(|report| report.persistence_message()),
@@ -1027,6 +1110,24 @@ fn parse_run_batch_response(
     })
 }
 
+/// An ID the batch never requested, echoed more than once. It cannot be
+/// attributed to a segment; aggregation drops it with a warning.
+fn duplicate_unrequested_item_failure(item_id: &str) -> BatchItemFailure {
+    BatchItemFailure {
+        item_id: item_id.to_string(),
+        segment_id: SegmentId("unknown".to_string()),
+        error: "duplicate item ID in batch response".to_string(),
+        input_tokens: None,
+        input_cached_tokens: None,
+        output_tokens: None,
+        tokens_estimated: false,
+        findings: vec![EngineFinding::new(
+            QaFindingKind::BatchBlockMismatch,
+            "duplicate item ID in batch response",
+        )],
+    }
+}
+
 fn incomplete_batch_response_error(requested: usize, missing: &[&str]) -> String {
     let returned = requested.saturating_sub(missing.len());
     format!(
@@ -1038,19 +1139,55 @@ fn incomplete_batch_response_error(requested: usize, missing: &[&str]) -> String
 pub(super) fn batch_response_item_count(batch: &TranslationBatch, content: &str) -> Option<usize> {
     let parsed = decode_batch_json::<serde_json::Value>(content).ok()?;
     let items = parsed.get("items")?.as_array()?;
-    let requested = batch
-        .items
-        .iter()
-        .map(|item| item.item_id.as_str())
-        .collect::<std::collections::HashSet<_>>();
+    let requested = response_item_lookup(batch);
     Some(
         items
             .iter()
-            .filter_map(|item| item.get("id")?.as_str())
-            .filter(|item_id| requested.contains(item_id))
+            .filter_map(|item| requested.get(item.get("id")?.as_str()?))
+            .map(|item| item.item_id.as_str())
             .collect::<std::collections::HashSet<_>>()
             .len(),
     )
+}
+
+/// The IDs a batch prompt gives its items: `i1`, `i2`, ... in item order.
+///
+/// An item's own ID joins a segment ID and a block ID
+/// (`seg_sec_000000_b_000070_be51253472d4:b_000130`), and the items of one
+/// batch share most of that text. Models copy such IDs back mangled
+/// (`seg_sec_000000_b_000130`). On one book most responses rejected as
+/// incomplete held every translation, in order, under IDs that matched
+/// nothing. A short positional ID leaves nothing to mangle. A batch whose own
+/// IDs already look like these keeps its own IDs, so the two can never be
+/// confused.
+pub(super) fn prompt_item_ids(batch: &TranslationBatch) -> Vec<String> {
+    let looks_positional = |id: &str| {
+        id.strip_prefix('i')
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if batch
+        .items
+        .iter()
+        .any(|item| looks_positional(&item.item_id))
+    {
+        return batch
+            .items
+            .iter()
+            .map(|item| item.item_id.clone())
+            .collect();
+    }
+    (1..=batch.items.len()).map(|n| format!("i{n}")).collect()
+}
+
+/// Map every ID a response may use for a requested item, its prompt ID from
+/// [`prompt_item_ids`] or its own ID, to that item.
+fn response_item_lookup(batch: &TranslationBatch) -> HashMap<String, &TranslationBatchItem> {
+    let mut lookup = HashMap::with_capacity(batch.items.len() * 2);
+    for (item, prompt_id) in batch.items.iter().zip(prompt_item_ids(batch)) {
+        lookup.insert(item.item_id.clone(), item);
+        lookup.insert(prompt_id, item);
+    }
+    lookup
 }
 
 fn batch_glossary_entries<'a>(
@@ -1194,7 +1331,8 @@ pub(super) fn render_batch_items(
     let items: Vec<serde_json::Value> = batch
         .items
         .iter()
-        .map(|item| {
+        .zip(prompt_item_ids(batch))
+        .map(|(item, prompt_id)| {
             let turbo = batch.mode == BatchMode::TurboTextOnly;
             let projected = (!turbo).then(|| prompt_projected_item(item).0);
             let prompt_item = projected.as_ref().unwrap_or(item);
@@ -1210,7 +1348,7 @@ pub(super) fn render_batch_items(
             };
             let protected_spans = protected_span_texts(item);
             let mut obj = serde_json::json!({
-                "id": item.item_id,
+                "id": prompt_id,
                 "kind": item.kind,
                 "text": source_text,
                 "required_markers": required_markers,
@@ -1887,5 +2025,147 @@ mod lenient_response_decoding_tests {
             err.starts_with("invalid batch JSON: "),
             "unexpected error: {err}"
         );
+    }
+    fn two_item_batch() -> TranslationBatch {
+        let mut batch = plain_batch();
+        let mut second = batch.items[0].clone();
+        second.item_id = "seg_sec_000000_b_000070_be51253472d4:b_000130".to_string();
+        second.block_id = BlockId("b_000130".to_string());
+        second.source_text = "World".to_string();
+        batch.items[0].item_id = "seg_sec_000000_b_000070_be51253472d4:b_000129".to_string();
+        batch.items.push(second);
+        batch
+    }
+
+    #[test]
+    fn unescaped_inner_quotes_are_repaired() {
+        let response = r#"{"items":[{"id":"item","translation":"Disse "no", poi se ne andò."}]}"#;
+        let result = parse_batch_response(&plain_batch(), response).expect("quotes repaired");
+        assert!(result.failures.is_empty());
+        assert_eq!(
+            result.translations[0].text,
+            r#"Disse "no", poi se ne andò."#
+        );
+    }
+
+    #[test]
+    fn quotes_at_the_edges_of_a_translation_are_repaired() {
+        let response = r#"{"items":[{"id":"item","translation":""Ciao", disse lei. "Addio.""}]}"#;
+        let result = parse_batch_response(&plain_batch(), response).expect("quotes repaired");
+        assert_eq!(
+            result.translations[0].text,
+            r#""Ciao", disse lei. "Addio.""#
+        );
+    }
+
+    #[test]
+    fn quote_repair_works_inside_a_fenced_response() {
+        let response = concat!(
+            "```json\n",
+            r#"{"items":[{"id":"item","translation":"un "esempio""}]}"#,
+            "\n```"
+        );
+        let result = parse_batch_response(&plain_batch(), response).expect("quotes repaired");
+        assert_eq!(result.translations[0].text, r#"un "esempio""#);
+    }
+
+    #[test]
+    fn quote_repair_that_would_add_a_key_is_rejected() {
+        // Read as closing quotes, `"y",` and `"z":` turn the tail of the
+        // translation into a new `z` key. A batch response has no such key, so
+        // the repair is refused rather than trusted.
+        let response = r#"{"items":[{"id":"item","translation":"x "y", "z":"w"}]}"#;
+        let err = parse_batch_response(&plain_batch(), response).unwrap_err();
+        assert!(
+            err.starts_with("invalid batch JSON: "),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn quote_repair_keeps_item_validation() {
+        let response = r#"{"items":[{"id":"seg_sec_000000_b_000070_be51253472d4:b_000129","translation":"Disse "ciao"."}]}"#;
+        let err = parse_batch_response(&two_item_batch(), response).unwrap_err();
+        assert!(
+            err.starts_with("batch response incomplete: requested 2 items, returned 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn prompt_items_carry_short_positional_ids() {
+        assert_eq!(prompt_item_ids(&two_item_batch()), ["i1", "i2"]);
+    }
+
+    #[test]
+    fn positional_ids_map_back_to_item_ids() {
+        let batch = two_item_batch();
+        let response =
+            r#"{"items":[{"id":"i1","translation":"Ciao"},{"id":"i2","translation":"Mondo"}]}"#;
+        let result = parse_batch_response(&batch, response).expect("positional IDs parse");
+        assert!(result.failures.is_empty());
+        let ids: Vec<&str> = result
+            .translations
+            .iter()
+            .map(|translation| translation.item_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "seg_sec_000000_b_000070_be51253472d4:b_000129",
+                "seg_sec_000000_b_000070_be51253472d4:b_000130",
+            ]
+        );
+        assert_eq!(batch_response_item_count(&batch, response), Some(2));
+    }
+
+    #[test]
+    fn full_item_ids_are_still_accepted_alongside_positional_ones() {
+        let batch = two_item_batch();
+        let response = r#"{"items":[{"id":"i1","translation":"Ciao"},{"id":"seg_sec_000000_b_000070_be51253472d4:b_000130","translation":"Mondo"}]}"#;
+        let result = parse_batch_response(&batch, response).expect("mixed IDs parse");
+        assert!(result.failures.is_empty());
+        assert_eq!(result.translations.len(), 2);
+    }
+
+    #[test]
+    fn one_item_under_both_of_its_ids_is_a_duplicate() {
+        let batch = two_item_batch();
+        let response = r#"{"items":[{"id":"i1","translation":"Ciao"},{"id":"seg_sec_000000_b_000070_be51253472d4:b_000129","translation":"Salve"},{"id":"i2","translation":"Mondo"}]}"#;
+        let result = parse_batch_response(&batch, response).expect("duplicate is per item");
+        assert_eq!(result.translations.len(), 2);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(
+            result.failures[0].item_id,
+            "seg_sec_000000_b_000070_be51253472d4:b_000129"
+        );
+        assert_eq!(
+            result.failures[0].error,
+            "duplicate item ID in batch response"
+        );
+    }
+
+    #[test]
+    fn a_mangled_full_id_still_leaves_its_item_missing() {
+        let batch = two_item_batch();
+        let response = r#"{"items":[{"id":"i1","translation":"Ciao"},{"id":"seg_sec_000000_b_000130","translation":"Mondo"}]}"#;
+        let err = parse_batch_response(&batch, response).unwrap_err();
+        assert!(
+            err.starts_with("batch response incomplete: requested 2 items, returned 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn items_whose_own_ids_look_positional_keep_them() {
+        let mut batch = two_item_batch();
+        batch.items[0].item_id = "i2".to_string();
+        batch.items[1].item_id = "i1".to_string();
+        assert_eq!(prompt_item_ids(&batch), ["i2", "i1"]);
+        let response =
+            r#"{"items":[{"id":"i2","translation":"Ciao"},{"id":"i1","translation":"Mondo"}]}"#;
+        let result = parse_batch_response(&batch, response).expect("own IDs parse");
+        assert_eq!(result.translations[0].item_id, "i2");
+        assert_eq!(result.translations[0].text, "Ciao");
     }
 }

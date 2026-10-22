@@ -2028,17 +2028,19 @@ where
                         timestamp_ms: bookforge_core::progress::now_ms(),
                     });
 
+                    let prompt_ids = prompt_item_ids(&repair_batch);
                     let items_json: Vec<serde_json::Value> = repair_batch
                         .items
                         .iter()
-                        .map(|item| {
+                        .zip(&prompt_ids)
+                        .map(|(item, prompt_id)| {
                             let protected = item
                                 .protected_spans
                                 .iter()
                                 .map(|span| span.text.as_str())
                                 .collect::<Vec<_>>();
                             serde_json::json!({
-                                "id": item.item_id,
+                                "id": prompt_id,
                                 "source_text": item.source_text,
                                 "required_markers": item.required_markers,
                                 "protected": protected,
@@ -2049,9 +2051,10 @@ where
                     let errors_json: Vec<serde_json::Value> = repair_batch
                         .items
                         .iter()
-                        .map(|item| {
+                        .zip(&prompt_ids)
+                        .map(|(item, prompt_id)| {
                             serde_json::json!({
-                                "id": item.item_id,
+                                "id": prompt_id,
                                 "error": repair_errors
                                     .get(&item.item_id)
                                     .map(|error| provider_safe_validation_error(error))
@@ -2062,14 +2065,15 @@ where
                     let guidance_json: Vec<serde_json::Value> = repair_batch
                         .items
                         .iter()
-                        .filter_map(|item| {
+                        .zip(&prompt_ids)
+                        .filter_map(|(item, prompt_id)| {
                             config
                                 .glossary
                                 .guidance_by_segment
                                 .get(&item.segment_id.0)
                                 .map(|guidance| {
                                     serde_json::json!({
-                                        "id": item.item_id,
+                                        "id": prompt_id,
                                         "guidance": guidance,
                                     })
                                 })
@@ -2160,13 +2164,29 @@ where
                                                 .then_some(config.target_language.as_str()),
                                         ) {
                                             Ok(mut repaired) => {
+                                                if !repaired.failures.is_empty() {
+                                                    capture_failed_batch_response(
+                                                        &repair_batch,
+                                                        &response.content,
+                                                        "items rejected by validation",
+                                                        &repaired.failures,
+                                                    );
+                                                }
                                                 repaired.input_tokens = response.input_tokens;
                                                 repaired.input_cached_tokens =
                                                     response.input_cached_tokens;
                                                 repaired.output_tokens = response.output_tokens;
                                                 Ok(repaired)
                                             }
-                                            Err(error) => Err(LlmError::InvalidResponse(error)),
+                                            Err(error) => {
+                                                capture_failed_batch_response(
+                                                    &repair_batch,
+                                                    &response.content,
+                                                    &error,
+                                                    &[],
+                                                );
+                                                Err(LlmError::InvalidResponse(error))
+                                            }
                                         }
                                     }
                                 }
@@ -2587,8 +2607,17 @@ async fn translate_one_batch_with_evidence(
                 (!config.provider.eq_ignore_ascii_case("mock"))
                     .then_some(config.target_language.as_str()),
             )
+            .inspect_err(|error| capture_failed_batch_response(&batch, &resp.content, error, &[]))
             .map_err(LlmError::InvalidResponse)
             .map(|mut result| {
+                if !result.failures.is_empty() {
+                    capture_failed_batch_response(
+                        &batch,
+                        &resp.content,
+                        "items rejected by validation",
+                        &result.failures,
+                    );
+                }
                 result.input_tokens = resp.input_tokens;
                 result.input_cached_tokens = resp.input_cached_tokens;
                 result.output_tokens = resp.output_tokens;

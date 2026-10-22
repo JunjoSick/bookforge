@@ -1108,18 +1108,22 @@ struct RecordingSequenceProvider {
 }
 
 struct DelayedSecondBatchProvider {
-    first_item_id: String,
-    second_item_id: String,
+    first_source: String,
+    second_source: String,
 }
 
 impl LlmProviderTrait for DelayedSecondBatchProvider {
     async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
-        let (item_id, translation) = if request.user.contains(&self.first_item_id) {
-            (self.first_item_id.clone(), "Ciao")
+        let item_id = item_ids_from_batch_prompt(&request.user)
+            .into_iter()
+            .next()
+            .expect("one prompt item");
+        let translation = if request.user.contains(&self.first_source) {
+            "Ciao"
         } else {
-            assert!(request.user.contains(&self.second_item_id));
+            assert!(request.user.contains(&self.second_source));
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            (self.second_item_id.clone(), "Addio")
+            "Addio"
         };
         Ok(CompletionResponse {
             content: serde_json::json!({
@@ -1334,6 +1338,24 @@ fn batch_prompt_shares_segment_glossary_and_keeps_item_guidance() {
     assert!(prompt_extra.contains("\"source\":\"Hello\""));
     assert!(prompt_extra.contains("\"target\":\"Ciao\""));
     assert!(prompt_extra.contains("Use informal register."));
+}
+
+#[test]
+fn rendered_batch_items_carry_positional_ids_not_item_ids() {
+    let batch = make_two_item_batch();
+    let rendered: Vec<serde_json::Value> =
+        serde_json::from_str(&render_batch_items(&batch, &test_run_config())).expect("items");
+    let ids: Vec<&str> = rendered
+        .iter()
+        .map(|item| item["id"].as_str().expect("string id"))
+        .collect();
+    assert_eq!(ids, ["i1", "i2"]);
+    assert!(
+        batch
+            .items
+            .iter()
+            .all(|item| !rendered.iter().any(|r| r["id"] == item.item_id.as_str()))
+    );
 }
 
 #[test]
@@ -1769,8 +1791,8 @@ async fn completed_batch_segments_are_published_before_the_whole_run_finishes() 
     let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
     assert_eq!(batches.len(), 2);
     let provider = DelayedSecondBatchProvider {
-        first_item_id: batches[0].items[0].item_id.clone(),
-        second_item_id: batches[1].items[0].item_id.clone(),
+        first_source: batches[0].items[0].source_text.clone(),
+        second_source: batches[1].items[0].source_text.clone(),
     };
     let published = Arc::new(AtomicUsize::new(0));
     let published_for_callback = published.clone();
@@ -2375,22 +2397,24 @@ struct DelayedPromptEchoProvider;
 
 impl LlmProviderTrait for DelayedPromptEchoProvider {
     async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
-        let item_ids = item_ids_from_batch_prompt(&request.user);
-        if item_ids.iter().any(|id| id.contains("First")) {
+        let items = batch_prompt_items(&request.user);
+        let source =
+            |item: &serde_json::Value| item["text"].as_str().unwrap_or_default().to_owned();
+        if items.iter().any(|item| source(item).contains("First")) {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         let json = serde_json::json!({
-            "items": item_ids
-                .into_iter()
-                .map(|id| {
-                    let text = if id.contains("First") {
+            "items": items
+                .iter()
+                .map(|item| {
+                    let text = if source(item).contains("First") {
                         "[it] First"
-                    } else if id.contains("Second") {
+                    } else if source(item).contains("Second") {
                         "[it] Second"
                     } else {
                         "[it] Unknown"
                     };
-                    serde_json::json!({"id": id, "translation": text})
+                    serde_json::json!({"id": item["id"], "translation": text})
                 })
                 .collect::<Vec<_>>(),
         });
@@ -2473,7 +2497,7 @@ impl LlmProviderTrait for GatedPromptEchoProvider {
     }
 }
 
-fn item_ids_from_batch_prompt(user_prompt: &str) -> Vec<String> {
+fn batch_prompt_items(user_prompt: &str) -> Vec<serde_json::Value> {
     let Some(after_input) = user_prompt.split("Input:\n").nth(1) else {
         return Vec::new();
     };
@@ -2482,10 +2506,11 @@ fn item_ids_from_batch_prompt(user_prompt: &str) -> Vec<String> {
         .next()
         .unwrap_or(after_input)
         .trim();
-    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(json_text) else {
-        return Vec::new();
-    };
-    items
+    serde_json::from_str(json_text).unwrap_or_default()
+}
+
+fn item_ids_from_batch_prompt(user_prompt: &str) -> Vec<String> {
+    batch_prompt_items(user_prompt)
         .into_iter()
         .filter_map(|item| item.get("id")?.as_str().map(ToString::to_string))
         .collect()

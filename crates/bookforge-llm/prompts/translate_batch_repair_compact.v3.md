@@ -4,7 +4,7 @@
 
 You are correcting rejected translations from {{source_language}} into {{target_language}}. Return JSON only.
 
-For each item: fix the listed validation errors, preserve item IDs, required markers, and protected spans.
+For each item: fix the listed validation errors, preserve item IDs, required markers, and protected spans. Return every item, and escape straight double quotes inside JSON strings as \".
 
 Follow the target-language style and per-item retry guidance exactly.
 
