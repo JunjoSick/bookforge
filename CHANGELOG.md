@@ -66,6 +66,15 @@
   several centred lines becomes one heading, and font sizes declared on an
   earlier page apply to later ones. On one 213-page book the paragraph count
   fell from 1,604 to 885 and stray note numbers from 416 to 8.
+- Keep each numbered note from a PDF in its own paragraph. One-line notes
+  share a margin and ordinary leading, so a page's notes used to run
+  together, several to a paragraph, and the translator saw them as one
+  block. A line now starts a new note when it opens with a label ("12. ",
+  "12 ", "[12]", a raised 12) that the next label continues at the same
+  left edge and size, and the line before it ends short of the measure or
+  closes a sentence. Wrapped note lines stay with their note, and prose that
+  wraps onto a number at line start, a year included, is not split. This is
+  the PDF counterpart of the EPUB endnote split.
 - Rank PDF heading sizes that recur across pages ahead of one-off title-page
   type. A cover and title page set in two large sizes used to take two of the
   three heading levels, leaving section headings as plain paragraphs.
