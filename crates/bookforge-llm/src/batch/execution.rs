@@ -2120,6 +2120,7 @@ where
                     let mut returned_items = None;
                     let result = match repair_template.render(&vars) {
                         Ok(rendered) => {
+                            let captured_prompt = prompt_for_capture(&rendered);
                             match provider
                                 .complete(CompletionRequest {
                                     system: rendered.system,
@@ -2167,6 +2168,7 @@ where
                                                 if !repaired.failures.is_empty() {
                                                     capture_failed_batch_response(
                                                         &repair_batch,
+                                                        captured_prompt.as_ref(),
                                                         &response.content,
                                                         "items rejected by validation",
                                                         &repaired.failures,
@@ -2181,6 +2183,7 @@ where
                                             Err(error) => {
                                                 capture_failed_batch_response(
                                                     &repair_batch,
+                                                    captured_prompt.as_ref(),
                                                     &response.content,
                                                     &error,
                                                     &[],
@@ -2555,6 +2558,7 @@ async fn translate_one_batch_with_evidence(
         }
     };
 
+    let captured_prompt = prompt_for_capture(&rendered);
     let max_tokens = max_output_tokens_override
         .unwrap_or_else(|| capped_batch_max_output_tokens(&batch, config, provider.is_reasoning()));
     let (runtime_config_revision, provider_max_attempts) = config.request_runtime_metadata();
@@ -2607,12 +2611,21 @@ async fn translate_one_batch_with_evidence(
                 (!config.provider.eq_ignore_ascii_case("mock"))
                     .then_some(config.target_language.as_str()),
             )
-            .inspect_err(|error| capture_failed_batch_response(&batch, &resp.content, error, &[]))
+            .inspect_err(|error| {
+                capture_failed_batch_response(
+                    &batch,
+                    captured_prompt.as_ref(),
+                    &resp.content,
+                    error,
+                    &[],
+                )
+            })
             .map_err(LlmError::InvalidResponse)
             .map(|mut result| {
                 if !result.failures.is_empty() {
                     capture_failed_batch_response(
                         &batch,
+                        captured_prompt.as_ref(),
                         &resp.content,
                         "items rejected by validation",
                         &result.failures,

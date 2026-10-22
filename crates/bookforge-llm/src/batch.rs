@@ -30,7 +30,7 @@ mod execution;
 mod planning;
 mod rendering;
 
-use capture::capture_failed_batch_response;
+use capture::{capture_failed_batch_response, prompt_for_capture};
 #[cfg(test)]
 use escalation::batch_max_output_tokens;
 use escalation::{

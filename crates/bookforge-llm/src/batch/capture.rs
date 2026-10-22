@@ -6,9 +6,10 @@
 //! IDs, and a rejected item only as a count; the content itself is dropped,
 //! so the cause cannot be diagnosed after the fact. Setting
 //! [`CAPTURE_DIR_ENV`] to a directory writes each such response there
-//! verbatim, next to the items that were requested and each rejected item's
-//! error. Nothing is captured while the variable is unset, and the content is
-//! never logged: the files hold book text and stay on the local disk.
+//! verbatim, next to the prompt it answered, the items that were requested
+//! and each rejected item's error, so the request can be replayed. Nothing is
+//! captured while the variable is unset, and the content is never logged: the
+//! files hold book text and stay on the local disk.
 
 use super::*;
 use std::path::{Path, PathBuf};
@@ -19,17 +20,31 @@ pub(super) const CAPTURE_DIR_ENV: &str = "BOOKFORGE_DEBUG_BATCH_RESPONSE_DIR";
 
 static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn capture_dir() -> Option<PathBuf> {
+    std::env::var_os(CAPTURE_DIR_ENV)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+}
+
+/// A copy of the prompt for [`capture_failed_batch_response`], made only while
+/// capture is on so normal runs never clone it.
+pub(super) fn prompt_for_capture(
+    rendered: &crate::prompt::Rendered,
+) -> Option<crate::prompt::Rendered> {
+    capture_dir().map(|_| rendered.clone())
+}
+
 pub(super) fn capture_failed_batch_response(
     batch: &TranslationBatch,
+    prompt: Option<&crate::prompt::Rendered>,
     content: &str,
     error: &str,
     rejected_items: &[BatchItemFailure],
 ) {
-    let Some(dir) = std::env::var_os(CAPTURE_DIR_ENV).filter(|dir| !dir.is_empty()) else {
+    let Some(dir) = capture_dir() else {
         return;
     };
-    let dir = PathBuf::from(dir);
-    if let Err(write_error) = write_capture(&dir, batch, content, error, rejected_items) {
+    if let Err(write_error) = write_capture(&dir, batch, prompt, content, error, rejected_items) {
         tracing::warn!(
             dir = %dir.display(),
             error = %write_error,
@@ -41,6 +56,7 @@ pub(super) fn capture_failed_batch_response(
 pub(super) fn write_capture(
     dir: &Path,
     batch: &TranslationBatch,
+    prompt: Option<&crate::prompt::Rendered>,
     content: &str,
     error: &str,
     rejected_items: &[BatchItemFailure],
@@ -83,6 +99,10 @@ pub(super) fn write_capture(
         "error": error,
         "rejected_items": rejected,
         "requested": requested,
+        "prompt": prompt.map(|prompt| serde_json::json!({
+            "system": prompt.system,
+            "user": prompt.user,
+        })),
         "content": content,
     });
     let bytes = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
@@ -125,9 +145,14 @@ mod tests {
         };
         let content = r#"{"items":[{"id":"seg:b_1","translation":"Disse "no"."}]}"#;
 
+        let prompt = crate::prompt::Rendered {
+            system: "Translate.".to_string(),
+            user: "[{\"id\":\"i1\"}]".to_string(),
+        };
         let path = write_capture(
             &dir,
             &batch,
+            Some(&prompt),
             content,
             "invalid batch JSON: expected `,`",
             &[],
@@ -143,6 +168,8 @@ mod tests {
         assert_eq!(record["requested"][0]["id"], "seg:b_1");
         assert_eq!(record["requested"][0]["text"], "He said \"no\".");
         assert_eq!(record["rejected_items"], serde_json::json!([]));
+        assert_eq!(record["prompt"]["system"], "Translate.");
+        assert_eq!(record["prompt"]["user"], "[{\"id\":\"i1\"}]");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
