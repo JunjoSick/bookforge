@@ -3444,6 +3444,54 @@ estimate.
   Sibling tools benefit from Candidate A's stable public API but must remain
   outside the engine surface.
 
+### 17.5 Candidate E — Reading edition: citations out of the text flow
+
+*Requested by the maintainer on 2026-10-22 after reading a translated academic
+book on a phone.*
+
+#### Goal
+
+Let a reader ask for an edition without the scholarly apparatus. On a small
+screen, inline references such as `(TP 511)` and numbered endnote blocks
+interrupt the prose far more than on a printed page, and a PDF-derived book
+places page-foot notes between the paragraphs they annotate.
+
+#### Architectural rationale
+
+Removing or relocating citations is a structural decision, so it belongs to the
+program, not the model (§1.1, §1.2). The pipeline already knows most of the
+structure involved: EPUB endnote links and backlinks, PDF note reference marks
+(superscripts), and numbered PDF notes, each kept as a paragraph of its own.
+Doing it before translation also saves the tokens the apparatus costs.
+
+#### Deliverables
+
+- An opt-in flag, for example `--notes keep|end|drop`: `end` moves page-foot
+  notes to the end of their chapter with working links, and `drop` removes them
+  together with their reference marks.
+- An opt-in `--inline-citations keep|drop` for parenthetical references,
+  limited to forms the program can recognise deterministically (abbreviation
+  plus page, `(Author Year: page)`), with a dry-run report of what would go.
+- The conversion or translation report counts what was moved or removed.
+
+#### Out of scope
+
+- Model-judged removal of anything that "looks like" a citation.
+- Changing the default: the full apparatus stays unless the flag is given.
+
+#### Acceptance criteria
+
+1. With `drop`, no note text or orphaned reference mark remains, and EPUBCheck
+   passes.
+2. With `end`, every reference mark links to its note and back.
+3. **Un-mockable:** a real PDF-derived academic book read on a phone reads
+   cleanly in both modes, and the default output is unchanged.
+
+#### Effort
+
+Roughly 3–6 focused person-days for notes; inline citations depend on how many
+reference forms are worth supporting.
+
 ---
 
 *End of document.*
