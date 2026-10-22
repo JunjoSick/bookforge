@@ -85,6 +85,8 @@ struct PendingBlock {
     top: i32,
     left: i32,
     right: i32,
+    /// Type size of the block's first line.
+    font_size: u32,
 }
 
 pub fn reconstruct(pages: &[Page], columns: ColumnMode) -> Reconstruction {
@@ -105,8 +107,11 @@ pub fn reconstruct_with_chapter_guard(
     let heading_levels = heading_levels(pages, body_size);
     let running_margin_texts = running_margin_texts(pages, body_size);
     let folios = folio_lines(pages, body_size);
+    let page_count = pages.iter().map(|page| page.number).max().unwrap_or(0);
 
     let mut blocks: Vec<AnchoredBlock> = Vec::new();
+    // Type size of each block in `blocks`, kept in step with it.
+    let mut block_sizes: Vec<u32> = Vec::new();
     let mut stats = Vec::new();
     let mut rotated_dropped_fragments = 0usize;
     let mut offpage_dropped_fragments = 0usize;
@@ -132,10 +137,12 @@ pub fn reconstruct_with_chapter_guard(
             ordered.sort_by_key(|line| (line.top, line.left));
             ordered
         };
+        let contents_numbers = contents_page_numbers(&lines, page_count);
         let mut running_header_chars = 0usize;
         ordered.retain(|line| {
             if is_running_margin_line(page, line, body_size, &running_margin_texts)
                 || folios.contains(&(page.number, line.top, line.left))
+                || contents_numbers.contains(&(line.top, line.left))
             {
                 running_header_chars += line.char_count();
                 return false;
@@ -169,6 +176,7 @@ pub fn reconstruct_with_chapter_guard(
         let page_blocks = cluster_paragraphs(&ordered, body_size, &heading_levels);
         append_with_continuation(
             &mut blocks,
+            &mut block_sizes,
             &mut carried,
             page.number,
             page_blocks,
@@ -251,6 +259,58 @@ fn is_running_margin_line(
     line.font_size <= body_size + 1
         && near_vertical_margin(page, line)
         && running_margin_texts.contains(&normalize_text_key(&line.text()))
+}
+
+/// Printed page references on a contents page, keyed by `(top, left)`. An
+/// entry sets its page number flush right on its first line, too far from
+/// the title to join that line, so each number became a paragraph of its own
+/// or ran into the next entry. Page numbers mean nothing in a reflowable
+/// book, so they are dropped. A number counts only on a page holding at
+/// least three that share a right edge, each the last text on a line that
+/// starts to its left, rising down the page (roman before arabic) and none
+/// above the document's page count, which keeps years and table figures out.
+fn contents_page_numbers(lines: &[Line], page_count: u32) -> HashSet<(i32, i32)> {
+    let mut candidates: Vec<(&Line, bool, i64)> = lines
+        .iter()
+        .filter_map(|line| {
+            let (roman, value) = folio_value(&line.text())?;
+            if !roman && value > i64::from(page_count) {
+                return None;
+            }
+            let tolerance = line.height.max(1) / 2;
+            let mut on_baseline = lines
+                .iter()
+                .filter(|other| !std::ptr::eq(*other, line))
+                .filter(|other| (other.top - line.top).abs() <= tolerance);
+            let entry_to_the_left = on_baseline
+                .clone()
+                .any(|other| other.right + line.height <= line.left);
+            let last_on_line = !on_baseline.any(|other| other.left > line.left);
+            (entry_to_the_left && last_on_line).then_some((line, roman, value))
+        })
+        .collect();
+    let Some(right_edge) = candidates.iter().map(|(line, ..)| line.right).max() else {
+        return HashSet::new();
+    };
+    candidates.retain(|(line, ..)| right_edge - line.right <= line.height);
+    candidates.sort_by_key(|(line, ..)| line.top);
+    let mut previous: Option<(bool, i64)> = None;
+    let rising = candidates.iter().all(|(_, roman, value)| {
+        let ok = match previous {
+            None => true,
+            Some((true, before)) => !*roman || *value > before,
+            Some((false, before)) => !*roman && *value > before,
+        };
+        previous = Some((*roman, *value));
+        ok
+    });
+    if candidates.len() < 3 || !rising {
+        return HashSet::new();
+    }
+    candidates
+        .iter()
+        .map(|(line, ..)| (line.top, line.left))
+        .collect()
 }
 
 /// How many pages apart two margin numbers may be and still corroborate each
@@ -807,6 +867,7 @@ fn cluster_paragraphs(
     let mut current_top: Option<i32> = None;
     let mut current_left: Option<i32> = None;
     let mut current_right: Option<i32> = None;
+    let mut current_size: Option<u32> = None;
     let mut previous: Option<&Line> = None;
 
     let flush = |spans: &mut Vec<Span>,
@@ -814,6 +875,7 @@ fn cluster_paragraphs(
                  top: &mut Option<i32>,
                  left: &mut Option<i32>,
                  right: &mut Option<i32>,
+                 size: &mut Option<u32>,
                  blocks: &mut Vec<PendingBlock>| {
         if spans.is_empty() {
             return;
@@ -830,6 +892,7 @@ fn cluster_paragraphs(
             top: top.take().unwrap_or_default(),
             left,
             right,
+            font_size: size.take().unwrap_or_default(),
         });
     };
 
@@ -865,9 +928,11 @@ fn cluster_paragraphs(
                 &mut current_top,
                 &mut current_left,
                 &mut current_right,
+                &mut current_size,
                 &mut blocks,
             );
             current_heading = heading;
+            current_size = Some(line.font_size);
             current_top = Some(line.top);
             current_left = Some(line.left);
             current_right = Some(line.right);
@@ -884,6 +949,7 @@ fn cluster_paragraphs(
         &mut current_top,
         &mut current_left,
         &mut current_right,
+        &mut current_size,
         &mut blocks,
     );
 
@@ -1125,11 +1191,16 @@ fn median_line_gap(lines: &[Line]) -> i32 {
 /// boundary opened by the configured prefix.
 fn append_with_continuation(
     blocks: &mut Vec<AnchoredBlock>,
+    block_sizes: &mut Vec<u32>,
     carried: &mut Vec<CarriedText>,
     page: u32,
     mut incoming: Vec<PendingBlock>,
     chapter_prefix: Option<&str>,
 ) {
+    let target = incoming
+        .first()
+        .and_then(|head| continuation_target(blocks, block_sizes, head.font_size));
+    let mut merged = false;
     if let (
         Some(AnchoredBlock {
             block: DocBlock::Paragraph { spans: tail },
@@ -1139,7 +1210,7 @@ fn append_with_continuation(
             block: DocBlock::Paragraph { spans: head },
             ..
         }),
-    ) = (blocks.last_mut(), incoming.first_mut())
+    ) = (target.map(|index| &mut blocks[index]), incoming.first_mut())
     {
         let tail_text: String = tail.iter().map(|span| span.text.as_str()).collect();
         let head_text: String = head.iter().map(|span| span.text.as_str()).collect();
@@ -1170,10 +1241,14 @@ fn append_with_continuation(
             for span in head.drain(..) {
                 push_styled(tail, span);
             }
-            incoming.remove(0);
+            merged = true;
         }
     }
+    if merged {
+        incoming.remove(0);
+    }
     for anchored in incoming {
+        block_sizes.push(anchored.font_size);
         blocks.push(AnchoredBlock {
             block: anchored.block,
             anchor: BlockAnchor {
@@ -1184,6 +1259,25 @@ fn append_with_continuation(
             },
         });
     }
+}
+
+/// The block a new page's opening text may continue: the previous page's
+/// last block, unless that page ends in blocks set smaller than the new text
+/// (footnotes, captions). Body text that ran over a page break below a
+/// page's footnotes was glued onto the last footnote; it now continues the
+/// last block before them set at least as large as itself.
+fn continuation_target(blocks: &[AnchoredBlock], sizes: &[u32], head_size: u32) -> Option<usize> {
+    let last = blocks.len().checked_sub(1)?;
+    let last_page = blocks[last].anchor.page;
+    let mut index = last;
+    while index > 0 && sizes[index] < head_size && blocks[index].anchor.page == last_page {
+        index -= 1;
+    }
+    Some(if sizes[index] < head_size {
+        last
+    } else {
+        index
+    })
 }
 
 #[cfg(test)]
@@ -1960,6 +2054,176 @@ mod tests {
             .collect();
         assert_eq!(texts(&result)[1], "Its Invented Subtitle");
         assert_eq!(levels, [1, 1, 1, 2, 3, 0, 1, 2, 3, 0]);
+    }
+
+    /// A page with the given `(top, left, width, height, font, text)`
+    /// fragments, followed by an empty page numbered 120 so page numbers up
+    /// to that count are plausible.
+    fn contents_fixture(fontspecs: &str, fragments: &[(i32, i32, i32, i32, u32, &str)]) -> String {
+        let mut xml = format!(
+            "<?xml version=\"1.0\"?>\n<pdf2xml><page number=\"1\" width=\"600\" height=\"800\">\n{fontspecs}\n"
+        );
+        for (top, left, width, height, font, text) in fragments {
+            xml.push_str(&format!(
+                "<text top=\"{top}\" left=\"{left}\" width=\"{width}\" height=\"{height}\" font=\"{font}\">{text}</text>\n"
+            ));
+        }
+        xml.push_str(
+            "</page>\n<page number=\"120\" width=\"600\" height=\"800\"></page></pdf2xml>",
+        );
+        xml
+    }
+
+    #[test]
+    fn contents_page_numbers_are_dropped() {
+        // A printed contents page sets each page number flush right on the
+        // entry's first line. Each number became a paragraph of its own, or
+        // ran into the next entry's text.
+        let xml = contents_fixture(
+            "<fontspec id=\"1\" size=\"13\" family=\"T\"/>\n<fontspec id=\"2\" size=\"10\" family=\"T\"/>",
+            &[
+                (100, 60, 80, 14, 1, "Preface"),
+                (100, 530, 6, 14, 1, "v"),
+                (140, 60, 90, 14, 1, "Introduction"),
+                (140, 528, 8, 14, 1, "2"),
+                (
+                    180,
+                    60,
+                    380,
+                    14,
+                    1,
+                    "An Invented Chapter Whose Title Runs On",
+                ),
+                (180, 520, 16, 14, 1, "11"),
+                (196, 60, 160, 14, 1, "onto a Second Line"),
+                (220, 60, 400, 12, 2, "First Section — Second Section —"),
+                (234, 60, 400, 12, 2, "Third Section — Fourth Section —"),
+                (248, 60, 200, 12, 2, "Fifth Section"),
+                (290, 60, 300, 14, 1, "Another Invented Chapter"),
+                (290, 520, 16, 14, 1, "49"),
+                (306, 60, 400, 12, 2, "Sixth Section — Seventh Section —"),
+                (320, 60, 200, 12, 2, "Eighth Section"),
+            ],
+        );
+        let pages = parse_pdf2xml(&xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert_eq!(
+            texts(&result),
+            vec![
+                "Preface",
+                "Introduction",
+                "An Invented Chapter Whose Title Runs On onto a Second Line",
+                "First Section — Second Section — Third Section — Fourth Section — Fifth Section",
+                "Another Invented Chapter",
+                "Sixth Section — Seventh Section — Eighth Section",
+            ]
+        );
+        assert_eq!(result.pages[0].running_header_chars, 6);
+    }
+
+    #[test]
+    fn right_aligned_years_and_lone_numbers_are_kept() {
+        // Figures past the page count are data, not page references, and two
+        // right-aligned numbers are too few to call a page a contents page.
+        let years = contents_fixture(
+            "<fontspec id=\"1\" size=\"11\" family=\"T\"/>",
+            &[
+                (100, 60, 300, 12, 1, "Founding of an invented society"),
+                (100, 510, 26, 12, 1, "1901"),
+                (120, 60, 300, 12, 1, "First invented congress"),
+                (120, 510, 26, 12, 1, "1923"),
+                (140, 60, 300, 12, 1, "Second invented congress"),
+                (140, 510, 26, 12, 1, "1958"),
+            ],
+        );
+        let result = reconstruct(
+            &parse_pdf2xml(&years).expect("fixture parses"),
+            ColumnMode::Auto,
+        );
+        assert!(
+            ["1901", "1923", "1958"]
+                .iter()
+                .all(|year| texts(&result).concat().contains(year)),
+            "{:?}",
+            texts(&result)
+        );
+
+        let two = contents_fixture(
+            "<fontspec id=\"1\" size=\"11\" family=\"T\"/>",
+            &[
+                (100, 60, 300, 12, 1, "An invented entry"),
+                (100, 520, 16, 12, 1, "11"),
+                (140, 60, 300, 12, 1, "Another invented entry"),
+                (140, 520, 16, 12, 1, "49"),
+            ],
+        );
+        let result = reconstruct(
+            &parse_pdf2xml(&two).expect("fixture parses"),
+            ColumnMode::Auto,
+        );
+        assert!(
+            texts(&result).concat().contains("11") && texts(&result).concat().contains("49"),
+            "{:?}",
+            texts(&result)
+        );
+    }
+
+    #[test]
+    fn body_text_running_on_below_footnotes_rejoins_its_paragraph() {
+        // A page that ends a paragraph mid-word above its footnotes: the next
+        // page's opening text was glued onto the last footnote.
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<fontspec id="1" size="9" family="T"/>
+<text top="100" left="60" width="440" height="13" font="0">Invented body prose runs long enough here to make eleven points the</text>
+<text top="116" left="60" width="440" height="13" font="0">body size of this page, and the sentence it starts as-</text>
+<text top="700" left="60" width="440" height="11" font="1">1. An invented note citing Somebody, An Invented Title (Some</text>
+</page>
+<page number="2" width="600" height="800">
+<text top="100" left="60" width="440" height="13" font="0">sumes the rest of its sentence on the following page.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert_eq!(
+            texts(&result),
+            vec![
+                "Invented body prose runs long enough here to make eleven points the body size of \
+                 this page, and the sentence it starts assumes the rest of its sentence on the \
+                 following page.",
+                "1. An invented note citing Somebody, An Invented Title (Some",
+            ]
+        );
+        assert_eq!(result.carried.len(), 1);
+        assert_eq!(result.carried[0].anchor_page, 1);
+    }
+
+    #[test]
+    fn a_footnote_running_on_to_the_next_page_still_joins_its_note() {
+        let xml = r#"<?xml version="1.0"?>
+<pdf2xml><page number="1" width="600" height="800">
+<fontspec id="0" size="11" family="T"/>
+<fontspec id="1" size="9" family="T"/>
+<text top="100" left="60" width="440" height="13" font="0">Invented body prose runs long enough here to make eleven points the</text>
+<text top="116" left="60" width="440" height="13" font="0">body size of this page, and it ends its sentence.</text>
+<text top="700" left="60" width="440" height="11" font="1">2. An invented note that runs</text>
+</page>
+<page number="2" width="600" height="800">
+<text top="100" left="60" width="440" height="11" font="1">on to the next page.</text>
+</page></pdf2xml>"#;
+        let pages = parse_pdf2xml(xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+
+        assert_eq!(
+            texts(&result),
+            vec![
+                "Invented body prose runs long enough here to make eleven points the body size of \
+                 this page, and it ends its sentence.",
+                "2. An invented note that runs on to the next page.",
+            ]
+        );
     }
 
     #[test]

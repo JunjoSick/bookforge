@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Drop printed page numbers from a PDF's contents page. Each entry's page
+  number sits flush right on the entry's first line, too far from the title to
+  join it, so the numbers became paragraphs of their own or ran into the next
+  entry's text. A number is dropped only on a page with at least three that
+  share a right edge, rise down the page, and stay within the document's page
+  count, which keeps years and table figures.
+- Continue body text that runs over a page break below the previous page's
+  footnotes. The next page's opening words were glued onto the last footnote,
+  leaving the body paragraph cut mid-sentence and the note garbled. Text now
+  continues the last paragraph set at its own size, skipping notes and other
+  smaller type at the foot of the page. On one 213-page book, sentences split
+  across two paragraphs fell from 22 to 11.
 - Split converted PDFs into one XHTML file per chapter by default, starting
   a chapter at each level-1 heading. A typical book now produces one file per
   chapter plus front matter: a 213-page book that used to be one 600 KB
