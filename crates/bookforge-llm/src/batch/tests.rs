@@ -1359,6 +1359,29 @@ fn rendered_batch_items_carry_positional_ids_not_item_ids() {
 }
 
 #[test]
+fn batch_prompts_name_a_target_given_as_a_language_code() {
+    // "Translate from the source language to it." left the model guessing;
+    // it returned whole batches untranslated until the prompt said Italian.
+    let batch = make_two_item_batch();
+    let mut config = test_run_config();
+    config.source_language = None;
+    config.target_language = "it".to_string();
+    for compact in [false, true] {
+        config.compact_prompts = compact;
+        let rendered = render_batch_prompt(&batch, &config, &PromptLibrary::embedded(), "", 0)
+            .expect("batch prompt renders");
+        assert!(
+            rendered
+                .system
+                .contains("from the source language to Italian (it)"),
+            "{}",
+            rendered.system
+        );
+        assert!(!rendered.system.contains(" to it."), "{}", rendered.system);
+    }
+}
+
+#[test]
 fn turbo_batches_keep_internal_markers_but_hide_them_from_the_model() {
     let block = SegmentBlock {
         block_id: bookforge_core::ir::BlockId("block1".to_string()),

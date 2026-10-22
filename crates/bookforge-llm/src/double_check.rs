@@ -569,12 +569,17 @@ where
     let mut vars = Substitutions::new();
     vars.string(
         "source_language",
-        config
-            .source_language
-            .as_deref()
-            .unwrap_or("the source language"),
+        bookforge_core::language::prompt_language_name(
+            config
+                .source_language
+                .as_deref()
+                .unwrap_or("the source language"),
+        ),
     )
-    .string("target_language", &config.target_language)
+    .string(
+        "target_language",
+        bookforge_core::language::prompt_language_name(&config.target_language),
+    )
     .string(
         "double_check_mode",
         double_check_mode_str(double_check_config.mode),
@@ -713,12 +718,17 @@ where
     let mut vars = Substitutions::new();
     vars.string(
         "source_language",
-        config
-            .source_language
-            .as_deref()
-            .unwrap_or("the source language"),
+        bookforge_core::language::prompt_language_name(
+            config
+                .source_language
+                .as_deref()
+                .unwrap_or("the source language"),
+        ),
     )
-    .string("target_language", &config.target_language)
+    .string(
+        "target_language",
+        bookforge_core::language::prompt_language_name(&config.target_language),
+    )
     .json_compact("items_json", &item_inputs)
     .json_compact("issues_json", &issue_inputs);
 

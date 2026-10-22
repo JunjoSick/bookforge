@@ -2095,12 +2095,12 @@ where
                     )
                     .raw(
                         "source_language",
-                        config
+                        bookforge_core::language::prompt_language_name(config
                             .source_language
                             .as_deref()
-                            .unwrap_or("source language"),
+                            .unwrap_or("source language")),
                     )
-                    .raw("target_language", &config.target_language)
+                    .raw("target_language", bookforge_core::language::prompt_language_name(&config.target_language))
                     .raw(
                         "style_block",
                         config

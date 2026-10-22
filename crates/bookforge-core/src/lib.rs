@@ -5,6 +5,7 @@ pub mod error;
 pub mod finding;
 pub mod glossary;
 pub mod ir;
+pub mod language;
 pub mod marker;
 pub mod math;
 pub mod numeric;
