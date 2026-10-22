@@ -658,14 +658,13 @@ const BATCH_RESPONSE_KEYS: [&str; 5] = ["items", "id", "translation", "runs", "t
 /// cause of the malformed batch JSON seen on real books: the source used
 /// typographic quotes and the model wrote them back as bare `"`.
 ///
-/// Inside a string, a quote is taken to close it only when what follows can
-/// continue the JSON (`:`, `}`, `]`, the end, or `,` before another string,
-/// object or array); any other quote is escaped. The result must parse, and
-/// it may use no key a batch response does not have, so a misjudged quote
-/// fails the parse instead of reshaping the response; the caller then
-/// validates the items as usual. Returns the response and the number of
-/// quotes escaped, or `None` when nothing was escaped or the repair does not
-/// produce such a response.
+/// Inside a string, a quote is taken to close it only where a batch response
+/// can continue (see [`quote_closes_string`]); any other quote is escaped. The
+/// result must parse, and it may use no key a batch response does not have,
+/// so a misjudged quote fails the parse instead of reshaping the response;
+/// the caller then validates the items as usual. Returns the response and the
+/// number of quotes escaped, or `None` when nothing was escaped or the repair
+/// does not produce such a response.
 fn decode_with_escaped_inner_quotes<T: serde::de::DeserializeOwned>(
     content: &str,
 ) -> Option<(T, usize)> {
@@ -687,37 +686,57 @@ fn decode_with_escaped_inner_quotes<T: serde::de::DeserializeOwned>(
 fn escape_inner_quotes(json: &str) -> (String, usize) {
     let mut repaired = String::with_capacity(json.len() + 16);
     let mut escaped_quotes = 0;
-    let mut in_string = false;
+    // Byte offset just past the opening quote of the string being scanned.
+    let mut string_start = None;
     let mut after_backslash = false;
     for (index, ch) in json.char_indices() {
-        if in_string {
+        if let Some(start) = string_start {
             if after_backslash {
                 after_backslash = false;
             } else if ch == '\\' {
                 after_backslash = true;
             } else if ch == '"' {
-                if quote_closes_string(&json[index + 1..]) {
-                    in_string = false;
+                if quote_closes_string(&json[start..index], &json[index + 1..]) {
+                    string_start = None;
                 } else {
                     repaired.push('\\');
                     escaped_quotes += 1;
                 }
             }
         } else if ch == '"' {
-            in_string = true;
+            string_start = Some(index + 1);
         }
         repaired.push(ch);
     }
     (repaired, escaped_quotes)
 }
 
-fn quote_closes_string(rest: &str) -> bool {
+/// Whether a quote ends the string holding `content`, judged by `rest`, the
+/// text after the quote. A key ends before `:`, and only a batch response key
+/// can be one; a value ends before `}`, `]`, the end, or a `,` leading to the
+/// next key, object or array. Batch responses hold no strings directly inside
+/// arrays, so a quoted list such as `"sole", "luna"` inside a
+/// translation is not mistaken for two values.
+fn quote_closes_string(content: &str, rest: &str) -> bool {
     let rest = rest.trim_start();
     match rest.chars().next() {
-        None | Some(':' | '}' | ']') => true,
-        Some(',') => matches!(rest[1..].trim_start().chars().next(), Some('"' | '{' | '[')),
+        None | Some('}' | ']') => true,
+        Some(':') => BATCH_RESPONSE_KEYS.contains(&content),
+        Some(',') => {
+            let next = rest[1..].trim_start();
+            next.starts_with(['{', '[']) || starts_with_batch_response_key(next)
+        }
         Some(_) => false,
     }
+}
+
+fn starts_with_batch_response_key(json: &str) -> bool {
+    BATCH_RESPONSE_KEYS.iter().any(|key| {
+        json.strip_prefix('"')
+            .and_then(|rest| rest.strip_prefix(key))
+            .and_then(|rest| rest.strip_prefix('"'))
+            .is_some_and(|rest| rest.trim_start().starts_with(':'))
+    })
 }
 
 fn uses_only_batch_response_keys(value: &serde_json::Value) -> bool {
@@ -2088,11 +2107,41 @@ mod lenient_response_decoding_tests {
     }
 
     #[test]
-    fn quote_repair_that_would_add_a_key_is_rejected() {
-        // Read as closing quotes, `"y",` and `"z":` turn the tail of the
-        // translation into a new `z` key. A batch response has no such key, so
-        // the repair is refused rather than trusted.
+    fn quoted_lists_inside_a_translation_are_repaired() {
+        // `"sole", "luna"` looks like the end of one value and the start
+        // of the next, but a batch response never has a bare string there.
+        let response =
+            r#"{"items":[{"id":"item","translation":"parole come "sole", "luna" e "stelle""}]}"#;
+        let result = parse_batch_response(&plain_batch(), response).expect("quotes repaired");
+        assert_eq!(
+            result.translations[0].text,
+            r#"parole come "sole", "luna" e "stelle""#
+        );
+    }
+
+    #[test]
+    fn quoted_text_that_looks_like_a_key_stays_in_the_translation() {
         let response = r#"{"items":[{"id":"item","translation":"x "y", "z":"w"}]}"#;
+        let result = parse_batch_response(&plain_batch(), response).expect("quotes repaired");
+        assert_eq!(result.translations[0].text, r#"x "y", "z":"w"#);
+    }
+
+    #[test]
+    fn quote_repair_keeps_every_item_of_a_batch() {
+        let response = r#"{"items":[{"id":"i1","translation":"a "b", "c""},{"id":"i2","translation":"d "e""}]}"#;
+        let result = parse_batch_response(&two_item_batch(), response).expect("quotes repaired");
+        assert!(result.failures.is_empty());
+        let texts: Vec<&str> = result
+            .translations
+            .iter()
+            .map(|translation| translation.text.as_str())
+            .collect();
+        assert_eq!(texts, [r#"a "b", "c""#, r#"d "e""#]);
+    }
+
+    #[test]
+    fn a_response_that_stops_inside_a_string_is_not_repaired() {
+        let response = r#"{"items":[{"id":"item","translation":"un "esem"#;
         let err = parse_batch_response(&plain_batch(), response).unwrap_err();
         assert!(
             err.starts_with("invalid batch JSON: "),
