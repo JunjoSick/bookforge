@@ -623,14 +623,28 @@ pub(super) fn parse_batch_response_with_validation(
 /// transport wrapper and unescaped quotes are repaired — the item schema is
 /// never loosened.
 fn decode_batch_json<T: serde::de::DeserializeOwned>(content: &str) -> Result<T, String> {
+    let (parsed, escaped_quotes) = decode_batch_json_quietly(content)?;
+    if escaped_quotes > 0 {
+        tracing::info!(
+            escaped_quotes,
+            "repaired unescaped quotes in a batch response"
+        );
+    }
+    Ok(parsed)
+}
+
+/// [`decode_batch_json`] without its log line, returning how many quotes the
+/// repair escaped. For callers that decode a response the parser also reads.
+fn decode_batch_json_quietly<T: serde::de::DeserializeOwned>(
+    content: &str,
+) -> Result<(T, usize), String> {
     match serde_json::from_str(content) {
-        Ok(parsed) => Ok(parsed),
-        Err(direct_error) => {
-            let recovered = outermost_json_value(content)
-                .and_then(|span| serde_json::from_str(span).ok())
-                .or_else(|| decode_with_escaped_inner_quotes(content));
-            recovered.ok_or_else(|| format!("invalid batch JSON: {direct_error}"))
-        }
+        Ok(parsed) => Ok((parsed, 0)),
+        Err(direct_error) => outermost_json_value(content)
+            .and_then(|span| serde_json::from_str(span).ok())
+            .map(|parsed| (parsed, 0))
+            .or_else(|| decode_with_escaped_inner_quotes(content))
+            .ok_or_else(|| format!("invalid batch JSON: {direct_error}")),
     }
 }
 
@@ -649,9 +663,12 @@ const BATCH_RESPONSE_KEYS: [&str; 5] = ["items", "id", "translation", "runs", "t
 /// object or array); any other quote is escaped. The result must parse, and
 /// it may use no key a batch response does not have, so a misjudged quote
 /// fails the parse instead of reshaping the response; the caller then
-/// validates the items as usual. Returns `None` when nothing was escaped or
-/// the repair does not produce such a response.
-fn decode_with_escaped_inner_quotes<T: serde::de::DeserializeOwned>(content: &str) -> Option<T> {
+/// validates the items as usual. Returns the response and the number of
+/// quotes escaped, or `None` when nothing was escaped or the repair does not
+/// produce such a response.
+fn decode_with_escaped_inner_quotes<T: serde::de::DeserializeOwned>(
+    content: &str,
+) -> Option<(T, usize)> {
     let start = content.find('{')?;
     let (repaired, escaped) = escape_inner_quotes(&content[start..]);
     if escaped == 0 {
@@ -664,11 +681,7 @@ fn decode_with_escaped_inner_quotes<T: serde::de::DeserializeOwned>(content: &st
         return None;
     }
     let parsed = serde_json::from_value(value).ok()?;
-    tracing::info!(
-        escaped_quotes = escaped,
-        "repaired unescaped quotes in a batch response"
-    );
-    Some(parsed)
+    Some((parsed, escaped))
 }
 
 fn escape_inner_quotes(json: &str) -> (String, usize) {
@@ -1137,7 +1150,7 @@ fn incomplete_batch_response_error(requested: usize, missing: &[&str]) -> String
 }
 
 pub(super) fn batch_response_item_count(batch: &TranslationBatch, content: &str) -> Option<usize> {
-    let parsed = decode_batch_json::<serde_json::Value>(content).ok()?;
+    let (parsed, _) = decode_batch_json_quietly::<serde_json::Value>(content).ok()?;
     let items = parsed.get("items")?.as_array()?;
     let requested = response_item_lookup(batch);
     Some(
