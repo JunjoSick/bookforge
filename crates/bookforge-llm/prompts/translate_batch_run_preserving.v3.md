@@ -8,11 +8,13 @@ Translate each text run from {{source_language}} to {{target_language}}.
 
 Rules:
 - Return JSON only.
-- Preserve every item ID exactly.
+- Return one output item for every input item, in the same order, and copy each item ID exactly.
+- Never leave an item out, even one whose text stays unchanged.
 - Preserve every run ID exactly.
 - Do not add or remove run IDs.
 - Marker-only runs must be copied exactly.
 - Protected spans must be copied exactly.
+- Escape every straight double quote inside a JSON string as \". Typographic quotes such as “ ” and « » need no escaping.
 - Translate naturally within run constraints.
 
 Return exactly:
@@ -52,4 +54,4 @@ Additional instructions:
 Input:
 {{items_json}}
 
-Return JSON only.
+Return JSON only. Include every input item.

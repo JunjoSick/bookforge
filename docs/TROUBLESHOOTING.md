@@ -204,6 +204,30 @@ When the finding is deterministic, read the exact message before retrying:
   retrying: malformed scans remain the dominant source of protected-number and
   math false positives in the measured corpus.
 
+## Batch responses come back incomplete, as invalid JSON, or untranslated
+
+`batch_incomplete_response_split` and `batch_invalid_response_split` warnings
+in `events.jsonl` mean a provider response left items out or could not be
+parsed. BookForge splits the batch and sends the halves again, so these cost
+extra requests rather than translations. Items the response returned but
+validation rejected, such as a paragraph left in the source language, go to
+a repair request instead. The events keep only the parser's error, such as
+`expected , or } at line 1 column 3684`, or a count, not the response.
+
+To see the responses themselves, point `BOOKFORGE_DEBUG_BATCH_RESPONSE_DIR`
+at a directory before the run:
+
+```bash
+BOOKFORGE_DEBUG_BATCH_RESPONSE_DIR=./failed-responses bookforge translate book.epub --target it
+```
+
+Each batch response that failed to parse or had items rejected is written
+there as one JSON file holding the error, each rejected item's error, the
+requested items, the prompt that was sent and the provider's content
+verbatim, so the request can be replayed. Nothing is written while the
+variable is unset, and the content is never logged. The files contain book
+text: keep them local.
+
 ## Validation cannot find EPUBCheck
 
 BookForge's built-in structural validation still runs. Missing EPUBCheck is
@@ -288,7 +312,8 @@ Treat estimates as planning values; provider billing is authoritative.
 
 ## What is safe to share
 
-Do not publish `.bookforge/` or generated review artifacts. They can contain:
+Do not publish `.bookforge/`, generated review artifacts, or a
+`BOOKFORGE_DEBUG_BATCH_RESPONSE_DIR` capture directory. They can contain:
 
 - the uploaded or snapshotted book;
 - full source and translated text;
