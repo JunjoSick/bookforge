@@ -17,8 +17,24 @@ versioned envelope, `doctor` exits non-zero when a check fails, and the
 not reused (cache key schema v3). `docs/AUDIT-2026-08-31.md` tracks the audit
 findings.
 
+### Release pipeline
+
+- Fix the macOS build. The process-liveness check compiled only on macOS and
+  other non-Linux Unix called a string method on raw command output, so the
+  macOS binaries failed to build. CI now runs clippy on macOS, and the release
+  gate requires it.
+- Let release tags on a merge commit pass the release gate. The gate required
+  a `CodeQL` check run that GitHub creates only for pull-request commits, so no
+  tag on the release branch's own merge commits could publish. It now reads
+  code scanning directly: a CodeQL analysis of the exact commit that did not
+  error, and no open high or critical alert on the release branch. The gate's
+  synthetic tests now run in CI.
+
 ### Security
 
+- Harden the dashboard's resume route: it checks the job-id allowlist like the
+  other job routes, and passes the id to the replacement worker after `--`, so
+  an id can never be read as an option.
 - **Security:** the browser dashboard authenticates by default. The server
   prints a one-time bootstrap URL containing its session token, and every
   route beyond that page requires the token in the `x-bookforge-csrf` header —
