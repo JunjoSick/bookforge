@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Stop deleting footnote lines as running footers. Two notes that end with
+  the same short line ("Title, 189.") put it in the bottom margin band of two
+  pages, so it matched as a repeated footer and both copies were dropped. A
+  margin line now counts as a running head or foot only when it stands apart
+  from the text of its own size next to it.
 - Drop printed page numbers from a PDF's contents page. Each entry's page
   number sits flush right on the entry's first line, too far from the title to
   join it, so the numbers became paragraphs of their own or ran into the next
