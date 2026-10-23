@@ -472,6 +472,7 @@ async fn resume_job(
             || (job_status_has_unfinished_pipeline_work(&job.status) && snapshot.is_some());
         let force = !live && job.status == "paused";
         Ok(Some(ResumeJobAction {
+            job_id: job.id,
             live,
             resumable,
             force,
@@ -557,9 +558,10 @@ async fn resume_job(
         // replacement must use the CLI's explicit dead-worker escape hatch.
         command.arg("--force");
     }
-    // The job id goes last, after `--`: the allowlist admits a leading `-`,
-    // and an id must never be read as an option of the child command.
-    command.arg("--").arg(&id);
+    // The child gets the id the store returned, last and after `--`: the
+    // allowlist admits a leading `-`, and an id must never be read as an
+    // option of the child command.
+    command.arg("--").arg(&action.job_id);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -642,6 +644,9 @@ struct ResumeJobRequest {
 }
 
 struct ResumeJobAction {
+    /// The job's id as stored, used for the child's command line instead of
+    /// the request path it was looked up by.
+    job_id: String,
     live: bool,
     resumable: bool,
     force: bool,
