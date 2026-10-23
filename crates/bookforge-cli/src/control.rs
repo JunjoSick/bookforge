@@ -501,7 +501,7 @@ pub(crate) fn pid_liveness(pid: u32) -> OwnerLiveness {
             .args(["-p", &pid.to_string(), "-o", "comm="])
             .output()
         {
-            Ok(output) if output.status.success() && !output.stdout.trim().is_empty() => {
+            Ok(output) if output.status.success() && !output.stdout.trim_ascii().is_empty() => {
                 OwnerLiveness::Alive
             }
             Ok(_) => OwnerLiveness::Gone,

@@ -1883,6 +1883,21 @@ fn cli_resume_missing_job_fails_clearly() {
 }
 
 #[test]
+fn cli_resume_reads_the_job_id_after_a_double_dash() {
+    // The dashboard launches `resume --ui quiet [--force] -- <job id>`, so an
+    // id shaped like a flag is only ever read as the job id.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let assert = bookforge()
+        .current_dir(temp.path())
+        .args(["resume", "--ui", "quiet", "--", "--force"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+
+    assert!(stderr.contains("job '--force' was not found"), "{stderr}");
+}
+
+#[test]
 fn cli_resume_reuses_checkpointed_segments() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let run = translate_quiet(&temp, "mock-prefix-target");

@@ -70,13 +70,28 @@ for check_name in \
   'clippy' \
   'test' \
   'test (windows-msvc)' \
+  'clippy (macos)' \
   'msrv (1.88.0)' \
   'corpus (small)' \
   'RustSec advisory audit' \
-  'CodeQL (Rust)' \
-  'CodeQL'; do
+  'CodeQL (Rust)'; do
   grep -F -q "$check_name" "$GATES" \
     || fail "required check missing from gate script: ${check_name}"
 done
+
+for endpoint in 'code-scanning/analyses' 'code-scanning/alerts'; do
+  grep -F -q "$endpoint" "$GATES" \
+    || fail "gate script must check ${endpoint} for the tagged commit"
+done
+gate_block="$(awk '
+  /^  verify-release-gates:$/ { in_gate=1; next }
+  in_gate && /^  [^ ]/ { exit }
+  in_gate { print }
+' "$WORKFLOW")"
+printf '%s\n' "$gate_block" | grep -q -E '^      "security-events": "read"$' \
+  || fail "the release gate job needs security-events: read to query code scanning"
+if printf '%s\n' "$gate_block" | grep -n -E 'write'; then
+  fail "the release gate job must stay read-only"
+fi
 
 echo "release security validation: OK"

@@ -58,6 +58,8 @@ jobs:
       "actions": "read"
       "checks": "read"
       "contents": "read"
+      # Code-scanning analyses and open alerts for the tagged commit.
+      "security-events": "read"
     env:
       GH_TOKEN: ${{ github.token }}
     steps:

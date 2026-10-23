@@ -2092,6 +2092,31 @@ async fn dashboard_resume_without_required_key_returns_actionable_error() {
 }
 
 #[tokio::test]
+async fn dashboard_resume_rejects_job_ids_outside_the_allowlist() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The resume route passes the id to a child process; it checks the same
+    // allowlist as the other job routes before touching the store.
+    let fixture = build_mutation_fixture();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let mut state = test_state_with_store(&fixture.session, fixture.store_path.clone());
+    state.resume_launches = Some(launches.clone());
+    let router = dashboard_router(state);
+
+    let response = post_json(
+        &router,
+        "/api/jobs/job.not-allowed/resume",
+        Some(&fixture.session),
+        json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = response_json(response).await;
+    assert_eq!(response["error"], "invalid job id");
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn dashboard_resume_accepts_and_remembers_replacement_key() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

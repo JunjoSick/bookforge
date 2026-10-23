@@ -30,6 +30,16 @@ The workflow now also includes the following hand-maintained controls:
   unless the latest completed attempt for every required CI/security job is
   successful. The required names are maintained in
   `scripts/verify-release-gates.sh`.
+- The gate also reads code scanning directly (the job has
+  `security-events: read`): code scanning must hold a CodeQL analysis of the
+  exact tagged SHA that did not error, and the release branch must have no open
+  alert of high or critical severity. GitHub reports CodeQL results as a
+  separate `CodeQL` check run only on pull-request commits; when that run exists
+  it must succeed too. Requiring the run itself made every tag on a merge
+  commit fail, which is how the first v3.0.0 tag attempt was stopped
+  (2026-10-23).
+- `scripts/test-verify-release-gates.sh` exercises the gate against a fake
+  `gh` and runs in the CI `fmt` job.
 - The workflow-wide permission is `contents: read`; only `host` receives
   `contents: write`, `attestations: write`, and `id-token: write`.
 - Plan/build jobs receive only the artifact permissions they need. The plan
@@ -76,6 +86,23 @@ or unsuccessful for the exact tag SHA. It does not wait for checks; a tag pushed
 too early must be retried after the checks complete. Repository settings must
 also require the CI/security checks before merging to the release branch, since
 the workflow can verify success but cannot enforce branch protection itself.
+
+### Code-scanning triage (2026-10-23)
+
+Pull-request checks fail only on *new* CodeQL alerts, so 15 high and critical
+alerts opened between 2026-08-31 and 2026-09-14 were never surfaced. All were
+reviewed before v3.0.0:
+
+| Alerts | Rule | Verdict |
+| --- | --- | --- |
+| #124 (critical) | `rust/command-line-injection`, dashboard resume route passing the job id to `bookforge resume` | False positive: no shell is involved, and the id must already exist as a job. Hardened anyway: the route now applies the job-id allowlist like its siblings, and the child receives the id after `--`, so a flag-shaped id can never be read as an option. |
+| #69, #80, #117–#123 (high) | `rust/cleartext-logging` on batch counts and planning output | False positive: the taint source is the function name `account_for_batch_prompt_overhead` ("account" reads as sensitive); only counts are printed. |
+| #72, #74, #76 (high) | `rust/cleartext-logging` printing `api_key_env` | False positive: the *name* of the environment variable is printed, never its value. |
+| #75 (high) | `rust/cleartext-logging` in `entity list` | False positive: entity records hold names and notes, not credentials. |
+| #81 (high) | `rust/cleartext-logging` at the OCR request send | False positive: the key travels in the request's `Authorization` header to the configured OCR endpoint; nothing is logged. |
+
+The release gate blocks on open high and critical alerts, so false positives
+are dismissed in GitHub with the reason above rather than left open.
 
 ## Existing protections and durable options
 
