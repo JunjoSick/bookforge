@@ -24,7 +24,7 @@ cargo --version
 node --version
 npm --version
 step() { printf '\nRunning:'; printf ' %q' "$@"; printf '\n'; "$@"; }
-fmt() { step bash -n scripts/verify.sh scripts/worktree.sh scripts/qa-run.sh scripts/qa-doctor.sh; step cargo fmt --all --check; step git diff --check; step bash scripts/validate-release-security.sh; }
+fmt() { step bash -n scripts/verify.sh scripts/worktree.sh scripts/qa-run.sh scripts/qa-doctor.sh; step cargo fmt --all --check; step git diff --check; step bash scripts/validate-release-security.sh; step bash scripts/test-verify-release-gates.sh; }
 clippy() { step cargo clippy --workspace --all-targets --all-features --locked -- -D warnings; }
 tests() { step node --test crates/bookforge-cli/tests/dashboard/runtime.test.cjs; step cargo test --workspace --locked; step cargo test --workspace --examples --locked; }
 features() { step cargo check -p bookforge-cli --no-default-features --locked; }

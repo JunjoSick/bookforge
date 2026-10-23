@@ -12,7 +12,8 @@ set -euo pipefail
 # parameter selects a single page. The fixture stores one JSON object per API
 # response: `.check_pages` is an array of pages, each `{ total_count,
 # check_runs }`, and `.compare` mirrors the compare endpoint's
-# `{ merge_base_commit: { sha } }` shape.
+# `{ merge_base_commit: { sha } }` shape. `.analyses` and `.alerts` are the
+# code-scanning analyses and open alerts the endpoints return, one array each.
 #
 # Version/CHANGELOG cases run against a throwaway workspace fixture (a copy of
 # the gate script plus a minimal Cargo crate and CHANGELOG), so tracked
@@ -60,6 +61,10 @@ case "$cmd" in
     fi
     if [[ "$url" == *"/compare/"* ]]; then
       jq -r ".compare | ${jq_filter}" "$FAKE_GH_DATA"
+    elif [[ "$url" == *"/code-scanning/analyses"* ]]; then
+      jq -c ".analyses | ${jq_filter}" "$FAKE_GH_DATA"
+    elif [[ "$url" == *"/code-scanning/alerts"* ]]; then
+      jq -c ".alerts | ${jq_filter}" "$FAKE_GH_DATA"
     elif [[ "$url" == *"/check-runs"* ]]; then
       # Only an explicit `page=N` query parameter selects a page; `per_page=`
       # must not match. Real `gh api --paginate` fetches every Link-header
@@ -107,11 +112,28 @@ mkrun() {
 SUCCESS='success'
 FAILURE='failure'
 
+# A CodeQL code-scanning analysis of the given commit; `error` is empty when
+# the analysis succeeded.
+mkanalysis() {
+  local sha="$1" error="${2:-}"
+  jq -n --arg sha "$sha" --arg error "$error" \
+    '{ commit_sha: $sha, tool: { name: "CodeQL" }, error: $error }'
+}
+
+# An open code-scanning alert of the given security severity.
+mkalert() {
+  local number="$1" level="$2"
+  jq -n --arg number "$number" --arg level "$level" \
+    '{ number: ($number | tonumber),
+       rule: { id: "rust/example-rule", security_severity_level: $level },
+       most_recent_instance: { location: { path: "src/lib.rs", start_line: 1 } } }'
+}
+
 # All required checks passing at the given timestamp; the result is a JSON array.
 all_pass() {
   local started="$1" completed="$2" sha="$3" id=100
   local names=( \
-    'fmt' 'clippy' 'test' 'test (windows-msvc)' 'msrv (1.88.0)' \
+    'fmt' 'clippy' 'test' 'test (windows-msvc)' 'clippy (macos)' 'msrv (1.88.0)' \
     'corpus (small)' 'RustSec advisory audit' 'CodeQL (Rust)' 'CodeQL' )
   local out="[]" name
   for name in "${names[@]}"; do
@@ -213,9 +235,12 @@ now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 base_json="$(jq -n \
   --argjson runs "$(all_pass "$new" "$new" "$TAG_SHA")" \
   --arg merge "$TAG_SHA" \
+  --argjson analysis "$(mkanalysis "$TAG_SHA")" \
   '{ check_pages: [ { total_count: ($runs | length), check_runs: $runs } ],
      compare: { status: "ahead", ahead_by: 0, behind_by: 0,
-                merge_base_commit: { sha: $merge } } }')"
+                merge_base_commit: { sha: $merge } },
+     analyses: [ $analysis ],
+     alerts: [] }')"
 
 # Case 1: duplicate old-success / new-failure -> the newer failure must win.
 fmt_old_success_new_failure="$(mkrun 1 'fmt' completed "$SUCCESS" "$old" "$old" "$TAG_SHA")"
@@ -270,12 +295,15 @@ page1="$(all_pass "$old" "$old" "$TAG_SHA")"
 page1="$(jq -c 'map(select(.name != "test"))' <<<"$page1")"
 test_new_failure="$(mkrun 7 'test' completed "$FAILURE" "$new" "$new" "$TAG_SHA")"
 data="$(jq -n --argjson p1 "$page1" --argjson p2 "[ $test_new_failure ]" --arg merge "$TAG_SHA" \
+  --argjson analysis "$(mkanalysis "$TAG_SHA")" \
   '{ check_pages: [
        { total_count: ($p1 | length), check_runs: $p1 },
        { total_count: ($p2 | length), check_runs: $p2 }
      ],
      compare: { status: "ahead", ahead_by: 0, behind_by: 0,
-                merge_base_commit: { sha: $merge } } }')"
+                merge_base_commit: { sha: $merge } },
+     analyses: [ $analysis ],
+     alerts: [] }')"
 write_data "$data"
 run_case "pagination flattens pages and newer failure on page 2 wins" 1
 
@@ -308,8 +336,9 @@ data="$(jq -c --argjson a "$fmt_old_success" --argjson b "$fmt_pending" \
 write_data "$data"
 run_case "pending latest attempt fails instead of falling back to old success" 1
 
-# Case 9: CodeQL security result fails while the CodeQL (Rust) workflow job
-# passes - the gate must require the security result, not just the job.
+# Case 9: the CodeQL code-scanning result (present on pull-request commits)
+# fails while the CodeQL (Rust) workflow job passes - when the result exists,
+# its failure must fail the gate.
 data="$(jq -c \
   --argjson run "$(mkrun 10 'CodeQL' completed "$FAILURE" "$new" "$new" "$TAG_SHA")" \
   '.check_pages[0] |= (.check_runs |= (map(select(.name != "CodeQL")) + [ $run ]))' \
@@ -325,13 +354,15 @@ data="$(jq -c \
 write_data "$data"
 run_case "missing CodeQL (Rust) job fails the gate independently" 1
 
-# Case 11: the CodeQL security result is missing entirely while the workflow
-# job is present - the gate must still fail closed.
+# Case 11: a push commit, such as the merge on the release branch, never has
+# the separate CodeQL check run; GitHub creates it only on pull-request
+# commits. Requiring it blocked every release tagged on a merge commit, so
+# its absence passes when code scanning's own record is clean.
 data="$(jq -c \
   '.check_pages[0] |= (.check_runs |= map(select(.name != "CodeQL")) | .total_count = (.check_runs | length))' \
   <<<"$base_json")"
 write_data "$data"
-run_case "missing CodeQL security result fails the gate independently" 1
+run_case "push commit without the CodeQL check run passes on code-scanning results" 0
 
 # Case 12: release-branch reachability - all checks pass but the tag is not an
 # ancestor of the configured release branch, so the compare merge base is an
@@ -354,6 +385,43 @@ run_case "compare API failure fails closed" 1 "" "" "/compare/"
 # workspace crate versions, the CHANGELOG heading, and reachability all line up.
 write_data "$base_json"
 run_case "happy path: all checks green, version, changelog, and reachability pass" 0
+
+# Case 16: code scanning holds no CodeQL analysis of the tagged commit (only
+# one of another commit) - the gate cannot vouch for its results.
+data="$(jq -c --argjson analysis "$(mkanalysis "$OTHER_SHA")" \
+  '.analyses = [ $analysis ]' <<<"$base_json")"
+write_data "$data"
+run_case "no CodeQL analysis of the tagged commit fails" 1
+
+# Case 17: the CodeQL analysis of the tagged commit reported an error.
+data="$(jq -c --argjson analysis "$(mkanalysis "$TAG_SHA" "extraction failed")" \
+  '.analyses = [ $analysis ]' <<<"$base_json")"
+write_data "$data"
+run_case "errored CodeQL analysis fails" 1
+
+# Case 18: an open high-severity alert on the release branch blocks release.
+data="$(jq -c --argjson alert "$(mkalert 7 high)" \
+  '.alerts = [ $alert ]' <<<"$base_json")"
+write_data "$data"
+run_case "open high-severity code-scanning alert fails" 1
+
+# Case 19: an open critical alert blocks release too.
+data="$(jq -c --argjson alert "$(mkalert 8 critical)" \
+  '.alerts = [ $alert ]' <<<"$base_json")"
+write_data "$data"
+run_case "open critical code-scanning alert fails" 1
+
+# Case 20: open medium and low alerts do not block release.
+data="$(jq -c --argjson a "$(mkalert 9 medium)" --argjson b "$(mkalert 10 low)" \
+  '.alerts = [ $a, $b ]' <<<"$base_json")"
+write_data "$data"
+run_case "open medium and low code-scanning alerts pass" 0
+
+# Cases 21-22: either code-scanning API failing (for example, a missing
+# security-events permission) fails closed.
+write_data "$base_json"
+run_case "code-scanning analyses API failure fails closed" 1 "" "" "code-scanning/analyses"
+run_case "code-scanning alerts API failure fails closed" 1 "" "" "code-scanning/alerts"
 
 # Version/CHANGELOG cases run against the throwaway workspace fixture.
 
