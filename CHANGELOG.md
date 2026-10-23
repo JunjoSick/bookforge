@@ -1,43 +1,56 @@
 # Changelog
 
-## Unreleased
+## v3.0.0 - 2026-10-23
 
-- Stop deleting footnote lines as running footers. Two notes that end with
-  the same short line ("Title, 189.") put it in the bottom margin band of two
-  pages, so it matched as a repeated footer and both copies were dropped. A
-  margin line now counts as a running head or foot only when it stands apart
-  from the text of its own size next to it.
-- Drop printed page numbers from a PDF's contents page. Each entry's page
-  number sits flush right on the entry's first line, too far from the title to
-  join it, so the numbers became paragraphs of their own or ran into the next
-  entry's text. A number is dropped only on a page with at least three that
-  share a right edge, rise down the page, and stay within the document's page
-  count, which keeps years and table figures.
-- Continue body text that runs over a page break below the previous page's
-  footnotes. The next page's opening words were glued onto the last footnote,
-  leaving the body paragraph cut mid-sentence and the note garbled. Text now
-  continues the last paragraph set at its own size, skipping notes and other
-  smaller type at the foot of the page. On one 213-page book, sentences split
-  across two paragraphs fell from 22 to 11.
-- Split converted PDFs into one XHTML file per chapter by default, starting
-  a chapter at each level-1 heading. A typical book now produces one file per
-  chapter plus front matter: a 213-page book that used to be one 600 KB
-  `content.xhtml` now converts to 5 files, the largest 250 KB (a cover, the
-  title pages with the introduction, and three chapter files; its fourth
-  chapter's title is set as an image, so that chapter shares the third's
-  file). A half-title page or part title with nothing but headings merges
-  into the next chapter, so no file is empty or heading-only. A document
-  with fewer than two chapters of body text, such as a paper whose only
-  level-1 heading is its title, keeps the single `content.xhtml` byte for
-  byte, and so does a book where level-1 headings are more than 256 or more
-  than half of its text blocks, with a conversion warning.
-  `--chapter-prefix` works as before.
-- List each chapter's own sections under it in the contents of a
-  multi-file EPUB, linked into that chapter's file. Heading ids now count
-  across the whole book, so they stay unique between files.
-- Keep sections of the same rank as siblings in the PDF-derived contents
-  when a rank is skipped. A chapter heading followed by numbered `h3`
-  sections listed each section inside the one before it.
+The first release since v2.6.1. It ships the 2026-08 deep-audit remediation
+campaign (merged in #112): security hardening around the local dashboard,
+reliability repairs in the checkpoint/resume lifecycle, translation-quality
+work and audio/PDF fixes. It also ships the September-October work that came
+out of real-book runs: typeset PDFs now convert into clean, chaptered EPUBs,
+and batch translation no longer leaves paragraphs untranslated on transient
+failures, mangled item IDs or bare language codes.
+
+Read **Breaking-ish changes** below before upgrading. The dashboard now
+requires its session token by default, `--ui json` lines are wrapped in a
+versioned envelope, `doctor` exits non-zero when a check fails, and the
+`clear` commands need `--yes`. Cached translations from earlier versions are
+not reused (cache key schema v3). `docs/AUDIT-2026-08-31.md` tracks the audit
+findings.
+
+### Security
+
+- **Security:** the browser dashboard authenticates by default. The server
+  prints a one-time bootstrap URL containing its session token, and every
+  route beyond that page requires the token in the `x-bookforge-csrf` header —
+  closing the hole where any local process could harvest a token from `/` and
+  spend remembered provider keys. `--no-auth` restores unauthenticated serving
+  for consoles-only environments.
+- **Security:** `.bookforge` roots are created private (0700 on Unix) from the
+  first moment, pre-existing loose components are tightened at startup,
+  dashboard-uploaded EPUBs are written 0600, and estimate-upload parsing uses
+  unpredictable owner-only temporary directories that self-delete.
+- **Security:** cancel requests check whether the stored worker PID is alive
+  before any process action, so PID reuse can no longer kill unrelated trees.
+- **Security:** job ids passed through dashboard routes are strictly
+  allowlisted before reaching filesystem paths, blocking traversal-shaped
+  reads of arbitrary files.
+- **Security:** concurrent dashboard launches are capped, protecting against
+  many parallel billable runs sharing remembered keys, and every launch runs
+  behind a panic boundary so a crash cannot take the server down mid-run.
+- **Security:** book text enters prompts inside fenced, sanitized context
+  blocks instead of unfenced sections, shrinking the prompt-injection surface
+  while validation still bounds structural damage.
+- **Security:** archive reads for `reflow` and `validate` now go through the
+  same decompression budget as translation parsing — no CLI command remains
+  that an under-declared zip entry can OOM.
+- Infrastructure hardening: CI gains a least-privilege permissions block,
+  SHA-pinned actions, and a checksum-verified EPUBCheck download; zip is built
+  deflate-only on the pure-Rust zlib-rs backend (drops the zstd-sys C
+  toolchain requirement); explicit ignore rules cover test-key files and
+  editor scratch directories.
+
+### Reliability
+
 - Stop rejecting complete batch responses as incomplete. Batch prompts gave
   each item its internal ID, such as
   `seg_sec_000000_b_000070_be51253472d4:b_000130`, and models copied these
@@ -74,44 +87,6 @@
   requested items, each rejected item's error and the provider's content, so
   the request can be read and replayed after the run. Nothing is written or
   logged otherwise; the files contain book text.
-
-- Rebuild typeset books from PDF with far fewer broken paragraphs. Page
-  numbers are recognised from their page-to-page sequence and dropped, so a
-  sentence running over a page break stays one paragraph instead of being
-  cut by the folio. Note reference marks stay inline in their sentence as
-  `<sup>` instead of becoming paragraphs of their own, a title wrapped over
-  several centred lines becomes one heading, and font sizes declared on an
-  earlier page apply to later ones. On one 213-page book the paragraph count
-  fell from 1,604 to 885 and stray note numbers from 416 to 8.
-- Keep each numbered note from a PDF in its own paragraph. One-line notes
-  share a margin and ordinary leading, so a page's notes used to run
-  together, several to a paragraph, and the translator saw them as one
-  block. A line now starts a new note when it opens with a label ("12. ",
-  "12 ", "[12]", a raised 12) that the next label continues at the same
-  left edge and size, and the line before it ends short of the measure or
-  closes a sentence. Wrapped note lines stay with their note, and prose that
-  wraps onto a number at line start, a year included, is not split. This is
-  the PDF counterpart of the EPUB endnote split.
-- Rank PDF heading sizes that recur across pages ahead of one-off title-page
-  type. A cover and title page set in two large sizes used to take two of the
-  three heading levels, leaving section headings as plain paragraphs.
-- Read a title set across a two-page spread once. Text lying wholly outside
-  its page is skipped and counted in the conversion report.
-- Stop `convert` from leaving pdftohtml's page images next to the source
-  PDF. They were never used and stayed behind after every conversion.
-- Credit text that continues a paragraph from an earlier page to the page it
-  was read on, and stop warning about pages whose only text was a page number
-  or running header. The conversion report no longer calls a page full of
-  text "no text reconstructed".
-- Fix resuming a paused job on Windows intermittently failing with "Access is
-  denied (os error 5)". The resume signal replaced the worker's control file
-  while the paused worker was reading it; control and sidecar files are now
-  replaced with POSIX rename semantics, which succeed during such reads.
-- Fix `translate --validate-output` failing after the translation whenever
-  `--out` was a bare file name such as `book.it.epub`. The output and its
-  validation report were compared through their parent directory, and a bare
-  name's parent is the empty path, which could not be resolved. The EPUB was
-  written, but the run exited 1 without its validation and report files.
 - Retry batch requests that fail to connect at least three times, whatever the
   profile allows. A connection error never reaches the provider and is never
   billed, but under the default one-attempt profile it failed every item of
@@ -126,119 +101,15 @@
 - Give a single paragraph that came back as malformed JSON one more attempt,
   even when the profile allows only one. Larger batches already got several
   through bisection.
-- Stop untranslated prose from hiding behind reference context. A Notes,
-  Bibliography, References, Works Cited or Index section title, a leading
-  `p. 12.`, or an `in English:` gloss now only excuses an unchanged block
-  shorter than 120 characters; longer unchanged or near-copied text is checked
-  like any other prose. A long citation that should stay verbatim needs
-  explicit acceptance with `bookforge correct`.
-- Hold saved and cached results to the same source-copy rule as fresh output.
-  A cache hit that fresh output could not pass is treated as a miss. On
-  resume, previously accepted provider output that contains a blocking copy
-  moves to `needs_review` with its text, usage and provenance unchanged, and
-  is not retranslated automatically. Human-accepted segments are never
-  rechecked and are never shared across jobs.
-- Keep human corrections out of the double-check pass on resume. The stored
-  correction was protected, but the rebuilt EPUB could still pick up an
-  automated rewrite of the same segment.
-
-- Accept batch translations whose only source-copy finding is an editorial
-  warning for a title, heading, or short proper-name line. Previously the
-  report called these warnings while the parser still rejected the blocks.
-  Unchanged prose and structural violations continue to fail validation.
-
-- Split packed EPUB endnotes at consecutive anchored note backlinks during
-  reading and rebuilding, keeping note text, formatting, and link targets intact.
-  Converted books no longer send an entire multi-note paragraph as one oversized
-  translation block.
-
-Dogfooding round on a real 400-page-scale EPUB (English→Italian, DeepSeek):
-fixes for every issue the live run surfaced.
-
-- **Latency-aware batch budgets:** batch planning caps output tokens so the
-  expected generation fits inside 80% of the request timeout, and the provider
-  extends an individual request's deadline to cover its own output budget
-  (never below the configured timeout, with a one-time log when it engages).
-  Large single-segment batches no longer race a fixed 180s deadline. A
-  slow-trickling-body regression test now proves the client timeout fires
-  mid-body instead of hanging.
-- **In-flight visibility:** `RequestProgress` heartbeats (every 5s per
-  outstanding request) make long normal generations distinguishable from a
-  stall, and `RequestStarted` gained an optional `effective_timeout_seconds`.
-- **Structured, block-attributed QA findings:** deterministic findings persist
-  with `kind`, instance severity, message, and `block_id` (migration 11).
-  Source-copy hits on title/heading/short proper-noun blocks are warnings —
-  leaving a book title or author line untranslated is editorially correct —
-  while unchanged prose stays an error. Reports, `status`, and the review page
-  prefer structured rows; legacy error strings decompose through a documented
-  parser. The CLI no longer regex-parses engine error text.
-- **Honest `estimate --pass-costs`:** per-pass surcharge lines plus a real
-  `Estimated total incl. passes` (the old line printed the surcharge alone,
-  less than the primary estimate). JSON events gained
-  `est_cost_usd_passes`/`est_cost_usd_total`.
-- **Supervised retries:** `retry` gains `--ui`, spawns a supervised
-  replacement worker whose deaths are surfaced (`replacement_worker_died`
-  events with exit status and stderr tail), respawn with exponential backoff,
-  and bounded give-up that marks the job honestly. Root-caused and fixed the
-  silent respawn loop from the dogfood run: the dashboard resume path held
-  the runtime launch claim across child spawn, so every replacement worker
-  bailed instantly on the claim check with its stderr discarded.
-- **Friendly validation errors:** persisted error text no longer leaks raw
-  serde internals ("missing field `translation` at line 1 column 157");
-  categorized plain-language sentences instead, with raw detail in debug logs.
-- `--no-thinking` and the provider connection flags gained real help text.
-
-## v3.0.0 (unreleased — release candidate)
-
-> **Version note (2026-08-31):** this section is a **release candidate**, not a
-> shipped release. The v3.0.0 campaign lives on branch
-> `remediation/audit-2026-08` (commit `aa90d94`), is **not merged to `main`**
-> (PR #112 open/blocked), and has **no tag or release**. The latest published
-> release remains **v2.6.1**. The content below describes what the v3.0.0
-> candidate contains once it ships; until then none of it is installable as v3.
-> Tracking: `docs/AUDIT-2026-08-31.md`.
-
-Remediation campaign for the 2026-08 deep audit (`docs/report.md`, waves 0–4):
-security hardening around the local dashboard, reliability repairs in the
-checkpoint/resume lifecycle, translation-quality work, audio/PDF fixes,
-breaking JSON/CLI surface changes, and corrections to two audit findings that
-turned out wrong. See `docs/HANDOFF-2026-08.md` (historical, release-candidate
-record) for the wave-by-wave detail.
-
-### Security
-
-- **Security:** the browser dashboard authenticates by default. The server
-  prints a one-time bootstrap URL containing its session token, and every
-  route beyond that page requires the token in the `x-bookforge-csrf` header —
-  closing the hole where any local process could harvest a token from `/` and
-  spend remembered provider keys. `--no-auth` restores unauthenticated serving
-  for consoles-only environments.
-- **Security:** `.bookforge` roots are created private (0700 on Unix) from the
-  first moment, pre-existing loose components are tightened at startup,
-  dashboard-uploaded EPUBs are written 0600, and estimate-upload parsing uses
-  unpredictable owner-only temporary directories that self-delete.
-- **Security:** cancel requests check whether the stored worker PID is alive
-  before any process action, so PID reuse can no longer kill unrelated trees.
-- **Security:** job ids passed through dashboard routes are strictly
-  allowlisted before reaching filesystem paths, blocking traversal-shaped
-  reads of arbitrary files.
-- **Security:** concurrent dashboard launches are capped, protecting against
-  many parallel billable runs sharing remembered keys, and every launch runs
-  behind a panic boundary so a crash cannot take the server down mid-run.
-- **Security:** book text enters prompts inside fenced, sanitized context
-  blocks instead of unfenced sections, shrinking the prompt-injection surface
-  while validation still bounds structural damage.
-- **Security:** archive reads for `reflow` and `validate` now go through the
-  same decompression budget as translation parsing — no CLI command remains
-  that an under-declared zip entry can OOM.
-- Infrastructure hardening: CI gains a least-privilege permissions block,
-  SHA-pinned actions, and a checksum-verified EPUBCheck download; zip is built
-  deflate-only on the pure-Rust zlib-rs backend (drops the zstd-sys C
-  toolchain requirement); explicit ignore rules cover test-key files and
-  editor scratch directories.
-
-### Reliability
-
+- Fix `translate --validate-output` failing after the translation whenever
+  `--out` was a bare file name such as `book.it.epub`. The output and its
+  validation report were compared through their parent directory, and a bare
+  name's parent is the empty path, which could not be resolved. The EPUB was
+  written, but the run exited 1 without its validation and report files.
+- Fix resuming a paused job on Windows intermittently failing with "Access is
+  denied (os error 5)". The resume signal replaced the worker's control file
+  while the paused worker was reading it; control and sidecar files are now
+  replaced with POSIX rename semantics, which succeed during such reads.
 - Human corrections are frozen by SQL inside single immediate transactions:
   `INSERT … WHERE human_corrected = 0` guarantees neither the CLI worker nor a
   dashboard job racing the same segment can overwrite an accepted correction,
@@ -280,6 +151,29 @@ record) for the wave-by-wave detail.
 
 ### Quality and performance
 
+- Stop untranslated prose from hiding behind reference context. A Notes,
+  Bibliography, References, Works Cited or Index section title, a leading
+  `p. 12.`, or an `in English:` gloss now only excuses an unchanged block
+  shorter than 120 characters; longer unchanged or near-copied text is checked
+  like any other prose. A long citation that should stay verbatim needs
+  explicit acceptance with `bookforge correct`.
+- Hold saved and cached results to the same source-copy rule as fresh output.
+  A cache hit that fresh output could not pass is treated as a miss. On
+  resume, previously accepted provider output that contains a blocking copy
+  moves to `needs_review` with its text, usage and provenance unchanged, and
+  is not retranslated automatically. Human-accepted segments are never
+  rechecked and are never shared across jobs.
+- Keep human corrections out of the double-check pass on resume. The stored
+  correction was protected, but the rebuilt EPUB could still pick up an
+  automated rewrite of the same segment.
+- Accept batch translations whose only source-copy finding is an editorial
+  warning for a title, heading, or short proper-name line. Previously the
+  report called these warnings while the parser still rejected the blocks.
+  Unchanged prose and structural violations continue to fail validation.
+- Split packed EPUB endnotes at consecutive anchored note backlinks during
+  reading and rebuilding, keeping note text, formatting, and link targets intact.
+  Converted books no longer send an entire multi-note paragraph as one oversized
+  translation block.
 - One canonical script-aware token estimator (`bookforge_core::token_estimate::estimate_tokens`)
   replaces eight divergent per-crate helpers (chars/4, bytes/4, words×4/3,
   dominant-case-class weighting) across batch packing, scheduler context
@@ -346,6 +240,70 @@ record) for the wave-by-wave detail.
 
 ### PDF
 
+- Rebuild typeset books from PDF with far fewer broken paragraphs. Page
+  numbers are recognised from their page-to-page sequence and dropped, so a
+  sentence running over a page break stays one paragraph instead of being
+  cut by the folio. Note reference marks stay inline in their sentence as
+  `<sup>` instead of becoming paragraphs of their own, a title wrapped over
+  several centred lines becomes one heading, and font sizes declared on an
+  earlier page apply to later ones. On one 213-page book the paragraph count
+  fell from 1,604 to 885 and stray note numbers from 416 to 8.
+- Keep each numbered note from a PDF in its own paragraph. One-line notes
+  share a margin and ordinary leading, so a page's notes used to run
+  together, several to a paragraph, and the translator saw them as one
+  block. A line now starts a new note when it opens with a label ("12. ",
+  "12 ", "[12]", a raised 12) that the next label continues at the same
+  left edge and size, and the line before it ends short of the measure or
+  closes a sentence. Wrapped note lines stay with their note, and prose that
+  wraps onto a number at line start, a year included, is not split. This is
+  the PDF counterpart of the EPUB endnote split.
+- Rank PDF heading sizes that recur across pages ahead of one-off title-page
+  type. A cover and title page set in two large sizes used to take two of the
+  three heading levels, leaving section headings as plain paragraphs.
+- Read a title set across a two-page spread once. Text lying wholly outside
+  its page is skipped and counted in the conversion report.
+- Drop printed page numbers from a PDF's contents page. Each entry's page
+  number sits flush right on the entry's first line, too far from the title to
+  join it, so the numbers became paragraphs of their own or ran into the next
+  entry's text. A number is dropped only on a page with at least three that
+  share a right edge, rise down the page, and stay within the document's page
+  count, which keeps years and table figures.
+- Continue body text that runs over a page break below the previous page's
+  footnotes. The next page's opening words were glued onto the last footnote,
+  leaving the body paragraph cut mid-sentence and the note garbled. Text now
+  continues the last paragraph set at its own size, skipping notes and other
+  smaller type at the foot of the page. On one 213-page book, sentences split
+  across two paragraphs fell from 22 to 11.
+- Stop deleting footnote lines as running footers. Two notes that end with
+  the same short line ("Title, 189.") put it in the bottom margin band of two
+  pages, so it matched as a repeated footer and both copies were dropped. A
+  margin line now counts as a running head or foot only when it stands apart
+  from the text of its own size next to it.
+- Split converted PDFs into one XHTML file per chapter by default, starting
+  a chapter at each level-1 heading. A typical book now produces one file per
+  chapter plus front matter: a 213-page book that used to be one 600 KB
+  `content.xhtml` now converts to 5 files, the largest 250 KB (a cover, the
+  title pages with the introduction, and three chapter files; its fourth
+  chapter's title is set as an image, so that chapter shares the third's
+  file). A half-title page or part title with nothing but headings merges
+  into the next chapter, so no file is empty or heading-only. A document
+  with fewer than two chapters of body text, such as a paper whose only
+  level-1 heading is its title, keeps the single `content.xhtml` byte for
+  byte, and so does a book where level-1 headings are more than 256 or more
+  than half of its text blocks, with a conversion warning.
+  `--chapter-prefix` works as before.
+- List each chapter's own sections under it in the contents of a
+  multi-file EPUB, linked into that chapter's file. Heading ids now count
+  across the whole book, so they stay unique between files.
+- Keep sections of the same rank as siblings in the PDF-derived contents
+  when a rank is skipped. A chapter heading followed by numbered `h3`
+  sections listed each section inside the one before it.
+- Stop `convert` from leaving pdftohtml's page images next to the source
+  PDF. They were never used and stayed behind after every conversion.
+- Credit text that continues a paragraph from an earlier page to the page it
+  was read on, and stop warning about pages whose only text was a page number
+  or running header. The conversion report no longer calls a page full of
+  text "no text reconstructed".
 - Temporary working directories are cleaned up through RAII even when figure
   or media passes fail early; successful OCR no longer wipes figure blocks
   anchored on the same pages; running-header removal is accounted for before
@@ -364,6 +322,43 @@ record) for the wave-by-wave detail.
 - A PopplerBackend seam plus an in-process fake poppler drive the conversion
   test matrix on any OS, so env-scrubbing, timeouts, pipes, and cleanup claims
   no longer ship untested on Windows (TEST-2/PDF-2).
+
+### Large-book dogfooding
+
+Fixes from a live English-to-Italian run of a 400-page-scale EPUB.
+
+- **Latency-aware batch budgets:** batch planning caps output tokens so the
+  expected generation fits inside 80% of the request timeout, and the provider
+  extends an individual request's deadline to cover its own output budget
+  (never below the configured timeout, with a one-time log when it engages).
+  Large single-segment batches no longer race a fixed 180s deadline. A
+  slow-trickling-body regression test now proves the client timeout fires
+  mid-body instead of hanging.
+- **In-flight visibility:** `RequestProgress` heartbeats (every 5s per
+  outstanding request) make long normal generations distinguishable from a
+  stall, and `RequestStarted` gained an optional `effective_timeout_seconds`.
+- **Structured, block-attributed QA findings:** deterministic findings persist
+  with `kind`, instance severity, message, and `block_id` (migration 11).
+  Source-copy hits on title/heading/short proper-noun blocks are warnings —
+  leaving a book title or author line untranslated is editorially correct —
+  while unchanged prose stays an error. Reports, `status`, and the review page
+  prefer structured rows; legacy error strings decompose through a documented
+  parser. The CLI no longer regex-parses engine error text.
+- **Honest `estimate --pass-costs`:** per-pass surcharge lines plus a real
+  `Estimated total incl. passes` (the old line printed the surcharge alone,
+  less than the primary estimate). JSON events gained
+  `est_cost_usd_passes`/`est_cost_usd_total`.
+- **Supervised retries:** `retry` gains `--ui`, spawns a supervised
+  replacement worker whose deaths are surfaced (`replacement_worker_died`
+  events with exit status and stderr tail), respawn with exponential backoff,
+  and bounded give-up that marks the job honestly. Root-caused and fixed the
+  silent respawn loop from the dogfood run: the dashboard resume path held
+  the runtime launch claim across child spawn, so every replacement worker
+  bailed instantly on the claim check with its stderr discarded.
+- **Friendly validation errors:** persisted error text no longer leaks raw
+  serde internals ("missing field `translation` at line 1 column 157");
+  categorized plain-language sentences instead, with raw detail in debug logs.
+- `--no-thinking` and the provider connection flags gained real help text.
 
 ### Breaking-ish changes
 

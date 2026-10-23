@@ -109,9 +109,8 @@ and the official action release pages for [checkout](https://github.com/actions/
 implemented on the **unreleased** remediation branch (audit wave 1, H-5) — the
 dashboard mints a random session token at startup, includes it only in the
 printed bootstrap URL, and requires it on every route outside that page;
-`--no-auth` restores unauthenticated serving explicitly. It ships only when the
-branch merges and is released (v3.0.0 candidate; PR #112 open/blocked), so it
-is **not present in the published v2.6.1**. The analysis below is preserved as
+`--no-auth` restores unauthenticated serving explicitly. It merged in #112 and
+ships in v3.0.0; v2.6.1 and earlier do not have it. The analysis below is preserved as
 written when the risk was accepted; concurrent-launch caps also landed on the
 candidate branch, while cookie exchange and spend limits remain open ideas.
 
