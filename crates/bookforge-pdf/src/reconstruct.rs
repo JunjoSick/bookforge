@@ -138,10 +138,18 @@ pub fn reconstruct_with_chapter_guard(
             ordered
         };
         let contents_numbers = contents_page_numbers(&lines, page_count);
+        let page_lines = lines_by_position(page);
+        let page_median_gap = median_line_gap(&page_lines);
         let mut running_header_chars = 0usize;
         ordered.retain(|line| {
-            if is_running_margin_line(page, line, body_size, &running_margin_texts)
-                || folios.contains(&(page.number, line.top, line.left))
+            if is_running_margin_line(
+                page,
+                &page_lines,
+                page_median_gap,
+                line,
+                body_size,
+                &running_margin_texts,
+            ) || folios.contains(&(page.number, line.top, line.left))
                 || contents_numbers.contains(&(line.top, line.left))
             {
                 running_header_chars += line.char_count();
@@ -227,8 +235,13 @@ fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for page in pages {
         let mut seen_on_page = HashSet::new();
-        for line in merge_fragments_into_lines(page) {
-            if line.font_size > body_size + 1 || !near_vertical_margin(page, &line) {
+        let lines = lines_by_position(page);
+        let median_gap = median_line_gap(&lines);
+        for line in &lines {
+            if line.font_size > body_size + 1
+                || !near_vertical_margin(page, line)
+                || !stands_apart(page, &lines, line, median_gap)
+            {
                 continue;
             }
             let normalized = normalize_text_key(&line.text());
@@ -252,6 +265,8 @@ fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<String> {
 
 fn is_running_margin_line(
     page: &Page,
+    page_lines: &[Line],
+    median_gap: i32,
     line: &Line,
     body_size: u32,
     running_margin_texts: &HashSet<String>,
@@ -259,6 +274,40 @@ fn is_running_margin_line(
     line.font_size <= body_size + 1
         && near_vertical_margin(page, line)
         && running_margin_texts.contains(&normalize_text_key(&line.text()))
+        && stands_apart(page, page_lines, line, median_gap)
+}
+
+/// The page's lines in reading position, top to bottom.
+fn lines_by_position(page: &Page) -> Vec<Line> {
+    let mut lines = merge_fragments_into_lines(page);
+    lines.sort_by_key(|line| (line.top, line.left));
+    lines
+}
+
+/// Whether a margin line stands apart from the text beside it, as running
+/// heads and feet do: the nearest line on the text-block side is farther
+/// away than one and a half line heights or the page's usual line spacing.
+/// A footnote line that happens to repeat at the foot of two pages
+/// ("Title, 189.") sits at ordinary leading under the note line above it,
+/// and was deleted as a running footer.
+fn stands_apart(page: &Page, lines: &[Line], line: &Line, median_gap: i32) -> bool {
+    let below_middle = line.top > page.height / 2;
+    let same_baseline = line.height.max(1) / 2;
+    lines
+        .iter()
+        // Only text set at about the line's own size is the flow it might
+        // belong to; a chapter title under a running head is not.
+        .filter(|other| other.font_size.abs_diff(line.font_size) <= 2)
+        .map(|other| {
+            if below_middle {
+                line.top - other.top
+            } else {
+                other.top - line.top
+            }
+        })
+        .filter(|gap| *gap > same_baseline)
+        .min()
+        .is_none_or(|gap| gap * 10 > line.height.max(1) * 15 || gap * 10 > median_gap.max(1) * 13)
 }
 
 /// Printed page references on a contents page, keyed by `(top, left)`. An
@@ -2224,6 +2273,48 @@ mod tests {
                 "2. An invented note that runs on to the next page.",
             ]
         );
+    }
+
+    #[test]
+    fn a_footnote_line_repeated_at_two_page_feet_is_not_a_running_footer() {
+        // Two notes end with the same short line, and both fall in the bottom
+        // margin band. The line repeats on two pages, so it was deleted as a
+        // running footer. The real running head still goes, also on a chapter
+        // opener where a large title sits close beneath it.
+        let page = |number: u32, note: &str| {
+            let mut xml = format!("<page number=\"{number}\" width=\"600\" height=\"800\">\n");
+            xml.push_str("<text top=\"40\" left=\"200\" width=\"200\" height=\"13\" font=\"0\">An Invented Running Head</text>\n");
+            if number == 1 {
+                xml.push_str("<text top=\"56\" left=\"100\" width=\"400\" height=\"30\" font=\"2\">AN INVENTED CHAPTER</text>\n");
+            }
+            for row in 0..10 {
+                xml.push_str(&format!(
+                    "<text top=\"{}\" left=\"60\" width=\"440\" height=\"13\" font=\"0\">Invented body line {row} of page {number}, long enough to set the body size.</text>\n",
+                    100 + row * 16
+                ));
+            }
+            xml.push_str(&format!(
+                "<text top=\"742\" left=\"60\" width=\"440\" height=\"11\" font=\"1\">{note} An invented note citing Somebody,</text>\n"
+            ));
+            xml.push_str("<text top=\"754\" left=\"60\" width=\"200\" height=\"11\" font=\"1\">the Same Invented Title, 189.</text>\n</page>\n");
+            xml
+        };
+        let xml = format!(
+            "<?xml version=\"1.0\"?>\n<pdf2xml>\n<fontspec id=\"0\" size=\"11\" family=\"T\"/>\n<fontspec id=\"1\" size=\"9\" family=\"T\"/>\n<fontspec id=\"2\" size=\"24\" family=\"T\"/>\n{}{}</pdf2xml>",
+            page(1, "1."),
+            page(2, "2.")
+        );
+        let pages = parse_pdf2xml(&xml).expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Auto);
+        let text = texts(&result).join("\n");
+
+        assert_eq!(
+            text.matches("the Same Invented Title, 189.").count(),
+            2,
+            "{text}"
+        );
+        assert!(!text.contains("Running Head"), "{text}");
+        assert!(text.contains("AN INVENTED CHAPTER"), "{text}");
     }
 
     #[test]

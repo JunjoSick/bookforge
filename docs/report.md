@@ -1,8 +1,10 @@
 # BookForge Deep Audit Report
 
 > **Status (2026-08-31).** This report is the **historical audit record** for
-> the 2026-08 deep audit (state as of v2.6.1, audit date 2026-08-25). The
-> remediation described below is **NOT complete and NOT released**: the
+> the 2026-08 deep audit (state as of v2.6.1, audit date 2026-08-25).
+> **Update (2026-10-23):** the remediation branch was merged to `main` in #112
+> on 2026-09-06 and ships in v3.0.0. As of 2026-08-31 the
+> remediation described below was **NOT complete and NOT released**: the
 > campaign branch `remediation/audit-2026-08` at commit `aa90d94` is not merged
 > to `main` (PR #112 open/blocked; PR #108 folded in), there is **no v3.0.0
 > tag/release**, and the latest published release is **v2.6.1**. Wave history

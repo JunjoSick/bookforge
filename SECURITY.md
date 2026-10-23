@@ -2,15 +2,14 @@
 
 ## Supported Versions
 
-The latest published release line is `2.6.x`. The `3.x` line is the current
-development/release-candidate line until a corresponding GitHub release is
-published. Security fixes are applied to `3.x` first; critical fixes may be
-backported to the latest `2.6.x` patch release when practical.
+The latest published release line is `3.x`. Security fixes are applied to
+`3.x` first; critical fixes may be backported to the latest `2.6.x` patch
+release when practical.
 
 | Version | Support |
 | --- | --- |
-| 3.x development/release candidate | Supported for security fixes |
-| 2.6.x latest published line | Supported for critical security fixes |
+| 3.x latest published line | Supported for security fixes |
+| 2.6.x | Supported for critical security fixes |
 | < 2.6 | Unsupported |
 
 Do not assume that an unreleased checkout has the same support or artifact

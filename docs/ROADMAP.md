@@ -12,12 +12,11 @@ the milestones below.
 > endpoint foundations. v2.6.1 was prepared and merged to `main` on 2026-07-21
 > with security-audit remediation and two ElevenLabs fixes, and was tagged and
 > released on 2026-07-22.
-> **Status note (2026-08-31):** the v3.0.0 remediation candidate (2026-08 deep
-> audit, branch `remediation/audit-2026-08` @ `aa90d94`) is **unreleased** — no
-> tag/release exists and the branch is not merged (PR #112 open/blocked). The
-> latest published release remains **v2.6.1**. See
-> `docs/AUDIT-2026-08-31.md` for the authoritative remediation ledger; §17
-> remains proposal, not a shipping commitment.
+> **Status note (2026-10-23):** v3.0.0 ships the 2026-08 deep-audit
+> remediation (merged to `main` in #112 on 2026-09-06) together with the
+> September-October PDF and translation-reliability work. See
+> `docs/AUDIT-2026-08-31.md` for the remediation ledger; §17 remains proposal,
+> not a shipping commitment.
 > This document is kept for architectural invariants, shipped-milestone
 > context, and deferred follow-up work. For current user behavior, start
 > with `README.md`, `CHANGELOG.md`, and `docs/v2-web-dashboard-plan.md`;
@@ -135,6 +134,7 @@ via `java`, but the BookForge binary itself does not need Java to run.
 | v2.0 | Monitoring UI (`RunState`, `watch`, `--ui tui`, local `serve`) | shipped scope | release notes | shipped; patch line completed at v2.0.3 (2026-07-02) |
 | v2.6.0 | Audiobook narration quality & UI parity (§16) | 8–12 days | release notes and updated audiobook guide | **shipped 2026-07-21 as release v2.6.0** |
 | v2.6.1 | Security-audit remediation + ElevenLabs fixes | patch release | release notes | **released 2026-07-22 as v2.6.1** |
+| v3.0.0 | 2026-08 audit remediation; PDF conversion of typeset books; translation reliability | major release | release notes | **v3.0.0, 2026-10-23** |
 
 Priority note (2026-06): the owner needs PDF translation more than
 bilingual output — scientific papers (figures/tables must survive) and

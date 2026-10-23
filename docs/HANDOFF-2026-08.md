@@ -2,6 +2,10 @@
 
 You are resuming a multi-wave remediation campaign. This file is your complete context.
 
+> **Update (2026-10-23):** the campaign branch was merged to `main` in #112 on
+> 2026-09-06 and ships in v3.0.0. The correction below describes the state on
+> 2026-08-31.
+>
 > **STATUS CORRECTION (2026-08-31):** the claims below that v3.0.0 shipped, that
 > the campaign is complete, or that work is "post-release" are **false**. The
 > branch `remediation/audit-2026-08` at commit `aa90d94` is **not released** and
