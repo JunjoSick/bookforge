@@ -410,25 +410,23 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
                     config.api_key_env = api_key_env;
                 }
                 config.timeout_seconds = args.timeout_seconds.min(15);
-                match resolve_preferred_elevenlabs_model_reported_with_cancel(
+                // Transient transport failures already degrade inside the
+                // library to a deterministic, cheapest-suitable tier. Any other
+                // discovery failure stops here, before quota checks or spend:
+                // guessing a model would pick a price and a cache identity the
+                // operator never chose.
+                let resolution = resolve_preferred_elevenlabs_model_reported_with_cancel(
                     &config,
                     args.max_chars,
                     (args.speed - 1.0).abs() > f32::EPSILON,
                     cancel.clone(),
                 )
                 .await
-                {
-                    Ok(resolution) => {
-                        degraded_model_reason = resolution.reason;
-                        resolution.model
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "warning: ElevenLabs model preflight failed ({error}); using default eleven_multilingual_v2"
-                        );
-                        "eleven_multilingual_v2".to_string()
-                    }
-                }
+                .context(
+                    "ElevenLabs model discovery failed; retry or select an explicit --model to skip discovery",
+                )?;
+                degraded_model_reason = resolution.reason;
+                resolution.model
             };
             let model_limit = elevenlabs_model_max_input_chars(&model);
             if args.max_chars > model_limit {

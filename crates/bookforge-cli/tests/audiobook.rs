@@ -1,11 +1,17 @@
 //! End-to-end coverage for `bookforge audiobook` over a synthetic EPUB,
-//! using the offline mock TTS provider so the test needs no network and is
-//! deterministic in CI.
+//! using the offline mock TTS provider and loopback provider fixtures so the
+//! tests need no network and are deterministic in CI.
 
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
+    net::{Shutdown, TcpListener},
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use assert_cmd::Command;
@@ -994,4 +1000,246 @@ fn audiobook_mock_warns_and_drops_speed_and_instructions() {
         ),
         "expected the matrix-driven warn-and-drop notice: {stderr}"
     );
+}
+
+/// Loopback stand-in for the ElevenLabs API. Model discovery always answers
+/// 503, so only an explicit `--model` can reach synthesis; the subscription
+/// and speech endpoints answer like a healthy account. Every request is
+/// recorded so tests can prove which endpoints a run touched.
+struct ElevenLabsFixture {
+    base_url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ElevenLabsFixture {
+    fn discovery_unavailable() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking fixture listener");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (captured, stopped) = (Arc::clone(&requests), Arc::clone(&stop));
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let request = read_fixture_request(&mut stream);
+                let (status, content_type, body) =
+                    if request.starts_with("POST /v1/text-to-speech/") {
+                        ("200 OK", "audio/wav", silent_wav())
+                    } else if request.starts_with("GET /v1/user/subscription ") {
+                        (
+                            "200 OK",
+                            "application/json",
+                            br#"{"character_count":0,"character_limit":1000000}"#.to_vec(),
+                        )
+                    } else {
+                        (
+                            "503 Service Unavailable",
+                            "application/json",
+                            br#"{"detail":"fixture model discovery is unavailable"}"#.to_vec(),
+                        )
+                    };
+                captured.lock().unwrap().push(request);
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(head.as_bytes()).is_err() || stream.write_all(&body).is_err()
+                {
+                    continue;
+                }
+                // Half-close, then drain, so Windows never answers unread
+                // inbound bytes with a reset the client would observe.
+                let _ = stream.shutdown(Shutdown::Write);
+                let mut drain = [0u8; 4096];
+                while matches!(stream.read(&mut drain), Ok(read) if read > 0) {}
+            }
+        });
+        Self {
+            base_url,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for ElevenLabsFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Read one HTTP request: headers, then exactly `Content-Length` body bytes.
+fn read_fixture_request(stream: &mut std::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut scratch = [0u8; 4096];
+    loop {
+        match stream.read(&mut scratch) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => request.extend_from_slice(&scratch[..read]),
+        }
+        let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+        let length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if request.len() >= end + 4 + length {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+/// 10 ms of mono 16-bit 44.1 kHz silence in a canonical WAV container.
+fn silent_wav() -> Vec<u8> {
+    let data_len = 441u32 * 2;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&44_100u32.to_le_bytes());
+    wav.extend_from_slice(&88_200u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.resize(44 + data_len as usize, 0);
+    wav
+}
+
+#[test]
+fn elevenlabs_discovery_failure_stops_before_synthesis() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    let server = ElevenLabsFixture::discovery_unavailable();
+    let out = temp.path().join("audio");
+    let key_env = "BOOKFORGE_ELEVENLABS_DISCOVERY_FAILURE_TEST_KEY";
+
+    // An HTTP 503 that survives the metadata retries is a provider error, not
+    // a transport outage, so the deterministic degraded tier does not apply
+    // and the run must stop before spending anything.
+    bookforge()
+        .current_dir(temp.path())
+        .env(key_env, "dummy-test-key")
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "fixture-voice",
+            "--base-url",
+            &server.base_url,
+            "--api-key-env",
+            key_env,
+            "--timeout-seconds",
+            "5",
+            "--no-book-file",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "ElevenLabs model discovery failed",
+        ))
+        .stderr(predicates::str::contains("select an explicit --model"));
+
+    let requests = server.requests();
+    assert!(!requests.is_empty(), "discovery must reach the fixture");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.starts_with("GET /v1/models ")),
+        "a failed discovery must not query quota or synthesize: {requests:?}"
+    );
+    assert!(
+        !out.exists(),
+        "a failed discovery must not create the audiobook output"
+    );
+}
+
+#[test]
+fn elevenlabs_explicit_model_synthesizes_without_discovery() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let input = fixture(temp.path());
+    let server = ElevenLabsFixture::discovery_unavailable();
+    let out = temp.path().join("audio");
+    let key_env = "BOOKFORGE_ELEVENLABS_EXPLICIT_MODEL_TEST_KEY";
+
+    bookforge()
+        .current_dir(temp.path())
+        .env(key_env, "dummy-test-key")
+        .args([
+            "audiobook",
+            input.to_str().unwrap(),
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "fixture-voice",
+            "--model",
+            "eleven_flash_v2_5",
+            "--base-url",
+            &server.base_url,
+            "--api-key-env",
+            key_env,
+            "--format",
+            "wav",
+            "--concurrency",
+            "1",
+            "--no-book-file",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let requests = server.requests();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.starts_with("GET /v1/models ")),
+        "an explicit model must skip discovery: {requests:?}"
+    );
+    let speech: Vec<_> = requests
+        .iter()
+        .filter(|request| request.starts_with("POST "))
+        .collect();
+    assert!(!speech.is_empty(), "synthesis must reach the fixture");
+    for request in speech {
+        let (_, body) = request.split_once("\r\n\r\n").expect("request has a body");
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON speech body");
+        assert_eq!(body["model_id"], "eleven_flash_v2_5");
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["status"], "succeeded");
 }

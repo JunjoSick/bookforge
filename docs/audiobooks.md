@@ -123,7 +123,11 @@ aloud instead of treating them as directives.
   If the models endpoint cannot be reached because of a transient network
   failure, the run does not abort: it degrades deterministically to the
   cheapest suitable tier instead — see
-  [Cost and quota preflight](#cost-and-quota-preflight).
+  [Cost and quota preflight](#cost-and-quota-preflight). Any other discovery
+  failure, such as an HTTP error from the models endpoint, stops the run
+  before synthesis; retry, or pass `--model` to skip discovery. An offline
+  `--dry-run` without `--model` plans with `eleven_multilingual_v2` and says
+  that a live run auto-selects.
 
   ```bash
   bookforge audiobook book.epub --provider elevenlabs \
@@ -235,9 +239,11 @@ hashes identically, and reuses previously paid chunks instead of re-synthesizing
 The library reports degraded selections with `degraded: true` plus a
 human-readable `reason`; the CLI surfaces the reason in plan output
 (`Degraded model choice: …` and `model_degraded_reason` in the JSON
-`audiobook_plan` event) and other (non-transient) preflight errors keep failing
-hard in the engine and are reported as a warning by the CLI, which then falls
-back to Multilingual v2 as before.
+`audiobook_plan` event). Other (non-transient) preflight errors stop the run
+before the quota lookup or any synthesis, with `ElevenLabs model discovery
+failed; retry or select an explicit --model to skip discovery`. Unlike the
+quota lookup, model discovery must succeed (or degrade) before anything is
+spent.
 
 ## Book files, stitching, and loudness
 
