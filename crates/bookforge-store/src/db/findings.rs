@@ -141,7 +141,11 @@ fn classify_failure(fragment: &str) -> QaFindingKind {
     // most useful classification. In particular, Interrupted must precede
     // ProviderError because the real string is "provider error: interrupted by
     // user" after LlmError::Provider wraps the operator interrupt.
-    if lower.contains("interrupted by user") {
+    // A segment stopped before every block arrived is preserved for retry
+    // with this exact message; it is an interruption, not a block mismatch.
+    if lower.contains("interrupted by user")
+        || lower == "translation interrupted before all blocks completed"
+    {
         QaFindingKind::Interrupted
     } else if lower.contains("protected span missing") {
         QaFindingKind::ProtectedSpanMissing
@@ -294,7 +298,13 @@ impl JobStore {
         error: &str,
     ) -> Result<usize> {
         let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
+        // Take the write lock before the freeze check: a manual correction can
+        // commit after a model checkpoint and before this best-effort write,
+        // and stale model findings must never reattach to the corrected row.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if super::translations::translation_is_human_corrected_on(&tx, job_id, segment_id)? {
+            return Ok(0);
+        }
         let written = record_segment_findings_on(&tx, job_id, segment_id, error)?;
         tx.commit()?;
         Ok(written)
@@ -313,7 +323,12 @@ impl JobStore {
         findings: &[EngineFinding],
     ) -> Result<usize> {
         let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
+        // Same freeze guard as `record_segment_findings`: the checkpoint writer
+        // persists these after the checkpoint transaction has committed.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if super::translations::translation_is_human_corrected_on(&tx, job_id, segment_id)? {
+            return Ok(0);
+        }
         let written = record_segment_engine_findings_on(&tx, job_id, segment_id, findings)?;
         tx.commit()?;
         Ok(written)

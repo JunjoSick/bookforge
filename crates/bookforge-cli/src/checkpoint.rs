@@ -255,6 +255,29 @@ fn apply(store: &JobStore, cmd: CheckpointCommand) -> Result<()> {
                 translation.error.as_deref(),
             );
         }
+        SegmentStatus::RetryPending => {
+            // A segment interrupted before every block arrived: keep its
+            // completed blocks and usage, but leave it resumable. The store
+            // classifies the interruption itself; there are no validation
+            // findings to persist for blocks that were never returned.
+            store.save_retry_pending_translation(SaveNeedsReview {
+                job_id: &job_id,
+                segment_id: &translation.segment_id.0,
+                preserved_text: &joined,
+                blocks: &translation.blocks,
+                provider: &provider,
+                model: &model,
+                prompt_version: &prompt_version,
+                error: translation
+                    .error
+                    .as_deref()
+                    .unwrap_or("translation interrupted before all blocks completed"),
+                input_tokens: translation.input_tokens,
+                input_cached_tokens: translation.input_cached_tokens,
+                output_tokens: translation.output_tokens,
+                tokens_estimated: translation.tokens_estimated,
+            })?;
+        }
         SegmentStatus::Failed => {
             store.mark_segment_failed_if_unfinished(
                 &job_id,
@@ -457,7 +480,11 @@ mod tests {
         store
             .insert_segments(
                 &job.id,
-                &[test_segment("seg_a", 0), test_segment("seg_b", 1)],
+                &[
+                    test_segment("seg_a", 0),
+                    test_segment("seg_b", 1),
+                    test_segment("seg_c", 2),
+                ],
                 "v1",
                 "mock",
                 "mock-model",
@@ -491,6 +518,17 @@ mod tests {
             .await
             .expect("send ok");
 
+        sender
+            .send(CheckpointCommand::SaveTranslation {
+                job_id: job.id.clone(),
+                translation: Box::new(test_translation("seg_c", 2, SegmentStatus::RetryPending)),
+                provider: "mock".to_string(),
+                model: "mock-model".to_string(),
+                prompt_version: "v1".to_string(),
+            })
+            .await
+            .expect("interrupted translation should queue");
+
         drop(sender);
         writer.shutdown().await.expect("shutdown should succeed");
 
@@ -498,7 +536,24 @@ mod tests {
         let summary = store.summary(&job.id).unwrap().expect("summary exists");
         assert_eq!(summary.succeeded, 1, "one succeeded");
         assert_eq!(summary.needs_review, 1, "one needs review");
-        assert_eq!(summary.total_segments, 2);
+        assert_eq!(summary.total_segments, 3);
+        // The interrupted segment keeps its partial work and usage but stays
+        // resumable instead of being dropped or claimed as finished.
+        assert_eq!(summary.retry_pending, 1);
+        assert_eq!(store.resumable_segment_ids(&job.id).unwrap(), vec!["seg_c"]);
+        let pending = store
+            .segment_records(&job.id)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == "seg_c")
+            .unwrap();
+        assert_eq!(pending.input_tokens, Some(10));
+        let blocks = store.load_block_translations(&job.id).unwrap();
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.segment_id == "seg_c" && block.text == "Translated text")
+        );
 
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_file(input_path);
