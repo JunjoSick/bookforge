@@ -211,15 +211,18 @@ Estimated cost: ~$1.23 / ~4500 credits
 
 Set `BOOKFORGE_AUDIO_PRICING_PATH` to a JSON file with the same structure to
 override the bundled table (for new models or updated rates). Pricing is per
-character, so changing chunk size does not change the estimate. These figures
+character of the planned narration text, including supported heading break
+tags, so changing chunk size does not change the estimate. These figures
 are planning estimates, not invoices: provider plans and rates can change, and
 the provider's own billing is authoritative.
 
 Before a live ElevenLabs run, BookForge queries `/v1/user/subscription` and
 prints a line such as `ElevenLabs quota: 12000 remaining of 20000`. It warns
-when the plan exceeds the remaining quota. A dry run performs the same check
-when the configured key environment variable is available. Network failures
-during that quota lookup are always a warning and never prevent synthesis.
+when the rounded-up credit estimate exceeds the remaining quota, comparing
+characters instead only when the model has no pricing entry. A dry run
+performs the same check when the configured key environment variable is
+available. Network failures during that quota lookup are always a warning and
+never prevent synthesis.
 
 Model preflight behaves differently from the quota lookup. If the account's
 model list cannot be fetched because of a transient network failure, BookForge
@@ -342,7 +345,11 @@ The Audiobooks screen mirrors the CLI's current workflow:
   account's voices through a server-side proxy; the API key never reaches the
   browser. If voice retrieval fails, the form falls back to a voice-ID field.
 - A pre-launch estimate reports chapters, chunks, characters, cost, and
-  ElevenLabs quota before synthesis starts.
+  ElevenLabs quota before synthesis starts. It uses the same narration cleanup
+  and PDF-page grouping as a launch. With an explicit model it also counts
+  that model's heading break tags; an Auto estimate stays provisional because
+  the model, and therefore its tags and price, is only known after model
+  discovery. Its quota `fits` flag compares credits the same way as the CLI.
 - Running jobs show per-chapter completed/total progress and the resolved
   auto-selected model.
 - The Advanced section exposes chapter pause, flat-file output, loudness

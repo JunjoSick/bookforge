@@ -1,6 +1,7 @@
 use super::*;
 use super::{assets::*, audio::*, glossary::*, jobs::*, options::*, security::*, translation::*};
 use axum::http::HeaderValue;
+mod audio_dashboard;
 
 const TEST_HOST: &str = "127.0.0.1:8765";
 const TEST_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(30);

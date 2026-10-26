@@ -1067,7 +1067,7 @@ fn resolve_context_chars(provider: AudioProviderKind, model: &str) -> usize {
     DEFAULT_CONTEXT_CHARS
 }
 
-fn resolve_heading_break_tag(
+pub(crate) fn resolve_heading_break_tag(
     provider: AudioProviderKind,
     model: &str,
     setting: BreakTagsArg,
@@ -1241,19 +1241,16 @@ async fn elevenlabs_quota_preflight(
             let remaining = subscription
                 .character_limit
                 .saturating_sub(subscription.character_count);
-            match estimated_credits {
-                Some(credits) if credits.ceil() as u64 > remaining => {
-                    eprintln!(
+            if !elevenlabs_quota_fits(planned_chars, estimated_credits, remaining) {
+                match estimated_credits {
+                    Some(credits) => eprintln!(
                         "warning: planned audiobook needs about {} credits ({planned_chars} characters on {model}), exceeding the {remaining} remaining",
                         credits.ceil() as u64
-                    );
-                }
-                None if planned_chars as u64 > remaining => {
-                    eprintln!(
+                    ),
+                    None => eprintln!(
                         "warning: planned audiobook has {planned_chars} characters and {model} has no pricing entry, which may exceed the {remaining} remaining credits"
-                    );
+                    ),
                 }
-                _ => {}
             }
             Some(QuotaInfo {
                 remaining,
@@ -1264,6 +1261,23 @@ async fn elevenlabs_quota_preflight(
             eprintln!("warning: ElevenLabs quota preflight failed ({error}); continuing");
             None
         }
+    }
+}
+
+/// Whether a planned run fits the remaining ElevenLabs quota.
+///
+/// The quota is denominated in credits, so the rounded-up credit estimate is
+/// compared when the model has a pricing entry. Without one, characters are
+/// the conservative stand-in. The CLI preflight and the dashboard estimate
+/// share this rule so they never disagree about the same plan.
+pub(crate) fn elevenlabs_quota_fits(
+    planned_chars: usize,
+    estimated_credits: Option<f64>,
+    remaining: u64,
+) -> bool {
+    match estimated_credits {
+        Some(credits) => credits.ceil() as u128 <= u128::from(remaining),
+        None => planned_chars as u128 <= u128::from(remaining),
     }
 }
 

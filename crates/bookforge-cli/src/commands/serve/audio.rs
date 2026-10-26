@@ -155,12 +155,13 @@ async fn estimate_audiobook(
     let bytes = source.bytes;
 
     let provider = field_value(&fields, "provider").unwrap_or_else(|| "mock".to_string());
-    if !matches!(
-        provider.as_str(),
-        "mock" | "openai" | "gemini" | "elevenlabs"
-    ) {
-        return Ok(bad_request("unsupported audiobook provider"));
-    }
+    let provider_kind = match provider.as_str() {
+        "mock" => audiobook::AudioProviderKind::Mock,
+        "openai" => audiobook::AudioProviderKind::Openai,
+        "gemini" => audiobook::AudioProviderKind::Gemini,
+        "elevenlabs" => audiobook::AudioProviderKind::Elevenlabs,
+        _ => return Ok(bad_request("unsupported audiobook provider")),
+    };
     let model = field_value(&fields, "model").unwrap_or_else(|| match provider.as_str() {
         "openai" => "gpt-4o-mini-tts".to_string(),
         "gemini" => "gemini-3.1-flash-tts-preview".to_string(),
@@ -188,32 +189,21 @@ async fn estimate_audiobook(
         None => None,
     };
 
+    let plan_model = model.clone();
     let plan_result = tokio::task::spawn_blocking(move || -> Result<(usize, usize, usize)> {
         let temp = PrivateTempDir::create().context("failed to create a private temp directory")?;
         let plan_path = temp.path.join("book.epub");
         write_private_file(&plan_path, &bytes)?;
         let scratch_dir = temp.path.clone();
         contain_epub_parser_panics(move || {
-            // AUDIO-7 parity: estimates preprocess through the exact launcher
-            // pipeline (PDF-cleanup reflow -> read -> PDF page grouping), so
-            // PDF-derived books stop quoting different chapter/chunk counts
-            // than the launches they precede. Also lets the panic guard clean
-            // up any staged EPUB the shared pipeline leaves behind.
-            let narration = bookforge_audio::read_narration_source(&plan_path, &scratch_dir)?;
-            let options = bookforge_audio::AudiobookOptions {
+            plan_audiobook_estimate(
+                &plan_path,
+                &scratch_dir,
+                provider_kind,
+                &plan_model,
                 max_chars,
                 chapter_filter,
-                pdf_page_grouping: narration.pdf_page_grouping,
-                ..bookforge_audio::AudiobookOptions::default()
-            };
-            let plan = bookforge_audio::plan_chunks(&narration.book, &options);
-            let chapters = plan
-                .iter()
-                .map(|chunk| chunk.chapter_index)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len();
-            let characters = plan.iter().map(|chunk| chunk.chars).sum();
-            Ok((chapters, plan.len(), characters))
+            )
         })
     })
     .await;
@@ -258,13 +248,59 @@ async fn estimate_audiobook(
                 json!({
                     "remaining": remaining,
                     "limit": subscription.character_limit,
-                    "fits": characters as u128 <= remaining as u128,
+                    "fits": audiobook::elevenlabs_quota_fits(
+                        characters,
+                        cost.and_then(|value| value.credits),
+                        remaining,
+                    ),
                 }),
             );
         }
     }
 
     Ok(Json(payload).into_response())
+}
+
+/// Plan an estimate exactly the way a dashboard launch narrates the book.
+///
+/// AUDIO-7 parity: the input goes through the shared launcher pipeline
+/// (PDF-cleanup reflow, read, PDF page grouping), so PDF-derived books quote
+/// the same chapter and chunk counts as the launch they precede. Dashboard
+/// launches use the CLI's default `--break-tags auto` policy, so an explicit
+/// model's heading break tags are counted too. An ElevenLabs Auto estimate
+/// has no model yet and therefore no tags; it stays provisional until model
+/// discovery runs.
+pub(super) fn plan_audiobook_estimate(
+    input: &Path,
+    scratch_dir: &Path,
+    provider: audiobook::AudioProviderKind,
+    model: &str,
+    max_chars: usize,
+    chapter_filter: Option<std::collections::BTreeSet<usize>>,
+) -> Result<(usize, usize, usize)> {
+    let narration = bookforge_audio::read_narration_source(input, scratch_dir)?;
+    let options = bookforge_audio::AudiobookOptions {
+        max_chars,
+        chapter_filter,
+        pdf_page_grouping: narration.pdf_page_grouping,
+        heading_break_tag: audiobook::resolve_heading_break_tag(
+            provider,
+            model,
+            audiobook::BreakTagsArg::Auto,
+        ),
+        ..bookforge_audio::AudiobookOptions::default()
+    };
+    let plan = bookforge_audio::plan_chunks(&narration.book, &options);
+    if plan.is_empty() {
+        anyhow::bail!("no narratable text found (cover-only or empty book?)");
+    }
+    let chapters = plan
+        .iter()
+        .map(|chunk| chunk.chapter_index)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let characters = plan.iter().map(|chunk| chunk.chars).sum();
+    Ok((chapters, plan.len(), characters))
 }
 
 async fn fetch_dashboard_elevenlabs_subscription(
