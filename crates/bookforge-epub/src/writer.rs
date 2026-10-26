@@ -9,7 +9,7 @@ use std::{
 use bookforge_core::{
     BookforgeError, Result,
     config::{BilingualMode, BilingualStyle},
-    ir::{Block, Book, DomPath, TEXT_NODE_PATH_BASE},
+    ir::{Block, BlockId, Book, DomPath, TEXT_NODE_PATH_BASE},
     marker::{parse_empty_marker, parse_paired_marker_open},
     segment::BlockTranslation,
 };
@@ -118,12 +118,8 @@ fn write_rebuilt_epub(
     preflight_archive_path(source_path)?;
     let mut archive = ZipArchive::new(source)?;
     let mut read_budget = validate_archive_metadata(&mut archive, DEFAULT_ARCHIVE_LIMITS)?;
-    let mut writer = ZipWriter::new(output_file);
 
-    let translations_by_block = translations
-        .iter()
-        .map(|translation| (&translation.block_id, translation.text.as_str()))
-        .collect::<HashMap<_, _>>();
+    let translations_by_block = index_translations(book, translations)?;
     let prepared_patches = book
         .blocks
         .iter()
@@ -141,10 +137,12 @@ fn write_rebuilt_epub(
         .iter()
         .map(|(block, translation)| (*block, translation.as_str()))
         .collect::<Vec<_>>();
-    let patches_by_href = patches_by_href(book, &patches);
+    let patches_by_href = patches_by_href(book, &patches)?;
+    ensure_patch_targets_exist(&mut archive, patches_by_href.keys().copied())?;
     let archive_names = archive_entry_names(&mut archive)?;
     let stylesheet = stylesheet_plan(book.id.0.as_str(), &archive_names, options);
 
+    let mut writer = ZipWriter::new(output_file);
     write_mimetype_first(&mut archive, &mut writer, &mut read_budget)?;
 
     let mut total_skipped = 0usize;
@@ -466,27 +464,97 @@ fn relative_href(from_file: &str, target_file: &str) -> String {
     }
 }
 
+/// Index the requested translations by block, rejecting requests the
+/// rebuild could only satisfy by guessing: a translation for a block the
+/// book does not contain would silently vanish, and duplicate block ids in
+/// the book or in the request leave it ambiguous which text lands where.
+fn index_translations<'a>(
+    book: &'a Book,
+    translations: &'a [BlockTranslation],
+) -> Result<HashMap<&'a BlockId, &'a str>> {
+    let mut known_blocks = HashSet::with_capacity(book.blocks.len());
+    for block in &book.blocks {
+        if !known_blocks.insert(&block.id) {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB book contains duplicate block '{}'",
+                block.id.0
+            )));
+        }
+    }
+    let mut by_block = HashMap::with_capacity(translations.len());
+    for translation in translations {
+        if !known_blocks.contains(&translation.block_id) {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB translation references unknown block '{}'",
+                translation.block_id.0
+            )));
+        }
+        if by_block
+            .insert(&translation.block_id, translation.text.as_str())
+            .is_some()
+        {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB translation contains duplicate block '{}'",
+                translation.block_id.0
+            )));
+        }
+    }
+    Ok(by_block)
+}
+
 fn patches_by_href<'a>(
     book: &'a Book,
     patches: &'a [(&'a Block, &'a str)],
-) -> HashMap<&'a str, Vec<BlockPatch<'a>>> {
-    let section_href = book
-        .sections
-        .iter()
-        .map(|section| (&section.id, section.href.as_str()))
-        .collect::<HashMap<_, _>>();
+) -> Result<HashMap<&'a str, Vec<BlockPatch<'a>>>> {
+    let mut section_href = HashMap::with_capacity(book.sections.len());
+    for section in &book.sections {
+        if section_href
+            .insert(&section.id, section.href.as_str())
+            .is_some()
+        {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB book contains duplicate section '{}'",
+                section.id.0
+            )));
+        }
+    }
     let mut by_href = HashMap::<&str, Vec<BlockPatch<'a>>>::new();
 
     for (block, translation) in patches {
-        if let Some(href) = section_href.get(&block.section_id) {
-            by_href
-                .entry(*href)
-                .or_default()
-                .push(BlockPatch { block, translation });
-        }
+        let href = section_href.get(&block.section_id).ok_or_else(|| {
+            BookforgeError::InvalidInput(format!(
+                "EPUB translation for block '{}' references missing section '{}'",
+                block.id.0, block.section_id.0
+            ))
+        })?;
+        by_href
+            .entry(*href)
+            .or_default()
+            .push(BlockPatch { block, translation });
     }
 
-    by_href
+    Ok(by_href)
+}
+
+/// Every patched resource must be a file in the source archive; otherwise
+/// its translations would be dropped without a trace.
+fn ensure_patch_targets_exist<'a>(
+    archive: &mut ZipArchive<File>,
+    hrefs: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    for href in hrefs {
+        let Some(index) = archive.index_for_name(href) else {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB translation targets resource '{href}', which is not in the archive"
+            )));
+        };
+        if archive.by_index_raw(index)?.is_dir() {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB translation targets directory '{href}' instead of a document"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn patch_opf_for_rebuild(
@@ -1109,10 +1177,21 @@ fn patch_xhtml_with_specs(
 ) -> Result<PatchOutcome> {
     let normalized = crate::packed_notes::normalize_packed_notes(xhtml)?;
     let xhtml = normalized.as_ref();
-    let patch_map = patches
-        .iter()
-        .map(|patch| (patch.dom_path.0.as_slice(), *patch))
-        .collect::<HashMap<_, _>>();
+    let mut patch_map = HashMap::with_capacity(patches.len());
+    for patch in patches {
+        if patch_map
+            .insert(patch.dom_path.0.as_slice(), *patch)
+            .is_some()
+        {
+            return Err(BookforgeError::InvalidInput(format!(
+                "multiple EPUB translations target the same DOM path {:?}",
+                patch.dom_path.0
+            )));
+        }
+    }
+    // Every requested patch must find its target. One that does not means
+    // the IR and the document disagree, and its translation would vanish.
+    let mut matched_paths = HashSet::with_capacity(patches.len());
     let mut reader = Reader::from_str(xhtml);
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::new());
@@ -1132,6 +1211,7 @@ fn patch_xhtml_with_specs(
                 writer.write_event(Event::Start(element.borrow()))?;
 
                 if let Some(patch) = patch_map.get(path.as_slice()).copied() {
+                    matched_paths.insert(patch.dom_path.0.as_slice());
                     let buffered = buffer_until_matching_end(&mut reader)?;
                     // <hgroup> permits only heading children: a sibling
                     // <p> after a heading inside the group would trip
@@ -1168,6 +1248,7 @@ fn patch_xhtml_with_specs(
             Event::Empty(element) => {
                 let path = next_child_path(&mut stack);
                 if let Some(patch) = patch_map.get(path.as_slice()).copied() {
+                    matched_paths.insert(patch.dom_path.0.as_slice());
                     match options.mode {
                         BilingualMode::Replace => {
                             let name = element.name();
@@ -1201,6 +1282,7 @@ fn patch_xhtml_with_specs(
                 let non_whitespace = !chunk.text.trim().is_empty();
                 match text_node_patch(&patch_map, &mut stack, non_whitespace) {
                     Some(patch) => {
+                        matched_paths.insert(patch.dom_path.0.as_slice());
                         // Extraction trims loose text, but its surrounding
                         // whitespace still separates it from neighbouring
                         // inline elements and must survive the patch.
@@ -1243,6 +1325,27 @@ fn patch_xhtml_with_specs(
                 writer.write_event(event.borrow())?;
             }
         }
+    }
+
+    if matched_paths.len() < patch_map.len() {
+        let mut unmatched = patch_map
+            .keys()
+            .filter(|path| !matched_paths.contains(*path))
+            .collect::<Vec<_>>();
+        unmatched.sort();
+        let described = unmatched
+            .iter()
+            .map(
+                |path| match patch_map.get(*path).and_then(|patch| patch.block) {
+                    Some(block) => format!("block '{}' at {path:?}", block.id.0),
+                    None => format!("{path:?}"),
+                },
+            )
+            .collect::<Vec<_>>();
+        return Err(BookforgeError::InvalidInput(format!(
+            "EPUB translation target(s) not found in the document: {}",
+            described.join(", ")
+        )));
     }
 
     let xhtml = String::from_utf8(writer.into_inner()).map_err(|err| {
@@ -3240,6 +3343,25 @@ mod tests {
             outcome.xhtml
         );
         validate_xml(&outcome.xhtml).expect("append output should re-parse");
+    }
+
+    #[test]
+    fn patch_targets_that_match_nothing_are_rejected() {
+        let xhtml = "<root><p>Present</p></root>";
+        let present = DomPath(vec![0, 0]);
+        let absent = DomPath(vec![0, 7]);
+        let error = patch_xhtml(xhtml, &[(&present, "Presente"), (&absent, "Assente")])
+            .expect_err("a translation without a target must not vanish");
+        assert!(error.to_string().contains("[0, 7]"), "{error}");
+    }
+
+    #[test]
+    fn two_translations_for_one_dom_path_are_rejected() {
+        let xhtml = "<root><p>Only</p></root>";
+        let path = DomPath(vec![0, 0]);
+        let error = patch_xhtml(xhtml, &[(&path, "Uno"), (&path, "Due")])
+            .expect_err("colliding patches must not silently pick one");
+        assert!(error.to_string().contains("same DOM path"), "{error}");
     }
 
     #[test]
