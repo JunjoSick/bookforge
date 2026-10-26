@@ -32,6 +32,12 @@ pub(super) fn ocr_low_confidence_pages(
             continue;
         }
         match engine.ocr_page(&image, *page_number) {
+            // Replacing the page with nothing would delete its text layer
+            // and keep it out of `--low-confidence preserve`. The HTTP
+            // client already rejects empty content; any engine may not.
+            Ok(text) if text.trim().is_empty() => outcome.warnings.push(format!(
+                "page {page_number}: OCR returned empty text; source content retained"
+            )),
             Ok(text) => {
                 replace_page_with_ocr_text(blocks, *page_number, &text);
                 outcome.recovered.push(*page_number);
@@ -568,6 +574,29 @@ mod ocr_tests {
         assert_eq!(blocks[0].block.text(), "original");
         assert!(outcome.warnings[0].contains("page 3: OCR failed"));
         assert!(outcome.warnings[0].contains("offline"));
+    }
+
+    #[test]
+    fn empty_ocr_text_keeps_the_page_and_leaves_it_for_preservation() {
+        let engine = MockOcrEngine::success(" \n\t\r\n");
+        let mut blocks = vec![paragraph(1, "original"), figure(1, 200)];
+        let outcome = ocr_low_confidence_pages(
+            &engine,
+            &mut |_page| Ok(vec![1, 2, 3]),
+            &mut blocks,
+            &[1],
+            usize::MAX,
+        );
+
+        assert!(
+            outcome.recovered.is_empty(),
+            "page stays a preservation candidate"
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].block.text(), "original");
+        assert!(matches!(blocks[1].block, DocBlock::Figure { .. }));
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].contains("page 1: OCR returned empty text"));
     }
 
     #[test]
