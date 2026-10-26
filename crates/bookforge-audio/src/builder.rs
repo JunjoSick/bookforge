@@ -2015,6 +2015,34 @@ mod tests {
     }
 
     #[test]
+    fn atomic_audio_write_preserves_unrelated_siblings_and_rejects_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        // Names an older writer (or a concurrent foreign one) could own.
+        let backup = path.with_extension("replace.bak");
+        let other_temp = path.with_extension("part.tmp");
+        std::fs::write(&path, b"old manifest").unwrap();
+        std::fs::write(&backup, b"recovery copy").unwrap();
+        std::fs::write(&other_temp, b"another writer").unwrap();
+
+        write_atomic(&path, b"new manifest").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new manifest");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"recovery copy");
+        assert_eq!(std::fs::read(&other_temp).unwrap(), b"another writer");
+
+        let directory = dir.path().join("audio.mp3");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("keep.txt"), b"keep").unwrap();
+        assert!(write_atomic(&directory, b"audio").is_err());
+        assert_eq!(std::fs::read(directory.join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            4,
+            "only the manifest, the two foreign siblings, and the directory remain"
+        );
+    }
+
+    #[test]
     fn failed_rename_cleans_up_its_temp_sibling() {
         let dir = tempfile::tempdir().unwrap();
         // Renaming onto an occupied *directory* path fails on every platform
