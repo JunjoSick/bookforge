@@ -1,9 +1,17 @@
 use super::*;
 
 impl JobStore {
+    /// The lookup and the possible insert run in one IMMEDIATE transaction.
+    /// A deferred transaction would read first and upgrade to a writer only
+    /// at the INSERT; if another connection committed in between, SQLite
+    /// refuses the stale upgrade (`SQLITE_BUSY_SNAPSHOT`) without waiting.
+    /// Reserving the writer up front makes concurrent edits queue instead.
     pub fn upsert_glossary_terms(&self, terms: &[GlossaryTerm]) -> Result<usize> {
+        if terms.is_empty() {
+            return Ok(0);
+        }
         let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = timestamp_string();
         let mut changed = 0usize;
         for term in terms {
@@ -131,8 +139,13 @@ impl JobStore {
         target_language: &str,
         candidates: &[NewGlossaryCandidate<'_>],
     ) -> Result<GlossaryCandidateUpsertResult> {
+        if candidates.is_empty() {
+            return Ok(GlossaryCandidateUpsertResult::default());
+        }
         let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
+        // Same read-then-write shape as `upsert_glossary_terms`: reserve the
+        // writer before the lookup so a concurrent commit cannot strand it.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = timestamp_string();
         let mut result = GlossaryCandidateUpsertResult::default();
 
@@ -418,9 +431,14 @@ impl JobStore {
     /// Upsert a style sheet for a (scope, target_language) tuple. Returns
     /// the row id of the inserted/updated row.
     pub fn upsert_style_sheet(&self, record: &NewStyleSheet<'_>) -> Result<i64> {
-        let conn = self.conn.borrow();
+        let mut conn = self.conn.borrow_mut();
+        // A NULL global scope never conflicts under the table UNIQUE
+        // constraint, so the update, the possible insert and the id read must
+        // hold one writer reservation; otherwise two first-time global writes
+        // race and the loser fails on the global partial unique index.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = timestamp_string();
-        let updated = conn.execute(
+        let updated = tx.execute(
             "UPDATE style_sheets
              SET content_toml = ?1,
                  fingerprint = ?2,
@@ -438,7 +456,7 @@ impl JobStore {
             ],
         )?;
         if updated == 0 {
-            conn.execute(
+            tx.execute(
             "INSERT INTO style_sheets
                 (scope_kind, scope_id, target_language, content_toml, fingerprint, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
@@ -456,7 +474,7 @@ impl JobStore {
             ],
             )?;
         }
-        let id: i64 = conn.query_row(
+        let id: i64 = tx.query_row(
             "SELECT id FROM style_sheets
                 WHERE scope_kind = ?1 AND IFNULL(scope_id, '') = IFNULL(?2, '')
                   AND target_language = ?3",
@@ -467,6 +485,7 @@ impl JobStore {
             ],
             |row| row.get(0),
         )?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -554,7 +573,8 @@ impl JobStore {
             return Ok(0);
         }
         let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
+        // Reserve the writer before the first lookup, as for glossary terms.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = timestamp_string();
         let mut changed = 0usize;
         for entity in entities {
@@ -787,3 +807,6 @@ impl std::fmt::Display for RowEnumError {
 }
 
 impl std::error::Error for RowEnumError {}
+
+#[cfg(test)]
+mod tests;
