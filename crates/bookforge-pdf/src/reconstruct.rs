@@ -953,6 +953,49 @@ fn ends_early(lines: &[Line], index: usize) -> bool {
     line.right < measure - line.height || ends_sentence_terminal(&line.text())
 }
 
+/// Lines of flush-right text: at least four lines of one size sharing a
+/// right edge (within 2 units) whose left edges have no common margin, no
+/// cluster holding half of them. Their varying left edges are line lengths,
+/// not paragraph indents. Grouping by size and right edge keeps another
+/// column or smaller notes from voting on the body's alignment, and in
+/// justified text the flush-left lines always hold the majority.
+fn ragged_left_lines(lines: &[Line]) -> HashSet<usize> {
+    let mut indices: Vec<usize> = (0..lines.len()).collect();
+    indices.sort_by_key(|&index| (lines[index].font_size, lines[index].right));
+    let mut ragged = HashSet::new();
+    let mut start = 0;
+    while start < indices.len() {
+        let anchor = &lines[indices[start]];
+        let end = (start + 1..indices.len())
+            .find(|&position| {
+                let line = &lines[indices[position]];
+                line.font_size != anchor.font_size || line.right - anchor.right > 2
+            })
+            .unwrap_or(indices.len());
+        let group = &indices[start..end];
+        if group.len() >= 4 {
+            let mut left_edges = group
+                .iter()
+                .map(|&index| lines[index].left)
+                .collect::<Vec<_>>();
+            left_edges.sort_unstable();
+            let mut window_start = 0;
+            let mut largest_cluster = 0;
+            for (position, &left) in left_edges.iter().enumerate() {
+                while left - left_edges[window_start] > 2 {
+                    window_start += 1;
+                }
+                largest_cluster = largest_cluster.max(position - window_start + 1);
+            }
+            if largest_cluster * 2 < group.len() {
+                ragged.extend(group.iter().copied());
+            }
+        }
+        start = end;
+    }
+    ragged
+}
+
 /// Cluster ordered lines into paragraphs and headings.
 fn cluster_paragraphs(
     lines: &[Line],
@@ -961,6 +1004,7 @@ fn cluster_paragraphs(
 ) -> Vec<PendingBlock> {
     let median_gap = median_line_gap(lines);
     let note_starts = numbered_note_starts(lines, heading_levels);
+    let ragged_left = ragged_left_lines(lines);
     let mut blocks = Vec::new();
     let mut current: Vec<Span> = Vec::new();
     let mut current_heading: Option<u8> = None;
@@ -1015,8 +1059,11 @@ fn cluster_paragraphs(
                         || heading_levels.contains_key(&prev.font_size)
                         || line.font_size.abs_diff(prev.font_size) >= 2);
                 let large_gap = gap > (median_gap as f32 * 1.8) as i32 || gap < 0;
-                let indented =
-                    line.left > prev.left + (body_size as i32) / 2 && prev.left <= line.left; // fresh indent, not a continuation of one
+                // A fresh indent, not a continuation of one, and not just a
+                // shorter line of flush-right text.
+                let indented = !ragged_left.contains(&index)
+                    && line.left > prev.left + (body_size as i32) / 2
+                    && prev.left <= line.left;
                 size_changed || large_gap || indented || note_starts.contains(&index)
             }
         };
@@ -1490,6 +1537,83 @@ mod tests {
                 "First paragraph line one. First paragraph line two.".to_string(),
                 "Second paragraph after a large gap.".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn right_aligned_lines_are_not_split_at_each_new_left_edge() {
+        // Flush-right prose: every line ends at x=544 and starts wherever
+        // its length puts it, so nearly every line looks indented.
+        let mut xml = String::from(
+            r#"<pdf2xml><page number="1" width="600" height="900"><fontspec id="0" size="18" family="T"/>"#,
+        );
+        for (index, left) in [140, 122, 131, 176, 178, 135, 137, 150]
+            .into_iter()
+            .enumerate()
+        {
+            xml.push_str(&format!(
+                r#"<text top="{}" left="{left}" width="{}" height="18" font="0">Verse {index}.</text>"#,
+                63 + index * 18,
+                544 - left
+            ));
+        }
+        xml.push_str(r#"<text top="250" left="145" width="399" height="18" font="0">Prose after a real vertical gap.</text></page></pdf2xml>"#);
+        let result = reconstruct(
+            &parse_pdf2xml(&xml).expect("fixture parses"),
+            ColumnMode::Single,
+        );
+
+        let texts = result
+            .blocks
+            .iter()
+            .map(|block| block.block.text())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "Verse 0. Verse 1. Verse 2. Verse 3. Verse 4. Verse 5. Verse 6. Verse 7.",
+                "Prose after a real vertical gap."
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stable_left_margin_keeps_first_line_indents_as_breaks() {
+        let mut xml = String::from(
+            r#"<pdf2xml><page number="1" width="600" height="800"><fontspec id="0" size="12" family="T"/>"#,
+        );
+        for (index, (left, right)) in [
+            (80, 520),
+            (80, 400),
+            (100, 520),
+            (80, 520),
+            (80, 450),
+            (100, 520),
+            (80, 520),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            xml.push_str(&format!(
+                r#"<text top="{}" left="{left}" width="{}" height="12" font="0">Row {index}.</text>"#,
+                100 + index * 16,
+                right - left
+            ));
+        }
+        xml.push_str("</page></pdf2xml>");
+        let result = reconstruct(
+            &parse_pdf2xml(&xml).expect("fixture parses"),
+            ColumnMode::Single,
+        );
+
+        let texts = result
+            .blocks
+            .iter()
+            .map(|block| block.block.text())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            ["Row 0. Row 1.", "Row 2. Row 3. Row 4.", "Row 5. Row 6."]
         );
     }
 
