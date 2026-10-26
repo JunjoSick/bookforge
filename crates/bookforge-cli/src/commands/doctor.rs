@@ -10,6 +10,10 @@ use bookforge_store::{JobStore, run_doctor};
 
 use crate::sanitize::{sanitize_terminal, sanitize_truncated};
 
+/// Output allowance for the provider probe. Reasoning models spend part of it
+/// thinking before the short JSON answer, so it must leave room for both.
+const DOCTOR_PROBE_MAX_OUTPUT_TOKENS: u32 = 1_024;
+
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
     /// Check storage health
@@ -390,7 +394,9 @@ async fn run_provider_doctor(
             user: "Reply with {\"status\": \"ok\"}".to_string(),
             response_format: ResponseFormat::Json,
             temperature: 0.0,
-            max_output_tokens: Some(50),
+            // Reasoning shares this budget with the JSON answer. A 50-token
+            // probe can be spent entirely on reasoning before any content.
+            max_output_tokens: Some(DOCTOR_PROBE_MAX_OUTPUT_TOKENS),
             metadata: RequestMetadata::default(),
         })
         .await;

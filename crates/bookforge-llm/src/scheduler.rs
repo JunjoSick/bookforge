@@ -1234,21 +1234,15 @@ pub(crate) fn clamped_output_budget(
     model_context_tokens: Option<u32>,
     user_cap: Option<u32>,
 ) -> u32 {
-    let mut limit = computed.max(MIN_OUTPUT_TOKEN_FLOOR);
-
-    if let Some(context) = model_context_tokens {
-        let prompt = u32::try_from(estimated_prompt_tokens).unwrap_or(u32::MAX);
-        // Small fixed headroom for usage accounting drift between our
-        // tokenizer estimate and the provider's count.
-        let remainder = context.saturating_sub(prompt).saturating_sub(256);
-        limit = limit.min(remainder);
-    }
-
-    if let Some(cap) = user_cap {
-        limit = limit.min(cap);
-    }
-
-    limit
+    // One implementation for every caller: core's helper applies the same
+    // floor and the same 256-token accounting headroom, and never lets the
+    // floor raise the result past the context remainder or the user cap.
+    bookforge_core::config::cap_output_tokens(
+        computed.max(MIN_OUTPUT_TOKEN_FLOOR),
+        estimated_prompt_tokens,
+        model_context_tokens,
+        user_cap,
+    )
 }
 
 fn render_prompt(
