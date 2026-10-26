@@ -2173,6 +2173,52 @@ fn cli_pause_and_resume_live_mock_run() {
     assert!(output.exists(), "resumed live run should write output");
 }
 
+/// A plain `resume` must not start a second worker beside a live one: it is
+/// refused before it changes the saved output, event log or job state.
+#[test]
+fn cli_resume_rejects_a_live_worker_before_changing_output_or_dispatching() {
+    let temp = tempfile::tempdir().unwrap();
+    let events = temp.path().join("live-events.jsonl");
+    let output = temp.path().join("out.epub");
+    let release = temp.path().join("mock-release");
+    let mut child = spawn_gated_mock_translate(&temp, &events, &output, &release);
+    let job_id = wait_for_job_id_in_events(&events, &mut child);
+    wait_for_first_batch_request(&events, &mut child);
+    let replacement_output = temp.path().join("unwanted.epub");
+    let resume_events = temp.path().join("unwanted-events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .timeout(Duration::from_secs(30))
+        .args([
+            "resume",
+            &job_id,
+            "--ui",
+            "quiet",
+            "--output",
+            replacement_output.to_str().unwrap(),
+            "--progress-jsonl",
+            resume_events.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already has an active worker"));
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).unwrap();
+    assert_eq!(store.get_job(&job_id).unwrap().unwrap().output_path, output);
+    drop(store);
+    assert!(
+        !resume_events.exists(),
+        "a rejected resume must not start a pipeline"
+    );
+    assert_eq!(batch_request_started_count(&read_jsonl_lenient(&events)), 1);
+    fs::write(&release, "release").unwrap();
+    assert!(
+        wait_for_child_exit(&mut child, Duration::from_secs(60))
+            .expect("translate child should exit")
+            .success()
+    );
+    assert!(!replacement_output.exists());
+}
+
 /// A parked run must still honour a stop.
 ///
 /// Pause deliberately has no timeout — a paused job waits indefinitely, which is
