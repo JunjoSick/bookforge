@@ -294,6 +294,76 @@ fn concurrent_glossary_candidate_upserts_queue_instead_of_failing() {
     assert_concurrent_upserts_are_serialized(Upsert::BookGlossaryCandidate);
 }
 
+fn global_entity<'a>(scope_id: Option<&'a str>, target_name: &'a str) -> NewEntity<'a> {
+    NewEntity {
+        scope_kind: GlossaryScopeKind::Global,
+        scope_id,
+        source_name: "Quillon",
+        target_name,
+        gender_target: None,
+        role: None,
+        notes: None,
+        source_language: "English",
+        target_language: "Italian",
+    }
+}
+
+#[test]
+fn global_entity_upsert_repairs_a_stray_scope_id_in_place() {
+    let db_path = temp_path("global_entity_stray_id.sqlite");
+    let store = JobStore::open(&db_path).unwrap();
+    // Older imports kept a global sheet's `meta.scope.id`. Such a row still
+    // owns the global identity under the partial unique index.
+    store
+        .conn
+        .borrow()
+        .execute(
+            "INSERT INTO entities
+                (scope_kind, scope_id, source_name, target_name, gender_target, role,
+                 notes, source_language, target_language, created_at, updated_at)
+             VALUES ('global', 'leftover-series', 'Quillon', 'old', NULL, NULL,
+                     NULL, 'English', 'Italian', 't0', 't0')",
+            [],
+        )
+        .unwrap();
+
+    store
+        .upsert_entities(&[global_entity(None, "corrected")])
+        .expect("a normalized global import must update the legacy row");
+    let global_rows = |store: &JobStore| {
+        store
+            .list_entities(None, None, Some(GlossaryScopeKind::Global), None)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.scope_id, row.target_name))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(global_rows(&store), [(None, "corrected".to_owned())]);
+
+    // A caller that still passes an id for global scope writes the same row.
+    store
+        .upsert_entities(&[global_entity(Some("another-id"), "again")])
+        .unwrap();
+    assert_eq!(global_rows(&store), [(None, "again".to_owned())]);
+
+    // Scoped rows keep their own identity next to the global one.
+    store
+        .upsert_entities(&[NewEntity {
+            scope_kind: GlossaryScopeKind::Book,
+            scope_id: Some("book-one"),
+            ..global_entity(None, "book")
+        }])
+        .unwrap();
+    let book_rows = store
+        .list_entities(None, None, Some(GlossaryScopeKind::Book), Some("book-one"))
+        .unwrap();
+    assert_eq!(book_rows.len(), 1);
+    assert_eq!(book_rows[0].target_name, "book");
+    assert_eq!(global_rows(&store), [(None, "again".to_owned())]);
+    drop(store);
+    remove_database(&db_path);
+}
+
 #[test]
 fn empty_guidance_batches_write_nothing() {
     let db_path = temp_path("guidance_empty.sqlite");

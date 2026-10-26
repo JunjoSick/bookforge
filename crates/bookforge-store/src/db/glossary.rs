@@ -578,15 +578,25 @@ impl JobStore {
         let now = timestamp_string();
         let mut changed = 0usize;
         for entity in entities {
+            // Global scope holds one row per name and language pair (the
+            // partial unique index ignores scope_id). Match a global row
+            // whatever stray id an older import stored, and clear that id,
+            // so a corrected import updates it instead of failing the index.
+            let scope_id = if entity.scope_kind == GlossaryScopeKind::Global {
+                None
+            } else {
+                entity.scope_id
+            };
             let updated = tx.execute(
                 "UPDATE entities
                  SET target_name = ?1,
                      gender_target = ?2,
                      role = ?3,
                      notes = ?4,
-                     updated_at = ?5
+                     updated_at = ?5,
+                     scope_id = ?7
                  WHERE scope_kind = ?6
-                   AND ((?7 IS NULL AND scope_id IS NULL) OR scope_id = ?7)
+                   AND (?6 = 'global' OR (?7 IS NULL AND scope_id IS NULL) OR scope_id = ?7)
                    AND source_name = ?8
                    AND source_language = ?9
                    AND target_language = ?10",
@@ -597,7 +607,7 @@ impl JobStore {
                     entity.notes,
                     &now,
                     entity.scope_kind.as_str(),
-                    entity.scope_id,
+                    scope_id,
                     entity.source_name,
                     entity.source_language,
                     entity.target_language,
@@ -618,7 +628,7 @@ impl JobStore {
                         updated_at = excluded.updated_at",
                 params![
                     entity.scope_kind.as_str(),
-                    entity.scope_id,
+                    scope_id,
                     entity.source_name,
                     entity.target_name,
                     entity.gender_target.map(|g| g.as_short()),
