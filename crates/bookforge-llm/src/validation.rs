@@ -405,8 +405,11 @@ pub(crate) fn empty_translation_validation_error(
     source: &str,
     translation: &str,
 ) -> Option<&'static str> {
-    (!source.trim().is_empty() && translation.trim().is_empty())
-        .then_some("empty translation for non-empty source")
+    // Markers are structure, not prose: a reply that kept every marker but
+    // dropped all of the text inside and around them translated nothing.
+    (!strip_marker_tokens(source).trim().is_empty()
+        && strip_marker_tokens(translation).trim().is_empty())
+    .then_some("empty translation for non-empty source")
 }
 
 const KNOWN_QA_VERDICTS: [&str; 3] = ["pass", "warn", "fail"];
@@ -1340,6 +1343,14 @@ mod tests {
             error.as_deref(),
             Some("translation is unchanged from the source-language prose")
         );
+    }
+
+    #[test]
+    fn marker_only_translation_is_empty_but_marker_only_source_is_not_prose() {
+        assert!(empty_translation_validation_error("<m1>Visible prose</m1>", "<m1> </m1>").is_some());
+        assert!(empty_translation_validation_error("Text<r1/>", "<r1/>").is_some());
+        assert!(empty_translation_validation_error("<r1/>", "<r1/>").is_none());
+        assert!(empty_translation_validation_error("<m1>Ciao</m1>", "<m1>Hello</m1>").is_none());
     }
 
     #[test]

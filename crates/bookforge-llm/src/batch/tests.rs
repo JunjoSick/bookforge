@@ -1045,6 +1045,24 @@ fn detects_duplicate_ids_in_batch_response() {
 }
 
 #[test]
+fn marker_only_output_cannot_succeed_when_all_prose_was_dropped() {
+    let batch = run_preserving_batch_with_runs(&["<m0>", "Hello world", "</m0>"]);
+    let response = serde_json::json!({
+        "items": [{"id": "runs", "runs": [
+            {"id": "r0", "text": "<m0>"},
+            {"id": "r1", "text": " "},
+            {"id": "r2", "text": "</m0>"},
+        ]}]
+    })
+    .to_string();
+
+    let result = parse_batch_response(&batch, &response).expect("parse");
+    assert!(result.translations.is_empty());
+    assert_eq!(result.failures.len(), 1);
+    assert!(result.failures[0].error.contains("empty translation"));
+}
+
+#[test]
 fn splits_batch_in_half() {
     let seg1 = make_segment("seg1", vec![plain_block("A")], vec![]);
     let seg2 = make_segment("seg2", vec![plain_block("B")], vec![]);
