@@ -284,7 +284,8 @@ where
     if response.finish_reason == FinishReason::Length {
         return Err(ProposalBatchRequestError {
             error: LlmError::InvalidResponse(format!(
-                "glossary proposal output was truncated at {max_output_tokens} tokens"
+                "glossary proposal output was truncated at {max_output_tokens} tokens; \
+                 reasoning shares this budget, so raise --qa-max-output-tokens"
             )),
             usage: request_usage,
         });

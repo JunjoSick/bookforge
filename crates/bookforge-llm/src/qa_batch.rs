@@ -356,7 +356,8 @@ where
     if response.finish_reason == FinishReason::Length {
         return Err(QaBatchRequestError::truncated(LlmError::InvalidResponse(
             format!(
-                "QA output was truncated: max_output_tokens limit ({max_output_tokens}) reached"
+                "QA output was truncated: max_output_tokens limit ({max_output_tokens}) reached; \
+                 reasoning shares this budget, so raise --qa-max-output-tokens"
             ),
         )));
     }

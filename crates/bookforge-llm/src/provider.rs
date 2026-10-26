@@ -112,17 +112,60 @@ pub struct CompletionResponse {
     pub raw: serde_json::Value,
 }
 
-impl CompletionResponse {
-    /// Returns `true` when the API returned `reasoning_content` in any choice,
-    /// indicating the model is a reasoning / chain-of-thought model that consumes
-    /// part of the `max_tokens` budget for internal reasoning.
-    pub fn is_reasoning_response(&self) -> bool {
-        self.raw
-            .pointer("/choices/0/message/reasoning_content")
-            .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
+/// Provider-reported token usage for one or more responses.
+///
+/// `None` means the provider reported nothing for that field; once any
+/// response reports a value, sums treat the missing ones as zero.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokenUsage {
+    pub input: Option<u64>,
+    pub cached_input: Option<u64>,
+    pub output: Option<u64>,
+}
+
+impl TokenUsage {
+    pub(crate) fn add(&mut self, other: Self) {
+        fn sum(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+            match (left, right) {
+                (None, None) => None,
+                (left, right) => Some(left.unwrap_or(0).saturating_add(right.unwrap_or(0))),
+            }
+        }
+        self.input = sum(self.input, other.input);
+        self.cached_input = sum(self.cached_input, other.cached_input);
+        self.output = sum(self.output, other.output);
     }
+}
+
+impl From<&CompletionResponse> for TokenUsage {
+    fn from(response: &CompletionResponse) -> Self {
+        Self {
+            input: response.input_tokens,
+            cached_input: response.input_cached_tokens,
+            output: response.output_tokens,
+        }
+    }
+}
+
+impl CompletionResponse {
+    /// Whether the response reports reasoning text, reasoning details, or
+    /// reasoning token usage. Some gateways hide the reasoning text and expose
+    /// only its usage, which still consumes the `max_tokens` budget.
+    pub fn is_reasoning_response(&self) -> bool {
+        response_has_reasoning(&self.raw)
+    }
+}
+
+fn response_has_reasoning(raw: &Value) -> bool {
+    ["reasoning_content", "reasoning"].iter().any(|field| {
+        raw.pointer(&format!("/choices/0/message/{field}"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    }) || raw
+        .pointer("/choices/0/message/reasoning_details")
+        .and_then(Value::as_array)
+        .is_some_and(|details| !details.is_empty())
+        || reasoning_tokens(raw).is_some_and(|tokens| tokens > 0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1242,23 +1285,27 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .and_then(Value::as_str)
             .map(parse_finish_reason)
             .unwrap_or(FinishReason::Unknown);
-        let content = raw
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| LlmError::InvalidResponse(empty_content_diagnosis(&raw, finish_reason)))?
-            .to_string();
+        // A reasoning model can spend its entire output budget before emitting
+        // any text. Keep that a length-finished response, with its usage, so
+        // callers treat it as truncation and can raise the budget, instead of
+        // a generic failure that is retried unchanged and never recorded.
+        let content = match raw.pointer("/choices/0/message/content") {
+            Some(Value::String(content)) => content.clone(),
+            None | Some(Value::Null) if finish_reason == FinishReason::Length => String::new(),
+            _ => {
+                return Err(LlmError::InvalidResponse(empty_content_diagnosis(
+                    &raw,
+                    finish_reason,
+                )));
+            }
+        };
         let input_tokens = raw.pointer("/usage/prompt_tokens").and_then(Value::as_u64);
         let input_cached_tokens = cached_input_tokens(&raw);
         let output_tokens = billable_output_tokens(&raw);
 
         // Detect reasoning models from their first response so subsequent
         // requests can use a higher max_output_tokens budget.
-        let has_reasoning = raw
-            .pointer("/choices/0/message/reasoning_content")
-            .and_then(Value::as_str)
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        if has_reasoning {
+        if response_has_reasoning(&raw) {
             self.reasoning_detected.store(true, Ordering::Relaxed);
         }
 
@@ -1617,14 +1664,38 @@ fn parse_finish_reason(value: &str) -> FinishReason {
 ///   thinking wasn't disabled before treating the model as reasoning — see
 ///   `new_with_cancel` and the BookForge presets that ship
 ///   `thinking_disabled: true`.
+///
+/// Gateway IDs (`deepseek/deepseek-v4-pro`, `openai/o3-mini`) are classified
+/// by their final path component. The `deepseek-flash` / `deepseek-pro`
+/// aliases and the GPT-5/GPT-6 families also default to reasoning and honor
+/// the disable toggle.
 fn model_ships_with_thinking(model: &str) -> bool {
     let lower = model.to_lowercase();
-    lower.contains("reasoner")
+    let name = model_base_name(&lower);
+    model_is_dedicated_reasoner(name)
         || lower.contains("v4-flash")
         || lower.contains("v4-pro")
-        || lower.starts_with("o1")
-        || lower.starts_with("o3")
-        || lower.starts_with("o4")
+        || name.starts_with("deepseek-v4-")
+        || matches!(name, "deepseek-flash" | "deepseek-pro")
+        || name.starts_with("gpt-5")
+        || name.starts_with("gpt-6")
+}
+
+/// Final path component of a (lowercased) model ID.
+fn model_base_name(lower: &str) -> &str {
+    lower.rsplit('/').next().unwrap_or(lower)
+}
+
+/// Reasoner-named IDs and the OpenAI o-series (`o3`, `o4-mini`, but not an
+/// unrelated `o123-other`) reason regardless of any disable toggle.
+fn model_is_dedicated_reasoner(name: &str) -> bool {
+    name.contains("reasoner")
+        || ["o1", "o3", "o4"].iter().any(|prefix| {
+            name == *prefix
+                || name
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('-'))
+        })
 }
 
 /// Whether the initial classification treats this config as a reasoning
@@ -1633,10 +1704,7 @@ fn model_ships_with_thinking(model: &str) -> bool {
 /// default-thinking chat tiers honor it.
 fn bootstrapped_reasoning(config: &OpenAiCompatibleConfig) -> bool {
     let lower = config.model.to_lowercase();
-    let dedicated = lower.contains("reasoner")
-        || lower.starts_with("o1")
-        || lower.starts_with("o3")
-        || lower.starts_with("o4");
+    let dedicated = model_is_dedicated_reasoner(model_base_name(&lower));
     dedicated || (model_ships_with_thinking(&config.model) && !config.thinking_disabled)
 }
 
@@ -2218,6 +2286,131 @@ mod tests {
             reasoner.is_reasoning(),
             "deepseek-reasoner-style IDs remain reasoning regardless of the toggle"
         );
+    }
+
+    #[test]
+    fn reasoning_model_names_cover_gateway_ids_and_current_aliases() {
+        for model in [
+            "deepseek-flash",
+            "deepseek-pro",
+            "deepseek-v4-flash",
+            "deepseek/deepseek-v4-pro",
+            "openai/o3-mini",
+            "o4-mini",
+            "o1",
+            "openai/gpt-5.6",
+            "openai/gpt-6-luna",
+        ] {
+            assert!(model_ships_with_thinking(model), "{model}");
+        }
+        for model in [
+            "gpt-4o",
+            "openai/gpt-4.1-mini",
+            "deepseek-chat",
+            "o123-other",
+        ] {
+            assert!(!model_ships_with_thinking(model), "{model}");
+        }
+        // Only reasoner-named IDs and the o-series ignore a disable toggle.
+        for model in ["openai/o3-mini", "deepseek/deepseek-reasoner"] {
+            assert!(offline_provider("https://llm.example.test/v1", model).is_reasoning());
+        }
+        for model in ["openai/gpt-6-luna", "deepseek-flash"] {
+            assert!(!offline_provider("https://llm.example.test/v1", model).is_reasoning());
+        }
+    }
+
+    #[test]
+    fn reasoning_detection_accepts_hidden_and_gateway_reasoning() {
+        for raw in [
+            json!({"choices": [{"message": {"reasoning_content": "work"}}]}),
+            json!({"choices": [{"message": {"reasoning": "work"}}]}),
+            json!({"choices": [{"message": {"reasoning_details": [{"type": "reasoning.encrypted", "data": "opaque"}]}}]}),
+            json!({"usage": {"completion_tokens_details": {"reasoning_tokens": 32}}}),
+            json!({"usage": {"output_tokens_details": {"reasoning_tokens": 32}}}),
+        ] {
+            assert!(response_has_reasoning(&raw), "{raw}");
+        }
+        assert!(!response_has_reasoning(&json!({
+            "choices": [{"message": {"reasoning": "", "reasoning_details": []}}],
+            "usage": {"completion_tokens_details": {"reasoning_tokens": 0}}
+        })));
+    }
+
+    #[test]
+    fn token_usage_sums_reported_fields_and_keeps_unreported_ones_absent() {
+        let mut usage = TokenUsage::default();
+        usage.add(TokenUsage {
+            input: Some(3),
+            cached_input: None,
+            output: Some(2),
+        });
+        usage.add(TokenUsage {
+            input: None,
+            cached_input: None,
+            output: Some(5),
+        });
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input: Some(3),
+                cached_input: None,
+                output: Some(7),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_response_preserves_budget_exhaustion_and_usage() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_mock_request(&mut stream).await;
+            let body = json!({
+                "choices": [{"message": {"content": null}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 32,
+                    "completion_tokens_details": {"reasoning_tokens": 32}}
+            })
+            .to_string();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(body.as_bytes()).await;
+            // The task result owns the socket until the client is done;
+            // an immediate close can reset a Windows loopback connection.
+            stream
+        });
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://{address}"),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            model: "unknown-model".to_string(),
+            timeout_seconds: 10,
+            provider_max_attempts: 1,
+            thinking_disabled: false,
+            retry_after_policy: RetryAfterPolicy::None,
+            max_backoff_seconds: 1,
+            max_idle_per_host: 1,
+            json_mode: bookforge_core::JsonMode::PromptOnly,
+        })
+        .unwrap();
+        assert!(!provider.is_reasoning());
+        let mut request = offline_request();
+        request.max_output_tokens = Some(32);
+        let response = provider.complete(request).await;
+        server.abort();
+        let _ = server.await;
+        let response = response.expect("reasoning-only truncation must keep its finish reason");
+
+        assert!(response.content.is_empty());
+        assert_eq!(response.finish_reason, FinishReason::Length);
+        assert_eq!(response.input_tokens, Some(20));
+        assert_eq!(response.output_tokens, Some(32));
+        assert!(response.is_reasoning_response());
+        assert!(provider.is_reasoning());
     }
 
     #[test]
