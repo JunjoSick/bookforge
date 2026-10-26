@@ -349,6 +349,93 @@ fn manifest_documents_outside_the_spine_are_extracted_once_and_translated() {
 }
 
 #[test]
+fn opaque_inline_math_svg_script_and_style_survive_translation_byte_for_byte() {
+    let opaque = [
+        r#"<math xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>n</mi><mo>&gt;</mo><mn>3</mn></mrow></math>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><text>Axis label</text></svg>"#,
+        "<script><![CDATA[const caption = 'kept';]]></script>",
+        "<style>.mark { color: blue; }</style>",
+    ];
+    let body = format!(
+        "<p>Where {} holds, <em>see</em>{}{}{}.</p>",
+        opaque[0], opaque[1], opaque[2], opaque[3]
+    );
+    let fixture = create_epub_fixture("opaque-inline", &body);
+    let book = read_epub(&fixture).unwrap();
+    let paragraph = book
+        .blocks
+        .iter()
+        .find(|block| block_text(block).starts_with("Where"))
+        .unwrap();
+    assert_eq!(
+        block_text(paragraph),
+        "Where <r1/> holds, <m2>see</m2><r3/><r4/><r5/>."
+    );
+
+    rebuild_epub(
+        &book,
+        &[BlockTranslation {
+            block_id: paragraph.id.clone(),
+            text: "Dove vale <r1/>, <m2>vedi</m2><r3/><r4/><r5/>.".to_string(),
+        }],
+        &fixture,
+    )
+    .unwrap();
+
+    let chapter = entry_text(&fixture, "OEBPS/chapter1.xhtml");
+    assert!(chapter.contains("Dove vale"), "{chapter}");
+    assert!(chapter.contains("<em>vedi</em>"), "{chapter}");
+    for original in opaque {
+        assert!(
+            chapter.contains(original),
+            "opaque content changed: {original}\n{chapter}"
+        );
+    }
+}
+
+#[test]
+fn mixed_content_round_trips_without_missing_or_duplicated_text() {
+    let bodies = [
+        "Red &amp; Blue<!--cut-->Green<![CDATA[ Gold]]><p>Pink<br/>Teal</p>Plum&#33;",
+        "<section>Red &amp; Blue<span>Green<em>Gold</em></span><![CDATA[Pink]]>&#33;<br/>Teal</section>",
+        "<div>Red<p>Blue<em>Green</em></p>Gold<math><mi>z</mi></math>Pink</div>",
+        "<div><span>Red</span>Blue<!--cut-->Green&#33;<svg><text>Kept label</text></svg>Gold</div>",
+        "<blockquote><p>Red</p><p>Blue</p></blockquote>Green<pre>Code</pre>Gold",
+    ];
+    let words = ["Red", "Blue", "Green", "Gold", "Pink", "Teal", "Plum"];
+    for body in bodies {
+        let fixture = create_epub_fixture("mixed-content-parity", body);
+        let book = read_epub(&fixture).unwrap();
+        let expected = book
+            .blocks
+            .iter()
+            .map(|block| {
+                words.iter().fold(block_text(block), |text, word| {
+                    text.replace(word, &format!("New{word}"))
+                })
+            })
+            .collect::<Vec<_>>();
+        let translations = book
+            .blocks
+            .iter()
+            .zip(&expected)
+            .map(|(block, text)| BlockTranslation {
+                block_id: block.id.clone(),
+                text: text.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        rebuild_epub(&book, &translations, &fixture).unwrap();
+        let rebuilt = read_epub(&fixture).unwrap();
+        assert_eq!(
+            rebuilt.blocks.iter().map(block_text).collect::<Vec<_>>(),
+            expected,
+            "mixed content changed: {body}"
+        );
+    }
+}
+
+#[test]
 fn loose_text_keeps_its_spacing_next_to_inline_siblings() {
     let fixture = create_epub_fixture(
         "loose-boundary-spaces",

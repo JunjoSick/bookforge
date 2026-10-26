@@ -1031,6 +1031,17 @@ fn extract_blocks(
                 }
                 enter_element(&mut element_stack, &mut current_path, &name);
 
+                // The interior of an opaque subtree carries no translation
+                // structure: no blocks anchor inside it and no markers are
+                // emitted for its descendants. Only path bookkeeping and
+                // the never-translate depth advance.
+                if suppress_depth > 0 {
+                    if never_translate_element(&name) {
+                        suppress_depth += 1;
+                    }
+                    continue;
+                }
+
                 // EPUB navigation list items have a constrained content
                 // model: the label must remain inside the child <a> or
                 // <span>, followed optionally by a nested <ol>. Anchoring a
@@ -1044,13 +1055,13 @@ fn extract_blocks(
                 if never_translate_element(&name) {
                     // Raw content (script bodies, SVG, MathML) must survive
                     // byte-for-byte and stay out of translation payloads.
-                    // Inside an active block the whole subtree is replaced
-                    // by a single paired marker whose interior stays empty;
-                    // the writer splices the original bytes back verbatim.
-                    let root_of_suppressed_tree = suppress_depth == 0;
+                    // Inside an active block the whole subtree becomes one
+                    // atomic reference marker (`<rN/>`): the model has no
+                    // interior to fill in, and the writer splices the
+                    // original bytes back verbatim.
                     suppress_depth += 1;
-                    if root_of_suppressed_tree && let Some(block) = active_block.as_mut() {
-                        block.push_inline_start(&name);
+                    if let Some(block) = active_block.as_mut() {
+                        block.push_inline_empty(&name);
                     }
                 } else if active_block.is_none()
                     && !navigation_list_item
@@ -1062,9 +1073,7 @@ fn extract_blocks(
                         DomPath(current_path.clone()),
                         initial_block_count + blocks.len(),
                     ));
-                } else if suppress_depth == 0
-                    && let Some(block) = active_block.as_mut()
-                {
+                } else if let Some(block) = active_block.as_mut() {
                     block.push_inline_start(&name);
                 }
             }
@@ -1103,6 +1112,19 @@ fn extract_blocks(
                 );
             }
             Event::End(_) => {
+                // Ends inside an opaque subtree, including its own root,
+                // close nothing: the subtree is a single atomic marker.
+                if suppress_depth > 0 {
+                    if element_stack
+                        .pop()
+                        .is_some_and(|frame| never_translate_element(&frame.name))
+                    {
+                        suppress_depth -= 1;
+                    }
+                    current_path.pop();
+                    continue;
+                }
+
                 let should_finish = active_block
                     .as_ref()
                     .is_some_and(|block| element_stack.len() == block.anchor_depth);
@@ -1112,26 +1134,11 @@ fn extract_blocks(
                     if let Some(block) = block.finish(section_id) {
                         blocks.push(block);
                     }
-                } else {
-                    // Ends inside a suppressed subtree carry no translation
-                    // structure; only the subtree's own root closes the
-                    // raw-content marker pair.
-                    let interior_of_suppressed_tree = match element_stack.last() {
-                        Some(frame) if never_translate_element(&frame.name) => suppress_depth > 1,
-                        Some(_) => suppress_depth > 0,
-                        None => false,
-                    };
-                    if !interior_of_suppressed_tree && let Some(block) = active_block.as_mut() {
-                        block.push_inline_end();
-                    }
+                } else if let Some(block) = active_block.as_mut() {
+                    block.push_inline_end();
                 }
 
-                if element_stack
-                    .pop()
-                    .is_some_and(|frame| never_translate_element(&frame.name))
-                {
-                    suppress_depth = suppress_depth.saturating_sub(1);
-                }
+                element_stack.pop();
                 current_path.pop();
             }
             Event::Eof => break,
@@ -2236,18 +2243,13 @@ mod tests {
             .iter()
             .map(|run| run.text.as_str())
             .collect::<Vec<_>>();
-        // The suppressed subtree contributes exactly one empty marker pair.
-        let marked: String = strip_marker_tokens(&text).chars().collect();
-        let _ = marked;
+        // The suppressed subtree contributes exactly one atomic marker.
+        assert_eq!(text, "Hello <r1/> world");
         assert!(runs.iter().all(|run| !run.contains("var")), "{runs:?}");
-        assert!(
-            text.starts_with("Hello") && text.ends_with("world"),
-            "prose around the raw pair survives: {text}"
-        );
     }
 
     #[test]
-    fn svg_and_math_markup_keeps_empty_marker_pairs_only() {
+    fn svg_and_math_markup_become_atomic_reference_markers() {
         for (element, kind) in [
             ("<svg xmlns=\"x\"><text>label</text></svg>", "svg"),
             ("<math><mi>x</mi></math>", "math"),
@@ -2257,16 +2259,41 @@ mod tests {
             let blocks =
                 extract_blocks(&xhtml, "chapter.xhtml", &section_id, 0).expect("should parse");
             assert_eq!(blocks.len(), 1);
-            let text = block_text(&blocks[0]);
-            assert!(
-                !text.contains("label") && !text.contains('x'),
-                "{kind} content leaked into block: {text}"
-            );
-            assert!(
-                blocks[0].inline_marks.iter().any(|mark| mark.kind == kind),
-                "{kind} boundary marker missing from {text}"
-            );
+            assert_eq!(block_text(&blocks[0]), "a<r1/>b", "{kind}");
+            assert_eq!(blocks[0].inline_marks.len(), 1, "{kind}");
+            assert_eq!(blocks[0].inline_marks[0].kind, kind);
         }
+    }
+
+    #[test]
+    fn opaque_subtrees_share_the_marker_ordinal_stream() {
+        let blocks = extract_blocks(
+            "<html><body><p>Sum <math><mi>a</mi><mo>+</mo><mn>2</mn></math> beside <em>text</em> and <svg><g><text>Label</text></g></svg>.</p></body></html>",
+            "chapter.xhtml",
+            &SectionId("sec_000000".to_string()),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            block_text(&blocks[0]),
+            "Sum <r1/> beside <m2>text</m2> and <r3/>."
+        );
+    }
+
+    #[test]
+    fn blocks_never_anchor_inside_opaque_subtrees() {
+        let blocks = extract_blocks(
+            "<html><body><svg><foreignObject><p>Inside drawing</p></foreignObject></svg><p>After drawing</p></body></html>",
+            "chapter.xhtml",
+            &SectionId("sec_000000".to_string()),
+            0,
+        )
+        .unwrap();
+
+        let texts = blocks.iter().map(block_text).collect::<Vec<_>>();
+        assert_eq!(texts, vec!["After drawing"]);
     }
 
     #[test]

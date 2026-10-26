@@ -1810,12 +1810,29 @@ impl RenderedEvent {
 
     /// Raw suppressed content is written back byte-for-byte: neither
     /// whitespace restoration nor append-mode flattening may touch it.
-    fn verbatim(event: Event<'static>) -> Self {
+    fn verbatim(event: Event<'static>, edge: Option<MarkerEdge>) -> Self {
         Self {
             event,
-            edge: None,
+            edge,
             verbatim: true,
         }
+    }
+}
+
+/// Splice an opaque subtree back verbatim. Its first and last events carry
+/// the marker's edges so a source space between it and a neighbouring
+/// marker is restored like a space between two ordinary inline elements.
+fn push_raw_subtree(id: &str, events: &[Event<'static>], output: &mut Vec<RenderedEvent>) {
+    let last = events.len().saturating_sub(1);
+    for (index, event) in events.iter().enumerate() {
+        let edge = if index == 0 {
+            Some(MarkerEdge::Start(id.to_string()))
+        } else if index == last {
+            Some(MarkerEdge::End(id.to_string()))
+        } else {
+            None
+        };
+        output.push(RenderedEvent::verbatim(event.clone(), edge));
     }
 }
 
@@ -1881,7 +1898,7 @@ fn marked_translation_rendered(
 
     // Suppressed subtrees whose markers the translation omitted are still
     // emitted, at tail position: script/style/svg/math content must never
-    // disappear merely because a model dropped its empty marker pair.
+    // disappear merely because a model dropped its atomic marker.
     let mut untouched = scan
         .raw_events
         .keys()
@@ -1891,9 +1908,7 @@ fn marked_translation_rendered(
     untouched.sort();
     for id in untouched {
         if let Some(events) = scan.raw_events.get(&id) {
-            for event in events {
-                rendered.push(RenderedEvent::verbatim(event.clone()));
-            }
+            push_raw_subtree(&id, events, &mut rendered);
         }
     }
 
@@ -1903,8 +1918,9 @@ fn marked_translation_rendered(
 
 /// Single pass assigning template ids exactly like the reader does:
 /// every Start/Empty inside an active block consumes one SHARED ordinal,
-/// prefixed `m` or `r` respectively except elements nested inside a
-/// suppressed subtree, which consume none on either side of the protocol.
+/// prefixed `m` or `r` respectively. The root of a suppressed subtree is
+/// atomic and takes an `r` id; elements nested inside it consume none on
+/// either side of the protocol.
 /// The reader draws paired and empty marker ids from one counter
 /// (`BlockBuilder::next_marker`), so splitting into two independent
 /// sequences here desynchronizes any block mixing paired children with
@@ -1918,9 +1934,9 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
 
     let mut scan = BlockScan::default();
     // Each open element's id plus the Start event needed later to build the
-    // paired template (None for raw-subtree roots, whose bytes live in
-    // `raw_events` rather than a template).
-    let mut stack = Vec::<(String, Option<Event<'static>>)>::new();
+    // paired template. Opaque subtrees never enter the stack: their bytes
+    // live in `raw_events` rather than a template.
+    let mut stack = Vec::<(String, Event<'static>)>::new();
     let mut marker_ordinal = 0usize;
     let mut pending_left = None::<String>;
     let mut saw_whitespace = false;
@@ -1938,12 +1954,9 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
                             == capture.root_name.as_slice()
                     {
                         let capture = raw_capture.take().expect("checked above");
-                        scan.raw_events.insert(capture.id.clone(), capture.events);
-                        let (id, _) = stack.pop().ok_or_else(|| {
-                            BookforgeError::InvalidInput(STACK_UNDERFLOW.to_string())
-                        })?;
-                        pending_left = Some(id);
+                        pending_left = Some(capture.id.clone());
                         saw_whitespace = false;
+                        scan.raw_events.insert(capture.id, capture.events);
                     } else {
                         capture.child_depth = capture.child_depth.saturating_sub(1);
                     }
@@ -1958,7 +1971,10 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
         match event {
             Event::Start(element) => {
                 let name = local_name(element.name().as_ref().as_bytes()).to_vec();
-                let id = marker_id("m", marker_ordinal);
+                // Opaque subtrees are atomic reference markers (`rN`), like
+                // empty elements; ordinary children are paired (`mN`).
+                let opaque = never_translate_element(&name);
+                let id = marker_id(if opaque { "r" } else { "m" }, marker_ordinal);
                 marker_ordinal += 1;
                 insert_pending_boundary(
                     &mut scan.boundaries,
@@ -1967,16 +1983,15 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
                     &id,
                 );
                 saw_whitespace = false;
-                if never_translate_element(&name) {
+                if opaque {
                     raw_capture = Some(RawCapture {
-                        id: id.clone(),
+                        id,
                         root_name: name,
                         child_depth: 0,
                         events: vec![event.clone()],
                     });
-                    stack.push((id, None));
                 } else {
-                    stack.push((id, Some(event.clone())));
+                    stack.push((id, event.clone()));
                 }
             }
             Event::Empty(element) => {
@@ -1999,15 +2014,13 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
                 };
                 pending_left = Some(id.clone());
                 saw_whitespace = false;
-                if let Some(start) = start {
-                    scan.templates.insert(
-                        id,
-                        InlineTemplate::Paired {
-                            start,
-                            end: end.clone(),
-                        },
-                    );
-                }
+                scan.templates.insert(
+                    id,
+                    InlineTemplate::Paired {
+                        start,
+                        end: end.clone(),
+                    },
+                );
             }
             Event::Text(_)
             | Event::CData(_)
@@ -2197,19 +2210,9 @@ fn push_marked_fragment(
                     )));
                 }
                 None => {
-                    // Suppressed subtrees carry empty pairs in translations
-                    // or may be dropped entirely; either way the original
-                    // bytes are spliced back verbatim.
-                    if let Some(events) = raw_events.get(&id) {
-                        for event in events {
-                            output.push(RenderedEvent::verbatim(event.clone()));
-                        }
-                        used.insert(id);
-                    } else {
-                        return Err(BookforgeError::InvalidInput(format!(
-                            "translation contains unknown inline marker '{id}'"
-                        )));
-                    }
+                    return Err(BookforgeError::InvalidInput(format!(
+                        "translation contains unknown inline marker '{id}'"
+                    )));
                 }
             }
 
@@ -2233,9 +2236,15 @@ fn push_marked_fragment(
                     )));
                 }
                 None => {
-                    return Err(BookforgeError::InvalidInput(format!(
-                        "translation contains unknown inline marker '{id}'"
-                    )));
+                    // An opaque subtree (script/style/svg/math) is one atomic
+                    // marker; its original bytes are spliced back verbatim.
+                    let Some(events) = raw_events.get(&id) else {
+                        return Err(BookforgeError::InvalidInput(format!(
+                            "translation contains unknown inline marker '{id}'"
+                        )));
+                    };
+                    push_raw_subtree(&id, events, output);
+                    used.insert(id);
                 }
             }
 
@@ -3328,7 +3337,7 @@ mod tests {
             dom_path: DomPath(vec![0, 0]),
             text_runs: vec![TextRun {
                 id: "r000000_000".to_string(),
-                text: "Prima <m1></m1> dopo".to_string(),
+                text: "Prima <r1/> dopo".to_string(),
             }],
             inline_marks,
             protected_spans: Vec::new(),
@@ -3340,14 +3349,14 @@ mod tests {
     fn replace_mode_splices_suppressed_script_bytes_verbatim() {
         let xhtml = r#"<root><p>Before <script type="text/javascript">var x = 1; // keep</script> tail</p></root>"#;
         let block = raw_subtree_block(vec![InlineMark {
-            id: "m1".to_string(),
+            id: "r1".to_string(),
             kind: "script".to_string(),
         }]);
         let outcome = patch_xhtml_blocks(
             xhtml,
             &[BlockPatch {
                 block: &block,
-                translation: "Prima <m1></m1> dopo",
+                translation: "Prima <r1/> dopo",
             }],
         )
         .expect("scripted paragraph should patch");
@@ -3381,14 +3390,14 @@ mod tests {
         ] {
             let xhtml = format!("<root><p>B {inner} A</p></root>");
             let block = raw_subtree_block(vec![InlineMark {
-                id: "m1".to_string(),
+                id: "r1".to_string(),
                 kind: kind.to_string(),
             }]);
             let outcome = patch_xhtml_blocks(
                 &xhtml,
                 &[BlockPatch {
                     block: &block,
-                    translation: "Prima <m1></m1> dopo",
+                    translation: "Prima <r1/> dopo",
                 }],
             )
             .unwrap_or_else(|error| panic!("{kind} paragraph should patch: {error}"));
@@ -3405,10 +3414,61 @@ mod tests {
     }
 
     #[test]
+    fn opaque_marker_restores_the_source_space_after_a_paired_marker() {
+        let xhtml = "<root><p><em>a</em> <math><mi>x</mi></math></p></root>";
+        let block = marked_block(
+            "b_000000",
+            DomPath(vec![0, 0]),
+            BlockKind::Paragraph,
+            "<m1>a</m1> <r2/>",
+            vec![
+                InlineMark {
+                    id: "m1".to_string(),
+                    kind: "em".to_string(),
+                },
+                InlineMark {
+                    id: "r2".to_string(),
+                    kind: "math".to_string(),
+                },
+            ],
+        );
+        let outcome = patch_xhtml_blocks(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "<m1>b</m1><r2/>",
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.skipped_blocks, 0);
+        assert!(
+            outcome.xhtml.contains("<em>b</em> <math><mi>x</mi></math>"),
+            "got: {}",
+            outcome.xhtml
+        );
+    }
+
+    #[test]
+    fn opaque_subtree_returned_as_paired_markup_is_not_a_template() {
+        let events = vec![
+            Event::Start(quick_xml::events::BytesStart::new("svg").into_owned()),
+            Event::Text(BytesText::new("label").into_owned()),
+            Event::End(BytesEnd::new("svg")),
+        ];
+        let error = marked_translation_rendered("<m1>label</m1>", &events)
+            .expect_err("an opaque subtree has no paired template");
+        assert!(
+            error.to_string().contains("unknown inline marker 'm1'"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn omitted_raw_marker_still_splices_suppressed_content_at_tail() {
         let xhtml = r#"<root><p>Before <style>p { color: red; }</style> tail</p></root>"#;
         let block = raw_subtree_block(vec![InlineMark {
-            id: "m1".to_string(),
+            id: "r1".to_string(),
             kind: "style".to_string(),
         }]);
         let outcome = patch_xhtml_blocks(
@@ -3423,7 +3483,7 @@ mod tests {
         assert_eq!(outcome.skipped_blocks, 0);
         assert!(
             outcome.xhtml.contains("<style>p { color: red; }</style>"),
-            "style bytes survive even without the marker pair, got: {}",
+            "style bytes survive even without the marker, got: {}",
             outcome.xhtml
         );
         assert!(outcome.xhtml.contains("Solo traduzione"));
