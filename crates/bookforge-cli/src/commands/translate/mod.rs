@@ -1336,6 +1336,7 @@ fn classify_error(e: &LlmError) -> &'static str {
         LlmError::HttpStatus { status, .. } if (500..600).contains(status) => "server",
         LlmError::HttpStatus { .. } => "client",
         LlmError::Provider(_) => "provider",
+        LlmError::RequestTooLarge(_) => "request_budget",
         LlmError::InvalidResponse(_) => "invalid_response",
         LlmError::Json(_) => "json",
     }

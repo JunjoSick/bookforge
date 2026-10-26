@@ -1105,6 +1105,7 @@ enum RecordedResponse {
 struct RecordingSequenceProvider {
     responses: Mutex<Vec<RecordedResponse>>,
     max_output_tokens: Arc<Mutex<Vec<Option<u32>>>>,
+    reasoning: bool,
 }
 
 struct DelayedSecondBatchProvider {
@@ -1155,11 +1156,16 @@ impl RecordingSequenceProvider {
         Self {
             responses: Mutex::new(responses.into_iter().rev().collect()),
             max_output_tokens,
+            reasoning: false,
         }
     }
 }
 
 impl LlmProviderTrait for RecordingSequenceProvider {
+    fn is_reasoning(&self) -> bool {
+        self.reasoning
+    }
+
     async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
         self.max_output_tokens
             .lock()
@@ -1646,22 +1652,41 @@ async fn batch_truncation_retries_same_batch_with_escalated_budget() {
         events: events.clone(),
     });
 
+    let telemetry = Arc::new(TelemetryLog::new());
+    let mut published_usage = Vec::new();
     let translations = translate_batches_with_callback(
         provider,
         batches,
         &segments,
         &test_run_config(),
-        Arc::new(TelemetryLog::new()),
+        telemetry.clone(),
         None,
         None,
         progress,
         None,
-        |_| Ok(()),
+        |translation| {
+            published_usage.push((translation.input_tokens, translation.output_tokens));
+            Ok(())
+        },
     )
     .await
     .expect("escalated retry should succeed");
 
     assert_eq!(translations.len(), 2);
+    // Both responses were billed: the truncated one counts too, in the
+    // returned translations, the published checkpoints and the telemetry.
+    let sum = |values: &mut dyn Iterator<Item = Option<u64>>| values.flatten().sum::<u64>();
+    assert_eq!(sum(&mut translations.iter().map(|t| t.input_tokens)), 2);
+    assert_eq!(sum(&mut translations.iter().map(|t| t.output_tokens)), 2);
+    assert_eq!(sum(&mut published_usage.iter().map(|usage| usage.0)), 2);
+    assert_eq!(sum(&mut published_usage.iter().map(|usage| usage.1)), 2);
+    let metrics = telemetry.snapshot();
+    assert_eq!(metrics.len(), 2);
+    assert!(
+        metrics
+            .iter()
+            .all(|metric| metric.input_tokens == Some(1) && metric.output_tokens == Some(1))
+    );
     let budgets = max_tokens.lock().unwrap().clone();
     assert_eq!(budgets.len(), 2);
     assert!(
@@ -1681,6 +1706,292 @@ async fn batch_truncation_retries_same_batch_with_escalated_budget() {
             .iter()
             .any(|event| { matches!(event, bookforge_core::ProgressEvent::BatchSplit { .. }) })
     );
+}
+
+fn single_item_batch_config() -> BatchConfig {
+    BatchConfig {
+        enabled: true,
+        target_tokens: 1_000,
+        max_items: 1,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    }
+}
+
+#[tokio::test]
+async fn reasoning_single_item_increases_exhausted_budget_before_compact_recovery() {
+    let segments = vec![make_segment("seg1", vec![plain_block("Hello")], vec![])];
+    let batches = build_translation_batches(
+        &segments,
+        &single_item_batch_config(),
+        TranslationProfile::Balanced,
+    );
+    let item_id = batches[0].items[0].item_id.clone();
+    let budgets = Arc::new(Mutex::new(Vec::new()));
+    let mut provider = RecordingSequenceProvider::new(
+        vec![
+            RecordedResponse::FinishLength,
+            RecordedResponse::FinishLength,
+            RecordedResponse::FinishLength,
+            RecordedResponse::ItemsFromBatch(vec![(item_id, "Ciao".to_string())]),
+        ],
+        budgets.clone(),
+    );
+    provider.reasoning = true;
+    let events = Arc::new(Mutex::new(Vec::new()));
+
+    let translated = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &test_run_config(),
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(RecordingProgress {
+            events: events.clone(),
+        }),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("reasoning exhaustion should recover with headroom");
+
+    assert_eq!(translated[0].status, SegmentStatus::Succeeded);
+    assert_eq!(translated[0].input_tokens, Some(4));
+    assert_eq!(translated[0].input_cached_tokens, Some(0));
+    assert_eq!(translated[0].output_tokens, Some(4));
+    assert!(!translated[0].tokens_estimated);
+    assert_eq!(
+        *budgets.lock().unwrap(),
+        vec![Some(2_048), Some(4_096), Some(8_192), Some(16_384)]
+    );
+    assert!(!events.lock().unwrap().iter().any(|event| matches!(event,
+        bookforge_core::ProgressEvent::Warning { kind, .. } if kind == "single_item_batch_compact_retry"
+    )));
+}
+
+#[test]
+fn reasoning_output_budget_respects_explicit_and_context_ceilings() {
+    let batch = make_two_item_batch();
+    let mut config = test_run_config();
+    assert_eq!(capped_batch_max_output_tokens(&batch, &config, true), 2_048);
+    config.batch_max_output_tokens = Some(3_000);
+    assert_eq!(
+        next_escalated_batch_max_output_tokens(2_048, &batch, &config, true),
+        Some(3_000)
+    );
+    assert_eq!(
+        next_escalated_batch_max_output_tokens(3_000, &batch, &config, true),
+        None
+    );
+    config.batch_max_output_tokens = None;
+    config.max_output_tokens = Some(1_024);
+    assert_eq!(capped_batch_max_output_tokens(&batch, &config, true), 1_024);
+    assert_eq!(
+        next_escalated_batch_max_output_tokens(1_024, &batch, &config, true),
+        None
+    );
+}
+
+#[tokio::test]
+async fn rendered_prompt_context_budget_never_calls_translation_or_repair_provider() {
+    let segments = vec![make_segment("seg1", vec![plain_block("Hello")], vec![])];
+    let batches = build_translation_batches(
+        &segments,
+        &single_item_batch_config(),
+        TranslationProfile::Balanced,
+    );
+    let budgets = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingSequenceProvider::new(Vec::new(), budgets.clone());
+    let mut config = test_run_config();
+    config.model_context_tokens = Some(1_024);
+    // The planner's source estimate fits; the rendered style guide does not.
+    config.style = Some(crate::StyleRunConfig {
+        rendered_block: "Use brief sentences. ".repeat(400),
+        fingerprint: "oversized-style".into(),
+    });
+    let translated = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &config,
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(bookforge_core::NullProgressSink),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("oversized rendered prompt remains reviewable");
+    assert!(
+        budgets.lock().unwrap().is_empty(),
+        "style overhead must exhaust the budget before any provider call"
+    );
+    assert_eq!(translated[0].status, SegmentStatus::NeedsReview);
+    assert!(
+        translated[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("no output-token budget")
+    );
+}
+
+#[tokio::test]
+async fn exhausted_context_budget_splits_without_calling_the_provider() {
+    let segments = vec![
+        make_segment("seg1", vec![plain_block("Hello")], vec![]),
+        make_segment("seg2", vec![plain_block("Goodbye")], vec![]),
+    ];
+    let batches = build_translation_batches(
+        &segments,
+        &BatchConfig {
+            max_items: 64,
+            ..single_item_batch_config()
+        },
+        TranslationProfile::Balanced,
+    );
+    assert_eq!(batches.len(), 1);
+    let budgets = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingSequenceProvider::new(Vec::new(), budgets.clone());
+    let mut config = test_run_config();
+    config.model_context_tokens = Some(1);
+    let events = Arc::new(Mutex::new(Vec::new()));
+
+    let translations = translate_batches_with_callback(
+        provider,
+        batches,
+        &segments,
+        &config,
+        Arc::new(TelemetryLog::new()),
+        None,
+        None,
+        Arc::new(RecordingProgress {
+            events: events.clone(),
+        }),
+        None,
+        |_| Ok(()),
+    )
+    .await
+    .expect("budget exhaustion should produce a reviewable failure");
+
+    assert!(
+        budgets.lock().unwrap().is_empty(),
+        "zero output budget must never reach a provider"
+    );
+    assert_eq!(translations.len(), 2);
+    assert!(translations.iter().all(|translation| {
+        translation.status == SegmentStatus::NeedsReview
+            && translation
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("no output-token budget"))
+    }));
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, bookforge_core::ProgressEvent::BatchSplit { .. })),
+        "an oversized multi-item request is split before giving up"
+    );
+}
+
+struct ContextBudgetProvider {
+    calls: Arc<Mutex<Vec<(String, u32)>>>,
+    context_limit: u32,
+    output_limit: u32,
+}
+
+impl LlmProviderTrait for ContextBudgetProvider {
+    async fn complete(&self, request: CompletionRequest) -> ProviderResult<CompletionResponse> {
+        let prompt_tokens = crate::budget::estimate_rendered_tokens(&crate::Rendered {
+            system: request.system.clone(),
+            user: request.user.clone(),
+        });
+        let output = request.max_output_tokens.expect("bounded output");
+        assert!(
+            prompt_tokens as u32 + output + 256 <= self.context_limit,
+            "rendered prompt {prompt_tokens} plus output {output} exceeds context {}",
+            self.context_limit
+        );
+        assert!(output <= self.output_limit);
+        let mut calls = self.calls.lock().unwrap();
+        assert!(
+            calls.len() < 10,
+            "context-limited truncation must terminate"
+        );
+        calls.push((request.metadata.prompt_template.unwrap_or_default(), output));
+        Ok(CompletionResponse {
+            content: String::new(),
+            input_tokens: Some(1),
+            input_cached_tokens: Some(0),
+            output_tokens: Some(1),
+            finish_reason: FinishReason::Length,
+            provider_latency_ms: 0,
+            raw: serde_json::json!({}),
+        })
+    }
+
+    fn is_reasoning(&self) -> bool {
+        true
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_response_format: true,
+            supports_usage_tokens: true,
+        }
+    }
+}
+
+#[tokio::test]
+async fn rendered_context_caps_translation_recovery_and_repair_without_endless_escalation() {
+    for output_limit in [3_000, 128] {
+        let segments = vec![make_segment("seg1", vec![plain_block("Hello")], vec![])];
+        let batches = build_translation_batches(
+            &segments,
+            &single_item_batch_config(),
+            TranslationProfile::Balanced,
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut config = test_run_config();
+        config.model_context_tokens = Some(1_600);
+        config.batch_max_output_tokens = Some(output_limit);
+        let translated = translate_batches_with_callback(
+            ContextBudgetProvider {
+                calls: calls.clone(),
+                context_limit: 1_600,
+                output_limit,
+            },
+            batches,
+            &segments,
+            &config,
+            Arc::new(TelemetryLog::new()),
+            None,
+            None,
+            Arc::new(bookforge_core::NullProgressSink),
+            None,
+            |_| Ok(()),
+        )
+        .await
+        .expect("bounded truncation produces a reviewable failure");
+        assert_eq!(translated[0].status, SegmentStatus::NeedsReview);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(template, _)| template.contains("repair")),
+            "{calls:?}"
+        );
+        // Every billed response, including each truncated attempt and the
+        // repairs, is attributed to the segment.
+        assert_eq!(translated[0].input_tokens, Some(calls.len() as u64));
+        assert_eq!(translated[0].output_tokens, Some(calls.len() as u64));
+    }
 }
 
 // Audit LLM-P3a: the escalation ladder's ceiling used to be computed without
@@ -2828,6 +3139,7 @@ async fn length_finished_repair_response_is_retried() {
     );
     let telemetry = Arc::new(TelemetryLog::new());
 
+    let mut published_usage = None;
     let translations = translate_batches_with_callback(
         provider,
         batches,
@@ -2838,16 +3150,26 @@ async fn length_finished_repair_response_is_retried() {
         None,
         Arc::new(bookforge_core::NullProgressSink),
         None,
-        |_| Ok(()),
+        |translation| {
+            published_usage = Some((translation.input_tokens, translation.output_tokens));
+            Ok(())
+        },
     )
     .await
     .expect("length-finished repair should retry");
 
     assert_eq!(max_output_tokens.lock().unwrap().len(), 3);
     assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+    // The rejected first answer and the truncated repair were billed too.
+    assert_eq!(translations[0].input_tokens, Some(3));
+    assert_eq!(translations[0].input_cached_tokens, Some(0));
+    assert_eq!(translations[0].output_tokens, Some(3));
+    assert_eq!(published_usage, Some((Some(3), Some(3))));
     let metrics = telemetry.snapshot();
     assert_eq!(metrics[1].finish_reason.as_deref(), Some("length"));
     assert_eq!(metrics[1].status, "truncated");
+    assert_eq!(metrics[1].input_tokens, Some(1));
+    assert_eq!(metrics[1].output_tokens, Some(1));
     assert_eq!(metrics[2].retry_count, 1);
 }
 

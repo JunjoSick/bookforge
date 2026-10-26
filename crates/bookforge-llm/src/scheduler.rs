@@ -1048,8 +1048,7 @@ async fn context_pairs_for_segment(
 /// model's context window: the rendered user payload plus the rendered
 /// system scaffold (audit LLM-P3b — previously only `user` was counted).
 fn estimated_request_prompt_tokens(rendered: &crate::prompt::Rendered) -> usize {
-    bookforge_core::segment::estimate_tokens(&rendered.system)
-        .saturating_add(bookforge_core::segment::estimate_tokens(&rendered.user))
+    crate::budget::estimate_rendered_tokens(rendered)
 }
 
 fn select_mode(segment: &Segment) -> TranslationMode {

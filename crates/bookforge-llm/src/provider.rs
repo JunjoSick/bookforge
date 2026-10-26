@@ -29,6 +29,12 @@ const MAX_HONORED_RETRY_AFTER_SECS: u64 = 300;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
+    /// The rendered request leaves no output allowance within the configured
+    /// context window or output limits. It is detected before dispatch, so no
+    /// provider request was sent; splitting the request can resolve it.
+    #[error("request exceeds configured budget: {0}")]
+    RequestTooLarge(String),
+
     #[error("provider error: {0}")]
     Provider(String),
 
