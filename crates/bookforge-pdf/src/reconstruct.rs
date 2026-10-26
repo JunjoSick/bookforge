@@ -263,8 +263,26 @@ fn is_on_page(page: &Page, fragment: &Fragment) -> bool {
     page.width <= 0 || (fragment.left < page.width && fragment.right() > 0)
 }
 
-fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<String> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
+/// A repeated running-margin text. `folio_offset` is set for a head that
+/// carries its page number in brackets: the number is replaced by `#` in
+/// `text` and the offset is the PDF page number minus the printed one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RunningMarginKey {
+    text: String,
+    folio_offset: Option<i64>,
+}
+
+impl RunningMarginKey {
+    fn exact(text: String) -> Self {
+        Self {
+            text,
+            folio_offset: None,
+        }
+    }
+}
+
+fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<RunningMarginKey> {
+    let mut counts: HashMap<RunningMarginKey, usize> = HashMap::new();
     for page in pages {
         let mut seen_on_page = HashSet::new();
         let lines = lines_by_position(page);
@@ -278,20 +296,28 @@ fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<String> {
             }
             let normalized = normalize_text_key(&line.text());
             if normalized.len() >= 4 && normalized.chars().any(|ch| ch.is_alphabetic()) {
-                seen_on_page.insert(normalized);
+                if let Some(key) = numbered_margin_key(page, line, &normalized) {
+                    seen_on_page.insert(key);
+                }
+                seen_on_page.insert(RunningMarginKey::exact(normalized));
             }
         }
-        for text in seen_on_page {
-            *counts.entry(text).or_default() += 1;
+        for key in seen_on_page {
+            *counts.entry(key).or_default() += 1;
         }
     }
     // Only treat a near-margin line as a running header/footer when the same
     // text repeats near the margins on at least two pages. Removing a one-off
     // line just because it is bold or larger (heading-like) silently deleted
-    // legitimate body text that merely sat near a page margin.
+    // legitimate body text that merely sat near a page margin. A head with a
+    // changing page number needs a third page: two pages agree on an offset
+    // too easily.
     counts
         .into_iter()
-        .filter_map(|(text, count)| (count >= 2).then_some(text))
+        .filter_map(|(key, count)| {
+            let required_pages = if key.folio_offset.is_some() { 3 } else { 2 };
+            (count >= required_pages).then_some(key)
+        })
         .collect()
 }
 
@@ -301,12 +327,39 @@ fn is_running_margin_line(
     median_gap: i32,
     line: &Line,
     body_size: u32,
-    running_margin_texts: &HashSet<String>,
+    running_margin_texts: &HashSet<RunningMarginKey>,
 ) -> bool {
-    line.font_size <= body_size + 1
-        && near_vertical_margin(page, line)
-        && running_margin_texts.contains(&normalize_text_key(&line.text()))
-        && stands_apart(page, page_lines, line, median_gap)
+    if line.font_size > body_size + 1 || !near_vertical_margin(page, line) {
+        return false;
+    }
+    let text = normalize_text_key(&line.text());
+    let repeated = numbered_margin_key(page, line, &text)
+        .is_some_and(|key| running_margin_texts.contains(&key))
+        || running_margin_texts.contains(&RunningMarginKey::exact(text));
+    repeated && stands_apart(page, page_lines, line, median_gap)
+}
+
+/// The key of a running head that carries its page number in brackets
+/// ("field notes [17] on rivers"): the text changes on every page, so it
+/// never repeats exactly. The number becomes `#` and the key keeps the
+/// offset between PDF page and printed number, which stays constant across
+/// a run of folios while years, chapter numbers and other figures do not.
+/// Only lines in the outer sixteenth of the page qualify, so numbered body
+/// prose cannot become a header.
+fn numbered_margin_key(page: &Page, line: &Line, normalized: &str) -> Option<RunningMarginKey> {
+    let outer_margin = page.height / 16;
+    if line.top > outer_margin && line.top + line.height < page.height - outer_margin {
+        return None;
+    }
+    let open = normalized.find('[')?;
+    let close = open + 1 + normalized[open + 1..].find(']')?;
+    let folio = normalized[open + 1..close].parse::<u32>().ok()?;
+    let mut text = normalized.to_string();
+    text.replace_range(open + 1..close, "#");
+    Some(RunningMarginKey {
+        text,
+        folio_offset: Some(i64::from(page.number) - i64::from(folio)),
+    })
 }
 
 /// The page's lines in reading position, top to bottom.
@@ -1537,6 +1590,52 @@ mod tests {
                 "First paragraph line one. First paragraph line two.".to_string(),
                 "Second paragraph after a large gap.".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn running_heads_with_a_changing_bracketed_folio_are_removed() {
+        let mut xml = String::from("<pdf2xml>");
+        for (index, unrelated) in [99, 42, 7].into_iter().enumerate() {
+            let folio = 17 + index;
+            xml.push_str(&format!(
+                r#"<page number="{}" width="594" height="918">
+<fontspec id="0" size="15" family="T"/><fontspec id="1" size="18" family="T"/>
+<text top="30" left="236" width="176" height="14" font="0">field notes [{folio}] on rivers</text>
+<text top="300" left="80" width="450" height="18" font="1">Body prose on page {index} quotes field notes [{folio}] on rivers here.</text>
+<text top="880" left="80" width="150" height="14" font="0">Gauge [{unrelated}] reading</text>
+</page>"#,
+                30 + index
+            ));
+        }
+        xml.push_str("</pdf2xml>");
+        let result = reconstruct(
+            &parse_pdf2xml(&xml).expect("fixture parses"),
+            ColumnMode::Single,
+        );
+
+        let text = result
+            .blocks
+            .iter()
+            .map(|block| block.block.text())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert_eq!(
+            text.matches("field notes [").count(),
+            3,
+            "the body mentions stay, the running heads go: {text}"
+        );
+        assert_eq!(
+            text.matches("Gauge [").count(),
+            3,
+            "numbers that do not follow the pages are not folios: {text}"
+        );
+        assert!(result.blocks.iter().all(|block| block.anchor.top != 30));
+        assert!(
+            result
+                .pages
+                .iter()
+                .all(|page| page.running_header_chars > 0)
         );
     }
 
