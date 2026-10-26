@@ -177,6 +177,12 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         blocks.append(&mut toc_blocks);
     }
 
+    // Every XHTML document is extracted once, keyed by its normalized
+    // archive path: a spine that lists a document twice, or two manifest
+    // items aliasing one file, must not duplicate its prose (and its patch
+    // targets) in the IR.
+    let mut extracted_xhtml = HashSet::new();
+
     for (spine_index, spine_item) in package.spine.iter_mut().enumerate() {
         let Some(resource) = manifest_by_id.get(spine_item.idref.as_str()) else {
             return Err(BookforgeError::InvalidInput(format!(
@@ -188,7 +194,7 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         let href = join_epub_path(&package_dir, &resource.href);
         spine_item.href = Some(href.clone());
 
-        if !is_xhtml_media_type(&resource.media_type) {
+        if !is_xhtml_media_type(&resource.media_type) || !extracted_xhtml.insert(href.clone()) {
             continue;
         }
 
@@ -217,19 +223,14 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         blocks.append(&mut section_blocks);
     }
 
-    let spine_idrefs = package
-        .spine
-        .iter()
-        .map(|item| item.idref.clone())
-        .collect::<HashSet<_>>();
-
-    for (nav_index, resource) in package
-        .manifest
-        .iter()
-        .filter(|item| is_nav_item(item) && !spine_idrefs.contains(&item.id))
-        .enumerate()
-    {
+    let mut nav_count = 0usize;
+    for resource in package.manifest.iter().filter(|item| is_nav_item(item)) {
         let href = join_epub_path(&package_dir, &resource.href);
+        if !extracted_xhtml.insert(href.clone()) {
+            continue;
+        }
+        let nav_index = nav_count;
+        nav_count += 1;
         let xhtml = read_archive_text(&mut archive, &mut read_budget, &href)?;
         let section_id = SectionId(format!("sec_nav_{nav_index:06}"));
         let mut nav_blocks = extract_blocks(&xhtml, &href, &section_id, blocks.len())?;
@@ -251,6 +252,57 @@ pub fn read_epub(path: &Path) -> Result<Book> {
             next: None,
         });
         blocks.append(&mut nav_blocks);
+    }
+
+    // Readable XHTML outside the spine (linked endnotes, appendices reached
+    // only through hyperlinks) ships with the book and is visible to readers,
+    // so it is translated too, after the spine and navigation, in manifest
+    // order.
+    let mut resource_count = 0usize;
+    for resource in package
+        .manifest
+        .iter()
+        .filter(|item| is_auxiliary_document_media_type(&item.media_type))
+    {
+        let href = join_epub_path(&package_dir, &resource.href);
+        if extracted_xhtml.contains(&href) {
+            continue;
+        }
+        // A manifest entry whose file is absent is an authoring defect that
+        // reading systems tolerate; it must not fail the whole book when the
+        // document is not part of the reading order.
+        if archive.index_for_name(&href).is_none() {
+            tracing::warn!(
+                href = %href,
+                "skipping non-spine manifest document that is missing from the archive"
+            );
+            continue;
+        }
+        extracted_xhtml.insert(href.clone());
+        let resource_index = resource_count;
+        resource_count += 1;
+        let xhtml = read_archive_text(&mut archive, &mut read_budget, &href)?;
+        let section_id = SectionId(format!("sec_resource_{resource_index:06}"));
+        let mut resource_blocks = extract_blocks(&xhtml, &href, &section_id, blocks.len())?;
+        if resource_blocks.is_empty() {
+            continue;
+        }
+        let block_ids = resource_blocks
+            .iter()
+            .map(|block| block.id.clone())
+            .collect::<Vec<_>>();
+        let (title, heading_level) = first_heading(&resource_blocks);
+        sections.push(Section {
+            id: section_id,
+            href,
+            spine_index: synthetic_base + 1 + toc_resource_count + nav_count + resource_index,
+            title,
+            heading_level,
+            block_ids,
+            prev: None,
+            next: None,
+        });
+        blocks.append(&mut resource_blocks);
     }
 
     link_sections(&mut sections);
@@ -350,9 +402,10 @@ pub fn inspect_epub(path: &Path) -> Result<EpubInspection> {
     })
 }
 
-/// Measure how much visible body text each XHTML spine document contributes
-/// versus how much the block extractor captures. Counts non-whitespace
-/// characters so block boundaries and indentation do not skew the ratio.
+/// Measure how much visible body text each XHTML content document (the
+/// spine, then readable XHTML outside it) contributes versus how much the
+/// block extractor captures. Counts non-whitespace characters so block
+/// boundaries and indentation do not skew the ratio.
 pub fn text_coverage(path: &Path) -> Result<TextCoverage> {
     let (mut archive, mut read_budget) = open_archive(path)?;
     validate_mimetype(&mut archive, &mut read_budget)?;
@@ -366,21 +419,42 @@ pub fn text_coverage(path: &Path) -> Result<TextCoverage> {
         .map(|item| (item.id.as_str(), item))
         .collect::<HashMap<_, _>>();
 
-    let mut coverage = TextCoverage::default();
-    for (spine_index, spine_item) in package.spine.iter().enumerate() {
+    // Content documents in extraction order: the spine, then readable
+    // XHTML outside it. Navigation documents are excluded so the metric
+    // does not depend on whether a book carries a nav document.
+    let mut documents = Vec::new();
+    for spine_item in &package.spine {
         let Some(resource) = manifest_by_id.get(spine_item.idref.as_str()) else {
             return Err(BookforgeError::InvalidInput(format!(
                 "spine item references missing manifest id '{}'",
                 spine_item.idref
             )));
         };
-        if !is_xhtml_media_type(&resource.media_type) {
+        if is_xhtml_media_type(&resource.media_type) {
+            documents.push(join_epub_path(&package_dir, &resource.href));
+        }
+    }
+    let spine_documents = documents.iter().cloned().collect::<HashSet<_>>();
+    for resource in package
+        .manifest
+        .iter()
+        .filter(|item| is_auxiliary_document_media_type(&item.media_type) && !is_nav_item(item))
+    {
+        let href = join_epub_path(&package_dir, &resource.href);
+        if spine_documents.contains(&href) || archive.index_for_name(&href).is_none() {
             continue;
         }
+        documents.push(href);
+    }
 
-        let href = join_epub_path(&package_dir, &resource.href);
+    let mut coverage = TextCoverage::default();
+    let mut seen = HashSet::new();
+    for (document_index, href) in documents.into_iter().enumerate() {
+        if !seen.insert(href.clone()) {
+            continue;
+        }
         let xhtml = read_archive_text(&mut archive, &mut read_budget, &href)?;
-        let section_id = SectionId(format!("sec_{spine_index:06}"));
+        let section_id = SectionId(format!("sec_{document_index:06}"));
         let blocks = extract_blocks(&xhtml, &href, &section_id, 0)?;
         let captured_chars = blocks
             .iter()
@@ -1602,6 +1676,13 @@ fn is_xhtml_media_type(media_type: &str) -> bool {
         media_type,
         "application/xhtml+xml" | "text/html" | "application/xml"
     )
+}
+
+/// Media types of documents outside the spine that are extracted for
+/// translation. Narrower than [`is_xhtml_media_type`]: a generic
+/// `application/xml` resource outside the reading order is data, not prose.
+fn is_auxiliary_document_media_type(media_type: &str) -> bool {
+    matches!(media_type, "application/xhtml+xml" | "text/html")
 }
 
 fn is_nav_item(item: &Resource) -> bool {

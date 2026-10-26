@@ -12,7 +12,7 @@ use bookforge_core::{
     segment::{BlockTranslation, build_segments},
 };
 use bookforge_epub::{
-    RebuildOptions, inspect_epub, read_epub, rebuild_epub, rebuild_epub_with_options,
+    RebuildOptions, inspect_epub, read_epub, rebuild_epub, rebuild_epub_with_options, text_coverage,
 };
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
@@ -257,6 +257,95 @@ fn rebuild_can_safely_replace_the_source_path() {
         .read_to_string(&mut chapter)
         .expect("chapter should read");
     assert!(chapter.contains("Safely replaced in place."));
+}
+
+#[test]
+fn manifest_documents_outside_the_spine_are_extracted_once_and_translated() {
+    let package = CONTENT_OPF.replace(
+        "</manifest>",
+        r#"  <item id="endnotes" href="endnotes.xhtml" media-type="application/xhtml+xml"/>
+    <item id="alias" href="./chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="data" href="data.xml" media-type="application/xml"/>
+    <item id="absent" href="absent.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>"#,
+    );
+    let fixture = create_epub_fixture_with_package(
+        "non-spine-documents",
+        "chapter1.xhtml",
+        "<p>Body paragraph.</p>",
+        &package,
+        &[
+            (
+                "OEBPS/endnotes.xhtml",
+                "<html><body><h2>Notes</h2><p>A note reached only by a link.</p></body></html>",
+            ),
+            (
+                "OEBPS/data.xml",
+                "<records><text>Not prose.</text></records>",
+            ),
+        ],
+    );
+
+    let book = read_epub(&fixture).unwrap();
+    assert_eq!(
+        book.blocks
+            .iter()
+            .filter(|block| block_text(block) == "Body paragraph.")
+            .count(),
+        1,
+        "an aliased manifest item must not duplicate the chapter"
+    );
+    assert!(
+        !book
+            .blocks
+            .iter()
+            .any(|block| block_text(block) == "Not prose."),
+        "generic XML outside the spine is not prose"
+    );
+    let note = book
+        .blocks
+        .iter()
+        .find(|block| block_text(block) == "A note reached only by a link.")
+        .expect("non-spine XHTML must be extracted");
+    let last = book.sections.last().unwrap();
+    assert_eq!(last.href, "OEBPS/endnotes.xhtml");
+    assert_eq!(last.id.0, "sec_resource_000000");
+    assert_eq!(last.title.as_deref(), Some("Notes"));
+
+    let coverage = text_coverage(&fixture).unwrap();
+    assert_eq!(
+        coverage
+            .files
+            .iter()
+            .map(|file| file.href.as_str())
+            .collect::<Vec<_>>(),
+        ["OEBPS/chapter1.xhtml", "OEBPS/endnotes.xhtml"],
+        "coverage follows extraction order and leaves navigation out"
+    );
+    assert_eq!(coverage.percent(), 100.0);
+
+    rebuild_epub(
+        &book,
+        &[BlockTranslation {
+            block_id: note.id.clone(),
+            text: "Una nota raggiunta solo da un collegamento.".to_string(),
+        }],
+        &fixture,
+    )
+    .unwrap();
+    let rebuilt = read_epub(&fixture).unwrap();
+    assert!(
+        rebuilt
+            .blocks
+            .iter()
+            .any(|block| { block_text(block) == "Una nota raggiunta solo da un collegamento." })
+    );
+    assert!(
+        !rebuilt
+            .blocks
+            .iter()
+            .any(|block| block_text(block) == "A note reached only by a link.")
+    );
 }
 
 #[test]
@@ -531,6 +620,22 @@ fn create_epub_fixture(name: &str, body: &str) -> PathBuf {
 }
 
 fn create_epub_fixture_with_chapter(name: &str, chapter_href: &str, body: &str) -> PathBuf {
+    create_epub_fixture_with_package(
+        name,
+        chapter_href,
+        body,
+        &CONTENT_OPF.replace("chapter1.xhtml", chapter_href),
+        &[],
+    )
+}
+
+fn create_epub_fixture_with_package(
+    name: &str,
+    chapter_href: &str,
+    body: &str,
+    package: &str,
+    extra_entries: &[(&str, &str)],
+) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")
@@ -560,11 +665,7 @@ fn create_epub_fixture_with_chapter(name: &str, chapter_href: &str, body: &str) 
         .start_file("OEBPS/content.opf", deflated)
         .expect("package entry should start");
     writer
-        .write_all(
-            CONTENT_OPF
-                .replace("chapter1.xhtml", chapter_href)
-                .as_bytes(),
-        )
+        .write_all(package.as_bytes())
         .expect("package should write");
     writer
         .start_file("OEBPS/nav.xhtml", deflated)
@@ -578,6 +679,14 @@ fn create_epub_fixture_with_chapter(name: &str, chapter_href: &str, body: &str) 
     writer
         .write_all(chapter_xhtml(body).as_bytes())
         .expect("chapter should write");
+    for (entry, text) in extra_entries {
+        writer
+            .start_file(*entry, deflated)
+            .expect("extra entry should start");
+        writer
+            .write_all(text.as_bytes())
+            .expect("extra entry should write");
+    }
     writer.finish().expect("fixture EPUB should finish");
 
     output
