@@ -26,8 +26,8 @@ use crate::{
     },
     report::{ConversionReport, LOW_CONFIDENCE_COVERAGE_RATIO, ReportMetrics},
     tools::{
-        ExtractedImage, PDF_RENDER_DPI, PDF_XML_ZOOM_DEN, PDF_XML_ZOOM_NUM, PageCrop,
-        PopplerBackend, PopplerTools, ScopedTempDir, crop_png_to_file,
+        ExtractedImage, MAX_RENDER_PIXELS, PDF_RENDER_DPI, PDF_XML_ZOOM_DEN, PDF_XML_ZOOM_NUM,
+        PageCrop, PopplerBackend, PopplerTools, ScopedTempDir, crop_png_to_file,
         validate_extracted_image_paths, validate_scratch_directories,
     },
 };
@@ -154,7 +154,7 @@ fn convert_pdf_with_tools(
         .collect::<Vec<_>>();
     validate_extracted_image_paths(image_dir.path(), &extracted_image_paths)?;
     validate_scratch_directories(&[media_dir.path(), image_dir.path(), page_render_dir.path()])?;
-    let mut crop_renderer = PageCropRenderer::new(input, tools, page_render_dir.path());
+    let mut crop_renderer = PageCropRenderer::new(input, tools, &pages, page_render_dir.path());
     let figure_result = figure_blocks_from_images(
         &pages,
         &page_stats,
@@ -198,7 +198,14 @@ fn convert_pdf_with_tools(
     if let Some(engine) = ocr {
         let ocr_page_dir = ScopedTempDir::new("bookforge-pdf-ocr-pages")?;
         let mut render = |page_number| {
-            let path = render_ocr_page_png(input, &pages, page_number, tools, ocr_page_dir.path())?;
+            let (path, _dpi) = render_page_within_budget(
+                input,
+                &pages,
+                page_number,
+                tools,
+                ocr_page_dir.path(),
+                MAX_OCR_RENDER_PIXELS,
+            )?;
             Ok(fs::read(path)?)
         };
         let ocr_outcome = ocr_low_confidence_pages(
@@ -314,39 +321,60 @@ fn ensure_distinct_paths(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Render one page PNG for OCR, downscaling extreme MediaBoxes so that
-/// pdftoppm's raster allocation stays within [`MAX_OCR_RENDER_PIXELS`]
-/// before any base64 encoding happens (PDF-22).
-fn render_ocr_page_png(
+/// The lowest DPI a page render may drop to; a page that does not fit the
+/// raster budget even here is refused rather than rendered.
+const MIN_RENDER_DPI: u32 = 8;
+
+/// Render one page PNG at [`PDF_RENDER_DPI`], or lower for an extreme
+/// MediaBox, so that pdftoppm's raster stays within `cap_pixels` before it
+/// is allocated (PDF-22). Returns the PNG and the DPI it was rendered at,
+/// which crop coordinates must be scaled by. A page too large to fit even at
+/// [`MIN_RENDER_DPI`] is refused without running pdftoppm.
+pub(super) fn render_page_within_budget(
     input: &Path,
     pages: &[Page],
     page_number: u32,
     tools: &dyn PopplerBackend,
     output_dir: &Path,
-) -> Result<PathBuf> {
+    cap_pixels: u64,
+) -> Result<(PathBuf, u32)> {
     let dpi = match pages.iter().find(|page| page.number == page_number) {
         Some(page) => {
-            let zoom = PDF_XML_ZOOM_NUM as f64 / PDF_XML_ZOOM_DEN as f64;
-            let width_pts = page.width.max(1) as f64 / zoom;
-            let height_pts = page.height.max(1) as f64 / zoom;
-            max_ocr_render_dpi(width_pts, height_pts, MAX_OCR_RENDER_PIXELS)
+            // pdftohtml rounds page dimensions; allow one unit for that.
+            let to_points = |xml: i32| {
+                (f64::from(xml.max(0)) + 1.0) * PDF_XML_ZOOM_DEN as f64 / PDF_XML_ZOOM_NUM as f64
+            };
+            let (width_pts, height_pts) = (to_points(page.width), to_points(page.height));
+            let dpi = max_render_dpi(width_pts, height_pts, cap_pixels);
+            let pixels_at = |points: f64| (points * f64::from(dpi) / 72.0).ceil();
+            if pixels_at(width_pts) * pixels_at(height_pts) > cap_pixels as f64 {
+                return Err(crate::tools::ToolError::PageTooLarge {
+                    page: page_number,
+                    width_pt: width_pts as u64,
+                    height_pt: height_pts as u64,
+                    limit: cap_pixels,
+                }
+                .into());
+            }
+            dpi
         }
         None => PDF_RENDER_DPI,
     };
-    Ok(tools.render_page_png_scaled(input, page_number, output_dir, dpi)?)
+    let path = tools.render_page_png_scaled(input, page_number, output_dir, dpi)?;
+    Ok((path, dpi))
 }
 
 /// The DPI at which `width_pts × height_pts` renders at most
-/// `cap_pixels`, clamped into `[8, PDF_RENDER_DPI]`. Extreme MediaBoxes
-/// may land far below the floor's quality expectations — the point is a
-/// hard allocation bound; such pages are additionally filtered by the
-/// request-body cap.
-fn max_ocr_render_dpi(width_pts: f64, height_pts: f64, cap_pixels: u64) -> u32 {
-    const MIN_DPI: f64 = 8.0;
+/// `cap_pixels`, clamped into `[MIN_RENDER_DPI, PDF_RENDER_DPI]`. Extreme
+/// MediaBoxes may land far below the floor's quality expectations — the
+/// point is a hard allocation bound; OCR pages are additionally filtered by
+/// the request-body cap.
+fn max_render_dpi(width_pts: f64, height_pts: f64, cap_pixels: u64) -> u32 {
     let area_pts = width_pts.max(1.0) * height_pts.max(1.0);
     let cap = cap_pixels.max(1) as f64;
     let dpi = (cap * 72.0 * 72.0 / area_pts).sqrt();
-    dpi.round().clamp(MIN_DPI, f64::from(PDF_RENDER_DPI)) as u32
+    dpi.floor()
+        .clamp(f64::from(MIN_RENDER_DPI), f64::from(PDF_RENDER_DPI)) as u32
 }
 
 /// Refresh per-page character counts from the final block list so OCR

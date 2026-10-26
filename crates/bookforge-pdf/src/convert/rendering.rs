@@ -122,8 +122,15 @@ pub(super) fn preserve_low_confidence_pages(
     let mut warnings = Vec::new();
     let result = (|| {
         for page_number in low_confidence_pages {
-            let rendered = match tools.render_page_png(input, *page_number, page_dir.path()) {
-                Ok(rendered) => rendered,
+            let rendered = match render_page_within_budget(
+                input,
+                pages,
+                *page_number,
+                tools,
+                page_dir.path(),
+                MAX_RENDER_PIXELS,
+            ) {
+                Ok((rendered, _dpi)) => rendered,
                 Err(err) => {
                     warnings.push(format!(
                         "page {page_number}: low-confidence page image preservation skipped because raster rendering failed: {err}"
@@ -197,29 +204,42 @@ fn replace_page_with_preserved_image(
 pub(super) struct PageCropRenderer<'a> {
     input: &'a Path,
     tools: &'a dyn PopplerBackend,
+    pages: &'a [Page],
     page_dir: &'a Path,
-    rendered_pages: HashMap<u32, PathBuf>,
+    /// Each rendered page and the DPI it was rendered at.
+    rendered_pages: HashMap<u32, (PathBuf, u32)>,
 }
 
 impl<'a> PageCropRenderer<'a> {
-    pub(super) fn new(input: &'a Path, tools: &'a dyn PopplerBackend, page_dir: &'a Path) -> Self {
+    pub(super) fn new(
+        input: &'a Path,
+        tools: &'a dyn PopplerBackend,
+        pages: &'a [Page],
+        page_dir: &'a Path,
+    ) -> Self {
         Self {
             input,
             tools,
+            pages,
             page_dir,
             rendered_pages: HashMap::new(),
         }
     }
 
-    fn render_page(&mut self, page: u32) -> Result<PathBuf> {
-        if let Some(path) = self.rendered_pages.get(&page) {
-            return Ok(path.clone());
+    fn render_page(&mut self, page: u32) -> Result<(PathBuf, u32)> {
+        if let Some(rendered) = self.rendered_pages.get(&page) {
+            return Ok(rendered.clone());
         }
-        let path = self
-            .tools
-            .render_page_png(self.input, page, self.page_dir)?;
-        self.rendered_pages.insert(page, path.clone());
-        Ok(path)
+        let rendered = render_page_within_budget(
+            self.input,
+            self.pages,
+            page,
+            self.tools,
+            self.page_dir,
+            MAX_RENDER_PIXELS,
+        )?;
+        self.rendered_pages.insert(page, rendered.clone());
+        Ok(rendered)
     }
 
     pub(super) fn render_crop(
@@ -229,9 +249,9 @@ impl<'a> PageCropRenderer<'a> {
         name: &str,
     ) -> Result<PathBuf> {
         fs::create_dir_all(output_dir)?;
-        let full_page = self.render_page(crop.page)?;
+        let (full_page, dpi) = self.render_page(crop.page)?;
         let output = output_dir.join(format!("{name}.png"));
-        crop_png_to_file(&full_page, crop.to_render_pixels(), &output)?;
+        crop_png_to_file(&full_page, crop.to_render_pixels_at(dpi), &output)?;
         Ok(output)
     }
 }

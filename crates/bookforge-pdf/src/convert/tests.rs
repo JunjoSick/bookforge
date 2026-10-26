@@ -610,7 +610,7 @@ fn regionless_small_and_repeated_images_are_reported_not_emitted() {
         pdftoppm: None,
     };
     let page_dir = dir.path().join("pages");
-    let mut renderer = PageCropRenderer::new(Path::new("input.pdf"), &tools, &page_dir);
+    let mut renderer = PageCropRenderer::new(Path::new("input.pdf"), &tools, &pages, &page_dir);
 
     let result = figure_blocks_from_images(&pages, &[], &images, &mut renderer, dir.path())
         .expect("figure pass");
@@ -1052,9 +1052,10 @@ fn nearby_raster_subimages_cluster_into_one_figure() {
         pdftoppm: Some(pdftoppm),
     };
     let page_dir = dir.path().join("pages");
-    let mut renderer = PageCropRenderer::new(Path::new("input.pdf"), &tools, &page_dir);
+    let pages = [page];
+    let mut renderer = PageCropRenderer::new(Path::new("input.pdf"), &tools, &pages, &page_dir);
 
-    let result = figure_blocks_from_images(&[page], &[], &images, &mut renderer, dir.path())
+    let result = figure_blocks_from_images(&pages, &[], &images, &mut renderer, dir.path())
         .expect("figure pass");
 
     assert_eq!(result.figures.len(), 1);
@@ -2222,13 +2223,13 @@ fn text_carried_onto_a_later_page_is_credited_to_that_page() {
 fn ocr_render_dpi_caps_extreme_media_boxes() {
     // PDF-22: A4-ish pages keep full DPI; a billboard MediaBox is
     // downscaled under the pixel budget; degenerate inputs clamp.
-    let a4 = max_ocr_render_dpi(595.0, 842.0, MAX_OCR_RENDER_PIXELS);
+    let a4 = max_render_dpi(595.0, 842.0, MAX_OCR_RENDER_PIXELS);
     assert_eq!(
         a4, PDF_RENDER_DPI,
         "ordinary pages stay at {PDF_RENDER_DPI} DPI"
     );
 
-    let extreme = max_ocr_render_dpi(20_000.0, 40_000.0, MAX_OCR_RENDER_PIXELS);
+    let extreme = max_render_dpi(20_000.0, 40_000.0, MAX_OCR_RENDER_PIXELS);
     let pixels = (20_000.0 * f64::from(extreme) / 72.0) * (40_000.0 * f64::from(extreme) / 72.0);
     assert!(
         pixels <= MAX_OCR_RENDER_PIXELS as f64,
@@ -2236,10 +2237,89 @@ fn ocr_render_dpi_caps_extreme_media_boxes() {
     );
 
     assert_eq!(
-        max_ocr_render_dpi(0.0, 0.0, MAX_OCR_RENDER_PIXELS),
+        max_render_dpi(0.0, 0.0, MAX_OCR_RENDER_PIXELS),
         PDF_RENDER_DPI,
         "degenerate dimensions cannot over-constrain"
     );
+}
+
+#[test]
+fn crop_pages_render_at_the_dpi_their_coordinates_assume() {
+    let dir = tempfile::tempdir().expect("fake-path temp dir");
+    let input = write_input_pdf(dir.path());
+    let output = dir.path().join("output.epub");
+    let fake = FakePoppler::new(TABLE_CROP_XML, TABLE_CROP_BASELINE);
+
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &fake, None)
+        .expect("conversion succeeds");
+
+    assert_eq!(outcome.report.tables, 1, "{}", outcome.report.summary());
+    assert_eq!(fake.rendered_dpis(), vec![PDF_RENDER_DPI]);
+}
+
+#[test]
+fn crops_of_a_downscaled_page_scale_by_its_render_dpi() {
+    // 30000 XML units is a 20000 pt page edge: 150 DPI would need about
+    // 1.7 billion pixels, so the page renders at 20 DPI and the crop must
+    // be cut at 20 DPI too.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut page = empty_page(1);
+    page.width = 30_000;
+    page.height = 30_000;
+    let pages = [page];
+    let fake = FakePoppler::new(TEXT_ONLY_XML, TEXT_ONLY_BASELINE);
+    let page_dir = dir.path().join("pages");
+    let mut renderer = PageCropRenderer::new(Path::new("input.pdf"), &fake, &pages, &page_dir);
+
+    let crop = renderer
+        .render_crop(
+            PageCrop {
+                page: 1,
+                left: 216,
+                top: 216,
+                width: 216,
+                height: 108,
+            },
+            dir.path(),
+            "crop",
+        )
+        .expect("crop renders");
+
+    assert_eq!(fake.rendered_dpis(), vec![20]);
+    let header = fs::read(crop).expect("crop reads");
+    let dimensions = |range: std::ops::Range<usize>| {
+        u32::from_be_bytes(header[range].try_into().expect("IHDR field"))
+    };
+    assert_eq!((dimensions(16..20), dimensions(20..24)), (40, 20));
+}
+
+#[test]
+fn pages_beyond_the_raster_budget_are_refused_before_pdftoppm_runs() {
+    let mut page = empty_page(1);
+    page.width = i32::MAX;
+    page.height = i32::MAX;
+    let fake = FakePoppler::new(TEXT_ONLY_XML, TEXT_ONLY_BASELINE);
+    let mut blocks = vec![AnchoredBlock {
+        block: DocBlock::Paragraph {
+            spans: vec![span("Original text")],
+        },
+        anchor: BlockAnchor {
+            page: 1,
+            top: 10,
+            left: 10,
+            width: 100,
+        },
+    }];
+
+    let warnings =
+        preserve_low_confidence_pages(Path::new("unused.pdf"), &[page], &fake, &mut blocks, &[1])
+            .expect("an oversized page falls back to its source text");
+
+    assert_eq!(fake.call_count("render_page"), 0);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].block.text(), "Original text");
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("raster budget"), "{warnings:?}");
 }
 
 #[test]
