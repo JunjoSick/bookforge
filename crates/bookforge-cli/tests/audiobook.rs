@@ -1057,8 +1057,7 @@ impl ElevenLabsFixture {
                     "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                if stream.write_all(head.as_bytes()).is_err() || stream.write_all(&body).is_err()
-                {
+                if stream.write_all(head.as_bytes()).is_err() || stream.write_all(&body).is_err() {
                     continue;
                 }
                 // Half-close, then drain, so Windows never answers unread

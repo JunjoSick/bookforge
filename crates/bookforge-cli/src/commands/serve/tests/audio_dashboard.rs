@@ -171,7 +171,11 @@ fn audiobook_quota_fits_uses_estimated_credits_with_rounding() {
     );
     let needed = credits.ceil() as u64;
     // Credits, not characters, decide the fit when a price exists.
-    assert!(audiobook::elevenlabs_quota_fits(5_000, Some(credits), needed));
+    assert!(audiobook::elevenlabs_quota_fits(
+        5_000,
+        Some(credits),
+        needed
+    ));
     assert!(!audiobook::elevenlabs_quota_fits(
         5_000,
         Some(credits),
