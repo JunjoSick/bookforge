@@ -87,7 +87,7 @@ fn reflow_epub_staged(
     let result = with_output_writer(input, output, options, staged_file);
     match result {
         Ok(report) => {
-            if let Err(error) = commit_staged_output("reflowed", &staged, output) {
+            if let Err(error) = commit_staged_output(&staged, output) {
                 let _ = fs::remove_file(&staged);
                 return Err(error);
             }

@@ -90,7 +90,7 @@ pub fn rebuild_epub_with_options(
             return Err(error);
         }
     };
-    if let Err(error) = commit_staged_output("rebuilt", &staged, output) {
+    if let Err(error) = commit_staged_output(&staged, output) {
         let _ = fs::remove_file(&staged);
         return Err(error);
     }
