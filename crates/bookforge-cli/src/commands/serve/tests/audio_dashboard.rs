@@ -91,6 +91,35 @@ fn audiobook_estimate_counts_model_heading_breaks_and_chapter_filter() {
 }
 
 #[test]
+fn audiobook_estimate_rejects_heading_break_without_text_room() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("book.epub");
+    build_headed_fixture_epub(&input);
+    // The break tag plus its separating space is 22 scalars: a 22-character
+    // budget leaves no room for any heading text.
+    let error = plan_audiobook_estimate(
+        &input,
+        temp.path(),
+        AudioProviderKind::Elevenlabs,
+        "eleven_flash_v2_5",
+        22,
+        None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("heading break tag"), "{error:#}");
+    // A model without break tags can use the same small budget.
+    plan_audiobook_estimate(
+        &input,
+        temp.path(),
+        AudioProviderKind::Elevenlabs,
+        "eleven_v3",
+        22,
+        None,
+    )
+    .unwrap();
+}
+
+#[test]
 fn audiobook_estimate_rejects_a_book_without_narratable_text() {
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 

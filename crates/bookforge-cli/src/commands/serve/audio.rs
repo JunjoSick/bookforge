@@ -290,6 +290,9 @@ pub(super) fn plan_audiobook_estimate(
         ),
         ..bookforge_audio::AudiobookOptions::default()
     };
+    // The launched CLI rejects these options before synthesis; the estimate
+    // must refuse them too instead of quoting a plan that can never run.
+    bookforge_audio::validate_options(&options)?;
     let plan = bookforge_audio::plan_chunks(&narration.book, &options);
     if plan.is_empty() {
         anyhow::bail!("no narratable text found (cover-only or empty book?)");

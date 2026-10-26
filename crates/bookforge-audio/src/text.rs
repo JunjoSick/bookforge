@@ -586,16 +586,31 @@ fn collapse_whitespace(text: &str) -> String {
     out
 }
 
+/// Chunk with one budget for every narration kind.
+#[cfg(test)]
+pub(crate) fn chunk_blocks(blocks: &[NarrationBlock], max_chars: usize) -> Vec<NarrationChunk> {
+    chunk_blocks_with_heading_limit(blocks, max_chars, max_chars)
+}
+
 /// Split chapter prose into chunks no longer than `max_chars` characters,
 /// cutting on sentence boundaries wherever possible. A sentence longer than
 /// the limit on its own is split at word boundaries, and a single word
 /// longer than the limit is split at a character boundary as a last resort.
 ///
-/// `max_chars` counts Unicode scalar values, not bytes; every returned
+/// Titles and headings use `heading_max_chars` instead, so a caller can
+/// reserve room for a provider-specific heading suffix (an ElevenLabs break
+/// tag) without re-chunking any body prose.
+///
+/// Both limits count Unicode scalar values, not bytes; every returned
 /// chunk is a valid string and non-empty. Returns an empty vector for
 /// blank input.
-pub(crate) fn chunk_blocks(blocks: &[NarrationBlock], max_chars: usize) -> Vec<NarrationChunk> {
+pub(crate) fn chunk_blocks_with_heading_limit(
+    blocks: &[NarrationBlock],
+    max_chars: usize,
+    heading_max_chars: usize,
+) -> Vec<NarrationChunk> {
     let max_chars = max_chars.max(1);
+    let heading_max_chars = heading_max_chars.max(1);
     let mut chunks = Vec::new();
     let mut paragraphs = Vec::new();
 
@@ -626,8 +641,8 @@ pub(crate) fn chunk_blocks(blocks: &[NarrationBlock], max_chars: usize) -> Vec<N
                 };
                 let text = block.text.trim();
                 if !text.is_empty() {
-                    let pieces = if text.chars().count() > max_chars {
-                        split_long_unit(text, max_chars)
+                    let pieces = if text.chars().count() > heading_max_chars {
+                        split_long_unit(text, heading_max_chars)
                     } else {
                         vec![text.to_string()]
                     };

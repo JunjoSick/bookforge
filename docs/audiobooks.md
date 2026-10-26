@@ -74,6 +74,13 @@ v2.5, and Multilingual v2. It never adds these tags for Eleven v3 or another
 provider. Use `--break-tags off` when the selected voice or model reads tags
 aloud instead of treating them as directives.
 
+`--max-chars` counts Unicode scalar values and includes the break tag and its
+separating space. Tagged titles and headings reserve that room before they are
+split; body chunks keep the full limit, so enabling or disabling tags never
+re-chunks body prose. If the limit leaves no room for heading text, the run
+(and the dashboard estimate) is rejected before synthesis; increase
+`--max-chars` or use `--break-tags off`.
+
 ## Providers
 
 - **`openai`** (default) — any endpoint speaking the OpenAI `/audio/speech`
