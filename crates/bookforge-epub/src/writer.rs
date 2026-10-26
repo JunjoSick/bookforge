@@ -27,8 +27,10 @@ use crate::{
     util::{
         MAX_MARKER_DEPTH, attr_value_unescaped, commit_staged_output, create_sibling_work_file,
         deterministic_zip_time, is_xhtml_resource_name, join_epub_path, local_name, marker_id,
-        never_translate_element, normalize_translation_entities, package_base_dir, validate_xml,
+        never_translate_element, normalize_translation_entities, package_base_dir,
+        resolve_general_ref, validate_xml,
     },
+    xml_text::read_text_chunk,
 };
 
 const TRANSLATION_CLASS: &str = "bookforge-translation";
@@ -1116,9 +1118,14 @@ fn patch_xhtml_with_specs(
     let mut writer = Writer::new(Vec::new());
     let mut stack = Vec::<ElementFrame>::new();
     let mut skipped_blocks = 0usize;
+    let mut pending_event = None;
 
     loop {
-        match reader.read_event()? {
+        let event = match pending_event.take() {
+            Some(event) => event,
+            None => reader.read_event()?,
+        };
+        match event {
             Event::Start(element) => {
                 let name = local_name(element.name().as_ref().as_bytes()).to_vec();
                 let path = enter_element(&mut stack, &name);
@@ -1185,58 +1192,50 @@ fn patch_xhtml_with_specs(
             // standalone blocks for non-whitespace text the block
             // whitelist missed, addressed as parent path plus
             // TEXT_NODE_PATH_BASE + n. Counting must mirror the reader:
-            // every text node that is non-whitespace after entity
-            // decoding consumes one index in its parent frame.
-            Event::Text(text) => {
-                let non_whitespace = !text.html_content().trim().is_empty();
+            // contiguous text, entity references and CDATA form one node,
+            // which consumes one index in its parent frame when its
+            // decoded text is not whitespace-only.
+            event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_)) => {
+                let chunk = read_text_chunk(event, &mut reader)?;
+                pending_event = Some(chunk.next);
+                let non_whitespace = !chunk.text.trim().is_empty();
                 match text_node_patch(&patch_map, &mut stack, non_whitespace) {
-                    Some(patch) => match options.mode {
-                        BilingualMode::Replace => {
-                            writer.write_event(translation_text_event(patch.translation))?
+                    Some(patch) => {
+                        // Extraction trims loose text, but its surrounding
+                        // whitespace still separates it from neighbouring
+                        // inline elements and must survive the patch.
+                        let leading =
+                            &chunk.text[..chunk.text.len() - chunk.text.trim_start().len()];
+                        let trailing = &chunk.text[chunk.text.trim_end().len()..];
+                        let trimmed = PatchSpec {
+                            translation: patch.translation.trim(),
+                            ..patch
+                        };
+                        match options.mode {
+                            BilingualMode::Replace => {
+                                write_plain_text(&mut writer, leading)?;
+                                writer.write_event(translation_text_event(trimmed.translation))?;
+                                write_plain_text(&mut writer, trailing)?;
+                            }
+                            BilingualMode::AppendText => {
+                                write_events(&mut writer, &chunk.events)?;
+                                write_inline_translation_span(&mut writer, trimmed, &[], options)?;
+                                write_plain_text(&mut writer, trailing)?;
+                            }
+                            BilingualMode::AppendBlock => {
+                                write_events(&mut writer, &chunk.events)?;
+                                write_translation_element_for_patch(
+                                    &mut writer,
+                                    "p",
+                                    &[TRANSLATION_CLASS],
+                                    trimmed,
+                                    &[],
+                                    options,
+                                )?;
+                            }
                         }
-                        BilingualMode::AppendText => {
-                            writer.write_event(Event::Text(text.borrow()))?;
-                            write_inline_translation_span(&mut writer, patch, &[], options)?;
-                        }
-                        BilingualMode::AppendBlock => {
-                            writer.write_event(Event::Text(text.borrow()))?;
-                            write_translation_element_for_patch(
-                                &mut writer,
-                                "p",
-                                &[TRANSLATION_CLASS],
-                                patch,
-                                &[],
-                                options,
-                            )?;
-                        }
-                    },
-                    None => writer.write_event(Event::Text(text.borrow()))?,
-                }
-            }
-            Event::CData(text) => {
-                let non_whitespace = !text.trim().is_empty();
-                match text_node_patch(&patch_map, &mut stack, non_whitespace) {
-                    Some(patch) => match options.mode {
-                        BilingualMode::Replace => {
-                            writer.write_event(translation_text_event(patch.translation))?
-                        }
-                        BilingualMode::AppendText => {
-                            writer.write_event(Event::CData(text.borrow()))?;
-                            write_inline_translation_span(&mut writer, patch, &[], options)?;
-                        }
-                        BilingualMode::AppendBlock => {
-                            writer.write_event(Event::CData(text.borrow()))?;
-                            write_translation_element_for_patch(
-                                &mut writer,
-                                "p",
-                                &[TRANSLATION_CLASS],
-                                patch,
-                                &[],
-                                options,
-                            )?;
-                        }
-                    },
-                    None => writer.write_event(Event::CData(text.borrow()))?,
+                    }
+                    None => write_events(&mut writer, &chunk.events)?,
                 }
             }
             Event::Eof => break,
@@ -1524,9 +1523,16 @@ fn dedupe_classes(classes: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn write_events(writer: &mut Writer<Vec<u8>>, events: &[Event<'static>]) -> Result<()> {
+fn write_events(writer: &mut Writer<Vec<u8>>, events: &[Event<'_>]) -> Result<()> {
     for event in events {
         writer.write_event(event.borrow())?;
+    }
+    Ok(())
+}
+
+fn write_plain_text(writer: &mut Writer<Vec<u8>>, text: &str) -> Result<()> {
+    if !text.is_empty() {
+        writer.write_event(Event::Text(BytesText::new(text)))?;
     }
     Ok(())
 }
@@ -1535,6 +1541,10 @@ fn source_has_visible_text(events: &[Event<'static>]) -> bool {
     events.iter().any(|event| match event {
         Event::Text(text) => !text.html_content().trim().is_empty(),
         Event::CData(text) => !text.trim().is_empty(),
+        // Entity-only text (`&#1043;&#1044;`) is visible text too.
+        Event::GeneralRef(reference) => {
+            resolve_general_ref(reference).is_ok_and(|value| !value.trim().is_empty())
+        }
         _ => false,
     })
 }
@@ -3170,6 +3180,57 @@ mod tests {
             outcome.xhtml,
         );
         validate_xml(&outcome.xhtml).expect("output should re-parse");
+    }
+
+    #[test]
+    fn patches_whole_stray_text_across_entities_and_cdata() {
+        let xhtml =
+            "<root><p>Head</p>North &amp; South&#8217;s <![CDATA[entire line]]>.<p>Foot</p></root>";
+        let path = DomPath(vec![0, TEXT_NODE_PATH_BASE]);
+        let outcome = patch_xhtml(xhtml, &[(&path, "La riga intera.")]).unwrap();
+
+        assert_eq!(
+            outcome.xhtml,
+            "<root><p>Head</p>La riga intera.<p>Foot</p></root>"
+        );
+    }
+
+    #[test]
+    fn replaced_stray_text_keeps_its_surrounding_whitespace() {
+        let xhtml = "<root><p>Head</p> loose words <em>tail</em></root>";
+        let path = DomPath(vec![0, TEXT_NODE_PATH_BASE]);
+        let outcome = patch_xhtml(xhtml, &[(&path, "parole sciolte")]).unwrap();
+
+        assert_eq!(
+            outcome.xhtml,
+            "<root><p>Head</p> parole sciolte <em>tail</em></root>"
+        );
+    }
+
+    #[test]
+    fn appended_stray_text_keeps_the_space_before_an_inline_sibling() {
+        let block = plain_block(
+            "b_000000",
+            DomPath(vec![0, TEXT_NODE_PATH_BASE]),
+            BlockKind::Paragraph,
+            "Before",
+        );
+        let outcome = patch_xhtml_blocks_with_options(
+            "<root>Before <em>word</em></root>",
+            &[BlockPatch {
+                block: &block,
+                translation: "Prima",
+            }],
+            &append_options(BilingualMode::AppendText),
+        )
+        .unwrap();
+
+        assert!(
+            outcome.xhtml.contains("Prima</span> <em>word</em>"),
+            "appended text lost its sibling separator: {}",
+            outcome.xhtml
+        );
+        validate_xml(&outcome.xhtml).expect("append output should re-parse");
     }
 
     #[test]

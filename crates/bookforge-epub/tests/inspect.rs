@@ -260,6 +260,44 @@ fn rebuild_can_safely_replace_the_source_path() {
 }
 
 #[test]
+fn loose_text_keeps_its_spacing_next_to_inline_siblings() {
+    let fixture = create_epub_fixture(
+        "loose-boundary-spaces",
+        "<section>One <em>two</em> three&nbsp;<strong>four</strong>.</section>",
+    );
+    let book = read_epub(&fixture).unwrap();
+    let replacements = [
+        ("One", "Uno"),
+        ("two", "due"),
+        ("three", "tre"),
+        ("four", "quattro"),
+    ];
+    let translations = book
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            let source = block_text(block);
+            replacements
+                .iter()
+                .find(|(original, _)| *original == source)
+                .map(|(_, translated)| BlockTranslation {
+                    block_id: block.id.clone(),
+                    text: (*translated).to_string(),
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(translations.len(), replacements.len());
+
+    rebuild_epub(&book, &translations, &fixture).unwrap();
+
+    let chapter = entry_text(&fixture, "OEBPS/chapter1.xhtml");
+    assert!(
+        chapter.contains("<section>Uno <em>due</em> tre\u{a0}<strong>quattro</strong>.</section>"),
+        "loose words lost their separators: {chapter}"
+    );
+}
+
+#[test]
 fn rebuild_replace_options_are_byte_identical_to_default_rebuild() {
     let fixture = create_minimal_epub();
     let book = read_epub(&fixture).expect("fixture should parse into IR");
@@ -475,6 +513,17 @@ fn block_text(block: &bookforge_core::ir::Block) -> String {
         .iter()
         .map(|run| run.text.as_str())
         .collect::<String>()
+}
+
+fn entry_text(epub: &std::path::Path, name: &str) -> String {
+    let mut archive = ZipArchive::new(File::open(epub).expect("EPUB should open")).expect("zip");
+    let mut text = String::new();
+    archive
+        .by_name(name)
+        .unwrap_or_else(|error| panic!("entry {name} missing: {error}"))
+        .read_to_string(&mut text)
+        .expect("entry should be UTF-8");
+    text
 }
 
 fn create_epub_fixture(name: &str, body: &str) -> PathBuf {

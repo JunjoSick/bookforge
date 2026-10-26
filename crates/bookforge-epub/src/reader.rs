@@ -33,6 +33,7 @@ use crate::{
         join_epub_path, local_name, marker_id, never_translate_element, normalize_space,
         package_base_dir, resolve_general_ref,
     },
+    xml_text::read_text_chunk,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,24 +503,34 @@ fn locate_package(
 
 fn parse_package(xml: &str) -> Result<PackageDocument> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
 
     let mut metadata = Metadata::default();
     let mut manifest = Vec::new();
     let mut spine = Vec::new();
     let mut toc_id = None;
-    let mut current_text_element: Option<Vec<u8>> = None;
+    // Metadata values are collected whole and trimmed at the closing tag:
+    // a title such as `Rock &amp; Roll` arrives as text, reference and text
+    // events, and keeping only the first event truncated it.
+    let mut current_text_element: Option<(Vec<u8>, String)> = None;
+    let mut pending_event = None;
     // Duplicate manifest ids resolve deterministically (first wins); EPUBs
     // with clashing ids would otherwise have patch targets chosen by
     // whichever duplicate happened to be seen last.
     let mut seen_manifest_ids = HashSet::new();
 
     loop {
-        match reader.read_event()? {
+        let event = match pending_event.take() {
+            Some(event) => event,
+            None => reader.read_event()?,
+        };
+        match event {
             Event::Start(element) => match local_name(element.name().as_ref().as_bytes()) {
                 b"title" | b"creator" | b"language" => {
-                    current_text_element =
-                        Some(local_name(element.name().as_ref().as_bytes()).to_vec());
+                    current_text_element = Some((
+                        local_name(element.name().as_ref().as_bytes()).to_vec(),
+                        String::new(),
+                    ));
                 }
                 b"item" => {
                     parse_manifest_item(&reader, &element, &mut seen_manifest_ids, &mut manifest)?
@@ -539,27 +550,30 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
                 b"itemref" => spine.push(parse_spine_item(&reader, &element)?),
                 _ => {}
             },
-            Event::Text(text) => {
-                if let Some(name) = current_text_element.as_deref() {
-                    let value = text.html_content().trim().to_string();
-                    if !value.is_empty() {
-                        match name {
-                            b"title" if metadata.title.is_none() => metadata.title = Some(value),
-                            b"creator" => metadata.creators.push(value),
-                            b"language" if metadata.language.is_none() => {
-                                metadata.language = Some(value)
-                            }
-                            _ => {}
-                        }
-                    }
+            event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_)) => {
+                let chunk = read_text_chunk(event, &mut reader)?;
+                pending_event = Some(chunk.next);
+                if let Some((_, text)) = current_text_element.as_mut() {
+                    text.push_str(&chunk.text);
                 }
             }
             Event::End(element)
-                if current_text_element
-                    .as_deref()
-                    .is_some_and(|name| name == local_name(element.name().as_ref().as_bytes())) =>
+                if current_text_element.as_ref().is_some_and(|(name, _)| {
+                    name == local_name(element.name().as_ref().as_bytes())
+                }) =>
             {
-                current_text_element = None;
+                let (name, value) = current_text_element.take().expect("checked above");
+                let value = value.trim().to_string();
+                if !value.is_empty() {
+                    match name.as_slice() {
+                        b"title" if metadata.title.is_none() => metadata.title = Some(value),
+                        b"creator" => metadata.creators.push(value),
+                        b"language" if metadata.language.is_none() => {
+                            metadata.language = Some(value)
+                        }
+                        _ => {}
+                    }
+                }
             }
             Event::Eof => break,
             _ => {}
@@ -926,9 +940,14 @@ fn extract_blocks(
     // Depth of never-translate ancestors (script/style/head/svg/...).
     // While positive, loose text is not captured into lazy blocks.
     let mut suppress_depth = 0usize;
+    let mut pending_event = None;
 
     loop {
-        match reader.read_event()? {
+        let event = match pending_event.take() {
+            Some(event) => event,
+            None => reader.read_event()?,
+        };
+        match event {
             Event::Start(element) => {
                 let name = local_name(element.name().as_ref().as_bytes()).to_vec();
                 if element_stack.len() >= MAX_READER_NESTING_DEPTH {
@@ -989,10 +1008,17 @@ fn extract_blocks(
                     block.push_inline_empty(&name);
                 }
             }
-            Event::Text(text) => {
-                let value = text.html_content();
+            // quick-xml surfaces entity references (&nbsp; &mdash; ...) and
+            // CDATA sections as events separate from the surrounding text.
+            // Adjacent pieces form one visible text node: it joins the active
+            // block, anchors a lazy block, or becomes one addressable stray
+            // text node. The writer chunks text with the same rule, so
+            // text-node indices stay aligned.
+            event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_)) => {
+                let chunk = read_text_chunk(event, &mut reader)?;
+                pending_event = Some(chunk.next);
                 handle_text(
-                    &value,
+                    &chunk.text,
                     &mut active_block,
                     &mut element_stack,
                     &current_path,
@@ -1000,41 +1026,6 @@ fn extract_blocks(
                     section_id,
                     initial_block_count,
                     suppress_depth > 0,
-                    true,
-                );
-            }
-            Event::CData(text) => {
-                let value = text.as_ref();
-                handle_text(
-                    value,
-                    &mut active_block,
-                    &mut element_stack,
-                    &current_path,
-                    &mut blocks,
-                    section_id,
-                    initial_block_count,
-                    suppress_depth > 0,
-                    true,
-                );
-            }
-            // quick-xml surfaces entity references (&nbsp; &mdash; ...) as
-            // separate events rather than resolving them inside Text.
-            // Resolve numeric and HTML5 named references; the resolved
-            // text joins the active block or may anchor a lazy one, but
-            // never consumes a stray text-node index — the writer counts
-            // Text events only, and indices must stay aligned.
-            Event::GeneralRef(reference) => {
-                let value = resolve_general_ref(&reference)?;
-                handle_text(
-                    &value,
-                    &mut active_block,
-                    &mut element_stack,
-                    &current_path,
-                    &mut blocks,
-                    section_id,
-                    initial_block_count,
-                    suppress_depth > 0,
-                    false,
                 );
             }
             Event::End(_) => {
@@ -1095,7 +1086,6 @@ fn handle_text(
     section_id: &SectionId,
     initial_block_count: usize,
     suppressed: bool,
-    allow_stray: bool,
 ) {
     if suppressed {
         return;
@@ -1120,9 +1110,6 @@ fn handle_text(
         );
         block.push_text(value);
         *active_block = Some(block);
-        return;
-    }
-    if !allow_stray {
         return;
     }
     // Stray text node: prior element siblings (or a wrapper element)
@@ -1876,6 +1863,53 @@ mod tests {
 
         assert_eq!(blocks.len(), 1);
         assert_eq!(block_text(&blocks[0]), "one two\u{2014}three");
+    }
+
+    #[test]
+    fn package_metadata_keeps_text_after_entities_and_cdata() {
+        let package = parse_package(
+            r#"<package><metadata><title>Salt &amp; <!--x--><![CDATA[Pepper]]></title><creator>Ada &amp; Grace</creator></metadata><manifest><item id="c" href="c.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c"/></spine></package>"#,
+        )
+        .expect("package should parse");
+
+        assert_eq!(package.metadata.title.as_deref(), Some("Salt & Pepper"));
+        assert_eq!(package.metadata.creators, vec!["Ada & Grace"]);
+    }
+
+    #[test]
+    fn stray_text_across_entities_and_cdata_is_one_block() {
+        let blocks = extract_blocks(
+            "<html><body><p>Head</p>North &amp; South&#8217;s <![CDATA[entire line]]>.<p>Foot</p></body></html>",
+            "chapter.xhtml",
+            &SectionId("sec_000000".to_string()),
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(
+            block_text(&blocks[1]),
+            "North & South\u{2019}s entire line."
+        );
+        assert_eq!(
+            blocks[1].dom_path.0.last().copied(),
+            Some(bookforge_core::ir::TEXT_NODE_PATH_BASE),
+            "the merged node consumes exactly one text-node index"
+        );
+    }
+
+    #[test]
+    fn stray_text_made_only_of_references_is_captured() {
+        let blocks = extract_blocks(
+            "<html><body><p>Head</p>&#1043;&#1044;&#1045;</body></html>",
+            "chapter.xhtml",
+            &SectionId("sec_000000".to_string()),
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(block_text(&blocks[1]), "\u{413}\u{414}\u{415}");
     }
 
     #[test]
