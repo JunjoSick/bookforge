@@ -889,6 +889,16 @@ fn render_qa_prompt(
         .map_err(|err| LlmError::Provider(format!("QA prompt render failed: {err}")))
 }
 
+/// Carried across one segment's attempts: every billed response's usage, the
+/// last validator error (fed back as retry guidance), and an output allowance
+/// raised after a truncated response.
+#[derive(Default)]
+struct SegmentAttemptState {
+    usage: crate::provider::TokenUsage,
+    last_error: Option<LlmError>,
+    max_output_tokens: Option<u32>,
+}
+
 async fn translate_one<P>(
     provider: Arc<P>,
     library: Arc<PromptLibrary>,
@@ -901,132 +911,60 @@ where
 {
     let mode = select_mode(&segment);
     let attempts = config.scheduler.max_attempts.max(1);
-    let mut last_error: Option<LlmError> = None;
-    let mut accum_in: u64 = 0;
-    let mut accum_cached_in: u64 = 0;
-    let mut accum_out: u64 = 0;
-
-    for _ in 0..attempts {
-        let retry_context = last_error.as_ref().map(ToString::to_string);
-        let result = request_translation(
-            provider.as_ref(),
-            library.as_ref(),
-            &segment,
-            config,
-            mode,
-            retry_context.as_deref(),
-            &context_pairs,
-        )
-        .await;
-        match result {
-            Ok(translation) => {
-                let mut translation = translation;
-                accum_in += translation.input_tokens.unwrap_or(0);
-                accum_cached_in += translation.input_cached_tokens.unwrap_or(0);
-                accum_out += translation.output_tokens.unwrap_or(0);
-                translation.input_tokens = if accum_in > 0 { Some(accum_in) } else { None };
-                translation.input_cached_tokens = if accum_cached_in > 0 {
-                    Some(accum_cached_in)
-                } else {
-                    None
-                };
-                translation.output_tokens = if accum_out > 0 { Some(accum_out) } else { None };
-                return translation;
-            }
-            Err(error) => {
-                if is_validator_error(&error) {
-                    last_error = Some(error);
-                } else {
-                    let tokens_in = if accum_in > 0 { Some(accum_in) } else { None };
-                    let cached_in = if accum_cached_in > 0 {
-                        Some(accum_cached_in)
-                    } else {
-                        None
-                    };
-                    let tokens_out = if accum_out > 0 { Some(accum_out) } else { None };
-                    return failed_translation_with_tokens(
-                        &segment,
-                        mode,
-                        error.to_string(),
-                        tokens_in,
-                        cached_in,
-                        tokens_out,
-                    );
-                }
-            }
-        }
-    }
-
+    let fallback = (mode == TranslationMode::MarkerSafe && has_structured_runs(&segment))
+        .then_some(TranslationMode::RunPreserving);
+    let mut state = SegmentAttemptState::default();
     let mut final_mode = mode;
-    if mode == TranslationMode::MarkerSafe && has_structured_runs(&segment) {
-        let retry_context = last_error.as_ref().map(ToString::to_string);
-        let result = request_translation(
+    for attempt_mode in std::iter::repeat_n(mode, attempts).chain(fallback) {
+        final_mode = attempt_mode;
+        match request_translation(
             provider.as_ref(),
             library.as_ref(),
             &segment,
             config,
-            TranslationMode::RunPreserving,
-            retry_context.as_deref(),
+            attempt_mode,
+            &mut state,
             &context_pairs,
         )
-        .await;
-        match result {
-            Ok(translation) => {
-                let mut translation = translation;
-                accum_in += translation.input_tokens.unwrap_or(0);
-                accum_cached_in += translation.input_cached_tokens.unwrap_or(0);
-                accum_out += translation.output_tokens.unwrap_or(0);
-                translation.input_tokens = if accum_in > 0 { Some(accum_in) } else { None };
-                translation.input_cached_tokens = if accum_cached_in > 0 {
-                    Some(accum_cached_in)
-                } else {
-                    None
-                };
-                translation.output_tokens = if accum_out > 0 { Some(accum_out) } else { None };
-                return translation;
+        .await
+        {
+            Ok(translation) => return translation,
+            // Nothing was sent and no retry can fit: review, don't fail.
+            Err(error @ LlmError::RequestTooLarge(_)) => {
+                return needs_review_translation_with_tokens(
+                    &segment,
+                    attempt_mode,
+                    error.to_string(),
+                    state.usage.input,
+                    state.usage.cached_input,
+                    state.usage.output,
+                );
             }
+            Err(error) if is_validator_error(&error) => state.last_error = Some(error),
             Err(error) => {
-                if is_validator_error(&error) {
-                    final_mode = TranslationMode::RunPreserving;
-                    last_error = Some(error);
-                } else {
-                    let tokens_in = if accum_in > 0 { Some(accum_in) } else { None };
-                    let cached_in = if accum_cached_in > 0 {
-                        Some(accum_cached_in)
-                    } else {
-                        None
-                    };
-                    let tokens_out = if accum_out > 0 { Some(accum_out) } else { None };
-                    return failed_translation_with_tokens(
-                        &segment,
-                        TranslationMode::RunPreserving,
-                        error.to_string(),
-                        tokens_in,
-                        cached_in,
-                        tokens_out,
-                    );
-                }
+                return failed_translation_with_tokens(
+                    &segment,
+                    attempt_mode,
+                    error.to_string(),
+                    state.usage.input,
+                    state.usage.cached_input,
+                    state.usage.output,
+                );
             }
         }
     }
 
-    let tokens_in = if accum_in > 0 { Some(accum_in) } else { None };
-    let cached_in = if accum_cached_in > 0 {
-        Some(accum_cached_in)
-    } else {
-        None
-    };
-    let tokens_out = if accum_out > 0 { Some(accum_out) } else { None };
-    let error_message = last_error
+    let error_message = state
+        .last_error
         .map(|err| err.to_string())
         .unwrap_or_else(|| "exhausted validation retries".to_string());
     needs_review_translation_with_tokens(
         &segment,
         final_mode,
         error_message,
-        tokens_in,
-        cached_in,
-        tokens_out,
+        state.usage.input,
+        state.usage.cached_input,
+        state.usage.output,
     )
 }
 
@@ -1065,7 +1003,7 @@ async fn request_translation<P>(
     segment: &Segment,
     config: &TranslationRunConfig,
     mode: TranslationMode,
-    retry_context: Option<&str>,
+    state: &mut SegmentAttemptState,
     context_pairs: &[CompletedContext],
 ) -> Result<SegmentTranslation>
 where
@@ -1077,10 +1015,12 @@ where
         TranslationMode::RunPreserving => &library.run_preserving,
     };
     let mut rendered = render_prompt(template, segment, config, mode, context_pairs)?;
-    if let Some(retry_context) = retry_context {
-        rendered
-            .user
-            .push_str(&validation_retry_appendix(segment, mode, retry_context));
+    if let Some(error) = &state.last_error {
+        rendered.user.push_str(&validation_retry_appendix(
+            segment,
+            mode,
+            &error.to_string(),
+        ));
     }
     let temperature = if config.temperature > 0.0 {
         config.temperature
@@ -1088,31 +1028,42 @@ where
         mode.temperature_default()
     };
 
-    let max_output_tokens = {
-        let requested = config.max_output_tokens;
-        let computed = requested.unwrap_or_else(|| {
-            max_output_tokens(
-                segment,
-                mode,
-                provider.is_reasoning(),
-                &config.target_language,
-                config.provider.eq_ignore_ascii_case("deepseek"),
-            )
-        });
-        // LLM-1/CORE-4/LLM-16: the same context/user clamp the batch path
-        // applies must also apply here. An explicit cap stays authoritative,
-        // and a nearly-full context window can never be "solved" by raising
-        // the budget back to an arbitrary floor.
-        // Audit LLM-P3b: the remainder estimate used to count only the
-        // rendered user payload; the system scaffold was deducted from
-        // nobody's budget, inflating the response allowance. Include it.
-        clamped_output_budget(
-            computed,
-            estimated_request_prompt_tokens(&rendered),
-            config.model_context_tokens,
-            requested,
+    let reasoning = provider.is_reasoning();
+    let extended_output = config.provider.eq_ignore_ascii_case("deepseek");
+    let estimated_prompt_tokens = estimated_request_prompt_tokens(&rendered);
+    let requested = config.max_output_tokens;
+    let default_budget = requested.unwrap_or_else(|| {
+        max_output_tokens(
+            segment,
+            mode,
+            reasoning,
+            &config.target_language,
+            extended_output,
         )
-    };
+    });
+    // LLM-1/CORE-4/LLM-16: the same context/user clamp the batch path
+    // applies must also apply here. An explicit cap stays authoritative,
+    // and a nearly-full context window can never be "solved" by raising
+    // the budget back to an arbitrary floor.
+    // Audit LLM-P3b: the remainder estimate used to count only the
+    // rendered user payload; the system scaffold was deducted from
+    // nobody's budget, inflating the response allowance. Include it.
+    // A previous truncated attempt may have raised the allowance.
+    let max_output_tokens = clamped_output_budget(
+        state
+            .max_output_tokens
+            .unwrap_or(default_budget)
+            .max(default_budget),
+        estimated_prompt_tokens,
+        config.model_context_tokens,
+        requested,
+    );
+    if max_output_tokens == 0 {
+        return Err(LlmError::RequestTooLarge(
+            "no output-token budget remains within the configured model context window"
+                .to_string(),
+        ));
+    }
     let (runtime_config_revision, provider_max_attempts) = config.request_runtime_metadata();
     let request = CompletionRequest {
         system: rendered.system,
@@ -1133,7 +1084,24 @@ where
         },
     };
     let response = provider.complete(request).await?;
+    state.usage.add((&response).into());
     if response.finish_reason == FinishReason::Length {
+        // Reasoning shares the allowance with the answer: retry with more
+        // room, within the profile ceiling, the context and any explicit cap.
+        let ceiling = output_token_ceiling(
+            reasoning || response.is_reasoning_response(),
+            &config.target_language,
+            extended_output,
+        );
+        state.max_output_tokens = Some(clamped_output_budget(
+            max_output_tokens
+                .saturating_mul(2)
+                .max(max_output_tokens.saturating_add(2_048))
+                .min(ceiling),
+            estimated_prompt_tokens,
+            config.model_context_tokens,
+            requested,
+        ));
         return Err(LlmError::InvalidResponse(
             "output was truncated: max_output_tokens limit reached".to_string(),
         ));
@@ -1154,9 +1122,9 @@ where
         status: SegmentStatus::Succeeded,
         template: template.name.clone(),
         error: None,
-        input_tokens: response.input_tokens,
-        input_cached_tokens: response.input_cached_tokens,
-        output_tokens: response.output_tokens,
+        input_tokens: state.usage.input,
+        input_cached_tokens: state.usage.cached_input,
+        output_tokens: state.usage.output,
         tokens_estimated: false,
         findings: Vec::new(),
     })
@@ -1190,23 +1158,31 @@ fn max_output_tokens(
     let built_in_multiplier = built_in_policy
         .map(|policy| policy.output_token_multiplier)
         .unwrap_or(0);
+    // Reasoning competes with the answer for the same allowance.
     let built_in_minimum = built_in_policy
         .map(|policy| policy.min_output_tokens as usize)
-        .unwrap_or(512);
+        .unwrap_or(512)
+        .max(if reasoning { 2_048 } else { 512 });
     let source_multiplier: usize = (if reasoning { 8 } else { 3 }).max(built_in_multiplier);
-    let max_cap: usize = if reasoning || extended_output {
-        32_768
-    } else if built_in_multiplier > 0 {
-        16_384
-    } else {
-        8_192
-    };
+    let max_cap = output_token_ceiling(reasoning, target_language, extended_output) as usize;
     let estimate = source_tokens
         .saturating_mul(source_multiplier)
         .saturating_add(block_overhead)
         .saturating_add(marker_overhead)
         .max(512);
     estimate.max(built_in_minimum).min(max_cap) as u32
+}
+
+fn output_token_ceiling(reasoning: bool, target_language: &str, extended_output: bool) -> u32 {
+    if reasoning || extended_output {
+        32_768
+    } else if bookforge_core::style::built_in_sizing_policy_for_target(target_language)
+        .is_some_and(|policy| policy.output_token_multiplier > 0)
+    {
+        16_384
+    } else {
+        8_192
+    }
 }
 
 /// Minimum output budget used only as a safety net against degenerate
@@ -1606,6 +1582,7 @@ fn parse_and_validate(
                 }
                 let expected_markers = marker_ids_in_text(&source_block.text);
                 validate_markers(segment, &expected_markers, &translation)?;
+                validate_marker_reference_text(segment, &source_block.text, &translation)?;
                 validate_protected_spans(segment, &source_block.protected_spans, &translation)?;
                 if validate_source_copy
                     && let Some(error) = crate::validation::source_copy_validation_error(
@@ -1677,6 +1654,7 @@ fn parse_and_validate(
                 }
                 let expected_markers = marker_ids_in_text(&source_block.text);
                 validate_markers(segment, &expected_markers, &text)?;
+                validate_marker_reference_text(segment, &source_block.text, &text)?;
                 validate_protected_spans(segment, &source_block.protected_spans, &text)?;
                 if validate_source_copy
                     && let Some(error) = crate::validation::source_copy_validation_error(
@@ -1820,6 +1798,19 @@ fn validate_protected_spans(
         }
     }
     Ok(())
+}
+
+/// The batch validator's endnote rule, applied to non-batch output: a marker
+/// that wrapped a reference token (`*1`) must keep it, even when the marker
+/// IDs themselves survived.
+fn validate_marker_reference_text(segment: &Segment, source: &str, translation: &str) -> Result<()> {
+    match crate::validation::marker_reference_text_error(source, translation) {
+        Some(error) => Err(LlmError::InvalidResponse(format!(
+            "invalid reference text in segment '{}': {error}",
+            segment.id.0
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn validate_markers(segment: &Segment, expected: &[String], translation: &str) -> Result<()> {
@@ -2774,6 +2765,175 @@ mod tests {
         assert!(rendered.user.contains("42"));
         assert!(!rendered.user.contains("\"kind\": \"Number\""));
         assert!(!rendered.user.contains("\"kind\":\"Number\""));
+    }
+
+    struct AttemptSequenceProvider {
+        responses: std::sync::Mutex<std::collections::VecDeque<CompletionResponse>>,
+        budgets: std::sync::Mutex<Vec<Option<u32>>>,
+    }
+
+    impl AttemptSequenceProvider {
+        fn new(responses: Vec<(FinishReason, &str)>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(|(finish_reason, content)| CompletionResponse {
+                            content: content.to_string(),
+                            input_tokens: Some(10),
+                            input_cached_tokens: Some(0),
+                            output_tokens: Some(20),
+                            finish_reason,
+                            provider_latency_ms: 0,
+                            raw: serde_json::json!({}),
+                        })
+                        .collect(),
+                ),
+                budgets: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl LlmProvider for AttemptSequenceProvider {
+        async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+            self.budgets.lock().unwrap().push(request.max_output_tokens);
+            Ok(self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("queued response"))
+        }
+
+        fn is_reasoning(&self) -> bool {
+            true
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: true,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nonbatch_retry_increases_exhausted_budget_and_keeps_all_response_usage() {
+        let provider = Arc::new(AttemptSequenceProvider::new(vec![
+            (FinishReason::Length, ""),
+            (FinishReason::Stop, "invalid JSON"),
+            (
+                FinishReason::Stop,
+                r#"{"segment_id":"seg","translation":"Ciao"}"#,
+            ),
+        ]));
+        let mut cfg = config();
+        cfg.scheduler.max_attempts = 3;
+        let translated = translate_one(
+            provider.clone(),
+            Arc::new(PromptLibrary::global().clone()),
+            segment("seg", 0, vec![("b", "Hello")]),
+            &cfg,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(translated.status, SegmentStatus::Succeeded);
+        assert_eq!(translated.input_tokens, Some(30));
+        assert_eq!(translated.input_cached_tokens, Some(0));
+        assert_eq!(translated.output_tokens, Some(60));
+        assert_eq!(
+            *provider.budgets.lock().unwrap(),
+            vec![Some(2_048), Some(4_096), Some(4_096)]
+        );
+    }
+
+    #[tokio::test]
+    async fn nonbatch_exhausted_retry_keeps_usage_and_respects_explicit_budget() {
+        let provider = Arc::new(AttemptSequenceProvider::new(vec![
+            (FinishReason::Length, ""),
+            (FinishReason::Length, ""),
+        ]));
+        let mut cfg = config();
+        cfg.scheduler.max_attempts = 2;
+        cfg.max_output_tokens = Some(600);
+        let translated = translate_one(
+            provider.clone(),
+            Arc::new(PromptLibrary::global().clone()),
+            segment("seg", 0, vec![("b", "Hello")]),
+            &cfg,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(translated.status, SegmentStatus::NeedsReview);
+        assert_eq!(translated.input_tokens, Some(20));
+        assert_eq!(translated.output_tokens, Some(40));
+        assert_eq!(
+            *provider.budgets.lock().unwrap(),
+            vec![Some(600), Some(600)]
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_context_budget_does_not_call_segment_provider() {
+        let segments = vec![segment("seg_a", 0, vec![("b0", "Visible prose")])];
+        let mut run_config = config();
+        run_config.model_context_tokens = Some(1);
+        // This provider produces a different terminal failure if called.
+        let translations = translate_segments(FailingProvider, &segments, &run_config)
+            .await
+            .expect("budget exhaustion is reviewable");
+        assert_eq!(translations[0].status, SegmentStatus::NeedsReview);
+        assert!(
+            translations[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("no output-token budget")
+        );
+    }
+
+    #[test]
+    fn nonbatch_marker_safe_rejects_lost_endnote_reference_with_intact_markers() {
+        let source = "Ravens deceive unseen birds as well.<m1><m2>*1</m2></m1>";
+        let segment = segment("seg", 0, vec![("b", source)]);
+        let response = serde_json::json!({"segment_id":"seg", "blocks":[{
+            "block_id":"b", "translation":"Anche i corvi ingannano gli uccelli nascosti.<m1><m2></m2></m1>"
+        }]})
+        .to_string();
+        let error = parse_and_validate(&response, &segment, TranslationMode::MarkerSafe, false)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("lost its reference text '*1'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn nonbatch_run_preserving_rejects_changed_endnote_number() {
+        let mut segment = segment("seg", 0, vec![("b", "Birds deceive.<m1>*1</m1>")]);
+        segment.source.blocks[0].text_runs = ["Birds deceive.", "<m1>", "*1", "</m1>"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| SegmentTextRun {
+                id: format!("r{i}"),
+                text: text.into(),
+            })
+            .collect();
+        let translated = ["Gli uccelli ingannano.", "<m1>", "*2", "</m1>"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| serde_json::json!({"id":format!("r{i}"),"text":text}))
+            .collect::<Vec<_>>();
+        let response = serde_json::json!({"segment_id":"seg", "blocks":[{
+            "block_id":"b", "translated_runs":translated
+        }]})
+        .to_string();
+        let error = parse_and_validate(&response, &segment, TranslationMode::RunPreserving, false)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("lost its reference text '*1'"),
+            "{error}"
+        );
     }
 
     fn config() -> TranslationRunConfig {
