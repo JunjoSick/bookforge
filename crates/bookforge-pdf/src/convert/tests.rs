@@ -664,6 +664,49 @@ fn three_row_aligned_stats_without_caption_are_not_tables() {
     assert!(table_regions_for_page(&page, &[]).is_empty());
 }
 
+fn styled_fragment(top: i32, left: i32, width: i32, text: &str, italic: bool) -> Fragment {
+    Fragment {
+        spans: vec![Span {
+            italic,
+            ..span(text)
+        }],
+        ..fragment(top, left, width, 12, text)
+    }
+}
+
+#[test]
+fn font_runs_of_numbered_notes_are_not_table_cells() {
+    // Each note is one line that Poppler splits at the italic title: three
+    // touching fragments, two with digits, at the same offsets every line.
+    let mut page = empty_page(1);
+    for row in 0..5 {
+        let top = 600 + row * 14;
+        page.fragments.extend([
+            styled_fragment(top, 54, 60, &format!("{}. A. Writer, ", row + 31), false),
+            styled_fragment(top - 1, 114, 70, "Rivers and Rain", true),
+            styled_fragment(top, 184, 30, &format!(", {}.", 120 + row), false),
+        ]);
+    }
+
+    assert!(table_regions_for_page(&page, &[]).is_empty());
+}
+
+#[test]
+fn separated_columns_stay_a_table_when_a_cell_changes_font() {
+    let mut page = empty_page(1);
+    for row in 0..4 {
+        let top = 150 + row * 20;
+        page.fragments.extend([
+            styled_fragment(top, 54, 20, "Run ", false),
+            styled_fragment(top - 1, 74, 20, "B", true),
+            styled_fragment(top, 160, 28, "0.71", false),
+            styled_fragment(top, 240, 28, "0.75", false),
+        ]);
+    }
+
+    assert_eq!(table_regions_for_page(&page, &[]).len(), 1);
+}
+
 #[test]
 fn table_region_clamps_to_table_column_on_two_column_page() {
     let mut page = empty_page(1);
