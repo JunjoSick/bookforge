@@ -92,11 +92,22 @@ pub fn validate_translated_epub(
 
                         let compressed_size = entry.compressed_size();
                         match read_budget.read_entry(&mut entry, &name, compressed_size) {
-                            Ok(bytes) => {
-                                if let Ok(content) = String::from_utf8(bytes) {
-                                    validate_xhtml_content(&mut report, &name, &content);
+                            // An XML resource that cannot be decoded is not
+                            // valid either; skipping it would report a
+                            // clean archive that reading systems reject.
+                            Ok(bytes) => match decode_xml_resource(bytes) {
+                                Ok(content) => validate_xhtml_content(&mut report, &name, &content),
+                                Err(message) => {
+                                    report.xml_valid = false;
+                                    report.issues.push(EpubValidationIssue {
+                                        severity: ValidationSeverity::Error,
+                                        kind: "resource_encoding".to_string(),
+                                        href: Some(name.clone()),
+                                        block_id: None,
+                                        message,
+                                    });
                                 }
-                            }
+                            },
                             Err(error) => {
                                 report.xml_valid = false;
                                 report.issues.push(EpubValidationIssue {
@@ -178,26 +189,93 @@ fn validate_xhtml_content(report: &mut EpubValidationReport, href: &str, content
     }
 }
 
-/// Entries whose well-formedness matters: document resources and the
-/// package manifest. Extension matching is case-insensitive — untrusted
-/// archives routinely ship `CHAPTER.XHTML` — but no second archive scan is
-/// performed for the check.
+/// Entries whose well-formedness matters: content documents, the package
+/// document, the NCX, SVG images and other XML resources such as
+/// `META-INF/container.xml`. Extension matching is case-insensitive —
+/// untrusted archives routinely ship `CHAPTER.XHTML` — but no second
+/// archive scan is performed for the check.
 fn is_validatable_resource_name(name: &str) -> bool {
     name.rsplit_once('.').is_some_and(|(_, extension)| {
         matches!(
             extension.to_ascii_lowercase().as_str(),
-            "xhtml" | "html" | "opf"
+            "xhtml" | "html" | "opf" | "ncx" | "xml" | "svg"
         )
     })
 }
 
+/// Decode an XML resource for validation. EPUB permits UTF-16 XML
+/// resources; they are recognized by their byte order mark and decoded
+/// strictly, so malformed code units are reported instead of replaced.
+/// Everything else must be UTF-8 (a UTF-8 BOM is skipped by the parser).
+fn decode_xml_resource(bytes: Vec<u8>) -> std::result::Result<String, String> {
+    let little_endian = match bytes.get(..2) {
+        Some([0xff, 0xfe]) => true,
+        Some([0xfe, 0xff]) => false,
+        _ => {
+            return String::from_utf8(bytes).map_err(|error| {
+                format!("XML resource is neither UTF-8 nor BOM-marked UTF-16: {error}")
+            });
+        }
+    };
+    let units = bytes[2..].chunks_exact(2);
+    if !units.remainder().is_empty() {
+        return Err("UTF-16 XML resource ends with an incomplete code unit".to_string());
+    }
+    char::decode_utf16(units.map(|unit| {
+        let pair = [unit[0], unit[1]];
+        if little_endian {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
+    }))
+    .collect::<std::result::Result<String, _>>()
+    .map_err(|error| format!("XML resource is not valid UTF-16: {error}"))
+}
+
+/// Well-formedness check: the parser must accept every event, attributes
+/// must parse, and the document must have exactly one root element with
+/// nothing but whitespace, comments and processing instructions around it.
+/// An empty file, bare text, a truncated document or two sibling roots all
+/// parse event by event without error, so the structure is checked too.
 fn has_broken_xml(content: &str) -> bool {
     use quick_xml::{Reader, events::Event};
     let mut reader = Reader::from_str(content);
     reader.config_mut().trim_text(false);
+    let mut depth = 0usize;
+    let mut roots = 0usize;
     loop {
         match reader.read_event() {
-            Ok(Event::Eof) => return false,
+            Ok(Event::Start(element)) => {
+                if element.attributes().any(|attribute| attribute.is_err()) {
+                    return true;
+                }
+                if depth == 0 {
+                    roots += 1;
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(element)) => {
+                if element.attributes().any(|attribute| attribute.is_err()) {
+                    return true;
+                }
+                if depth == 0 {
+                    roots += 1;
+                }
+            }
+            Ok(Event::End(_)) => {
+                let Some(parent_depth) = depth.checked_sub(1) else {
+                    return true;
+                };
+                depth = parent_depth;
+            }
+            Ok(Event::Text(text)) if depth == 0 => {
+                if !text.html_content().trim().is_empty() {
+                    return true;
+                }
+            }
+            Ok(Event::CData(_) | Event::GeneralRef(_)) if depth == 0 => return true,
+            Ok(Event::Eof) => return roots != 1 || depth != 0,
             Ok(_) => continue,
             Err(_) => return true,
         }
@@ -297,9 +375,12 @@ mod tests {
         assert!(is_validatable_resource_name("TEXT/CHAPTER.XHTML"));
         assert!(is_validatable_resource_name("index.Html"));
         assert!(is_validatable_resource_name("OEBPS/content.OPF"));
-        assert!(!is_validatable_resource_name("toc.ncx"));
+        assert!(is_validatable_resource_name("toc.ncx"));
+        assert!(is_validatable_resource_name("NAVIGATION.NCX"));
+        assert!(is_validatable_resource_name("META-INF/container.xml"));
+        assert!(is_validatable_resource_name("images/figure.SVG"));
         assert!(!is_validatable_resource_name("images/cover.png"));
-        assert!(!is_validatable_resource_name("META-INF/container.xml"));
+        assert!(!is_validatable_resource_name("styles/book.css"));
     }
 
     #[test]
@@ -383,6 +464,177 @@ mod tests {
             report.issues
         );
         assert!(!report.xml_valid);
+    }
+
+    /// Archive holding the mimetype, a container and one extra entry; the
+    /// file is removed on drop.
+    struct OneResourceArchive(std::path::PathBuf);
+
+    impl OneResourceArchive {
+        fn new(resource: &str, bytes: &[u8]) -> Self {
+            use std::io::Write as _;
+            use zip::{CompressionMethod, write::SimpleFileOptions};
+
+            static SEQUENCE: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let label = format!("bookforge-validate-resource-{sequence}");
+            Self(temp_zip(&label, |mut writer| {
+                let stored =
+                    SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+                let deflated =
+                    SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+                writer.start_file("mimetype", stored).unwrap();
+                writer.write_all(b"application/epub+zip").unwrap();
+                writer
+                    .start_file("META-INF/container.xml", deflated)
+                    .unwrap();
+                writer.write_all(CONTAINER_XML.as_bytes()).unwrap();
+                writer.start_file(resource, deflated).unwrap();
+                writer.write_all(bytes).unwrap();
+                writer.finish().unwrap();
+            }))
+        }
+
+        fn report(&self) -> EpubValidationReport {
+            validate_translated_epub(&self.0, &[], &[])
+        }
+    }
+
+    impl Drop for OneResourceArchive {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn utf16(xml: &str, little_endian: bool) -> Vec<u8> {
+        let mut bytes = if little_endian {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in xml.encode_utf16() {
+            bytes.extend(if little_endian {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        bytes
+    }
+
+    #[test]
+    fn undecodable_xml_is_a_validation_failure() {
+        let archive = OneResourceArchive::new("chapter.xhtml", b"<html>\xff</html>");
+        let report = archive.report();
+        assert!(!report.xml_valid, "invalid UTF-8 was silently skipped");
+        assert!(report.issues.iter().any(|issue| {
+            issue.kind == "resource_encoding" && issue.href.as_deref() == Some("chapter.xhtml")
+        }));
+    }
+
+    #[test]
+    fn bom_marked_utf16_and_utf8_resources_validate() {
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><svg xmlns=\"http://www.w3.org/2000/svg\"><title>Caf\u{e9} \u{1f30d}</title></svg>";
+        for little_endian in [true, false] {
+            let archive = OneResourceArchive::new("figure.SVG", &utf16(xml, little_endian));
+            let report = archive.report();
+            assert!(report.xml_valid, "{:#?}", report.issues);
+        }
+        let archive = OneResourceArchive::new("figure.svg", b"\xef\xbb\xbf<svg/>");
+        let report = archive.report();
+        assert!(report.xml_valid, "{:#?}", report.issues);
+    }
+
+    #[test]
+    fn malformed_utf16_is_rejected_instead_of_replaced() {
+        for bytes in [
+            vec![0xff, 0xfe, b'<'],
+            vec![0xfe, 0xff, 0],
+            vec![0xff, 0xfe, 0x00, 0xd8],
+            vec![0xfe, 0xff, 0xdc, 0x00],
+        ] {
+            let archive = OneResourceArchive::new("figure.svg", &bytes);
+            let report = archive.report();
+            assert!(!report.xml_valid);
+            assert!(report.issues.iter().any(|issue| {
+                issue.kind == "resource_encoding" && issue.href.as_deref() == Some("figure.svg")
+            }));
+        }
+
+        let archive = OneResourceArchive::new("figure.svg", &utf16("<svg><title></svg>", true));
+        let report = archive.report();
+        assert!(!report.xml_valid);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == "malformed_xhtml")
+        );
+    }
+
+    #[test]
+    fn every_xml_resource_extension_is_checked_case_insensitively() {
+        for name in [
+            "chapter.XHTML",
+            "package.OPF",
+            "navigation.NCX",
+            "broken.XML",
+            "figure.SVG",
+        ] {
+            let archive = OneResourceArchive::new(name, b"<root><child></root>");
+            assert!(
+                !archive.report().xml_valid,
+                "malformed resource {name} was skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn documents_without_exactly_one_complete_root_are_broken() {
+        for xml in [
+            "",
+            "only text",
+            "<root>",
+            "<root><child/>",
+            "<a/><b/>",
+            "<root/>trailing",
+            "&amp;<root/>",
+        ] {
+            assert!(has_broken_xml(xml), "invalid document accepted: {xml:?}");
+        }
+        assert!(!has_broken_xml(
+            "<?xml version=\"1.0\"?>\n<!DOCTYPE html>\n<!-- lead -->\n<html/>\n"
+        ));
+    }
+
+    #[test]
+    fn understated_entry_sizes_cannot_expand_past_the_budget() {
+        let content = format!("<root>{}</root>", "x".repeat(1024 * 1024));
+        let archive = OneResourceArchive::new("liar.xhtml", content.as_bytes());
+        let mut bytes = std::fs::read(&archive.0).unwrap();
+        let central = bytes
+            .windows(4)
+            .enumerate()
+            .find_map(|(index, signature)| {
+                (signature == b"PK\x01\x02"
+                    && bytes.get(index + 46..index + 56) == Some(b"liar.xhtml"))
+                .then_some(index)
+            })
+            .expect("test entry has a central directory record");
+        // Declare 1 KiB uncompressed while the entry really inflates to 1 MiB.
+        bytes[central + 24..central + 28].copy_from_slice(&1024u32.to_le_bytes());
+        std::fs::write(&archive.0, bytes).unwrap();
+
+        let report = archive.report();
+        assert!(!report.xml_valid);
+        assert!(
+            report.issues.iter().any(|issue| {
+                issue.kind == "decompression_limit" && issue.href.as_deref() == Some("liar.xhtml")
+            }),
+            "{:#?}",
+            report.issues
+        );
     }
 
     /// Minimal EPUB with one chapter whose body is injected verbatim, so
