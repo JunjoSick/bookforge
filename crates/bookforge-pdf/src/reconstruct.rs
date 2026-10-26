@@ -36,6 +36,12 @@ pub struct PageStats {
     /// rather than conversion quality; it never gates coverage itself.
     #[serde(default)]
     pub rtl_dominant: bool,
+    /// The page has no text in the XML and one positioned image covering at
+    /// least half of it: a scanned page. Conversion confirms it against the
+    /// `pdftotext` baseline (it must be empty too) and then treats the page
+    /// as low-confidence, so OCR can supply its text.
+    #[serde(default)]
+    pub image_only_candidate: bool,
     pub low_confidence: bool,
     pub low_confidence_action: Option<String>,
 }
@@ -177,6 +183,7 @@ pub fn reconstruct_with_chapter_guard(
             running_header_chars,
             two_column,
             rtl_dominant,
+            image_only_candidate: image_only_candidate(page),
             low_confidence: false,
             low_confidence_action: None,
         });
@@ -223,6 +230,31 @@ fn rotated_fragment_count(page: &Page) -> usize {
         .iter()
         .filter(|fragment| fragment.width <= 0 && !spans_text(&fragment.spans).trim().is_empty())
         .count()
+}
+
+/// Whether a page reads as a scan: no visible text anywhere in its XML, and
+/// one positioned image covering at least half of the page once clipped to
+/// it. Blank pages and small decorative images do not qualify; neither does
+/// a scan assembled from several smaller image tiles.
+fn image_only_candidate(page: &Page) -> bool {
+    if page.width <= 0
+        || page.height <= 0
+        || page
+            .fragments
+            .iter()
+            .any(|fragment| fragment.char_count() > 0)
+    {
+        return false;
+    }
+    let width = i64::from(page.width);
+    let height = i64::from(page.height);
+    page.images.iter().any(|image| {
+        let left = i64::from(image.left).clamp(0, width);
+        let top = i64::from(image.top).clamp(0, height);
+        let right = (i64::from(image.left) + i64::from(image.width.max(0))).clamp(0, width);
+        let bottom = (i64::from(image.top) + i64::from(image.height.max(0))).clamp(0, height);
+        (right - left) * (bottom - top) * 2 >= width * height
+    })
 }
 
 /// Whether any of the fragment lies inside the page box. A page without a

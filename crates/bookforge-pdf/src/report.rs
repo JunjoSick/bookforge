@@ -75,7 +75,18 @@ impl ConversionReport {
             ));
         }
         for page in &page_stats {
-            if page.low_confidence {
+            if page.image_only_candidate && page.low_confidence {
+                let action = page.low_confidence_action.as_deref().unwrap_or("linearize");
+                let detail = if action == "ocr" {
+                    "OCR supplied its text, which no selectable-text baseline can check"
+                } else {
+                    "large image-only page needs OCR for translatable text"
+                };
+                warnings.push(format!(
+                    "page {}: selectable text unavailable; {detail}; action={action}",
+                    page.page
+                ));
+            } else if page.low_confidence {
                 let action = page.low_confidence_action.as_deref().unwrap_or("linearize");
                 let page_coverage = page_coverage_percent(page.chars, page.baseline_chars);
                 warnings.push(format!(
@@ -201,6 +212,7 @@ mod tests {
                 running_header_chars: 0,
                 two_column: false,
                 rtl_dominant: false,
+                image_only_candidate: false,
                 low_confidence: false,
                 low_confidence_action: None,
             }],
@@ -234,6 +246,7 @@ mod tests {
                 running_header_chars: 0,
                 two_column: false,
                 rtl_dominant: false,
+                image_only_candidate: false,
                 low_confidence: false,
                 low_confidence_action: None,
             }],
@@ -269,6 +282,7 @@ mod tests {
                 running_header_chars: 13,
                 two_column: false,
                 rtl_dominant: false,
+                image_only_candidate: false,
                 low_confidence: false,
                 low_confidence_action: None,
             }],
@@ -301,6 +315,7 @@ mod tests {
                 running_header_chars: 0,
                 two_column: false,
                 rtl_dominant: false,
+                image_only_candidate: false,
                 low_confidence: true,
                 low_confidence_action: Some("preserve".to_string()),
             }],
@@ -341,6 +356,7 @@ mod tests {
                 running_header_chars: 0,
                 two_column: false,
                 rtl_dominant: false,
+                image_only_candidate: false,
                 low_confidence: true,
                 low_confidence_action: Some("ocr".to_string()),
             }],

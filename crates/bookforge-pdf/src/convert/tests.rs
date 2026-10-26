@@ -2143,6 +2143,7 @@ fn running_header_removal_does_not_push_pages_below_the_confidence_threshold() {
         running_header_chars: 35,
         two_column: false,
         rtl_dominant: false,
+        image_only_candidate: false,
         low_confidence: false,
         low_confidence_action: None,
     };
@@ -2163,6 +2164,7 @@ fn running_header_removal_does_not_push_pages_below_the_confidence_threshold() {
         running_header_chars: 0,
         two_column: false,
         rtl_dominant: false,
+        image_only_candidate: false,
         low_confidence: false,
         low_confidence_action: None,
     };
@@ -2188,6 +2190,7 @@ fn text_carried_onto_a_later_page_is_credited_to_that_page() {
         running_header_chars: 0,
         two_column: false,
         rtl_dominant: false,
+        image_only_candidate: false,
         low_confidence: false,
         low_confidence_action: None,
     };
@@ -2615,4 +2618,144 @@ fn convert_pdf_splits_chapters_at_level_one_headings_by_default() {
             "{nav}"
         );
     }
+}
+
+/// Five pages: a full-page scan, a blank page, a small logo, an image that
+/// lies almost wholly off the page, and a background image under text.
+const IMAGE_ONLY_PAGES_XML: &str = r##"<pdf2xml>
+  <page number="1" width="600" height="800">
+    <image top="0" left="0" width="600" height="800" src="scan.png"/>
+  </page>
+  <page number="2" width="600" height="800"/>
+  <page number="3" width="600" height="800">
+    <image top="10" left="10" width="60" height="80" src="logo.png"/>
+  </page>
+  <page number="4" width="600" height="800">
+    <image top="790" left="590" width="600" height="800" src="outside.png"/>
+  </page>
+  <page number="5" width="600" height="800">
+    <fontspec id="0" size="12" family="Times" color="#000000"/>
+    <image top="0" left="0" width="600" height="800" src="background.png"/>
+    <text top="80" left="80" width="300" height="12" font="0">Text printed over a tinted page.</text>
+  </page>
+</pdf2xml>"##;
+
+const IMAGE_ONLY_PAGES_BASELINE: &str = "\x0c\x0c\x0c\x0cText printed over a tinted page.\n";
+
+/// Records which pages it was asked to read.
+#[derive(Default)]
+struct RecordingOcr {
+    text: String,
+    pages: std::sync::Mutex<Vec<u32>>,
+}
+
+impl OcrEngine for RecordingOcr {
+    fn ocr_page(
+        &self,
+        _image_png: &[u8],
+        page_number: u32,
+    ) -> std::result::Result<String, crate::ocr::OcrError> {
+        self.pages.lock().expect("page log").push(page_number);
+        Ok(self.text.clone())
+    }
+}
+
+#[test]
+fn image_only_pages_become_ocr_candidates() {
+    use std::io::Read;
+    use zip::ZipArchive;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = write_input_pdf(dir.path());
+    let output = dir.path().join("output.epub");
+    let fake = FakePoppler::new(IMAGE_ONLY_PAGES_XML, IMAGE_ONLY_PAGES_BASELINE);
+    let ocr = RecordingOcr {
+        text: "Words read from the scanned page.".to_string(),
+        ..RecordingOcr::default()
+    };
+
+    let outcome = convert_pdf_with_tools(
+        &input,
+        &output,
+        &ConvertOptions::default(),
+        &fake,
+        Some(&ocr),
+    )
+    .expect("conversion succeeds");
+
+    assert_eq!(*ocr.pages.lock().expect("page log"), vec![1]);
+    let report = &outcome.report;
+    assert_eq!(report.ocr_pages, 1, "{}", report.summary());
+    let candidates = report
+        .page_stats
+        .iter()
+        .filter(|page| page.image_only_candidate)
+        .map(|page| page.page)
+        .collect::<Vec<_>>();
+    assert_eq!(candidates, vec![1]);
+    assert_eq!(
+        report.page_stats[0].low_confidence_action.as_deref(),
+        Some("ocr")
+    );
+    assert!(
+        report.warnings.iter().any(|warning| warning
+            .starts_with("page 1: selectable text unavailable; OCR supplied its text")),
+        "{:?}",
+        report.warnings
+    );
+    let mut archive = ZipArchive::new(fs::File::open(&output).expect("epub opens")).expect("zip");
+    let mut content = String::new();
+    archive
+        .by_name("content.xhtml")
+        .expect("content exists")
+        .read_to_string(&mut content)
+        .expect("content reads");
+    assert!(content.contains("Words read from the scanned page."));
+    assert!(content.contains("Text printed over a tinted page."));
+}
+
+#[test]
+fn image_only_pages_without_ocr_are_flagged_for_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = write_input_pdf(dir.path());
+    let output = dir.path().join("output.epub");
+    let fake = FakePoppler::new(IMAGE_ONLY_PAGES_XML, IMAGE_ONLY_PAGES_BASELINE);
+
+    let outcome = convert_pdf_with_tools(&input, &output, &ConvertOptions::default(), &fake, None)
+        .expect("conversion succeeds");
+
+    let report = &outcome.report;
+    assert_eq!(report.low_confidence_pages, 1, "{}", report.summary());
+    assert!(report.page_stats[0].low_confidence);
+    assert!(
+        report.warnings.iter().any(|warning| warning
+            == "page 1: selectable text unavailable; large image-only page needs OCR for translatable text; action=linearize"),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn selectable_baseline_text_disproves_an_image_only_page() {
+    let mut stats = PageStats {
+        page: 1,
+        lines: 0,
+        chars: 0,
+        baseline_chars: 12,
+        running_header_chars: 0,
+        two_column: false,
+        rtl_dominant: false,
+        image_only_candidate: true,
+        low_confidence: false,
+        low_confidence_action: None,
+    };
+
+    let flagged = mark_low_confidence_pages(
+        std::slice::from_mut(&mut stats),
+        LowConfidenceMode::Linearize,
+    );
+
+    assert!(!stats.image_only_candidate);
+    // Still flagged, but by its coverage gap like any other page.
+    assert_eq!(flagged, vec![1]);
 }
