@@ -523,6 +523,10 @@ async fn run_inner(
         timestamp_ms: now_ms(),
     });
     let segments = build_segments(&book, &settings.segmentation)?;
+    progress.emit(ProgressEvent::SegmentationFinished {
+        segment_count: segments.len(),
+        timestamp_ms: now_ms(),
+    });
     let pending_ids = store.resumable_segment_ids(&job.id)?;
 
     let print_stdout = human_stdout_enabled(args.ui);
@@ -701,6 +705,7 @@ async fn run_inner(
         misses: pending_segments.len(),
         timestamp_ms: now_ms(),
     });
+    emit_restored_progress(store, &job.id, &pending_segments, progress.as_ref())?;
     store.mark_job_running(&job.id)?;
 
     if !pending_segments.is_empty() {
@@ -1002,6 +1007,57 @@ async fn run_inner(
         crate::exit_code::request(crate::exit_code::COMPLETED_WITH_FAILURES);
     }
 
+    Ok(())
+}
+
+/// Publish the job's saved checkpoint totals after the resume's cache scan, so
+/// a viewer attached only to this run shows the whole job's progress. Prior
+/// terminal statuses of segments about to be retried follow in bounded chunks,
+/// letting their new outcome replace the old one instead of adding to it.
+fn emit_restored_progress(
+    store: &JobStore,
+    job_id: &str,
+    pending: &[Segment],
+    progress: &dyn ProgressSink,
+) -> Result<()> {
+    const STATUS_CHUNK: usize = 64;
+    let summary = store
+        .summary(job_id)?
+        .ok_or_else(|| anyhow::anyhow!("job '{job_id}' was not found"))?;
+    progress.emit(ProgressEvent::ProgressRestored {
+        total_segments: summary.total_segments,
+        succeeded: summary.succeeded,
+        cached: summary.cached,
+        needs_review: summary.needs_review,
+        failed: summary.failed,
+        input_tokens: summary.input_tokens,
+        output_tokens: summary.output_tokens,
+        timestamp_ms: now_ms(),
+    });
+    let pending_ids = pending
+        .iter()
+        .map(|segment| segment.id.0.as_str())
+        .collect::<HashSet<_>>();
+    // Succeeded and cached checkpoints are not retried, so the summary already
+    // covers them; only replaceable outcomes need per-segment bookkeeping.
+    let statuses = store
+        .segment_records(job_id)?
+        .into_iter()
+        .filter(|record| {
+            pending_ids.contains(record.id.as_str())
+                && matches!(
+                    record.status.as_str(),
+                    "succeeded" | "skipped_cached" | "needs_review" | "failed"
+                )
+        })
+        .map(|record| (record.id, record.status))
+        .collect::<Vec<_>>();
+    for chunk in statuses.chunks(STATUS_CHUNK) {
+        progress.emit(ProgressEvent::SegmentStatusesRestored {
+            statuses: chunk.to_vec(),
+            timestamp_ms: now_ms(),
+        });
+    }
     Ok(())
 }
 
@@ -2114,6 +2170,73 @@ mod tests {
             .expect("job should exist");
         assert_eq!(summary.succeeded, 2);
         assert_eq!(summary.failed, 0);
+
+        // A viewer attached only to this resume sees the job's saved progress
+        // before any fresh work finishes, and the retried failure is replaced
+        // by its new outcome rather than counted twice.
+        let first_finished = events
+            .iter()
+            .position(|event| matches!(event, ProgressEvent::SegmentFinished { .. }))
+            .unwrap();
+        let restored =
+            bookforge_core::RunState::from_events(events[..first_finished].iter().cloned());
+        assert_eq!(restored.total_segments, 2);
+        assert_eq!(
+            (restored.succeeded, restored.cached, restored.failed),
+            (1, 0, 1)
+        );
+        assert_eq!(restored.run_total_segments, 1);
+        assert_eq!(restored.run_completed_segments, 0);
+        let restored_statuses = events
+            .iter()
+            .filter_map(|event| match event {
+                ProgressEvent::SegmentStatusesRestored { statuses, .. } => Some(statuses.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored_statuses,
+            vec![(fixture.segments[1].id.0.clone(), "failed".into())]
+        );
+        let mut updated = restored;
+        updated.fold(&events[first_finished]);
+        assert_eq!(
+            (updated.done_segments, updated.succeeded, updated.failed),
+            (2, 2, 0)
+        );
+
+        // Replaying the original run's log first must give the same view.
+        let attached = bookforge_core::RunState::from_events(events.clone());
+        let mut replayed = bookforge_core::RunState::from_events([
+            ProgressEvent::JobCreated {
+                job_id: fixture.job.id.clone(),
+                input_path: "old.epub".into(),
+                output_path: "old-out.epub".into(),
+                timestamp_ms: 1_000,
+            },
+            ProgressEvent::SegmentFinished {
+                segment_id: fixture.segments[0].id.0.clone(),
+                status: "succeeded".into(),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                timestamp_ms: 2_000,
+            },
+        ]);
+        for event in &events {
+            replayed.fold(event);
+        }
+        assert_eq!(attached.done_segments, replayed.done_segments);
+        assert_eq!(attached.elapsed_secs(), replayed.elapsed_secs());
+        assert_eq!(
+            attached.segments_per_minute(),
+            replayed.segments_per_minute()
+        );
+        assert_eq!(
+            (attached.input_tokens, attached.output_tokens),
+            (replayed.input_tokens, replayed.output_tokens)
+        );
+        assert_eq!(attached.run_completed_segments, 1);
     }
 
     #[tokio::test]

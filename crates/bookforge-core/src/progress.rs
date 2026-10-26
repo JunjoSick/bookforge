@@ -5,7 +5,7 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +86,27 @@ pub enum ProgressEvent {
     CacheScanFinished {
         hits: usize,
         misses: usize,
+        timestamp_ms: u64,
+    },
+    /// Whole-job checkpoint totals at the start of a resumed run, emitted after
+    /// its cache scan. Lets a fresh viewer show the job's saved progress rather
+    /// than only this invocation's work. Token totals describe the saved
+    /// checkpoints, not a provider billing ledger.
+    ProgressRestored {
+        total_segments: usize,
+        succeeded: usize,
+        cached: usize,
+        needs_review: usize,
+        failed: usize,
+        input_tokens: u64,
+        output_tokens: u64,
+        timestamp_ms: u64,
+    },
+    /// Prior terminal statuses of the segments this resumed run will retry,
+    /// emitted in bounded chunks, so a retried segment replaces its earlier
+    /// outcome instead of being counted twice.
+    SegmentStatusesRestored {
+        statuses: Vec<(String, String)>,
         timestamp_ms: u64,
     },
     BatchQueued {
@@ -238,6 +259,8 @@ pub fn event_timestamp_ms(event: &ProgressEvent) -> u64 {
         | RuntimeConfigRejected { timestamp_ms, .. }
         | SegmentationFinished { timestamp_ms, .. }
         | CacheScanFinished { timestamp_ms, .. }
+        | ProgressRestored { timestamp_ms, .. }
+        | SegmentStatusesRestored { timestamp_ms, .. }
         | BatchQueued { timestamp_ms, .. }
         | BatchSplit { timestamp_ms, .. }
         | BatchRepairStarted { timestamp_ms, .. }
@@ -314,6 +337,21 @@ pub struct RunState {
     pub target_concurrency: usize,
     pub checkpoint_flushed: usize,
 
+    /// Segments this invocation still owed provider work when it started
+    /// (cache misses), and how many of them reached a terminal outcome. Cache
+    /// hits, restored checkpoints and earlier runs are excluded, so rate and
+    /// ETA describe fresh work only.
+    #[serde(default)]
+    pub run_total_segments: usize,
+    #[serde(default)]
+    pub run_completed_segments: usize,
+    /// Latest known status per segment, so a repeated outcome replaces the
+    /// earlier one instead of being counted again.
+    #[serde(skip)]
+    segment_statuses: HashMap<String, String>,
+    #[serde(skip)]
+    run_completed_ids: HashSet<String>,
+
     // Tokens.
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -376,6 +414,18 @@ impl RunState {
                 self.finished = false;
                 self.finished_elapsed_ms = None;
                 self.paused = false;
+                // Each invocation is its own timing and throughput window: idle
+                // time between runs and earlier work never feed rate or ETA. A
+                // zero timestamp keeps the previous baseline instead of erasing it.
+                if ts != 0 {
+                    self.first_timestamp_ms = Some(ts);
+                }
+                self.active_requests = 0;
+                self.checkpoint_flushed = 0;
+                self.run_total_segments = self.total_segments;
+                self.run_completed_segments = 0;
+                self.segment_statuses.clear();
+                self.run_completed_ids.clear();
             }
             ProgressEvent::JobPaused { job_id, .. } => {
                 self.job_id = Some(job_id.clone());
@@ -418,10 +468,38 @@ impl RunState {
             }
             ProgressEvent::SegmentationFinished { segment_count, .. } => {
                 self.total_segments = *segment_count;
+                self.run_total_segments = *segment_count;
             }
-            ProgressEvent::CacheScanFinished { hits, .. } => {
+            ProgressEvent::CacheScanFinished { hits, misses, .. } => {
                 self.cached = *hits;
+                self.succeeded = 0;
+                self.needs_review = 0;
+                self.failed = 0;
                 self.done_segments = *hits;
+                self.run_total_segments = *misses;
+            }
+            ProgressEvent::ProgressRestored {
+                total_segments,
+                succeeded,
+                cached,
+                needs_review,
+                failed,
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                self.total_segments = *total_segments;
+                self.succeeded = *succeeded;
+                self.cached = *cached;
+                self.needs_review = *needs_review;
+                self.failed = *failed;
+                self.done_segments = succeeded + cached + needs_review + failed;
+                // Authoritative checkpoint totals, as in TranslationFinished.
+                self.input_tokens = *input_tokens;
+                self.output_tokens = *output_tokens;
+            }
+            ProgressEvent::SegmentStatusesRestored { statuses, .. } => {
+                self.segment_statuses.extend(statuses.iter().cloned());
             }
             ProgressEvent::SegmentFinished {
                 segment_id,
@@ -430,14 +508,19 @@ impl RunState {
                 output_tokens,
                 ..
             } => {
-                match status.as_str() {
-                    "succeeded" | "skipped_cached" | "needs_review" | "failed" => {
-                        self.done_segments += 1;
-                    }
-                    _ => {}
+                // A segment that finishes again (retry, resume) replaces its
+                // earlier outcome rather than adding a second one.
+                if let Some(previous) = self
+                    .segment_statuses
+                    .insert(segment_id.clone(), status.clone())
+                {
+                    self.remove_terminal_status(&previous);
                 }
+                self.failed_segments.retain(|id| id != segment_id);
+                self.needs_review_segments.retain(|id| id != segment_id);
                 match status.as_str() {
                     "succeeded" => self.succeeded += 1,
+                    "skipped_cached" => self.cached += 1,
                     "needs_review" => {
                         self.needs_review += 1;
                         push_capped_vec(
@@ -456,6 +539,14 @@ impl RunState {
                     }
                     _ => {}
                 }
+                self.done_segments = self.succeeded + self.cached + self.needs_review + self.failed;
+                if matches!(status.as_str(), "succeeded" | "needs_review" | "failed")
+                    && self.run_completed_ids.insert(segment_id.clone())
+                {
+                    self.run_completed_segments += 1;
+                }
+                // Usage is additive: a retried segment's earlier attempt was
+                // still spent, so its tokens are not discarded.
                 if let Some(tokens) = input_tokens {
                     self.input_tokens += *tokens;
                 }
@@ -535,6 +626,7 @@ impl RunState {
                 self.finished = true;
                 self.finished_elapsed_ms = Some(*elapsed_ms);
                 self.paused = false;
+                self.active_requests = 0;
             }
             _ => {}
         }
@@ -547,30 +639,54 @@ impl RunState {
         self.total_segments.saturating_sub(self.done_segments)
     }
 
-    /// Wall-clock span covered by the folded events, in seconds.
+    fn remove_terminal_status(&mut self, status: &str) {
+        let count = match status {
+            "succeeded" => &mut self.succeeded,
+            "skipped_cached" => &mut self.cached,
+            "needs_review" => &mut self.needs_review,
+            "failed" => &mut self.failed,
+            _ => return,
+        };
+        *count = count.saturating_sub(1);
+    }
+
+    /// Current invocation's elapsed time in seconds. A finished run reports
+    /// its own measured duration; otherwise the span since the invocation's
+    /// first event (gaps between resumed runs are excluded).
     pub fn elapsed_secs(&self) -> f64 {
+        if let Some(elapsed) = self.finished_elapsed_ms {
+            return elapsed as f64 / 1000.0;
+        }
         match (self.first_timestamp_ms, self.last_timestamp_ms) {
             (Some(start), Some(end)) if end >= start => (end - start) as f64 / 1000.0,
             _ => 0.0,
         }
     }
 
-    /// Throughput in segments per minute, or 0 before any time has elapsed.
+    /// Fresh terminal completions per minute in this invocation, excluding
+    /// cache hits and restored checkpoints; 0 before any time has elapsed.
     pub fn segments_per_minute(&self) -> f64 {
         let secs = self.elapsed_secs();
         if secs <= 0.0 {
             return 0.0;
         }
-        self.done_segments as f64 / secs * 60.0
+        self.run_completed_segments as f64 / secs * 60.0
     }
 
-    /// Estimated seconds until completion, or 0 when it cannot be estimated.
+    /// This invocation's provider work still outstanding.
+    pub fn run_remaining(&self) -> usize {
+        self.run_total_segments
+            .saturating_sub(self.run_completed_segments)
+    }
+
+    /// Estimated seconds until this invocation's provider work completes, or 0
+    /// when it is finished or cannot be estimated.
     pub fn eta_secs(&self) -> f64 {
         let per_min = self.segments_per_minute();
-        if per_min <= 0.0 {
+        if self.finished || per_min <= 0.0 {
             return 0.0;
         }
-        self.remaining() as f64 / (per_min / 60.0)
+        self.run_remaining() as f64 / (per_min / 60.0)
     }
 }
 
@@ -723,6 +839,161 @@ mod tests {
         assert!((state.segments_per_minute() - 4.0).abs() < 1e-9);
         // 4 remaining at 4/min -> ~60s ETA.
         assert!((state.eta_secs() - 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cached_segments_do_not_inflate_translation_rate() {
+        let state = RunState::from_events([
+            ProgressEvent::SegmentationFinished {
+                segment_count: 100,
+                timestamp_ms: 1_000,
+            },
+            ProgressEvent::CacheScanFinished {
+                hits: 90,
+                misses: 10,
+                timestamp_ms: 1_001,
+            },
+            seg_finished("fresh", "succeeded", 61_000),
+        ]);
+        assert_eq!(state.done_segments, 91);
+        assert!((state.segments_per_minute() - 1.0).abs() < 1e-9);
+        // Nine fresh segments remain at one per minute.
+        assert!((state.eta_secs() - 540.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn restored_progress_matches_fresh_and_historical_resume_views() {
+        let created = |timestamp_ms| ProgressEvent::JobCreated {
+            job_id: "job_1".into(),
+            input_path: "in.epub".into(),
+            output_path: "out.epub".into(),
+            timestamp_ms,
+        };
+        // A viewer that replayed the original run's log...
+        let mut replay = RunState::from_events([
+            created(1_000),
+            ProgressEvent::SegmentationFinished {
+                segment_count: 8,
+                timestamp_ms: 1_001,
+            },
+            seg_finished("old-success", "succeeded", 10_000),
+            seg_finished("retry", "failed", 20_000),
+        ]);
+        // ...and a viewer that only sees the resumed run, a day later.
+        let resumed = vec![
+            created(86_401_000),
+            ProgressEvent::SegmentationFinished {
+                segment_count: 8,
+                timestamp_ms: 86_401_001,
+            },
+            ProgressEvent::CacheScanFinished {
+                hits: 0,
+                misses: 4,
+                timestamp_ms: 86_401_002,
+            },
+            ProgressEvent::ProgressRestored {
+                total_segments: 8,
+                succeeded: 2,
+                cached: 1,
+                needs_review: 1,
+                failed: 1,
+                input_tokens: 1_000,
+                output_tokens: 2_000,
+                timestamp_ms: 86_401_003,
+            },
+            ProgressEvent::SegmentStatusesRestored {
+                statuses: vec![("retry".into(), "failed".into())],
+                timestamp_ms: 86_401_004,
+            },
+            seg_finished("retry", "succeeded", 86_461_000),
+        ];
+        let fresh = RunState::from_events(resumed.clone());
+        for event in resumed {
+            replay.fold(&event);
+        }
+        for state in [&fresh, &replay] {
+            assert_eq!(state.done_segments, 5);
+            assert_eq!(
+                (
+                    state.succeeded,
+                    state.cached,
+                    state.needs_review,
+                    state.failed
+                ),
+                (3, 1, 1, 0)
+            );
+            assert_eq!((state.input_tokens, state.output_tokens), (1_010, 2_020));
+            assert_eq!(state.elapsed_secs(), 60.0);
+            assert_eq!(state.run_completed_segments, 1);
+            assert_eq!(state.run_total_segments, 4);
+            assert_eq!(state.segments_per_minute(), 1.0);
+            assert_eq!(state.eta_secs(), 180.0);
+            assert!(!state.failed_segments.contains(&"retry".to_string()));
+            let serialized = serde_json::to_value(state).unwrap();
+            assert_eq!(serialized["run_completed_segments"], 1);
+            assert!(serialized.get("segment_statuses").is_none());
+        }
+    }
+
+    #[test]
+    fn status_replacement_keeps_progress_unique_without_discarding_usage() {
+        let state = RunState::from_events([
+            ProgressEvent::SegmentationFinished {
+                segment_count: 2,
+                timestamp_ms: 1_000,
+            },
+            seg_finished("s1", "failed", 31_000),
+            seg_finished("s1", "succeeded", 61_000),
+        ]);
+        assert_eq!(state.done_segments, 1);
+        assert_eq!((state.succeeded, state.failed), (1, 0));
+        assert!(state.failed_segments.is_empty());
+        assert_eq!(state.segments_per_minute(), 1.0);
+        // Both attempts were spent, so their usage stays counted.
+        assert_eq!((state.input_tokens, state.output_tokens), (20, 40));
+    }
+
+    #[test]
+    fn finished_elapsed_matches_the_current_invocation_summary() {
+        let mut state = RunState::from_events([seg_finished("s1", "succeeded", 1_000)]);
+        state.fold(&ProgressEvent::TranslationFinished {
+            succeeded: 1,
+            cached: 9,
+            needs_review: 0,
+            failed: 0,
+            input_tokens: 10,
+            output_tokens: 20,
+            elapsed_ms: 60_000,
+            timestamp_ms: 86_461_000,
+        });
+        assert_eq!(state.elapsed_secs(), 60.0);
+        assert_eq!(state.segments_per_minute(), 1.0);
+        assert_eq!(state.eta_secs(), 0.0);
+        assert_eq!(state.active_requests, 0);
+    }
+
+    #[test]
+    fn restored_progress_events_round_trip_through_json() {
+        for event in [
+            ProgressEvent::ProgressRestored {
+                total_segments: 3,
+                succeeded: 1,
+                cached: 1,
+                needs_review: 0,
+                failed: 1,
+                input_tokens: 5,
+                output_tokens: 7,
+                timestamp_ms: 11,
+            },
+            ProgressEvent::SegmentStatusesRestored {
+                statuses: vec![("s1".into(), "failed".into())],
+                timestamp_ms: 12,
+            },
+        ] {
+            let line = serde_json::to_string(&event).unwrap();
+            let parsed: ProgressEvent = serde_json::from_str(&line).unwrap();
+            assert_eq!(event_timestamp_ms(&parsed), event_timestamp_ms(&event));
+        }
     }
 
     #[test]

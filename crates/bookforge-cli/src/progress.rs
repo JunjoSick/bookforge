@@ -628,7 +628,8 @@ impl ProgressBars {
                 self.seg_bar
                     .set_message(format!("{} cached", self.view.cached));
             }
-            ProgressEvent::CacheScanFinished { .. } => {
+            ProgressEvent::CacheScanFinished { .. } | ProgressEvent::ProgressRestored { .. } => {
+                self.seg_bar.set_length(self.view.total_segments as u64);
                 self.seg_bar.set_position(self.view.done_segments as u64);
                 self.seg_bar
                     .set_message(format!("{} cached", self.view.cached));
@@ -751,6 +752,7 @@ fn is_important_event(event: &ProgressEvent) -> bool {
         | ProgressEvent::JobResumed { .. }
         | ProgressEvent::RuntimeConfigChanged { .. }
         | ProgressEvent::RuntimeConfigRejected { .. }
+        | ProgressEvent::ProgressRestored { .. }
         | ProgressEvent::RequestStarted { .. }
         | ProgressEvent::Warning { .. }
         | ProgressEvent::BatchRepairFinished { .. }

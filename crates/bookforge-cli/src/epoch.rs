@@ -13,17 +13,22 @@
 //!    done/total segments across all epochs, while stats must describe the
 //!    current epoch's throughput.
 //!
-//! [`EpochTracker`] fixes both without touching core: it resets the timing
-//! baseline at each epoch boundary and remembers how many segments were
-//! already done when the epoch began, so rate/ETA are computed over
-//! *(done − carried)* within *(now − epoch start)* while gauges keep showing
-//! absolute progress.
+//! `RunState` itself now starts a fresh throughput window at every
+//! `JobCreated`: it counts only this invocation's unique fresh completions
+//! (`run_completed_segments`, excluding cache hits and restored checkpoints)
+//! against the work it still owed (`run_total_segments`). [`EpochTracker`]
+//! adds the in-process boundary core cannot see — a live `JobResumed` — by
+//! resetting the timing baseline there and remembering how many of this
+//! invocation's completions came before it, so rate/ETA are computed over
+//! *(run completions − carried)* within *(now − epoch start)* while gauges
+//! keep showing absolute progress.
 
 use bookforge_core::{ProgressEvent, RunState};
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct EpochTracker {
-    /// Segments that were already terminal before the current epoch began.
+    /// This invocation's fresh completions from before the current epoch
+    /// window began (always zero right after a `JobCreated`).
     carried_done: usize,
     /// True once any `JobCreated` has been folded (the first JobCreated is the
     /// start of epoch one, not a boundary onto epoch two).
@@ -50,7 +55,7 @@ impl EpochTracker {
         if boundary {
             // The window restarts at the epoch boundary so idle gaps between
             // epochs and earlier-epoch work fall out of rate/ETA entirely.
-            self.carried_done = state.done_segments;
+            self.carried_done = state.run_completed_segments;
             // Rebaseline the timing window to the epoch start. A pathological
             // zero timestamp leaves the previous baseline untouched rather
             // than erasing all timing.
@@ -62,7 +67,7 @@ impl EpochTracker {
     }
 
     fn epoch_done(&self, state: &RunState) -> usize {
-        state.done_segments.saturating_sub(self.carried_done)
+        state.run_completed_segments.saturating_sub(self.carried_done)
     }
 
     /// Throughput of the *current* epoch only (UI-9). Identical to
@@ -75,14 +80,14 @@ impl EpochTracker {
         self.epoch_done(state) as f64 / secs * 60.0
     }
 
-    /// ETA derived from current-epoch throughput; remaining work stays
-    /// absolute because the gauge is absolute.
+    /// ETA derived from current-epoch throughput over the provider work this
+    /// invocation still owes; 0 once the run has finished.
     pub(crate) fn eta_secs(&self, state: &RunState) -> f64 {
         let per_min = self.segments_per_minute(state);
-        if per_min <= 0.0 {
+        if state.finished || per_min <= 0.0 {
             return 0.0;
         }
-        state.remaining() as f64 / (per_min / 60.0)
+        state.run_remaining() as f64 / (per_min / 60.0)
     }
 
     #[cfg(test)]
@@ -167,8 +172,9 @@ mod tests {
         );
         tracker.fold(&mut state, &seg_done("b0", 160_000));
 
-        // Carried 3 excluded; the 60 s window saw exactly one fresh segment.
-        assert_eq!(tracker.carried(), 3);
+        // The resumed invocation carries none of epoch one's completions; the
+        // 60 s window saw exactly one fresh segment.
+        assert_eq!(tracker.carried(), 0);
         assert_eq!(state.done_segments, 4);
         assert_eq!(tracker.epoch_done(&state), 1);
         assert!(
@@ -220,7 +226,7 @@ mod tests {
                 timestamp_ms: 0,
             },
         );
-        assert_eq!(tracker.carried(), 1);
+        assert_eq!(tracker.carried(), 0);
         assert_eq!(state.first_timestamp_ms, Some(50_000));
     }
 }
