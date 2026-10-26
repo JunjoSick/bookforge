@@ -218,7 +218,9 @@ impl JobStore {
         kind: IncompleteCheckpoint,
     ) -> Result<()> {
         let (segment_status, job_status) = match kind {
-            IncompleteCheckpoint::NeedsReview => (SegmentStatus::NeedsReview, JobStatus::NeedsReview),
+            IncompleteCheckpoint::NeedsReview => {
+                (SegmentStatus::NeedsReview, JobStatus::NeedsReview)
+            }
             IncompleteCheckpoint::RetryPending => (SegmentStatus::RetryPending, JobStatus::Running),
         };
         let now = timestamp_string();

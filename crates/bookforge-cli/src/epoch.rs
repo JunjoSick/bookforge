@@ -67,7 +67,9 @@ impl EpochTracker {
     }
 
     fn epoch_done(&self, state: &RunState) -> usize {
-        state.run_completed_segments.saturating_sub(self.carried_done)
+        state
+            .run_completed_segments
+            .saturating_sub(self.carried_done)
     }
 
     /// Throughput of the *current* epoch only (UI-9). Identical to

@@ -250,7 +250,10 @@ fn retry_pending_checkpoint_keeps_partial_work_resumable() {
     );
     assert_eq!(fixture.block_text(), "Partial");
     assert_eq!(
-        fixture.store.resumable_segment_ids(&fixture.job_id).unwrap(),
+        fixture
+            .store
+            .resumable_segment_ids(&fixture.job_id)
+            .unwrap(),
         ["seg_a"]
     );
     // An interruption does not claim the job needs review.
@@ -367,7 +370,10 @@ fn retry_pending_checkpoint_preserves_manual_corrections_and_job_state() {
         .store
         .save_retry_pending_translation(partial_request(&fixture.job_id, &partial))
         .unwrap();
-    fixture.store.mark_job_needs_review(&fixture.job_id).unwrap();
+    fixture
+        .store
+        .mark_job_needs_review(&fixture.job_id)
+        .unwrap();
     fixture
         .store
         .save_manual_correction(SaveManualCorrection {
@@ -436,7 +442,10 @@ fn findings_writes_skip_a_human_corrected_segment() {
             .record_segment_engine_findings(
                 &fixture.job_id,
                 "seg_a",
-                &[EngineFinding::new(QaFindingKind::Other, "stale engine finding")],
+                &[EngineFinding::new(
+                    QaFindingKind::Other,
+                    "stale engine finding"
+                )],
             )
             .unwrap(),
         0

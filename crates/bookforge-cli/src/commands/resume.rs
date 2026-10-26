@@ -2690,14 +2690,13 @@ mod tests {
 
     #[test]
     fn plain_resume_refuses_a_fresh_worker_lease() {
-        let job_id = format!(
-            "resume-active-lease-{}-{}",
-            std::process::id(),
-            now_ms()
-        );
+        let job_id = format!("resume-active-lease-{}-{}", std::process::id(), now_ms());
         let path = crate::control::runtime_path_for_job(&job_id);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        assert!(ensure_no_live_worker(&job_id).is_ok(), "no lease, no worker");
+        assert!(
+            ensure_no_live_worker(&job_id).is_ok(),
+            "no lease, no worker"
+        );
         let lease = crate::control::RuntimeLease {
             schema_version: 1,
             instance_id: "active-test-worker".to_string(),

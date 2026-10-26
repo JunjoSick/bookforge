@@ -2227,7 +2227,10 @@ fn cli_rejected_resume_preserves_stopped_job_paths_and_control() {
     let temp = tempfile::tempdir().unwrap();
     let run = translate_quiet(&temp, "mock-prefix-target");
     let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).unwrap();
-    let original = store.load_job_config_snapshot(&run.job_id).unwrap().unwrap();
+    let original = store
+        .load_job_config_snapshot(&run.job_id)
+        .unwrap()
+        .unwrap();
     let mut incompatible = original.clone();
     incompatible.cache_namespace = "obsolete-contract".to_string();
     store
