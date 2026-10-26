@@ -505,6 +505,25 @@ fn merge_fragments_into_lines(page: &Page) -> Vec<Line> {
         .filter(|fragment| fragment.width > 0 && is_on_page(page, fragment))
         .collect();
     fragments.sort_by_key(|fragment| (fragment.top, fragment.left));
+    // A font change can shift a fragment's box a pixel or two on one
+    // baseline, and sorting by exact top put an italic word ahead of the
+    // regular text to its left. Fragments whose tops lie within half the
+    // smaller height of a row's first fragment form one row and are taken
+    // left to right. Comparing with that fixed anchor keeps small offsets
+    // from chaining down the page, and the smaller height keeps a drop cap
+    // from drawing the next line into its row.
+    let mut row_start = 0;
+    while row_start < fragments.len() {
+        let anchor = fragments[row_start];
+        let row_end = (row_start + 1..fragments.len())
+            .find(|&index| {
+                let fragment = fragments[index];
+                fragment.top - anchor.top > anchor.height.min(fragment.height) / 2
+            })
+            .unwrap_or(fragments.len());
+        fragments[row_start..row_end].sort_by_key(|fragment| fragment.left);
+        row_start = row_end;
+    }
 
     let mut groups: Vec<LineGroup> = Vec::new();
     for fragment in fragments {
@@ -1471,6 +1490,105 @@ mod tests {
                 "First paragraph line one. First paragraph line two.".to_string(),
                 "Second paragraph after a large gap.".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn a_word_set_one_pixel_higher_keeps_its_place_in_the_line() {
+        // Poppler's box for an italic word can sit a pixel above the
+        // regular words around it on the same baseline. Sorted by top
+        // first, the italic word led the line and split it in three.
+        let pages = parse_pdf2xml(
+            r#"<pdf2xml><page number="1" width="600" height="900">
+<fontspec id="0" size="18" family="Serif"/>
+<fontspec id="1" size="18" family="Serif-Italic"/>
+<text top="333" left="124" width="34" height="18" font="0">seen</text>
+<text top="332" left="158" width="42" height="18" font="1"><i> twice </i></text>
+<text top="333" left="200" width="340" height="18" font="0">before the river rose again.</text>
+</page></pdf2xml>"#,
+        )
+        .expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Single);
+
+        assert_eq!(result.blocks.len(), 1, "{:?}", result.blocks);
+        assert_eq!(
+            result.blocks[0].block.text().trim(),
+            "seen twice before the river rose again."
+        );
+        assert!(
+            result.blocks[0]
+                .block
+                .spans()
+                .iter()
+                .any(|span| span.italic && span.text == " twice ")
+        );
+    }
+
+    #[test]
+    fn shifted_style_runs_keep_two_columns_and_their_lines_apart() {
+        let mut xml = String::from(
+            r#"<pdf2xml><page number="1" width="900" height="1200"><fontspec id="0" size="18" family="T"/>"#,
+        );
+        for row in 0..4 {
+            let top = 100 + row * 18;
+            for (left, column) in [(80, "West"), (430, "East")] {
+                xml.push_str(&format!(
+                    r#"<text top="{top}" left="{left}" width="120" height="18" font="0">{column} {row} </text>
+<text top="{}" left="{}" width="50" height="18" font="0"><i>slanted </i></text>
+<text top="{top}" left="{}" width="150" height="18" font="0">close.</text>"#,
+                    top - 1,
+                    left + 120,
+                    left + 170
+                ));
+            }
+        }
+        xml.push_str("</page></pdf2xml>");
+        let pages = parse_pdf2xml(&xml).expect("fixture parses");
+
+        let lines = merge_fragments_into_lines(&pages[0]);
+        assert_eq!(lines.len(), 8);
+        for (index, line) in lines.iter().enumerate() {
+            let column = if index % 2 == 0 { "West" } else { "East" };
+            assert_eq!(
+                line.text(),
+                format!("{column} {} slanted close.", index / 2)
+            );
+        }
+        let result = reconstruct(&pages, ColumnMode::Auto);
+        assert!(result.pages[0].two_column);
+        let text = result
+            .blocks
+            .iter()
+            .map(|block| block.block.text())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.find("West 3").expect("west") < text.find("East 0").expect("east"));
+    }
+
+    #[test]
+    fn a_drop_cap_does_not_pull_the_next_line_into_its_row() {
+        // A tall initial spans several body lines. Fragments of two
+        // different lines must not be sorted together by position.
+        let pages = parse_pdf2xml(
+            r#"<pdf2xml><page number="1" width="600" height="900">
+<fontspec id="0" size="12" family="T"/><fontspec id="1" size="40" family="T"/>
+<text top="100" left="50" width="30" height="40" font="1">T</text>
+<text top="105" left="90" width="150" height="12" font="0">he first line opens </text>
+<text top="105" left="240" width="200" height="12" font="0">the story with a cap.</text>
+<text top="119" left="90" width="150" height="12" font="0">A second line follows </text>
+<text top="119" left="240" width="200" height="12" font="0">it straight after.</text>
+<text top="133" left="50" width="390" height="12" font="0">A third line runs the full measure here.</text>
+</page></pdf2xml>"#,
+        )
+        .expect("fixture parses");
+
+        let texts = merge_fragments_into_lines(&pages[0])
+            .iter()
+            .map(Line::text)
+            .collect::<Vec<_>>();
+        assert!(
+            texts.contains(&"A second line follows it straight after.".to_string()),
+            "{texts:?}"
         );
     }
 
