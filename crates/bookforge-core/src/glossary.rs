@@ -603,14 +603,35 @@ pub fn merge_scope_terms(terms: &[GlossaryTerm]) -> Vec<GlossaryTerm> {
         }
     }
     let mut merged = by_key.into_values().collect::<Vec<_>>();
+    // The merge key makes (source text, languages, case sensitivity) unique,
+    // so this order is total. Without the trailing keys, equal spellings in
+    // different languages or case modes kept the HashMap's arbitrary order,
+    // which changed the prompt and which notes survived the token budget.
     merged.sort_by(|a, b| {
         a.scope_kind
             .priority()
             .cmp(&b.scope_kind.priority())
             .then_with(|| a.source_text.cmp(&b.source_text))
             .then_with(|| a.target_text.cmp(&b.target_text))
+            .then_with(|| a.source_language.cmp(&b.source_language))
+            .then_with(|| a.target_language.cmp(&b.target_language))
+            .then_with(|| a.case_sensitive.cmp(&b.case_sensitive))
     });
     merged
+}
+
+/// Whether two merged terms share the spelling keys that alone ordered
+/// [`merge_scope_terms`] output before languages and case sensitivity broke
+/// ties. Such sets could produce different prompts under one cache identity.
+pub fn has_formerly_ambiguous_order(merged: &[GlossaryTerm]) -> bool {
+    let mut keys = HashSet::with_capacity(merged.len());
+    merged.iter().any(|term| {
+        !keys.insert((
+            term.scope_kind.priority(),
+            term.source_text.as_str(),
+            term.target_text.as_str(),
+        ))
+    })
 }
 
 pub fn select_glossary_for_segments(
@@ -1408,6 +1429,60 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().any(|term| term.source_text == "Will"));
         assert!(merged.iter().any(|term| term.source_text == "will"));
+    }
+
+    #[test]
+    fn equal_spelling_terms_have_stable_language_and_sensitivity_order() {
+        let mut english = term("Odile", "Odile", GlossaryScopeKind::Global);
+        english.source_language = "en".into();
+        english.notes = Some("English note".into());
+        let mut french = english.clone();
+        french.source_language = "fr".into();
+        french.notes = Some("French note".into());
+        let mut sensitive = english.clone();
+        sensitive.case_sensitive = true;
+        sensitive.notes = Some("Case-sensitive note".into());
+        let expected = vec![english.clone(), sensitive.clone(), french.clone()];
+        let segments = [segment("seg_order", 0, "Odile entered the room.")];
+        // Room for exactly one entry, so the first in order is the one kept.
+        let budget = estimate_prompt_tokens(&english);
+
+        // Each merge builds a fresh randomly seeded HashMap; repeat so an
+        // order-dependent tie would show up.
+        for _ in 0..32 {
+            for input in [
+                vec![english.clone(), sensitive.clone(), french.clone()],
+                vec![
+                    french.clone(),
+                    sensitive.clone(),
+                    english.clone(),
+                    english.clone(),
+                ],
+            ] {
+                assert_eq!(merge_scope_terms(&input), expected);
+                let selected = select_glossary_for_segments(&segments, &input, budget);
+                let entries = &selected.entries_by_segment["seg_order"];
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].note.as_deref(), Some("English note"));
+            }
+        }
+        assert_eq!(
+            merge_scope_terms(&[english.clone(), english.clone()]),
+            [english.clone()]
+        );
+        assert!(has_formerly_ambiguous_order(&expected));
+        assert!(has_formerly_ambiguous_order(&merge_scope_terms(&[
+            english.clone(),
+            french
+        ])));
+        assert!(!has_formerly_ambiguous_order(&merge_scope_terms(&[
+            english.clone(),
+            english.clone()
+        ])));
+        let mut other_scope = english.clone();
+        other_scope.scope_kind = GlossaryScopeKind::Book;
+        other_scope.source_language = "fr".into();
+        assert!(!has_formerly_ambiguous_order(&[english, other_scope]));
     }
 
     #[test]
