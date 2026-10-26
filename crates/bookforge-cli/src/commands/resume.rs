@@ -2,9 +2,9 @@ use super::resolve_job_input;
 use crate::progress::finalize_reporter;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::Result;
@@ -211,11 +211,6 @@ pub async fn run(
     if !args.force {
         ensure_no_live_worker(&args.job_id)?;
     }
-    crate::control::clear_job_control(&args.job_id)?;
-    if (job.status == "paused" && args.force) || job.status == "stopped" {
-        store.mark_job_running_for_resume(&args.job_id)?;
-    }
-
     let progress_jsonl = args
         .progress_jsonl
         .clone()
@@ -246,10 +241,7 @@ pub async fn run(
         // Hard failures must not strand the job row in "running" forever
         // (CLI-5); an honest terminal status beats silent limbo.
         if let Ok(Some(record)) = store.get_job(&args.job_id)
-            && !matches!(
-                record.status.as_str(),
-                "succeeded" | "needs_review" | "failed" | "stopped"
-            )
+            && matches!(record.status.as_str(), "running" | "queued")
         {
             tracing::warn!(
                 job_id = %args.job_id,
@@ -506,6 +498,8 @@ async fn run_pipeline(
     stop_cancel_token: tokio_util::sync::CancellationToken,
     launch_claim: Option<&mut crate::control::RuntimeLaunchClaim>,
 ) -> Result<()> {
+    let control_path = bookforge_core::control_path_for_job(&job.id);
+    let initial_control_revision = control_revision(&control_path)?;
     let started = std::time::Instant::now();
     progress.emit(ProgressEvent::StageStarted {
         stage: "resume".to_string(),
@@ -516,14 +510,6 @@ async fn run_pipeline(
         .output
         .clone()
         .unwrap_or_else(|| snapshot.output_path.clone());
-    if args.output.is_some() {
-        store.update_job_output_path(&job.id, &output)?;
-        snapshot.output_path = output.clone();
-    }
-    if let Some(path) = args.progress_jsonl.clone() {
-        store.update_job_event_path(&job.id, &path)?;
-        snapshot.events_path = Some(path);
-    }
     progress.emit(ProgressEvent::JobCreated {
         job_id: job.id.clone(),
         input_path: input.display().to_string(),
@@ -652,6 +638,57 @@ async fn run_pipeline(
         }
     };
     glossary.run_config.guidance_by_segment = store.load_retry_guidance(&job.id)?;
+    let cache_namespace = if legacy_cache_namespace {
+        compute_cache_namespace_v1(
+            settings.segmentation.max_segment_tokens,
+            settings.segmentation.context_tokens,
+            settings.profile.namespace_str(),
+            settings.batch.enabled,
+            prompt_version,
+        )
+    } else {
+        compute_cache_namespace(
+            settings.segmentation.max_segment_tokens,
+            settings.segmentation.context_tokens,
+            settings.profile.namespace_str(),
+            settings.batch.enabled,
+            prompt_version,
+            &glossary.fingerprint,
+            if snapshot.style_rendered_block.is_empty() {
+                ""
+            } else {
+                snapshot.style_fingerprint.as_str()
+            },
+            if snapshot.entities_rendered_block.is_empty() {
+                ""
+            } else {
+                snapshot.entities_fingerprint.as_str()
+            },
+        )
+    };
+    if cache_namespace != snapshot.cache_namespace {
+        anyhow::bail!(
+            "resume cache namespace mismatch for job '{}': snapshot={}, recomputed={}",
+            job.id,
+            snapshot.cache_namespace,
+            cache_namespace
+        );
+    }
+    // The rebuilt contract matches, so this resume now owns the job. Until here
+    // nothing was changed: a rejected resume leaves the status, the saved paths
+    // and any pending control command exactly as they were.
+    clear_preflight_control(&control_path, initial_control_revision)?;
+    if (job.status == "paused" && args.force) || job.status == "stopped" {
+        store.mark_job_running_for_resume(&job.id)?;
+    }
+    if args.output.is_some() {
+        store.update_job_output_path(&job.id, &output)?;
+        snapshot.output_path = output.clone();
+    }
+    if let Some(path) = args.progress_jsonl.clone() {
+        store.update_job_event_path(&job.id, &path)?;
+        snapshot.events_path = Some(path);
+    }
     // Recheck accepted provider output only after the saved input and prompt
     // contract passed preflight, and before it can seed translation context.
     let revalidated = super::translate::revalidate_stored_translations(
@@ -719,42 +756,6 @@ async fn run_pipeline(
         runtime_settings: Some(control_watcher.runtime_settings()),
     };
 
-    let cache_namespace = if legacy_cache_namespace {
-        compute_cache_namespace_v1(
-            settings.segmentation.max_segment_tokens,
-            settings.segmentation.context_tokens,
-            run_config.profile.namespace_str(),
-            settings.batch.enabled,
-            prompt_version,
-        )
-    } else {
-        compute_cache_namespace(
-            settings.segmentation.max_segment_tokens,
-            settings.segmentation.context_tokens,
-            run_config.profile.namespace_str(),
-            settings.batch.enabled,
-            prompt_version,
-            &glossary.fingerprint,
-            if snapshot.style_rendered_block.is_empty() {
-                ""
-            } else {
-                snapshot.style_fingerprint.as_str()
-            },
-            if snapshot.entities_rendered_block.is_empty() {
-                ""
-            } else {
-                snapshot.entities_fingerprint.as_str()
-            },
-        )
-    };
-    if cache_namespace != snapshot.cache_namespace {
-        anyhow::bail!(
-            "resume cache namespace mismatch for job '{}': snapshot={}, recomputed={}",
-            job.id,
-            snapshot.cache_namespace,
-            cache_namespace
-        );
-    }
     let retry_pending_ids = store
         .segment_records(&job.id)?
         .into_iter()
@@ -1131,6 +1132,26 @@ fn emit_restored_progress(
             statuses: chunk.to_vec(),
             timestamp_ms: now_ms(),
         });
+    }
+    Ok(())
+}
+
+/// Identity of the control file's current contents (modification time and
+/// length), or `None` when there is no control file.
+fn control_revision(path: &Path) -> std::io::Result<Option<(SystemTime, u64)>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some((metadata.modified()?, metadata.len()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Clear the stale control command this resume started with. A Pause or Stop
+/// written while the input was being rebuilt belongs to this invocation, even
+/// when it repeats the old command, so a changed revision is left in place.
+fn clear_preflight_control(path: &Path, before: Option<(SystemTime, u64)>) -> Result<()> {
+    if control_revision(path)? == before {
+        bookforge_core::clear_control_file(path)?;
     }
     Ok(())
 }
@@ -2994,6 +3015,148 @@ mod tests {
                 "stage {stage} must not signal completion"
             );
         }
+    }
+
+    #[test]
+    fn preflight_clears_only_the_original_control_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control");
+        let write_revision = |command, seconds| {
+            bookforge_core::write_control_file(&path, command).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(seconds))
+                .unwrap();
+        };
+
+        write_revision(ControlCommand::Stop, 60);
+        let original = control_revision(&path).unwrap();
+        clear_preflight_control(&path, original).unwrap();
+        assert!(!path.exists());
+
+        // Even a repeated Stop is a new request when written during preflight.
+        write_revision(ControlCommand::Stop, 60);
+        let original = control_revision(&path).unwrap();
+        write_revision(ControlCommand::Stop, 120);
+        clear_preflight_control(&path, original).unwrap();
+        assert_eq!(
+            bookforge_core::read_control_file(&path).unwrap(),
+            ControlCommand::Stop
+        );
+
+        let original = control_revision(&path).unwrap();
+        write_revision(ControlCommand::Pause, 180);
+        clear_preflight_control(&path, original).unwrap();
+        assert_eq!(
+            bookforge_core::read_control_file(&path).unwrap(),
+            ControlCommand::Pause
+        );
+
+        bookforge_core::clear_control_file(&path).unwrap();
+        let absent = control_revision(&path).unwrap();
+        write_revision(ControlCommand::Stop, 240);
+        clear_preflight_control(&path, absent).unwrap();
+        assert_eq!(
+            bookforge_core::read_control_file(&path).unwrap(),
+            ControlCommand::Stop
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_resume_keeps_the_job_state_paths_and_pending_control() {
+        let settings = TranslationProfile::V1Fast.resolve();
+        let mut fixture = resume_fixture(settings, 2);
+        save_succeeded(
+            &fixture.store,
+            &fixture.job.id,
+            &fixture.segments[0],
+            "stored",
+        );
+        fixture.store.mark_job_stopped(&fixture.job.id).unwrap();
+        fixture.job = fixture.store.get_job(&fixture.job.id).unwrap().unwrap();
+        fixture.snapshot.cache_namespace = "incompatible-namespace".to_string();
+        fixture
+            .store
+            .update_job_config_snapshot(&fixture.job.id, &fixture.snapshot)
+            .unwrap();
+        let control = bookforge_core::control_path_for_job(&fixture.job.id);
+        bookforge_core::write_control_file(&control, ControlCommand::Stop).unwrap();
+        let before = serde_json::to_value(&fixture.snapshot).unwrap();
+        let blocks = fixture
+            .store
+            .load_block_translations(&fixture.job.id)
+            .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink {
+            events: events.clone(),
+        });
+        let mut args = resume_args(&fixture.job.id);
+        let tempdir = tempfile::tempdir().unwrap();
+        args.output = Some(tempdir.path().join("elsewhere.epub"));
+        args.progress_jsonl = Some(tempdir.path().join("elsewhere.jsonl"));
+        let run_store = JobStore::open(fixture.store.path()).unwrap();
+        let error = run_inner(
+            &args,
+            &run_store,
+            fixture.job.clone(),
+            &mut fixture.snapshot,
+            None,
+            sink,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("an incompatible checkpoint contract must not resume");
+
+        assert!(
+            error
+                .to_string()
+                .contains("resume cache namespace mismatch")
+        );
+        assert!(!events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ProgressEvent::RequestStarted { .. } | ProgressEvent::SegmentFinished { .. }
+        )));
+        assert_eq!(
+            fixture
+                .store
+                .load_block_translations(&fixture.job.id)
+                .unwrap(),
+            blocks
+        );
+        let saved = fixture
+            .store
+            .load_job_config_snapshot(&fixture.job.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(&saved).unwrap(), before);
+        let job = fixture.store.get_job(&fixture.job.id).unwrap().unwrap();
+        assert_eq!(job.status, "stopped");
+        assert_eq!(job.output_path, fixture.snapshot.output_path);
+        assert_eq!(
+            bookforge_core::read_control_file(&control).unwrap(),
+            ControlCommand::Stop,
+            "the pending command stays until a resume is accepted"
+        );
+        assert!(!fixture.snapshot.output_path.exists());
+        bookforge_core::clear_control_file(&control).unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_resume_clears_the_stale_control_command() {
+        let mut fixture = resume_fixture(TranslationProfile::V1Fast.resolve(), 1);
+        fixture.store.mark_job_stopped(&fixture.job.id).unwrap();
+        fixture.job = fixture.store.get_job(&fixture.job.id).unwrap().unwrap();
+        let control = bookforge_core::control_path_for_job(&fixture.job.id);
+        bookforge_core::write_control_file(&control, ControlCommand::Stop).unwrap();
+
+        run_fixture(&mut fixture)
+            .await
+            .expect("a compatible resume should run");
+        assert!(!control.exists());
+        assert_eq!(job_status(&fixture), "succeeded");
     }
 
     fn resume_fixture(settings: ResolvedRunSettings, segment_count: usize) -> ResumeFixture {
