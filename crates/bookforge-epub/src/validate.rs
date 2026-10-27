@@ -217,12 +217,11 @@ fn decode_xml_resource(bytes: Vec<u8>) -> std::result::Result<String, String> {
             });
         }
     };
-    let units = bytes[2..].chunks_exact(2);
-    if !units.remainder().is_empty() {
+    let (units, remainder) = bytes[2..].as_chunks::<2>();
+    if !remainder.is_empty() {
         return Err("UTF-16 XML resource ends with an incomplete code unit".to_string());
     }
-    char::decode_utf16(units.map(|unit| {
-        let pair = [unit[0], unit[1]];
+    char::decode_utf16(units.iter().map(|&pair| {
         if little_endian {
             u16::from_le_bytes(pair)
         } else {
