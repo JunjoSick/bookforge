@@ -279,3 +279,105 @@ async fn audiobook_estimate_groups_pdf_pages_like_narration() {
     assert_eq!(estimate["chunks"], json!(expected.1));
     assert_eq!(estimate["characters"], json!(expected.2));
 }
+
+/// Fixture body for the cancellation tests. A no-op in an ordinary test run;
+/// when re-executed by [`cancel_fixture_child`] it stands in for an audiobook
+/// child: `cooperate` cleans up and exits once the marker appears, `ignore`
+/// never reacts to it.
+#[test]
+fn audio_cancel_process_fixture() {
+    let Ok(mode) = std::env::var("BOOKFORGE_AUDIO_CANCEL_FIXTURE") else {
+        return;
+    };
+    let marker = PathBuf::from(std::env::var_os("BOOKFORGE_AUDIO_CANCEL_MARKER").unwrap());
+    let ready = PathBuf::from(std::env::var_os("BOOKFORGE_AUDIO_CANCEL_READY").unwrap());
+    std::fs::write(&ready, b"ready").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if mode == "cooperate" && marker.exists() {
+            std::fs::write(ready.with_extension("cleaned"), b"cleanup complete").unwrap();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+async fn cancel_fixture_child(mode: &str, marker: &Path, ready: &Path) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "commands::serve::tests::audio_dashboard::audio_cancel_process_fixture",
+            "--nocapture",
+        ])
+        .env("BOOKFORGE_AUDIO_CANCEL_FIXTURE", mode)
+        .env("BOOKFORGE_AUDIO_CANCEL_MARKER", marker)
+        .env("BOOKFORGE_AUDIO_CANCEL_READY", ready)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().unwrap();
+    let started = tokio::time::timeout(Duration::from_secs(30), async {
+        while !ready.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "the fixture exited before it was ready"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    if started.is_err() {
+        let _ = child.kill().await;
+        panic!("the cancellation fixture did not start");
+    }
+    child
+}
+
+#[tokio::test]
+async fn active_audio_cancel_waits_for_cleanup_and_removes_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = audio_cancel_marker(dir.path());
+    let ready = dir.path().join("ready");
+    let mut child = cancel_fixture_child("cooperate", &marker, &ready).await;
+
+    cancel_running_audiobook(&mut child, &marker, Duration::from_secs(20))
+        .await
+        .unwrap();
+
+    assert!(
+        child.try_wait().unwrap().unwrap().success(),
+        "a cooperative child exits on its own"
+    );
+    assert!(
+        ready.with_extension("cleaned").exists(),
+        "cleanup ran before exit"
+    );
+    assert!(!marker.exists(), "the marker must not outlive the cancel");
+}
+
+#[tokio::test]
+async fn active_audio_cancel_force_stops_unresponsive_child_after_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = audio_cancel_marker(dir.path());
+    let ready = dir.path().join("ready");
+    let mut child = cancel_fixture_child("ignore", &marker, &ready).await;
+
+    let started = Instant::now();
+    cancel_running_audiobook(&mut child, &marker, Duration::from_millis(50))
+        .await
+        .unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "an unresponsive child is force-stopped, not awaited: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        child.try_wait().unwrap().is_some(),
+        "the stopped child is reaped"
+    );
+    assert!(!ready.with_extension("cleaned").exists());
+    assert!(!marker.exists(), "the marker must not outlive the cancel");
+}

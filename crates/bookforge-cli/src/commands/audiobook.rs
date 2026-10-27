@@ -13,7 +13,7 @@ use bookforge_audio::{
     acquire_audiobook_output_lock_with_handoff, build_audiobook_with_lock,
     elevenlabs_model_max_input_chars, feature_set, fetch_elevenlabs_subscription,
     list_elevenlabs_voices, plan_chunks, plan_chunks_for_prune,
-    resolve_preferred_elevenlabs_model_reported_with_cancel, stitch, validate_options,
+    resolve_preferred_elevenlabs_model_reported_with_cancel, stitch_with_cancel, validate_options,
 };
 use clap::{Args, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -227,12 +227,52 @@ pub struct AudiobookArgs {
     /// `json-v1` keeps the deprecated raw `{"event":…}` lines.
     #[arg(long, value_enum, default_value_t = UiMode::Auto)]
     pub ui: UiMode,
+
+    /// Dashboard-owned cancellation marker: when this file appears, the run
+    /// cancels cooperatively exactly like Ctrl+C.
+    #[arg(long, hide = true)]
+    pub cancel_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct QuotaInfo {
     remaining: u64,
     limit: u64,
+}
+
+/// Watches the dashboard's cancellation marker for one run. The watcher
+/// cancels the run's token when the marker appears and is aborted when
+/// dropped, so a finished run never reacts to a later marker.
+struct CancelFileWatcher(tokio::task::JoinHandle<()>);
+
+impl CancelFileWatcher {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    fn spawn(path: PathBuf, cancel: CancellationToken) -> Self {
+        if path.exists() {
+            cancel.cancel();
+        }
+        Self(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Self::POLL_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        if path.exists() {
+                            cancel.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        }))
+    }
+}
+
+impl Drop for CancelFileWatcher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Single choke point for every stdout JSON line this command emits (UI-23):
@@ -260,6 +300,13 @@ impl AudiobookJson {
 }
 
 pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
+    let _cancel_watcher = args
+        .cancel_file
+        .clone()
+        .map(|path| CancelFileWatcher::spawn(path, cancel.clone()));
+    if cancel.is_cancelled() {
+        anyhow::bail!("audiobook cancelled before synthesis");
+    }
     if args.list_voices {
         return list_voices_and_exit(&args).await;
     }
@@ -815,24 +862,34 @@ pub async fn run(args: AudiobookArgs, cancel: CancellationToken) -> Result<()> {
     }
 
     let stitch_report = if postprocess {
-        Some(stitch_output(StitchRequest {
-            manifest_path: &report.manifest_path,
-            out_dir: &out_dir,
-            book: &book,
-            format,
-            make_m4b,
-            make_single: args.single,
-            gap_chapter_ms: args.gap_chapter_ms,
-            gap_title_ms: args.gap_title_ms,
-            gap_paragraph_ms: args.gap_paragraph_ms,
-            loudnorm: args.loudnorm,
-            human_output: human_output || fallback_tui_output,
-        })?)
+        Some(
+            stitch_output(StitchRequest {
+                manifest_path: &report.manifest_path,
+                out_dir: &out_dir,
+                book: &book,
+                format,
+                make_m4b,
+                make_single: args.single,
+                gap_chapter_ms: args.gap_chapter_ms,
+                gap_title_ms: args.gap_title_ms,
+                gap_paragraph_ms: args.gap_paragraph_ms,
+                loudnorm: args.loudnorm,
+                human_output: human_output || fallback_tui_output,
+                cancel: cancel.clone(),
+            })
+            .await?,
+        )
     } else {
         None
     };
     if let Some(stitch_report) = &stitch_report {
         write_stitch_warnings_to_process(&out_dir, &stitch_report.warnings)?;
+    }
+    if cancel.is_cancelled() {
+        anyhow::bail!(
+            "audiobook stitching cancelled; synthesized chunks remain in {}",
+            out_dir.display()
+        );
     }
     let deliverable_errors = stitch_report.as_ref().map_or_else(Vec::new, |result| {
         missing_requested_deliverables(result, report.chapters, args.stitch, make_m4b, args.single)
@@ -1446,9 +1503,10 @@ struct StitchRequest<'a> {
     gap_paragraph_ms: u32,
     loudnorm: bool,
     human_output: bool,
+    cancel: CancellationToken,
 }
 
-fn stitch_output(request: StitchRequest<'_>) -> Result<bookforge_audio::StitchReport> {
+async fn stitch_output(request: StitchRequest<'_>) -> Result<bookforge_audio::StitchReport> {
     let StitchRequest {
         manifest_path,
         out_dir,
@@ -1461,6 +1519,7 @@ fn stitch_output(request: StitchRequest<'_>) -> Result<bookforge_audio::StitchRe
         gap_paragraph_ms,
         loudnorm,
         human_output,
+        cancel,
     } = request;
 
     let manifest_json = std::fs::read_to_string(manifest_path)
@@ -1497,7 +1556,16 @@ fn stitch_output(request: StitchRequest<'_>) -> Result<bookforge_audio::StitchRe
         author: (!book.metadata.creators.is_empty()).then(|| book.metadata.creators.join(", ")),
         cover_path: cover.as_ref().map(|cover| cover.0.clone()),
     };
-    let mut result = stitch(&manifest, &stitch_options);
+    // Stitching blocks on ffmpeg for minutes; run it off the async workers so
+    // the Ctrl+C handler and the cancel-file watcher keep running, and let
+    // the token stop the owned ffmpeg child. `cover` outlives the await, so
+    // the staged cover image stays on disk until stitching is done.
+    let mut result = tokio::task::spawn_blocking(move || {
+        stitch_with_cancel(&manifest, &stitch_options, &cancel)
+    })
+    .await
+    .context("audiobook stitching worker failed")?;
+    drop(cover);
     if let Some(warning) = cover_warning {
         result.warnings.push(warning);
     }
@@ -1780,11 +1848,42 @@ fn validate_audio_base_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioProviderKind, BreakTagsArg, cover_image_resource, epub_resource_path,
-        missing_requested_deliverables, normalize_language_code, parse_chapter_ranges,
-        resolve_context_chars, resolve_heading_break_tag, resolve_language_code,
-        validate_audio_base_url, write_stitch_warnings_to_process,
+        AudioProviderKind, BreakTagsArg, CancelFileWatcher, cover_image_resource,
+        epub_resource_path, missing_requested_deliverables, normalize_language_code,
+        parse_chapter_ranges, resolve_context_chars, resolve_heading_break_tag,
+        resolve_language_code, validate_audio_base_url, write_stitch_warnings_to_process,
     };
+
+    #[tokio::test]
+    async fn cancel_file_watcher_cancels_and_stops_when_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".cancel");
+
+        // A marker that appears mid-run cancels the run.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let watcher = CancelFileWatcher::spawn(marker.clone(), cancel.clone());
+        std::fs::write(&marker, b"cancel").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancel.cancelled())
+            .await
+            .expect("the marker should cancel the active run");
+        drop(watcher);
+
+        // A marker that already exists cancels before any work starts.
+        let already = tokio_util::sync::CancellationToken::new();
+        drop(CancelFileWatcher::spawn(marker.clone(), already.clone()));
+        assert!(already.is_cancelled());
+
+        // A dropped watcher never reacts to a later marker.
+        std::fs::remove_file(&marker).unwrap();
+        let later = tokio_util::sync::CancellationToken::new();
+        drop(CancelFileWatcher::spawn(marker.clone(), later.clone()));
+        std::fs::write(&marker, b"cancel").unwrap();
+        tokio::time::sleep(CancelFileWatcher::POLL_INTERVAL * 3).await;
+        assert!(
+            !later.is_cancelled(),
+            "a finished run must not keep a watcher alive"
+        );
+    }
 
     fn image_resource(id: &str, href: &str, properties: &[&str]) -> bookforge_core::ir::Resource {
         bookforge_core::ir::Resource {

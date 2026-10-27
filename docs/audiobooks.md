@@ -295,6 +295,14 @@ good artifact untouched. Failure messages include a bounded tail of ffmpeg's
 stderr. If ffprobe cannot determine every chapter duration, BookForge does not
 publish an unchaptered `.m4b` under the promised chaptered filename.
 
+Every ffmpeg and ffprobe run has a deadline (15 seconds for tool version
+checks, 60 seconds for media probes, 30 minutes per encode); a child that
+misses it is killed and reported as a stitch warning. Ctrl+C also stops
+stitching: the running ffmpeg child is killed, its unfinished staged output is
+removed, nothing further is published, and the command exits with an error
+that says so. Completed chunks and previously published chapter files and
+book files are kept, so rerunning the command resumes from them.
+
 Explicit whole-book requests are strict: `--m4b` and `--single` make the
 command fail if their requested artifacts are absent. The established
 best-effort contract for `--stitch` and automatic M4B assembly remains
@@ -365,6 +373,10 @@ The Audiobooks screen mirrors the CLI's current workflow:
   discovery. Its quota `fits` flag compares credits the same way as the CLI.
 - Running jobs show per-chapter completed/total progress and the resolved
   auto-selected model.
+- Cancel first asks the running process to stop the way Ctrl+C does, so
+  synthesis and encoding can stop and remove their temporary output while
+  completed chunks are preserved. A process that has not exited after five
+  seconds is force-stopped together with its child processes.
 - The Advanced section exposes chapter pause, flat-file output, loudness
   normalization, seed, and language. Chapter-pause presets map none/short/
   medium/long to 0/600/1200/2000 ms; the title gap is derived as the smaller

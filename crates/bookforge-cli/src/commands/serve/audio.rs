@@ -6,6 +6,18 @@ use std::io::Write;
 /// this nonce and the child adopts it instead of racing the parent's release.
 const AUDIO_LOCK_HANDOFF_ENV: &str = "BOOKFORGE_AUDIO_OUT_LOCK_HANDOFF";
 
+/// Cancellation marker inside each dashboard operation directory. The child
+/// watches it through the hidden `--cancel-file` flag.
+const AUDIO_CANCEL_MARKER: &str = ".cancel";
+
+/// How long a cancelled child may spend cancelling synthesis/encoding and
+/// removing its staged files before the dashboard force-stops its tree.
+const AUDIO_CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+pub(super) fn audio_cancel_marker(out_dir: &Path) -> PathBuf {
+    out_dir.join(AUDIO_CANCEL_MARKER)
+}
+
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/audio/voices", get(audio_voices))
@@ -685,6 +697,9 @@ async fn launch_audiobook(
         api_key_env,
         &advanced,
     ));
+    command
+        .arg("--cancel-file")
+        .arg(audio_cancel_marker(&out_dir));
     configure_dashboard_child_environment(&mut command, api_key_env.zip(key.as_deref()));
     configure_audio_child_process_group(&mut command);
     // Hand the output lock to the child before it can exist: rewrite the
@@ -1263,12 +1278,46 @@ mod audio_process_signals {
     }
 }
 
+/// Cancel a running dashboard audiobook child.
+///
+/// The child is first asked to stop through its cancellation marker, which
+/// lets it cancel synthesis and ffmpeg, remove staged output, and checkpoint
+/// its manifest. If it has not exited after `grace`, its process tree is
+/// force-stopped. The marker is removed either way so a later retry in the
+/// same operation directory does not start out cancelled.
+pub(super) async fn cancel_running_audiobook(
+    child: &mut tokio::process::Child,
+    marker: &Path,
+    grace: Duration,
+) -> Result<()> {
+    let requested = tokio::fs::write(marker, b"cancel\n").await.is_ok();
+    let cooperative = if requested {
+        tokio::time::timeout(grace, child.wait()).await.ok()
+    } else {
+        None
+    };
+    let result = match cooperative {
+        Some(status) => status
+            .map(|_| ())
+            .context("waiting for cooperative audiobook cancellation"),
+        None => {
+            terminate_audio_child_tree(child).await;
+            Ok(())
+        }
+    };
+    let _ = tokio::fs::remove_file(marker).await;
+    result
+}
+
 async fn terminate_audio_child_tree(child: &mut tokio::process::Child) {
     let pid = child.id();
     #[cfg(windows)]
     if let Some(pid) = pid {
         let _ = tokio::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .await;
     }
@@ -1536,8 +1585,19 @@ fn register_audio_cancellation(
                 Err(error) => ("failed", Some(format!("could not wait for audiobook process: {error}"))),
             },
             _ = cancel.cancelled() => {
-                terminate_audio_child_tree(&mut child).await;
-                ("cancelled", None)
+                match cancel_running_audiobook(
+                    &mut child,
+                    &audio_cancel_marker(&out_dir),
+                    AUDIO_CANCEL_GRACE,
+                )
+                .await
+                {
+                    Ok(()) => ("cancelled", None),
+                    Err(error) => (
+                        "failed",
+                        Some(format!("could not cancel audiobook process: {error:#}")),
+                    ),
+                }
             }
         };
         let _ = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -2827,6 +2887,22 @@ async fn retry_failed_chunks(
         &prepared.advanced,
     ));
     command.arg("--retry-failed");
+    // A marker left behind by an interrupted earlier cancel would cancel this
+    // retry on start; the operation lock is held, so no live run owns it.
+    let cancel_marker = audio_cancel_marker(&prepared.out_dir);
+    match std::fs::remove_file(&cancel_marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::Error::from(error)
+                .context(format!(
+                    "could not clear the stale cancellation marker {}",
+                    cancel_marker.display()
+                ))
+                .into());
+        }
+    }
+    command.arg("--cancel-file").arg(&cancel_marker);
     configure_dashboard_child_environment(&mut command, api_key_env.zip(key.as_deref()));
     configure_audio_child_process_group(&mut command);
 
