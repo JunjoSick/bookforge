@@ -10,7 +10,7 @@ use std::{
     cell::RefCell,
     ffi::{CStr, c_char, c_int, c_uint, c_void},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc,
     time::Duration,
 };
@@ -38,9 +38,9 @@ fn temp_path(name: &str) -> PathBuf {
     ))
 }
 
-fn remove_database(path: &PathBuf) {
+fn remove_database(path: &Path) {
     for suffix in ["", "-wal", "-shm"] {
-        let mut file = path.clone().into_os_string();
+        let mut file = path.as_os_str().to_owned();
         file.push(suffix);
         let _ = fs::remove_file(PathBuf::from(file));
     }
