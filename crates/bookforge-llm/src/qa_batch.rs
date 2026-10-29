@@ -1019,10 +1019,11 @@ mod tests {
         .await;
 
         assert_eq!(reviews.len(), 1);
-        let requests = requests.lock().expect("requests mutex");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].max_output_tokens, Some(12_345));
-        drop(requests);
+        {
+            let requests = requests.lock().expect("requests mutex");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].max_output_tokens, Some(12_345));
+        }
 
         // Without a per-call cap, the cap saved with the job applies.
         let provider = CaptureQaProvider::default();
