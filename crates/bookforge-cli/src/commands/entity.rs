@@ -155,6 +155,13 @@ pub(crate) fn parse_entities_toml(raw: &str) -> Result<Vec<Entity>> {
         );
     }
     validate_scope(parsed.meta.scope.kind, parsed.meta.scope.id.as_deref())?;
+    // Each language pair has one global scope, as for glossary imports: a
+    // stray `meta.scope.id` on a global sheet must not split it.
+    let scope_id = if parsed.meta.scope.kind == GlossaryScopeKind::Global {
+        None
+    } else {
+        parsed.meta.scope.id
+    };
     let mut out = Vec::with_capacity(parsed.entities.len());
     for entity in parsed.entities {
         if entity.source_name.is_empty() || entity.target_name.is_empty() {
@@ -163,7 +170,7 @@ pub(crate) fn parse_entities_toml(raw: &str) -> Result<Vec<Entity>> {
         out.push(Entity {
             id: None,
             scope_kind: parsed.meta.scope.kind,
-            scope_id: parsed.meta.scope.id.clone(),
+            scope_id: scope_id.clone(),
             source_name: entity.source_name,
             target_name: entity.target_name,
             gender_target: entity.gender_target,
@@ -385,6 +392,22 @@ mod tests {
             source_language: "English".to_string(),
             target_language: "Italian".to_string(),
         }
+    }
+
+    #[test]
+    fn global_sheets_drop_their_scope_id_and_scoped_sheets_keep_it() {
+        let sheet = |kind: &str| {
+            format!(
+                "[meta]\nschema_version = 1\nsource_language = \"en\"\ntarget_language = \"it\"\n\
+                 [meta.scope]\nkind = \"{kind}\"\nid = \"saga-one\"\n\
+                 [[entity]]\nsource_name = \"Quillon\"\ntarget_name = \"Quillon\"\n"
+            )
+        };
+        let global = parse_entities_toml(&sheet("global")).unwrap();
+        assert_eq!(global[0].scope_kind, GlossaryScopeKind::Global);
+        assert_eq!(global[0].scope_id, None);
+        let series = parse_entities_toml(&sheet("series")).unwrap();
+        assert_eq!(series[0].scope_id.as_deref(), Some("saga-one"));
     }
 
     #[test]

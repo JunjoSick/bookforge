@@ -603,14 +603,35 @@ pub fn merge_scope_terms(terms: &[GlossaryTerm]) -> Vec<GlossaryTerm> {
         }
     }
     let mut merged = by_key.into_values().collect::<Vec<_>>();
+    // The merge key makes (source text, languages, case sensitivity) unique,
+    // so this order is total. Without the trailing keys, equal spellings in
+    // different languages or case modes kept the HashMap's arbitrary order,
+    // which changed the prompt and which notes survived the token budget.
     merged.sort_by(|a, b| {
         a.scope_kind
             .priority()
             .cmp(&b.scope_kind.priority())
             .then_with(|| a.source_text.cmp(&b.source_text))
             .then_with(|| a.target_text.cmp(&b.target_text))
+            .then_with(|| a.source_language.cmp(&b.source_language))
+            .then_with(|| a.target_language.cmp(&b.target_language))
+            .then_with(|| a.case_sensitive.cmp(&b.case_sensitive))
     });
     merged
+}
+
+/// Whether two merged terms share the spelling keys that alone ordered
+/// [`merge_scope_terms`] output before languages and case sensitivity broke
+/// ties. Such sets could produce different prompts under one cache identity.
+pub fn has_formerly_ambiguous_order(merged: &[GlossaryTerm]) -> bool {
+    let mut keys = HashSet::with_capacity(merged.len());
+    merged.iter().any(|term| {
+        !keys.insert((
+            term.scope_kind.priority(),
+            term.source_text.as_str(),
+            term.target_text.as_str(),
+        ))
+    })
 }
 
 pub fn select_glossary_for_segments(
@@ -622,32 +643,40 @@ pub fn select_glossary_for_segments(
     let matcher = GlossaryMatcher::new(&terms);
     let computed_counts = source_counts(segments, &matcher);
     let high_frequency = high_frequency_anchors(&terms, &computed_counts, 20);
+    // Per-term facts every segment consults. Computing them once avoids
+    // re-serializing an entry to estimate its size, and re-hashing a
+    // synthetic id, each time a segment considers that term.
+    let synthetic_ids = terms
+        .iter()
+        .map(SyntheticId::synthetic_id)
+        .collect::<Vec<_>>();
+    let estimates = terms.iter().map(estimate_prompt_tokens).collect::<Vec<_>>();
+    let always_active = (0..terms.len())
+        .filter(|&term_index| terms[term_index].always_active)
+        .collect::<Vec<_>>();
     let mut entries_by_segment = HashMap::new();
     let mut rules_by_segment = HashMap::new();
     let mut truncated_authoritative_entries = 0usize;
 
     let mut recent_matches = VecDeque::<Vec<usize>>::with_capacity(5);
+    let mut selected = Vec::<(usize, GlossarySelectionRule)>::new();
+    let mut seen = HashSet::<i64>::new();
     for (index, segment) in segments.iter().enumerate() {
-        let mut selected = Vec::<(&GlossaryTerm, GlossarySelectionRule)>::new();
-        let mut seen = HashSet::<i64>::new();
+        selected.clear();
+        seen.clear();
+        let mut push = |term_index: usize, rule| {
+            if seen.insert(synthetic_ids[term_index]) {
+                selected.push((term_index, rule));
+            }
+        };
 
         let matches = matcher.matching_indices(&segment.source.text);
         for &term_index in &matches {
-            push_term(
-                &mut selected,
-                &mut seen,
-                &terms[term_index],
-                GlossarySelectionRule::SegmentMatched,
-            );
+            push(term_index, GlossarySelectionRule::SegmentMatched);
         }
 
-        for term in terms.iter().filter(|term| term.always_active) {
-            push_term(
-                &mut selected,
-                &mut seen,
-                term,
-                GlossarySelectionRule::AlwaysActive,
-            );
+        for &term_index in &always_active {
+            push(term_index, GlossarySelectionRule::AlwaysActive);
         }
 
         let start = index.saturating_sub(5);
@@ -656,12 +685,7 @@ pub fn select_glossary_for_segments(
                 continue;
             }
             for &term_index in previous_matches {
-                push_term(
-                    &mut selected,
-                    &mut seen,
-                    &terms[term_index],
-                    GlossarySelectionRule::RecentlyActive,
-                );
+                push(term_index, GlossarySelectionRule::RecentlyActive);
             }
         }
         // The window counts all preceding segments, including other sections.
@@ -671,21 +695,17 @@ pub fn select_glossary_for_segments(
         }
         recent_matches.push_back(matches);
 
-        for term in &high_frequency {
-            push_term(
-                &mut selected,
-                &mut seen,
-                term,
-                GlossarySelectionRule::HighFrequencyAnchor,
-            );
+        for &term_index in &high_frequency {
+            push(term_index, GlossarySelectionRule::HighFrequencyAnchor);
         }
 
-        let (bounded, truncated) = enforce_budget(selected, budget_tokens);
-        truncated_authoritative_entries += truncated;
-        let (entries, rules) = bounded
-            .into_iter()
-            .map(|(term, rule)| (GlossaryPromptTerm::from_term(term), rule))
-            .unzip();
+        let (entries, rules) = enforce_budget(
+            &selected,
+            &terms,
+            &estimates,
+            budget_tokens,
+            &mut truncated_authoritative_entries,
+        );
         entries_by_segment.insert(segment.id.0.clone(), entries);
         rules_by_segment.insert(segment.id.0.clone(), rules);
     }
@@ -721,35 +741,30 @@ pub fn target_matches(text: &str, term: &GlossaryTerm) -> bool {
     }
 }
 
-fn push_term<'a>(
-    selected: &mut Vec<(&'a GlossaryTerm, GlossarySelectionRule)>,
-    seen: &mut HashSet<i64>,
-    term: &'a GlossaryTerm,
-    rule: GlossarySelectionRule,
-) {
-    let synthetic = term.synthetic_id();
-    if seen.insert(synthetic) {
-        selected.push((term, rule));
-    }
-}
-
+/// Keep selected entries, in order, while their precomputed estimates fit the
+/// budget, and count authoritative entries that did not fit.
 fn enforce_budget(
-    terms: Vec<(&GlossaryTerm, GlossarySelectionRule)>,
+    selected: &[(usize, GlossarySelectionRule)],
+    terms: &[GlossaryTerm],
+    estimates: &[usize],
     budget_tokens: usize,
-) -> (Vec<(&GlossaryTerm, GlossarySelectionRule)>, usize) {
+    truncated_authoritative_entries: &mut usize,
+) -> (Vec<GlossaryPromptTerm>, Vec<GlossarySelectionRule>) {
     let mut used = 0usize;
-    let mut kept = Vec::new();
-    let mut truncated = 0usize;
-    for (term, rule) in terms {
-        let estimate = estimate_prompt_tokens(term);
+    let mut entries = Vec::new();
+    let mut rules = Vec::new();
+    for &(term_index, rule) in selected {
+        let term = &terms[term_index];
+        let estimate = estimates[term_index];
         if used.saturating_add(estimate) <= budget_tokens {
             used = used.saturating_add(estimate);
-            kept.push((term, rule));
+            entries.push(GlossaryPromptTerm::from_term(term));
+            rules.push(rule);
         } else if term.status == GlossaryStatus::UserSeeded || term.always_active {
-            truncated += 1;
+            *truncated_authoritative_entries += 1;
         }
     }
-    (kept, truncated)
+    (entries, rules)
 }
 
 fn estimate_prompt_tokens(term: &GlossaryTerm) -> usize {
@@ -842,24 +857,27 @@ fn source_counts(segments: &[Segment], matcher: &GlossaryMatcher<'_>) -> HashMap
         .collect()
 }
 
-fn high_frequency_anchors<'a>(
-    terms: &'a [GlossaryTerm],
+/// Indices into `terms` of the most frequent anchor-category terms.
+fn high_frequency_anchors(
+    terms: &[GlossaryTerm],
     computed_counts: &HashMap<i64, usize>,
     limit: usize,
-) -> Vec<&'a GlossaryTerm> {
+) -> Vec<usize> {
     let mut anchors = terms
         .iter()
-        .filter(|term| term.category.is_high_frequency_anchor())
-        .map(|term| {
+        .enumerate()
+        .filter(|(_, term)| term.category.is_high_frequency_anchor())
+        .map(|(term_index, term)| {
             let count = term
                 .source_count
                 .max(*computed_counts.get(&term.synthetic_id()).unwrap_or(&0));
-            (term, count)
+            (term_index, count)
         })
         .filter(|(_, count)| *count > 0)
         .collect::<Vec<_>>();
-    anchors.sort_by(|(a, ac), (b, bc)| {
-        bc.cmp(ac)
+    anchors.sort_by(|&(a, ac), &(b, bc)| {
+        let (a, b) = (&terms[a], &terms[b]);
+        bc.cmp(&ac)
             .then_with(|| {
                 a.scope_kind
                     .priority()
@@ -871,7 +889,7 @@ fn high_frequency_anchors<'a>(
     anchors
         .into_iter()
         .take(limit)
-        .map(|(term, _)| term)
+        .map(|(term_index, _)| term_index)
         .collect()
 }
 
@@ -1345,6 +1363,224 @@ mod tests {
         );
     }
 
+    /// Straightforward selection kept as an oracle: every lookup rescans the
+    /// text with `term_matches`, every recent lookup rescans the previous
+    /// segments, and every entry is estimated where it is used.
+    fn reference_selection(
+        segments: &[Segment],
+        terms: &[GlossaryTerm],
+        budget_tokens: usize,
+    ) -> SegmentGlossarySelections {
+        fn push<'a>(
+            selected: &mut Vec<(&'a GlossaryTerm, GlossarySelectionRule)>,
+            seen: &mut HashSet<i64>,
+            term: &'a GlossaryTerm,
+            rule: GlossarySelectionRule,
+        ) {
+            if seen.insert(term.synthetic_id()) {
+                selected.push((term, rule));
+            }
+        }
+
+        let terms = merge_scope_terms(terms);
+        let mut counts = HashMap::new();
+        for term in &terms {
+            let count = segments
+                .iter()
+                .filter(|segment| term_matches(&segment.source.text, term))
+                .count();
+            counts.insert(term.synthetic_id(), count);
+        }
+        let mut anchors = terms
+            .iter()
+            .filter(|term| term.category.is_high_frequency_anchor())
+            .map(|term| (term, term.source_count.max(counts[&term.synthetic_id()])))
+            .filter(|(_, count)| *count > 0)
+            .collect::<Vec<_>>();
+        anchors.sort_by(|(a, ac), (b, bc)| {
+            bc.cmp(ac)
+                .then_with(|| {
+                    a.scope_kind
+                        .priority()
+                        .cmp(&b.scope_kind.priority())
+                        .reverse()
+                })
+                .then_with(|| a.source_text.cmp(&b.source_text))
+        });
+        anchors.truncate(20);
+
+        let mut result = SegmentGlossarySelections {
+            entries_by_segment: HashMap::new(),
+            rules_by_segment: HashMap::new(),
+            truncated_authoritative_entries: 0,
+        };
+        for (index, segment) in segments.iter().enumerate() {
+            let mut selected = Vec::new();
+            let mut seen = HashSet::new();
+            for term in &terms {
+                if term_matches(&segment.source.text, term) {
+                    push(
+                        &mut selected,
+                        &mut seen,
+                        term,
+                        GlossarySelectionRule::SegmentMatched,
+                    );
+                }
+            }
+            for term in terms.iter().filter(|term| term.always_active) {
+                push(
+                    &mut selected,
+                    &mut seen,
+                    term,
+                    GlossarySelectionRule::AlwaysActive,
+                );
+            }
+            for previous in &segments[index.saturating_sub(5)..index] {
+                if previous.section_id != segment.section_id {
+                    continue;
+                }
+                for term in &terms {
+                    if term_matches(&previous.source.text, term) {
+                        push(
+                            &mut selected,
+                            &mut seen,
+                            term,
+                            GlossarySelectionRule::RecentlyActive,
+                        );
+                    }
+                }
+            }
+            for (term, _) in &anchors {
+                push(
+                    &mut selected,
+                    &mut seen,
+                    term,
+                    GlossarySelectionRule::HighFrequencyAnchor,
+                );
+            }
+            let mut used = 0usize;
+            let mut entries = Vec::new();
+            let mut rules = Vec::new();
+            for (term, rule) in selected {
+                let estimate = estimate_prompt_tokens(term);
+                if used.saturating_add(estimate) <= budget_tokens {
+                    used = used.saturating_add(estimate);
+                    entries.push(GlossaryPromptTerm::from_term(term));
+                    rules.push(rule);
+                } else if term.status == GlossaryStatus::UserSeeded || term.always_active {
+                    result.truncated_authoritative_entries += 1;
+                }
+            }
+            result
+                .entries_by_segment
+                .insert(segment.id.0.clone(), entries);
+            result.rules_by_segment.insert(segment.id.0.clone(), rules);
+        }
+        result
+    }
+
+    /// Small deterministic generator, so a failure reproduces from its case.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self, bound: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 33) % bound as u64) as usize
+        }
+
+        fn pick<'a, T>(&mut self, values: &'a [T]) -> &'a T {
+            &values[self.next(values.len())]
+        }
+    }
+
+    #[test]
+    fn selection_matches_the_straightforward_oracle() {
+        const WORDS: &[&str] = &[
+            "Ring",
+            "ring",
+            "RING",
+            "İstanbul",
+            "istanbul",
+            "Straße",
+            "STRASSE",
+            "ΟΣ",
+            "ος",
+            "東京",
+            "",
+            "Will",
+            "will",
+            "Ann",
+            "Anna",
+            "harbor",
+            "Harbor",
+        ];
+        const CATEGORIES: &[GlossaryCategory] = &[
+            GlossaryCategory::Person,
+            GlossaryCategory::Place,
+            GlossaryCategory::Object,
+            GlossaryCategory::Invented,
+            GlossaryCategory::Style,
+            GlossaryCategory::Phrase,
+            GlossaryCategory::Other,
+        ];
+        const SCOPES: &[GlossaryScopeKind] = &[
+            GlossaryScopeKind::Global,
+            GlossaryScopeKind::Series,
+            GlossaryScopeKind::Book,
+        ];
+        const STATUSES: &[GlossaryStatus] = &[
+            GlossaryStatus::UserSeeded,
+            GlossaryStatus::Accepted,
+            GlossaryStatus::AutoCandidate,
+        ];
+        let mut compared = 0usize;
+        for case in 0..200u64 {
+            let mut rng = Lcg(case.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xb00c);
+            let terms = (0..1 + rng.next(24))
+                .map(|_| {
+                    let source = rng.pick(WORDS).to_string();
+                    let mut value = term(&source, &source.to_uppercase(), *rng.pick(SCOPES));
+                    value.id = match rng.next(4) {
+                        0 => None,
+                        // A small id range forces duplicate ids.
+                        _ => Some(rng.next(12) as i64),
+                    };
+                    value.category = *rng.pick(CATEGORIES);
+                    value.case_sensitive = rng.next(2) == 0;
+                    value.always_active = rng.next(6) == 0;
+                    value.status = *rng.pick(STATUSES);
+                    value.source_language = rng.pick(&["English", "French"]).to_string();
+                    value.notes = (rng.next(3) == 0).then(|| format!("note {}", rng.next(100)));
+                    value.source_count = rng.next(3);
+                    value
+                })
+                .collect::<Vec<_>>();
+            let segments = (0..1 + rng.next(14))
+                .map(|ordinal| {
+                    let text = (0..rng.next(6))
+                        .map(|_| *rng.pick(WORDS))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let mut value = segment(&format!("seg_{ordinal}"), ordinal, &text);
+                    value.section_id = SectionId(format!("sec_{}", rng.next(3)));
+                    value
+                })
+                .collect::<Vec<_>>();
+            for budget in [0, 1, 8, 20, 60, 800] {
+                assert_eq!(
+                    select_glossary_for_segments(&segments, &terms, budget),
+                    reference_selection(&segments, &terms, budget),
+                    "case {case}, budget {budget}"
+                );
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 1_200);
+    }
+
     // Opt-in timing probe; correctness tests below have no machine-speed gate.
     #[test]
     #[ignore]
@@ -1408,6 +1644,60 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().any(|term| term.source_text == "Will"));
         assert!(merged.iter().any(|term| term.source_text == "will"));
+    }
+
+    #[test]
+    fn equal_spelling_terms_have_stable_language_and_sensitivity_order() {
+        let mut english = term("Odile", "Odile", GlossaryScopeKind::Global);
+        english.source_language = "en".into();
+        english.notes = Some("English note".into());
+        let mut french = english.clone();
+        french.source_language = "fr".into();
+        french.notes = Some("French note".into());
+        let mut sensitive = english.clone();
+        sensitive.case_sensitive = true;
+        sensitive.notes = Some("Case-sensitive note".into());
+        let expected = vec![english.clone(), sensitive.clone(), french.clone()];
+        let segments = [segment("seg_order", 0, "Odile entered the room.")];
+        // Room for exactly one entry, so the first in order is the one kept.
+        let budget = estimate_prompt_tokens(&english);
+
+        // Each merge builds a fresh randomly seeded HashMap; repeat so an
+        // order-dependent tie would show up.
+        for _ in 0..32 {
+            for input in [
+                vec![english.clone(), sensitive.clone(), french.clone()],
+                vec![
+                    french.clone(),
+                    sensitive.clone(),
+                    english.clone(),
+                    english.clone(),
+                ],
+            ] {
+                assert_eq!(merge_scope_terms(&input), expected);
+                let selected = select_glossary_for_segments(&segments, &input, budget);
+                let entries = &selected.entries_by_segment["seg_order"];
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].note.as_deref(), Some("English note"));
+            }
+        }
+        assert_eq!(
+            merge_scope_terms(&[english.clone(), english.clone()]),
+            [english.clone()]
+        );
+        assert!(has_formerly_ambiguous_order(&expected));
+        assert!(has_formerly_ambiguous_order(&merge_scope_terms(&[
+            english.clone(),
+            french
+        ])));
+        assert!(!has_formerly_ambiguous_order(&merge_scope_terms(&[
+            english.clone(),
+            english.clone()
+        ])));
+        let mut other_scope = english.clone();
+        other_scope.scope_kind = GlossaryScopeKind::Book;
+        other_scope.source_language = "fr".into();
+        assert!(!has_formerly_ambiguous_order(&[english, other_scope]));
     }
 
     #[test]

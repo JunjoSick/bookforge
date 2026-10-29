@@ -706,6 +706,14 @@ selected with `--book-id` and `--series-id`. Files and stored guidance are
 fingerprinted into the job configuration so incompatible cache entries are not
 reused.
 
+Global glossary and entity imports ignore `meta.scope.id`: each language pair
+has one global scope. Older entity imports could store a stray id on a global
+row; importing that entity again, with `entities import` or `--entities`,
+updates the row in place and clears the id. Entity `notes` are included in the
+prompt's entity guidance under the entity they describe. Saved jobs keep the
+entity guidance they started with when resumed; start a new translation to use
+corrected guidance.
+
 ## Validation, diagnostics, and machine-readable progress
 
 BookForge always applies its deterministic translation validators. `validate`
