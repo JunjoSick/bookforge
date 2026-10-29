@@ -1571,7 +1571,12 @@ fn build_mutation_fixture_for_provider(
     let snapshot = bookforge_core::RunConfigSnapshot {
         input_path: input_path.clone(),
         input_snapshot_path: Some(input_path.clone()),
-        input_sha256: Some("test-sha".to_string()),
+        // Commands now verify the saved input against this checksum.
+        input_sha256: Some({
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(std::fs::read(&input_path).expect("fixture input reads"));
+            digest.iter().map(|byte| format!("{byte:02x}")).collect()
+        }),
         output_path: output_path.clone(),
         events_path: None,
         report_json_path: None,

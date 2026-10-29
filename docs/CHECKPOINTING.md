@@ -8,6 +8,8 @@ Jobs live in `.bookforge/jobs.sqlite`. The store tracks job metadata, segment re
 
 When a job is created, `translate` snapshots the input EPUB into the job directory and stores a resolved run configuration. `resume` reads that snapshot instead of trusting current CLI defaults, then rebuilds the source IR and verifies that pending segment IDs still exist.
 
+The snapshot is an independent copy on every platform (never a hard link), so editing or moving the original book cannot change a job's saved input. `resume`, `review` and `correct` check the snapshot against its recorded SHA-256 before using it. A mismatch stops the command before any work: checkpoints, the saved hash and the output are left as they were. Restoring the exact saved file makes the job usable again. Jobs without a recorded hash are read as they are, and jobs that predate snapshots keep the original-path fallback.
+
 ## Segment States
 
 Segments move through pending, running, succeeded, skipped-cached, failed, needs-review, and retry-pending states. A segment translation is saved as soon as it validates, before the whole job finishes. If the process is interrupted, terminal segments remain usable.

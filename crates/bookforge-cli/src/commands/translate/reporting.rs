@@ -41,8 +41,9 @@ pub(crate) fn print_run_summary(
     println!("Retried: {}", summary.retried);
     println!("Needs review: {}", summary.needs_review);
     println!("Failed: {}", summary.failed);
-    println!("Input tokens: {}", summary.input_tokens);
-    println!("Output tokens: {}", summary.output_tokens);
+    println!("Tokens (latest saved checkpoints):");
+    println!("  input: {}", summary.input_tokens);
+    println!("  output: {}", summary.output_tokens);
     if let Some(cost) = estimate_cost_usd_with_cached(
         provider,
         model,
@@ -50,8 +51,9 @@ pub(crate) fn print_run_summary(
         summary.input_cached_tokens,
         summary.output_tokens,
     ) {
-        println!("Estimated cost: ${cost:.6}");
+        println!("Estimated checkpoint cost (primary model rates): ${cost:.6}");
     }
+    println!("{}", crate::report::CHECKPOINT_USAGE_NOTE);
     println!("Output: {}", output.display());
     println!("Report: {}", report_markdown.display());
     println!("Review: bookforge review {review_job_id} --open");

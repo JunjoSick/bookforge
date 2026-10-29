@@ -1317,7 +1317,8 @@ function drawReview() {
   }
   $("#stage").innerHTML = `<div class="review">
     <div class="rev-list"><div class="lh"><div class="t">${esc(shorten(title, 32))}</div>
-        <div class="m">${langs} · ${segs.length} segments · ${fmtCost(doc.totals && doc.totals.estimated_cost_usd)}</div>
+        <div class="m">${langs} · ${segs.length} segments</div>
+        <div class="m" title="Latest saved checkpoints at primary model rates, including fallback results. Excludes replaced checkpoints and separate QA/double-check calls.">Saved checkpoints: ${fmtCost(doc.totals && doc.totals.estimated_cost_usd)}</div>
         <div class="rev-filters">${filters.map(([f, l]) => `<div class="rev-filter ${R.filter === f ? "on" : ""}" onclick="bfReviewFilter('${f}')">${esc(l)}</div>`).join("")}</div></div>
       <div class="rev-rows scr">${rows}</div></div>
     <div class="rev-main">${main}</div></div>`;

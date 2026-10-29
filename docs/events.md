@@ -64,6 +64,23 @@ so a durable log replays identically for `watch`, `serve`, and `tail`.
 | `ConcurrencyChanged` | `previous`, `current`, `reason` | Adaptive concurrency retuned itself. |
 | `BatchSizingChanged` | `batch_id?`, `previous_target`, `new_target`, `previous_max_items`, `new_max_items`, `reason` | Adaptive batch sizing retuned itself. |
 
+`RequestFinished.status` is `"connect_error"` for a request that never reached
+the provider (connection or TLS failure); such requests carry no
+`status_code`. Performance summaries count them as connection errors, never as
+invalid model responses, and count an invalid response only from a
+response-level status (`invalid_response`, `json_error`, `truncated`,
+`incomplete`). `retry_count` values are summed as retries.
+
+Performance summaries (`status`, the JSON/Markdown report) describe the latest
+run: request counts, latency samples, error counts, token usage and elapsed
+time restart at the log's last `JobCreated`, and a log without one uses the
+whole stream. Elapsed time is that run's `TranslationFinished.elapsed_ms`, or
+its observed event span while it has not finished. Throughput counts each
+segment ID once when it reaches `succeeded`, `needs_review` or `failed`; cache
+hits and pending retries add nothing. The JSON adds `scope: "latest_run"` and
+keeps the historical `blocks_per_minute` key for this rate, which measures
+segments, not blocks; human output labels it segments/min.
+
 ### Segments
 
 | Variant | Fields | Semantics |
@@ -77,6 +94,14 @@ so a durable log replays identically for `watch`, `serve`, and `tail`.
 | --- | --- | --- |
 | `CheckpointQueued` | `queued` | Current checkpoint queue depth. |
 | `CheckpointFlushed` | `segment_id?`, `flushed_count`, `latency_ms?` | The dedicated checkpoint writer persisted a command; `flushed_count` counts flushes since writer start. |
+
+Persisted token totals (`status`, reports, review, dashboard job list) describe
+the latest saved checkpoint of each segment. Retries folded into a saved
+checkpoint stay counted, but a retry or resume can replace a checkpoint with
+lower counts, and separate QA/double-check calls are not included. Report and
+review JSON label these totals `usage_scope: "latest_saved_checkpoints"`, and
+their cost estimate uses the job's primary model rates, including for fallback
+results. They are not a lifetime billing ledger.
 
 The checkpoint writer deliberately never aborts a run because one write
 failed: a poisoned command (for example a foreign-key violation from a

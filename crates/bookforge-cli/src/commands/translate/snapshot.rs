@@ -173,15 +173,10 @@ fn snapshot_input_epub(
     let epub_path = run_dir.join("input.epub");
     let sha_path = run_dir.join("input.sha256");
 
-    // A hard link shares its mode with the source inode, so Unix must copy in
-    // order to make the private snapshot 0600 without modifying the input.
-    #[cfg(unix)]
+    // Always an independent copy: a hard link shares contents with the
+    // original, so editing the source book would silently change the job's
+    // recovery input (and on Unix it would share the source file's mode).
     let sha256 = copy_and_hash(input, &epub_path)?;
-    #[cfg(not(unix))]
-    let sha256 = match fs::hard_link(input, &epub_path) {
-        Ok(()) => sha256_file(&epub_path)?,
-        Err(_) => copy_and_hash(input, &epub_path)?,
-    };
 
     fs::write(&sha_path, format!("{sha256}\n"))?;
     store.update_job_input_snapshot(&job.id, &epub_path, &sha256)?;
@@ -230,21 +225,6 @@ fn create_private_snapshot_file(path: &Path) -> std::io::Result<fs::File> {
 #[cfg(not(unix))]
 fn create_private_snapshot_file(path: &Path) -> std::io::Result<fs::File> {
     fs::File::create(path)
-}
-
-#[cfg(not(unix))]
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
-    let mut reader = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex_digest(hasher.finalize().as_slice()))
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
