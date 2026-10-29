@@ -84,6 +84,10 @@ pub enum PromptVersion {
     /// matching translations produced under the old v2-era batch prompt
     /// text.
     BatchV3,
+    /// Batch prompts preserve cited work titles unless guidance supplies a
+    /// translation, translate prose inside markers once without added
+    /// repetition, and ask repairs for the complete corrected text.
+    BatchV4,
 }
 
 impl PromptVersion {
@@ -91,6 +95,7 @@ impl PromptVersion {
         match self {
             PromptVersion::V2 => "v2",
             PromptVersion::BatchV3 => "batch_v3",
+            PromptVersion::BatchV4 => "batch_v4",
         }
     }
 }
