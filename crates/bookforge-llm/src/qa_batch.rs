@@ -9,7 +9,7 @@ use bookforge_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{HashMap, VecDeque},
     sync::Arc,
 };
 use tokio::sync::Semaphore;
@@ -19,12 +19,13 @@ const DEFAULT_QA_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
 #[derive(Debug, Deserialize)]
 struct QaBatchResponse {
-    reviews: Vec<QaBatchReview>,
+    // Reviews are decoded one at a time so one malformed review cannot
+    // discard its valid neighbours or force a re-request of the batch.
+    reviews: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct QaBatchReview {
-    id: String,
     verdict: String,
     #[serde(default)]
     issues: Vec<QaIssue>,
@@ -364,54 +365,100 @@ where
 
     let parsed: QaBatchResponse =
         serde_json::from_str(&response.content).map_err(QaBatchRequestError::from_json)?;
-    let by_id = items
-        .iter()
-        .map(|item| (item.segment.id.0.as_str(), item))
-        .collect::<HashMap<_, _>>();
-    let mut seen_ids = BTreeSet::new();
-    let mut reviews = Vec::with_capacity(items.len());
-
-    for parsed_review in parsed.reviews {
-        let Some(item) = by_id.get(parsed_review.id.as_str()) else {
-            continue;
-        };
-        if !seen_ids.insert(parsed_review.id.clone()) {
-            continue;
+    let mut by_id: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    for review in parsed.reviews {
+        if let Some(id) = review.get("id").and_then(serde_json::Value::as_str) {
+            by_id.entry(id.to_owned()).or_default().push(review);
         }
-        // Audit ⚪ group: verdict strings are validated against the known
-        // set; unrecognized values degrade to warn with a finding instead of
-        // flowing verbatim into reports.
-        let (verdict, mut verdict_issue) =
-            crate::validation::normalize_qa_verdict(&parsed_review.verdict);
-        let mut issues = parsed_review.issues;
-        if let Some(message) = verdict_issue.take() {
-            issues.push(QaIssue {
-                severity: "low".to_string(),
-                kind: "qa_unknown_verdict".to_string(),
-                message,
-                source_excerpt: None,
-                translation_excerpt: None,
-            });
-        }
-        reviews.push(QaSegmentReview {
-            segment_id: item.translation.segment_id.clone(),
-            verdict: verdict.to_string(),
-            issues,
-        });
     }
 
+    let mut reviews = Vec::with_capacity(items.len());
     for item in items {
-        if seen_ids.contains(item.segment.id.0.as_str()) {
+        let Some(mut matches) = by_id.remove(item.segment.id.0.as_str()) else {
+            reviews.push(qa_error_review(
+                item,
+                "qa_response_omitted",
+                "QA provider response omitted this segment",
+            ));
+            continue;
+        };
+        // Two verdicts for one segment are ambiguous whichever comes first.
+        if matches.len() != 1 {
+            reviews.push(qa_error_review(
+                item,
+                "qa_response_duplicate",
+                "QA provider returned duplicate reviews for this segment",
+            ));
             continue;
         }
-        reviews.push(qa_error_review(
-            item,
-            "qa_response_omitted",
-            "QA provider response omitted this segment",
-        ));
+        let review = match serde_json::from_value::<QaBatchReview>(matches.pop().expect("one review"))
+        {
+            Ok(review) => review,
+            Err(error) => {
+                reviews.push(qa_error_review(
+                    item,
+                    "qa_response_invalid",
+                    format!("Malformed QA review: {error}"),
+                ));
+                continue;
+            }
+        };
+        reviews.push(validated_qa_review(item, review));
     }
 
     Ok(reviews)
+}
+
+/// Normalize one decoded review. Unknown verdicts degrade to `warn` with an
+/// explanatory finding (audit ⚪ group); issues must carry a known severity
+/// and a nonempty kind and message; a `pass` that reports issues is a
+/// contradiction and is treated as `warn`.
+fn validated_qa_review(item: &QaWorkItem, review: QaBatchReview) -> QaSegmentReview {
+    let (verdict, verdict_issue) = crate::validation::normalize_qa_verdict(&review.verdict);
+    let mut issues = review.issues;
+    for issue in &mut issues {
+        issue.severity = issue.severity.trim().to_ascii_lowercase();
+        if !matches!(issue.severity.as_str(), "low" | "medium" | "high") {
+            return qa_error_review(
+                item,
+                "qa_response_invalid",
+                "QA issue severity must be low, medium, or high",
+            );
+        }
+        if issue.kind.trim().is_empty() || issue.message.trim().is_empty() {
+            return qa_error_review(
+                item,
+                "qa_response_invalid",
+                "QA issue kind and message must be nonempty",
+            );
+        }
+    }
+    let mut verdict = verdict.to_string();
+    if verdict == "pass" && !issues.is_empty() {
+        verdict = "warn".to_string();
+        issues.extend(
+            qa_error_review(
+                item,
+                "qa_response_invalid",
+                "QA review says pass but also reports issues",
+            )
+            .issues,
+        );
+    }
+    if let Some(message) = verdict_issue {
+        issues.push(QaIssue {
+            severity: "low".to_string(),
+            kind: "qa_unknown_verdict".to_string(),
+            message,
+            source_excerpt: None,
+            translation_excerpt: None,
+        });
+    }
+    QaSegmentReview {
+        segment_id: item.translation.segment_id.clone(),
+        verdict,
+        issues,
+    }
 }
 
 async fn wait_for_qa_pause(config: &TranslationRunConfig) -> Result<(), LlmError> {
@@ -846,6 +893,131 @@ mod tests {
                 "only unrecognized verdicts carry a finding: {raw:?}"
             );
         }
+    }
+
+    struct StaticQaProvider {
+        reviews: serde_json::Value,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LlmProvider for StaticQaProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> crate::provider::Result<CompletionResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(CompletionResponse {
+                content: json!({"reviews": self.reviews}).to_string(),
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                finish_reason: FinishReason::Stop,
+                provider_latency_ms: 0,
+                raw: json!({}),
+            })
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_json_response_format: true,
+                supports_usage_tokens: false,
+            }
+        }
+    }
+
+    async fn review_response(reviews: serde_json::Value) -> Vec<QaSegmentReview> {
+        let segments = vec![segment("bad", 0, "Hello"), segment("good", 1, "Goodbye")];
+        let translations = segments
+            .iter()
+            .map(|segment| translation(segment, "Ciao"))
+            .collect::<Vec<_>>();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = qa_segments_parallel(
+            StaticQaProvider {
+                reviews,
+                calls: calls.clone(),
+            },
+            &segments,
+            &translations,
+            &run_config(),
+            &qa_config(20_000),
+        )
+        .await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unrelated valid reviews must survive without a retry"
+        );
+        result
+    }
+
+    #[tokio::test]
+    async fn duplicate_qa_reviews_are_ambiguous_in_either_order() {
+        for verdicts in [["pass", "fail"], ["fail", "pass"]] {
+            let reviews = review_response(json!([
+                {"id":"bad", "verdict":verdicts[0], "issues":[]},
+                {"id":"good", "verdict":"pass", "issues":[]},
+                {"id":"bad", "verdict":verdicts[1], "issues":[]},
+            ]))
+            .await;
+            assert_eq!(reviews.len(), 2);
+            assert_eq!(reviews[0].verdict, "warn");
+            assert_eq!(reviews[0].issues[0].kind, "qa_response_duplicate");
+            assert_eq!(reviews[1].segment_id.0, "good");
+            assert_eq!(reviews[1].verdict, "pass");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_and_contradictory_qa_reviews_do_not_discard_valid_neighbors() {
+        for (invalid, kind) in [
+            (json!({"id":"bad", "verdict":7, "issues":[]}), "qa_response_invalid"),
+            (
+                json!({"id":"bad", "verdict":"pass", "issues":[{"severity":"high", "kind":"omission", "message":"A paragraph was omitted"}]}),
+                "qa_response_invalid",
+            ),
+            (
+                json!({"id":"bad", "verdict":"fail", "issues":[{"severity":"urgent", "kind":"omission", "message":"A paragraph was omitted"}]}),
+                "qa_response_invalid",
+            ),
+            (
+                json!({"id":"bad", "verdict":"warn", "issues":[{"severity":"low", "kind":"", "message":""}]}),
+                "qa_response_invalid",
+            ),
+            (
+                json!({"id":"bad", "verdict":"approved", "issues":[]}),
+                "qa_unknown_verdict",
+            ),
+        ] {
+            let reviews = review_response(json!([
+                invalid, {"id":"good", "verdict":"pass", "issues":[]}
+            ]))
+            .await;
+            assert_eq!(reviews.len(), 2);
+            assert_eq!(reviews[0].verdict, "warn");
+            assert!(
+                reviews[0].issues.iter().any(|issue| issue.kind == kind),
+                "{:?}",
+                reviews[0].issues
+            );
+            assert_eq!(reviews[1].verdict, "pass");
+            assert!(reviews[1].issues.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn qa_verdict_validation_keeps_valid_warnings_and_failures() {
+        let reviews = review_response(json!([
+            {"id":"bad", "verdict":" WARN ", "issues":[{"severity":" LOW ", "kind":"register", "message":"Check the register"}]},
+            {"id":"good", "verdict":"fail", "issues":[]},
+        ]))
+        .await;
+        assert_eq!(reviews[0].verdict, "warn");
+        assert_eq!(reviews[0].issues.len(), 1);
+        assert_eq!(reviews[0].issues[0].severity, "low");
+        assert_eq!(reviews[0].issues[0].kind, "register");
+        assert_eq!(reviews[1].verdict, "fail");
+        assert!(reviews[1].issues.is_empty());
     }
 
     #[tokio::test]
