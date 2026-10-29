@@ -198,6 +198,31 @@ impl JobStore {
     /// checkpoint commits as one `IMMEDIATE` transaction guarded against
     /// clobbering a frozen human correction.
     pub fn save_needs_review(&self, request: SaveNeedsReview<'_>) -> Result<()> {
+        self.save_incomplete_translation(request, IncompleteCheckpoint::NeedsReview)
+    }
+
+    /// Preserve the completed blocks and usage of a segment whose translation
+    /// was interrupted (stop or cancellation) before every block arrived. The
+    /// segment stays `retry_pending`, so an ordinary resume retries it, and
+    /// the job keeps its running status instead of claiming it needs review.
+    /// Dashboard retry guidance is left unconsumed for that retry. The
+    /// transaction and human-correction guard match
+    /// [`JobStore::save_needs_review`].
+    pub fn save_retry_pending_translation(&self, request: SaveNeedsReview<'_>) -> Result<()> {
+        self.save_incomplete_translation(request, IncompleteCheckpoint::RetryPending)
+    }
+
+    fn save_incomplete_translation(
+        &self,
+        request: SaveNeedsReview<'_>,
+        kind: IncompleteCheckpoint,
+    ) -> Result<()> {
+        let (segment_status, job_status) = match kind {
+            IncompleteCheckpoint::NeedsReview => {
+                (SegmentStatus::NeedsReview, JobStatus::NeedsReview)
+            }
+            IncompleteCheckpoint::RetryPending => (SegmentStatus::RetryPending, JobStatus::Running),
+        };
         let now = timestamp_string();
         let translated_hash = stable_hash(request.preserved_text);
         let mut conn = self.conn.borrow_mut();
@@ -236,7 +261,7 @@ impl JobStore {
                      translated_hash = ?5,
                      error = ?6
                  WHERE job_id = ?7 AND id = ?8",
-                SegmentStatus::NeedsReview.as_db_text()
+                segment_status.as_db_text()
             ),
             params![
                 request.input_tokens.map(|value| value as i64),
@@ -261,11 +286,15 @@ impl JobStore {
         let _ = record_segment_findings_on(&tx, request.job_id, request.segment_id, request.error);
         // Like the success path, no ledger row is derived from this
         // checkpoint: it records segment state, not a provider wire attempt.
-        consume_dashboard_retry_guidance_on(&tx, request.job_id, request.segment_id)?;
+        if kind == IncompleteCheckpoint::NeedsReview {
+            // An interrupted segment has not been retried yet, so its pending
+            // dashboard guidance must still reach the next attempt.
+            consume_dashboard_retry_guidance_on(&tx, request.job_id, request.segment_id)?;
+        }
         touch_job_unless_status_on(
             &tx,
             request.job_id,
-            JobStatus::NeedsReview,
+            job_status,
             &[JobStatus::Paused, JobStatus::Stopped],
         )?;
         tx.commit()?;
@@ -1057,6 +1086,15 @@ impl JobStore {
         )
         .map_err(StoreError::from)
     }
+}
+
+/// Which state a preserved partial/rejected model output is saved in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncompleteCheckpoint {
+    /// The provider finished but the output failed validation.
+    NeedsReview,
+    /// The run stopped before every block arrived; resume retries it.
+    RetryPending,
 }
 
 /// Connection-scoped freeze check so the model-write paths and

@@ -48,7 +48,9 @@ so a durable log replays identically for `watch`, `serve`, and `tail`.
 | Variant | Fields | Semantics |
 | --- | --- | --- |
 | `SegmentationFinished` | `segment_count` | Scheduler segmentation produced this many segments. Also seeds `total_segments` in folded state. |
-| `CacheScanFinished` | `hits`, `misses` | Prior-run cache matching completed before translation started. |
+| `CacheScanFinished` | `hits`, `misses` | Prior-run cache matching completed before translation started. `misses` is the provider work this run owes; rate and ETA are measured against it. |
+| `ProgressRestored` | `total_segments`, `succeeded`, `cached`, `needs_review`, `failed`, `input_tokens`, `output_tokens` | Emitted by `resume` after its cache scan: the whole job's saved checkpoint totals, so a viewer attached only to the resumed run shows the job's progress rather than this run's alone. Token totals describe the saved checkpoints, not a billing ledger. |
+| `SegmentStatusesRestored` | `statuses` (array of `[segment_id, status]`) | Emitted by `resume` after `ProgressRestored`, in chunks of at most 64: the earlier terminal status of each segment this run will retry, so its new outcome replaces the old one instead of being counted twice. |
 
 ### Batching and requests
 
@@ -69,7 +71,7 @@ so a durable log replays identically for `watch`, `serve`, and `tail`.
 | Variant | Fields | Semantics |
 | --- | --- | --- |
 | `SegmentStarted` | `segment_id`, `ordinal` | Work on a segment began. |
-| `SegmentFinished` | `segment_id`, `status`, `input_tokens?`, `output_tokens?` | Terminal segment outcome. Expected `status` values are `succeeded`, `skipped_cached`, `needs_review`, and `failed`; token figures are Optional and may be absent for statuses that never reached a provider. |
+| `SegmentFinished` | `segment_id`, `status`, `input_tokens?`, `output_tokens?` | Segment outcome. Expected `status` values are `succeeded`, `skipped_cached`, `needs_review`, and `failed`, plus `retry_pending` for a segment stopped before every block arrived (its completed blocks are saved and it stays resumable). A later outcome for the same segment replaces the earlier one in folded counts; its tokens are still added, because both attempts were spent. Token figures are Optional and may be absent for statuses that never reached a provider. |
 
 ### Checkpoints
 
@@ -148,6 +150,18 @@ as a durable `DroppedEvents` line within ~500 ms, repeating each time more
 events are lost. Because the marker is appended to the replay log, SQLite and
 long-lived dashboards cannot permanently disagree about how much telemetry was
 lost — even though no previously persisted data is affected.
+
+### Rate and ETA
+
+Folded state measures throughput per run: each `JobCreated` starts a new
+window, so idle time between runs never dilutes the rate. The rate counts each
+segment's first fresh terminal outcome in the run (`succeeded`, `needs_review`
+or `failed`); cache hits and restored checkpoints are progress, not
+throughput. The ETA divides the run's remaining provider work (`misses` from
+`CacheScanFinished` minus those completions) by that rate and is zero once the
+run finished. A finished run reports its own `elapsed_ms`. Logs written before
+`ProgressRestored` existed still replay, but a resumed run in them shows only
+its own work until its `TranslationFinished` restores the totals.
 
 ## Stability
 

@@ -2,9 +2,9 @@ use super::resolve_job_input;
 use crate::progress::finalize_reporter;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::Result;
@@ -157,7 +157,7 @@ pub struct ResumeArgs {
     #[arg(
         long,
         default_value_t = false,
-        help = "Relaunch a paused job; only use if the paused process is gone because this can double-run the job"
+        help = "Relaunch even when a worker appears active; only use if it is gone because this can double-run the job"
     )]
     pub force: bool,
 }
@@ -176,7 +176,10 @@ pub async fn run(
         anyhow::bail!("job '{}' was not found", args.job_id);
     };
     if job.status == "paused" && !args.force {
-        return live_fast_resume_paused_job(&store, &args).await;
+        return tokio::select! {
+            _ = cancel_token.cancelled() => Ok(()),
+            result = live_fast_resume_paused_job(&store, &args) => result,
+        };
     }
     // Finding (lifecycle audit): validate the run configuration snapshot,
     // overrides, paths, and flags BEFORE acquiring the launch claim or
@@ -199,12 +202,15 @@ pub async fn run(
     // fresh one. The claim is cleared by run_inner once the worker's control
     // watcher has established its runtime lease; every other exit path
     // releases it on drop.
-    let mut launch_claim = acquire_or_adopt_launch_claim(&args.job_id)?;
-    crate::control::clear_job_control(&args.job_id)?;
-    if (job.status == "paused" && args.force) || job.status == "stopped" {
-        store.mark_job_running_for_resume(&args.job_id)?;
+    if !args.force {
+        ensure_no_live_worker(&args.job_id)?;
     }
-
+    let mut launch_claim = acquire_or_adopt_launch_claim(&args.job_id)?;
+    // Check the lease again now that the claim is held: a worker that started
+    // between the first check and the claim must not be double-run.
+    if !args.force {
+        ensure_no_live_worker(&args.job_id)?;
+    }
     let progress_jsonl = args
         .progress_jsonl
         .clone()
@@ -235,10 +241,7 @@ pub async fn run(
         // Hard failures must not strand the job row in "running" forever
         // (CLI-5); an honest terminal status beats silent limbo.
         if let Ok(Some(record)) = store.get_job(&args.job_id)
-            && !matches!(
-                record.status.as_str(),
-                "succeeded" | "needs_review" | "failed" | "stopped"
-            )
+            && matches!(record.status.as_str(), "running" | "queued")
         {
             tracing::warn!(
                 job_id = %args.job_id,
@@ -256,7 +259,7 @@ pub async fn run(
         && let Ok(Some(record)) = store.get_job(&args.job_id)
         && matches!(
             record.status.as_str(),
-            "running" | "queued" | "retry_pending"
+            "running" | "queued" | "retry_pending" | "interrupted"
         )
     {
         let _ = store.mark_job_interrupted(&args.job_id);
@@ -300,7 +303,7 @@ fn load_resume_overrides_for_status(
     job_status: &str,
 ) -> Result<Option<reconfigure::RunConfigOverrides>> {
     match job_status {
-        "paused" | "stopped" | "retry_pending" | "needs_review" | "failed" => {
+        "paused" | "stopped" | "interrupted" | "retry_pending" | "needs_review" | "failed" => {
             reconfigure::load_overrides_for_job(job_id)
         }
         _ => Ok(None),
@@ -397,6 +400,21 @@ fn resume_output_path(args: &ResumeArgs, snapshot: &RunConfigSnapshot) -> Result
     Ok(output)
 }
 
+/// Plain resume must not start a second worker beside a live one: a fresh
+/// runtime lease (or an owner whose death cannot be established) refuses.
+/// `--force` is the explicit escape hatch for a worker known to be gone.
+fn ensure_no_live_worker(job_id: &str) -> Result<()> {
+    if let crate::control::RuntimeLeaseState::Fresh(lease) =
+        crate::control::runtime_lease_state(job_id, crate::control::RUNTIME_LEASE_STALE_AFTER)
+    {
+        anyhow::bail!(
+            "job '{job_id}' already has an active worker (PID {}); stop that worker before resuming, or use --force only if it is gone",
+            lease.pid
+        );
+    }
+    Ok(())
+}
+
 /// Acquire the cross-process launch claim, adopting a parent's handoff when a
 /// retry supervisor spawned this worker (closes the parent-to-child gap).
 fn acquire_or_adopt_launch_claim(job_id: &str) -> Result<crate::control::RuntimeLaunchClaim> {
@@ -412,6 +430,14 @@ fn acquire_or_adopt_launch_claim(job_id: &str) -> Result<crate::control::Runtime
     Ok(claim)
 }
 
+/// Run the resume pipeline under the caller's cancellation token.
+///
+/// Cancellation (Ctrl+C, or the TUI quitting) stops new dispatch through the
+/// shared pause signal and aborts in-flight provider calls, but the pipeline
+/// itself is never dropped: completed responses still reach the checkpoint
+/// writer and its queue drains before this returns. A cancelled run records
+/// `interrupted` and never publishes a book with source-text fallbacks. An
+/// explicit Stop keeps precedence and leaves the job `stopped`.
 #[allow(clippy::too_many_arguments)]
 async fn run_inner(
     args: &ResumeArgs,
@@ -423,24 +449,67 @@ async fn run_inner(
     cancel_token: tokio_util::sync::CancellationToken,
     launch_claim: Option<&mut crate::control::RuntimeLaunchClaim>,
 ) -> Result<()> {
+    let print_stdout = human_stdout_enabled(args.ui);
+    let pause_signal = bookforge_llm::PauseSignal::new();
+    // A control-file Stop cancels this child token without cancelling the
+    // caller's, which is how an explicit stop is told apart from interruption.
+    let stop_cancel_token = cancel_token.child_token();
+    let result = if cancel_token.is_cancelled() {
+        Ok(())
+    } else {
+        let pipeline = run_pipeline(
+            args,
+            store,
+            &job,
+            snapshot,
+            overrides,
+            progress,
+            pause_signal.clone(),
+            stop_cancel_token,
+            launch_claim,
+        );
+        tokio::pin!(pipeline);
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                pause_signal.stop();
+                pipeline.await
+            }
+            result = &mut pipeline => result,
+        }
+    };
+    if job_was_stopped(store, &job.id)? {
+        print_stopped_resume_hint(&job.id, print_stdout);
+    } else if cancel_token.is_cancelled() && result.is_ok() {
+        store.mark_job_interrupted(&job.id)?;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_pipeline(
+    args: &ResumeArgs,
+    store: &JobStore,
+    job: &JobRecord,
+    snapshot: &mut RunConfigSnapshot,
+    overrides: Option<reconfigure::RunConfigOverrides>,
+    progress: Arc<dyn ProgressSink>,
+    pause_signal: bookforge_llm::PauseSignal,
+    stop_cancel_token: tokio_util::sync::CancellationToken,
+    launch_claim: Option<&mut crate::control::RuntimeLaunchClaim>,
+) -> Result<()> {
+    let control_path = bookforge_core::control_path_for_job(&job.id);
+    let initial_control_revision = control_revision(&control_path)?;
     let started = std::time::Instant::now();
     progress.emit(ProgressEvent::StageStarted {
         stage: "resume".to_string(),
         timestamp_ms: now_ms(),
     });
-    let input = resolve_job_input(&job, snapshot)?;
+    let input = resolve_job_input(job, snapshot)?;
     let output = args
         .output
         .clone()
         .unwrap_or_else(|| snapshot.output_path.clone());
-    if args.output.is_some() {
-        store.update_job_output_path(&job.id, &output)?;
-        snapshot.output_path = output.clone();
-    }
-    if let Some(path) = args.progress_jsonl.clone() {
-        store.update_job_event_path(&job.id, &path)?;
-        snapshot.events_path = Some(path);
-    }
     progress.emit(ProgressEvent::JobCreated {
         job_id: job.id.clone(),
         input_path: input.display().to_string(),
@@ -523,6 +592,10 @@ async fn run_inner(
         timestamp_ms: now_ms(),
     });
     let segments = build_segments(&book, &settings.segmentation)?;
+    progress.emit(ProgressEvent::SegmentationFinished {
+        segment_count: segments.len(),
+        timestamp_ms: now_ms(),
+    });
     let pending_ids = store.resumable_segment_ids(&job.id)?;
 
     let print_stdout = human_stdout_enabled(args.ui);
@@ -565,6 +638,57 @@ async fn run_inner(
         }
     };
     glossary.run_config.guidance_by_segment = store.load_retry_guidance(&job.id)?;
+    let cache_namespace = if legacy_cache_namespace {
+        compute_cache_namespace_v1(
+            settings.segmentation.max_segment_tokens,
+            settings.segmentation.context_tokens,
+            settings.profile.namespace_str(),
+            settings.batch.enabled,
+            prompt_version,
+        )
+    } else {
+        compute_cache_namespace(
+            settings.segmentation.max_segment_tokens,
+            settings.segmentation.context_tokens,
+            settings.profile.namespace_str(),
+            settings.batch.enabled,
+            prompt_version,
+            &glossary.fingerprint,
+            if snapshot.style_rendered_block.is_empty() {
+                ""
+            } else {
+                snapshot.style_fingerprint.as_str()
+            },
+            if snapshot.entities_rendered_block.is_empty() {
+                ""
+            } else {
+                snapshot.entities_fingerprint.as_str()
+            },
+        )
+    };
+    if cache_namespace != snapshot.cache_namespace {
+        anyhow::bail!(
+            "resume cache namespace mismatch for job '{}': snapshot={}, recomputed={}",
+            job.id,
+            snapshot.cache_namespace,
+            cache_namespace
+        );
+    }
+    // The rebuilt contract matches, so this resume now owns the job. Until here
+    // nothing was changed: a rejected resume leaves the status, the saved paths
+    // and any pending control command exactly as they were.
+    clear_preflight_control(&control_path, initial_control_revision)?;
+    if (job.status == "paused" && args.force) || job.status == "stopped" {
+        store.mark_job_running_for_resume(&job.id)?;
+    }
+    if args.output.is_some() {
+        store.update_job_output_path(&job.id, &output)?;
+        snapshot.output_path = output.clone();
+    }
+    if let Some(path) = args.progress_jsonl.clone() {
+        store.update_job_event_path(&job.id, &path)?;
+        snapshot.events_path = Some(path);
+    }
     // Recheck accepted provider output only after the saved input and prompt
     // contract passed preflight, and before it can seed translation context.
     let revalidated = super::translate::revalidate_stored_translations(
@@ -587,11 +711,10 @@ async fn run_inner(
     } else {
         None
     };
-    let pause_signal = bookforge_llm::PauseSignal::new();
     // The Ctrl+C token from main feeds the same stop path the control-file
-    // Stop command uses (CLI-3): it cancels provider calls and marks an
-    // interrupted state at safe boundaries, never mid-checkpoint.
-    let stop_cancel_token = cancel_token.child_token();
+    // Stop command uses (CLI-3): `run_inner` stops the shared pause signal and
+    // the child token cancels provider calls, so the run halts at safe
+    // boundaries and never mid-checkpoint.
     let control_watcher = crate::control::ControlFileWatcher::spawn_with_stop_cancel(
         store.path().to_path_buf(),
         job.id.clone(),
@@ -633,42 +756,6 @@ async fn run_inner(
         runtime_settings: Some(control_watcher.runtime_settings()),
     };
 
-    let cache_namespace = if legacy_cache_namespace {
-        compute_cache_namespace_v1(
-            settings.segmentation.max_segment_tokens,
-            settings.segmentation.context_tokens,
-            run_config.profile.namespace_str(),
-            settings.batch.enabled,
-            prompt_version,
-        )
-    } else {
-        compute_cache_namespace(
-            settings.segmentation.max_segment_tokens,
-            settings.segmentation.context_tokens,
-            run_config.profile.namespace_str(),
-            settings.batch.enabled,
-            prompt_version,
-            &glossary.fingerprint,
-            if snapshot.style_rendered_block.is_empty() {
-                ""
-            } else {
-                snapshot.style_fingerprint.as_str()
-            },
-            if snapshot.entities_rendered_block.is_empty() {
-                ""
-            } else {
-                snapshot.entities_fingerprint.as_str()
-            },
-        )
-    };
-    if cache_namespace != snapshot.cache_namespace {
-        anyhow::bail!(
-            "resume cache namespace mismatch for job '{}': snapshot={}, recomputed={}",
-            job.id,
-            snapshot.cache_namespace,
-            cache_namespace
-        );
-    }
     let retry_pending_ids = store
         .segment_records(&job.id)?
         .into_iter()
@@ -701,6 +788,7 @@ async fn run_inner(
         misses: pending_segments.len(),
         timestamp_ms: now_ms(),
     });
+    emit_restored_progress(store, &job.id, &pending_segments, progress.as_ref())?;
     store.mark_job_running(&job.id)?;
 
     if !pending_segments.is_empty() {
@@ -726,7 +814,7 @@ async fn run_inner(
                 .await
             }
             "deepseek" | "openrouter" | "openai-compatible" => {
-                let provider_config = openai_compatible_config(&job, snapshot, &settings)?;
+                let provider_config = openai_compatible_config(job, snapshot, &settings)?;
                 let provider = OpenAiCompatibleProvider::new_with_cancel(
                     provider_config,
                     stop_cancel_token.clone(),
@@ -752,7 +840,6 @@ async fn run_inner(
         }?;
     }
     if job_was_stopped(store, &job.id)? {
-        print_stopped_resume_hint(&job.id, print_stdout);
         return Ok(());
     }
 
@@ -772,13 +859,12 @@ async fn run_inner(
             .await?,
         bookforge_llm::PauseState::Stopped
     ) {
-        print_stopped_resume_hint(&job.id, print_stdout);
         return Ok(());
     }
     let qa_runtime = job_runtime_settings.borrow().clone();
     let qa_run_config = crate::control::freeze_run_config_for_stage(&run_config, &qa_runtime);
     let qa_reviews = qa_after_resume(
-        &job,
+        job,
         &segments,
         &translations,
         &qa_run_config,
@@ -796,7 +882,6 @@ async fn run_inner(
             .await?,
         bookforge_llm::PauseState::Stopped
     ) {
-        print_stopped_resume_hint(&job.id, print_stdout);
         return Ok(());
     }
     if qa_runtime.qa != QaMode::Off {
@@ -825,7 +910,6 @@ async fn run_inner(
             .await?,
         bookforge_llm::PauseState::Stopped
     ) {
-        print_stopped_resume_hint(&job.id, print_stdout);
         return Ok(());
     }
     let double_check_runtime = job_runtime_settings.borrow().clone();
@@ -850,7 +934,7 @@ async fn run_inner(
             .cloned()
             .collect::<Vec<_>>();
         let changed_segment_ids = match double_check_after_resume(
-            &job,
+            job,
             &reviewable_segments,
             &mut translations,
             &double_check_run_config,
@@ -863,7 +947,6 @@ async fn run_inner(
         {
             Ok(changed_segment_ids) => changed_segment_ids,
             Err(_) if pause_signal.is_stopped() => {
-                print_stopped_resume_hint(&job.id, print_stdout);
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -884,7 +967,6 @@ async fn run_inner(
                 .await?,
             bookforge_llm::PauseState::Stopped
         ) {
-            print_stopped_resume_hint(&job.id, print_stdout);
             return Ok(());
         }
     }
@@ -913,14 +995,12 @@ async fn run_inner(
                 .await?,
             bookforge_llm::PauseState::Stopped
         ) {
-            print_stopped_resume_hint(&job.id, print_stdout);
             return Ok(());
         }
         if mark_job_finished(store, &job.id, &translations)? {
             break;
         }
         if job_was_stopped(store, &job.id)? {
-            print_stopped_resume_hint(&job.id, print_stdout);
             return Ok(());
         }
     }
@@ -1002,6 +1082,77 @@ async fn run_inner(
         crate::exit_code::request(crate::exit_code::COMPLETED_WITH_FAILURES);
     }
 
+    Ok(())
+}
+
+/// Publish the job's saved checkpoint totals after the resume's cache scan, so
+/// a viewer attached only to this run shows the whole job's progress. Prior
+/// terminal statuses of segments about to be retried follow in bounded chunks,
+/// letting their new outcome replace the old one instead of adding to it.
+fn emit_restored_progress(
+    store: &JobStore,
+    job_id: &str,
+    pending: &[Segment],
+    progress: &dyn ProgressSink,
+) -> Result<()> {
+    const STATUS_CHUNK: usize = 64;
+    let summary = store
+        .summary(job_id)?
+        .ok_or_else(|| anyhow::anyhow!("job '{job_id}' was not found"))?;
+    progress.emit(ProgressEvent::ProgressRestored {
+        total_segments: summary.total_segments,
+        succeeded: summary.succeeded,
+        cached: summary.cached,
+        needs_review: summary.needs_review,
+        failed: summary.failed,
+        input_tokens: summary.input_tokens,
+        output_tokens: summary.output_tokens,
+        timestamp_ms: now_ms(),
+    });
+    let pending_ids = pending
+        .iter()
+        .map(|segment| segment.id.0.as_str())
+        .collect::<HashSet<_>>();
+    // Succeeded and cached checkpoints are not retried, so the summary already
+    // covers them; only replaceable outcomes need per-segment bookkeeping.
+    let statuses = store
+        .segment_records(job_id)?
+        .into_iter()
+        .filter(|record| {
+            pending_ids.contains(record.id.as_str())
+                && matches!(
+                    record.status.as_str(),
+                    "succeeded" | "skipped_cached" | "needs_review" | "failed"
+                )
+        })
+        .map(|record| (record.id, record.status))
+        .collect::<Vec<_>>();
+    for chunk in statuses.chunks(STATUS_CHUNK) {
+        progress.emit(ProgressEvent::SegmentStatusesRestored {
+            statuses: chunk.to_vec(),
+            timestamp_ms: now_ms(),
+        });
+    }
+    Ok(())
+}
+
+/// Identity of the control file's current contents (modification time and
+/// length), or `None` when there is no control file.
+fn control_revision(path: &Path) -> std::io::Result<Option<(SystemTime, u64)>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some((metadata.modified()?, metadata.len()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Clear the stale control command this resume started with. A Pause or Stop
+/// written while the input was being rebuilt belongs to this invocation, even
+/// when it repeats the old command, so a changed revision is left in place.
+fn clear_preflight_control(path: &Path, before: Option<(SystemTime, u64)>) -> Result<()> {
+    if control_revision(path)? == before {
+        bookforge_core::clear_control_file(path)?;
+    }
     Ok(())
 }
 
@@ -2034,7 +2185,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_pending_resume_loads_a_durable_override_sidecar() {
+    fn incomplete_resume_loads_a_durable_override_sidecar() {
         let job_id = format!("retry_pending_overrides_{}", std::process::id());
         let path = write_overrides_sidecar(
             &job_id,
@@ -2044,10 +2195,12 @@ mod tests {
             },
         );
 
-        let loaded = load_resume_overrides_for_status(&job_id, "retry_pending")
-            .expect("retry-pending resume should read its sidecar")
-            .expect("override should be present");
-        assert_eq!(loaded.batch_max_output_tokens, Some(4_096));
+        for status in ["retry_pending", "interrupted"] {
+            let loaded = load_resume_overrides_for_status(&job_id, status)
+                .expect("incomplete resume should read its sidecar")
+                .expect("override should be present");
+            assert_eq!(loaded.batch_max_output_tokens, Some(4_096), "{status}");
+        }
 
         reconfigure::clear_overrides_for_job(&job_id).expect("sidecar should clean up");
         assert!(!path.exists());
@@ -2114,6 +2267,73 @@ mod tests {
             .expect("job should exist");
         assert_eq!(summary.succeeded, 2);
         assert_eq!(summary.failed, 0);
+
+        // A viewer attached only to this resume sees the job's saved progress
+        // before any fresh work finishes, and the retried failure is replaced
+        // by its new outcome rather than counted twice.
+        let first_finished = events
+            .iter()
+            .position(|event| matches!(event, ProgressEvent::SegmentFinished { .. }))
+            .unwrap();
+        let restored =
+            bookforge_core::RunState::from_events(events[..first_finished].iter().cloned());
+        assert_eq!(restored.total_segments, 2);
+        assert_eq!(
+            (restored.succeeded, restored.cached, restored.failed),
+            (1, 0, 1)
+        );
+        assert_eq!(restored.run_total_segments, 1);
+        assert_eq!(restored.run_completed_segments, 0);
+        let restored_statuses = events
+            .iter()
+            .filter_map(|event| match event {
+                ProgressEvent::SegmentStatusesRestored { statuses, .. } => Some(statuses.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored_statuses,
+            vec![(fixture.segments[1].id.0.clone(), "failed".into())]
+        );
+        let mut updated = restored;
+        updated.fold(&events[first_finished]);
+        assert_eq!(
+            (updated.done_segments, updated.succeeded, updated.failed),
+            (2, 2, 0)
+        );
+
+        // Replaying the original run's log first must give the same view.
+        let attached = bookforge_core::RunState::from_events(events.clone());
+        let mut replayed = bookforge_core::RunState::from_events([
+            ProgressEvent::JobCreated {
+                job_id: fixture.job.id.clone(),
+                input_path: "old.epub".into(),
+                output_path: "old-out.epub".into(),
+                timestamp_ms: 1_000,
+            },
+            ProgressEvent::SegmentFinished {
+                segment_id: fixture.segments[0].id.0.clone(),
+                status: "succeeded".into(),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                timestamp_ms: 2_000,
+            },
+        ]);
+        for event in &events {
+            replayed.fold(event);
+        }
+        assert_eq!(attached.done_segments, replayed.done_segments);
+        assert_eq!(attached.elapsed_secs(), replayed.elapsed_secs());
+        assert_eq!(
+            attached.segments_per_minute(),
+            replayed.segments_per_minute()
+        );
+        assert_eq!(
+            (attached.input_tokens, attached.output_tokens),
+            (replayed.input_tokens, replayed.output_tokens)
+        );
+        assert_eq!(attached.run_completed_segments, 1);
     }
 
     #[tokio::test]
@@ -2468,6 +2688,476 @@ mod tests {
         assert_eq!(accepted[0].status, "succeeded");
     }
 
+    #[test]
+    fn plain_resume_refuses_a_fresh_worker_lease() {
+        let job_id = format!("resume-active-lease-{}-{}", std::process::id(), now_ms());
+        let path = crate::control::runtime_path_for_job(&job_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(
+            ensure_no_live_worker(&job_id).is_ok(),
+            "no lease, no worker"
+        );
+        let lease = crate::control::RuntimeLease {
+            schema_version: 1,
+            instance_id: "active-test-worker".to_string(),
+            pid: std::process::id(),
+            process_started_at_ms: now_ms(),
+            heartbeat_at_ms: now_ms(),
+            last_loaded_revision: 0,
+            last_applied_revision: 0,
+        };
+        std::fs::write(&path, serde_json::to_vec(&lease).unwrap()).unwrap();
+        let error = ensure_no_live_worker(&job_id).expect_err("a live worker must block");
+        assert!(error.to_string().contains("already has an active worker"));
+        assert!(error.to_string().contains("--force"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_blockless_malformed_responses_needing_review() {
+        let mut settings = TranslationProfile::V1Fast.resolve();
+        settings.provider.validation_max_attempts = 1;
+        let mut fixture = resume_fixture(settings, 1);
+        fixture.snapshot.model = "mock-malformed-json".to_string();
+
+        run_fixture(&mut fixture)
+            .await
+            .expect("resume should finish");
+        let status = |fixture: &ResumeFixture| {
+            fixture
+                .store
+                .get_job(&fixture.job.id)
+                .unwrap()
+                .unwrap()
+                .status
+        };
+        let summary = fixture.store.summary(&fixture.job.id).unwrap().unwrap();
+        assert_eq!(summary.succeeded, 0);
+        assert_eq!(summary.needs_review + summary.failed, 1);
+        assert_eq!(status(&fixture), "needs_review");
+
+        // Resuming the exhausted job again must not turn source fallbacks green.
+        run_fixture(&mut fixture)
+            .await
+            .expect("repeat resume should finish");
+        assert_eq!(status(&fixture), "needs_review");
+    }
+
+    #[test]
+    fn finalization_retains_persisted_failure_without_translation_blocks() {
+        let fixture = resume_fixture(TranslationProfile::V1Fast.resolve(), 1);
+        fixture
+            .store
+            .mark_segment_failed(
+                &fixture.job.id,
+                &fixture.segments[0].id.0,
+                "provider unavailable",
+            )
+            .unwrap();
+
+        assert!(mark_job_finished(&fixture.store, &fixture.job.id, &[]).unwrap());
+        assert_eq!(
+            fixture
+                .store
+                .get_job(&fixture.job.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "needs_review"
+        );
+        let records = fixture.store.segment_records(&fixture.job.id).unwrap();
+        let restored = rebuild_segment_translations(&fixture.segments, &[], &records);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].status, SegmentStatus::Failed);
+        assert!(restored[0].blocks.is_empty());
+        assert_eq!(restored[0].error.as_deref(), Some("provider unavailable"));
+    }
+
+    /// Cancels the caller token at the first request (or the first queued
+    /// checkpoint), simulating Ctrl+C in the middle of a resumed run.
+    struct CancellingSink {
+        token: tokio_util::sync::CancellationToken,
+        events: Arc<Mutex<Vec<ProgressEvent>>>,
+        after_checkpoint: bool,
+    }
+
+    impl ProgressSink for CancellingSink {
+        fn emit(&self, event: ProgressEvent) {
+            let should_cancel = if self.after_checkpoint {
+                matches!(event, ProgressEvent::CheckpointQueued { .. })
+            } else {
+                matches!(event, ProgressEvent::RequestStarted { .. })
+            };
+            self.events.lock().unwrap().push(event);
+            if should_cancel {
+                self.token.cancel();
+            }
+        }
+    }
+
+    fn job_status(fixture: &ResumeFixture) -> String {
+        fixture
+            .store
+            .get_job(&fixture.job.id)
+            .unwrap()
+            .unwrap()
+            .status
+    }
+
+    #[tokio::test]
+    async fn resume_cancellation_stops_dispatch_and_drains_checkpoints() {
+        for after_checkpoint in [false, true] {
+            let mut settings = TranslationProfile::V1Fast.resolve();
+            settings.scheduler.concurrency = 1;
+            settings.batch.max_items = 1;
+            // One block per item keeps this fixture independent of the mock
+            // batch parser's malformed-response repair.
+            settings.segmentation.max_segment_tokens = 1;
+            let mut fixture = resume_fixture(settings, 3);
+            let token = tokio_util::sync::CancellationToken::new();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::new(CancellingSink {
+                token: token.clone(),
+                events: events.clone(),
+                after_checkpoint,
+            });
+
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                run_fixture_with_progress(&mut fixture, None, sink, token.clone()),
+            )
+            .await
+            .expect("cancellation must finish promptly")
+            .expect("checkpoint drain should succeed");
+
+            assert!(token.is_cancelled());
+            assert_eq!(job_status(&fixture), "interrupted");
+            assert!(
+                !fixture.snapshot.output_path.exists(),
+                "interruption must not publish a source-fallback book"
+            );
+            {
+                let recorded = events.lock().unwrap();
+                let requests = recorded
+                    .iter()
+                    .filter(|event| matches!(event, ProgressEvent::RequestStarted { .. }))
+                    .count();
+                assert!(
+                    requests < fixture.segments.len(),
+                    "cancellation must stop new dispatch: {requests} requests"
+                );
+                let queued = recorded
+                    .iter()
+                    .filter(|event| matches!(event, ProgressEvent::CheckpointQueued { .. }))
+                    .count();
+                let flushed = recorded
+                    .iter()
+                    .filter(|event| matches!(event, ProgressEvent::CheckpointFlushed { .. }))
+                    .count();
+                assert_eq!(
+                    queued, flushed,
+                    "every completed response must be checkpointed before return"
+                );
+                assert!(
+                    !recorded
+                        .iter()
+                        .any(|event| matches!(event, ProgressEvent::TranslationFinished { .. })),
+                    "an interrupted run must not signal completion"
+                );
+                if after_checkpoint {
+                    assert!(flushed > 0);
+                    assert!(
+                        !fixture
+                            .store
+                            .load_block_translations(&fixture.job.id)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+            }
+
+            run_fixture(&mut fixture)
+                .await
+                .expect("interrupted job should resume");
+            assert_eq!(
+                job_status(&fixture),
+                "succeeded",
+                "remaining records: {:?}",
+                fixture.store.segment_records(&fixture.job.id).unwrap()
+            );
+            assert!(fixture.snapshot.output_path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_cancelled_before_dispatch_preserves_stopped_precedence() {
+        for stopped in [false, true] {
+            let mut fixture = resume_fixture(TranslationProfile::V1Fast.resolve(), 1);
+            if stopped {
+                fixture.store.mark_job_stopped(&fixture.job.id).unwrap();
+            }
+            let token = tokio_util::sync::CancellationToken::new();
+            token.cancel();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::new(RecordingSink {
+                events: events.clone(),
+            });
+            run_fixture_with_progress(&mut fixture, None, sink, token)
+                .await
+                .unwrap();
+            assert_eq!(
+                job_status(&fixture),
+                if stopped { "stopped" } else { "interrupted" }
+            );
+            assert!(events.lock().unwrap().is_empty());
+            assert_eq!(
+                fixture
+                    .store
+                    .resumable_segment_ids(&fixture.job.id)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_cancels_stalled_http_in_translation_and_finalization() {
+        use tokio::{io::AsyncReadExt, net::TcpListener};
+
+        for stage in ["translation", "batch", "qa", "fallback", "double_check"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let token = tokio_util::sync::CancellationToken::new();
+            let request_token = token.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut first_byte = [0];
+                stream.read_exact(&mut first_byte).await.unwrap();
+                // Hold the accepted request open without answering: only the
+                // caller's token can end it before the 60 s provider timeout.
+                request_token.cancel();
+                std::future::pending::<()>().await;
+                drop(stream);
+            });
+            let mut settings = TranslationProfile::V1Fast.resolve();
+            settings.batch.enabled = stage == "batch";
+            settings.scheduler.concurrency = 1;
+            settings.provider.timeout_seconds = 60;
+            settings.provider.provider_max_attempts = 1;
+            if stage == "double_check" {
+                settings.double_check.mode = DoubleCheckMode::Full;
+            }
+            let mut fixture = resume_fixture(settings, 1);
+            fixture.job.provider = "openai-compatible".to_string();
+            fixture.snapshot.provider = "openai-compatible".to_string();
+            fixture.snapshot.model = "local-cancellation-test".to_string();
+            fixture.snapshot.base_url = Some(base_url.clone());
+            fixture.snapshot.api_key_env = Some("OLLAMA_API_KEY".to_string());
+            match stage {
+                "qa" | "double_check" => {
+                    save_succeeded(
+                        &fixture.store,
+                        &fixture.job.id,
+                        &fixture.segments[0],
+                        "stored",
+                    );
+                    if stage == "qa" {
+                        fixture.snapshot.qa_mode = "all".to_string();
+                    }
+                }
+                "fallback" => {
+                    save_needs_review(&fixture.store, &fixture.job.id, &fixture.segments[0]);
+                    fixture.snapshot.fallback =
+                        Some(bookforge_core::run_snapshot::FallbackRunConfigSnapshot {
+                            provider: "openai-compatible".to_string(),
+                            model: "local-cancellation-test".to_string(),
+                            base_url: Some(base_url),
+                            api_key_env: Some("OLLAMA_API_KEY".to_string()),
+                            scope: FallbackScope::NeedsReview,
+                        });
+                }
+                _ => {}
+            }
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::new(RecordingSink {
+                events: events.clone(),
+            });
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(20),
+                run_fixture_with_progress(&mut fixture, None, sink, token.clone()),
+            )
+            .await;
+            server.abort();
+            outcome
+                .expect("caller cancellation should abort stalled HTTP promptly")
+                .unwrap_or_else(|error| panic!("cancelled {stage} failed to finalize: {error}"));
+            assert!(
+                token.is_cancelled(),
+                "{stage} must make the loopback request"
+            );
+            assert_eq!(job_status(&fixture), "interrupted", "stage {stage}");
+            assert!(
+                !fixture.snapshot.output_path.exists(),
+                "stage {stage} must not publish after cancellation"
+            );
+            assert!(
+                !fixture.snapshot.finalize.double_check_complete,
+                "cancelled double-check must remain resumable"
+            );
+            assert!(
+                !events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event, ProgressEvent::TranslationFinished { .. })),
+                "stage {stage} must not signal completion"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_clears_only_the_original_control_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control");
+        let write_revision = |command, seconds| {
+            bookforge_core::write_control_file(&path, command).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(seconds))
+                .unwrap();
+        };
+
+        write_revision(ControlCommand::Stop, 60);
+        let original = control_revision(&path).unwrap();
+        clear_preflight_control(&path, original).unwrap();
+        assert!(!path.exists());
+
+        // Even a repeated Stop is a new request when written during preflight.
+        write_revision(ControlCommand::Stop, 60);
+        let original = control_revision(&path).unwrap();
+        write_revision(ControlCommand::Stop, 120);
+        clear_preflight_control(&path, original).unwrap();
+        assert_eq!(
+            bookforge_core::read_control_file(&path).unwrap(),
+            ControlCommand::Stop
+        );
+
+        let original = control_revision(&path).unwrap();
+        write_revision(ControlCommand::Pause, 180);
+        clear_preflight_control(&path, original).unwrap();
+        assert_eq!(
+            bookforge_core::read_control_file(&path).unwrap(),
+            ControlCommand::Pause
+        );
+
+        bookforge_core::clear_control_file(&path).unwrap();
+        let absent = control_revision(&path).unwrap();
+        write_revision(ControlCommand::Stop, 240);
+        clear_preflight_control(&path, absent).unwrap();
+        assert_eq!(
+            bookforge_core::read_control_file(&path).unwrap(),
+            ControlCommand::Stop
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_resume_keeps_the_job_state_paths_and_pending_control() {
+        let settings = TranslationProfile::V1Fast.resolve();
+        let mut fixture = resume_fixture(settings, 2);
+        save_succeeded(
+            &fixture.store,
+            &fixture.job.id,
+            &fixture.segments[0],
+            "stored",
+        );
+        fixture.store.mark_job_stopped(&fixture.job.id).unwrap();
+        fixture.job = fixture.store.get_job(&fixture.job.id).unwrap().unwrap();
+        fixture.snapshot.cache_namespace = "incompatible-namespace".to_string();
+        fixture
+            .store
+            .update_job_config_snapshot(&fixture.job.id, &fixture.snapshot)
+            .unwrap();
+        let control = bookforge_core::control_path_for_job(&fixture.job.id);
+        bookforge_core::write_control_file(&control, ControlCommand::Stop).unwrap();
+        let before = serde_json::to_value(&fixture.snapshot).unwrap();
+        let blocks = fixture
+            .store
+            .load_block_translations(&fixture.job.id)
+            .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink {
+            events: events.clone(),
+        });
+        let mut args = resume_args(&fixture.job.id);
+        let tempdir = tempfile::tempdir().unwrap();
+        args.output = Some(tempdir.path().join("elsewhere.epub"));
+        args.progress_jsonl = Some(tempdir.path().join("elsewhere.jsonl"));
+        let run_store = JobStore::open(fixture.store.path()).unwrap();
+        let error = run_inner(
+            &args,
+            &run_store,
+            fixture.job.clone(),
+            &mut fixture.snapshot,
+            None,
+            sink,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("an incompatible checkpoint contract must not resume");
+
+        assert!(
+            error
+                .to_string()
+                .contains("resume cache namespace mismatch")
+        );
+        assert!(!events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ProgressEvent::RequestStarted { .. } | ProgressEvent::SegmentFinished { .. }
+        )));
+        assert_eq!(
+            fixture
+                .store
+                .load_block_translations(&fixture.job.id)
+                .unwrap(),
+            blocks
+        );
+        let saved = fixture
+            .store
+            .load_job_config_snapshot(&fixture.job.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(&saved).unwrap(), before);
+        let job = fixture.store.get_job(&fixture.job.id).unwrap().unwrap();
+        assert_eq!(job.status, "stopped");
+        assert_eq!(job.output_path, fixture.snapshot.output_path);
+        assert_eq!(
+            bookforge_core::read_control_file(&control).unwrap(),
+            ControlCommand::Stop,
+            "the pending command stays until a resume is accepted"
+        );
+        assert!(!fixture.snapshot.output_path.exists());
+        bookforge_core::clear_control_file(&control).unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_resume_clears_the_stale_control_command() {
+        let mut fixture = resume_fixture(TranslationProfile::V1Fast.resolve(), 1);
+        fixture.store.mark_job_stopped(&fixture.job.id).unwrap();
+        fixture.job = fixture.store.get_job(&fixture.job.id).unwrap().unwrap();
+        let control = bookforge_core::control_path_for_job(&fixture.job.id);
+        bookforge_core::write_control_file(&control, ControlCommand::Stop).unwrap();
+
+        run_fixture(&mut fixture)
+            .await
+            .expect("a compatible resume should run");
+        assert!(!control.exists());
+        assert_eq!(job_status(&fixture), "succeeded");
+    }
+
     fn resume_fixture(settings: ResolvedRunSettings, segment_count: usize) -> ResumeFixture {
         resume_fixture_with_chapter(settings, segment_count, RESUME_CHAPTER_ONE, |_| true)
     }
@@ -2606,22 +3296,35 @@ mod tests {
         let sink = Arc::new(RecordingSink {
             events: events.clone(),
         });
+        run_fixture_with_progress(
+            fixture,
+            overrides,
+            sink,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+        Ok(events.lock().expect("events lock").clone())
+    }
+
+    async fn run_fixture_with_progress(
+        fixture: &mut ResumeFixture,
+        overrides: Option<reconfigure::RunConfigOverrides>,
+        progress: Arc<dyn ProgressSink>,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
         let run_store = JobStore::open(fixture.store.path()).expect("store should reopen");
         let args = resume_args(&fixture.job.id);
-
         run_inner(
             &args,
             &run_store,
             fixture.job.clone(),
             &mut fixture.snapshot,
             overrides,
-            sink,
-            tokio_util::sync::CancellationToken::new(),
+            progress,
+            cancel_token,
             None,
         )
-        .await?;
-
-        Ok(events.lock().expect("events lock").clone())
+        .await
     }
 
     fn resume_args(job_id: &str) -> ResumeArgs {
