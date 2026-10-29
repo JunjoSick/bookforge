@@ -619,17 +619,32 @@ pub(super) fn suspicious_qa_candidates(
             let Some(segment) = by_segment.get(translation.segment_id.0.as_str()) else {
                 return false;
             };
+            let translated_text = translation.joined_text();
             let source_len = segment.source.text.chars().count().max(1);
-            let translated_len = translation.joined_text().chars().count();
+            let translated_len = translated_text.chars().count();
             let ratio = translated_len as f64 / source_len as f64;
             translation.status == SegmentStatus::NeedsReview
                 || !(0.75..=1.5).contains(&ratio)
                 || translation.template == "translate_run_preserving"
                 || segment.constraints.preserve_spans.len() >= 4
                 || marker_structure_changed(segment, translation)
+                || number_reference_changed(&segment.source.text, &translated_text)
         })
         .cloned()
         .collect()
+}
+
+/// A source number (a date, a quantity) missing from the translation after
+/// the report's decimal-format normalization. It requests contextual review,
+/// not rejection: a year can be correctly written in words. Localized
+/// decimals alone do not select a segment.
+fn number_reference_changed(source: &str, translation: &str) -> bool {
+    let source = bookforge_core::marker::strip_marker_tokens(source);
+    let translation = bookforge_core::marker::strip_marker_tokens(translation);
+    let target_numbers = crate::report::numbers(&translation);
+    crate::report::numbers(&source)
+        .iter()
+        .any(|number| !crate::report::token_present(number, &target_numbers))
 }
 
 #[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -908,6 +923,53 @@ mod suspicious_tests {
             .collect::<Vec<_>>();
 
         assert!(suspicious_qa_candidates(&segments, &translations).is_empty());
+    }
+
+    #[test]
+    fn suspicious_candidates_include_changed_dates_but_allow_localized_numbers() {
+        let year = test_segment(
+            "year_changed",
+            0,
+            "The forecast places these changes in the approaching 2030s, with several possible outcomes.",
+        );
+        let decimal = test_segment(
+            "localized_decimal",
+            1,
+            "The current price is 1,000.50 euros per item.",
+        );
+        let unchanged_year = test_segment(
+            "year_preserved",
+            2,
+            "The forecast places these changes in the approaching 2030s.",
+        );
+        let translations = vec![
+            test_translation(
+                &year,
+                "La previsione colloca questi cambiamenti verso gli anni Dieci, con vari esiti possibili.",
+                "translate_batch_plain",
+                SegmentStatus::Succeeded,
+            ),
+            test_translation(
+                &decimal,
+                "Il prezzo attuale è 1.000,50 euro per articolo.",
+                "translate_batch_plain",
+                SegmentStatus::Succeeded,
+            ),
+            test_translation(
+                &unchanged_year,
+                "La previsione colloca questi cambiamenti negli anni 2030.",
+                "translate_batch_plain",
+                SegmentStatus::Succeeded,
+            ),
+        ];
+        let candidates = suspicious_qa_candidates(&[year, decimal, unchanged_year], &translations);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|item| item.segment_id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["year_changed"]
+        );
     }
 
     #[tokio::test]

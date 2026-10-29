@@ -535,6 +535,83 @@ fn mark_job_finished_keeps_queued_segments_needs_review() {
 }
 
 #[test]
+fn output_rebuild_failure_marks_job_failed_without_discarding_checkpoints() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source.epub");
+    build_translation_fixture(&input);
+    let book = bookforge_epub::read_epub(&input).unwrap();
+    let segments = bookforge_core::segment::build_segments(
+        &book,
+        &TranslationProfile::Safe.resolve().segmentation,
+    )
+    .unwrap();
+    // The parent directory does not exist, so the rebuild must fail.
+    let output = temp.path().join("missing-parent/output.epub");
+    let store = JobStore::open(temp.path().join("jobs.sqlite")).unwrap();
+    let job = store
+        .create_job(CreateJob {
+            input: &input,
+            output: &output,
+            source_lang: Some("English"),
+            target_lang: "Italian",
+            provider: "mock",
+            model: "mock-identity",
+            base_url: None,
+            api_key_env: None,
+            book_id: None,
+            series_id: None,
+        })
+        .unwrap();
+    store
+        .insert_segments(&job.id, &segments, "v2", "mock", "mock-identity", "test")
+        .unwrap();
+    for segment in &segments {
+        let blocks = segment
+            .source
+            .blocks
+            .iter()
+            .map(|block| BlockTranslation {
+                block_id: block.block_id.clone(),
+                text: block.text.clone(),
+            })
+            .collect::<Vec<_>>();
+        store
+            .save_translation(SaveTranslation {
+                job_id: &job.id,
+                segment_id: &segment.id.0,
+                translated_text: &segment.source.text,
+                blocks: &blocks,
+                provider: "mock",
+                model: "mock-identity",
+                prompt_version: "v2",
+                input_tokens: None,
+                input_cached_tokens: None,
+                output_tokens: None,
+                tokens_estimated: false,
+            })
+            .unwrap();
+    }
+    store.mark_job_succeeded(&job.id).unwrap();
+
+    let result = reporting::rebuild_epub_for_job(
+        &store,
+        &job,
+        &book,
+        &[],
+        &output,
+        &bookforge_epub::RebuildOptions::default(),
+    );
+
+    assert!(result.is_err());
+    assert_eq!(store.get_job(&job.id).unwrap().unwrap().status, "failed");
+    assert_eq!(
+        store.summary(&job.id).unwrap().unwrap().succeeded,
+        segments.len()
+    );
+    assert!(!output.exists());
+}
+
+#[test]
 fn glossary_file_is_selected_for_matching_segment() {
     let db_path = temp_path("glossary_prepare.sqlite");
     let glossary_path = temp_path("glossary.toml");
