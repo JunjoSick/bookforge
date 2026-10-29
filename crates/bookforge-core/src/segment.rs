@@ -616,21 +616,25 @@ pub fn build_segments(book: &Book, config: &SegmentationConfig) -> Result<Vec<Se
     }
 
     let mut segments = Vec::new();
+    // Index blocks once instead of scanning the whole book for every
+    // reference (quadratic on large books). The first occurrence of a
+    // duplicated ID wins, matching the previous linear lookup.
+    let mut blocks_by_id = std::collections::HashMap::with_capacity(book.blocks.len());
+    for block in &book.blocks {
+        blocks_by_id.entry(&block.id).or_insert(block);
+    }
 
     for (section_index, section) in book.sections.iter().enumerate() {
         let section_blocks = section
             .block_ids
             .iter()
             .map(|block_id| {
-                book.blocks
-                    .iter()
-                    .find(|block| &block.id == block_id)
-                    .ok_or_else(|| {
-                        BookforgeError::InvalidInput(format!(
-                            "section '{}' references missing block '{}'",
-                            section.id.0, block_id.0
-                        ))
-                    })
+                blocks_by_id.get(block_id).copied().ok_or_else(|| {
+                    BookforgeError::InvalidInput(format!(
+                        "section '{}' references missing block '{}'",
+                        section.id.0, block_id.0
+                    ))
+                })
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -921,6 +925,45 @@ mod tests {
         assert_eq!(first[1].section_id.0, "sec_000000");
         assert_eq!(first[2].section_id.0, "sec_000001");
         assert_eq!(first[2].block_ids, vec![BlockId("b_000003".to_string())]);
+    }
+
+    #[test]
+    fn block_lookup_preserves_reference_order_and_first_duplicate() {
+        let mut book = book_with_two_sections();
+        let reference = build_segments(&book, &SegmentationConfig::default()).unwrap();
+        let mut duplicate = book.blocks[1].clone();
+        duplicate.text_runs[0].text = "later duplicate must not replace the first".to_string();
+        book.blocks.reverse();
+        book.blocks.push(duplicate);
+
+        let segments = build_segments(&book, &SegmentationConfig::default()).unwrap();
+
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| (&segment.id, &segment.source.text))
+                .collect::<Vec<_>>(),
+            reference
+                .iter()
+                .map(|segment| (&segment.id, &segment.source.text))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn block_lookup_reports_the_section_and_missing_reference() {
+        let mut book = book_with_two_sections();
+        book.sections[1]
+            .block_ids
+            .push(BlockId("missing".to_string()));
+
+        let error = build_segments(&book, &SegmentationConfig::default()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            BookforgeError::InvalidInput(message)
+                if message == "section 'sec_000001' references missing block 'missing'"
+        ));
     }
 
     #[test]
