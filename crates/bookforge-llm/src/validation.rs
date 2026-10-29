@@ -1347,7 +1347,9 @@ mod tests {
 
     #[test]
     fn marker_only_translation_is_empty_but_marker_only_source_is_not_prose() {
-        assert!(empty_translation_validation_error("<m1>Visible prose</m1>", "<m1> </m1>").is_some());
+        assert!(
+            empty_translation_validation_error("<m1>Visible prose</m1>", "<m1> </m1>").is_some()
+        );
         assert!(empty_translation_validation_error("Text<r1/>", "<r1/>").is_some());
         assert!(empty_translation_validation_error("<r1/>", "<r1/>").is_none());
         assert!(empty_translation_validation_error("<m1>Ciao</m1>", "<m1>Hello</m1>").is_none());

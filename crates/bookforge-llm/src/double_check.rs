@@ -1137,7 +1137,10 @@ mod tests {
             super::validate_correction(&dropped, "errato", false, None),
             CorrectionStatus::RejectedValidationFailed(error) if error.contains("reference text")
         ));
-        let preserved = correction(source, "<m0>Gli uccelli ingannano</m0>.<m1><m2>*1</m2></m1>");
+        let preserved = correction(
+            source,
+            "<m0>Gli uccelli ingannano</m0>.<m1><m2>*1</m2></m1>",
+        );
         assert!(matches!(
             super::validate_correction(&preserved, "errato", false, None),
             CorrectionStatus::Applied

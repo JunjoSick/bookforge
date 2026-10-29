@@ -1060,8 +1060,7 @@ where
     );
     if max_output_tokens == 0 {
         return Err(LlmError::RequestTooLarge(
-            "no output-token budget remains within the configured model context window"
-                .to_string(),
+            "no output-token budget remains within the configured model context window".to_string(),
         ));
     }
     let (runtime_config_revision, provider_max_attempts) = config.request_runtime_metadata();
@@ -1803,7 +1802,11 @@ fn validate_protected_spans(
 /// The batch validator's endnote rule, applied to non-batch output: a marker
 /// that wrapped a reference token (`*1`) must keep it, even when the marker
 /// IDs themselves survived.
-fn validate_marker_reference_text(segment: &Segment, source: &str, translation: &str) -> Result<()> {
+fn validate_marker_reference_text(
+    segment: &Segment,
+    source: &str,
+    translation: &str,
+) -> Result<()> {
     match crate::validation::marker_reference_text_error(source, translation) {
         Some(error) => Err(LlmError::InvalidResponse(format!(
             "invalid reference text in segment '{}': {error}",

@@ -391,18 +391,18 @@ where
             ));
             continue;
         }
-        let review = match serde_json::from_value::<QaBatchReview>(matches.pop().expect("one review"))
-        {
-            Ok(review) => review,
-            Err(error) => {
-                reviews.push(qa_error_review(
-                    item,
-                    "qa_response_invalid",
-                    format!("Malformed QA review: {error}"),
-                ));
-                continue;
-            }
-        };
+        let review =
+            match serde_json::from_value::<QaBatchReview>(matches.pop().expect("one review")) {
+                Ok(review) => review,
+                Err(error) => {
+                    reviews.push(qa_error_review(
+                        item,
+                        "qa_response_invalid",
+                        format!("Malformed QA review: {error}"),
+                    ));
+                    continue;
+                }
+            };
         reviews.push(validated_qa_review(item, review));
     }
 
@@ -971,7 +971,10 @@ mod tests {
     #[tokio::test]
     async fn malformed_and_contradictory_qa_reviews_do_not_discard_valid_neighbors() {
         for (invalid, kind) in [
-            (json!({"id":"bad", "verdict":7, "issues":[]}), "qa_response_invalid"),
+            (
+                json!({"id":"bad", "verdict":7, "issues":[]}),
+                "qa_response_invalid",
+            ),
             (
                 json!({"id":"bad", "verdict":"pass", "issues":[{"severity":"high", "kind":"omission", "message":"A paragraph was omitted"}]}),
                 "qa_response_invalid",

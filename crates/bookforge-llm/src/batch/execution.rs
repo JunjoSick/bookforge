@@ -934,15 +934,15 @@ where
                     // The final allowance is known only once the prompt is
                     // rendered and measured, so the request is announced then.
                     let announce_request = |max_output_tokens: u32| {
-                        let effective_timeout_seconds =
-                            configured_timeout_seconds(Some(config.as_ref())).and_then(
-                                |configured| {
-                                    crate::latency::effective_request_timeout_seconds(
-                                        configured,
-                                        Some(max_output_tokens),
-                                    )
-                                },
-                            );
+                        let effective_timeout_seconds = configured_timeout_seconds(Some(
+                            config.as_ref(),
+                        ))
+                        .and_then(|configured| {
+                            crate::latency::effective_request_timeout_seconds(
+                                configured,
+                                Some(max_output_tokens),
+                            )
+                        });
                         progress.emit(bookforge_core::ProgressEvent::RequestStarted {
                             request_id: request_id.clone(),
                             batch_id: Some(batch.id.clone()),
@@ -3023,7 +3023,11 @@ fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 /// Apportion cached input tokens like [`apportion`], without ever giving an
 /// item more cached tokens than its share of the input, while keeping the
 /// total. Independent rounding of the two splits could otherwise do both.
-fn apportion_cached(total: Option<u64>, weights: &[u64], input: &[Option<u64>]) -> Vec<Option<u64>> {
+fn apportion_cached(
+    total: Option<u64>,
+    weights: &[u64],
+    input: &[Option<u64>],
+) -> Vec<Option<u64>> {
     let mut cached = apportion(total, weights);
     let mut excess = 0_u64;
     for (cached, input) in cached.iter_mut().zip(input) {
