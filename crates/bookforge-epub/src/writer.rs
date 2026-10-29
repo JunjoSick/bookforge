@@ -9,7 +9,7 @@ use std::{
 use bookforge_core::{
     BookforgeError, Result,
     config::{BilingualMode, BilingualStyle},
-    ir::{Block, Book, DomPath, TEXT_NODE_PATH_BASE},
+    ir::{Block, BlockId, Book, DomPath, TEXT_NODE_PATH_BASE},
     marker::{parse_empty_marker, parse_paired_marker_open},
     segment::BlockTranslation,
 };
@@ -27,8 +27,10 @@ use crate::{
     util::{
         MAX_MARKER_DEPTH, attr_value_unescaped, commit_staged_output, create_sibling_work_file,
         deterministic_zip_time, is_xhtml_resource_name, join_epub_path, local_name, marker_id,
-        never_translate_element, normalize_translation_entities, package_base_dir, validate_xml,
+        never_translate_element, normalize_translation_entities, package_base_dir,
+        resolve_general_ref, validate_xml,
     },
+    xml_text::read_text_chunk,
 };
 
 const TRANSLATION_CLASS: &str = "bookforge-translation";
@@ -88,7 +90,7 @@ pub fn rebuild_epub_with_options(
             return Err(error);
         }
     };
-    if let Err(error) = commit_staged_output("rebuilt", &staged, output) {
+    if let Err(error) = commit_staged_output(&staged, output) {
         let _ = fs::remove_file(&staged);
         return Err(error);
     }
@@ -116,12 +118,8 @@ fn write_rebuilt_epub(
     preflight_archive_path(source_path)?;
     let mut archive = ZipArchive::new(source)?;
     let mut read_budget = validate_archive_metadata(&mut archive, DEFAULT_ARCHIVE_LIMITS)?;
-    let mut writer = ZipWriter::new(output_file);
 
-    let translations_by_block = translations
-        .iter()
-        .map(|translation| (&translation.block_id, translation.text.as_str()))
-        .collect::<HashMap<_, _>>();
+    let translations_by_block = index_translations(book, translations)?;
     let prepared_patches = book
         .blocks
         .iter()
@@ -139,10 +137,12 @@ fn write_rebuilt_epub(
         .iter()
         .map(|(block, translation)| (*block, translation.as_str()))
         .collect::<Vec<_>>();
-    let patches_by_href = patches_by_href(book, &patches);
+    let patches_by_href = patches_by_href(book, &patches)?;
+    ensure_patch_targets_exist(&mut archive, patches_by_href.keys().copied())?;
     let archive_names = archive_entry_names(&mut archive)?;
     let stylesheet = stylesheet_plan(book.id.0.as_str(), &archive_names, options);
 
+    let mut writer = ZipWriter::new(output_file);
     write_mimetype_first(&mut archive, &mut writer, &mut read_budget)?;
 
     let mut total_skipped = 0usize;
@@ -464,27 +464,97 @@ fn relative_href(from_file: &str, target_file: &str) -> String {
     }
 }
 
+/// Index the requested translations by block, rejecting requests the
+/// rebuild could only satisfy by guessing: a translation for a block the
+/// book does not contain would silently vanish, and duplicate block ids in
+/// the book or in the request leave it ambiguous which text lands where.
+fn index_translations<'a>(
+    book: &'a Book,
+    translations: &'a [BlockTranslation],
+) -> Result<HashMap<&'a BlockId, &'a str>> {
+    let mut known_blocks = HashSet::with_capacity(book.blocks.len());
+    for block in &book.blocks {
+        if !known_blocks.insert(&block.id) {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB book contains duplicate block '{}'",
+                block.id.0
+            )));
+        }
+    }
+    let mut by_block = HashMap::with_capacity(translations.len());
+    for translation in translations {
+        if !known_blocks.contains(&translation.block_id) {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB translation references unknown block '{}'",
+                translation.block_id.0
+            )));
+        }
+        if by_block
+            .insert(&translation.block_id, translation.text.as_str())
+            .is_some()
+        {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB translation contains duplicate block '{}'",
+                translation.block_id.0
+            )));
+        }
+    }
+    Ok(by_block)
+}
+
 fn patches_by_href<'a>(
     book: &'a Book,
     patches: &'a [(&'a Block, &'a str)],
-) -> HashMap<&'a str, Vec<BlockPatch<'a>>> {
-    let section_href = book
-        .sections
-        .iter()
-        .map(|section| (&section.id, section.href.as_str()))
-        .collect::<HashMap<_, _>>();
+) -> Result<HashMap<&'a str, Vec<BlockPatch<'a>>>> {
+    let mut section_href = HashMap::with_capacity(book.sections.len());
+    for section in &book.sections {
+        if section_href
+            .insert(&section.id, section.href.as_str())
+            .is_some()
+        {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB book contains duplicate section '{}'",
+                section.id.0
+            )));
+        }
+    }
     let mut by_href = HashMap::<&str, Vec<BlockPatch<'a>>>::new();
 
     for (block, translation) in patches {
-        if let Some(href) = section_href.get(&block.section_id) {
-            by_href
-                .entry(*href)
-                .or_default()
-                .push(BlockPatch { block, translation });
-        }
+        let href = section_href.get(&block.section_id).ok_or_else(|| {
+            BookforgeError::InvalidInput(format!(
+                "EPUB translation for block '{}' references missing section '{}'",
+                block.id.0, block.section_id.0
+            ))
+        })?;
+        by_href
+            .entry(*href)
+            .or_default()
+            .push(BlockPatch { block, translation });
     }
 
-    by_href
+    Ok(by_href)
+}
+
+/// Every patched resource must be a file in the source archive; otherwise
+/// its translations would be dropped without a trace.
+fn ensure_patch_targets_exist<'a>(
+    archive: &mut ZipArchive<File>,
+    hrefs: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    for href in hrefs {
+        let Some(index) = archive.index_for_name(href) else {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB translation targets resource '{href}', which is not in the archive"
+            )));
+        };
+        if archive.by_index_raw(index)?.is_dir() {
+            return Err(BookforgeError::InvalidInput(format!(
+                "EPUB translation targets directory '{href}' instead of a document"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn patch_opf_for_rebuild(
@@ -1107,24 +1177,41 @@ fn patch_xhtml_with_specs(
 ) -> Result<PatchOutcome> {
     let normalized = crate::packed_notes::normalize_packed_notes(xhtml)?;
     let xhtml = normalized.as_ref();
-    let patch_map = patches
-        .iter()
-        .map(|patch| (patch.dom_path.0.as_slice(), *patch))
-        .collect::<HashMap<_, _>>();
+    let mut patch_map = HashMap::with_capacity(patches.len());
+    for patch in patches {
+        if patch_map
+            .insert(patch.dom_path.0.as_slice(), *patch)
+            .is_some()
+        {
+            return Err(BookforgeError::InvalidInput(format!(
+                "multiple EPUB translations target the same DOM path {:?}",
+                patch.dom_path.0
+            )));
+        }
+    }
+    // Every requested patch must find its target. One that does not means
+    // the IR and the document disagree, and its translation would vanish.
+    let mut matched_paths = HashSet::with_capacity(patches.len());
     let mut reader = Reader::from_str(xhtml);
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::new());
     let mut stack = Vec::<ElementFrame>::new();
     let mut skipped_blocks = 0usize;
+    let mut pending_event = None;
 
     loop {
-        match reader.read_event()? {
+        let event = match pending_event.take() {
+            Some(event) => event,
+            None => reader.read_event()?,
+        };
+        match event {
             Event::Start(element) => {
                 let name = local_name(element.name().as_ref().as_bytes()).to_vec();
                 let path = enter_element(&mut stack, &name);
                 writer.write_event(Event::Start(element.borrow()))?;
 
                 if let Some(patch) = patch_map.get(path.as_slice()).copied() {
+                    matched_paths.insert(patch.dom_path.0.as_slice());
                     let buffered = buffer_until_matching_end(&mut reader)?;
                     // <hgroup> permits only heading children: a sibling
                     // <p> after a heading inside the group would trip
@@ -1161,6 +1248,7 @@ fn patch_xhtml_with_specs(
             Event::Empty(element) => {
                 let path = next_child_path(&mut stack);
                 if let Some(patch) = patch_map.get(path.as_slice()).copied() {
+                    matched_paths.insert(patch.dom_path.0.as_slice());
                     match options.mode {
                         BilingualMode::Replace => {
                             let name = element.name();
@@ -1185,58 +1273,51 @@ fn patch_xhtml_with_specs(
             // standalone blocks for non-whitespace text the block
             // whitelist missed, addressed as parent path plus
             // TEXT_NODE_PATH_BASE + n. Counting must mirror the reader:
-            // every text node that is non-whitespace after entity
-            // decoding consumes one index in its parent frame.
-            Event::Text(text) => {
-                let non_whitespace = !text.html_content().trim().is_empty();
+            // contiguous text, entity references and CDATA form one node,
+            // which consumes one index in its parent frame when its
+            // decoded text is not whitespace-only.
+            event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_)) => {
+                let chunk = read_text_chunk(event, &mut reader)?;
+                pending_event = Some(chunk.next);
+                let non_whitespace = !chunk.text.trim().is_empty();
                 match text_node_patch(&patch_map, &mut stack, non_whitespace) {
-                    Some(patch) => match options.mode {
-                        BilingualMode::Replace => {
-                            writer.write_event(translation_text_event(patch.translation))?
+                    Some(patch) => {
+                        matched_paths.insert(patch.dom_path.0.as_slice());
+                        // Extraction trims loose text, but its surrounding
+                        // whitespace still separates it from neighbouring
+                        // inline elements and must survive the patch.
+                        let leading =
+                            &chunk.text[..chunk.text.len() - chunk.text.trim_start().len()];
+                        let trailing = &chunk.text[chunk.text.trim_end().len()..];
+                        let trimmed = PatchSpec {
+                            translation: patch.translation.trim(),
+                            ..patch
+                        };
+                        match options.mode {
+                            BilingualMode::Replace => {
+                                write_plain_text(&mut writer, leading)?;
+                                writer.write_event(translation_text_event(trimmed.translation))?;
+                                write_plain_text(&mut writer, trailing)?;
+                            }
+                            BilingualMode::AppendText => {
+                                write_events(&mut writer, &chunk.events)?;
+                                write_inline_translation_span(&mut writer, trimmed, &[], options)?;
+                                write_plain_text(&mut writer, trailing)?;
+                            }
+                            BilingualMode::AppendBlock => {
+                                write_events(&mut writer, &chunk.events)?;
+                                write_translation_element_for_patch(
+                                    &mut writer,
+                                    "p",
+                                    &[TRANSLATION_CLASS],
+                                    trimmed,
+                                    &[],
+                                    options,
+                                )?;
+                            }
                         }
-                        BilingualMode::AppendText => {
-                            writer.write_event(Event::Text(text.borrow()))?;
-                            write_inline_translation_span(&mut writer, patch, &[], options)?;
-                        }
-                        BilingualMode::AppendBlock => {
-                            writer.write_event(Event::Text(text.borrow()))?;
-                            write_translation_element_for_patch(
-                                &mut writer,
-                                "p",
-                                &[TRANSLATION_CLASS],
-                                patch,
-                                &[],
-                                options,
-                            )?;
-                        }
-                    },
-                    None => writer.write_event(Event::Text(text.borrow()))?,
-                }
-            }
-            Event::CData(text) => {
-                let non_whitespace = !text.trim().is_empty();
-                match text_node_patch(&patch_map, &mut stack, non_whitespace) {
-                    Some(patch) => match options.mode {
-                        BilingualMode::Replace => {
-                            writer.write_event(translation_text_event(patch.translation))?
-                        }
-                        BilingualMode::AppendText => {
-                            writer.write_event(Event::CData(text.borrow()))?;
-                            write_inline_translation_span(&mut writer, patch, &[], options)?;
-                        }
-                        BilingualMode::AppendBlock => {
-                            writer.write_event(Event::CData(text.borrow()))?;
-                            write_translation_element_for_patch(
-                                &mut writer,
-                                "p",
-                                &[TRANSLATION_CLASS],
-                                patch,
-                                &[],
-                                options,
-                            )?;
-                        }
-                    },
-                    None => writer.write_event(Event::CData(text.borrow()))?,
+                    }
+                    None => write_events(&mut writer, &chunk.events)?,
                 }
             }
             Event::Eof => break,
@@ -1244,6 +1325,27 @@ fn patch_xhtml_with_specs(
                 writer.write_event(event.borrow())?;
             }
         }
+    }
+
+    if matched_paths.len() < patch_map.len() {
+        let mut unmatched = patch_map
+            .keys()
+            .filter(|path| !matched_paths.contains(*path))
+            .collect::<Vec<_>>();
+        unmatched.sort();
+        let described = unmatched
+            .iter()
+            .map(
+                |path| match patch_map.get(*path).and_then(|patch| patch.block) {
+                    Some(block) => format!("block '{}' at {path:?}", block.id.0),
+                    None => format!("{path:?}"),
+                },
+            )
+            .collect::<Vec<_>>();
+        return Err(BookforgeError::InvalidInput(format!(
+            "EPUB translation target(s) not found in the document: {}",
+            described.join(", ")
+        )));
     }
 
     let xhtml = String::from_utf8(writer.into_inner()).map_err(|err| {
@@ -1524,9 +1626,16 @@ fn dedupe_classes(classes: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn write_events(writer: &mut Writer<Vec<u8>>, events: &[Event<'static>]) -> Result<()> {
+fn write_events(writer: &mut Writer<Vec<u8>>, events: &[Event<'_>]) -> Result<()> {
     for event in events {
         writer.write_event(event.borrow())?;
+    }
+    Ok(())
+}
+
+fn write_plain_text(writer: &mut Writer<Vec<u8>>, text: &str) -> Result<()> {
+    if !text.is_empty() {
+        writer.write_event(Event::Text(BytesText::new(text)))?;
     }
     Ok(())
 }
@@ -1535,6 +1644,10 @@ fn source_has_visible_text(events: &[Event<'static>]) -> bool {
     events.iter().any(|event| match event {
         Event::Text(text) => !text.html_content().trim().is_empty(),
         Event::CData(text) => !text.trim().is_empty(),
+        // Entity-only text (`&#1043;&#1044;`) is visible text too.
+        Event::GeneralRef(reference) => {
+            resolve_general_ref(reference).is_ok_and(|value| !value.trim().is_empty())
+        }
         _ => false,
     })
 }
@@ -1800,12 +1913,29 @@ impl RenderedEvent {
 
     /// Raw suppressed content is written back byte-for-byte: neither
     /// whitespace restoration nor append-mode flattening may touch it.
-    fn verbatim(event: Event<'static>) -> Self {
+    fn verbatim(event: Event<'static>, edge: Option<MarkerEdge>) -> Self {
         Self {
             event,
-            edge: None,
+            edge,
             verbatim: true,
         }
+    }
+}
+
+/// Splice an opaque subtree back verbatim. Its first and last events carry
+/// the marker's edges so a source space between it and a neighbouring
+/// marker is restored like a space between two ordinary inline elements.
+fn push_raw_subtree(id: &str, events: &[Event<'static>], output: &mut Vec<RenderedEvent>) {
+    let last = events.len().saturating_sub(1);
+    for (index, event) in events.iter().enumerate() {
+        let edge = if index == 0 {
+            Some(MarkerEdge::Start(id.to_string()))
+        } else if index == last {
+            Some(MarkerEdge::End(id.to_string()))
+        } else {
+            None
+        };
+        output.push(RenderedEvent::verbatim(event.clone(), edge));
     }
 }
 
@@ -1871,7 +2001,7 @@ fn marked_translation_rendered(
 
     // Suppressed subtrees whose markers the translation omitted are still
     // emitted, at tail position: script/style/svg/math content must never
-    // disappear merely because a model dropped its empty marker pair.
+    // disappear merely because a model dropped its atomic marker.
     let mut untouched = scan
         .raw_events
         .keys()
@@ -1881,9 +2011,7 @@ fn marked_translation_rendered(
     untouched.sort();
     for id in untouched {
         if let Some(events) = scan.raw_events.get(&id) {
-            for event in events {
-                rendered.push(RenderedEvent::verbatim(event.clone()));
-            }
+            push_raw_subtree(&id, events, &mut rendered);
         }
     }
 
@@ -1893,8 +2021,9 @@ fn marked_translation_rendered(
 
 /// Single pass assigning template ids exactly like the reader does:
 /// every Start/Empty inside an active block consumes one SHARED ordinal,
-/// prefixed `m` or `r` respectively except elements nested inside a
-/// suppressed subtree, which consume none on either side of the protocol.
+/// prefixed `m` or `r` respectively. The root of a suppressed subtree is
+/// atomic and takes an `r` id; elements nested inside it consume none on
+/// either side of the protocol.
 /// The reader draws paired and empty marker ids from one counter
 /// (`BlockBuilder::next_marker`), so splitting into two independent
 /// sequences here desynchronizes any block mixing paired children with
@@ -1908,9 +2037,9 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
 
     let mut scan = BlockScan::default();
     // Each open element's id plus the Start event needed later to build the
-    // paired template (None for raw-subtree roots, whose bytes live in
-    // `raw_events` rather than a template).
-    let mut stack = Vec::<(String, Option<Event<'static>>)>::new();
+    // paired template. Opaque subtrees never enter the stack: their bytes
+    // live in `raw_events` rather than a template.
+    let mut stack = Vec::<(String, Event<'static>)>::new();
     let mut marker_ordinal = 0usize;
     let mut pending_left = None::<String>;
     let mut saw_whitespace = false;
@@ -1928,12 +2057,9 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
                             == capture.root_name.as_slice()
                     {
                         let capture = raw_capture.take().expect("checked above");
-                        scan.raw_events.insert(capture.id.clone(), capture.events);
-                        let (id, _) = stack.pop().ok_or_else(|| {
-                            BookforgeError::InvalidInput(STACK_UNDERFLOW.to_string())
-                        })?;
-                        pending_left = Some(id);
+                        pending_left = Some(capture.id.clone());
                         saw_whitespace = false;
+                        scan.raw_events.insert(capture.id, capture.events);
                     } else {
                         capture.child_depth = capture.child_depth.saturating_sub(1);
                     }
@@ -1948,7 +2074,10 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
         match event {
             Event::Start(element) => {
                 let name = local_name(element.name().as_ref().as_bytes()).to_vec();
-                let id = marker_id("m", marker_ordinal);
+                // Opaque subtrees are atomic reference markers (`rN`), like
+                // empty elements; ordinary children are paired (`mN`).
+                let opaque = never_translate_element(&name);
+                let id = marker_id(if opaque { "r" } else { "m" }, marker_ordinal);
                 marker_ordinal += 1;
                 insert_pending_boundary(
                     &mut scan.boundaries,
@@ -1957,16 +2086,15 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
                     &id,
                 );
                 saw_whitespace = false;
-                if never_translate_element(&name) {
+                if opaque {
                     raw_capture = Some(RawCapture {
-                        id: id.clone(),
+                        id,
                         root_name: name,
                         child_depth: 0,
                         events: vec![event.clone()],
                     });
-                    stack.push((id, None));
                 } else {
-                    stack.push((id, Some(event.clone())));
+                    stack.push((id, event.clone()));
                 }
             }
             Event::Empty(element) => {
@@ -1989,15 +2117,13 @@ fn scan_block_events(events: &[Event<'static>]) -> Result<BlockScan> {
                 };
                 pending_left = Some(id.clone());
                 saw_whitespace = false;
-                if let Some(start) = start {
-                    scan.templates.insert(
-                        id,
-                        InlineTemplate::Paired {
-                            start,
-                            end: end.clone(),
-                        },
-                    );
-                }
+                scan.templates.insert(
+                    id,
+                    InlineTemplate::Paired {
+                        start,
+                        end: end.clone(),
+                    },
+                );
             }
             Event::Text(_)
             | Event::CData(_)
@@ -2187,19 +2313,9 @@ fn push_marked_fragment(
                     )));
                 }
                 None => {
-                    // Suppressed subtrees carry empty pairs in translations
-                    // or may be dropped entirely; either way the original
-                    // bytes are spliced back verbatim.
-                    if let Some(events) = raw_events.get(&id) {
-                        for event in events {
-                            output.push(RenderedEvent::verbatim(event.clone()));
-                        }
-                        used.insert(id);
-                    } else {
-                        return Err(BookforgeError::InvalidInput(format!(
-                            "translation contains unknown inline marker '{id}'"
-                        )));
-                    }
+                    return Err(BookforgeError::InvalidInput(format!(
+                        "translation contains unknown inline marker '{id}'"
+                    )));
                 }
             }
 
@@ -2223,9 +2339,15 @@ fn push_marked_fragment(
                     )));
                 }
                 None => {
-                    return Err(BookforgeError::InvalidInput(format!(
-                        "translation contains unknown inline marker '{id}'"
-                    )));
+                    // An opaque subtree (script/style/svg/math) is one atomic
+                    // marker; its original bytes are spliced back verbatim.
+                    let Some(events) = raw_events.get(&id) else {
+                        return Err(BookforgeError::InvalidInput(format!(
+                            "translation contains unknown inline marker '{id}'"
+                        )));
+                    };
+                    push_raw_subtree(&id, events, output);
+                    used.insert(id);
                 }
             }
 
@@ -3173,6 +3295,76 @@ mod tests {
     }
 
     #[test]
+    fn patches_whole_stray_text_across_entities_and_cdata() {
+        let xhtml =
+            "<root><p>Head</p>North &amp; South&#8217;s <![CDATA[entire line]]>.<p>Foot</p></root>";
+        let path = DomPath(vec![0, TEXT_NODE_PATH_BASE]);
+        let outcome = patch_xhtml(xhtml, &[(&path, "La riga intera.")]).unwrap();
+
+        assert_eq!(
+            outcome.xhtml,
+            "<root><p>Head</p>La riga intera.<p>Foot</p></root>"
+        );
+    }
+
+    #[test]
+    fn replaced_stray_text_keeps_its_surrounding_whitespace() {
+        let xhtml = "<root><p>Head</p> loose words <em>tail</em></root>";
+        let path = DomPath(vec![0, TEXT_NODE_PATH_BASE]);
+        let outcome = patch_xhtml(xhtml, &[(&path, "parole sciolte")]).unwrap();
+
+        assert_eq!(
+            outcome.xhtml,
+            "<root><p>Head</p> parole sciolte <em>tail</em></root>"
+        );
+    }
+
+    #[test]
+    fn appended_stray_text_keeps_the_space_before_an_inline_sibling() {
+        let block = plain_block(
+            "b_000000",
+            DomPath(vec![0, TEXT_NODE_PATH_BASE]),
+            BlockKind::Paragraph,
+            "Before",
+        );
+        let outcome = patch_xhtml_blocks_with_options(
+            "<root>Before <em>word</em></root>",
+            &[BlockPatch {
+                block: &block,
+                translation: "Prima",
+            }],
+            &append_options(BilingualMode::AppendText),
+        )
+        .unwrap();
+
+        assert!(
+            outcome.xhtml.contains("Prima</span> <em>word</em>"),
+            "appended text lost its sibling separator: {}",
+            outcome.xhtml
+        );
+        validate_xml(&outcome.xhtml).expect("append output should re-parse");
+    }
+
+    #[test]
+    fn patch_targets_that_match_nothing_are_rejected() {
+        let xhtml = "<root><p>Present</p></root>";
+        let present = DomPath(vec![0, 0]);
+        let absent = DomPath(vec![0, 7]);
+        let error = patch_xhtml(xhtml, &[(&present, "Presente"), (&absent, "Assente")])
+            .expect_err("a translation without a target must not vanish");
+        assert!(error.to_string().contains("[0, 7]"), "{error}");
+    }
+
+    #[test]
+    fn two_translations_for_one_dom_path_are_rejected() {
+        let xhtml = "<root><p>Only</p></root>";
+        let path = DomPath(vec![0, 0]);
+        let error = patch_xhtml(xhtml, &[(&path, "Uno"), (&path, "Due")])
+            .expect_err("colliding patches must not silently pick one");
+        assert!(error.to_string().contains("same DOM path"), "{error}");
+    }
+
+    #[test]
     fn validate_xml_rejects_malformed_input() {
         assert!(validate_xml("<root><p>oops</root>").is_err());
     }
@@ -3267,7 +3459,7 @@ mod tests {
             dom_path: DomPath(vec![0, 0]),
             text_runs: vec![TextRun {
                 id: "r000000_000".to_string(),
-                text: "Prima <m1></m1> dopo".to_string(),
+                text: "Prima <r1/> dopo".to_string(),
             }],
             inline_marks,
             protected_spans: Vec::new(),
@@ -3279,14 +3471,14 @@ mod tests {
     fn replace_mode_splices_suppressed_script_bytes_verbatim() {
         let xhtml = r#"<root><p>Before <script type="text/javascript">var x = 1; // keep</script> tail</p></root>"#;
         let block = raw_subtree_block(vec![InlineMark {
-            id: "m1".to_string(),
+            id: "r1".to_string(),
             kind: "script".to_string(),
         }]);
         let outcome = patch_xhtml_blocks(
             xhtml,
             &[BlockPatch {
                 block: &block,
-                translation: "Prima <m1></m1> dopo",
+                translation: "Prima <r1/> dopo",
             }],
         )
         .expect("scripted paragraph should patch");
@@ -3320,14 +3512,14 @@ mod tests {
         ] {
             let xhtml = format!("<root><p>B {inner} A</p></root>");
             let block = raw_subtree_block(vec![InlineMark {
-                id: "m1".to_string(),
+                id: "r1".to_string(),
                 kind: kind.to_string(),
             }]);
             let outcome = patch_xhtml_blocks(
                 &xhtml,
                 &[BlockPatch {
                     block: &block,
-                    translation: "Prima <m1></m1> dopo",
+                    translation: "Prima <r1/> dopo",
                 }],
             )
             .unwrap_or_else(|error| panic!("{kind} paragraph should patch: {error}"));
@@ -3344,10 +3536,61 @@ mod tests {
     }
 
     #[test]
+    fn opaque_marker_restores_the_source_space_after_a_paired_marker() {
+        let xhtml = "<root><p><em>a</em> <math><mi>x</mi></math></p></root>";
+        let block = marked_block(
+            "b_000000",
+            DomPath(vec![0, 0]),
+            BlockKind::Paragraph,
+            "<m1>a</m1> <r2/>",
+            vec![
+                InlineMark {
+                    id: "m1".to_string(),
+                    kind: "em".to_string(),
+                },
+                InlineMark {
+                    id: "r2".to_string(),
+                    kind: "math".to_string(),
+                },
+            ],
+        );
+        let outcome = patch_xhtml_blocks(
+            xhtml,
+            &[BlockPatch {
+                block: &block,
+                translation: "<m1>b</m1><r2/>",
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.skipped_blocks, 0);
+        assert!(
+            outcome.xhtml.contains("<em>b</em> <math><mi>x</mi></math>"),
+            "got: {}",
+            outcome.xhtml
+        );
+    }
+
+    #[test]
+    fn opaque_subtree_returned_as_paired_markup_is_not_a_template() {
+        let events = vec![
+            Event::Start(quick_xml::events::BytesStart::new("svg").into_owned()),
+            Event::Text(BytesText::new("label").into_owned()),
+            Event::End(BytesEnd::new("svg")),
+        ];
+        let error = marked_translation_rendered("<m1>label</m1>", &events)
+            .expect_err("an opaque subtree has no paired template");
+        assert!(
+            error.to_string().contains("unknown inline marker 'm1'"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn omitted_raw_marker_still_splices_suppressed_content_at_tail() {
         let xhtml = r#"<root><p>Before <style>p { color: red; }</style> tail</p></root>"#;
         let block = raw_subtree_block(vec![InlineMark {
-            id: "m1".to_string(),
+            id: "r1".to_string(),
             kind: "style".to_string(),
         }]);
         let outcome = patch_xhtml_blocks(
@@ -3362,7 +3605,7 @@ mod tests {
         assert_eq!(outcome.skipped_blocks, 0);
         assert!(
             outcome.xhtml.contains("<style>p { color: red; }</style>"),
-            "style bytes survive even without the marker pair, got: {}",
+            "style bytes survive even without the marker, got: {}",
             outcome.xhtml
         );
         assert!(outcome.xhtml.contains("Solo traduzione"));
