@@ -45,5 +45,5 @@ pub use provider::{
     list_elevenlabs_voices_with_cancel, resolve_preferred_elevenlabs_model_reported_with_cancel,
 };
 pub use source::{NarrationSource, NarrationSourceError, read_narration_source};
-pub use stitch::{StitchOptions, StitchReport, ffmpeg_available, stitch};
+pub use stitch::{StitchOptions, StitchReport, ffmpeg_available, stitch, stitch_with_cancel};
 pub use text::ChunkKind;

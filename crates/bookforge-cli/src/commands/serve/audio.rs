@@ -6,6 +6,18 @@ use std::io::Write;
 /// this nonce and the child adopts it instead of racing the parent's release.
 const AUDIO_LOCK_HANDOFF_ENV: &str = "BOOKFORGE_AUDIO_OUT_LOCK_HANDOFF";
 
+/// Cancellation marker inside each dashboard operation directory. The child
+/// watches it through the hidden `--cancel-file` flag.
+const AUDIO_CANCEL_MARKER: &str = ".cancel";
+
+/// How long a cancelled child may spend cancelling synthesis/encoding and
+/// removing its staged files before the dashboard force-stops its tree.
+const AUDIO_CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+pub(super) fn audio_cancel_marker(out_dir: &Path) -> PathBuf {
+    out_dir.join(AUDIO_CANCEL_MARKER)
+}
+
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/audio/voices", get(audio_voices))
@@ -155,12 +167,13 @@ async fn estimate_audiobook(
     let bytes = source.bytes;
 
     let provider = field_value(&fields, "provider").unwrap_or_else(|| "mock".to_string());
-    if !matches!(
-        provider.as_str(),
-        "mock" | "openai" | "gemini" | "elevenlabs"
-    ) {
-        return Ok(bad_request("unsupported audiobook provider"));
-    }
+    let provider_kind = match provider.as_str() {
+        "mock" => audiobook::AudioProviderKind::Mock,
+        "openai" => audiobook::AudioProviderKind::Openai,
+        "gemini" => audiobook::AudioProviderKind::Gemini,
+        "elevenlabs" => audiobook::AudioProviderKind::Elevenlabs,
+        _ => return Ok(bad_request("unsupported audiobook provider")),
+    };
     let model = field_value(&fields, "model").unwrap_or_else(|| match provider.as_str() {
         "openai" => "gpt-4o-mini-tts".to_string(),
         "gemini" => "gemini-3.1-flash-tts-preview".to_string(),
@@ -188,32 +201,21 @@ async fn estimate_audiobook(
         None => None,
     };
 
+    let plan_model = model.clone();
     let plan_result = tokio::task::spawn_blocking(move || -> Result<(usize, usize, usize)> {
         let temp = PrivateTempDir::create().context("failed to create a private temp directory")?;
         let plan_path = temp.path.join("book.epub");
         write_private_file(&plan_path, &bytes)?;
         let scratch_dir = temp.path.clone();
         contain_epub_parser_panics(move || {
-            // AUDIO-7 parity: estimates preprocess through the exact launcher
-            // pipeline (PDF-cleanup reflow -> read -> PDF page grouping), so
-            // PDF-derived books stop quoting different chapter/chunk counts
-            // than the launches they precede. Also lets the panic guard clean
-            // up any staged EPUB the shared pipeline leaves behind.
-            let narration = bookforge_audio::read_narration_source(&plan_path, &scratch_dir)?;
-            let options = bookforge_audio::AudiobookOptions {
+            plan_audiobook_estimate(
+                &plan_path,
+                &scratch_dir,
+                provider_kind,
+                &plan_model,
                 max_chars,
                 chapter_filter,
-                pdf_page_grouping: narration.pdf_page_grouping,
-                ..bookforge_audio::AudiobookOptions::default()
-            };
-            let plan = bookforge_audio::plan_chunks(&narration.book, &options);
-            let chapters = plan
-                .iter()
-                .map(|chunk| chunk.chapter_index)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len();
-            let characters = plan.iter().map(|chunk| chunk.chars).sum();
-            Ok((chapters, plan.len(), characters))
+            )
         })
     })
     .await;
@@ -258,13 +260,62 @@ async fn estimate_audiobook(
                 json!({
                     "remaining": remaining,
                     "limit": subscription.character_limit,
-                    "fits": characters as u128 <= remaining as u128,
+                    "fits": audiobook::elevenlabs_quota_fits(
+                        characters,
+                        cost.and_then(|value| value.credits),
+                        remaining,
+                    ),
                 }),
             );
         }
     }
 
     Ok(Json(payload).into_response())
+}
+
+/// Plan an estimate exactly the way a dashboard launch narrates the book.
+///
+/// AUDIO-7 parity: the input goes through the shared launcher pipeline
+/// (PDF-cleanup reflow, read, PDF page grouping), so PDF-derived books quote
+/// the same chapter and chunk counts as the launch they precede. Dashboard
+/// launches use the CLI's default `--break-tags auto` policy, so an explicit
+/// model's heading break tags are counted too. An ElevenLabs Auto estimate
+/// has no model yet and therefore no tags; it stays provisional until model
+/// discovery runs.
+pub(super) fn plan_audiobook_estimate(
+    input: &Path,
+    scratch_dir: &Path,
+    provider: audiobook::AudioProviderKind,
+    model: &str,
+    max_chars: usize,
+    chapter_filter: Option<std::collections::BTreeSet<usize>>,
+) -> Result<(usize, usize, usize)> {
+    let narration = bookforge_audio::read_narration_source(input, scratch_dir)?;
+    let options = bookforge_audio::AudiobookOptions {
+        max_chars,
+        chapter_filter,
+        pdf_page_grouping: narration.pdf_page_grouping,
+        heading_break_tag: audiobook::resolve_heading_break_tag(
+            provider,
+            model,
+            audiobook::BreakTagsArg::Auto,
+        ),
+        ..bookforge_audio::AudiobookOptions::default()
+    };
+    // The launched CLI rejects these options before synthesis; the estimate
+    // must refuse them too instead of quoting a plan that can never run.
+    bookforge_audio::validate_options(&options)?;
+    let plan = bookforge_audio::plan_chunks(&narration.book, &options);
+    if plan.is_empty() {
+        anyhow::bail!("no narratable text found (cover-only or empty book?)");
+    }
+    let chapters = plan
+        .iter()
+        .map(|chunk| chunk.chapter_index)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let characters = plan.iter().map(|chunk| chunk.chars).sum();
+    Ok((chapters, plan.len(), characters))
 }
 
 async fn fetch_dashboard_elevenlabs_subscription(
@@ -646,6 +697,9 @@ async fn launch_audiobook(
         api_key_env,
         &advanced,
     ));
+    command
+        .arg("--cancel-file")
+        .arg(audio_cancel_marker(&out_dir));
     configure_dashboard_child_environment(&mut command, api_key_env.zip(key.as_deref()));
     configure_audio_child_process_group(&mut command);
     // Hand the output lock to the child before it can exist: rewrite the
@@ -1224,12 +1278,46 @@ mod audio_process_signals {
     }
 }
 
+/// Cancel a running dashboard audiobook child.
+///
+/// The child is first asked to stop through its cancellation marker, which
+/// lets it cancel synthesis and ffmpeg, remove staged output, and checkpoint
+/// its manifest. If it has not exited after `grace`, its process tree is
+/// force-stopped. The marker is removed either way so a later retry in the
+/// same operation directory does not start out cancelled.
+pub(super) async fn cancel_running_audiobook(
+    child: &mut tokio::process::Child,
+    marker: &Path,
+    grace: Duration,
+) -> Result<()> {
+    let requested = tokio::fs::write(marker, b"cancel\n").await.is_ok();
+    let cooperative = if requested {
+        tokio::time::timeout(grace, child.wait()).await.ok()
+    } else {
+        None
+    };
+    let result = match cooperative {
+        Some(status) => status
+            .map(|_| ())
+            .context("waiting for cooperative audiobook cancellation"),
+        None => {
+            terminate_audio_child_tree(child).await;
+            Ok(())
+        }
+    };
+    let _ = tokio::fs::remove_file(marker).await;
+    result
+}
+
 async fn terminate_audio_child_tree(child: &mut tokio::process::Child) {
     let pid = child.id();
     #[cfg(windows)]
     if let Some(pid) = pid {
         let _ = tokio::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .await;
     }
@@ -1415,52 +1503,138 @@ async fn audiobook_artifact(
     }
 }
 
-fn ensure_audio_download_zip(out_dir: &std::path::Path) -> Result<PathBuf> {
+const AUDIO_DOWNLOAD_ZIP: &str = "audiobook-audio.zip";
+
+/// Build (or reuse) the per-chunk download archive.
+///
+/// The archive embeds the exact `manifest.json` bytes it was built from, so a
+/// cached ZIP is reused only while it matches the current manifest; any
+/// manifest revision (a resumed run, a retry, a new checkpoint) rebuilds it.
+/// Each build writes a private stage and publishes atomically, so concurrent
+/// downloads never read or clobber another request's partial archive.
+pub(super) fn ensure_audio_download_zip(out_dir: &std::path::Path) -> Result<PathBuf> {
     use std::io::{Read, Write};
 
-    let archive_path = out_dir.join("audiobook-audio.zip");
-    if archive_path.is_file() {
+    let archive_path = out_dir.join(AUDIO_DOWNLOAD_ZIP);
+    let manifest_path = out_dir.join("manifest.json");
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    if audio_archive_matches_manifest(&archive_path, &manifest_bytes) {
         return Ok(archive_path);
     }
-    let manifest_path = out_dir.join("manifest.json");
-    let manifest: bookforge_audio::AudiobookManifest = serde_json::from_slice(
-        &std::fs::read(&manifest_path)
-            .with_context(|| format!("failed to read {}", manifest_path.display()))?,
-    )?;
-    let staged = out_dir.join("audiobook-audio.zip.tmp");
-    let _ = std::fs::remove_file(&staged);
-    let file = std::fs::File::create(&staged)?;
-    let mut archive = zip::ZipWriter::new(file);
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    archive.start_file("manifest.json", options)?;
-    archive.write_all(&std::fs::read(&manifest_path)?)?;
-    for chunk in &manifest.chunks {
-        let name = std::path::Path::new(&chunk.file);
-        if name.file_name().and_then(|value| value.to_str()) != Some(chunk.file.as_str()) {
-            anyhow::bail!("unsafe audio filename in manifest");
+    let manifest: bookforge_audio::AudiobookManifest = serde_json::from_slice(&manifest_bytes)?;
+    let built = write_audio_artifact(out_dir, AUDIO_DOWNLOAD_ZIP, |file| {
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        archive.start_file("manifest.json", options)?;
+        archive.write_all(&manifest_bytes)?;
+        for chunk in &manifest.chunks {
+            let name = std::path::Path::new(&chunk.file);
+            if name.file_name().and_then(|value| value.to_str()) != Some(chunk.file.as_str()) {
+                anyhow::bail!("unsafe audio filename in manifest");
+            }
+            let source = out_dir.join(&chunk.file);
+            let mut source_file = std::fs::File::open(&source)
+                .with_context(|| format!("failed to read audio part {}", source.display()))?;
+            archive.start_file(&chunk.file, options)?;
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = source_file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                archive.write_all(&buffer[..read])?;
+            }
         }
-        let source = out_dir.join(&chunk.file);
-        let mut source_file = std::fs::File::open(&source)
-            .with_context(|| format!("failed to read audio part {}", source.display()))?;
-        archive.start_file(&chunk.file, options)?;
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let read = source_file.read(&mut buffer)?;
-            if read == 0 {
+        archive.finish()?;
+        Ok(())
+    });
+    match built {
+        Ok(()) => Ok(archive_path),
+        // A concurrent request may have published the same archive while this
+        // one could not replace it (for example, a reader holds it open).
+        Err(_) if audio_archive_matches_manifest(&archive_path, &manifest_bytes) => {
+            Ok(archive_path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// True when `path` is a readable ZIP whose `manifest.json` entry is exactly
+/// `expected`.
+fn audio_archive_matches_manifest(path: &Path, expected: &[u8]) -> bool {
+    use std::io::Read;
+
+    let read_manifest = || -> Result<Vec<u8>> {
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+        let mut actual = Vec::new();
+        archive
+            .by_name("manifest.json")?
+            .take(expected.len() as u64 + 1)
+            .read_to_end(&mut actual)?;
+        Ok(actual)
+    };
+    read_manifest().is_ok_and(|actual| actual == expected)
+}
+
+/// Publish one dashboard-owned file in `out_dir` from a stage only this
+/// writer owns.
+///
+/// The stage is created exclusively under a unique `*.part.tmp` name (which
+/// `--prune` sweeps recognize as crash debris), written and synced by
+/// `write`, then atomically replaces `name`. On any failure the stage is
+/// removed and the previously published file, and every other writer's stage,
+/// is left untouched.
+pub(super) fn write_audio_artifact(
+    out_dir: &Path,
+    name: &str,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let mut staged = None;
+    for _ in 0..32 {
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = out_dir.join(format!(
+            ".{name}.{}-{sequence}.part.tmp",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                staged = Some((path, file));
                 break;
             }
-            archive.write_all(&buffer[..read])?;
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(anyhow::Error::from(error)
+                    .context(format!("failed to stage {}", path.display())));
+            }
         }
     }
-    archive.finish()?;
-    if let Err(error) = std::fs::rename(&staged, &archive_path) {
-        let _ = std::fs::remove_file(&staged);
-        if !archive_path.is_file() {
-            return Err(error.into());
-        }
+    let (staged_path, mut file) =
+        staged.with_context(|| format!("could not create a private stage for {name}"))?;
+    let written = write(&mut file).and_then(|()| file.sync_all().map_err(Into::into));
+    // Close the handle before publication: Windows cannot replace a
+    // destination from a file that is still open.
+    drop(file);
+    let destination = out_dir.join(name);
+    let result = written.and_then(|()| {
+        bookforge_audio::replace_file(&staged_path, &destination)
+            .with_context(|| format!("failed to publish {}", destination.display()))
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged_path);
+        return result;
     }
-    Ok(archive_path)
+    #[cfg(unix)]
+    std::fs::File::open(out_dir)?.sync_all()?;
+    Ok(())
 }
 
 pub(super) fn valid_audiobook_id(id: &str) -> bool {
@@ -1497,8 +1671,19 @@ fn register_audio_cancellation(
                 Err(error) => ("failed", Some(format!("could not wait for audiobook process: {error}"))),
             },
             _ = cancel.cancelled() => {
-                terminate_audio_child_tree(&mut child).await;
-                ("cancelled", None)
+                match cancel_running_audiobook(
+                    &mut child,
+                    &audio_cancel_marker(&out_dir),
+                    AUDIO_CANCEL_GRACE,
+                )
+                .await
+                {
+                    Ok(()) => ("cancelled", None),
+                    Err(error) => (
+                        "failed",
+                        Some(format!("could not cancel audiobook process: {error:#}")),
+                    ),
+                }
             }
         };
         let _ = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1552,7 +1737,7 @@ fn register_audio_cancellation(
     });
 }
 
-fn write_audio_process_state(
+pub(super) fn write_audio_process_state(
     out_dir: &std::path::Path,
     status: &str,
     pid: Option<u32>,
@@ -1561,12 +1746,6 @@ fn write_audio_process_state(
     options: Option<&serde_json::Value>,
 ) -> Result<()> {
     let path = out_dir.join("process.json");
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let temp = out_dir.join(format!(
-        ".process-{}-{sequence}.part.tmp",
-        std::process::id()
-    ));
     let previous = std::fs::read(&path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
@@ -1600,23 +1779,12 @@ fn write_audio_process_state(
         object.insert("options".to_string(), options);
     }
     let bytes = serde_json::to_vec_pretty(&process)?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)?;
-    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
-        drop(file);
-        let _ = std::fs::remove_file(&temp);
-        return Err(error.into());
-    }
-    drop(file);
-    if let Err(error) = bookforge_audio::replace_file(&temp, &path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error.into());
-    }
-    #[cfg(unix)]
-    std::fs::File::open(out_dir)?.sync_all()?;
-    Ok(())
+    // A failed replacement keeps the previous process.json readable, so the
+    // dashboard never loses the last durable state of an operation.
+    write_audio_artifact(out_dir, "process.json", |file| {
+        file.write_all(&bytes)?;
+        Ok(())
+    })
 }
 
 fn write_audio_process_state_if_owner(
@@ -2788,6 +2956,22 @@ async fn retry_failed_chunks(
         &prepared.advanced,
     ));
     command.arg("--retry-failed");
+    // A marker left behind by an interrupted earlier cancel would cancel this
+    // retry on start; the operation lock is held, so no live run owns it.
+    let cancel_marker = audio_cancel_marker(&prepared.out_dir);
+    match std::fs::remove_file(&cancel_marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::Error::from(error)
+                .context(format!(
+                    "could not clear the stale cancellation marker {}",
+                    cancel_marker.display()
+                ))
+                .into());
+        }
+    }
+    command.arg("--cancel-file").arg(&cancel_marker);
     configure_dashboard_child_environment(&mut command, api_key_env.zip(key.as_deref()));
     configure_audio_child_process_group(&mut command);
 

@@ -7,6 +7,11 @@
 //! and reaped exactly like the PDF crate's poppler handling, and the failure
 //! surfaces as a normal stitch warning instead of hanging the run forever.
 //!
+//! Cancellation: [`stitch_with_cancel`] polls a [`CancellationToken`] in the
+//! same wait loop. A cancelled run kills and reaps the owned child, removes
+//! that step's staged output, never publishes it, and leaves completed chunks
+//! and previously published artifacts untouched.
+//!
 //! Loudness normalization and chapter markers (AUDIO-12/AUDIO-13): the
 //! historical single pass concatenated everything, applied `loudnorm` once,
 //! and computed chapter starts from *pre-normalization* chapter durations;
@@ -29,6 +34,10 @@ use std::time::{Duration, Instant};
 use crate::builder::{AudiobookManifest, ChunkRecord};
 use crate::text::ChunkKind;
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
+
+/// Warning recorded once when a stitch stops because it was cancelled.
+const STITCH_CANCELLED_WARNING: &str = "audiobook stitching cancelled";
 
 #[derive(Debug, Clone)]
 pub struct StitchOptions {
@@ -110,6 +119,10 @@ fn ffprobe_command() -> Command {
 }
 
 fn tool_available(tool: &str) -> bool {
+    tool_available_with_cancel(tool, &CancellationToken::new())
+}
+
+fn tool_available_with_cancel(tool: &str, cancel: &CancellationToken) -> bool {
     let mut command = Command::new(tool);
     if tool == "ffmpeg" {
         // ffmpeg honours (and audio flows require) -nostdin; see
@@ -118,7 +131,7 @@ fn tool_available(tool: &str) -> bool {
     }
     command.arg("-version");
     matches!(
-        run_tool_with_deadline(command, TOOL_PROBE_TIMEOUT),
+        run_tool_with_deadline(command, TOOL_PROBE_TIMEOUT, cancel),
         Some(output) if output.status.success()
     )
 }
@@ -131,6 +144,7 @@ struct ToolOutput {
 enum WaitOutcome {
     Finished(Result<ExitStatus, std::io::Error>),
     TimedOut,
+    Cancelled,
 }
 
 struct ChildGuard {
@@ -150,13 +164,19 @@ impl ChildGuard {
         self.child.as_mut()?.stderr.take()
     }
 
-    fn wait_with_deadline(&mut self, timeout: Duration) -> WaitOutcome {
+    fn wait_with_deadline(&mut self, timeout: Duration, cancel: &CancellationToken) -> WaitOutcome {
         let started = Instant::now();
         loop {
             match self.child() {
                 Ok(None) => {}
                 Ok(Some(status)) => return WaitOutcome::Finished(Ok(status)),
                 Err(error) => return WaitOutcome::Finished(Err(error)),
+            }
+            if cancel.is_cancelled() {
+                // Same kill + reap as a deadline: the child never outlives
+                // the stitch that owns it.
+                self.kill_and_reap();
+                return WaitOutcome::Cancelled;
             }
             if started.elapsed() >= timeout {
                 // AUDIO-5: kill + reap on expiry so no zombie and no hang.
@@ -212,9 +232,17 @@ impl Drop for ChildGuard {
 }
 
 /// Spawn with piped stdio (plus null stdin), capture bounded stdout/stderr,
-/// and enforce `timeout` via kill+reap. Returns `None` for spawn failures and
-/// timeouts alike; callers decide how a silent loss degrades.
-fn run_tool_with_deadline(mut command: Command, timeout: Duration) -> Option<ToolOutput> {
+/// and enforce `timeout` and `cancel` via kill+reap. Returns `None` for spawn
+/// failures, timeouts, and cancellation alike; callers decide how a silent
+/// loss degrades.
+fn run_tool_with_deadline(
+    mut command: Command,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Option<ToolOutput> {
+    if cancel.is_cancelled() {
+        return None;
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -253,10 +281,10 @@ fn run_tool_with_deadline(mut command: Command, timeout: Duration) -> Option<Too
         }
         bytes
     });
-    let wait = guard.wait_with_deadline(timeout);
+    let wait = guard.wait_with_deadline(timeout, cancel);
     let _ = stderr_reader.join();
     match wait {
-        WaitOutcome::TimedOut => None,
+        WaitOutcome::TimedOut | WaitOutcome::Cancelled => None,
         WaitOutcome::Finished(result) => result.ok().map(|status| ToolOutput {
             status,
             stdout: outcome.join().unwrap_or_default(),
@@ -265,6 +293,36 @@ fn run_tool_with_deadline(mut command: Command, timeout: Duration) -> Option<Too
 }
 
 pub fn stitch(manifest: &AudiobookManifest, options: &StitchOptions) -> StitchReport {
+    stitch_with_cancel(manifest, options, &CancellationToken::new())
+}
+
+/// [`stitch`], stopping owned ffmpeg/ffprobe children when `cancel` fires.
+///
+/// A cancelled stitch records [`STITCH_CANCELLED_WARNING`], removes the
+/// staged output of the step it interrupted, and publishes nothing further;
+/// chapter files and books published by earlier steps or earlier runs stay.
+pub fn stitch_with_cancel(
+    manifest: &AudiobookManifest,
+    options: &StitchOptions,
+    cancel: &CancellationToken,
+) -> StitchReport {
+    let mut report = stitch_until_cancelled(manifest, options, cancel);
+    if cancel.is_cancelled()
+        && !report
+            .warnings
+            .iter()
+            .any(|warning| warning == STITCH_CANCELLED_WARNING)
+    {
+        report.warnings.push(STITCH_CANCELLED_WARNING.to_string());
+    }
+    report
+}
+
+fn stitch_until_cancelled(
+    manifest: &AudiobookManifest,
+    options: &StitchOptions,
+    cancel: &CancellationToken,
+) -> StitchReport {
     let mut report = StitchReport::default();
     // AUDIO-12: loudnorm only ever applies inside M4B / single-file assembly;
     // surfacing the no-op here keeps per-chapter-only stitches honest even
@@ -302,10 +360,15 @@ pub fn stitch(manifest: &AudiobookManifest, options: &StitchOptions) -> StitchRe
         ));
         return report;
     }
-    if !ffmpeg_available() {
-        report.warnings.push(
-            "ffmpeg not found on PATH; skipped stitching (per-chunk files are intact)".into(),
-        );
+    if cancel.is_cancelled() {
+        return report;
+    }
+    if !tool_available_with_cancel("ffmpeg", cancel) {
+        if !cancel.is_cancelled() {
+            report.warnings.push(
+                "ffmpeg not found on PATH; skipped stitching (per-chunk files are intact)".into(),
+            );
+        }
         return report;
     }
 
@@ -322,11 +385,12 @@ pub fn stitch(manifest: &AudiobookManifest, options: &StitchOptions) -> StitchRe
             .map(|part| options.out_dir.join(&part.file));
         match first_chunk
             .as_deref()
-            .and_then(probe_audio_params)
+            .and_then(|path| probe_audio_params(path, cancel))
             .and_then(|(rate, channels)| {
-                prepare_silence_files(options, rate, channels, &mut silence_files).ok()
+                prepare_silence_files(options, rate, channels, &mut silence_files, cancel).ok()
             }) {
             Some(prepared) => gaps = prepared,
+            None if cancel.is_cancelled() => {}
             None => report.warnings.push(
                 "ffprobe could not determine audio parameters or silence generation failed; stitching without gaps"
                     .to_string(),
@@ -335,6 +399,9 @@ pub fn stitch(manifest: &AudiobookManifest, options: &StitchOptions) -> StitchRe
     }
 
     for (chapter_index, parts) in &chapters {
+        if cancel.is_cancelled() {
+            break;
+        }
         let title = parts
             .first()
             .map(|part| part.chapter_title.clone())
@@ -346,8 +413,9 @@ pub fn stitch(manifest: &AudiobookManifest, options: &StitchOptions) -> StitchRe
             sanitize_filename(&title),
             options.extension
         );
-        match concat_copy(&options.out_dir, &entries, &output_name) {
+        match concat_copy(&options.out_dir, &entries, &output_name, cancel) {
             Ok(()) => report.chapter_files.push(options.out_dir.join(output_name)),
+            Err(_) if cancel.is_cancelled() => break,
             Err(error) => report
                 .warnings
                 .push(format!("chapter {}: {error}", chapter_index + 1)),
@@ -355,27 +423,31 @@ pub fn stitch(manifest: &AudiobookManifest, options: &StitchOptions) -> StitchRe
     }
 
     let all_chapters = report.chapter_files.len() == chapters.len();
-    if (options.make_m4b || options.make_single) && !all_chapters {
+    // A cancelled chapter pass never proceeds to book assembly.
+    let assemble = !cancel.is_cancelled();
+    if assemble && (options.make_m4b || options.make_single) && !all_chapters {
         report.warnings.push(format!(
             "only {}/{} chapters stitched successfully; skipped book assembly to avoid an incomplete audiobook",
             report.chapter_files.len(),
             chapters.len()
         ));
-    } else {
+    } else if assemble {
         if options.make_m4b {
-            match assemble_m4b(options, &chapters, &report.chapter_files, &gaps) {
+            match assemble_m4b(options, &chapters, &report.chapter_files, &gaps, cancel) {
                 Ok((path, cover_warning)) => {
                     report.book_file = Some(path);
                     if let Some(warning) = cover_warning {
                         report.warnings.push(warning);
                     }
                 }
+                Err(_) if cancel.is_cancelled() => {}
                 Err(error) => report.warnings.push(error),
             }
         }
-        if options.make_single {
-            match assemble_single_file(options, &report.chapter_files, &gaps) {
+        if options.make_single && !cancel.is_cancelled() {
+            match assemble_single_file(options, &report.chapter_files, &gaps, cancel) {
                 Ok(path) => report.single_file = Some(path),
+                Err(_) if cancel.is_cancelled() => {}
                 Err(error) => report.warnings.push(error),
             }
         }
@@ -392,6 +464,7 @@ fn prepare_silence_files(
     rate: u32,
     channels: u16,
     generated: &mut Vec<PathBuf>,
+    cancel: &CancellationToken,
 ) -> std::result::Result<ConcatGaps, String> {
     let mut cache = BTreeMap::<u32, String>::new();
     for ms in [
@@ -402,7 +475,14 @@ fn prepare_silence_files(
         if ms == 0 || cache.contains_key(&ms) {
             continue;
         }
-        let path = ensure_silence_file(&options.out_dir, ms, &options.extension, rate, channels)?;
+        let path = ensure_silence_file(
+            &options.out_dir,
+            ms,
+            &options.extension,
+            rate,
+            channels,
+            cancel,
+        )?;
         generated.push(path.clone());
         cache.insert(ms, file_name_of(&path));
     }
@@ -468,7 +548,12 @@ fn build_book_concat_entries(chapter_files: &[PathBuf], gap: Option<&str>) -> Ve
     entries
 }
 
-fn concat_copy(dir: &Path, inputs: &[String], output: &str) -> std::result::Result<(), String> {
+fn concat_copy(
+    dir: &Path,
+    inputs: &[String],
+    output: &str,
+    cancel: &CancellationToken,
+) -> std::result::Result<(), String> {
     let list_name = format!("{output}.concat.txt");
     let list_path = dir.join(&list_name);
     std::fs::write(&list_path, concat_list_content(inputs))
@@ -483,7 +568,8 @@ fn concat_copy(dir: &Path, inputs: &[String], output: &str) -> std::result::Resu
         .arg(&list_name)
         .args(["-c", "copy"])
         .arg(&staged_name);
-    let result = run_ffmpeg_transactional(&mut command, &staged, &output_path, "ffmpeg concat");
+    let result =
+        run_ffmpeg_transactional(&mut command, &staged, &output_path, "ffmpeg concat", cancel);
     let _ = std::fs::remove_file(&list_path);
     result
 }
@@ -493,9 +579,13 @@ fn assemble_m4b(
     chapters: &[(usize, Vec<ChunkRecord>)],
     chapter_files: &[PathBuf],
     gaps: &ConcatGaps,
+    cancel: &CancellationToken,
 ) -> std::result::Result<(PathBuf, Option<String>), String> {
     if chapter_files.is_empty() {
         return Err("no chapter files were produced; cannot assemble m4b".into());
+    }
+    if cancel.is_cancelled() {
+        return Err("ffmpeg m4b assembly cancelled".into());
     }
     let list_name = "book.concat.txt";
     let meta_name = "chapters.ffmeta.txt";
@@ -506,7 +596,8 @@ fn assemble_m4b(
         // from those intermediates drive the chapter table, so markers match
         // the published audio even though single-pass loudnorm resamples.
         let (concat_sources, durations) = if options.loudnorm {
-            match normalize_chapters_for_timings(options, chapter_files, &mut intermediates) {
+            match normalize_chapters_for_timings(options, chapter_files, &mut intermediates, cancel)
+            {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     return Err(format!(
@@ -517,7 +608,7 @@ fn assemble_m4b(
         } else {
             let durations = chapter_files
                 .iter()
-                .map(|path| ffprobe_duration_ms(path))
+                .map(|path| ffprobe_duration_ms(path, cancel))
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| {
                     "chapter metadata was skipped because ffprobe could not determine every chapter duration; skipped m4b assembly rather than publishing an unchaptered book"
@@ -608,12 +699,20 @@ fn assemble_m4b(
         args.push(file_name_of(&staged));
         let mut command = ffmpeg_command();
         command.current_dir(&options.out_dir).args(&args);
-        match run_ffmpeg_transactional(&mut command, &staged, &output_path, "ffmpeg m4b assembly") {
+        match run_ffmpeg_transactional(
+            &mut command,
+            &staged,
+            &output_path,
+            "ffmpeg m4b assembly",
+            cancel,
+        ) {
             Ok(()) => Ok((output_path, None)),
-            Err(cover_error) if options.cover_path.is_some() => {
+            // A cancelled encode is not a cover problem; never retry it.
+            Err(cover_error) if options.cover_path.is_some() && !cancel.is_cancelled() => {
                 let mut fallback_options = options.clone();
                 fallback_options.cover_path = None;
-                let (path, _) = assemble_m4b(&fallback_options, chapters, chapter_files, gaps)?;
+                let (path, _) =
+                    assemble_m4b(&fallback_options, chapters, chapter_files, gaps, cancel)?;
                 Ok((
                     path,
                     Some(format!(
@@ -645,9 +744,10 @@ fn normalize_chapters_for_timings(
     options: &StitchOptions,
     chapter_files: &[PathBuf],
     sink: &mut Vec<PathBuf>,
+    cancel: &CancellationToken,
 ) -> std::result::Result<(Vec<PathBuf>, Vec<u64>), String> {
     for (index, path) in chapter_files.iter().enumerate() {
-        let (rate, channels) = probe_audio_params(path)
+        let (rate, channels) = probe_audio_params(path, cancel)
             .ok_or_else(|| format!("ffprobe could not read {} parameters", file_name_of(path)))?;
         let intermediate_path = options.out_dir.join(format!(
             ".normalized-chapter-{index:03}-{rate}-{channels}.wav"
@@ -673,12 +773,13 @@ fn normalize_chapters_for_timings(
             &staged,
             &intermediate_path,
             "ffmpeg per-chapter loudness normalization",
+            cancel,
         )?;
         sink.push(intermediate_path);
     }
     let durations = sink
         .iter()
-        .map(|path| ffprobe_duration_ms(path))
+        .map(|path| ffprobe_duration_ms(path, cancel))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| {
             "ffprobe could not determine post-normalization chapter durations".to_string()
@@ -690,6 +791,7 @@ fn assemble_single_file(
     options: &StitchOptions,
     chapter_files: &[PathBuf],
     gaps: &ConcatGaps,
+    cancel: &CancellationToken,
 ) -> std::result::Result<PathBuf, String> {
     if options.extension.eq_ignore_ascii_case("pcm") {
         return Err("cannot assemble a single pcm file; choose a container format".to_string());
@@ -722,6 +824,7 @@ fn assemble_single_file(
         &staged,
         &output_path,
         "ffmpeg single-file assembly",
+        cancel,
     );
     let _ = std::fs::remove_file(options.out_dir.join(list_name));
     result.map(|()| output_path)
@@ -802,8 +905,16 @@ fn run_ffmpeg_transactional(
     staged: &Path,
     final_path: &Path,
     context: &str,
+    cancel: &CancellationToken,
 ) -> std::result::Result<(), String> {
-    run_ffmpeg_transactional_with_timeout(command, staged, final_path, context, FFMPEG_TIMEOUT)
+    run_ffmpeg_transactional_with_timeout(
+        command,
+        staged,
+        final_path,
+        context,
+        FFMPEG_TIMEOUT,
+        cancel,
+    )
 }
 
 fn run_ffmpeg_transactional_with_timeout(
@@ -812,8 +923,9 @@ fn run_ffmpeg_transactional_with_timeout(
     final_path: &Path,
     context: &str,
     timeout: Duration,
+    cancel: &CancellationToken,
 ) -> std::result::Result<(), String> {
-    let result = run_ffmpeg_with_timeout(command, context, timeout);
+    let result = run_ffmpeg_with_timeout(command, context, timeout, cancel);
     if let Err(error) = result {
         let _ = std::fs::remove_file(staged);
         return Err(error);
@@ -823,6 +935,12 @@ fn run_ffmpeg_transactional_with_timeout(
             "{context} exited successfully but did not create {}",
             staged.display()
         ));
+    }
+    // A cancel that lands after a successful encode still wins: the run was
+    // asked to stop, so the new output is discarded and the old one kept.
+    if cancel.is_cancelled() {
+        let _ = std::fs::remove_file(staged);
+        return Err(format!("{context} cancelled"));
     }
     if let Err(error) = publish_staged_file(staged, final_path) {
         let _ = std::fs::remove_file(staged);
@@ -891,7 +1009,11 @@ fn run_ffmpeg_with_timeout(
     command: &mut Command,
     context: &str,
     timeout: Duration,
+    cancel: &CancellationToken,
 ) -> std::result::Result<(), String> {
+    if cancel.is_cancelled() {
+        return Err(format!("{context} cancelled"));
+    }
     // AUDIO-5: a null stdin plus the hard deadline turn a wedged encode
     // into a bounded, reported failure instead of an eternal hang.
     command.stdin(Stdio::null());
@@ -909,13 +1031,17 @@ fn run_ffmpeg_with_timeout(
         .ok_or_else(|| format!("capturing {context} stderr failed"))?;
     let stderr_reader = std::thread::spawn(move || bounded_stderr_tail(stderr));
     let mut guard = ChildGuard::new(child);
-    match guard.wait_with_deadline(timeout) {
+    match guard.wait_with_deadline(timeout, cancel) {
         WaitOutcome::TimedOut => {
             let _ = stderr_reader.join();
             Err(format!(
                 "{context} did not finish within {} seconds and was terminated",
                 timeout.as_secs()
             ))
+        }
+        WaitOutcome::Cancelled => {
+            let _ = stderr_reader.join();
+            Err(format!("{context} cancelled"))
         }
         WaitOutcome::Finished(result) => {
             let status = result.map_err(|error| format!("waiting for {context}: {error}"))?;
@@ -978,7 +1104,7 @@ fn publish_staged_file(staged: &Path, final_path: &Path) -> std::result::Result<
         .map_err(|error| format!("publishing ffmpeg output {}: {error}", final_path.display()))
 }
 
-fn probe_audio_params(path: &Path) -> Option<(u32, u16)> {
+fn probe_audio_params(path: &Path, cancel: &CancellationToken) -> Option<(u32, u16)> {
     let mut command = ffprobe_command();
     command.args([
         "-v",
@@ -991,7 +1117,7 @@ fn probe_audio_params(path: &Path) -> Option<(u32, u16)> {
         "json",
     ]);
     command.arg(path);
-    let output = run_tool_with_deadline(command, FFPROBE_TIMEOUT)?;
+    let output = run_tool_with_deadline(command, FFPROBE_TIMEOUT, cancel)?;
     if !output.status.success() {
         return None;
     }
@@ -1018,6 +1144,7 @@ fn ensure_silence_file(
     extension: &str,
     rate: u32,
     channels: u16,
+    cancel: &CancellationToken,
 ) -> std::result::Result<PathBuf, String> {
     let encoder = match extension.to_ascii_lowercase().as_str() {
         "mp3" => "libmp3lame",
@@ -1031,7 +1158,7 @@ fn ensure_silence_file(
     // would feed mismatched silence into a `-c copy` concat.
     let output_name = format!("silence-{ms}-{rate}-{channels}.{extension}");
     let output_path = out_dir.join(&output_name);
-    if output_path.is_file() && silence_file_is_valid(&output_path, ms, rate, channels) {
+    if output_path.is_file() && silence_file_is_valid(&output_path, ms, rate, channels, cancel) {
         return Ok(output_path);
     }
     let channel_layout = if channels == 1 { "mono" } else { "stereo" };
@@ -1056,24 +1183,31 @@ fn ensure_silence_file(
         &staged,
         &output_path,
         "ffmpeg silence generation",
+        cancel,
     )?;
     Ok(output_path)
 }
 
-fn silence_file_is_valid(path: &Path, expected_ms: u32, rate: u32, channels: u16) -> bool {
+fn silence_file_is_valid(
+    path: &Path,
+    expected_ms: u32,
+    rate: u32,
+    channels: u16,
+    cancel: &CancellationToken,
+) -> bool {
     if std::fs::metadata(path).map_or(true, |metadata| metadata.len() == 0) {
         return false;
     }
-    if probe_audio_params(path) != Some((rate, channels)) {
+    if probe_audio_params(path, cancel) != Some((rate, channels)) {
         return false;
     }
-    let Some(duration_ms) = ffprobe_duration_ms(path) else {
+    let Some(duration_ms) = ffprobe_duration_ms(path, cancel) else {
         return false;
     };
     duration_ms.abs_diff(u64::from(expected_ms)) <= u64::from((expected_ms / 5).max(100))
 }
 
-fn ffprobe_duration_ms(path: &Path) -> Option<u64> {
+fn ffprobe_duration_ms(path: &Path, cancel: &CancellationToken) -> Option<u64> {
     let mut command = ffprobe_command();
     command.args([
         "-v",
@@ -1084,7 +1218,7 @@ fn ffprobe_duration_ms(path: &Path) -> Option<u64> {
         "default=nokey=1:noprint_wrappers=1",
     ]);
     command.arg(path);
-    let output = run_tool_with_deadline(command, FFPROBE_TIMEOUT)?;
+    let output = run_tool_with_deadline(command, FFPROBE_TIMEOUT, cancel)?;
     if !output.status.success() {
         return None;
     }
@@ -1609,8 +1743,14 @@ mod tests {
             command
         };
 
-        let error = run_ffmpeg_transactional(&mut command, &staged, &final_path, "test ffmpeg")
-            .unwrap_err();
+        let error = run_ffmpeg_transactional(
+            &mut command,
+            &staged,
+            &final_path,
+            "test ffmpeg",
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
         assert!(error.contains("diagnostic-from-ffmpeg"), "{error}");
         assert_eq!(std::fs::read(&final_path).unwrap(), b"previous-good-output");
         assert!(!staged.exists());
@@ -1652,8 +1792,14 @@ mod tests {
         let chapters = vec![(0, vec![chunk(0, 1, ChunkKind::Title)])];
         let missing = dir.path().join("missing-chapter.wav");
 
-        let warning =
-            assemble_m4b(&options, &chapters, &[missing], &ConcatGaps::default()).unwrap_err();
+        let warning = assemble_m4b(
+            &options,
+            &chapters,
+            &[missing],
+            &ConcatGaps::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
 
         assert!(
             warning.contains("chapter metadata was skipped"),
@@ -1670,14 +1816,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let partial = dir.path().join("silence-800-8000-1.wav");
         std::fs::write(&partial, b"RIFF\0\0\0\0WAVEaudio").unwrap();
-        assert!(!silence_file_is_valid(&partial, 800, 8_000, 1));
+        let cancel = CancellationToken::new();
+        assert!(!silence_file_is_valid(&partial, 800, 8_000, 1, &cancel));
 
         if !ffmpeg_available() || !ffprobe_available() {
             return;
         }
-        let generated = ensure_silence_file(dir.path(), 800, "wav", 8_000, 1).unwrap();
+        let generated = ensure_silence_file(dir.path(), 800, "wav", 8_000, 1, &cancel).unwrap();
         assert_eq!(generated, partial);
-        assert!(silence_file_is_valid(&generated, 800, 8_000, 1));
+        assert!(silence_file_is_valid(&generated, 800, 8_000, 1, &cancel));
     }
 
     #[test]
@@ -1788,8 +1935,9 @@ mod tests {
         // is absent (they also cover the timeout path by construction).
         let missing = Path::new("definitely-missing-file.wav");
         if !ffprobe_available() {
-            assert_eq!(probe_audio_params(missing), None);
-            assert_eq!(ffprobe_duration_ms(missing), None);
+            let cancel = CancellationToken::new();
+            assert_eq!(probe_audio_params(missing, &cancel), None);
+            assert_eq!(ffprobe_duration_ms(missing, &cancel), None);
         }
         assert!(!gaps_supported("flac"));
         assert!(gaps_supported("wav"));
@@ -1827,12 +1975,109 @@ mod tests {
             &final_path,
             "test timeout ffmpeg",
             Duration::from_millis(250),
+            &CancellationToken::new(),
         );
         let elapsed = started.elapsed();
         assert!(outcome.is_err(), "sleeping child must fail");
         assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
         assert_eq!(std::fs::read(&final_path).unwrap(), b"prior-output");
         assert!(!staged.exists(), "staged output must be removed");
+    }
+
+    /// Re-exec this test binary as a stand-in media tool, so cancellation is
+    /// tested against a real child process without ffmpeg installed.
+    fn media_fixture_command(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "stitch::tests::media_process_fixture",
+                "--nocapture",
+            ])
+            .env("BOOKFORGE_AUDIO_PROCESS_FIXTURE", mode);
+        command
+    }
+
+    /// Fixture body. A no-op in an ordinary test run; when re-executed by
+    /// [`media_fixture_command`] it writes a partial staged output, signals
+    /// readiness, and then never finishes on its own.
+    #[test]
+    fn media_process_fixture() {
+        let Ok(mode) = std::env::var("BOOKFORGE_AUDIO_PROCESS_FIXTURE") else {
+            return;
+        };
+        if let Ok(staged) = std::env::var("BOOKFORGE_AUDIO_PROCESS_STAGE") {
+            std::fs::write(staged, b"partial encode").unwrap();
+        }
+        if let Ok(ready) = std::env::var("BOOKFORGE_AUDIO_PROCESS_READY") {
+            std::fs::write(ready, b"ready").unwrap();
+        }
+        match mode.as_str() {
+            "hang" => std::thread::sleep(Duration::from_secs(60)),
+            _ => panic!("unknown media process fixture mode"),
+        }
+    }
+
+    #[test]
+    fn cancelled_encode_removes_its_stage_and_preserves_existing_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("book.wav");
+        let staged = staged_output_path(&final_path);
+        let ready = dir.path().join("ready");
+        std::fs::write(&final_path, b"prior complete book").unwrap();
+        let cancel = CancellationToken::new();
+        let stopper = {
+            let cancel = cancel.clone();
+            let ready = ready.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !ready.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                cancel.cancel();
+                ready.exists()
+            })
+        };
+
+        let started = Instant::now();
+        let error = run_ffmpeg_transactional(
+            media_fixture_command("hang")
+                .env("BOOKFORGE_AUDIO_PROCESS_STAGE", &staged)
+                .env("BOOKFORGE_AUDIO_PROCESS_READY", &ready),
+            &staged,
+            &final_path,
+            "fixture encode",
+            &cancel,
+        )
+        .unwrap_err();
+
+        assert!(
+            stopper.join().unwrap(),
+            "the encoder never reached its staged output"
+        );
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(45),
+            "a cancelled encode must not wait for the child to finish"
+        );
+        assert!(!staged.exists(), "the cancelled stage must be removed");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"prior complete book");
+    }
+
+    #[test]
+    fn cancelled_stitch_publishes_nothing_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let report = stitch_with_cancel(
+            &completed_manifest(),
+            &stitch_fixture_options(dir.path()),
+            &cancel,
+        );
+        assert!(report.chapter_files.is_empty());
+        assert!(report.book_file.is_none());
+        assert_eq!(report.warnings, vec![STITCH_CANCELLED_WARNING.to_string()]);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
@@ -1862,6 +2107,7 @@ mod tests {
             &final_path,
             "test wrapper timeout",
             Duration::from_millis(100),
+            &CancellationToken::new(),
         );
 
         assert!(outcome.is_err(), "wrapper must time out");
