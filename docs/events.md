@@ -64,6 +64,23 @@ so a durable log replays identically for `watch`, `serve`, and `tail`.
 | `ConcurrencyChanged` | `previous`, `current`, `reason` | Adaptive concurrency retuned itself. |
 | `BatchSizingChanged` | `batch_id?`, `previous_target`, `new_target`, `previous_max_items`, `new_max_items`, `reason` | Adaptive batch sizing retuned itself. |
 
+`RequestFinished.status` is `"connect_error"` for a request that never reached
+the provider (connection or TLS failure); such requests carry no
+`status_code`. Performance summaries count them as connection errors, never as
+invalid model responses, and count an invalid response only from a
+response-level status (`invalid_response`, `json_error`, `truncated`,
+`incomplete`). `retry_count` values are summed as retries.
+
+Performance summaries (`status`, the JSON/Markdown report) describe the latest
+run: request counts, latency samples, error counts, token usage and elapsed
+time restart at the log's last `JobCreated`, and a log without one uses the
+whole stream. Elapsed time is that run's `TranslationFinished.elapsed_ms`, or
+its observed event span while it has not finished. Throughput counts each
+segment ID once when it reaches `succeeded`, `needs_review` or `failed`; cache
+hits and pending retries add nothing. The JSON adds `scope: "latest_run"` and
+keeps the historical `blocks_per_minute` key for this rate, which measures
+segments, not blocks; human output labels it segments/min.
+
 ### Segments
 
 | Variant | Fields | Semantics |

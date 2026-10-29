@@ -1600,7 +1600,7 @@ fn cli_status_after_translate_reports_succeeded_job() {
     assert!(stdout.contains("Output:"));
     assert!(stdout.contains("Event log:"));
     assert!(stdout.contains("Report:"));
-    assert!(stdout.contains("Performance:"));
+    assert!(stdout.contains("Performance (latest run):"));
 }
 
 #[test]

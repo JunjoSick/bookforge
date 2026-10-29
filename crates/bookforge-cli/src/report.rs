@@ -836,7 +836,7 @@ fn render_markdown(report: &QaReport) -> String {
         }
     }
 
-    output.push_str("\n## Performance\n\n");
+    output.push_str("\n## Performance (latest run)\n\n");
     if let Some(perf) = &report.performance {
         output.push_str(&format!("- Requests: {}\n", perf.request_count));
         output.push_str(&format!(
@@ -846,8 +846,8 @@ fn render_markdown(report: &QaReport) -> String {
         ));
         output.push_str(&format!("- Retries: {}\n", perf.retries));
         output.push_str(&format!(
-            "- 429/timeouts/server errors: {}/{}/{}\n",
-            perf.rate_limited, perf.timeouts, perf.server_errors
+            "- 429/timeouts/server/connection errors: {}/{}/{}/{}\n",
+            perf.rate_limited, perf.timeouts, perf.server_errors, perf.connection_errors
         ));
         output.push_str(&format!(
             "- Invalid responses/truncations: {}/{}\n",
@@ -862,8 +862,8 @@ fn render_markdown(report: &QaReport) -> String {
             perf.checkpoint_flushes
         ));
         output.push_str(&format!(
-            "- Blocks/min: {}\n",
-            perf.blocks_per_minute
+            "- Segments/min: {}\n",
+            perf.segments_per_minute
                 .map(|value| format!("{value:.2}"))
                 .unwrap_or_else(|| "n/a".to_string())
         ));

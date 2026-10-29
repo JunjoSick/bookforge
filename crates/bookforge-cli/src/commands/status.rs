@@ -88,7 +88,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     }
 
     println!();
-    println!("Performance:");
+    println!("Performance (latest run):");
     match performance_summary_from_events(&event_log_path)? {
         Some(perf) => print_performance(&perf),
         None => println!("  unavailable: no event log found"),
@@ -181,18 +181,18 @@ fn print_performance(perf: &RunPerformanceSummary) {
     );
     println!("  retries: {}", perf.retries);
     println!(
-        "  429/timeouts/server errors: {}/{}/{}",
-        perf.rate_limited, perf.timeouts, perf.server_errors
+        "  429/timeouts/server/connection errors: {}/{}/{}/{}",
+        perf.rate_limited, perf.timeouts, perf.server_errors, perf.connection_errors
     );
     println!(
         "  invalid/truncated: {}/{}",
         perf.invalid_responses, perf.truncations
     );
     println!("  checkpoint flushes: {}", perf.checkpoint_flushes);
-    if let Some(rate) = perf.blocks_per_minute {
-        println!("  blocks/min: {rate:.2}");
+    if let Some(rate) = perf.segments_per_minute {
+        println!("  segments/min: {rate:.2}");
     } else {
-        println!("  blocks/min: n/a");
+        println!("  segments/min: n/a");
     }
 }
 
