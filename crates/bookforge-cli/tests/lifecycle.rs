@@ -1597,6 +1597,7 @@ fn cli_status_after_translate_reports_succeeded_job() {
     assert!(stdout.contains(&format!("Job: {}", run.job_id)));
     assert!(stdout.contains("Status: succeeded"));
     assert!(stdout.contains("Segments:"));
+    assert!(stdout.contains("Tokens (latest saved checkpoints):"));
     assert!(stdout.contains("Output:"));
     assert!(stdout.contains("Event log:"));
     assert!(stdout.contains("Report:"));
@@ -3447,6 +3448,10 @@ fn cli_review_generates_artifacts_and_ingest_flags_marks_retry() {
         .and_then(|value| value.as_u64())
         .expect("total input tokens should exist");
     assert_eq!(total_input, sum_input);
+    assert_eq!(
+        review_json.pointer("/totals/usage_scope"),
+        Some(&serde_json::json!("latest_saved_checkpoints"))
+    );
     assert!(
         fs::read_to_string(&review_html_path)
             .expect("review HTML should read")

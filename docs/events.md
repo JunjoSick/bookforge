@@ -95,6 +95,14 @@ segments, not blocks; human output labels it segments/min.
 | `CheckpointQueued` | `queued` | Current checkpoint queue depth. |
 | `CheckpointFlushed` | `segment_id?`, `flushed_count`, `latency_ms?` | The dedicated checkpoint writer persisted a command; `flushed_count` counts flushes since writer start. |
 
+Persisted token totals (`status`, reports, review, dashboard job list) describe
+the latest saved checkpoint of each segment. Retries folded into a saved
+checkpoint stay counted, but a retry or resume can replace a checkpoint with
+lower counts, and separate QA/double-check calls are not included. Report and
+review JSON label these totals `usage_scope: "latest_saved_checkpoints"`, and
+their cost estimate uses the job's primary model rates, including for fallback
+results. They are not a lifetime billing ledger.
+
 The checkpoint writer deliberately never aborts a run because one write
 failed: a poisoned command (for example a foreign-key violation from a
 malformed model echo) is logged as an `Error{kind:"checkpoint_write"}` event

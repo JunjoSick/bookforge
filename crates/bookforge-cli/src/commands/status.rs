@@ -72,7 +72,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
         println!("{line}");
     }
     println!();
-    println!("Tokens:");
+    println!("Tokens (latest saved checkpoints):");
     println!("  input:  {}", summary.input_tokens);
     println!("  output: {}", summary.output_tokens);
     println!();

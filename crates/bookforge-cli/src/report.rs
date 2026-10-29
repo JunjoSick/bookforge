@@ -21,6 +21,12 @@ use serde::Serialize;
 use crate::cost::estimate_cost_usd_with_cached;
 use crate::performance::RunPerformanceSummary;
 
+/// What persisted token totals describe: the latest saved checkpoint of each
+/// segment. Replaced checkpoints and separate QA/double-check calls are not in
+/// it, so it is not a lifetime billing ledger.
+pub(crate) const SAVED_CHECKPOINT_USAGE_SCOPE: &str = "latest_saved_checkpoints";
+pub(crate) const CHECKPOINT_USAGE_NOTE: &str = "Usage covers the latest saved checkpoints, excluding usage from replaced checkpoints and separate QA/double-check calls. Cost uses primary model rates, including for fallback results.";
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReportFiles {
     pub json: PathBuf,
@@ -98,6 +104,7 @@ struct QaReport {
     needs_review_rate_percent: f64,
     retry_pending_segments: usize,
     corrected_segments: usize,
+    usage_scope: &'static str,
     input_tokens: u64,
     input_cached_tokens: u64,
     output_tokens: u64,
@@ -197,6 +204,7 @@ pub(crate) fn write_report(input: ReportInput<'_>) -> Result<ReportFiles> {
         ),
         retry_pending_segments: input.summary.retry_pending,
         corrected_segments: input.corrected_segments,
+        usage_scope: SAVED_CHECKPOINT_USAGE_SCOPE,
         input_tokens: input.summary.input_tokens,
         input_cached_tokens: input.summary.input_cached_tokens,
         output_tokens: input.summary.output_tokens,
@@ -796,7 +804,10 @@ fn render_markdown(report: &QaReport) -> String {
         "- Manually corrected: {}\n",
         report.corrected_segments
     ));
-    output.push_str(&format!("- Input tokens: {}\n", report.input_tokens));
+    output.push_str(&format!(
+        "- Input tokens (latest saved checkpoints): {}\n",
+        report.input_tokens
+    ));
     output.push_str(&format!(
         "- Cached input tokens: {}\n",
         report.input_cached_tokens
@@ -807,9 +818,15 @@ fn render_markdown(report: &QaReport) -> String {
         report.qa_reviewed_segments
     ));
     match report.estimated_cost {
-        Some(cost) => output.push_str(&format!("- Estimated cost: ${cost:.6}\n\n")),
-        None => output.push_str("- Estimated cost: not available\n\n"),
+        Some(cost) => output.push_str(&format!(
+            "- Estimated checkpoint cost (primary model rates): ${cost:.6}\n\n"
+        )),
+        None => {
+            output.push_str("- Estimated checkpoint cost (primary model rates): not available\n\n")
+        }
     }
+    output.push_str(CHECKPOINT_USAGE_NOTE);
+    output.push_str("\n\n");
 
     output.push_str("## QA Warnings\n\n");
     if report.qa_warnings.is_empty() {
@@ -1138,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn report_keeps_reviewed_segment_count_while_collapsing_qa_warnings() {
+    fn report_preserves_usage_scope_and_collapsed_qa_counts() {
         let reviews = (0..9)
             .map(|index| {
                 qa_review(
@@ -1174,6 +1191,9 @@ mod tests {
             status: job.status.clone(),
             total_segments: 9,
             succeeded: 9,
+            input_tokens: 200,
+            input_cached_tokens: 20,
+            output_tokens: 100,
             ..JobSummary::default()
         };
         let output = std::env::temp_dir().join(format!(
@@ -1200,6 +1220,14 @@ mod tests {
                 .expect("JSON report parses");
 
         assert_eq!(report["qa_reviewed_segments"], 9);
+        assert_eq!(report["usage_scope"], "latest_saved_checkpoints");
+        assert_eq!(report["input_tokens"], 200);
+        assert_eq!(report["input_cached_tokens"], 20);
+        assert_eq!(report["output_tokens"], 100);
+        let markdown = fs::read_to_string(&files.markdown).expect("Markdown report can be read");
+        assert!(markdown.contains("Input tokens (latest saved checkpoints): 200"));
+        assert!(markdown.contains("Estimated checkpoint cost (primary model rates):"));
+        assert!(markdown.contains(CHECKPOINT_USAGE_NOTE));
         let warnings = report["qa_warnings"]
             .as_array()
             .expect("qa_warnings stays an array");
