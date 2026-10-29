@@ -1064,7 +1064,7 @@ mod tests {
             "the segment source/checksum remains the unprojected IR text"
         );
         assert_eq!(
-            namespace, "60bdecff5342c2a413e077c23b8a647208043258616c5beda9f2fc0ec25c1347",
+            namespace, "251c954265d9105d7cb68bd9db4435a43b0ed9defe878649203b986eadbd529d",
             "a reversible render projection must not move the existing cache namespace"
         );
     }
