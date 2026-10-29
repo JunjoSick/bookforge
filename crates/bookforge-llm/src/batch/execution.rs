@@ -263,6 +263,7 @@ impl BatchRetryLedger {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn retry_count(&self, batch_id: &str) -> usize {
         self.retries_by_batch.get(batch_id).copied().unwrap_or(0)
     }
@@ -584,6 +585,7 @@ where
     let mut compact_retry_attempts_by_item: HashMap<String, usize> = HashMap::new();
     let mut truncation_alert = TruncationAlertState::default();
     let mut retry_ledger = BatchRetryLedger::default();
+    let mut completed_requests_by_batch: HashMap<String, usize> = HashMap::new();
     let mut stop_dispatch = false;
     let mut runtime_sizer: Option<(u64, bool, BatchSizer)> = None;
     let mut repartitioned_revision: Option<u64> = None;
@@ -1062,7 +1064,14 @@ where
             let recorded_finish_reason =
                 finish_reason.map(|reason| finish_reason_label(reason).to_string());
             let recorded_status_code = result.as_ref().err().and_then(http_status_of_error);
-            let recorded_retry_count = retry_ledger.retry_count(&batch.id);
+            // Additive: 0 on a batch's first request, 1 on each repeat of it, so
+            // summing events counts retries once. A split child starts its own
+            // series; the ledger keeps the inherited history for backoff.
+            let completed_requests = completed_requests_by_batch
+                .entry(batch.id.clone())
+                .or_insert(0usize);
+            let recorded_retry_count = usize::from(*completed_requests > 0);
+            *completed_requests += 1;
             let recorded_backoff_ms = retry_ledger.backoff_ms(&batch.id);
             let recorded_error_kind = result.as_ref().err().map(provider_error_kind);
 

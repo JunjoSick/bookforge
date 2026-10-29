@@ -3061,6 +3061,54 @@ async fn connect_errors_are_retried_even_when_one_attempt_is_configured() {
 }
 
 #[tokio::test]
+async fn repeated_batch_requests_count_each_retry_once() {
+    let segments = vec![make_segment("seg1", vec![plain_block("Hello")], vec![])];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1000,
+        max_items: 1,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let provider = Arc::new(AlwaysTransientProvider::new());
+    let telemetry = Arc::new(TelemetryLog::new());
+    let mut config = test_run_config();
+    config.scheduler.max_attempts = 3;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        translate_batches_with_callback(
+            provider.clone(),
+            batches,
+            &segments,
+            &config,
+            telemetry.clone(),
+            None,
+            None,
+            Arc::new(bookforge_core::NullProgressSink),
+            None,
+            |_| Ok(()),
+        ),
+    )
+    .await
+    .expect("transient retries must be capped")
+    .expect("batch run should return needs-review translations");
+
+    assert_eq!(provider.calls(), 3);
+    let metrics = telemetry.snapshot();
+    // Three requests are two retries; cumulative counts would sum to three.
+    assert_eq!(
+        metrics
+            .iter()
+            .map(|metric| metric.retry_count)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 1]
+    );
+    assert!(metrics.iter().all(|metric| metric.status_code == Some(503)));
+}
+
+#[tokio::test]
 async fn transient_batch_errors_stop_after_max_attempts() {
     let segment = make_segment("seg1", vec![plain_block("Hello")], vec![]);
     let segments = vec![segment];
