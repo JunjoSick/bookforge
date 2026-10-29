@@ -49,16 +49,41 @@ where
     let qa_runtime = job_runtime_settings.borrow().clone();
     let qa_run_config =
         crate::control::freeze_run_config_for_stage(&controlled_run_config, &qa_runtime);
-    let qa_reviews = qa_reviews_for_mode_with_max_output_tokens(
-        ProgressRequestProvider::new(provider.clone(), progress.clone()),
-        segments,
-        translations,
-        &qa_run_config,
-        &qa_runtime.settings.qa,
-        qa_runtime.qa,
-        Some(cli_args.qa_max_output_tokens),
-    )
-    .await;
+    // QA honors its own provider/model/endpoint/key overrides; without any,
+    // it reuses the translation provider and its known limits.
+    let qa_endpoint = ReviewEndpoint::qa(&qa_runtime.settings.qa);
+    let qa_reviews = if qa_runtime.qa == QaMode::Off {
+        Vec::new()
+    } else if qa_endpoint.is_overridden() {
+        let (qa_provider, qa_run_config) = configured_review_provider::<P>(
+            snapshot,
+            &qa_runtime.settings,
+            &qa_run_config,
+            qa_endpoint,
+            cancel_token.clone(),
+        )?;
+        qa_reviews_for_mode_with_max_output_tokens(
+            ProgressRequestProvider::new(qa_provider, progress.clone()),
+            segments,
+            translations,
+            &qa_run_config,
+            &qa_runtime.settings.qa,
+            qa_runtime.qa,
+            Some(cli_args.qa_max_output_tokens),
+        )
+        .await
+    } else {
+        qa_reviews_for_mode_with_max_output_tokens(
+            ProgressRequestProvider::new(provider.clone(), progress.clone()),
+            segments,
+            translations,
+            &qa_run_config,
+            &qa_runtime.settings.qa,
+            qa_runtime.qa,
+            Some(cli_args.qa_max_output_tokens),
+        )
+        .await
+    };
 
     if !wait_for_finalize_stage_control(&mut control_poller, &pause_signal).await? {
         print_stopped_resume_hint(&job.id, human_stdout_enabled(cli_args.ui));
@@ -109,6 +134,7 @@ where
             job_id: &job.id,
             config: &double_check_run_config,
             settings: &double_check_runtime.settings,
+            snapshot,
             progress: progress.clone(),
         })
         .await?
@@ -208,17 +234,19 @@ struct DoubleCheckPass<'a, P> {
     job_id: &'a str,
     config: &'a TranslationRunConfig,
     settings: &'a ResolvedRunSettings,
+    snapshot: &'a RunConfigSnapshot,
     progress: Arc<dyn bookforge_core::ProgressSink>,
 }
 
+/// The provider a review stage (QA or double-check) talks to.
 #[derive(Clone)]
-enum DoubleCheckProvider<P> {
+enum ReviewProvider<P> {
     Primary(P),
     Mock(MockProvider),
     OpenAi(OpenAiCompatibleProvider),
 }
 
-impl<P> LlmProvider for DoubleCheckProvider<P>
+impl<P> LlmProvider for ReviewProvider<P>
 where
     P: LlmProvider,
 {
@@ -264,6 +292,7 @@ where
         job_id,
         config,
         settings,
+        snapshot,
         progress,
     } = pass;
     if settings.double_check.mode == DoubleCheckMode::Off {
@@ -274,59 +303,12 @@ where
     // surface as double-check-prefixed RequestStarted/Finished events.
     let print_stdout = human_stdout_enabled(cli_args.ui);
 
-    let (dc_provider, dc_provider_name, dc_model) =
-        if cli_args.double_check_provider.is_some() || cli_args.double_check_model.is_some() {
-            let provider_str = cli_args
-                .double_check_provider
-                .as_deref()
-                .unwrap_or("openrouter");
-            if provider_str == "mock" {
-                let model = cli_args
-                    .double_check_model
-                    .clone()
-                    .unwrap_or_else(|| config.model.clone());
-                (
-                    DoubleCheckProvider::Mock(MockProvider::new(
-                        mock_mode(&model),
-                        &config.target_language,
-                    )),
-                    provider_str.to_string(),
-                    model,
-                )
-            } else {
-                let dc_config = provider_config(
-                    provider_str,
-                    cli_args.double_check_model.as_deref(),
-                    cli_args.double_check_base_url.as_deref(),
-                    cli_args.double_check_api_key_env.as_deref(),
-                    settings.provider.timeout_seconds,
-                    settings.provider.provider_max_attempts,
-                    settings.provider.thinking_disabled,
-                    settings.provider.retry_after_policy,
-                    settings.provider.max_backoff_seconds,
-                    settings.provider.max_idle_per_host,
-                    settings.provider.json_mode,
-                )?;
-                let provider =
-                    OpenAiCompatibleProvider::new_with_cancel(dc_config, cancel_token.clone())
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let model = provider.model().to_string();
-                (
-                    DoubleCheckProvider::OpenAi(provider),
-                    provider_str.to_string(),
-                    model,
-                )
-            }
-        } else {
-            (
-                DoubleCheckProvider::Primary(provider.clone()),
-                config.provider.clone(),
-                config.model.clone(),
-            )
-        };
-    let mut double_check_config = config.clone();
-    double_check_config.provider = dc_provider_name;
-    double_check_config.model = dc_model;
+    let endpoint = ReviewEndpoint::double_check(&settings.double_check);
+    let (dc_provider, double_check_config) = if endpoint.is_overridden() {
+        configured_review_provider(snapshot, settings, config, endpoint, cancel_token.clone())?
+    } else {
+        (ReviewProvider::Primary(provider.clone()), config.clone())
+    };
 
     if print_stdout {
         println!("Double-check: auditing translations...");
@@ -406,6 +388,105 @@ where
     }
 
     Ok(true)
+}
+
+/// A review stage's endpoint overrides. Unset fields inherit the job's
+/// saved translation endpoint.
+struct ReviewEndpoint<'a> {
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
+    base_url: Option<&'a str>,
+    api_key_env: Option<&'a str>,
+}
+
+impl<'a> ReviewEndpoint<'a> {
+    fn qa(qa: &'a bookforge_core::config::QaRunConfig) -> Self {
+        Self {
+            provider: qa.provider.as_deref(),
+            model: qa.model.as_deref(),
+            base_url: qa.base_url.as_deref(),
+            api_key_env: qa.api_key_env.as_deref(),
+        }
+    }
+
+    fn double_check(double_check: &'a bookforge_core::config::DoubleCheckConfig) -> Self {
+        Self {
+            provider: double_check.provider.as_deref(),
+            model: double_check.model.as_deref(),
+            base_url: double_check.base_url.as_deref(),
+            api_key_env: double_check.api_key_env.as_deref(),
+        }
+    }
+
+    fn is_overridden(&self) -> bool {
+        self.provider.is_some()
+            || self.model.is_some()
+            || self.base_url.is_some()
+            || self.api_key_env.is_some()
+    }
+}
+
+/// Build the provider and run config for an overridden review endpoint.
+/// Each unset override falls back to the job's saved translation endpoint
+/// (provider, model, base URL, key variable), so QA and double-check resolve
+/// the same way.
+fn configured_review_provider<P: LlmProvider>(
+    snapshot: &RunConfigSnapshot,
+    settings: &ResolvedRunSettings,
+    primary: &TranslationRunConfig,
+    endpoint: ReviewEndpoint<'_>,
+    cancel_token: tokio_util::sync::CancellationToken,
+) -> Result<(ReviewProvider<P>, TranslationRunConfig)> {
+    let provider_name = endpoint.provider.unwrap_or(&snapshot.provider);
+    let model = endpoint.model.unwrap_or(&snapshot.model);
+    let provider = if provider_name == "mock" {
+        ReviewProvider::Mock(MockProvider::new(
+            mock_mode(model),
+            &primary.target_language,
+        ))
+    } else {
+        let config = provider_config(
+            provider_name,
+            Some(model),
+            endpoint.base_url.or(snapshot.base_url.as_deref()),
+            endpoint.api_key_env.or(snapshot.api_key_env.as_deref()),
+            settings.provider.timeout_seconds,
+            settings.provider.provider_max_attempts,
+            settings.provider.thinking_disabled,
+            settings.provider.retry_after_policy,
+            settings.provider.max_backoff_seconds,
+            settings.provider.max_idle_per_host,
+            settings.provider.json_mode,
+        )?;
+        ReviewProvider::OpenAi(
+            OpenAiCompatibleProvider::new_with_cancel(config, cancel_token)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )
+    };
+    let config = review_run_config(
+        primary,
+        provider_name.to_owned(),
+        model.to_owned(),
+        endpoint.is_overridden(),
+    );
+    Ok((provider, config))
+}
+
+fn review_run_config(
+    primary: &TranslationRunConfig,
+    provider: String,
+    model: String,
+    separate_endpoint: bool,
+) -> TranslationRunConfig {
+    let mut config = primary.clone();
+    config.provider = provider;
+    config.model = model;
+    // A model label can name different deployments at different endpoints;
+    // only the reused primary provider has the primary model's known limit.
+    if separate_endpoint {
+        config.model_context_tokens = None;
+    }
+    config
 }
 
 pub(crate) fn apply_double_check_corrections(
@@ -943,6 +1024,26 @@ mod suspicious_tests {
             entities: None,
             pause_signal: None,
             runtime_settings: None,
+        }
+    }
+
+    #[test]
+    fn separate_review_endpoint_does_not_inherit_primary_context_limit() {
+        let mut primary = test_run_config();
+        primary.model_context_tokens = Some(32_768);
+        primary.max_output_tokens = Some(1_024);
+        for separate in [false, true] {
+            let review = review_run_config(
+                &primary,
+                primary.provider.clone(),
+                primary.model.clone(),
+                separate,
+            );
+            assert_eq!(
+                review.model_context_tokens,
+                if separate { None } else { Some(32_768) }
+            );
+            assert_eq!(review.max_output_tokens, Some(1_024));
         }
     }
 }
