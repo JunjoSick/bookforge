@@ -108,6 +108,7 @@ pub fn resolve_settings(args: &TranslateArgs) -> ResolvedRunSettings {
     settings.provider.json_mode = args.json_mode;
 
     settings.qa.concurrency = args.qa_concurrency;
+    settings.qa.max_output_tokens = Some(args.qa_max_output_tokens);
     if let Some(v) = args.qa_batch_target_tokens {
         settings.qa.batch_target_tokens = v;
     }

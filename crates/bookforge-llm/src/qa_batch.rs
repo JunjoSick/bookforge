@@ -124,7 +124,10 @@ where
     let library = Arc::new(PromptLibrary::global().clone());
     let provider = Arc::new(provider);
     let semaphore = Arc::new(Semaphore::new(qa_config.concurrency.max(1)));
+    // An explicit per-call cap wins; otherwise the cap saved with the job
+    // (so a resume without the flag keeps it); otherwise the default.
     let max_output_tokens = max_output_tokens
+        .or(qa_config.max_output_tokens)
         .unwrap_or(DEFAULT_QA_MAX_OUTPUT_TOKENS)
         .max(1);
     let mut tasks = JoinSet::new();
@@ -691,6 +694,7 @@ mod tests {
 
     fn qa_config(batch_target_tokens: usize) -> QaRunConfig {
         QaRunConfig {
+            max_output_tokens: None,
             concurrency: 1,
             batch_target_tokens,
             model: None,
@@ -1018,6 +1022,26 @@ mod tests {
         let requests = requests.lock().expect("requests mutex");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].max_output_tokens, Some(12_345));
+        drop(requests);
+
+        // Without a per-call cap, the cap saved with the job applies.
+        let provider = CaptureQaProvider::default();
+        let requests = provider.requests.clone();
+        let mut saved = qa_config(10_000);
+        saved.max_output_tokens = Some(137);
+        qa_segments_parallel_with_max_output_tokens(
+            provider,
+            &segments,
+            &translations,
+            &run_config(),
+            &saved,
+            None,
+        )
+        .await;
+        assert_eq!(
+            requests.lock().expect("requests mutex")[0].max_output_tokens,
+            Some(137)
+        );
     }
 
     #[tokio::test]

@@ -849,6 +849,7 @@ mod suspicious_tests {
             std::slice::from_ref(&translation),
             &test_run_config(),
             &QaRunConfig {
+                max_output_tokens: None,
                 concurrency: 1,
                 batch_target_tokens: 10_000,
                 model: None,
