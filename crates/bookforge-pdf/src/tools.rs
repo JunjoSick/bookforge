@@ -18,7 +18,8 @@ use std::{
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 
 pub const PDF_RENDER_DPI: u32 = 150;
-/// Bound every non-OCR raster, including figure crops and preserved pages.
+/// Bound every raster: page renders (whose DPI conversion lowers for an
+/// oversized page before pdftoppm runs), figure crops and preserved pages.
 pub const MAX_RENDER_PIXELS: u64 = 32_000_000;
 const MAX_RENDER_EDGE: u32 = 4096;
 const MAX_EXTRACTED_IMAGES: usize = 4096;
@@ -73,6 +74,16 @@ pub enum ToolError {
     #[error("unsupported PNG produced by pdftoppm: {0}")]
     UnsupportedPng(String),
 
+    #[error(
+        "page {page} ({width_pt}x{height_pt} pt) cannot be rendered within the {limit}-pixel raster budget"
+    )]
+    PageTooLarge {
+        page: u32,
+        width_pt: u64,
+        height_pt: u64,
+        limit: u64,
+    },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -106,12 +117,17 @@ pub struct PageCrop {
 
 impl PageCrop {
     pub(crate) fn to_render_pixels(self) -> Self {
+        self.to_render_pixels_at(PDF_RENDER_DPI)
+    }
+
+    /// The crop in the pixels of a page rendered at `dpi`.
+    pub(crate) fn to_render_pixels_at(self, dpi: u32) -> Self {
         Self {
             page: self.page,
-            left: scale_xml_to_render_px(self.left).max(0),
-            top: scale_xml_to_render_px(self.top).max(0),
-            width: scale_xml_to_render_px(self.width).clamp(1, MAX_RENDER_EDGE as i32),
-            height: scale_xml_to_render_px(self.height).clamp(1, MAX_RENDER_EDGE as i32),
+            left: scale_xml_to_render_px(self.left, dpi).max(0),
+            top: scale_xml_to_render_px(self.top, dpi).max(0),
+            width: scale_xml_to_render_px(self.width, dpi).clamp(1, MAX_RENDER_EDGE as i32),
+            height: scale_xml_to_render_px(self.height, dpi).clamp(1, MAX_RENDER_EDGE as i32),
         }
     }
 }
@@ -302,6 +318,12 @@ impl PopplerTools {
     }
 
     /// Render one page with a caller-selected deadline and DPI.
+    ///
+    /// The page is rendered at exactly `dpi`, so crop coordinates can be
+    /// scaled by it. This low-level call does not read the page geometry:
+    /// conversion lowers the DPI of an oversized page before calling it,
+    /// and any other caller must bound the geometry the same way. The PNG
+    /// is still checked against [`MAX_RENDER_PIXELS`] afterwards.
     pub fn render_page_png_at_dpi_with_timeout(
         &self,
         pdf: &Path,
@@ -312,22 +334,9 @@ impl PopplerTools {
     ) -> Result<PathBuf, ToolError> {
         fs::create_dir_all(output_dir)?;
         let root = output_dir.join(format!("page-{page:04}"));
-        let page_arg = page.to_string();
-        let dpi_arg = dpi.max(1).to_string();
         let mut command = poppler_command(self.pdftoppm_path()?);
         command
-            .args([
-                "-f",
-                &page_arg,
-                "-l",
-                &page_arg,
-                "-singlefile",
-                "-png",
-                "-r",
-                &dpi_arg,
-                "-scale-to",
-                &MAX_RENDER_EDGE.to_string(),
-            ])
+            .args(page_render_args(page, dpi))
             .arg(pdf)
             .arg(&root);
         let output = command_output(&mut command, "pdftoppm", timeout)?;
@@ -774,8 +783,28 @@ impl Drop for ChildGuard {
     }
 }
 
-fn scale_xml_to_render_px(value: i32) -> i32 {
-    let numerator = value as i64 * PDF_RENDER_DPI as i64 * PDF_XML_ZOOM_DEN;
+/// pdftoppm arguments that render one page at exactly `dpi`.
+///
+/// No `-scale-to`: it overrides `-r`, scaling every page's long side to the
+/// given size, so a letter page rendered at about 370 DPI instead of 150 and
+/// figure crops, which assume the requested DPI, were cut from the wrong
+/// region.
+fn page_render_args(page: u32, dpi: u32) -> Vec<String> {
+    let page = page.to_string();
+    vec![
+        "-f".to_string(),
+        page.clone(),
+        "-l".to_string(),
+        page,
+        "-singlefile".to_string(),
+        "-png".to_string(),
+        "-r".to_string(),
+        dpi.max(1).to_string(),
+    ]
+}
+
+fn scale_xml_to_render_px(value: i32, dpi: u32) -> i32 {
+    let numerator = value as i64 * i64::from(dpi) * PDF_XML_ZOOM_DEN;
     let denominator = PDF_POINTS_PER_INCH * PDF_XML_ZOOM_NUM;
     ((numerator + denominator / 2) / denominator).clamp(0, i32::MAX as i64) as i32
 }
@@ -1773,6 +1802,103 @@ mod tests {
         assert_eq!(crop.top, 150);
         assert_eq!(crop.width, 300);
         assert_eq!(crop.height, 75);
+    }
+
+    #[test]
+    fn crop_coordinates_scale_by_the_page_render_dpi() {
+        let crop = PageCrop {
+            page: 2,
+            left: 72,
+            top: 108,
+            width: 216,
+            height: 54,
+        };
+
+        assert_eq!(
+            crop.to_render_pixels_at(PDF_RENDER_DPI),
+            crop.to_render_pixels()
+        );
+        let half = crop.to_render_pixels_at(75);
+        assert_eq!(
+            (half.left, half.top, half.width, half.height),
+            (50, 75, 150, 38)
+        );
+    }
+
+    #[test]
+    fn page_renders_request_the_exact_dpi() {
+        let args = page_render_args(7, 150);
+
+        assert_eq!(
+            args,
+            ["-f", "7", "-l", "7", "-singlefile", "-png", "-r", "150"]
+        );
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("-scale-to")),
+            "-scale-to overrides -r and breaks crop coordinates"
+        );
+        assert_eq!(page_render_args(1, 0)[7], "1", "a zero DPI is clamped");
+    }
+
+    /// A one-page PDF with one line of text and the given MediaBox, in
+    /// points.
+    fn synthetic_pdf(width: u32, height: u32) -> Vec<u8> {
+        let content = b"BT /F1 12 Tf 72 700 Td (Synthetic line) Tj ET";
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            )
+            .into_bytes(),
+            [
+                format!("<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+                content,
+                b"\nendstream",
+            ]
+            .concat(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            bytes.extend_from_slice(object);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = bytes.len();
+        bytes.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    #[ignore = "requires installed Poppler; set POPPLER_PATH to its bin directory"]
+    fn real_pdftoppm_renders_a_letter_page_at_the_requested_dpi() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pdf = dir.path().join("letter.pdf");
+        fs::write(&pdf, synthetic_pdf(612, 792)).expect("fixture PDF writes");
+        let tools = PopplerTools::discover().expect("Poppler installed");
+
+        for (dpi, expected) in [(PDF_RENDER_DPI, (1275, 1650)), (72, (612, 792))] {
+            let png = tools
+                .render_page_png_scaled(&pdf, 1, &dir.path().join(format!("dpi-{dpi}")), dpi)
+                .expect("page renders");
+            let image = read_png(&png).expect("rendered PNG decodes");
+            assert_eq!((image.width, image.height), expected, "at {dpi} DPI");
+        }
     }
 
     #[test]

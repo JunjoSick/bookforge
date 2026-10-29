@@ -36,6 +36,12 @@ pub struct PageStats {
     /// rather than conversion quality; it never gates coverage itself.
     #[serde(default)]
     pub rtl_dominant: bool,
+    /// The page has no text in the XML and one positioned image covering at
+    /// least half of it: a scanned page. Conversion confirms it against the
+    /// `pdftotext` baseline (it must be empty too) and then treats the page
+    /// as low-confidence, so OCR can supply its text.
+    #[serde(default)]
+    pub image_only_candidate: bool,
     pub low_confidence: bool,
     pub low_confidence_action: Option<String>,
 }
@@ -177,6 +183,7 @@ pub fn reconstruct_with_chapter_guard(
             running_header_chars,
             two_column,
             rtl_dominant,
+            image_only_candidate: image_only_candidate(page),
             low_confidence: false,
             low_confidence_action: None,
         });
@@ -225,14 +232,57 @@ fn rotated_fragment_count(page: &Page) -> usize {
         .count()
 }
 
+/// Whether a page reads as a scan: no visible text anywhere in its XML, and
+/// one positioned image covering at least half of the page once clipped to
+/// it. Blank pages and small decorative images do not qualify; neither does
+/// a scan assembled from several smaller image tiles.
+fn image_only_candidate(page: &Page) -> bool {
+    if page.width <= 0
+        || page.height <= 0
+        || page
+            .fragments
+            .iter()
+            .any(|fragment| fragment.char_count() > 0)
+    {
+        return false;
+    }
+    let width = i64::from(page.width);
+    let height = i64::from(page.height);
+    page.images.iter().any(|image| {
+        let left = i64::from(image.left).clamp(0, width);
+        let top = i64::from(image.top).clamp(0, height);
+        let right = (i64::from(image.left) + i64::from(image.width.max(0))).clamp(0, width);
+        let bottom = (i64::from(image.top) + i64::from(image.height.max(0))).clamp(0, height);
+        (right - left) * (bottom - top) * 2 >= width * height
+    })
+}
+
 /// Whether any of the fragment lies inside the page box. A page without a
 /// declared width keeps everything.
 fn is_on_page(page: &Page, fragment: &Fragment) -> bool {
     page.width <= 0 || (fragment.left < page.width && fragment.right() > 0)
 }
 
-fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<String> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
+/// A repeated running-margin text. `folio_offset` is set for a head that
+/// carries its page number in brackets: the number is replaced by `#` in
+/// `text` and the offset is the PDF page number minus the printed one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RunningMarginKey {
+    text: String,
+    folio_offset: Option<i64>,
+}
+
+impl RunningMarginKey {
+    fn exact(text: String) -> Self {
+        Self {
+            text,
+            folio_offset: None,
+        }
+    }
+}
+
+fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<RunningMarginKey> {
+    let mut counts: HashMap<RunningMarginKey, usize> = HashMap::new();
     for page in pages {
         let mut seen_on_page = HashSet::new();
         let lines = lines_by_position(page);
@@ -246,20 +296,28 @@ fn running_margin_texts(pages: &[Page], body_size: u32) -> HashSet<String> {
             }
             let normalized = normalize_text_key(&line.text());
             if normalized.len() >= 4 && normalized.chars().any(|ch| ch.is_alphabetic()) {
-                seen_on_page.insert(normalized);
+                if let Some(key) = numbered_margin_key(page, line, &normalized) {
+                    seen_on_page.insert(key);
+                }
+                seen_on_page.insert(RunningMarginKey::exact(normalized));
             }
         }
-        for text in seen_on_page {
-            *counts.entry(text).or_default() += 1;
+        for key in seen_on_page {
+            *counts.entry(key).or_default() += 1;
         }
     }
     // Only treat a near-margin line as a running header/footer when the same
     // text repeats near the margins on at least two pages. Removing a one-off
     // line just because it is bold or larger (heading-like) silently deleted
-    // legitimate body text that merely sat near a page margin.
+    // legitimate body text that merely sat near a page margin. A head with a
+    // changing page number needs a third page: two pages agree on an offset
+    // too easily.
     counts
         .into_iter()
-        .filter_map(|(text, count)| (count >= 2).then_some(text))
+        .filter_map(|(key, count)| {
+            let required_pages = if key.folio_offset.is_some() { 3 } else { 2 };
+            (count >= required_pages).then_some(key)
+        })
         .collect()
 }
 
@@ -269,12 +327,39 @@ fn is_running_margin_line(
     median_gap: i32,
     line: &Line,
     body_size: u32,
-    running_margin_texts: &HashSet<String>,
+    running_margin_texts: &HashSet<RunningMarginKey>,
 ) -> bool {
-    line.font_size <= body_size + 1
-        && near_vertical_margin(page, line)
-        && running_margin_texts.contains(&normalize_text_key(&line.text()))
-        && stands_apart(page, page_lines, line, median_gap)
+    if line.font_size > body_size + 1 || !near_vertical_margin(page, line) {
+        return false;
+    }
+    let text = normalize_text_key(&line.text());
+    let repeated = numbered_margin_key(page, line, &text)
+        .is_some_and(|key| running_margin_texts.contains(&key))
+        || running_margin_texts.contains(&RunningMarginKey::exact(text));
+    repeated && stands_apart(page, page_lines, line, median_gap)
+}
+
+/// The key of a running head that carries its page number in brackets
+/// ("field notes [17] on rivers"): the text changes on every page, so it
+/// never repeats exactly. The number becomes `#` and the key keeps the
+/// offset between PDF page and printed number, which stays constant across
+/// a run of folios while years, chapter numbers and other figures do not.
+/// Only lines in the outer sixteenth of the page qualify, so numbered body
+/// prose cannot become a header.
+fn numbered_margin_key(page: &Page, line: &Line, normalized: &str) -> Option<RunningMarginKey> {
+    let outer_margin = page.height / 16;
+    if line.top > outer_margin && line.top + line.height < page.height - outer_margin {
+        return None;
+    }
+    let open = normalized.find('[')?;
+    let close = open + 1 + normalized[open + 1..].find(']')?;
+    let folio = normalized[open + 1..close].parse::<u32>().ok()?;
+    let mut text = normalized.to_string();
+    text.replace_range(open + 1..close, "#");
+    Some(RunningMarginKey {
+        text,
+        folio_offset: Some(i64::from(page.number) - i64::from(folio)),
+    })
 }
 
 /// The page's lines in reading position, top to bottom.
@@ -473,6 +558,25 @@ fn merge_fragments_into_lines(page: &Page) -> Vec<Line> {
         .filter(|fragment| fragment.width > 0 && is_on_page(page, fragment))
         .collect();
     fragments.sort_by_key(|fragment| (fragment.top, fragment.left));
+    // A font change can shift a fragment's box a pixel or two on one
+    // baseline, and sorting by exact top put an italic word ahead of the
+    // regular text to its left. Fragments whose tops lie within half the
+    // smaller height of a row's first fragment form one row and are taken
+    // left to right. Comparing with that fixed anchor keeps small offsets
+    // from chaining down the page, and the smaller height keeps a drop cap
+    // from drawing the next line into its row.
+    let mut row_start = 0;
+    while row_start < fragments.len() {
+        let anchor = fragments[row_start];
+        let row_end = (row_start + 1..fragments.len())
+            .find(|&index| {
+                let fragment = fragments[index];
+                fragment.top - anchor.top > anchor.height.min(fragment.height) / 2
+            })
+            .unwrap_or(fragments.len());
+        fragments[row_start..row_end].sort_by_key(|fragment| fragment.left);
+        row_start = row_end;
+    }
 
     let mut groups: Vec<LineGroup> = Vec::new();
     for fragment in fragments {
@@ -902,6 +1006,49 @@ fn ends_early(lines: &[Line], index: usize) -> bool {
     line.right < measure - line.height || ends_sentence_terminal(&line.text())
 }
 
+/// Lines of flush-right text: at least four lines of one size sharing a
+/// right edge (within 2 units) whose left edges have no common margin, no
+/// cluster holding half of them. Their varying left edges are line lengths,
+/// not paragraph indents. Grouping by size and right edge keeps another
+/// column or smaller notes from voting on the body's alignment, and in
+/// justified text the flush-left lines always hold the majority.
+fn ragged_left_lines(lines: &[Line]) -> HashSet<usize> {
+    let mut indices: Vec<usize> = (0..lines.len()).collect();
+    indices.sort_by_key(|&index| (lines[index].font_size, lines[index].right));
+    let mut ragged = HashSet::new();
+    let mut start = 0;
+    while start < indices.len() {
+        let anchor = &lines[indices[start]];
+        let end = (start + 1..indices.len())
+            .find(|&position| {
+                let line = &lines[indices[position]];
+                line.font_size != anchor.font_size || line.right - anchor.right > 2
+            })
+            .unwrap_or(indices.len());
+        let group = &indices[start..end];
+        if group.len() >= 4 {
+            let mut left_edges = group
+                .iter()
+                .map(|&index| lines[index].left)
+                .collect::<Vec<_>>();
+            left_edges.sort_unstable();
+            let mut window_start = 0;
+            let mut largest_cluster = 0;
+            for (position, &left) in left_edges.iter().enumerate() {
+                while left - left_edges[window_start] > 2 {
+                    window_start += 1;
+                }
+                largest_cluster = largest_cluster.max(position - window_start + 1);
+            }
+            if largest_cluster * 2 < group.len() {
+                ragged.extend(group.iter().copied());
+            }
+        }
+        start = end;
+    }
+    ragged
+}
+
 /// Cluster ordered lines into paragraphs and headings.
 fn cluster_paragraphs(
     lines: &[Line],
@@ -910,6 +1057,7 @@ fn cluster_paragraphs(
 ) -> Vec<PendingBlock> {
     let median_gap = median_line_gap(lines);
     let note_starts = numbered_note_starts(lines, heading_levels);
+    let ragged_left = ragged_left_lines(lines);
     let mut blocks = Vec::new();
     let mut current: Vec<Span> = Vec::new();
     let mut current_heading: Option<u8> = None;
@@ -964,8 +1112,11 @@ fn cluster_paragraphs(
                         || heading_levels.contains_key(&prev.font_size)
                         || line.font_size.abs_diff(prev.font_size) >= 2);
                 let large_gap = gap > (median_gap as f32 * 1.8) as i32 || gap < 0;
-                let indented =
-                    line.left > prev.left + (body_size as i32) / 2 && prev.left <= line.left; // fresh indent, not a continuation of one
+                // A fresh indent, not a continuation of one, and not just a
+                // shorter line of flush-right text.
+                let indented = !ragged_left.contains(&index)
+                    && line.left > prev.left + (body_size as i32) / 2
+                    && prev.left <= line.left;
                 size_changed || large_gap || indented || note_starts.contains(&index)
             }
         };
@@ -1439,6 +1590,228 @@ mod tests {
                 "First paragraph line one. First paragraph line two.".to_string(),
                 "Second paragraph after a large gap.".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn running_heads_with_a_changing_bracketed_folio_are_removed() {
+        let mut xml = String::from("<pdf2xml>");
+        for (index, unrelated) in [99, 42, 7].into_iter().enumerate() {
+            let folio = 17 + index;
+            xml.push_str(&format!(
+                r#"<page number="{}" width="594" height="918">
+<fontspec id="0" size="15" family="T"/><fontspec id="1" size="18" family="T"/>
+<text top="30" left="236" width="176" height="14" font="0">field notes [{folio}] on rivers</text>
+<text top="300" left="80" width="450" height="18" font="1">Body prose on page {index} quotes field notes [{folio}] on rivers here.</text>
+<text top="880" left="80" width="150" height="14" font="0">Gauge [{unrelated}] reading</text>
+</page>"#,
+                30 + index
+            ));
+        }
+        xml.push_str("</pdf2xml>");
+        let result = reconstruct(
+            &parse_pdf2xml(&xml).expect("fixture parses"),
+            ColumnMode::Single,
+        );
+
+        let text = result
+            .blocks
+            .iter()
+            .map(|block| block.block.text())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert_eq!(
+            text.matches("field notes [").count(),
+            3,
+            "the body mentions stay, the running heads go: {text}"
+        );
+        assert_eq!(
+            text.matches("Gauge [").count(),
+            3,
+            "numbers that do not follow the pages are not folios: {text}"
+        );
+        assert!(result.blocks.iter().all(|block| block.anchor.top != 30));
+        assert!(
+            result
+                .pages
+                .iter()
+                .all(|page| page.running_header_chars > 0)
+        );
+    }
+
+    #[test]
+    fn right_aligned_lines_are_not_split_at_each_new_left_edge() {
+        // Flush-right prose: every line ends at x=544 and starts wherever
+        // its length puts it, so nearly every line looks indented.
+        let mut xml = String::from(
+            r#"<pdf2xml><page number="1" width="600" height="900"><fontspec id="0" size="18" family="T"/>"#,
+        );
+        for (index, left) in [140, 122, 131, 176, 178, 135, 137, 150]
+            .into_iter()
+            .enumerate()
+        {
+            xml.push_str(&format!(
+                r#"<text top="{}" left="{left}" width="{}" height="18" font="0">Verse {index}.</text>"#,
+                63 + index * 18,
+                544 - left
+            ));
+        }
+        xml.push_str(r#"<text top="250" left="145" width="399" height="18" font="0">Prose after a real vertical gap.</text></page></pdf2xml>"#);
+        let result = reconstruct(
+            &parse_pdf2xml(&xml).expect("fixture parses"),
+            ColumnMode::Single,
+        );
+
+        let texts = result
+            .blocks
+            .iter()
+            .map(|block| block.block.text())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "Verse 0. Verse 1. Verse 2. Verse 3. Verse 4. Verse 5. Verse 6. Verse 7.",
+                "Prose after a real vertical gap."
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stable_left_margin_keeps_first_line_indents_as_breaks() {
+        let mut xml = String::from(
+            r#"<pdf2xml><page number="1" width="600" height="800"><fontspec id="0" size="12" family="T"/>"#,
+        );
+        for (index, (left, right)) in [
+            (80, 520),
+            (80, 400),
+            (100, 520),
+            (80, 520),
+            (80, 450),
+            (100, 520),
+            (80, 520),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            xml.push_str(&format!(
+                r#"<text top="{}" left="{left}" width="{}" height="12" font="0">Row {index}.</text>"#,
+                100 + index * 16,
+                right - left
+            ));
+        }
+        xml.push_str("</page></pdf2xml>");
+        let result = reconstruct(
+            &parse_pdf2xml(&xml).expect("fixture parses"),
+            ColumnMode::Single,
+        );
+
+        let texts = result
+            .blocks
+            .iter()
+            .map(|block| block.block.text())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            ["Row 0. Row 1.", "Row 2. Row 3. Row 4.", "Row 5. Row 6."]
+        );
+    }
+
+    #[test]
+    fn a_word_set_one_pixel_higher_keeps_its_place_in_the_line() {
+        // Poppler's box for an italic word can sit a pixel above the
+        // regular words around it on the same baseline. Sorted by top
+        // first, the italic word led the line and split it in three.
+        let pages = parse_pdf2xml(
+            r#"<pdf2xml><page number="1" width="600" height="900">
+<fontspec id="0" size="18" family="Serif"/>
+<fontspec id="1" size="18" family="Serif-Italic"/>
+<text top="333" left="124" width="34" height="18" font="0">seen</text>
+<text top="332" left="158" width="42" height="18" font="1"><i> twice </i></text>
+<text top="333" left="200" width="340" height="18" font="0">before the river rose again.</text>
+</page></pdf2xml>"#,
+        )
+        .expect("fixture parses");
+        let result = reconstruct(&pages, ColumnMode::Single);
+
+        assert_eq!(result.blocks.len(), 1, "{:?}", result.blocks);
+        assert_eq!(
+            result.blocks[0].block.text().trim(),
+            "seen twice before the river rose again."
+        );
+        assert!(
+            result.blocks[0]
+                .block
+                .spans()
+                .iter()
+                .any(|span| span.italic && span.text == " twice ")
+        );
+    }
+
+    #[test]
+    fn shifted_style_runs_keep_two_columns_and_their_lines_apart() {
+        let mut xml = String::from(
+            r#"<pdf2xml><page number="1" width="900" height="1200"><fontspec id="0" size="18" family="T"/>"#,
+        );
+        for row in 0..4 {
+            let top = 100 + row * 18;
+            for (left, column) in [(80, "West"), (430, "East")] {
+                xml.push_str(&format!(
+                    r#"<text top="{top}" left="{left}" width="120" height="18" font="0">{column} {row} </text>
+<text top="{}" left="{}" width="50" height="18" font="0"><i>slanted </i></text>
+<text top="{top}" left="{}" width="150" height="18" font="0">close.</text>"#,
+                    top - 1,
+                    left + 120,
+                    left + 170
+                ));
+            }
+        }
+        xml.push_str("</page></pdf2xml>");
+        let pages = parse_pdf2xml(&xml).expect("fixture parses");
+
+        let lines = merge_fragments_into_lines(&pages[0]);
+        assert_eq!(lines.len(), 8);
+        for (index, line) in lines.iter().enumerate() {
+            let column = if index % 2 == 0 { "West" } else { "East" };
+            assert_eq!(
+                line.text(),
+                format!("{column} {} slanted close.", index / 2)
+            );
+        }
+        let result = reconstruct(&pages, ColumnMode::Auto);
+        assert!(result.pages[0].two_column);
+        let text = result
+            .blocks
+            .iter()
+            .map(|block| block.block.text())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.find("West 3").expect("west") < text.find("East 0").expect("east"));
+    }
+
+    #[test]
+    fn a_drop_cap_does_not_pull_the_next_line_into_its_row() {
+        // A tall initial spans several body lines. Fragments of two
+        // different lines must not be sorted together by position.
+        let pages = parse_pdf2xml(
+            r#"<pdf2xml><page number="1" width="600" height="900">
+<fontspec id="0" size="12" family="T"/><fontspec id="1" size="40" family="T"/>
+<text top="100" left="50" width="30" height="40" font="1">T</text>
+<text top="105" left="90" width="150" height="12" font="0">he first line opens </text>
+<text top="105" left="240" width="200" height="12" font="0">the story with a cap.</text>
+<text top="119" left="90" width="150" height="12" font="0">A second line follows </text>
+<text top="119" left="240" width="200" height="12" font="0">it straight after.</text>
+<text top="133" left="50" width="390" height="12" font="0">A third line runs the full measure here.</text>
+</page></pdf2xml>"#,
+        )
+        .expect("fixture parses");
+
+        let texts = merge_fragments_into_lines(&pages[0])
+            .iter()
+            .map(Line::text)
+            .collect::<Vec<_>>();
+        assert!(
+            texts.contains(&"A second line follows it straight after.".to_string()),
+            "{texts:?}"
         );
     }
 
