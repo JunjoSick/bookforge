@@ -280,6 +280,214 @@ async fn audiobook_estimate_groups_pdf_pages_like_narration() {
     assert_eq!(estimate["characters"], json!(expected.2));
 }
 
+fn directory_names(path: &Path) -> Vec<String> {
+    let mut names = std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn write_single_entry_zip(file: &mut std::fs::File, body: &[u8]) -> Result<()> {
+    let mut archive = zip::ZipWriter::new(file);
+    archive.start_file("audio.wav", zip::write::SimpleFileOptions::default())?;
+    archive.write_all(body)?;
+    archive.finish()?;
+    Ok(())
+}
+
+fn zip_entry(path: &Path, name: &str) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let mut contents = Vec::new();
+    archive.by_name(name)?.read_to_end(&mut contents)?;
+    Ok(contents)
+}
+
+#[test]
+fn failed_artifact_writer_preserves_prior_state_and_unrelated_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("process.json");
+    let previous = br#"{"status":"running","warnings":["keep me"]}"#;
+    std::fs::write(&path, previous).unwrap();
+    // The fixed stage name older builds used; another writer may own it.
+    let legacy = dir.path().join("process.part.tmp");
+    std::fs::write(&legacy, b"another writer owns this").unwrap();
+
+    let error = write_audio_artifact(dir.path(), "process.json", |file| {
+        file.write_all(b"partial new state")?;
+        anyhow::bail!("injected writer failure")
+    })
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("injected writer failure"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), previous);
+    assert_eq!(std::fs::read(&legacy).unwrap(), b"another writer owns this");
+    assert_eq!(
+        directory_names(dir.path()),
+        ["process.json", "process.part.tmp"]
+    );
+}
+
+#[test]
+fn concurrent_artifact_writers_publish_only_their_completed_zip() {
+    use std::sync::mpsc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(AUDIO_DOWNLOAD_ZIP_NAME);
+    let wait = Duration::from_secs(30);
+
+    // The first writer completes its archive and pauses before publishing.
+    let (first_ready, first_written) = mpsc::channel();
+    let (release_first, first_released) = mpsc::channel::<()>();
+    let first_dir = dir.path().to_path_buf();
+    let first = std::thread::spawn(move || {
+        write_audio_artifact(&first_dir, AUDIO_DOWNLOAD_ZIP_NAME, |file| {
+            write_single_entry_zip(file, b"first complete audio")?;
+            first_ready.send(())?;
+            first_released.recv_timeout(wait)?;
+            Ok(())
+        })
+    });
+    first_written.recv_timeout(wait).unwrap();
+
+    // The second writer holds its own, still empty, stage open meanwhile.
+    let (second_ready, second_opened) = mpsc::channel();
+    let (release_second, second_released) = mpsc::channel::<()>();
+    let second_dir = dir.path().to_path_buf();
+    let second = std::thread::spawn(move || {
+        write_audio_artifact(&second_dir, AUDIO_DOWNLOAD_ZIP_NAME, |file| {
+            second_ready.send(())?;
+            second_released.recv_timeout(wait)?;
+            write_single_entry_zip(file, b"second complete audio")
+        })
+    });
+    second_opened.recv_timeout(wait).unwrap();
+
+    release_first.send(()).unwrap();
+    first.join().unwrap().unwrap();
+    assert_eq!(
+        zip_entry(&path, "audio.wav").unwrap(),
+        b"first complete audio",
+        "the first writer publishes only its own completed archive"
+    );
+    release_second.send(()).unwrap();
+    second.join().unwrap().unwrap();
+    assert_eq!(
+        zip_entry(&path, "audio.wav").unwrap(),
+        b"second complete audio"
+    );
+    assert_eq!(directory_names(dir.path()), [AUDIO_DOWNLOAD_ZIP_NAME]);
+}
+
+const AUDIO_DOWNLOAD_ZIP_NAME: &str = "audiobook-audio.zip";
+
+fn write_fixture_manifest(dir: &Path, parts: usize, status: &str) -> Vec<u8> {
+    let chunks = (1..=parts)
+        .map(|part| {
+            let file = format!("part-{part}.wav");
+            std::fs::write(dir.join(&file), format!("synthetic audio part {part}")).unwrap();
+            json!({
+                "chapter_index": 0,
+                "chapter_title": "Chapter",
+                "part": part,
+                "kind": "body",
+                "file": file,
+                "chars": 10,
+                "synthesis_sha256": "fixture",
+                "status": "synthesized",
+            })
+        })
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&json!({
+        "schema_version": 3,
+        "title": "Fixture",
+        "synthesis_id": "fixture",
+        "voice": "voice",
+        "format": "wav",
+        "speed": 1.0,
+        "max_chars": 2000,
+        "chapters": 1,
+        "chunks": chunks,
+        "completed_chunks": parts,
+        "status": status,
+        "updated_at_ms": 0,
+    }))
+    .unwrap();
+    std::fs::write(dir.join("manifest.json"), &bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn download_zip_rebuilds_after_manifest_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = write_fixture_manifest(dir.path(), 1, "running");
+    let path = ensure_audio_download_zip(dir.path()).unwrap();
+    assert_eq!(zip_entry(&path, "manifest.json").unwrap(), original);
+    assert!(zip_entry(&path, "part-2.wav").is_err());
+
+    // Unchanged manifest: the cached archive is reused as is.
+    let cached = std::fs::read(&path).unwrap();
+    assert_eq!(ensure_audio_download_zip(dir.path()).unwrap(), path);
+    assert_eq!(std::fs::read(&path).unwrap(), cached);
+
+    // A later checkpoint added a part: the archive must be rebuilt.
+    let current = write_fixture_manifest(dir.path(), 2, "succeeded");
+    assert_eq!(ensure_audio_download_zip(dir.path()).unwrap(), path);
+    assert_eq!(zip_entry(&path, "manifest.json").unwrap(), current);
+    assert_eq!(
+        zip_entry(&path, "part-1.wav").unwrap(),
+        b"synthetic audio part 1"
+    );
+    assert_eq!(
+        zip_entry(&path, "part-2.wav").unwrap(),
+        b"synthetic audio part 2"
+    );
+    assert_eq!(
+        directory_names(dir.path()),
+        [
+            AUDIO_DOWNLOAD_ZIP_NAME,
+            "manifest.json",
+            "part-1.wav",
+            "part-2.wav"
+        ]
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn failed_process_state_replacement_preserves_previous_file() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("process.json");
+    let previous = br#"{"status":"running","warnings":["keep me"]}"#;
+    std::fs::write(&path, previous).unwrap();
+    // Share read and write but not delete: the destination cannot be
+    // replaced while this handle is open.
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1 | 0x2)
+        .open(&path)
+        .unwrap();
+    assert!(write_audio_process_state(dir.path(), "succeeded", None, None, false, None).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), previous);
+    assert_eq!(directory_names(dir.path()), ["process.json"]);
+    drop(holder);
+
+    write_audio_process_state(dir.path(), "succeeded", None, None, false, None).unwrap();
+    let process: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(process["status"], "succeeded");
+    assert_eq!(process["warnings"], json!(["keep me"]));
+    assert_eq!(directory_names(dir.path()), ["process.json"]);
+}
+
 /// Fixture body for the cancellation tests. A no-op in an ordinary test run;
 /// when re-executed by [`cancel_fixture_child`] it stands in for an audiobook
 /// child: `cooperate` cleans up and exits once the marker appears, `ignore`

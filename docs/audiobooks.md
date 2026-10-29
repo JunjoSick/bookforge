@@ -382,7 +382,13 @@ The Audiobooks screen mirrors the CLI's current workflow:
   medium/long to 0/600/1200/2000 ms; the title gap is derived as the smaller
   of 800 ms and the selected chapter gap.
 - The finished panel plays the chaptered `.m4b` in-page and keeps the download
-  action available.
+  action available. Without an `.m4b`, the download is a ZIP of the manifest
+  and its chunk files. The ZIP is cached in the operation directory and rebuilt
+  whenever `manifest.json` changes, so it never serves parts from an older
+  revision. Each build writes its own temporary file and replaces the archive
+  atomically, so concurrent downloads always receive a complete archive.
+- `process.json` is replaced the same way; a failed update leaves the previous
+  state readable.
 
 The artifact route does not yet support HTTP Range requests, so seeking through
 a long `.m4b` may depend on browser buffering behavior.
