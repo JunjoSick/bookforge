@@ -1892,7 +1892,9 @@ mod tests {
         let _ = server_handle.await;
         let response = response.expect("floored budget request should complete");
         let wire_body = inbound_rx.await.expect("mock server captures the request");
-        let budget_flagged = provider.collapsed_budget_warning_emitted.load(Ordering::Relaxed);
+        let budget_flagged = provider
+            .collapsed_budget_warning_emitted
+            .load(Ordering::Relaxed);
 
         // The run proceeded: the endpoint answered, nothing chased a 400.
         assert_eq!(response.content, "ok");

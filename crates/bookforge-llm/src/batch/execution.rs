@@ -834,9 +834,28 @@ where
                         // supplying a controller and no runtime receiver.
                         .unwrap_or_else(|| rate_controller.is_some());
                     let permit = match rate_controller.as_ref().filter(|_| adaptive_concurrency) {
-                        Some(controller) => match controller.acquire().await {
-                            Ok(permit) => Some(permit),
-                            Err(_) => {
+                        Some(controller) => match acquire_unless_stopped(
+                            controller.acquire(),
+                            pause_signal.as_ref(),
+                        )
+                        .await
+                        {
+                            None => {
+                                return BatchWorkerOutput {
+                                    batch,
+                                    result: BatchWorkerResult::StoppedUnfinished,
+                                    request_status: RequestStatus::OtherError,
+                                    finish_reason: None,
+                                    returned_items: None,
+                                    latency_ms: 0,
+                                    max_output_tokens: 0,
+                                    output_escalated,
+                                    next_max_output_tokens: None,
+                                    request_permit: None,
+                                };
+                            }
+                            Some(Ok(permit)) => Some(permit),
+                            Some(Err(_)) => {
                                 return BatchWorkerOutput {
                                     batch,
                                     result: BatchWorkerResult::Provider(Err(LlmError::Provider(
@@ -855,6 +874,24 @@ where
                         },
                         None => None,
                     };
+                    // A pause that began while this worker waited for its
+                    // permit must hold the request; a stop must abandon it.
+                    if let Some(signal) = pause_signal.as_ref()
+                        && signal.wait_until_running_or_stopped().await == PauseState::Stopped
+                    {
+                        return BatchWorkerOutput {
+                            batch,
+                            result: BatchWorkerResult::StoppedUnfinished,
+                            request_status: RequestStatus::OtherError,
+                            finish_reason: None,
+                            returned_items: None,
+                            latency_ms: 0,
+                            max_output_tokens: 0,
+                            output_escalated,
+                            next_max_output_tokens: None,
+                            request_permit: None,
+                        };
+                    }
 
                     let mut effective_config = config.as_ref().clone();
                     if let Some(receiver) = runtime_settings.as_ref() {
@@ -1969,9 +2006,25 @@ where
                         .unwrap_or_else(|| rate_controller.is_some());
                     let controller_permit =
                         match rate_controller.as_ref().filter(|_| adaptive_concurrency) {
-                            Some(controller) => match controller.acquire().await {
-                                Ok(permit) => Some(permit),
-                                Err(_) => {
+                            Some(controller) => match acquire_unless_stopped(
+                                controller.acquire(),
+                                pause_signal.as_ref(),
+                            )
+                            .await
+                            {
+                                None => {
+                                    return RepairWorkerOutput {
+                                        batch: repair_batch,
+                                        result: Err(LlmError::Provider("repair stopped".to_string())),
+                                        finish_reason: None,
+                                        returned_items: None,
+                                        latency_ms: 0,
+                                        max_output_tokens: 0,
+                                        skipped: true,
+                                    };
+                                }
+                                Some(Ok(permit)) => Some(permit),
+                                Some(Err(_)) => {
                                     return RepairWorkerOutput {
                                         batch: repair_batch,
                                         result: Err(LlmError::Provider(
@@ -1987,6 +2040,19 @@ where
                             },
                             None => None,
                         };
+                    if let Some(signal) = pause_signal.as_ref()
+                        && signal.wait_until_running_or_stopped().await == PauseState::Stopped
+                    {
+                        return RepairWorkerOutput {
+                            batch: repair_batch,
+                            result: Err(LlmError::Provider("repair stopped".to_string())),
+                            finish_reason: None,
+                            returned_items: None,
+                            latency_ms: 0,
+                            max_output_tokens: 0,
+                            skipped: true,
+                        };
+                    }
 
                     let started = std::time::Instant::now();
                     let is_reasoning = provider.is_reasoning();
@@ -2485,6 +2551,28 @@ where
     }
 
     Ok(translations)
+}
+
+/// Await `future` (an adaptive-permit wait) unless the run is stopped first.
+/// A pause alone keeps waiting, so the permit can still be used on resume;
+/// a stop must not wait for another request to release its permit.
+async fn acquire_unless_stopped<F: std::future::Future>(
+    future: F,
+    signal: Option<&PauseSignal>,
+) -> Option<F::Output> {
+    let Some(signal) = signal else {
+        return Some(future.await);
+    };
+    let stopped = async {
+        while !signal.is_stopped() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = stopped => None,
+        output = future => Some(output),
+    }
 }
 
 async fn wait_for_batch_resume_or_stop<C>(
