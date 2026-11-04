@@ -338,12 +338,21 @@ fn import_glossary_files(
     Ok(imported)
 }
 
+/// Fingerprint active terms after scope merging has resolved duplicate keys.
 pub(crate) fn glossary_fingerprint(
     format: GlossaryFormat,
     budget_tokens: usize,
     prompt_extra: Option<&str>,
     terms: &[GlossaryTerm],
 ) -> String {
+    // v3 only for sets whose merged order used to depend on HashMap order:
+    // their budget could keep different guidance under one v2 identity.
+    // Every other set keeps its v2 hash and cache namespace.
+    let schema = if bookforge_core::glossary::has_formerly_ambiguous_order(terms) {
+        3
+    } else {
+        2
+    };
     let mut normalized = terms.to_vec();
     for term in &mut normalized {
         term.id = None;
@@ -356,6 +365,7 @@ pub(crate) fn glossary_fingerprint(
             .then_with(|| a.scope_id.cmp(&b.scope_id))
             .then_with(|| a.source_text.cmp(&b.source_text))
             .then_with(|| a.target_text.cmp(&b.target_text))
+            .then_with(|| a.case_sensitive.cmp(&b.case_sensitive))
     });
     let payload = serde_json::json!({
         // v2: glossary budget packing switched from the chars-div-3
@@ -365,7 +375,7 @@ pub(crate) fn glossary_fingerprint(
         // term list itself is unchanged. Bumping the payload schema keys
         // such runs into fresh cache namespaces instead of reusing
         // translations produced with differently-packed glossaries.
-        "schema": 2,
+        "schema": schema,
         "format": format.as_str(),
         "budget_tokens": budget_tokens,
         "prompt_extra": prompt_extra.unwrap_or(""),
@@ -379,6 +389,76 @@ pub(crate) fn glossary_fingerprint(
         write!(&mut hex, "{byte:02x}").expect("writing to string cannot fail");
     }
     hex
+}
+
+#[cfg(test)]
+mod glossary_identity_tests {
+    use super::*;
+
+    fn ordering_term(language: &str, note: &str) -> GlossaryTerm {
+        GlossaryTerm {
+            id: None,
+            scope_kind: bookforge_core::GlossaryScopeKind::Global,
+            scope_id: None,
+            source_text: "Odile".into(),
+            target_text: "Odile".into(),
+            category: bookforge_core::GlossaryCategory::Person,
+            notes: Some(note.into()),
+            case_sensitive: false,
+            always_active: true,
+            status: bookforge_core::GlossaryStatus::UserSeeded,
+            source_language: language.into(),
+            target_language: "it".into(),
+            source_count: 0,
+        }
+    }
+
+    fn fingerprint(terms: &[GlossaryTerm]) -> String {
+        glossary_fingerprint(GlossaryFormat::Json, 1, None, terms)
+    }
+
+    #[test]
+    fn glossary_fingerprint_preserves_unambiguous_legacy_hashes() {
+        // Captured from the implementation before equal-spelling tie-breaks.
+        assert_eq!(
+            fingerprint(&[]),
+            "032110a8d8a8e9689f4880a824d67ad9d48d8c8fe74f5cddfb32018210e6ba62"
+        );
+        let english = ordering_term("en", "English note");
+        for terms in [
+            vec![english.clone()],
+            merge_scope_terms(&[english.clone(), english]),
+        ] {
+            assert_eq!(
+                fingerprint(&terms),
+                "69bc6c57975a34a6a860f7cc60b0a390dbed72e4eddff75bd83fc6cd43f34935"
+            );
+        }
+    }
+
+    #[test]
+    fn glossary_fingerprint_versions_only_formerly_ambiguous_ordering() {
+        let english = ordering_term("en", "English note");
+        let french = ordering_term("fr", "French note");
+        // One old hash covered both orders of this set, although the budget
+        // could keep either note depending on HashMap order.
+        let forward = fingerprint(&[english.clone(), french.clone()]);
+        assert_ne!(
+            forward,
+            "49a4a912274d8df32ccd87d76fd89fb84b652fbabb9a70184197d3f510f10f5c"
+        );
+        assert_eq!(forward, fingerprint(&[french, english.clone()]));
+
+        // Case-sensitivity variants used to fingerprint differently by input
+        // order (old hashes 156fc179... and 005dd168...).
+        let mut sensitive = english.clone();
+        sensitive.case_sensitive = true;
+        sensitive.notes = Some("Case-sensitive note".into());
+        assert_eq!(
+            fingerprint(&[english.clone(), sensitive.clone()]),
+            fingerprint(&[sensitive, english])
+        );
+    }
 }
 
 pub(crate) fn mock_mode(model: &str) -> MockMode {
