@@ -74,6 +74,13 @@ v2.5, and Multilingual v2. It never adds these tags for Eleven v3 or another
 provider. Use `--break-tags off` when the selected voice or model reads tags
 aloud instead of treating them as directives.
 
+`--max-chars` counts Unicode scalar values and includes the break tag and its
+separating space. Tagged titles and headings reserve that room before they are
+split; body chunks keep the full limit, so enabling or disabling tags never
+re-chunks body prose. If the limit leaves no room for heading text, the run
+(and the dashboard estimate) is rejected before synthesis; increase
+`--max-chars` or use `--break-tags off`.
+
 ## Providers
 
 - **`openai`** (default) — any endpoint speaking the OpenAI `/audio/speech`
@@ -123,7 +130,11 @@ aloud instead of treating them as directives.
   If the models endpoint cannot be reached because of a transient network
   failure, the run does not abort: it degrades deterministically to the
   cheapest suitable tier instead — see
-  [Cost and quota preflight](#cost-and-quota-preflight).
+  [Cost and quota preflight](#cost-and-quota-preflight). Any other discovery
+  failure, such as an HTTP error from the models endpoint, stops the run
+  before synthesis; retry, or pass `--model` to skip discovery. An offline
+  `--dry-run` without `--model` plans with `eleven_multilingual_v2` and says
+  that a live run auto-selects.
 
   ```bash
   bookforge audiobook book.epub --provider elevenlabs \
@@ -211,15 +222,18 @@ Estimated cost: ~$1.23 / ~4500 credits
 
 Set `BOOKFORGE_AUDIO_PRICING_PATH` to a JSON file with the same structure to
 override the bundled table (for new models or updated rates). Pricing is per
-character, so changing chunk size does not change the estimate. These figures
+character of the planned narration text, including supported heading break
+tags, so changing chunk size does not change the estimate. These figures
 are planning estimates, not invoices: provider plans and rates can change, and
 the provider's own billing is authoritative.
 
 Before a live ElevenLabs run, BookForge queries `/v1/user/subscription` and
 prints a line such as `ElevenLabs quota: 12000 remaining of 20000`. It warns
-when the plan exceeds the remaining quota. A dry run performs the same check
-when the configured key environment variable is available. Network failures
-during that quota lookup are always a warning and never prevent synthesis.
+when the rounded-up credit estimate exceeds the remaining quota, comparing
+characters instead only when the model has no pricing entry. A dry run
+performs the same check when the configured key environment variable is
+available. Network failures during that quota lookup are always a warning and
+never prevent synthesis.
 
 Model preflight behaves differently from the quota lookup. If the account's
 model list cannot be fetched because of a transient network failure, BookForge
@@ -232,9 +246,11 @@ hashes identically, and reuses previously paid chunks instead of re-synthesizing
 The library reports degraded selections with `degraded: true` plus a
 human-readable `reason`; the CLI surfaces the reason in plan output
 (`Degraded model choice: …` and `model_degraded_reason` in the JSON
-`audiobook_plan` event) and other (non-transient) preflight errors keep failing
-hard in the engine and are reported as a warning by the CLI, which then falls
-back to Multilingual v2 as before.
+`audiobook_plan` event). Other (non-transient) preflight errors stop the run
+before the quota lookup or any synthesis, with `ElevenLabs model discovery
+failed; retry or select an explicit --model to skip discovery`. Unlike the
+quota lookup, model discovery must succeed (or degrade) before anything is
+spent.
 
 ## Book files, stitching, and loudness
 
@@ -278,6 +294,14 @@ public filename; a failed encode removes the staged file and leaves any older
 good artifact untouched. Failure messages include a bounded tail of ffmpeg's
 stderr. If ffprobe cannot determine every chapter duration, BookForge does not
 publish an unchaptered `.m4b` under the promised chaptered filename.
+
+Every ffmpeg and ffprobe run has a deadline (15 seconds for tool version
+checks, 60 seconds for media probes, 30 minutes per encode); a child that
+misses it is killed and reported as a stitch warning. Ctrl+C also stops
+stitching: the running ffmpeg child is killed, its unfinished staged output is
+removed, nothing further is published, and the command exits with an error
+that says so. Completed chunks and previously published chapter files and
+book files are kept, so rerunning the command resumes from them.
 
 Explicit whole-book requests are strict: `--m4b` and `--single` make the
 command fail if their requested artifacts are absent. The established
@@ -342,15 +366,29 @@ The Audiobooks screen mirrors the CLI's current workflow:
   account's voices through a server-side proxy; the API key never reaches the
   browser. If voice retrieval fails, the form falls back to a voice-ID field.
 - A pre-launch estimate reports chapters, chunks, characters, cost, and
-  ElevenLabs quota before synthesis starts.
+  ElevenLabs quota before synthesis starts. It uses the same narration cleanup
+  and PDF-page grouping as a launch. With an explicit model it also counts
+  that model's heading break tags; an Auto estimate stays provisional because
+  the model, and therefore its tags and price, is only known after model
+  discovery. Its quota `fits` flag compares credits the same way as the CLI.
 - Running jobs show per-chapter completed/total progress and the resolved
   auto-selected model.
+- Cancel first asks the running process to stop the way Ctrl+C does, so
+  synthesis and encoding can stop and remove their temporary output while
+  completed chunks are preserved. A process that has not exited after five
+  seconds is force-stopped together with its child processes.
 - The Advanced section exposes chapter pause, flat-file output, loudness
   normalization, seed, and language. Chapter-pause presets map none/short/
   medium/long to 0/600/1200/2000 ms; the title gap is derived as the smaller
   of 800 ms and the selected chapter gap.
 - The finished panel plays the chaptered `.m4b` in-page and keeps the download
-  action available.
+  action available. Without an `.m4b`, the download is a ZIP of the manifest
+  and its chunk files. The ZIP is cached in the operation directory and rebuilt
+  whenever `manifest.json` changes, so it never serves parts from an older
+  revision. Each build writes its own temporary file and replaces the archive
+  atomically, so concurrent downloads always receive a complete archive.
+- `process.json` is replaced the same way; a failed update leaves the previous
+  state readable.
 
 The artifact route does not yet support HTTP Range requests, so seeking through
 a long `.m4b` may depend on browser buffering behavior.

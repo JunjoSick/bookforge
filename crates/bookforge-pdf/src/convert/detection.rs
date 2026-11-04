@@ -391,32 +391,50 @@ fn push_table_region(page: &Page, rows: &[&FragmentRow<'_>], regions: &mut Vec<M
 }
 
 fn is_tableish_row(row: &FragmentRow<'_>) -> bool {
-    if row.fragments.len() < 3 {
+    let cells = table_cells(row);
+    if cells.len() < 3 {
         return false;
     }
-    let numeric_cells = row
-        .fragments
+    let numeric_cells = cells
         .iter()
-        .filter(|fragment| {
-            let text = spans_text(&fragment.spans);
-            text.chars().any(|ch| ch.is_ascii_digit()) || text.contains('%')
-        })
+        .filter(|(_, text)| text.chars().any(|ch| ch.is_ascii_digit()) || text.contains('%'))
         .count();
-    let short_cells = row
-        .fragments
+    let short_cells = cells
         .iter()
-        .filter(|fragment| spans_text(&fragment.spans).trim().chars().count() <= 32)
+        .filter(|(_, text)| text.trim().chars().count() <= 32)
         .count();
 
-    numeric_cells >= 2 && short_cells >= row.fragments.len().saturating_sub(1)
+    numeric_cells >= 2 && short_cells >= cells.len().saturating_sub(1)
+}
+
+/// A row's cells as `(left, text)`. Poppler splits a line into fragments at
+/// every font change, without any column behind it: a numbered note with an
+/// italic title is three touching fragments. Only a visible gap starts a new
+/// cell, so such notes stay translatable prose instead of a table crop.
+fn table_cells(row: &FragmentRow<'_>) -> Vec<(i32, String)> {
+    let gap_threshold = (row.height() / 2).max(4);
+    let mut cells: Vec<(i32, String)> = Vec::new();
+    let mut previous_right = i32::MIN;
+    for fragment in &row.fragments {
+        let text = spans_text(&fragment.spans);
+        if fragment.left.saturating_sub(previous_right) <= gap_threshold
+            && let Some((_, cell_text)) = cells.last_mut()
+        {
+            cell_text.push_str(&text);
+        } else {
+            cells.push((fragment.left, text));
+        }
+        previous_right = previous_right.max(fragment.right());
+    }
+    cells
 }
 
 fn table_group_has_aligned_columns(rows: &[&FragmentRow<'_>]) -> bool {
     let mut buckets: HashMap<i32, usize> = HashMap::new();
     for row in rows {
         let mut seen = Vec::new();
-        for fragment in &row.fragments {
-            let bucket = fragment.left / 12;
+        for (left, _) in table_cells(row) {
+            let bucket = left / 12;
             if !seen.contains(&bucket) {
                 seen.push(bucket);
             }

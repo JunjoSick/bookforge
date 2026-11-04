@@ -33,6 +33,7 @@ use crate::{
         join_epub_path, local_name, marker_id, never_translate_element, normalize_space,
         package_base_dir, resolve_general_ref,
     },
+    xml_text::read_text_chunk,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +177,12 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         blocks.append(&mut toc_blocks);
     }
 
+    // Every XHTML document is extracted once, keyed by its normalized
+    // archive path: a spine that lists a document twice, or two manifest
+    // items aliasing one file, must not duplicate its prose (and its patch
+    // targets) in the IR.
+    let mut extracted_xhtml = HashSet::new();
+
     for (spine_index, spine_item) in package.spine.iter_mut().enumerate() {
         let Some(resource) = manifest_by_id.get(spine_item.idref.as_str()) else {
             return Err(BookforgeError::InvalidInput(format!(
@@ -187,7 +194,7 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         let href = join_epub_path(&package_dir, &resource.href);
         spine_item.href = Some(href.clone());
 
-        if !is_xhtml_media_type(&resource.media_type) {
+        if !is_xhtml_media_type(&resource.media_type) || !extracted_xhtml.insert(href.clone()) {
             continue;
         }
 
@@ -216,19 +223,14 @@ pub fn read_epub(path: &Path) -> Result<Book> {
         blocks.append(&mut section_blocks);
     }
 
-    let spine_idrefs = package
-        .spine
-        .iter()
-        .map(|item| item.idref.clone())
-        .collect::<HashSet<_>>();
-
-    for (nav_index, resource) in package
-        .manifest
-        .iter()
-        .filter(|item| is_nav_item(item) && !spine_idrefs.contains(&item.id))
-        .enumerate()
-    {
+    let mut nav_count = 0usize;
+    for resource in package.manifest.iter().filter(|item| is_nav_item(item)) {
         let href = join_epub_path(&package_dir, &resource.href);
+        if !extracted_xhtml.insert(href.clone()) {
+            continue;
+        }
+        let nav_index = nav_count;
+        nav_count += 1;
         let xhtml = read_archive_text(&mut archive, &mut read_budget, &href)?;
         let section_id = SectionId(format!("sec_nav_{nav_index:06}"));
         let mut nav_blocks = extract_blocks(&xhtml, &href, &section_id, blocks.len())?;
@@ -250,6 +252,57 @@ pub fn read_epub(path: &Path) -> Result<Book> {
             next: None,
         });
         blocks.append(&mut nav_blocks);
+    }
+
+    // Readable XHTML outside the spine (linked endnotes, appendices reached
+    // only through hyperlinks) ships with the book and is visible to readers,
+    // so it is translated too, after the spine and navigation, in manifest
+    // order.
+    let mut resource_count = 0usize;
+    for resource in package
+        .manifest
+        .iter()
+        .filter(|item| is_auxiliary_document_media_type(&item.media_type))
+    {
+        let href = join_epub_path(&package_dir, &resource.href);
+        if extracted_xhtml.contains(&href) {
+            continue;
+        }
+        // A manifest entry whose file is absent is an authoring defect that
+        // reading systems tolerate; it must not fail the whole book when the
+        // document is not part of the reading order.
+        if archive.index_for_name(&href).is_none() {
+            tracing::warn!(
+                href = %href,
+                "skipping non-spine manifest document that is missing from the archive"
+            );
+            continue;
+        }
+        extracted_xhtml.insert(href.clone());
+        let resource_index = resource_count;
+        resource_count += 1;
+        let xhtml = read_archive_text(&mut archive, &mut read_budget, &href)?;
+        let section_id = SectionId(format!("sec_resource_{resource_index:06}"));
+        let mut resource_blocks = extract_blocks(&xhtml, &href, &section_id, blocks.len())?;
+        if resource_blocks.is_empty() {
+            continue;
+        }
+        let block_ids = resource_blocks
+            .iter()
+            .map(|block| block.id.clone())
+            .collect::<Vec<_>>();
+        let (title, heading_level) = first_heading(&resource_blocks);
+        sections.push(Section {
+            id: section_id,
+            href,
+            spine_index: synthetic_base + 1 + toc_resource_count + nav_count + resource_index,
+            title,
+            heading_level,
+            block_ids,
+            prev: None,
+            next: None,
+        });
+        blocks.append(&mut resource_blocks);
     }
 
     link_sections(&mut sections);
@@ -349,9 +402,10 @@ pub fn inspect_epub(path: &Path) -> Result<EpubInspection> {
     })
 }
 
-/// Measure how much visible body text each XHTML spine document contributes
-/// versus how much the block extractor captures. Counts non-whitespace
-/// characters so block boundaries and indentation do not skew the ratio.
+/// Measure how much visible body text each XHTML content document (the
+/// spine, then readable XHTML outside it) contributes versus how much the
+/// block extractor captures. Counts non-whitespace characters so block
+/// boundaries and indentation do not skew the ratio.
 pub fn text_coverage(path: &Path) -> Result<TextCoverage> {
     let (mut archive, mut read_budget) = open_archive(path)?;
     validate_mimetype(&mut archive, &mut read_budget)?;
@@ -365,21 +419,42 @@ pub fn text_coverage(path: &Path) -> Result<TextCoverage> {
         .map(|item| (item.id.as_str(), item))
         .collect::<HashMap<_, _>>();
 
-    let mut coverage = TextCoverage::default();
-    for (spine_index, spine_item) in package.spine.iter().enumerate() {
+    // Content documents in extraction order: the spine, then readable
+    // XHTML outside it. Navigation documents are excluded so the metric
+    // does not depend on whether a book carries a nav document.
+    let mut documents = Vec::new();
+    for spine_item in &package.spine {
         let Some(resource) = manifest_by_id.get(spine_item.idref.as_str()) else {
             return Err(BookforgeError::InvalidInput(format!(
                 "spine item references missing manifest id '{}'",
                 spine_item.idref
             )));
         };
-        if !is_xhtml_media_type(&resource.media_type) {
+        if is_xhtml_media_type(&resource.media_type) {
+            documents.push(join_epub_path(&package_dir, &resource.href));
+        }
+    }
+    let spine_documents = documents.iter().cloned().collect::<HashSet<_>>();
+    for resource in package
+        .manifest
+        .iter()
+        .filter(|item| is_auxiliary_document_media_type(&item.media_type) && !is_nav_item(item))
+    {
+        let href = join_epub_path(&package_dir, &resource.href);
+        if spine_documents.contains(&href) || archive.index_for_name(&href).is_none() {
             continue;
         }
+        documents.push(href);
+    }
 
-        let href = join_epub_path(&package_dir, &resource.href);
+    let mut coverage = TextCoverage::default();
+    let mut seen = HashSet::new();
+    for (document_index, href) in documents.into_iter().enumerate() {
+        if !seen.insert(href.clone()) {
+            continue;
+        }
         let xhtml = read_archive_text(&mut archive, &mut read_budget, &href)?;
-        let section_id = SectionId(format!("sec_{spine_index:06}"));
+        let section_id = SectionId(format!("sec_{document_index:06}"));
         let blocks = extract_blocks(&xhtml, &href, &section_id, 0)?;
         let captured_chars = blocks
             .iter()
@@ -502,24 +577,34 @@ fn locate_package(
 
 fn parse_package(xml: &str) -> Result<PackageDocument> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
 
     let mut metadata = Metadata::default();
     let mut manifest = Vec::new();
     let mut spine = Vec::new();
     let mut toc_id = None;
-    let mut current_text_element: Option<Vec<u8>> = None;
+    // Metadata values are collected whole and trimmed at the closing tag:
+    // a title such as `Rock &amp; Roll` arrives as text, reference and text
+    // events, and keeping only the first event truncated it.
+    let mut current_text_element: Option<(Vec<u8>, String)> = None;
+    let mut pending_event = None;
     // Duplicate manifest ids resolve deterministically (first wins); EPUBs
     // with clashing ids would otherwise have patch targets chosen by
     // whichever duplicate happened to be seen last.
     let mut seen_manifest_ids = HashSet::new();
 
     loop {
-        match reader.read_event()? {
+        let event = match pending_event.take() {
+            Some(event) => event,
+            None => reader.read_event()?,
+        };
+        match event {
             Event::Start(element) => match local_name(element.name().as_ref().as_bytes()) {
                 b"title" | b"creator" | b"language" => {
-                    current_text_element =
-                        Some(local_name(element.name().as_ref().as_bytes()).to_vec());
+                    current_text_element = Some((
+                        local_name(element.name().as_ref().as_bytes()).to_vec(),
+                        String::new(),
+                    ));
                 }
                 b"item" => {
                     parse_manifest_item(&reader, &element, &mut seen_manifest_ids, &mut manifest)?
@@ -539,27 +624,30 @@ fn parse_package(xml: &str) -> Result<PackageDocument> {
                 b"itemref" => spine.push(parse_spine_item(&reader, &element)?),
                 _ => {}
             },
-            Event::Text(text) => {
-                if let Some(name) = current_text_element.as_deref() {
-                    let value = text.html_content().trim().to_string();
-                    if !value.is_empty() {
-                        match name {
-                            b"title" if metadata.title.is_none() => metadata.title = Some(value),
-                            b"creator" => metadata.creators.push(value),
-                            b"language" if metadata.language.is_none() => {
-                                metadata.language = Some(value)
-                            }
-                            _ => {}
-                        }
-                    }
+            event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_)) => {
+                let chunk = read_text_chunk(event, &mut reader)?;
+                pending_event = Some(chunk.next);
+                if let Some((_, text)) = current_text_element.as_mut() {
+                    text.push_str(&chunk.text);
                 }
             }
             Event::End(element)
-                if current_text_element
-                    .as_deref()
-                    .is_some_and(|name| name == local_name(element.name().as_ref().as_bytes())) =>
+                if current_text_element.as_ref().is_some_and(|(name, _)| {
+                    name == local_name(element.name().as_ref().as_bytes())
+                }) =>
             {
-                current_text_element = None;
+                let (name, value) = current_text_element.take().expect("checked above");
+                let value = value.trim().to_string();
+                if !value.is_empty() {
+                    match name.as_slice() {
+                        b"title" if metadata.title.is_none() => metadata.title = Some(value),
+                        b"creator" => metadata.creators.push(value),
+                        b"language" if metadata.language.is_none() => {
+                            metadata.language = Some(value)
+                        }
+                        _ => {}
+                    }
+                }
             }
             Event::Eof => break,
             _ => {}
@@ -926,9 +1014,14 @@ fn extract_blocks(
     // Depth of never-translate ancestors (script/style/head/svg/...).
     // While positive, loose text is not captured into lazy blocks.
     let mut suppress_depth = 0usize;
+    let mut pending_event = None;
 
     loop {
-        match reader.read_event()? {
+        let event = match pending_event.take() {
+            Some(event) => event,
+            None => reader.read_event()?,
+        };
+        match event {
             Event::Start(element) => {
                 let name = local_name(element.name().as_ref().as_bytes()).to_vec();
                 if element_stack.len() >= MAX_READER_NESTING_DEPTH {
@@ -937,6 +1030,17 @@ fn extract_blocks(
                     )));
                 }
                 enter_element(&mut element_stack, &mut current_path, &name);
+
+                // The interior of an opaque subtree carries no translation
+                // structure: no blocks anchor inside it and no markers are
+                // emitted for its descendants. Only path bookkeeping and
+                // the never-translate depth advance.
+                if suppress_depth > 0 {
+                    if never_translate_element(&name) {
+                        suppress_depth += 1;
+                    }
+                    continue;
+                }
 
                 // EPUB navigation list items have a constrained content
                 // model: the label must remain inside the child <a> or
@@ -951,13 +1055,13 @@ fn extract_blocks(
                 if never_translate_element(&name) {
                     // Raw content (script bodies, SVG, MathML) must survive
                     // byte-for-byte and stay out of translation payloads.
-                    // Inside an active block the whole subtree is replaced
-                    // by a single paired marker whose interior stays empty;
-                    // the writer splices the original bytes back verbatim.
-                    let root_of_suppressed_tree = suppress_depth == 0;
+                    // Inside an active block the whole subtree becomes one
+                    // atomic reference marker (`<rN/>`): the model has no
+                    // interior to fill in, and the writer splices the
+                    // original bytes back verbatim.
                     suppress_depth += 1;
-                    if root_of_suppressed_tree && let Some(block) = active_block.as_mut() {
-                        block.push_inline_start(&name);
+                    if let Some(block) = active_block.as_mut() {
+                        block.push_inline_empty(&name);
                     }
                 } else if active_block.is_none()
                     && !navigation_list_item
@@ -969,9 +1073,7 @@ fn extract_blocks(
                         DomPath(current_path.clone()),
                         initial_block_count + blocks.len(),
                     ));
-                } else if suppress_depth == 0
-                    && let Some(block) = active_block.as_mut()
-                {
+                } else if let Some(block) = active_block.as_mut() {
                     block.push_inline_start(&name);
                 }
             }
@@ -989,10 +1091,17 @@ fn extract_blocks(
                     block.push_inline_empty(&name);
                 }
             }
-            Event::Text(text) => {
-                let value = text.html_content();
+            // quick-xml surfaces entity references (&nbsp; &mdash; ...) and
+            // CDATA sections as events separate from the surrounding text.
+            // Adjacent pieces form one visible text node: it joins the active
+            // block, anchors a lazy block, or becomes one addressable stray
+            // text node. The writer chunks text with the same rule, so
+            // text-node indices stay aligned.
+            event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_)) => {
+                let chunk = read_text_chunk(event, &mut reader)?;
+                pending_event = Some(chunk.next);
                 handle_text(
-                    &value,
+                    &chunk.text,
                     &mut active_block,
                     &mut element_stack,
                     &current_path,
@@ -1000,44 +1109,22 @@ fn extract_blocks(
                     section_id,
                     initial_block_count,
                     suppress_depth > 0,
-                    true,
-                );
-            }
-            Event::CData(text) => {
-                let value = text.as_ref();
-                handle_text(
-                    value,
-                    &mut active_block,
-                    &mut element_stack,
-                    &current_path,
-                    &mut blocks,
-                    section_id,
-                    initial_block_count,
-                    suppress_depth > 0,
-                    true,
-                );
-            }
-            // quick-xml surfaces entity references (&nbsp; &mdash; ...) as
-            // separate events rather than resolving them inside Text.
-            // Resolve numeric and HTML5 named references; the resolved
-            // text joins the active block or may anchor a lazy one, but
-            // never consumes a stray text-node index — the writer counts
-            // Text events only, and indices must stay aligned.
-            Event::GeneralRef(reference) => {
-                let value = resolve_general_ref(&reference)?;
-                handle_text(
-                    &value,
-                    &mut active_block,
-                    &mut element_stack,
-                    &current_path,
-                    &mut blocks,
-                    section_id,
-                    initial_block_count,
-                    suppress_depth > 0,
-                    false,
                 );
             }
             Event::End(_) => {
+                // Ends inside an opaque subtree, including its own root,
+                // close nothing: the subtree is a single atomic marker.
+                if suppress_depth > 0 {
+                    if element_stack
+                        .pop()
+                        .is_some_and(|frame| never_translate_element(&frame.name))
+                    {
+                        suppress_depth -= 1;
+                    }
+                    current_path.pop();
+                    continue;
+                }
+
                 let should_finish = active_block
                     .as_ref()
                     .is_some_and(|block| element_stack.len() == block.anchor_depth);
@@ -1047,26 +1134,11 @@ fn extract_blocks(
                     if let Some(block) = block.finish(section_id) {
                         blocks.push(block);
                     }
-                } else {
-                    // Ends inside a suppressed subtree carry no translation
-                    // structure; only the subtree's own root closes the
-                    // raw-content marker pair.
-                    let interior_of_suppressed_tree = match element_stack.last() {
-                        Some(frame) if never_translate_element(&frame.name) => suppress_depth > 1,
-                        Some(_) => suppress_depth > 0,
-                        None => false,
-                    };
-                    if !interior_of_suppressed_tree && let Some(block) = active_block.as_mut() {
-                        block.push_inline_end();
-                    }
+                } else if let Some(block) = active_block.as_mut() {
+                    block.push_inline_end();
                 }
 
-                if element_stack
-                    .pop()
-                    .is_some_and(|frame| never_translate_element(&frame.name))
-                {
-                    suppress_depth = suppress_depth.saturating_sub(1);
-                }
+                element_stack.pop();
                 current_path.pop();
             }
             Event::Eof => break,
@@ -1095,7 +1167,6 @@ fn handle_text(
     section_id: &SectionId,
     initial_block_count: usize,
     suppressed: bool,
-    allow_stray: bool,
 ) {
     if suppressed {
         return;
@@ -1120,9 +1191,6 @@ fn handle_text(
         );
         block.push_text(value);
         *active_block = Some(block);
-        return;
-    }
-    if !allow_stray {
         return;
     }
     // Stray text node: prior element siblings (or a wrapper element)
@@ -1617,6 +1685,13 @@ fn is_xhtml_media_type(media_type: &str) -> bool {
     )
 }
 
+/// Media types of documents outside the spine that are extracted for
+/// translation. Narrower than [`is_xhtml_media_type`]: a generic
+/// `application/xml` resource outside the reading order is data, not prose.
+fn is_auxiliary_document_media_type(media_type: &str) -> bool {
+    matches!(media_type, "application/xhtml+xml" | "text/html")
+}
+
 fn is_nav_item(item: &Resource) -> bool {
     item.media_type == "application/xhtml+xml"
         && (item.properties.iter().any(|property| property == "nav")
@@ -1879,6 +1954,53 @@ mod tests {
     }
 
     #[test]
+    fn package_metadata_keeps_text_after_entities_and_cdata() {
+        let package = parse_package(
+            r#"<package><metadata><title>Salt &amp; <!--x--><![CDATA[Pepper]]></title><creator>Ada &amp; Grace</creator></metadata><manifest><item id="c" href="c.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c"/></spine></package>"#,
+        )
+        .expect("package should parse");
+
+        assert_eq!(package.metadata.title.as_deref(), Some("Salt & Pepper"));
+        assert_eq!(package.metadata.creators, vec!["Ada & Grace"]);
+    }
+
+    #[test]
+    fn stray_text_across_entities_and_cdata_is_one_block() {
+        let blocks = extract_blocks(
+            "<html><body><p>Head</p>North &amp; South&#8217;s <![CDATA[entire line]]>.<p>Foot</p></body></html>",
+            "chapter.xhtml",
+            &SectionId("sec_000000".to_string()),
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(
+            block_text(&blocks[1]),
+            "North & South\u{2019}s entire line."
+        );
+        assert_eq!(
+            blocks[1].dom_path.0.last().copied(),
+            Some(bookforge_core::ir::TEXT_NODE_PATH_BASE),
+            "the merged node consumes exactly one text-node index"
+        );
+    }
+
+    #[test]
+    fn stray_text_made_only_of_references_is_captured() {
+        let blocks = extract_blocks(
+            "<html><body><p>Head</p>&#1043;&#1044;&#1045;</body></html>",
+            "chapter.xhtml",
+            &SectionId("sec_000000".to_string()),
+            0,
+        )
+        .expect("block extraction should succeed");
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(block_text(&blocks[1]), "\u{413}\u{414}\u{415}");
+    }
+
+    #[test]
     fn script_and_style_text_is_never_extracted() {
         let section_id = SectionId("sec_000000".to_string());
         let blocks = extract_blocks(
@@ -2121,18 +2243,13 @@ mod tests {
             .iter()
             .map(|run| run.text.as_str())
             .collect::<Vec<_>>();
-        // The suppressed subtree contributes exactly one empty marker pair.
-        let marked: String = strip_marker_tokens(&text).chars().collect();
-        let _ = marked;
+        // The suppressed subtree contributes exactly one atomic marker.
+        assert_eq!(text, "Hello <r1/> world");
         assert!(runs.iter().all(|run| !run.contains("var")), "{runs:?}");
-        assert!(
-            text.starts_with("Hello") && text.ends_with("world"),
-            "prose around the raw pair survives: {text}"
-        );
     }
 
     #[test]
-    fn svg_and_math_markup_keeps_empty_marker_pairs_only() {
+    fn svg_and_math_markup_become_atomic_reference_markers() {
         for (element, kind) in [
             ("<svg xmlns=\"x\"><text>label</text></svg>", "svg"),
             ("<math><mi>x</mi></math>", "math"),
@@ -2142,16 +2259,41 @@ mod tests {
             let blocks =
                 extract_blocks(&xhtml, "chapter.xhtml", &section_id, 0).expect("should parse");
             assert_eq!(blocks.len(), 1);
-            let text = block_text(&blocks[0]);
-            assert!(
-                !text.contains("label") && !text.contains('x'),
-                "{kind} content leaked into block: {text}"
-            );
-            assert!(
-                blocks[0].inline_marks.iter().any(|mark| mark.kind == kind),
-                "{kind} boundary marker missing from {text}"
-            );
+            assert_eq!(block_text(&blocks[0]), "a<r1/>b", "{kind}");
+            assert_eq!(blocks[0].inline_marks.len(), 1, "{kind}");
+            assert_eq!(blocks[0].inline_marks[0].kind, kind);
         }
+    }
+
+    #[test]
+    fn opaque_subtrees_share_the_marker_ordinal_stream() {
+        let blocks = extract_blocks(
+            "<html><body><p>Sum <math><mi>a</mi><mo>+</mo><mn>2</mn></math> beside <em>text</em> and <svg><g><text>Label</text></g></svg>.</p></body></html>",
+            "chapter.xhtml",
+            &SectionId("sec_000000".to_string()),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            block_text(&blocks[0]),
+            "Sum <r1/> beside <m2>text</m2> and <r3/>."
+        );
+    }
+
+    #[test]
+    fn blocks_never_anchor_inside_opaque_subtrees() {
+        let blocks = extract_blocks(
+            "<html><body><svg><foreignObject><p>Inside drawing</p></foreignObject></svg><p>After drawing</p></body></html>",
+            "chapter.xhtml",
+            &SectionId("sec_000000".to_string()),
+            0,
+        )
+        .unwrap();
+
+        let texts = blocks.iter().map(block_text).collect::<Vec<_>>();
+        assert_eq!(texts, vec!["After drawing"]);
     }
 
     #[test]
