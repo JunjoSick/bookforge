@@ -655,7 +655,7 @@ mod tests {
         let resolved = retry_transient_transport(|| {
             let body = body.to_string();
             async move {
-                let (base_url, _) = one_request_server(body.into_bytes(), "application/json");
+                let (base_url, _server) = one_request_server(body.into_bytes(), "application/json");
                 unsafe { std::env::set_var(key_env, "resolver-v3-key") };
                 let resolved = resolve_preferred_elevenlabs_model(
                     &resolver_config(base_url, key_env),
@@ -684,7 +684,7 @@ mod tests {
         let resolved = retry_transient_transport(|| {
             let body = body.to_string();
             async move {
-                let (base_url, _) = one_request_server(body.into_bytes(), "application/json");
+                let (base_url, _server) = one_request_server(body.into_bytes(), "application/json");
                 unsafe { std::env::set_var(key_env, "resolver-limit-key") };
                 let resolved = resolve_preferred_elevenlabs_model(
                     &resolver_config(base_url, key_env),
@@ -711,7 +711,7 @@ mod tests {
         let resolved = retry_transient_transport(|| {
             let body = body.to_string();
             async move {
-                let (base_url, _) = one_request_server(body.into_bytes(), "application/json");
+                let (base_url, _server) = one_request_server(body.into_bytes(), "application/json");
                 unsafe { std::env::set_var(key_env, "resolver-tts-key") };
                 let resolved = resolve_preferred_elevenlabs_model(
                     &resolver_config(base_url, key_env),
@@ -738,7 +738,7 @@ mod tests {
         let resolved = retry_transient_transport(|| {
             let body = body.to_string();
             async move {
-                let (base_url, _) = one_request_server(body.into_bytes(), "application/json");
+                let (base_url, _server) = one_request_server(body.into_bytes(), "application/json");
                 unsafe { std::env::set_var(key_env, "resolver-speed-key") };
                 let resolved = resolve_preferred_elevenlabs_model(
                     &resolver_config(base_url, key_env),
@@ -795,7 +795,7 @@ mod tests {
     async fn resolver_errors_on_unparseable_body() {
         let key_env = "BOOKFORGE_ELEVENLABS_RESOLVER_GARBAGE_TEST_KEY";
         let error = retry_transient_transport(|| async {
-            let (base_url, _) = one_request_server(b"not json".to_vec(), "application/json");
+            let (base_url, _server) = one_request_server(b"not json".to_vec(), "application/json");
             unsafe { std::env::set_var(key_env, "resolver-garbage-key") };
             let resolved = resolve_preferred_elevenlabs_model(
                 &resolver_config(base_url, key_env),
@@ -817,7 +817,7 @@ mod tests {
     async fn resolver_errors_on_empty_body() {
         let key_env = "BOOKFORGE_ELEVENLABS_RESOLVER_EMPTY_TEST_KEY";
         let error = retry_transient_transport(|| async {
-            let (base_url, _) = one_request_server(Vec::new(), "application/json");
+            let (base_url, _server) = one_request_server(Vec::new(), "application/json");
             unsafe { std::env::set_var(key_env, "resolver-empty-key") };
             let resolved = resolve_preferred_elevenlabs_model(
                 &resolver_config(base_url, key_env),
@@ -1049,7 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn subscription_rejects_oversized_json_before_buffering_body() {
         let error = retry_transient_transport(|| async {
-            let (base_url, _) = one_request_server_with_content_length(
+            let (base_url, _server) = one_request_server_with_content_length(
                 b"{}".to_vec(),
                 "application/json",
                 MAX_JSON_RESPONSE_BODY_BYTES as u64 + 1,
@@ -1076,7 +1076,7 @@ mod tests {
     async fn subscription_errors_on_garbage_body() {
         let key_env = "BOOKFORGE_ELEVENLABS_SUBSCRIPTION_GARBAGE_TEST_KEY";
         let error = retry_transient_transport(|| async {
-            let (base_url, _) = one_request_server(b"garbage".to_vec(), "application/json");
+            let (base_url, _server) = one_request_server(b"garbage".to_vec(), "application/json");
             unsafe { std::env::set_var(key_env, "subscription-garbage-key") };
             let subscription = fetch_elevenlabs_subscription(&resolver_config(base_url, key_env))
                 .await
@@ -1127,7 +1127,7 @@ mod tests {
     #[tokio::test]
     async fn voices_errors_on_garbage_body() {
         let error = retry_transient_transport(|| async {
-            let (base_url, _) = one_request_server(b"garbage".to_vec(), "application/json");
+            let (base_url, _server) = one_request_server(b"garbage".to_vec(), "application/json");
             let outcome: std::result::Result<(), TtsError> =
                 list_elevenlabs_voices(&base_url, "voices-garbage-key", 5)
                     .await

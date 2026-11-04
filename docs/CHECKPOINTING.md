@@ -8,11 +8,40 @@ Jobs live in `.bookforge/jobs.sqlite`. The store tracks job metadata, segment re
 
 When a job is created, `translate` snapshots the input EPUB into the job directory and stores a resolved run configuration. `resume` reads that snapshot instead of trusting current CLI defaults, then rebuilds the source IR and verifies that pending segment IDs still exist.
 
+The snapshot is an independent copy on every platform (never a hard link), so editing or moving the original book cannot change a job's saved input. `resume`, `review` and `correct` check the snapshot against its recorded SHA-256 before using it. A mismatch stops the command before any work: checkpoints, the saved hash and the output are left as they were. Restoring the exact saved file makes the job usable again. Jobs without a recorded hash are read as they are, and jobs that predate snapshots keep the original-path fallback.
+
 ## Segment States
 
 Segments move through pending, running, succeeded, skipped-cached, failed, needs-review, and retry-pending states. A segment translation is saved as soon as it validates, before the whole job finishes. If the process is interrupted, terminal segments remain usable.
 
 `retry` marks selected failed or needs-review segments retry-pending. `resume` translates only resumable segments. Retry-pending segments bypass cache so the user gets a fresh provider call instead of reusing a known-bad result.
+
+A segment stopped partway (stop or cancellation before every block arrived) is
+saved as retry-pending with its completed blocks and usage, so ordinary resume
+retries it; the retry currently translates the whole segment again. Pending
+dashboard retry guidance stays attached for that retry.
+
+Each checkpoint (translation text, blocks, segment state, its findings, and
+the job status) commits in one SQLite `IMMEDIATE` transaction. The write lock
+is taken before the human-correction check, so a late success, failure, cache
+or partial checkpoint cannot replace a correction committed by another process
+while it waited. Findings written after a checkpoint respect the correction
+too.
+
+## Interruption
+
+Ctrl+C during `resume` (or quitting an attached TUI) stops new dispatch at the
+next safe boundary and cancels in-flight provider calls, including QA,
+fallback and double-check requests. Completed responses still reach the
+checkpoint writer, and its queue drains before the process exits. The job is
+recorded as `interrupted` and no output book is published, since unfinished
+segments would fall back to source text. An explicit `stop` keeps precedence:
+the job stays `stopped`. Runtime overrides from `reconfigure` are reloaded when
+an interrupted job resumes.
+
+A plain `resume` refuses to start while the job's worker still holds a fresh
+runtime heartbeat. Use `resume --force` only when that worker is known to be
+gone.
 
 ## Cache Keys
 
@@ -26,6 +55,18 @@ Cache lookup requires matching:
 - terminal segment status.
 
 The cache namespace is derived from segmentation settings, profile namespace, batch mode, prompt version, glossary fingerprint, style fingerprint, entity fingerprint, and the inline marker schema version.
+
+Glossary entries with the same scope priority, source spelling and target spelling
+have a stable order across source languages and case-sensitivity settings. Only
+sets that contain such equal spellings use a new glossary fingerprint, because
+their token budget could previously keep different guidance under one identity.
+An affected job that has not finished reports a namespace mismatch on resume;
+start a new translation from its saved input. Every other glossary fingerprint
+is unchanged.
+
+Entity notes now reach the prompt. New jobs whose entity set has non-blank notes
+use a new entity fingerprint, so translations cached while notes were dropped are
+not reused. Saved jobs resume with their stored entity guidance and fingerprint.
 
 ## Shared Execution Engine
 

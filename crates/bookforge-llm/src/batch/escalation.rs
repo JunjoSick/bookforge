@@ -51,7 +51,8 @@ pub(super) fn batch_max_output_tokens(
     // batches of many short labels can receive a 512-token budget and
     // repeatedly truncate even though their prose payload is tiny.
     let envelope = 128u32.saturating_add((batch.items.len() as u32).saturating_mul(64));
-    let estimate = (batch.token_estimate as u32)
+    let estimate = u32::try_from(batch.token_estimate)
+        .unwrap_or(u32::MAX)
         .saturating_mul(multiplier)
         .saturating_add(envelope);
     let max = if profile == TranslationProfile::FreeTier {
@@ -61,7 +62,13 @@ pub(super) fn batch_max_output_tokens(
     } else {
         if reasoning { 32_768 } else { 16_384 }
     };
-    let minimum = target_min_output_tokens.unwrap_or(512).clamp(512, max);
+    // Reasoning competes with the visible JSON for this same allowance, so a
+    // short label still needs room for the model to finish thinking.
+    let default_minimum = if reasoning { 2_048 } else { 512 };
+    let minimum = target_min_output_tokens
+        .unwrap_or(default_minimum)
+        .max(default_minimum)
+        .min(max);
     estimate.clamp(minimum, max)
 }
 

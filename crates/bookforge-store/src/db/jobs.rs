@@ -314,26 +314,7 @@ impl JobStore {
     /// already persisted. Keep this twin only where overwriting is the point
     /// (fixtures, deliberate state repair).
     pub fn mark_segment_failed(&self, job_id: &str, segment_id: &str, error: &str) -> Result<()> {
-        let updated = {
-            let conn = self.conn.borrow();
-            ensure_job_exists(&conn, job_id)?;
-            let sql = format!(
-                "UPDATE segments SET status = '{}', attempts = attempts + 1, error = ?1
-                 WHERE job_id = ?2 AND id = ?3",
-                SegmentStatus::Failed.as_db_text()
-            );
-            conn.execute(&sql, params![error, job_id, segment_id])?
-        };
-        if updated == 0 {
-            return Err(StoreError::NotFound(format!(
-                "segment '{segment_id}' was not found in job '{job_id}'"
-            )));
-        }
-        // Findings are instrumentation, so a failed findings write must never
-        // fail the surrounding translation checkpoint.
-        let _ = self.record_segment_findings(job_id, segment_id, error);
-        self.mark_job_failed(job_id)?;
-        Ok(())
+        self.mark_segment_failed_where(job_id, segment_id, error, &[])
     }
 
     pub fn mark_segment_failed_if_unfinished(
@@ -342,34 +323,56 @@ impl JobStore {
         segment_id: &str,
         error: &str,
     ) -> Result<()> {
-        let updated = {
-            let conn = self.conn.borrow();
-            ensure_job_exists(&conn, job_id)?;
-            let sql = format!(
-                "UPDATE segments
-                 SET status = '{}', attempts = attempts + 1, error = ?1
-                 WHERE job_id = ?2
-                   AND id = ?3
-                   AND status NOT IN ({})",
-                SegmentStatus::Failed.as_db_text(),
-                SegmentStatus::sql_set(SegmentStatus::terminal_with_translation())
-            );
-            conn.execute(&sql, params![error, job_id, segment_id])?
-        };
-        if updated == 0 && !segment_exists(&self.conn.borrow(), job_id, segment_id)? {
-            // Zero rows can legitimately mean "the segment already reached a
-            // terminal-with-translation state" (an intentional no-op); a
-            // segment that does not EXIST at all must surface as NotFound.
+        self.mark_segment_failed_where(
+            job_id,
+            segment_id,
+            error,
+            SegmentStatus::terminal_with_translation(),
+        )
+    }
+
+    /// Record a failed attempt as one `IMMEDIATE` transaction: segment state,
+    /// its findings, and the job status commit together, and the write lock is
+    /// taken before the freeze check. A manual correction that commits while a
+    /// late failure checkpoint waits for the lock is therefore never replaced
+    /// by `failed` (the human-corrected segment and its job status stand).
+    /// Segments in `untouched` statuses are a deliberate no-op.
+    fn mark_segment_failed_where(
+        &self,
+        job_id: &str,
+        segment_id: &str,
+        error: &str,
+        untouched: &[SegmentStatus],
+    ) -> Result<()> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure_job_exists(&tx, job_id)?;
+        if !segment_exists(&tx, job_id, segment_id)? {
             return Err(StoreError::NotFound(format!(
                 "segment '{segment_id}' was not found in job '{job_id}'"
             )));
         }
-        if updated > 0 {
+        if super::translations::translation_is_human_corrected_on(&tx, job_id, segment_id)? {
+            return Ok(());
+        }
+        let status_guard = if untouched.is_empty() {
+            String::new()
+        } else {
+            format!("AND status NOT IN ({})", SegmentStatus::sql_set(untouched))
+        };
+        let sql = format!(
+            "UPDATE segments
+             SET status = '{}', attempts = attempts + 1, error = ?1
+             WHERE job_id = ?2 AND id = ?3 {status_guard}",
+            SegmentStatus::Failed.as_db_text()
+        );
+        if tx.execute(&sql, params![error, job_id, segment_id])? > 0 {
             // Findings are instrumentation, so a failed findings write must
             // never fail the surrounding translation checkpoint.
-            let _ = self.record_segment_findings(job_id, segment_id, error);
+            let _ = record_segment_findings_on(&tx, job_id, segment_id, error);
         }
-        self.mark_job_failed(job_id)?;
+        touch_job_unless_status_on(&tx, job_id, JobStatus::Failed, &[JobStatus::Stopped])?;
+        tx.commit()?;
         Ok(())
     }
 

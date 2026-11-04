@@ -14,6 +14,7 @@ Rules:
 - Fix only the listed problems.
 - Do not add commentary.
 - Do not return unchanged text if the issue requires correction.
+- Return each item's complete corrected translation, including all unaffected prose.
 - Do not alter correct formatting.
 
 Return exactly:
