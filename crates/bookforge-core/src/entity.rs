@@ -120,9 +120,36 @@ pub fn render_entity_agreement_block(entities: &[Entity]) -> String {
         }
         out.push_str(&line);
         out.push('\n');
+        // Notes stay attached to their entity: continuation lines are
+        // indented under the first so a multi-line note cannot read as a
+        // new table row.
+        let mut note_lines = entity
+            .notes
+            .as_deref()
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|note| !note.is_empty());
+        if let Some(first) = note_lines.next() {
+            out.push_str("  Notes: ");
+            out.push_str(first);
+            out.push('\n');
+            for note in note_lines {
+                out.push_str("         ");
+                out.push_str(note);
+                out.push('\n');
+            }
+        }
     }
     out.push_str("=== End ===\n");
     out
+}
+
+fn has_note_guidance(entity: &Entity) -> bool {
+    entity
+        .notes
+        .as_deref()
+        .is_some_and(|notes| !notes.trim().is_empty())
 }
 
 /// Stable fingerprint of a merged entity set. Empty input still produces
@@ -145,8 +172,16 @@ pub fn entities_fingerprint(entities: &[Entity]) -> String {
             .then_with(|| a.source_name.cmp(&b.source_name))
             .then_with(|| a.target_name.cmp(&b.target_name))
     });
+    // Notes were always part of this payload, but earlier prompts dropped
+    // them. Version only the sets whose notes now add guidance, so their old
+    // cache entries are not reused while every other namespace is unchanged.
+    let schema = if normalized.iter().any(has_note_guidance) {
+        2
+    } else {
+        1
+    };
     let payload = serde_json::json!({
-        "schema": 1,
+        "schema": schema,
         "entities": normalized,
     });
     let serialized = serde_json::to_vec(&payload).unwrap_or_default();
@@ -284,6 +319,76 @@ mod tests {
         let b = entities_fingerprint(&[]);
         assert_eq!(a, b);
         assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn render_block_keeps_multiline_notes_with_their_entity() {
+        let mut captain = entity(
+            "Mira Voss",
+            "Mira Voss",
+            GlossaryScopeKind::Book,
+            EntityGender::Feminine,
+        );
+        captain.notes =
+            Some("  Address her as Capitana Voss.\n\n  She speaks in clipped sentences.  ".into());
+        let ship = entity(
+            "the Gull",
+            "la Gabbiana",
+            GlossaryScopeKind::Book,
+            EntityGender::Feminine,
+        );
+        let rendered = render_entity_agreement_block(&[captain, ship]);
+        assert!(
+            rendered.contains(
+                "- Mira Voss: feminine\n  Notes: Address her as Capitana Voss.\n         She speaks in clipped sentences.\n- la Gabbiana (the Gull): feminine\n"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn entity_notes_invalidate_legacy_cache_without_changing_unaffected_namespaces() {
+        let mut captain = entity(
+            "Mira Voss",
+            "Mira Voss",
+            GlossaryScopeKind::Book,
+            EntityGender::Feminine,
+        );
+        captain.role = Some("harbor-master".into());
+        // Captured from the implementation that left notes out of prompts.
+        assert_eq!(
+            entities_fingerprint(&[]),
+            "9ed90ba863639b8c4a07a1ebbe0e8ad2785605c1657e2d1e455e181a51a834a1"
+        );
+        assert_eq!(
+            entities_fingerprint(std::slice::from_ref(&captain)),
+            "c58e04d138dcbe2bffe17d2ce99d34b4dd7a60f3cc74d143b00425eeca0998e6"
+        );
+        let rendered_without_notes = render_entity_agreement_block(std::slice::from_ref(&captain));
+
+        // Blank notes add no guidance, so neither the prompt nor the cache
+        // identity may change.
+        captain.notes = Some(" \n\t ".into());
+        assert_eq!(
+            render_entity_agreement_block(std::slice::from_ref(&captain)),
+            rendered_without_notes
+        );
+        assert_eq!(
+            entities_fingerprint(std::slice::from_ref(&captain)),
+            "4fdda60b8ed76bf5f3dbd40f7542f64fc317705a2fb36740e6e6aab81db3957d"
+        );
+
+        // Real notes now reach the prompt; entries cached when the same notes
+        // were silently dropped must not be reused.
+        captain.notes = Some("Address her as Capitana Voss.".into());
+        assert!(
+            render_entity_agreement_block(std::slice::from_ref(&captain))
+                .contains("  Notes: Address her as Capitana Voss.\n")
+        );
+        assert_ne!(
+            entities_fingerprint(std::slice::from_ref(&captain)),
+            "75d56a142dd12ef5e0be7dac5fa763d36c676bbdf73e093d7509ebade1935b15"
+        );
     }
 
     #[test]

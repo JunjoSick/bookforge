@@ -47,7 +47,11 @@ pub const SEGMENT_UNIT_NAME: &str = "scheduler_segment";
 /// replace verbose global ids (`<m id="m000000_000">...</m>`).
 /// v4: whitespace-only text nodes between adjacent inline elements stay
 /// between marker tokens instead of moving inside the preceding marker.
-pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 4;
+/// v5: adjacent XML text, entity and CDATA events form one addressable text
+/// node; manifest XHTML outside the spine is extracted after the spine and
+/// navigation; opaque inline math, SVG, script and style subtrees become
+/// atomic reference markers (`<rN/>`) instead of empty paired markers.
+pub const INLINE_MARKER_SCHEMA_VERSION: u32 = 5;
 
 /// Historical path for the canonical script-aware token estimator.
 pub use crate::token_estimate::estimate_tokens;
@@ -1060,7 +1064,7 @@ mod tests {
             "the segment source/checksum remains the unprojected IR text"
         );
         assert_eq!(
-            namespace, "60bdecff5342c2a413e077c23b8a647208043258616c5beda9f2fc0ec25c1347",
+            namespace, "251c954265d9105d7cb68bd9db4435a43b0ed9defe878649203b986eadbd529d",
             "a reversible render projection must not move the existing cache namespace"
         );
     }

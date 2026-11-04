@@ -11,7 +11,28 @@ The EPUB pipeline parses package metadata, preserves resources, translates XML t
 - XHTML `head/title`;
 - XHTML body content from known block elements and from visible direct text inside non-structural wrappers.
 
-The reader suppresses `script`, `style`, `svg`, and `math`. It preserves package resources, stylesheets, images, fonts, and non-translated XML entries. Named and numeric entities are decoded for segmentation, while path accounting ignores entity events so reader and writer stay aligned.
+Documents are extracted in this order: the spine, then the navigation document,
+then every remaining manifest document of type `application/xhtml+xml` or
+`text/html` (linked endnotes or appendices outside the reading order), in
+manifest order, as `sec_resource_NNNNNN` sections. Each document is extracted
+once, keyed by its normalized archive path, so a spine that repeats a document
+or manifest items that alias one file do not duplicate prose. A non-spine
+manifest entry whose file is missing is skipped with a warning. Generic
+`application/xml` resources outside the spine are not treated as prose.
+The text coverage that `bookforge inspect` reports covers the same content
+documents, without the navigation document.
+
+The reader suppresses `script`, `style`, `svg`, and `math`. When one of them
+occurs inside a block, the whole subtree becomes one atomic reference marker
+(`<rN/>`); the model never sees or translates its contents. The reader
+preserves package resources, stylesheets, images, fonts, and non-translated XML
+entries.
+
+Adjacent XML text, entity references, and CDATA sections form one visible text
+node. Named HTML5 and numeric entities are decoded; an unknown entity is kept
+literally (`&name;`) rather than dropped. The reader and writer use the same
+text-node boundaries, so loose text outside the known block elements is
+addressed identically on both sides.
 
 ## PDF-derived chapter boundaries
 
@@ -62,5 +83,40 @@ This projection does not change segment source text, checksums, inline-marker sc
 
 Patch routing is by section href and DOM path. For ordinary element blocks, the writer replaces the captured element text while preserving attributes and child elements represented by markers. For addressable stray text nodes, the writer uses the same non-whitespace text-node counting rule as the reader.
 
-After patching, XML is parsed again as a basic validity check. Missing translations leave source text in place; failed or needs-review segments are visible in the report and review flow.
+Before anything is written, the rebuild rejects a request it could only satisfy
+by guessing: a translation for a block the book does not contain, two
+translations for one block or one DOM path, a block whose section or document
+is missing, a DOM path that matches nothing in its document, and duplicate
+block or section ids in the IR. The rebuild then fails and the existing output
+is left in place. A translation whose inline markers cannot be applied still
+leaves that block's source content in place and is logged; the rebuild
+succeeds.
+
+After patching, XML is parsed again as a basic validity check. Blocks with no
+supplied translation keep their source text; failed or needs-review segments
+are visible in the report and review flow. The rebuilt archive is staged
+beside the output and published with a single rename, so the output path
+always holds either the previous or the new complete file.
+
+## Validate
+
+`bookforge validate` checks every `.xhtml`, `.html`, `.opf`, `.ncx`, `.xml` and
+`.svg` entry (extensions match case-insensitively). Each must decode as UTF-8
+or as BOM-marked UTF-16, parse without errors, and contain exactly one complete
+root element. Every read goes through the same decompression budget as the
+reader, so an entry whose declared size understates its real expansion is
+rejected.
+
+## Content audit
+
+Structural validity does not establish that the prose was translated.
+`scripts/epub_quality_audit.py SOURCE.epub TARGET.epub [--json REPORT.json]`
+compares a source EPUB with a replace-mode translation paragraph by paragraph,
+with no provider calls. It reports review candidates: unchanged long prose,
+long copied source spans behind a translated prefix, empty targets, extreme
+length ratios, repetition the source does not have, identical long targets for
+different sources, and locations present on only one side. These are
+candidates, not verdicts: quotations, names, and bibliographies can
+legitimately stay unchanged. Its tests run with
+`python -m unittest discover -s scripts -p test_epub_quality_audit.py`.
 

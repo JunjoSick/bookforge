@@ -139,30 +139,15 @@ pub(crate) fn create_sibling_work_file(output: &Path, label: &str) -> Result<(Pa
     )))
 }
 
-pub(crate) fn commit_staged_output(what: &str, staged: &Path, output: &Path) -> Result<()> {
-    if !output.exists() {
-        fs::rename(staged, output)?;
-        return Ok(());
-    }
-
-    let backup = sibling_work_path(output, "backup");
-    fs::rename(output, &backup)?;
-    match fs::rename(staged, output) {
-        Ok(()) => {
-            if let Err(error) = fs::remove_file(&backup) {
-                tracing::warn!(
-                    backup = %backup.display(),
-                    error = %error,
-                    "{what} EPUB is committed but its backup could not be removed"
-                );
-            }
-            Ok(())
-        }
-        Err(error) => {
-            let _ = fs::rename(&backup, output);
-            Err(error.into())
-        }
-    }
+/// Publish a staged sibling over `output`. The staged file lives in the
+/// same directory, so one rename replaces an existing output on both Unix
+/// and Windows. Moving the existing output aside first would leave a window
+/// in which the published path does not exist at all; with a single rename
+/// the path always holds either the previous or the new complete file, and
+/// a failed rename leaves the previous file in place.
+pub(crate) fn commit_staged_output(staged: &Path, output: &Path) -> Result<()> {
+    fs::rename(staged, output)?;
+    Ok(())
 }
 
 /// Well-formedness check used before committing any regenerated resource.
@@ -400,6 +385,40 @@ mod tests {
         assert_eq!(normalize_translation_entities("bare & amp"), "bare & amp");
         assert_eq!(normalize_translation_entities("a&nbsp;b"), "a\u{a0}b");
         assert_eq!(normalize_translation_entities("plain text"), "plain text");
+    }
+
+    #[test]
+    fn publishing_replaces_existing_output_and_preserves_it_when_stage_is_missing() {
+        use std::io::Write as _;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("bookforge-publish-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("book.epub");
+        fs::write(&output, b"old book").unwrap();
+        let (staged, mut file) = create_sibling_work_file(&output, "tmp").unwrap();
+        file.write_all(b"new book").unwrap();
+        drop(file);
+
+        commit_staged_output(&staged, &output).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"new book");
+
+        assert!(commit_staged_output(&staged, &output).is_err());
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            b"new book",
+            "a failed publish must leave the existing output in place"
+        );
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "publishing must not leave staged or backup files behind"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

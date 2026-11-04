@@ -12,6 +12,7 @@ pub mod reflow;
 pub(crate) mod util;
 pub mod validate;
 pub mod writer;
+mod xml_text;
 
 pub use reader::{
     EpubInspection, FileTextCoverage, TextCoverage, inspect_epub, read_epub, text_coverage,

@@ -82,6 +82,7 @@ pub(super) struct FakePoppler {
     images: ImagesOutcome,
     render_stderr: Option<String>,
     calls: Mutex<HashMap<&'static str, usize>>,
+    rendered_dpis: Mutex<Vec<u32>>,
 }
 
 impl FakePoppler {
@@ -93,6 +94,7 @@ impl FakePoppler {
             images: ImagesOutcome::Extraction(Vec::new()),
             render_stderr: None,
             calls: Mutex::new(HashMap::new()),
+            rendered_dpis: Mutex::new(Vec::new()),
         }
     }
 
@@ -139,6 +141,11 @@ impl FakePoppler {
             .get(surface)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The DPI of every page render requested so far, in order.
+    pub(super) fn rendered_dpis(&self) -> Vec<u32> {
+        self.rendered_dpis.lock().expect("fake DPI log").clone()
     }
 
     fn count(&self, surface: &'static str) {
@@ -217,9 +224,10 @@ impl PopplerBackend for FakePoppler {
         _pdf: &Path,
         page: u32,
         output_dir: &Path,
-        _dpi: u32,
+        dpi: u32,
     ) -> std::result::Result<PathBuf, ToolError> {
         self.count("render_page");
+        self.rendered_dpis.lock().expect("fake DPI log").push(dpi);
         if let Some(stderr) = &self.render_stderr {
             return Err(ToolError::Failed {
                 tool: "pdftoppm",
