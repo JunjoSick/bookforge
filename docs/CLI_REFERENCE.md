@@ -360,8 +360,26 @@ bookforge resume <job-id>
 
 `pause` parks the current worker. `stop` asks it to exit while preserving all
 completed checkpoints. `resume` first tries to wake a live worker and otherwise
-starts one replacement worker. Avoid `resume --force` unless a paused worker is
-known to be gone; forcing a second live worker can duplicate requests.
+starts one replacement worker. A plain `resume` refuses while the job's worker
+still has a fresh runtime heartbeat. Avoid `resume --force` unless that worker
+is known to be gone; forcing a second live worker can duplicate requests.
+
+Ctrl+C during `resume` stops new dispatch, cancels in-flight provider calls
+(translation, QA, fallback and double-check), drains completed checkpoint
+writes, and records the job as `interrupted` without publishing a partial
+book. An explicit `stop` keeps precedence. A segment stopped before every
+block arrived stays `retry_pending`, so ordinary resume retries it; its
+completed blocks and usage are kept, but the retry translates the whole segment
+again.
+
+A resume rejected before it starts work (for example an incompatible checkpoint
+contract) leaves the job's status, saved output and event paths, and any
+pending control command unchanged. A pause or stop written while the resume was
+still preparing is honored rather than cleared.
+
+On resume, progress first restores the job's saved counts. Rate and ETA measure
+fresh work in the current run, excluding cache hits and time between runs.
+Token totals describe saved checkpoints, not a provider billing ledger.
 
 `retry` marks the desired scope and then launches a supervised replacement
 worker that processes the marked segments:
@@ -705,6 +723,14 @@ You can also pass TOML files directly to `translate` with repeatable
 selected with `--book-id` and `--series-id`. Files and stored guidance are
 fingerprinted into the job configuration so incompatible cache entries are not
 reused.
+
+Global glossary and entity imports ignore `meta.scope.id`: each language pair
+has one global scope. Older entity imports could store a stray id on a global
+row; importing that entity again, with `entities import` or `--entities`,
+updates the row in place and clears the id. Entity `notes` are included in the
+prompt's entity guidance under the entity they describe. Saved jobs keep the
+entity guidance they started with when resumed; start a new translation to use
+corrected guidance.
 
 ## Validation, diagnostics, and machine-readable progress
 

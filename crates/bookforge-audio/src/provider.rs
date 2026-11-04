@@ -528,7 +528,7 @@ pub(crate) fn validate_audio_payload(
 pub(super) mod test_support {
     use std::{
         io::{Read, Write},
-        net::{Shutdown, TcpListener},
+        net::{TcpListener, TcpStream},
         sync::mpsc,
         time::Duration,
     };
@@ -538,6 +538,26 @@ pub(super) mod test_support {
     pub(super) const TRANSPORT_ATTEMPTS: usize = 5;
     pub(super) const CAPTURE_WINDOW: Duration = Duration::from_secs(30);
     const RETRY_SETTLE_DELAY: Duration = Duration::from_millis(100);
+
+    /// The captured request of a [`one_request_server`]. The server hands
+    /// its accepted socket over together with the request, so the socket
+    /// stays open until the test has received the capture (or dropped this
+    /// handle). Closing or half-closing it right after the response can make
+    /// Windows reset a loopback request the client has not finished reading.
+    /// Tests that do not inspect the request must still bind it (`_server`)
+    /// for as long as the client runs.
+    pub(super) struct RequestCapture(mpsc::Receiver<(String, TcpStream)>);
+
+    impl RequestCapture {
+        pub(super) fn recv_timeout(
+            &self,
+            timeout: Duration,
+        ) -> Result<String, mpsc::RecvTimeoutError> {
+            self.0
+                .recv_timeout(timeout)
+                .map(|(request, _stream)| request)
+        }
+    }
 
     pub(super) fn transport_error_detail(error: &TtsError) -> String {
         let mut detail = error.to_string();
@@ -586,7 +606,7 @@ pub(super) mod test_support {
     pub(super) fn one_request_server(
         response_body: Vec<u8>,
         content_type: &str,
-    ) -> (String, mpsc::Receiver<String>) {
+    ) -> (String, RequestCapture) {
         let content_length = response_body.len() as u64;
         one_request_server_with_content_length(response_body, content_type, content_length)
     }
@@ -595,7 +615,7 @@ pub(super) mod test_support {
         response_body: Vec<u8>,
         content_type: &str,
         content_length: u64,
-    ) -> (String, mpsc::Receiver<String>) {
+    ) -> (String, RequestCapture) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock listener");
         let address = listener.local_addr().expect("mock address");
         let content_type = content_type.to_string();
@@ -626,9 +646,6 @@ pub(super) mod test_support {
                     break;
                 }
             }
-            // Queue the capture before responding so `recv` can never race
-            // the server thread.
-            let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
             );
@@ -637,14 +654,12 @@ pub(super) mod test_support {
             {
                 return;
             }
-            // Close write-side first and drain until the peer finishes so the
-            // socket never closes with unread inbound data (Windows answers
-            // that with RST instead of FIN, which surfaces to clients).
-            let _ = stream.shutdown(Shutdown::Write);
-            let mut drain = [0u8; 4096];
-            while matches!(stream.read(&mut drain), Ok(read) if read > 0) {}
+            // Hand the socket over with the capture instead of closing it
+            // here; see `RequestCapture`. If the capture was already dropped
+            // the send fails and the socket closes with it.
+            let _ = sender.send((String::from_utf8_lossy(&request).into_owned(), stream));
         });
-        (format!("http://{address}/v1"), receiver)
+        (format!("http://{address}/v1"), RequestCapture(receiver))
     }
 }
 
@@ -824,7 +839,7 @@ mod tests {
         let error = match test_support::retry_transient_transport(|| {
             // A one-request server per attempt, so a retried transient error
             // reaches a live listener instead of a closed port.
-            let (base_url, _) = test_support::one_request_server_with_content_length(
+            let (base_url, server) = test_support::one_request_server_with_content_length(
                 b"ID3small-body".to_vec(),
                 "audio/mpeg",
                 MAX_AUDIO_RESPONSE_BODY_BYTES as u64 + 1,
@@ -832,6 +847,7 @@ mod tests {
             let client = client.clone();
             let cancel_token = cancel_token.clone();
             async move {
+                let _server = server;
                 send_with_retry(&cancel_token, 1, MAX_AUDIO_RESPONSE_BODY_BYTES, || {
                     client.get(&base_url)
                 })
