@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::lock::acquire_out_dir_lock;
 use crate::provider::{AudioFormat, SpeechRequest, TextNormalization, TtsProvider};
-use crate::text::{ChunkKind, chapters_from_book_with_options, chunk_blocks};
+use crate::text::{ChunkKind, chapters_from_book_with_options, chunk_blocks_with_heading_limit};
 
 /// Knobs for a single audiobook build.
 #[derive(Debug, Clone)]
@@ -27,7 +27,8 @@ pub struct AudiobookOptions {
     pub voice: String,
     pub format: AudioFormat,
     pub speed: f32,
-    /// Maximum characters per synthesis request.
+    /// Maximum Unicode scalar values per synthesis request, including any
+    /// heading break tag and its separating space.
     pub max_chars: usize,
     /// Number of chunks synthesized in parallel.
     pub concurrency: usize,
@@ -274,6 +275,7 @@ const MANIFEST_CHECKPOINT_INTERVAL: usize = 16;
 
 /// Build the deterministic chunk plan for a book. Public so the CLI can
 /// preview counts (e.g. a cost estimate) without synthesizing.
+/// Call [`validate_options`] first to reject invalid request budgets.
 pub fn plan_chunks(book: &Book, options: &AudiobookOptions) -> Vec<ChunkRecord> {
     build_plan(book, options)
         .into_iter()
@@ -309,6 +311,12 @@ pub fn plan_chunks_for_prune(book: &Book, options: &AudiobookOptions) -> Vec<Chu
 
 fn build_plan(book: &Book, options: &AudiobookOptions) -> Vec<PlannedChunk> {
     let ext = options.format.extension();
+    // Tagged headings reserve room for " <tag>" so the final request stays
+    // within max_chars; body prose keeps the full budget and its chunking
+    // (and therefore its cache identity) does not depend on the tag.
+    let heading_max_chars = options
+        .max_chars
+        .saturating_sub(heading_break_overhead(options));
     let mut planned = Vec::new();
     for chapter in chapters_from_book_with_options(book, options.pdf_page_grouping) {
         if chapter.is_empty() {
@@ -321,7 +329,8 @@ fn build_plan(book: &Book, options: &AudiobookOptions) -> Vec<PlannedChunk> {
         {
             continue;
         }
-        let chunks = chunk_blocks(&chapter.blocks, options.max_chars);
+        let chunks =
+            chunk_blocks_with_heading_limit(&chapter.blocks, options.max_chars, heading_max_chars);
         for (part_idx, mut chunk) in chunks.into_iter().enumerate() {
             if matches!(chunk.kind, ChunkKind::Title | ChunkKind::Heading)
                 && let Some(tag) = options.heading_break_tag.as_deref()
@@ -1013,6 +1022,16 @@ fn file_name_of(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Characters a heading break tag adds to a title or heading request: the
+/// tag itself plus the space that separates it from the heading text.
+fn heading_break_overhead(options: &AudiobookOptions) -> usize {
+    options
+        .heading_break_tag
+        .as_deref()
+        .filter(|tag| !tag.is_empty())
+        .map_or(0, |tag| tag.chars().count().saturating_add(1))
+}
+
 pub fn validate_options(options: &AudiobookOptions) -> Result<()> {
     if options.voice.trim().is_empty() {
         return Err(BuildError::InvalidOptions(
@@ -1027,6 +1046,11 @@ pub fn validate_options(options: &AudiobookOptions) -> Result<()> {
     if options.max_chars == 0 {
         return Err(BuildError::InvalidOptions(
             "max_chars must be greater than zero".to_string(),
+        ));
+    }
+    if heading_break_overhead(options) >= options.max_chars {
+        return Err(BuildError::InvalidOptions(
+            "max_chars must leave room for heading text after the heading break tag and its separating space; increase max_chars or disable break tags".to_string(),
         ));
     }
     if options.concurrency == 0 {
@@ -1344,6 +1368,107 @@ mod tests {
                 .filter(|chunk| chunk.kind == ChunkKind::Body)
                 .all(|chunk| !chunk.text.contains("<break"))
         );
+    }
+
+    #[test]
+    fn heading_break_tag_respects_limit_without_rechunking_body() {
+        use bookforge_core::ir::{BlockId, BlockKind};
+
+        // One chapter: an oversized title, an oversized single-word body, and
+        // an oversized in-section heading. Multi-byte scalars (including one
+        // outside the BMP) prove the budget counts scalars, not bytes.
+        let mut book = book_with_sections();
+        book.sections.truncate(1);
+        book.blocks.truncate(2);
+        let title = "日".repeat(60);
+        let heading = "𠮷".repeat(60);
+        book.blocks[0].text_runs[0].text = title.clone();
+        book.blocks[1].text_runs[0].text = "x".repeat(61);
+        let mut extra_heading = book.blocks[0].clone();
+        extra_heading.id = BlockId("extra_heading".to_string());
+        extra_heading.kind = BlockKind::Heading(2);
+        extra_heading.text_runs[0].text = heading.clone();
+        book.sections[0].block_ids.push(extra_heading.id.clone());
+        book.blocks.push(extra_heading);
+
+        let mut options = AudiobookOptions {
+            max_chars: 60,
+            context_chars: 0,
+            ..AudiobookOptions::default()
+        };
+        let plain = build_plan(&book, &options);
+        let tag = "<break time=\"0.6s\" />";
+        options.heading_break_tag = Some(tag.to_string());
+        validate_options(&options).unwrap();
+        let tagged = build_plan(&book, &options);
+        assert!(
+            plan_chunks(&book, &options)
+                .iter()
+                .all(|chunk| chunk.chars <= options.max_chars),
+            "every request, tag included, must fit max_chars"
+        );
+
+        let suffix = format!(" {tag}");
+        for (kind, source) in [(ChunkKind::Title, title), (ChunkKind::Heading, heading)] {
+            let chunks: Vec<_> = tagged.iter().filter(|chunk| chunk.kind == kind).collect();
+            assert_eq!(chunks.len(), 2, "{kind:?} must split to reserve tag room");
+            let restored: String = chunks
+                .iter()
+                .map(|chunk| chunk.text.strip_suffix(&suffix).unwrap())
+                .collect();
+            assert_eq!(restored, source, "{kind:?} text must survive the split");
+        }
+        let body = |plan: Vec<PlannedChunk>| {
+            plan.into_iter()
+                .filter(|chunk| chunk.kind == ChunkKind::Body)
+                .map(|chunk| chunk.text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            body(tagged),
+            body(plain),
+            "body chunks keep the full budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn heading_break_tag_without_text_room_is_rejected_before_synthesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::new(None));
+        let mut options = AudiobookOptions {
+            out_dir: dir.path().join("audio"),
+            heading_break_tag: Some("日日日".to_string()),
+            ..AudiobookOptions::default()
+        };
+        // The tag plus its separating space take four scalars.
+        for max_chars in [1, 4] {
+            options.max_chars = max_chars;
+            let error = build_audiobook(
+                &book_with_sections(),
+                provider.clone(),
+                &options,
+                CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, BuildError::InvalidOptions(_)), "{error}");
+            assert!(error.to_string().contains("heading break tag"), "{error}");
+            assert!(!options.out_dir.exists());
+        }
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+
+        options.max_chars = 5;
+        validate_options(&options).unwrap();
+        assert!(
+            plan_chunks(&book_with_sections(), &options)
+                .iter()
+                .all(|chunk| chunk.chars <= options.max_chars)
+        );
+        // An empty tag reserves nothing.
+        options.max_chars = 1;
+        options.heading_break_tag = Some(String::new());
+        validate_options(&options).unwrap();
     }
 
     #[test]
@@ -1886,6 +2011,34 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("chunk.wav")).unwrap(),
             b"replacement"
+        );
+    }
+
+    #[test]
+    fn atomic_audio_write_preserves_unrelated_siblings_and_rejects_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        // Names an older writer (or a concurrent foreign one) could own.
+        let backup = path.with_extension("replace.bak");
+        let other_temp = path.with_extension("part.tmp");
+        std::fs::write(&path, b"old manifest").unwrap();
+        std::fs::write(&backup, b"recovery copy").unwrap();
+        std::fs::write(&other_temp, b"another writer").unwrap();
+
+        write_atomic(&path, b"new manifest").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new manifest");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"recovery copy");
+        assert_eq!(std::fs::read(&other_temp).unwrap(), b"another writer");
+
+        let directory = dir.path().join("audio.mp3");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("keep.txt"), b"keep").unwrap();
+        assert!(write_atomic(&directory, b"audio").is_err());
+        assert_eq!(std::fs::read(directory.join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            4,
+            "only the manifest, the two foreign siblings, and the directory remain"
         );
     }
 
