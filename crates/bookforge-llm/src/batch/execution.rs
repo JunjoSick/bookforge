@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::TokenUsage;
 use bookforge_core::finding::QaFindingKind;
 
 pub(super) fn repair_batch_item_limit(target_language: &str) -> usize {
@@ -20,6 +21,7 @@ struct BatchWorkerOutput {
     request_status: RequestStatus,
     finish_reason: Option<FinishReason>,
     returned_items: Option<usize>,
+    usage: TokenUsage,
     latency_ms: u64,
     max_output_tokens: u32,
     output_escalated: bool,
@@ -27,11 +29,45 @@ struct BatchWorkerOutput {
     request_permit: Option<AdaptivePermit>,
 }
 
+impl BatchWorkerOutput {
+    /// The worker stopped before sending a request.
+    fn stopped(batch: TranslationBatch, output_escalated: bool) -> Self {
+        Self {
+            batch,
+            result: BatchWorkerResult::StoppedUnfinished,
+            request_status: RequestStatus::OtherError,
+            finish_reason: None,
+            returned_items: None,
+            usage: TokenUsage::default(),
+            latency_ms: 0,
+            max_output_tokens: 0,
+            output_escalated,
+            next_max_output_tokens: None,
+            request_permit: None,
+        }
+    }
+
+    /// The worker failed before sending a request.
+    fn failed_before_request(
+        batch: TranslationBatch,
+        output_escalated: bool,
+        error: LlmError,
+        request_permit: Option<AdaptivePermit>,
+    ) -> Self {
+        Self {
+            result: BatchWorkerResult::Provider(Err(error)),
+            request_permit,
+            ..Self::stopped(batch, output_escalated)
+        }
+    }
+}
+
 struct RepairWorkerOutput {
     batch: TranslationBatch,
     result: Result<BatchTranslationResult, LlmError>,
     finish_reason: Option<FinishReason>,
     returned_items: Option<usize>,
+    usage: TokenUsage,
     latency_ms: u64,
     max_output_tokens: u32,
     /// Set when the repair round never reached the provider because the run
@@ -40,10 +76,48 @@ struct RepairWorkerOutput {
     skipped: bool,
 }
 
+impl RepairWorkerOutput {
+    fn skipped(batch: TranslationBatch, error: &str) -> Self {
+        Self {
+            batch,
+            result: Err(LlmError::Provider(error.to_string())),
+            finish_reason: None,
+            returned_items: None,
+            usage: TokenUsage::default(),
+            latency_ms: 0,
+            max_output_tokens: 0,
+            skipped: true,
+        }
+    }
+}
+
 struct BatchRequestOutput {
     result: Result<BatchTranslationResult, LlmError>,
     finish_reason: Option<FinishReason>,
     returned_items: Option<usize>,
+    usage: TokenUsage,
+    /// The allowance actually requested, after the rendered prompt was
+    /// measured against the context window and output limits.
+    max_output_tokens: u32,
+    /// The next larger allowance an escalated retry may request, if any.
+    next_max_output_tokens: Option<u32>,
+}
+
+/// Provider usage attributed to one segment across every response that
+/// covered it: accepted, truncated, rejected, retried, split, and repaired.
+#[derive(Default)]
+struct SegmentUsage {
+    tokens: TokenUsage,
+    estimated: bool,
+}
+
+impl SegmentUsage {
+    fn apply(&self, translation: &mut SegmentTranslation) {
+        translation.input_tokens = self.tokens.input;
+        translation.input_cached_tokens = self.tokens.cached_input;
+        translation.output_tokens = self.tokens.output;
+        translation.tokens_estimated = self.estimated;
+    }
 }
 
 struct InFlightRequestGuard(Arc<AtomicUsize>);
@@ -222,7 +296,7 @@ fn provider_error_kind(error: &LlmError) -> bookforge_core::config::ProviderErro
         LlmError::Http(e) if e.is_timeout() => ProviderErrorKind::Timeout,
         LlmError::Http(_) => ProviderErrorKind::Client,
         LlmError::InvalidResponse(_) | LlmError::Json(_) => ProviderErrorKind::InvalidResponse,
-        LlmError::Provider(_) => ProviderErrorKind::Client,
+        LlmError::Provider(_) | LlmError::RequestTooLarge(_) => ProviderErrorKind::Client,
     }
 }
 
@@ -575,6 +649,10 @@ where
         .map(|s| (s.id.0.clone(), s.block_ids.len()))
         .collect();
     let mut pending_segment_translations: HashMap<String, SegmentTranslation> = HashMap::new();
+    // Usage is recorded for every provider response, including truncated,
+    // rejected, retried and repaired ones, and applied to each segment when it
+    // is published. Accepted-result usage alone hid billed failures.
+    let mut usage_by_segment: HashMap<String, SegmentUsage> = HashMap::new();
     let mut incrementally_finalized_segment_ids = std::collections::HashSet::<String>::new();
 
     let mut all_results: Vec<BatchTranslationResult> = Vec::new();
@@ -767,18 +845,7 @@ where
                     if let Some(signal) = pause_signal.as_ref()
                         && signal.wait_until_running_or_stopped().await == PauseState::Stopped
                     {
-                        return BatchWorkerOutput {
-                            batch,
-                            result: BatchWorkerResult::StoppedUnfinished,
-                            request_status: RequestStatus::OtherError,
-                            finish_reason: None,
-                            returned_items: None,
-                            latency_ms: 0,
-                            max_output_tokens: 0,
-                            output_escalated,
-                            next_max_output_tokens: None,
-                            request_permit: None,
-                        };
+                        return BatchWorkerOutput::stopped(batch, output_escalated);
                     }
                     let request_permit = loop {
                         if let Some(receiver) = runtime_settings.as_ref() {
@@ -790,18 +857,7 @@ where
                         if let Some(signal) = pause_signal.as_ref()
                             && signal.wait_until_running_or_stopped().await == PauseState::Stopped
                         {
-                            return BatchWorkerOutput {
-                                batch,
-                                result: BatchWorkerResult::StoppedUnfinished,
-                                request_status: RequestStatus::OtherError,
-                                finish_reason: None,
-                                returned_items: None,
-                                latency_ms: 0,
-                                max_output_tokens: 0,
-                                output_escalated,
-                                next_max_output_tokens: None,
-                                request_permit: None,
-                            };
+                            return BatchWorkerOutput::stopped(batch, output_escalated);
                         }
                         match request_limiter.try_acquire() {
                             Ok(permit) => break permit,
@@ -809,20 +865,14 @@ where
                                 tokio::time::sleep(Duration::from_millis(25)).await;
                             }
                             Err(TryAcquireError::Closed) => {
-                                return BatchWorkerOutput {
+                                return BatchWorkerOutput::failed_before_request(
                                     batch,
-                                    result: BatchWorkerResult::Provider(Err(LlmError::Provider(
-                                        "batch request semaphore closed".to_string(),
-                                    ))),
-                                    request_status: RequestStatus::OtherError,
-                                    finish_reason: None,
-                                    returned_items: None,
-                                    latency_ms: 0,
-                                    max_output_tokens: 0,
                                     output_escalated,
-                                    next_max_output_tokens: None,
-                                    request_permit: None,
-                                };
+                                    LlmError::Provider(
+                                        "batch request semaphore closed".to_string(),
+                                    ),
+                                    None,
+                                );
                             }
                         }
                     };
@@ -837,20 +887,14 @@ where
                         Some(controller) => match controller.acquire().await {
                             Ok(permit) => Some(permit),
                             Err(_) => {
-                                return BatchWorkerOutput {
+                                return BatchWorkerOutput::failed_before_request(
                                     batch,
-                                    result: BatchWorkerResult::Provider(Err(LlmError::Provider(
-                                        "adaptive concurrency limiter closed".to_string(),
-                                    ))),
-                                    request_status: RequestStatus::OtherError,
-                                    finish_reason: None,
-                                    returned_items: None,
-                                    latency_ms: 0,
-                                    max_output_tokens: 0,
                                     output_escalated,
-                                    next_max_output_tokens: None,
-                                    request_permit: Some(request_permit),
-                                };
+                                    LlmError::Provider(
+                                        "adaptive concurrency limiter closed".to_string(),
+                                    ),
+                                    Some(request_permit),
+                                );
                             }
                         },
                         None => None,
@@ -874,17 +918,8 @@ where
                     let is_reasoning = provider.is_reasoning();
                     let default_max_output_tokens =
                         capped_batch_max_output_tokens(&batch, &config, is_reasoning);
-                    let max_output_tokens = output_override.unwrap_or(default_max_output_tokens);
-                    let next_max_output_tokens = (!output_escalated)
-                        .then(|| {
-                            next_escalated_batch_max_output_tokens(
-                                max_output_tokens,
-                                &batch,
-                                &config,
-                                is_reasoning,
-                            )
-                        })
-                        .flatten();
+                    let requested_max_output_tokens =
+                        output_override.unwrap_or(default_max_output_tokens);
 
                     let request_id = format!("batch_{}", batch.id);
                     let (runtime_config_revision, provider_max_attempts) =
@@ -896,30 +931,36 @@ where
                         &batch.id,
                         batch.items.len(),
                     );
-                    let effective_timeout_seconds =
-                        configured_timeout_seconds(Some(config.as_ref())).and_then(|configured| {
+                    // The final allowance is known only once the prompt is
+                    // rendered and measured, so the request is announced then.
+                    let announce_request = |max_output_tokens: u32| {
+                        let effective_timeout_seconds = configured_timeout_seconds(Some(
+                            config.as_ref(),
+                        ))
+                        .and_then(|configured| {
                             crate::latency::effective_request_timeout_seconds(
                                 configured,
                                 Some(max_output_tokens),
                             )
                         });
-                    progress.emit(bookforge_core::ProgressEvent::RequestStarted {
-                        request_id: request_id.clone(),
-                        batch_id: Some(batch.id.clone()),
-                        segment_id: None,
-                        provider: Some(config.provider.clone()),
-                        model: Some(config.model.clone()),
-                        prompt_template: None,
-                        items: batch.items.len(),
-                        estimated_input_tokens: batch.token_estimate,
-                        max_output_tokens: Some(max_output_tokens),
-                        active_requests: active_request_count,
-                        target_concurrency: config.scheduler.concurrency,
-                        runtime_config_revision,
-                        provider_max_attempts,
-                        effective_timeout_seconds,
-                        timestamp_ms: bookforge_core::progress::now_ms(),
-                    });
+                        progress.emit(bookforge_core::ProgressEvent::RequestStarted {
+                            request_id: request_id.clone(),
+                            batch_id: Some(batch.id.clone()),
+                            segment_id: None,
+                            provider: Some(config.provider.clone()),
+                            model: Some(config.model.clone()),
+                            prompt_template: None,
+                            items: batch.items.len(),
+                            estimated_input_tokens: batch.token_estimate,
+                            max_output_tokens: Some(max_output_tokens),
+                            active_requests: active_request_count,
+                            target_concurrency: config.scheduler.concurrency,
+                            runtime_config_revision,
+                            provider_max_attempts,
+                            effective_timeout_seconds,
+                            timestamp_ms: bookforge_core::progress::now_ms(),
+                        });
+                    };
 
                     let attempt = translate_one_batch_with_evidence(
                         provider.clone(),
@@ -927,15 +968,25 @@ where
                         batch.clone(),
                         BatchTranslationRequest {
                             config: &config,
-                            max_output_tokens_override: Some(max_output_tokens),
+                            max_output_tokens_override: Some(requested_max_output_tokens),
                             context_pairs,
                             validate_source_copy,
                             section_titles: &section_titles,
                             compact_retry_attempt,
                         },
+                        announce_request,
                     )
                     .await;
                     let latency_ms = started.elapsed().as_millis() as u64;
+                    let max_output_tokens = attempt.max_output_tokens;
+                    // A reasoning model shares its allowance between thinking
+                    // and the answer, so a single item may grow it repeatedly
+                    // up to the ceiling before compact recovery; other
+                    // batches escalate once and then split.
+                    let next_max_output_tokens = (!output_escalated
+                        || (batch.items.len() == 1 && is_reasoning))
+                        .then_some(attempt.next_max_output_tokens)
+                        .flatten();
 
                     let request_status = request_status_for_controller(&attempt.result);
 
@@ -946,6 +997,7 @@ where
                         request_status,
                         finish_reason: attempt.finish_reason,
                         returned_items: attempt.returned_items,
+                        usage: attempt.usage,
                         latency_ms,
                         max_output_tokens,
                         output_escalated,
@@ -992,6 +1044,7 @@ where
                 request_status,
                 finish_reason,
                 returned_items,
+                usage,
                 latency_ms,
                 max_output_tokens,
                 output_escalated,
@@ -1020,6 +1073,7 @@ where
                     continue;
                 }
             };
+            record_batch_usage(&batch, usage, &mut usage_by_segment);
             let recorded_status =
                 batch_request_metric_status(&result, batch.items.len(), returned_items);
             let recorded_finish_reason =
@@ -1038,8 +1092,8 @@ where
                 status_code: recorded_status_code,
                 finish_reason: recorded_finish_reason.clone(),
                 retry_count: recorded_retry_count,
-                input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
-                output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
+                input_tokens: usage.input,
+                output_tokens: usage.output,
                 error_kind: result.as_ref().err().map(|e| format!("{e:?}")),
                 timestamp_ms: bookforge_core::progress::now_ms(),
             });
@@ -1053,8 +1107,8 @@ where
                 items: batch.items.len(),
                 estimated_input_tokens: batch.token_estimate,
                 max_output_tokens: Some(max_output_tokens),
-                input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
-                output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
+                input_tokens: usage.input,
+                output_tokens: usage.output,
                 latency_ms,
                 finish_reason: recorded_finish_reason,
                 status: recorded_status,
@@ -1143,6 +1197,9 @@ where
                                 );
                                 if missing.is_empty() && extra.is_empty() && duplicate.is_empty() {
                                     completed.blocks = blocks;
+                                    if let Some(usage) = usage_by_segment.get(&key) {
+                                        usage.apply(&mut completed);
+                                    }
                                     if let Some(registry) = config.context_registry.as_deref() {
                                         let joined = completed
                                             .blocks
@@ -1283,10 +1340,25 @@ where
                         });
                     }
                 }
+                Err(LlmError::RequestTooLarge(_)) if batch.items.len() > 1 => {
+                    // Nothing was sent: the rendered prompt left no output
+                    // allowance. Smaller halves carry less prompt.
+                    let split = split_batch_with_config(&batch, Some(config.as_ref()));
+                    if split.len() == 2 {
+                        progress.emit(bookforge_core::ProgressEvent::BatchSplit {
+                            batch_id: batch.id.clone(),
+                            left_items: split[0].items.len(),
+                            right_items: split[1].items.len(),
+                            timestamp_ms: bookforge_core::progress::now_ms(),
+                        });
+                    }
+                    pending_queue.extend(split);
+                }
                 Err(LlmError::InvalidResponse(_))
                     if batch.kind == BatchKind::Translation
                         && request_status == RequestStatus::Truncated
                         && batch.items.len() == 1
+                        && (!provider.is_reasoning() || next_max_output_tokens.is_none())
                         && batch
                             .items
                             .iter()
@@ -1327,7 +1399,8 @@ where
                 Err(LlmError::InvalidResponse(_))
                     if batch.kind == BatchKind::Translation
                         && request_status == RequestStatus::Truncated
-                        && !output_escalated
+                        && (!output_escalated
+                            || (batch.items.len() == 1 && provider.is_reasoning()))
                         && next_max_output_tokens.is_some() =>
                 {
                     let next_max_output_tokens =
@@ -1335,7 +1408,7 @@ where
                     progress.emit(bookforge_core::ProgressEvent::Warning {
                         kind: "batch_truncation_escalated_retry".to_string(),
                         message: format!(
-                            "batch {} exhausted max_output_tokens {}; retrying once with {} before splitting",
+                            "batch {} exhausted max_output_tokens {}; retrying with {} before splitting or compact recovery",
                             batch.id, max_output_tokens, next_max_output_tokens
                         ),
                         timestamp_ms: bookforge_core::progress::now_ms(),
@@ -1928,15 +2001,7 @@ where
                     if let Some(signal) = pause_signal.as_ref()
                         && signal.wait_until_running_or_stopped().await == PauseState::Stopped
                     {
-                        return RepairWorkerOutput {
-                            batch: repair_batch,
-                            result: Err(LlmError::Provider("repair stopped".to_string())),
-                            finish_reason: None,
-                            returned_items: None,
-                            latency_ms: 0,
-                            max_output_tokens: 0,
-                            skipped: true,
-                        };
+                        return RepairWorkerOutput::skipped(repair_batch, "repair stopped");
                     }
                     // Share the run-wide request limiter with translation
                     // workers instead of bypassing it.
@@ -1947,17 +2012,10 @@ where
                                 tokio::time::sleep(Duration::from_millis(25)).await;
                             }
                             Err(TryAcquireError::Closed) => {
-                                return RepairWorkerOutput {
-                                    batch: repair_batch,
-                                    result: Err(LlmError::Provider(
-                                        "batch request semaphore closed".to_string(),
-                                    )),
-                                    finish_reason: None,
-                                    returned_items: None,
-                                    latency_ms: 0,
-                                    max_output_tokens: 0,
-                                    skipped: true,
-                                };
+                                return RepairWorkerOutput::skipped(
+                                    repair_batch,
+                                    "batch request semaphore closed",
+                                );
                             }
                         }
                     };
@@ -1972,17 +2030,10 @@ where
                             Some(controller) => match controller.acquire().await {
                                 Ok(permit) => Some(permit),
                                 Err(_) => {
-                                    return RepairWorkerOutput {
-                                        batch: repair_batch,
-                                        result: Err(LlmError::Provider(
-                                            "adaptive concurrency limiter closed".to_string(),
-                                        )),
-                                        finish_reason: None,
-                                        returned_items: None,
-                                        latency_ms: 0,
-                                        max_output_tokens: 0,
-                                        skipped: true,
-                                    };
+                                    return RepairWorkerOutput::skipped(
+                                        repair_batch,
+                                        "adaptive concurrency limiter closed",
+                                    );
                                 }
                             },
                             None => None,
@@ -1990,7 +2041,7 @@ where
 
                     let started = std::time::Instant::now();
                     let is_reasoning = provider.is_reasoning();
-                    let max_output_tokens =
+                    let mut max_output_tokens =
                         capped_batch_max_output_tokens(&repair_batch, &config, is_reasoning);
                     let request_id = format!("batch_{}", repair_batch.id);
                     let (runtime_config_revision, provider_max_attempts) =
@@ -2002,32 +2053,6 @@ where
                         &repair_batch.id,
                         repair_batch.items.len(),
                     );
-                    let effective_timeout_seconds = configured_timeout_seconds(Some(config.as_ref()))
-                        .and_then(|configured| {
-                            crate::latency::effective_request_timeout_seconds(
-                                configured,
-                                Some(max_output_tokens),
-                            )
-                        });
-
-                    progress.emit(bookforge_core::ProgressEvent::RequestStarted {
-                        request_id: request_id.clone(),
-                        batch_id: Some(repair_batch.id.clone()),
-                        segment_id: None,
-                        provider: Some(config.provider.clone()),
-                        model: Some(config.model.clone()),
-                        prompt_template: Some("batch_repair".to_string()),
-                        items: repair_batch.items.len(),
-                        estimated_input_tokens: repair_batch.token_estimate,
-                        max_output_tokens: Some(max_output_tokens),
-                        active_requests: active_request_count,
-                        target_concurrency: config.scheduler.concurrency,
-                        runtime_config_revision,
-                        provider_max_attempts,
-                        effective_timeout_seconds,
-                        timestamp_ms: bookforge_core::progress::now_ms(),
-                    });
-
                     let prompt_ids = prompt_item_ids(&repair_batch);
                     let items_json: Vec<serde_json::Value> = repair_batch
                         .items
@@ -2118,7 +2143,51 @@ where
 
                     let mut finish_reason = None;
                     let mut returned_items = None;
-                    let result = match repair_template.render(&vars) {
+                    let mut usage = TokenUsage::default();
+                    // Measure the rendered repair prompt before announcing the
+                    // request: an allowance of zero is never sent.
+                    let rendered = repair_template
+                        .render(&vars)
+                        .map_err(|error| {
+                            LlmError::Provider(format!("failed to render repair prompt: {error}"))
+                        })
+                        .and_then(|rendered| {
+                            max_output_tokens = cap_rendered_batch_output_tokens(
+                                max_output_tokens,
+                                &rendered,
+                                &config,
+                            );
+                            if max_output_tokens == 0 {
+                                Err(no_output_budget_error())
+                            } else {
+                                Ok(rendered)
+                            }
+                        });
+                    let effective_timeout_seconds = configured_timeout_seconds(Some(config.as_ref()))
+                        .and_then(|configured| {
+                            crate::latency::effective_request_timeout_seconds(
+                                configured,
+                                Some(max_output_tokens),
+                            )
+                        });
+                    progress.emit(bookforge_core::ProgressEvent::RequestStarted {
+                        request_id: request_id.clone(),
+                        batch_id: Some(repair_batch.id.clone()),
+                        segment_id: None,
+                        provider: Some(config.provider.clone()),
+                        model: Some(config.model.clone()),
+                        prompt_template: Some("batch_repair".to_string()),
+                        items: repair_batch.items.len(),
+                        estimated_input_tokens: repair_batch.token_estimate,
+                        max_output_tokens: Some(max_output_tokens),
+                        active_requests: active_request_count,
+                        target_concurrency: config.scheduler.concurrency,
+                        runtime_config_revision,
+                        provider_max_attempts,
+                        effective_timeout_seconds,
+                        timestamp_ms: bookforge_core::progress::now_ms(),
+                    });
+                    let result = match rendered {
                         Ok(rendered) => {
                             let captured_prompt = prompt_for_capture(&rendered);
                             match provider
@@ -2147,6 +2216,7 @@ where
                                 .await
                             {
                                 Ok(response) => {
+                                    usage = TokenUsage::from(&response);
                                     finish_reason = Some(response.finish_reason);
                                     returned_items =
                                         batch_response_item_count(&repair_batch, &response.content);
@@ -2196,9 +2266,7 @@ where
                                 Err(error) => Err(error),
                             }
                         }
-                        Err(error) => Err(LlmError::Provider(format!(
-                            "failed to render repair prompt: {error}"
-                        ))),
+                        Err(error) => Err(error),
                     };
 
                     drop(controller_permit);
@@ -2208,6 +2276,7 @@ where
                         result,
                         finish_reason,
                         returned_items,
+                        usage,
                         latency_ms: started.elapsed().as_millis() as u64,
                         max_output_tokens,
                         skipped: false,
@@ -2238,6 +2307,7 @@ where
                 result,
                 finish_reason,
                 returned_items,
+                usage,
                 latency_ms,
                 max_output_tokens,
                 skipped,
@@ -2259,6 +2329,7 @@ where
                 continue;
             }
 
+            record_batch_usage(&batch, usage, &mut usage_by_segment);
             let recorded_status =
                 batch_request_metric_status(&result, batch.items.len(), returned_items);
             let recorded_finish_reason =
@@ -2279,8 +2350,8 @@ where
                 status_code: repair_status_code,
                 finish_reason: recorded_finish_reason.clone(),
                 retry_count: repair_retry_count,
-                input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
-                output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
+                input_tokens: usage.input,
+                output_tokens: usage.output,
                 error_kind: result.as_ref().err().map(|e| format!("{e:?}")),
                 timestamp_ms: bookforge_core::progress::now_ms(),
             });
@@ -2294,8 +2365,8 @@ where
                 items: batch.items.len(),
                 estimated_input_tokens: batch.token_estimate,
                 max_output_tokens: Some(max_output_tokens),
-                input_tokens: result.as_ref().ok().and_then(|r| r.input_tokens),
-                output_tokens: result.as_ref().ok().and_then(|r| r.output_tokens),
+                input_tokens: usage.input,
+                output_tokens: usage.output,
                 latency_ms,
                 finish_reason: recorded_finish_reason,
                 status: recorded_status,
@@ -2374,6 +2445,11 @@ where
                                 );
                                 if missing.is_empty() && extra.is_empty() && duplicate.is_empty() {
                                     candidate.blocks = blocks;
+                                    if let Some(usage) =
+                                        usage_by_segment.get(&candidate.segment_id.0)
+                                    {
+                                        usage.apply(&mut candidate);
+                                    }
                                     completed_segment = Some(candidate);
                                 }
                             }
@@ -2440,6 +2516,9 @@ where
     let mut translations: Vec<SegmentTranslation> = segment_translations.into_values().collect();
 
     for translation in &mut translations {
+        if let Some(usage) = usage_by_segment.get(&translation.segment_id.0) {
+            usage.apply(translation);
+        }
         let (ordered_blocks, missing, extra, duplicate) = order_blocks_by_segment(
             &translation.block_ids,
             std::mem::take(&mut translation.blocks),
@@ -2520,16 +2599,20 @@ pub(super) async fn translate_one_batch(
     batch: TranslationBatch,
     request: BatchTranslationRequest<'_>,
 ) -> Result<BatchTranslationResult, LlmError> {
-    translate_one_batch_with_evidence(provider, library, batch, request)
+    translate_one_batch_with_evidence(provider, library, batch, request, |_| {})
         .await
         .result
 }
 
+/// Render, size and send one batch request. `on_request` receives the final
+/// output allowance once the rendered prompt has been measured, just before
+/// the provider is called (or the request is rejected for lack of budget).
 async fn translate_one_batch_with_evidence(
     provider: Arc<impl LlmProvider>,
     library: Arc<PromptLibrary>,
     batch: TranslationBatch,
     request: BatchTranslationRequest<'_>,
+    on_request: impl FnOnce(u32),
 ) -> BatchRequestOutput {
     let BatchTranslationRequest {
         config,
@@ -2550,17 +2633,45 @@ async fn translate_one_batch_with_evidence(
     ) {
         Ok(rendered) => rendered,
         Err(error) => {
+            let requested = max_output_tokens_override.unwrap_or_default();
+            on_request(requested);
             return BatchRequestOutput {
                 result: Err(LlmError::Provider(error.to_string())),
                 finish_reason: None,
                 returned_items: None,
+                usage: TokenUsage::default(),
+                max_output_tokens: requested,
+                next_max_output_tokens: None,
             };
         }
     };
 
     let captured_prompt = prompt_for_capture(&rendered);
-    let max_tokens = max_output_tokens_override
-        .unwrap_or_else(|| capped_batch_max_output_tokens(&batch, config, provider.is_reasoning()));
+    let reasoning = provider.is_reasoning();
+    // The planner sized the batch from its source estimate; the rendered
+    // prompt also carries the style guide, entities, glossary, prior context
+    // and retry guidance, so the allowance is measured against it again.
+    let max_tokens = cap_rendered_batch_output_tokens(
+        max_output_tokens_override
+            .unwrap_or_else(|| capped_batch_max_output_tokens(&batch, config, reasoning)),
+        &rendered,
+        config,
+    );
+    let next_max_output_tokens =
+        next_escalated_batch_max_output_tokens(max_tokens, &batch, config, reasoning)
+            .map(|next| cap_rendered_batch_output_tokens(next, &rendered, config))
+            .filter(|next| *next > max_tokens);
+    on_request(max_tokens);
+    if max_tokens == 0 {
+        return BatchRequestOutput {
+            result: Err(no_output_budget_error()),
+            finish_reason: None,
+            returned_items: None,
+            usage: TokenUsage::default(),
+            max_output_tokens: 0,
+            next_max_output_tokens: None,
+        };
+    }
     let (runtime_config_revision, provider_max_attempts) = config.request_runtime_metadata();
 
     let response = provider
@@ -2591,6 +2702,7 @@ async fn translate_one_batch_with_evidence(
 
     match response {
         Ok(resp) => {
+            let usage = TokenUsage::from(&resp);
             let finish_reason = Some(resp.finish_reason);
             let returned_items = batch_response_item_count(&batch, &resp.content);
             if resp.finish_reason == FinishReason::Length {
@@ -2600,6 +2712,9 @@ async fn translate_one_batch_with_evidence(
                     )),
                     finish_reason,
                     returned_items,
+                    usage,
+                    max_output_tokens: max_tokens,
+                    next_max_output_tokens,
                 };
             }
 
@@ -2641,14 +2756,81 @@ async fn translate_one_batch_with_evidence(
                 result,
                 finish_reason,
                 returned_items,
+                usage,
+                max_output_tokens: max_tokens,
+                next_max_output_tokens,
             }
         }
         Err(error) => BatchRequestOutput {
             result: Err(error),
             finish_reason: None,
             returned_items: None,
+            usage: TokenUsage::default(),
+            max_output_tokens: max_tokens,
+            next_max_output_tokens,
         },
     }
+}
+
+/// Measure a rendered batch prompt against the context window and the
+/// configured output caps. A result of `0` means nothing can be requested.
+fn cap_rendered_batch_output_tokens(
+    computed: u32,
+    rendered: &crate::Rendered,
+    config: &TranslationRunConfig,
+) -> u32 {
+    crate::scheduler::clamped_output_budget(
+        computed,
+        crate::budget::estimate_rendered_tokens(rendered),
+        config.model_context_tokens,
+        config.batch_max_output_tokens.or(config.max_output_tokens),
+    )
+}
+
+fn no_output_budget_error() -> LlmError {
+    LlmError::RequestTooLarge(
+        "no output-token budget remains within the configured model context window".to_string(),
+    )
+}
+
+/// Record one provider response's usage against the segments it covered,
+/// independently of whether its result was accepted. Request telemetry keeps
+/// the exact totals; segment accounting apportions them by source size, so
+/// truncated, rejected and repaired attempts reach the saved checkpoints too.
+fn record_batch_usage(
+    batch: &TranslationBatch,
+    usage: TokenUsage,
+    by_segment: &mut HashMap<String, SegmentUsage>,
+) {
+    if batch.items.is_empty() {
+        return;
+    }
+    let weights = batch
+        .items
+        .iter()
+        .map(|item| usage_weight(&item.source_text))
+        .collect::<Vec<_>>();
+    let input = apportion(usage.input, &weights);
+    let cached = apportion_cached(usage.cached_input, &weights, &input);
+    let output = apportion(usage.output, &weights);
+    let estimated = batch.items.len() > 1;
+    for (index, item) in batch.items.iter().enumerate() {
+        let entry = by_segment.entry(item.segment_id.0.clone()).or_default();
+        entry.tokens.add(TokenUsage {
+            input: input[index],
+            cached_input: cached[index],
+            output: output[index],
+        });
+        entry.estimated |= estimated;
+    }
+}
+
+/// Weight used to split one response's usage across its items. It depends
+/// only on the item's source text, never on capacity overheads such as retry
+/// guidance or prompt scaffolding, so changing request planning does not
+/// move usage between segments. Provider totals remain authoritative.
+fn usage_weight(text: &str) -> u64 {
+    token_estimate(text).max(1) as u64
 }
 
 async fn context_pairs_for_batch(
@@ -2696,14 +2878,14 @@ fn apportion_batch_usage(batch: &TranslationBatch, result: &mut BatchTranslation
     let weights = batch
         .items
         .iter()
-        .map(|item| token_estimate(&item.source_text).max(1) as u64)
+        .map(|item| usage_weight(&item.source_text))
         .collect::<Vec<_>>();
     if weights.is_empty() {
         return;
     }
 
     let input = apportion(total_input, &weights);
-    let cached = apportion(total_cached, &weights);
+    let cached = apportion_cached(total_cached, &weights, &input);
     let output = apportion(total_output, &weights);
     let estimated = batch.items.len() > 1;
 
@@ -2838,6 +3020,33 @@ fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
+/// Apportion cached input tokens like [`apportion`], without ever giving an
+/// item more cached tokens than its share of the input, while keeping the
+/// total. Independent rounding of the two splits could otherwise do both.
+fn apportion_cached(
+    total: Option<u64>,
+    weights: &[u64],
+    input: &[Option<u64>],
+) -> Vec<Option<u64>> {
+    let mut cached = apportion(total, weights);
+    let mut excess = 0_u64;
+    for (cached, input) in cached.iter_mut().zip(input) {
+        if let (Some(cached), Some(input)) = (cached, input) {
+            excess = excess.saturating_add(cached.saturating_sub(*input));
+            *cached = (*cached).min(*input);
+        }
+    }
+    // Move any remainder into other items' unused input allocation.
+    for (cached, input) in cached.iter_mut().zip(input) {
+        if let (Some(cached), Some(input)) = (cached, input) {
+            let moved = excess.min(input.saturating_sub(*cached));
+            *cached += moved;
+            excess -= moved;
+        }
+    }
+    cached
+}
+
 fn apportion(total: Option<u64>, weights: &[u64]) -> Vec<Option<u64>> {
     let Some(total) = total else {
         return vec![None; weights.len()];
@@ -2925,7 +3134,41 @@ pub(super) fn request_status_for_controller<T>(result: &Result<T, LlmError>) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::provider_safe_validation_error;
+    use super::{apportion, apportion_cached, provider_safe_validation_error, usage_weight};
+
+    #[test]
+    fn cached_apportionment_preserves_totals_without_exceeding_item_input() {
+        for weights in [&[1, 1, 1][..], &[1, 2, 10][..]] {
+            for total_input in 0..30 {
+                let input = apportion(Some(total_input), weights);
+                for total_cached in 0..=total_input {
+                    let cached = apportion_cached(Some(total_cached), weights, &input);
+                    assert_eq!(cached.iter().flatten().sum::<u64>(), total_cached);
+                    assert!(
+                        cached
+                            .iter()
+                            .zip(&input)
+                            .all(|(cached, input)| cached <= input)
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            apportion_cached(Some(2), &[1, 1, 1], &[Some(1), Some(1), Some(1)]),
+            vec![Some(1), Some(0), Some(1)],
+        );
+        assert_eq!(
+            apportion_cached(None, &[1, 1], &[Some(1), Some(1)]),
+            vec![None, None]
+        );
+    }
+
+    #[test]
+    fn usage_weights_depend_only_on_source_text() {
+        assert_eq!(usage_weight(""), 1);
+        assert_eq!(usage_weight("abcdefgh"), 2);
+        assert_eq!(usage_weight("春天的雨"), 4);
+    }
 
     #[test]
     fn provider_validation_errors_omit_protected_span_kinds() {

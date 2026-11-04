@@ -1,4 +1,5 @@
 pub mod batch;
+mod budget;
 pub mod concurrency;
 pub mod double_check;
 pub mod glossary_proposal;

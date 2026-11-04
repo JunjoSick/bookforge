@@ -1,7 +1,7 @@
 use bookforge_core::{
     config::DoubleCheckConfig,
     ir::BlockId,
-    marker::{marker_ids_in_text, marker_structure_error, strip_marker_tokens},
+    marker::{marker_ids_in_text, marker_structure_error},
     segment::{Segment, SegmentId, SegmentStatus},
 };
 use serde::Deserialize;
@@ -272,6 +272,20 @@ where
     // re-sampled against their latest text on later rounds and become
     // unresolved records only once every round is spent.
     let rounds = double_check_config.correction_rounds.max(1);
+    let section_titles: HashMap<&str, &str> = segments
+        .iter()
+        .filter_map(|segment| {
+            segment
+                .metadata
+                .section_title
+                .as_deref()
+                .map(|title| (segment.id.0.as_str(), title))
+        })
+        .collect();
+    let validation = CorrectionValidation {
+        validate_source_copy,
+        section_titles: &section_titles,
+    };
     let mut pending = correction_items;
     for round in 1..=rounds {
         if pending.is_empty() {
@@ -302,6 +316,7 @@ where
                 corr_chunk,
                 corr_results,
                 final_round,
+                &validation,
                 &mut records,
                 &mut carry_over,
             );
@@ -319,10 +334,17 @@ where
 /// Fold one corrected chunk into the record list. Items that resolved leave
 /// the pipeline; failures either land as terminal records (`final_round`) or
 /// ride along for another sampling round with their newest text attached.
+/// Run-level inputs to [`validate_correction`].
+struct CorrectionValidation<'a> {
+    validate_source_copy: bool,
+    section_titles: &'a HashMap<&'a str, &'a str>,
+}
+
 fn resolve_correction_chunk(
     corr_chunk: Vec<CorrectionItem>,
     corr_results: Vec<CorrectionItem>,
     final_round: bool,
+    validation: &CorrectionValidation<'_>,
     records: &mut Vec<CorrectionRecord>,
     carry_over: &mut Vec<CorrectionItem>,
 ) {
@@ -337,7 +359,15 @@ fn resolve_correction_chunk(
         let Some(original) = original_by_id.get(result.item_id.as_str()) else {
             continue;
         };
-        let valid = validate_correction(&result);
+        let valid = validate_correction(
+            &result,
+            &original.current_translation,
+            validation.validate_source_copy,
+            validation
+                .section_titles
+                .get(result.segment_id.0.as_str())
+                .copied(),
+        );
         let resolved = matches!(valid, CorrectionStatus::Applied) || final_round;
         if resolved {
             records.push(CorrectionRecord {
@@ -613,7 +643,13 @@ where
         })
         .await?;
 
+    if response.finish_reason == crate::FinishReason::Length {
+        return Err(LlmError::InvalidResponse(
+            "double-check audit was truncated".to_string(),
+        ));
+    }
     let parsed: DoubleCheckResponse = serde_json::from_str(&response.content)?;
+    reject_duplicate_ids(parsed.items.iter().map(|item| item.id.as_str()))?;
 
     let mut corrections = Vec::new();
     let item_map: std::collections::HashMap<&str, &DoubleCheckItem> =
@@ -759,7 +795,16 @@ where
         })
         .await?;
 
+    // A length-finished correction can still be complete JSON, but its text
+    // may be cut short: never apply it.
+    if response.finish_reason == crate::FinishReason::Length {
+        return Err(LlmError::InvalidResponse(
+            "double-check correction was truncated".to_string(),
+        ));
+    }
     let parsed: CorrectionResponse = serde_json::from_str(&response.content)?;
+    // Two different corrections for one item cannot both be applied.
+    reject_duplicate_ids(parsed.items.iter().map(|item| item.id.as_str()))?;
 
     let mut result_items = Vec::new();
     let item_map: std::collections::HashMap<&str, &CorrectionItem> = items
@@ -826,13 +871,36 @@ async fn wait_for_double_check_pause(
     Ok(())
 }
 
-fn validate_correction(item: &CorrectionItem) -> CorrectionStatus {
+fn reject_duplicate_ids<'a>(ids: impl Iterator<Item = &'a str>) -> Result<(), LlmError> {
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            return Err(LlmError::InvalidResponse(format!(
+                "duplicate double-check item id: {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Accept a correction only when it is a complete, structurally valid
+/// translation that actually changed the rejected text.
+///
+/// The same deterministic rules as translation apply: prose inside markers
+/// counts (a marker-only reply is empty), reference markers keep their
+/// reference text (`*1`), and protected numbers may use localized decimal
+/// separators. Restoring the source text is rejected only when source-copy
+/// validation applies, so a same-language editing run may restore it.
+fn validate_correction(
+    item: &CorrectionItem,
+    original_translation: &str,
+    validate_source_copy: bool,
+    section_title: Option<&str>,
+) -> CorrectionStatus {
     let text = &item.current_translation;
 
-    if text.is_empty() && !item.source.is_empty() {
-        return CorrectionStatus::RejectedValidationFailed(
-            "corrected translation is empty".to_string(),
-        );
+    if let Some(error) = crate::validation::empty_translation_validation_error(&item.source, text) {
+        return CorrectionStatus::RejectedValidationFailed(error.to_string());
     }
 
     if let Some(error) = marker_structure_error(text) {
@@ -849,30 +917,32 @@ fn validate_correction(item: &CorrectionItem) -> CorrectionStatus {
         ));
     }
 
+    if let Some(error) = crate::validation::marker_reference_text_error(&item.source, text) {
+        return CorrectionStatus::RejectedValidationFailed(error);
+    }
+
     for span in &item.protected_spans {
-        if !text.contains(span) {
+        if !crate::validation::protected_span_present(span, text) {
             return CorrectionStatus::RejectedValidationFailed(format!(
                 "missing protected span: {span}"
             ));
         }
     }
 
-    if item.issues.iter().any(|issue| issue.needs_correction)
-        && normalized_prose(&item.source) == normalized_prose(text)
+    if validate_source_copy
+        && let Some(error) =
+            crate::validation::source_copy_validation_error(&item.source, text, section_title)
     {
+        return CorrectionStatus::RejectedValidationFailed(error);
+    }
+
+    if text.trim() == original_translation.trim() {
         return CorrectionStatus::RejectedValidationFailed(
-            "corrected translation is unchanged from the source".to_string(),
+            "correction did not change the rejected translation".to_string(),
         );
     }
 
     CorrectionStatus::Applied
-}
-
-fn normalized_prose(text: &str) -> String {
-    strip_marker_tokens(text)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn double_check_mode_str(mode: bookforge_core::config::DoubleCheckMode) -> &'static str {
@@ -911,6 +981,8 @@ mod tests {
     #[derive(Clone)]
     struct SequenceProvider {
         responses: Arc<Mutex<Vec<String>>>,
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+        truncated: bool,
     }
 
     impl SequenceProvider {
@@ -919,6 +991,8 @@ mod tests {
             responses.reverse();
             Self {
                 responses: Arc::new(Mutex::new(responses)),
+                requests: Arc::default(),
+                truncated: false,
             }
         }
     }
@@ -926,8 +1000,12 @@ mod tests {
     impl LlmProvider for SequenceProvider {
         async fn complete(
             &self,
-            _request: CompletionRequest,
+            request: CompletionRequest,
         ) -> crate::provider::Result<CompletionResponse> {
+            self.requests
+                .lock()
+                .expect("requests mutex should not be poisoned")
+                .push(request);
             let content = self
                 .responses
                 .lock()
@@ -939,7 +1017,11 @@ mod tests {
                 input_tokens: Some(1),
                 input_cached_tokens: Some(0),
                 output_tokens: Some(1),
-                finish_reason: FinishReason::Stop,
+                finish_reason: if self.truncated {
+                    FinishReason::Length
+                } else {
+                    FinishReason::Stop
+                },
                 provider_latency_ms: 0,
                 raw: json!({}),
             })
@@ -1018,6 +1100,166 @@ mod tests {
         translation.blocks[0].text = text.to_string();
         translation.checksum = format!("checksum-{segment_id}");
         translation
+    }
+
+    fn correction(source: &str, translated: &str) -> super::CorrectionItem {
+        super::CorrectionItem {
+            item_id: "seg:b".into(),
+            segment_id: SegmentId("seg".into()),
+            block_id: BlockId("b".into()),
+            source: source.into(),
+            current_translation: translated.into(),
+            required_markers: bookforge_core::marker::marker_ids_in_text(source),
+            protected_spans: Vec::new(),
+            issues: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn correction_rejects_empty_marker_contents_and_unchanged_rejected_output() {
+        let empty = correction("<m1>Visible prose</m1>", "<m1>  </m1>");
+        assert!(matches!(
+            super::validate_correction(&empty, "errato", false, None),
+            CorrectionStatus::RejectedValidationFailed(_)
+        ));
+        let unchanged = correction("Hello", "Ciao");
+        assert!(matches!(
+            super::validate_correction(&unchanged, "Ciao", false, None),
+            CorrectionStatus::RejectedValidationFailed(error) if error.contains("did not change")
+        ));
+    }
+
+    #[test]
+    fn correction_preserves_reference_contents_but_translates_marker_prose() {
+        let source = "<m0>Birds deceive</m0>.<m1><m2>*1</m2></m1>";
+        let dropped = correction(source, "<m0>Gli uccelli ingannano</m0>.<m1><m2></m2></m1>");
+        assert!(matches!(
+            super::validate_correction(&dropped, "errato", false, None),
+            CorrectionStatus::RejectedValidationFailed(error) if error.contains("reference text")
+        ));
+        let preserved = correction(
+            source,
+            "<m0>Gli uccelli ingannano</m0>.<m1><m2>*1</m2></m1>",
+        );
+        assert!(matches!(
+            super::validate_correction(&preserved, "errato", false, None),
+            CorrectionStatus::Applied
+        ));
+    }
+
+    #[test]
+    fn correction_accepts_localized_decimal_and_same_language_source_restoration() {
+        let mut localized = correction("A diameter of 0.1 mm", "Un diametro di 0,1 mm");
+        localized.protected_spans.push("0.1".into());
+        assert!(matches!(
+            super::validate_correction(&localized, "errato", false, None),
+            CorrectionStatus::Applied
+        ));
+        let source = "This paragraph is long enough to activate the source-copy check. Restoring \
+            the source is valid during same-language correction when the earlier translation \
+            introduced an error that an editor had to undo.";
+        let restored = correction(source, source);
+        assert!(matches!(
+            super::validate_correction(&restored, "incorrect earlier version", false, None),
+            CorrectionStatus::Applied
+        ));
+        assert!(matches!(
+            super::validate_correction(&restored, "incorrect earlier version", true, None),
+            CorrectionStatus::RejectedValidationFailed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn correction_rejects_conflicting_duplicate_results() {
+        let provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg:b","corrected_translation":"Ciao"},{"id":"seg:b","corrected_translation":"Addio"}]}"#.into(),
+        ]);
+        let error = super::run_correction_chunk(
+            &provider,
+            crate::PromptLibrary::global(),
+            &[correction("Hello", "errato")],
+            &run_config(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate double-check item id"));
+    }
+
+    #[tokio::test]
+    async fn correction_does_not_apply_length_finished_complete_json() {
+        let mut provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg:b","corrected_translation":"Ciao"}]}"#.into(),
+        ]);
+        provider.truncated = true;
+        let corrected = super::run_correction_chunk_resilient(
+            &provider,
+            crate::PromptLibrary::global(),
+            &[correction("Hello", "errato")],
+            &run_config(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            corrected.is_empty(),
+            "a truncated correction must remain unresolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_or_duplicated_audit_response_is_not_trusted() {
+        let mut provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg:b","verdict":"pass","issues":[]}]}"#.into(),
+        ]);
+        provider.truncated = true;
+        let item = super::DoubleCheckItem {
+            id: "seg:b".into(),
+            segment_id: "seg".into(),
+            block_id: "b".into(),
+            section_title: None,
+            kind: "paragraph".into(),
+            source: "Hello".into(),
+            translation: "Ciao".into(),
+            required_markers: Vec::new(),
+            protected_spans: Vec::new(),
+            deterministic_warnings: Vec::new(),
+        };
+        let config = DoubleCheckConfig {
+            mode: DoubleCheckMode::Full,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key_env: None,
+            concurrency: 1,
+            batch_target_tokens: 8_000,
+            auto_correct: false,
+            correction_rounds: 1,
+        };
+        let audited = super::run_audit_chunk_resilient(
+            &provider,
+            crate::PromptLibrary::global(),
+            std::slice::from_ref(&item),
+            &run_config(),
+            &config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(audited.len(), 1);
+        assert_eq!(audited[0].issues[0].kind, super::AUDIT_UNRESOLVED_KIND);
+
+        let provider = SequenceProvider::new(vec![
+            r#"{"items":[{"id":"seg:b","verdict":"pass","issues":[]},{"id":"seg:b","verdict":"fail","issues":[]}]}"#.into(),
+        ]);
+        let audited = super::run_audit_chunk_resilient(
+            &provider,
+            crate::PromptLibrary::global(),
+            std::slice::from_ref(&item),
+            &run_config(),
+            &config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(audited.len(), 1);
+        assert_eq!(audited[0].issues[0].kind, super::AUDIT_UNRESOLVED_KIND);
     }
 
     fn run_config() -> TranslationRunConfig {

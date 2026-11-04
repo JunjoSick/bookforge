@@ -606,26 +606,33 @@ impl ContextScope {
     }
 }
 
+/// Resolve one request's output-token allowance.
+///
+/// `computed` is a planning preference and is raised to a 256-token floor.
+/// The context remainder (window minus the estimated prompt minus 256 tokens
+/// of headroom) and an explicit `user_cap` are ceilings: the floor never
+/// raises the result past either, so a full window yields `0` and a 128-token
+/// cap yields `128`. Callers must treat `0` as "no room to request output".
 pub fn cap_output_tokens(
     computed: u32,
     estimated_prompt_tokens: usize,
     model_context_tokens: Option<u32>,
     user_cap: Option<u32>,
 ) -> u32 {
-    let mut out = computed;
+    // The planning floor is a preference; explicit limits remain ceilings.
+    let mut out = computed.max(256);
 
     if let Some(context) = model_context_tokens {
-        let prompt = estimated_prompt_tokens as u32;
+        let prompt = u32::try_from(estimated_prompt_tokens).unwrap_or(u32::MAX);
         let remaining = context.saturating_sub(prompt);
-        let safe_remaining = remaining.saturating_sub(256);
-        out = out.min(safe_remaining.max(512));
+        out = out.min(remaining.saturating_sub(256));
     }
 
     if let Some(cap) = user_cap {
         out = out.min(cap);
     }
 
-    out.max(256)
+    out
 }
 
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
@@ -933,6 +940,16 @@ pub enum FallbackScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_budget_never_exceeds_user_or_context_limit() {
+        assert_eq!(cap_output_tokens(2_048, 100, None, Some(128)), 128);
+        assert_eq!(cap_output_tokens(2_048, 700, Some(1_200), None), 244);
+        assert_eq!(cap_output_tokens(2_048, 700, Some(1_200), Some(100)), 100);
+        assert_eq!(cap_output_tokens(2_048, 1_200, Some(1_200), None), 0);
+        assert_eq!(cap_output_tokens(2_048, usize::MAX, Some(1_200), None), 0);
+        assert_eq!(cap_output_tokens(10, 100, None, None), 256);
+    }
 
     #[test]
     fn openrouter_paid_fast_preset_sets_runtime_overrides() {
