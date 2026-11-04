@@ -12,7 +12,7 @@ use bookforge_core::{
     segment::{BlockTranslation, build_segments},
 };
 use bookforge_epub::{
-    RebuildOptions, inspect_epub, read_epub, rebuild_epub, rebuild_epub_with_options,
+    RebuildOptions, inspect_epub, read_epub, rebuild_epub, rebuild_epub_with_options, text_coverage,
 };
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
@@ -260,6 +260,392 @@ fn rebuild_can_safely_replace_the_source_path() {
 }
 
 #[test]
+fn manifest_documents_outside_the_spine_are_extracted_once_and_translated() {
+    let package = CONTENT_OPF.replace(
+        "</manifest>",
+        r#"  <item id="endnotes" href="endnotes.xhtml" media-type="application/xhtml+xml"/>
+    <item id="alias" href="./chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="data" href="data.xml" media-type="application/xml"/>
+    <item id="absent" href="absent.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>"#,
+    );
+    let fixture = create_epub_fixture_with_package(
+        "non-spine-documents",
+        "chapter1.xhtml",
+        "<p>Body paragraph.</p>",
+        &package,
+        &[
+            (
+                "OEBPS/endnotes.xhtml",
+                "<html><body><h2>Notes</h2><p>A note reached only by a link.</p></body></html>",
+            ),
+            (
+                "OEBPS/data.xml",
+                "<records><text>Not prose.</text></records>",
+            ),
+        ],
+    );
+
+    let book = read_epub(&fixture).unwrap();
+    assert_eq!(
+        book.blocks
+            .iter()
+            .filter(|block| block_text(block) == "Body paragraph.")
+            .count(),
+        1,
+        "an aliased manifest item must not duplicate the chapter"
+    );
+    assert!(
+        !book
+            .blocks
+            .iter()
+            .any(|block| block_text(block) == "Not prose."),
+        "generic XML outside the spine is not prose"
+    );
+    let note = book
+        .blocks
+        .iter()
+        .find(|block| block_text(block) == "A note reached only by a link.")
+        .expect("non-spine XHTML must be extracted");
+    let last = book.sections.last().unwrap();
+    assert_eq!(last.href, "OEBPS/endnotes.xhtml");
+    assert_eq!(last.id.0, "sec_resource_000000");
+    assert_eq!(last.title.as_deref(), Some("Notes"));
+
+    let coverage = text_coverage(&fixture).unwrap();
+    assert_eq!(
+        coverage
+            .files
+            .iter()
+            .map(|file| file.href.as_str())
+            .collect::<Vec<_>>(),
+        ["OEBPS/chapter1.xhtml", "OEBPS/endnotes.xhtml"],
+        "coverage follows extraction order and leaves navigation out"
+    );
+    assert_eq!(coverage.percent(), 100.0);
+
+    rebuild_epub(
+        &book,
+        &[BlockTranslation {
+            block_id: note.id.clone(),
+            text: "Una nota raggiunta solo da un collegamento.".to_string(),
+        }],
+        &fixture,
+    )
+    .unwrap();
+    let rebuilt = read_epub(&fixture).unwrap();
+    assert!(
+        rebuilt
+            .blocks
+            .iter()
+            .any(|block| { block_text(block) == "Una nota raggiunta solo da un collegamento." })
+    );
+    assert!(
+        !rebuilt
+            .blocks
+            .iter()
+            .any(|block| block_text(block) == "A note reached only by a link.")
+    );
+}
+
+#[test]
+fn opaque_inline_math_svg_script_and_style_survive_translation_byte_for_byte() {
+    let opaque = [
+        r#"<math xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>n</mi><mo>&gt;</mo><mn>3</mn></mrow></math>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><text>Axis label</text></svg>"#,
+        "<script><![CDATA[const caption = 'kept';]]></script>",
+        "<style>.mark { color: blue; }</style>",
+    ];
+    let body = format!(
+        "<p>Where {} holds, <em>see</em>{}{}{}.</p>",
+        opaque[0], opaque[1], opaque[2], opaque[3]
+    );
+    let fixture = create_epub_fixture("opaque-inline", &body);
+    let book = read_epub(&fixture).unwrap();
+    let paragraph = book
+        .blocks
+        .iter()
+        .find(|block| block_text(block).starts_with("Where"))
+        .unwrap();
+    assert_eq!(
+        block_text(paragraph),
+        "Where <r1/> holds, <m2>see</m2><r3/><r4/><r5/>."
+    );
+
+    rebuild_epub(
+        &book,
+        &[BlockTranslation {
+            block_id: paragraph.id.clone(),
+            text: "Dove vale <r1/>, <m2>vedi</m2><r3/><r4/><r5/>.".to_string(),
+        }],
+        &fixture,
+    )
+    .unwrap();
+
+    let chapter = entry_text(&fixture, "OEBPS/chapter1.xhtml");
+    assert!(chapter.contains("Dove vale"), "{chapter}");
+    assert!(chapter.contains("<em>vedi</em>"), "{chapter}");
+    for original in opaque {
+        assert!(
+            chapter.contains(original),
+            "opaque content changed: {original}\n{chapter}"
+        );
+    }
+}
+
+#[test]
+fn mixed_content_round_trips_without_missing_or_duplicated_text() {
+    let bodies = [
+        "Red &amp; Blue<!--cut-->Green<![CDATA[ Gold]]><p>Pink<br/>Teal</p>Plum&#33;",
+        "<section>Red &amp; Blue<span>Green<em>Gold</em></span><![CDATA[Pink]]>&#33;<br/>Teal</section>",
+        "<div>Red<p>Blue<em>Green</em></p>Gold<math><mi>z</mi></math>Pink</div>",
+        "<div><span>Red</span>Blue<!--cut-->Green&#33;<svg><text>Kept label</text></svg>Gold</div>",
+        "<blockquote><p>Red</p><p>Blue</p></blockquote>Green<pre>Code</pre>Gold",
+    ];
+    let words = ["Red", "Blue", "Green", "Gold", "Pink", "Teal", "Plum"];
+    for body in bodies {
+        let fixture = create_epub_fixture("mixed-content-parity", body);
+        let book = read_epub(&fixture).unwrap();
+        let expected = book
+            .blocks
+            .iter()
+            .map(|block| {
+                words.iter().fold(block_text(block), |text, word| {
+                    text.replace(word, &format!("New{word}"))
+                })
+            })
+            .collect::<Vec<_>>();
+        let translations = book
+            .blocks
+            .iter()
+            .zip(&expected)
+            .map(|(block, text)| BlockTranslation {
+                block_id: block.id.clone(),
+                text: text.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        rebuild_epub(&book, &translations, &fixture).unwrap();
+        let rebuilt = read_epub(&fixture).unwrap();
+        assert_eq!(
+            rebuilt.blocks.iter().map(block_text).collect::<Vec<_>>(),
+            expected,
+            "mixed content changed: {body}"
+        );
+    }
+}
+
+#[test]
+fn loose_text_keeps_its_spacing_next_to_inline_siblings() {
+    let fixture = create_epub_fixture(
+        "loose-boundary-spaces",
+        "<section>One <em>two</em> three&nbsp;<strong>four</strong>.</section>",
+    );
+    let book = read_epub(&fixture).unwrap();
+    let replacements = [
+        ("One", "Uno"),
+        ("two", "due"),
+        ("three", "tre"),
+        ("four", "quattro"),
+    ];
+    let translations = book
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            let source = block_text(block);
+            replacements
+                .iter()
+                .find(|(original, _)| *original == source)
+                .map(|(_, translated)| BlockTranslation {
+                    block_id: block.id.clone(),
+                    text: (*translated).to_string(),
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(translations.len(), replacements.len());
+
+    rebuild_epub(&book, &translations, &fixture).unwrap();
+
+    let chapter = entry_text(&fixture, "OEBPS/chapter1.xhtml");
+    assert!(
+        chapter.contains("<section>Uno <em>due</em> tre\u{a0}<strong>quattro</strong>.</section>"),
+        "loose words lost their separators: {chapter}"
+    );
+}
+
+/// Rebuild `book` into its own source path and assert it fails without
+/// touching the existing file.
+fn assert_rebuild_rejected(
+    book: &bookforge_core::ir::Book,
+    translations: &[BlockTranslation],
+    fixture: &std::path::Path,
+    expected: &str,
+) {
+    let original = std::fs::read(fixture).unwrap();
+    let error = rebuild_epub(book, translations, fixture)
+        .expect_err("an unusable translation request must not report success");
+    assert!(
+        error.to_string().contains(expected),
+        "expected '{expected}' in: {error}"
+    );
+    assert_eq!(
+        std::fs::read(fixture).unwrap(),
+        original,
+        "a rejected rebuild must leave the existing output untouched"
+    );
+}
+
+fn body_block(book: &bookforge_core::ir::Book) -> bookforge_core::ir::Block {
+    book.blocks
+        .iter()
+        .find(|block| block_text(block) == "Hello from chapter 1.")
+        .expect("body paragraph should be extracted")
+        .clone()
+}
+
+#[test]
+fn rebuild_rejects_translations_for_unknown_or_repeated_blocks() {
+    let fixture = create_minimal_epub();
+    let book = read_epub(&fixture).unwrap();
+    let paragraph = body_block(&book);
+
+    assert_rebuild_rejected(
+        &book,
+        &[BlockTranslation {
+            block_id: bookforge_core::ir::BlockId("b_nowhere".to_string()),
+            text: "Ciao.".to_string(),
+        }],
+        &fixture,
+        "unknown block 'b_nowhere'",
+    );
+    assert_rebuild_rejected(
+        &book,
+        &[
+            BlockTranslation {
+                block_id: paragraph.id.clone(),
+                text: "Prima.".to_string(),
+            },
+            BlockTranslation {
+                block_id: paragraph.id.clone(),
+                text: "Seconda.".to_string(),
+            },
+        ],
+        &fixture,
+        "duplicate block",
+    );
+}
+
+#[test]
+fn rebuild_rejects_ambiguous_ir_identifiers() {
+    let fixture = create_minimal_epub();
+    let book = read_epub(&fixture).unwrap();
+    let paragraph = body_block(&book);
+    let translation = [BlockTranslation {
+        block_id: paragraph.id.clone(),
+        text: "Ciao.".to_string(),
+    }];
+
+    let mut repeated_block = book.clone();
+    repeated_block.blocks.push(paragraph.clone());
+    assert_rebuild_rejected(&repeated_block, &translation, &fixture, "duplicate block");
+
+    let mut repeated_section = book.clone();
+    let section = repeated_section
+        .sections
+        .iter()
+        .find(|section| section.id == paragraph.section_id)
+        .unwrap()
+        .clone();
+    repeated_section.sections.push(section);
+    assert_rebuild_rejected(
+        &repeated_section,
+        &translation,
+        &fixture,
+        "duplicate section",
+    );
+}
+
+#[test]
+fn rebuild_rejects_targets_missing_from_the_ir_or_the_archive() {
+    let fixture = create_minimal_epub();
+    let book = read_epub(&fixture).unwrap();
+    let paragraph = body_block(&book);
+    let translation = [BlockTranslation {
+        block_id: paragraph.id.clone(),
+        text: "Ciao.".to_string(),
+    }];
+
+    let mut orphaned = book.clone();
+    orphaned
+        .blocks
+        .iter_mut()
+        .find(|block| block.id == paragraph.id)
+        .unwrap()
+        .section_id = bookforge_core::ir::SectionId("sec_gone".to_string());
+    assert_rebuild_rejected(&orphaned, &translation, &fixture, "missing section");
+
+    let mut misplaced = book.clone();
+    misplaced
+        .sections
+        .iter_mut()
+        .find(|section| section.id == paragraph.section_id)
+        .unwrap()
+        .href = "OEBPS/gone.xhtml".to_string();
+    assert_rebuild_rejected(&misplaced, &translation, &fixture, "not in the archive");
+
+    let mut dangling = book.clone();
+    dangling
+        .blocks
+        .iter_mut()
+        .find(|block| block.id == paragraph.id)
+        .unwrap()
+        .dom_path
+        .0
+        .push(99);
+    assert_rebuild_rejected(
+        &dangling,
+        &translation,
+        &fixture,
+        "not found in the document",
+    );
+}
+
+#[test]
+fn rebuild_rejects_two_translations_for_one_element() {
+    let fixture = create_epub_fixture("colliding-patches", "<p>Left.</p><p>Right.</p>");
+    let mut book = read_epub(&fixture).unwrap();
+    let left = book
+        .blocks
+        .iter()
+        .find(|block| block_text(block) == "Left.")
+        .unwrap()
+        .clone();
+    let right = book
+        .blocks
+        .iter_mut()
+        .find(|block| block_text(block) == "Right.")
+        .unwrap();
+    right.dom_path = left.dom_path.clone();
+    let right_id = right.id.clone();
+
+    assert_rebuild_rejected(
+        &book,
+        &[
+            BlockTranslation {
+                block_id: left.id,
+                text: "Sinistra.".to_string(),
+            },
+            BlockTranslation {
+                block_id: right_id,
+                text: "Destra.".to_string(),
+            },
+        ],
+        &fixture,
+        "same DOM path",
+    );
+}
+
+#[test]
 fn rebuild_replace_options_are_byte_identical_to_default_rebuild() {
     let fixture = create_minimal_epub();
     let book = read_epub(&fixture).expect("fixture should parse into IR");
@@ -477,11 +863,38 @@ fn block_text(block: &bookforge_core::ir::Block) -> String {
         .collect::<String>()
 }
 
+fn entry_text(epub: &std::path::Path, name: &str) -> String {
+    let mut archive = ZipArchive::new(File::open(epub).expect("EPUB should open")).expect("zip");
+    let mut text = String::new();
+    archive
+        .by_name(name)
+        .unwrap_or_else(|error| panic!("entry {name} missing: {error}"))
+        .read_to_string(&mut text)
+        .expect("entry should be UTF-8");
+    text
+}
+
 fn create_epub_fixture(name: &str, body: &str) -> PathBuf {
     create_epub_fixture_with_chapter(name, "chapter1.xhtml", body)
 }
 
 fn create_epub_fixture_with_chapter(name: &str, chapter_href: &str, body: &str) -> PathBuf {
+    create_epub_fixture_with_package(
+        name,
+        chapter_href,
+        body,
+        &CONTENT_OPF.replace("chapter1.xhtml", chapter_href),
+        &[],
+    )
+}
+
+fn create_epub_fixture_with_package(
+    name: &str,
+    chapter_href: &str,
+    body: &str,
+    package: &str,
+    extra_entries: &[(&str, &str)],
+) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")
@@ -511,11 +924,7 @@ fn create_epub_fixture_with_chapter(name: &str, chapter_href: &str, body: &str) 
         .start_file("OEBPS/content.opf", deflated)
         .expect("package entry should start");
     writer
-        .write_all(
-            CONTENT_OPF
-                .replace("chapter1.xhtml", chapter_href)
-                .as_bytes(),
-        )
+        .write_all(package.as_bytes())
         .expect("package should write");
     writer
         .start_file("OEBPS/nav.xhtml", deflated)
@@ -529,6 +938,14 @@ fn create_epub_fixture_with_chapter(name: &str, chapter_href: &str, body: &str) 
     writer
         .write_all(chapter_xhtml(body).as_bytes())
         .expect("chapter should write");
+    for (entry, text) in extra_entries {
+        writer
+            .start_file(*entry, deflated)
+            .expect("extra entry should start");
+        writer
+            .write_all(text.as_bytes())
+            .expect("extra entry should write");
+    }
     writer.finish().expect("fixture EPUB should finish");
 
     output
