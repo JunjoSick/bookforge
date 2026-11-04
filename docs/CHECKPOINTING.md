@@ -14,6 +14,33 @@ Segments move through pending, running, succeeded, skipped-cached, failed, needs
 
 `retry` marks selected failed or needs-review segments retry-pending. `resume` translates only resumable segments. Retry-pending segments bypass cache so the user gets a fresh provider call instead of reusing a known-bad result.
 
+A segment stopped partway (stop or cancellation before every block arrived) is
+saved as retry-pending with its completed blocks and usage, so ordinary resume
+retries it; the retry currently translates the whole segment again. Pending
+dashboard retry guidance stays attached for that retry.
+
+Each checkpoint (translation text, blocks, segment state, its findings, and
+the job status) commits in one SQLite `IMMEDIATE` transaction. The write lock
+is taken before the human-correction check, so a late success, failure, cache
+or partial checkpoint cannot replace a correction committed by another process
+while it waited. Findings written after a checkpoint respect the correction
+too.
+
+## Interruption
+
+Ctrl+C during `resume` (or quitting an attached TUI) stops new dispatch at the
+next safe boundary and cancels in-flight provider calls, including QA,
+fallback and double-check requests. Completed responses still reach the
+checkpoint writer, and its queue drains before the process exits. The job is
+recorded as `interrupted` and no output book is published, since unfinished
+segments would fall back to source text. An explicit `stop` keeps precedence:
+the job stays `stopped`. Runtime overrides from `reconfigure` are reloaded when
+an interrupted job resumes.
+
+A plain `resume` refuses to start while the job's worker still holds a fresh
+runtime heartbeat. Use `resume --force` only when that worker is known to be
+gone.
+
 ## Cache Keys
 
 Cache lookup requires matching:

@@ -96,6 +96,7 @@ fn read_last_lines(file: &mut std::fs::File, max_lines: usize) -> std::io::Resul
         }
     }
 
+    drop_unfinished_trailing_code_point(&mut buffer);
     let text = String::from_utf8_lossy(&buffer);
     let mut lines: Vec<String> = text
         .lines()
@@ -111,6 +112,26 @@ fn read_last_lines(file: &mut std::fs::File, max_lines: usize) -> std::io::Resul
         lines.drain(..lines.len() - max_lines);
     }
     Ok(lines)
+}
+
+/// A live writer may be between the bytes of its trailing record's last code
+/// point. That unterminated fragment is unfinished rather than corrupt, so it
+/// is dropped: earlier events stay readable, nothing is reported as an
+/// unparseable line, and `--json` output stays pure JSONL. A complete but
+/// unterminated line, or invalid bytes anywhere else, are kept as before.
+fn drop_unfinished_trailing_code_point(buffer: &mut Vec<u8>) {
+    if buffer.last() == Some(&b'\n') {
+        return;
+    }
+    let start = buffer
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |index| index + 1);
+    if let Err(error) = std::str::from_utf8(&buffer[start..])
+        && error.error_len().is_none()
+    {
+        buffer.truncate(start);
+    }
 }
 
 fn event_log_path_for_tail(
@@ -421,6 +442,33 @@ mod tests {
         // Requesting fewer lines than exist must still yield exactly that many
         // complete lines, never a torn fragment.
         assert_eq!(read_last_lines(&mut file, 2).unwrap(), vec!["b", "c"]);
+    }
+
+    #[test]
+    fn tail_keeps_prior_events_during_partial_unicode_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.jsonl");
+        let event = "{\"StageStarted\":{\"stage\":\"translating\",\"timestamp_ms\":1}}";
+        let mut log = format!("{event}\n").into_bytes();
+        // The writer has flushed only the first byte of a two-byte code point.
+        log.extend_from_slice(b"{\"Warning\":{\"message\":\"\xc3");
+        std::fs::write(&path, log).unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let events = read_last_lines(&mut file, 20).unwrap();
+        assert_eq!(events, vec![event]);
+        assert_eq!(
+            render_tail("job_1", &events, 20, true),
+            format!("{event}\n")
+        );
+        let human = render_tail("job_1", &events, 20, false);
+        assert!(human.contains("stage:        translating"), "{human}");
+        assert!(!human.contains("unparseable"), "{human}");
+
+        // A complete but unterminated record is still shown.
+        std::fs::write(&path, format!("{event}\n{event}")).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(read_last_lines(&mut file, 20).unwrap(), vec![event, event]);
     }
 
     #[test]
