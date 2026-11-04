@@ -72,6 +72,7 @@ pub(crate) struct ReviewFinding {
 #[derive(Debug, Serialize)]
 pub(crate) struct ReviewTotals {
     segments: usize,
+    usage_scope: &'static str,
     tokens_input: u64,
     tokens_input_cached: u64,
     tokens_output: u64,
@@ -340,6 +341,7 @@ fn build_review_document(
             .map(|path| path.display().to_string()),
         totals: ReviewTotals {
             segments: review_segments.len(),
+            usage_scope: crate::report::SAVED_CHECKPOINT_USAGE_SCOPE,
             tokens_input: summary.input_tokens,
             tokens_input_cached: summary.input_cached_tokens,
             tokens_output: summary.output_tokens,
@@ -847,7 +849,7 @@ function updateMeta() {
   const totals = data.totals;
   document.getElementById("meta").textContent =
     `${data.provider}/${data.model} | ${totals.segments} segments | ${flagged} flagged | ` +
-    `${totals.tokens_input} input, ${totals.tokens_input_cached} cached, ${totals.tokens_output} output tokens`;
+    `Latest saved checkpoints: ${totals.tokens_input} input, ${totals.tokens_input_cached} cached, ${totals.tokens_output} output tokens`;
 }
 
 function kindLabel(kind) {
