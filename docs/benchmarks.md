@@ -31,10 +31,19 @@ For provider benchmarks, capture:
 - elapsed time
 - request count
 - p50 and p95 latency
-- 429s, timeouts, invalid JSON, and truncations
+- 429s, timeouts, connection failures, invalid model responses, and truncations
 - input/output tokens
-- tokens per minute and blocks per minute
+- tokens per minute and segments per minute
 - batch split count and repair count
+
+The performance section of `status` and of translation reports covers the
+latest run only: it restarts at the last `JobCreated` of a log that resume
+appended to. Segments/min counts unique segments reaching a terminal work state,
+excluding cache hits and pending retries; the JSON keeps the legacy
+`blocks_per_minute` key for it and declares `scope: "latest_run"`. One segment
+can hold several blocks, so record the segmentation settings when comparing
+rates. Before `TranslationFinished`, elapsed time is the observed event span,
+so also keep an independently measured wall-clock time.
 
 Real-provider scripts must require API keys through environment variables and must not print key values.
 

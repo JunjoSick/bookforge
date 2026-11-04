@@ -7,6 +7,9 @@ pub(super) fn mark_low_confidence_pages(
     let action = low_confidence_action(mode);
     let mut pages = Vec::new();
     for stats in page_stats {
+        // Selectable text that pdftotext found but the XML missed disproves
+        // a scan; such a page is judged by coverage like any other.
+        stats.image_only_candidate &= stats.baseline_chars == 0;
         if is_low_confidence_page(stats) {
             stats.low_confidence = true;
             stats.low_confidence_action = Some(action.to_string());
@@ -17,6 +20,11 @@ pub(super) fn mark_low_confidence_pages(
 }
 
 fn is_low_confidence_page(stats: &PageStats) -> bool {
+    // A scanned page has no baseline to fall short of, yet all of its text
+    // is missing: it is the page OCR exists for.
+    if stats.image_only_candidate {
+        return true;
+    }
     if stats.baseline_chars == 0 {
         return false;
     }

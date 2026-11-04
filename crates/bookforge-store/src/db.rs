@@ -34,6 +34,8 @@ mod status;
 mod translations;
 
 #[cfg(test)]
+mod checkpoint_tests;
+#[cfg(test)]
 mod migrations_docs;
 
 // Internal cross-module helpers shared by the transactional checkpoint paths.
@@ -545,7 +547,12 @@ fn file_hash(path: &Path) -> CoreResult<String> {
     let mut hasher = Sha256::new();
     let mut chunk = vec![0u8; FILE_HASH_CHUNK_BYTES];
     loop {
-        let read = file.read(&mut chunk)?;
+        // A signal-interrupted read is retried rather than failing job
+        // creation: the hash is the cache identity of the whole input.
+        let read = match file.read(&mut chunk) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
         if read == 0 {
             break;
         }

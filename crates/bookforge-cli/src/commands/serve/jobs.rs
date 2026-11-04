@@ -803,6 +803,7 @@ struct JobListItem {
     needs_review: usize,
     failed: usize,
     retry_pending: usize,
+    usage_scope: &'static str,
     input_tokens: u64,
     output_tokens: u64,
 }
@@ -824,6 +825,7 @@ impl JobListItem {
             needs_review: summary.needs_review,
             failed: summary.failed,
             retry_pending: summary.retry_pending,
+            usage_scope: crate::report::SAVED_CHECKPOINT_USAGE_SCOPE,
             input_tokens: summary.input_tokens,
             output_tokens: summary.output_tokens,
         }

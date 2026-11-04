@@ -1,17 +1,29 @@
-use std::{fs::File, io::BufRead, path::Path};
+use std::{collections::HashSet, fs::File, io::BufRead, path::Path};
 
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 
+/// Which part of a job's event log a [`RunPerformanceSummary`] describes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PerformanceScope {
+    /// The most recent run: everything after the log's last `JobCreated`.
+    #[default]
+    LatestRun,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct RunPerformanceSummary {
+    pub scope: PerformanceScope,
     pub request_count: usize,
     pub p50_latency_ms: Option<u64>,
     pub p95_latency_ms: Option<u64>,
     pub rate_limited: usize,
     pub timeouts: usize,
     pub server_errors: usize,
+    /// Requests that never reached the provider (connect/TLS failures).
+    pub connection_errors: usize,
     pub invalid_responses: usize,
     pub truncations: usize,
     pub retries: usize,
@@ -20,7 +32,11 @@ pub(crate) struct RunPerformanceSummary {
     pub repair_failures: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub blocks_per_minute: Option<f64>,
+    /// Unique fresh terminal segment completions per minute, excluding cache
+    /// hits. The JSON key keeps its historical name so existing report
+    /// consumers keep the throughput field.
+    #[serde(rename = "blocks_per_minute")]
+    pub segments_per_minute: Option<f64>,
     pub checkpoint_flushes: usize,
     pub elapsed_ms: Option<u64>,
 }
@@ -37,7 +53,7 @@ pub(crate) fn performance_summary_from_events(
     let mut latencies = Vec::<u64>::new();
     let mut first_ts = None::<u64>;
     let mut last_ts = None::<u64>;
-    let mut finished_segments = 0usize;
+    let mut finished_segments = HashSet::<String>::new();
     let mut request_input_tokens = 0u64;
     let mut request_output_tokens = 0u64;
     let mut request_events_with_tokens = 0usize;
@@ -56,7 +72,26 @@ pub(crate) fn performance_summary_from_events(
         else {
             continue;
         };
-        if let Some(ts) = payload.get("timestamp_ms").and_then(Value::as_u64) {
+        // `resume` appends a fresh JobCreated to the same log, the run boundary
+        // RunState also uses. Counters and finish times before it belong to an
+        // earlier run. A log without any JobCreated keeps the whole stream.
+        if kind == "JobCreated" {
+            summary = RunPerformanceSummary::default();
+            latencies.clear();
+            first_ts = None;
+            last_ts = None;
+            finished_segments.clear();
+            request_input_tokens = 0;
+            request_output_tokens = 0;
+            request_events_with_tokens = 0;
+            segment_input_tokens = 0;
+            segment_output_tokens = 0;
+        }
+        if let Some(ts) = payload
+            .get("timestamp_ms")
+            .and_then(Value::as_u64)
+            .filter(|ts| *ts > 0)
+        {
             first_ts = Some(first_ts.map_or(ts, |current| current.min(ts)));
             last_ts = Some(last_ts.map_or(ts, |current| current.max(ts)));
         }
@@ -85,11 +120,23 @@ pub(crate) fn performance_summary_from_events(
                 {
                     summary.server_errors += 1;
                 }
-                if error_kind_lower.contains("json")
-                    || error_kind_lower.contains("invalid")
-                    || status_lower.contains("invalid")
-                    || status_lower.contains("json")
-                {
+                if status_lower == "connect_error" {
+                    summary.connection_errors += 1;
+                }
+                // Transport diagnostics can mention terms such as InvalidData
+                // or InvalidContentType without any model response existing,
+                // so only response-level statuses count as invalid output.
+                let invalid_response = match status_lower.as_str() {
+                    "invalid_response" | "json_error" | "truncated" | "incomplete" => true,
+                    status if status.starts_with("incomplete:") => true,
+                    "" | "error" if code.is_none() => {
+                        matches!(error_kind_lower.as_str(), "invalid_response" | "json")
+                            || error_kind_lower.starts_with("invalidresponse(")
+                            || error_kind_lower.starts_with("json(")
+                    }
+                    _ => false,
+                };
+                if invalid_response {
                     summary.invalid_responses += 1;
                 }
                 if payload
@@ -114,7 +161,19 @@ pub(crate) fn performance_summary_from_events(
                 request_output_tokens += output_tokens.unwrap_or(0);
             }
             "SegmentFinished" => {
-                finished_segments += 1;
+                // Throughput counts each segment's fresh terminal outcome once,
+                // like live progress: cache hits, pending states and repeated
+                // outcomes for the same segment do not add work.
+                if matches!(
+                    payload.get("status").and_then(Value::as_str),
+                    Some("succeeded" | "needs_review" | "failed")
+                ) && let Some(id) = payload
+                    .get("segment_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    finished_segments.insert(id.to_string());
+                }
                 segment_input_tokens += payload
                     .get("input_tokens")
                     .and_then(Value::as_u64)
@@ -161,7 +220,8 @@ pub(crate) fn performance_summary_from_events(
     });
     summary.elapsed_ms = elapsed_ms;
     if let Some(elapsed_ms) = elapsed_ms.filter(|elapsed| *elapsed > 0) {
-        summary.blocks_per_minute = Some(finished_segments as f64 / (elapsed_ms as f64 / 60_000.0));
+        summary.segments_per_minute =
+            Some(finished_segments.len() as f64 / (elapsed_ms as f64 / 60_000.0));
     }
 
     Ok(Some(summary))
@@ -412,6 +472,179 @@ mod tests {
         assert_eq!(summary.input_tokens, 13);
         assert_eq!(summary.output_tokens, 5);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn transport_diagnostics_do_not_count_as_invalid_model_responses() {
+        let path = temp_path("transport-diagnostics.jsonl");
+        write_events(
+            &path,
+            &[
+                request_finished(
+                    "tls",
+                    "connect_error",
+                    None,
+                    Some("Http(Error(Connect, InvalidData, InvalidMessage(InvalidContentType)))"),
+                ),
+                request_finished(
+                    "timeout",
+                    "timeout",
+                    None,
+                    Some("Http(timeout while reading json response)"),
+                ),
+                request_finished(
+                    "http",
+                    "error",
+                    Some(400),
+                    Some("HttpStatus(400, invalid JSON request)"),
+                ),
+                request_finished(
+                    "legacy",
+                    "error",
+                    None,
+                    Some("InvalidResponse(\"malformed JSON\")"),
+                ),
+                request_finished("partial", "incomplete:1/2", None, None),
+                request_finished("review-invalid", "error", None, Some("invalid_response")),
+                request_finished("review-json", "error", None, Some("json")),
+            ],
+        );
+        let summary = performance_summary_from_events(&path).unwrap().unwrap();
+        assert_eq!(summary.connection_errors, 1);
+        assert_eq!(summary.timeouts, 1);
+        assert_eq!(summary.invalid_responses, 4);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn resumed_performance_summary_contains_only_latest_run() {
+        let summary = summary_from_values(&[
+            serde_json::json!({"JobCreated":{"timestamp_ms":1000}}),
+            serde_json::json!({"RequestFinished":{"status":"rate_limited","status_code":429,"latency_ms":900,"retry_count":2,"input_tokens":100,"output_tokens":40,"timestamp_ms":2000}}),
+            serde_json::json!({"RequestFinished":{"status":"timeout","timestamp_ms":3000}}),
+            serde_json::json!({"RequestFinished":{"status":"server_error","timestamp_ms":4000}}),
+            serde_json::json!({"RequestFinished":{"status":"connect_error","timestamp_ms":5000}}),
+            serde_json::json!({"RequestFinished":{"status":"truncated","timestamp_ms":6000}}),
+            serde_json::json!({"SegmentFinished":{"segment_id":"old","status":"succeeded","input_tokens":100,"output_tokens":40,"timestamp_ms":7000}}),
+            serde_json::json!({"BatchSplit":{}}),
+            serde_json::json!({"BatchRepairStarted":{}}),
+            serde_json::json!({"BatchRepairFinished":{"still_failed_items":1}}),
+            serde_json::json!({"CheckpointFlushed":{}}),
+            serde_json::json!({"TranslationFinished":{"elapsed_ms":120000,"timestamp_ms":121000}}),
+            serde_json::json!({"JobCreated":{"timestamp_ms":1000000}}),
+            serde_json::json!({"RequestFinished":{"status":"ok","latency_ms":50,"input_tokens":30,"output_tokens":10,"timestamp_ms":1020000}}),
+            serde_json::json!({"SegmentFinished":{"segment_id":"new","status":"succeeded","input_tokens":30,"output_tokens":10,"timestamp_ms":1029000}}),
+            serde_json::json!({"TranslationFinished":{"elapsed_ms":30000,"timestamp_ms":1030000}}),
+        ]);
+
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(
+            serde_json::to_value(&summary).unwrap(),
+            serde_json::json!({
+                "scope":"latest_run", "request_count":1, "p50_latency_ms":50,
+                "p95_latency_ms":50, "rate_limited":0, "timeouts":0, "server_errors":0,
+                "connection_errors":0, "invalid_responses":0, "truncations":0,
+                "retries":0, "batch_splits":0, "repair_batches":0, "repair_failures":0,
+                "input_tokens":30, "output_tokens":10, "blocks_per_minute":2.0,
+                "checkpoint_flushes":0, "elapsed_ms":30000
+            }),
+            "all accumulators reset, while the legacy throughput JSON key remains stable"
+        );
+    }
+
+    #[test]
+    fn unfinished_resume_discards_previous_elapsed_and_usage_fallback() {
+        let summary = summary_from_values(&[
+            serde_json::json!({"JobCreated":{"timestamp_ms":1000}}),
+            serde_json::json!({"RequestFinished":{"status":"ok","latency_ms":900,"input_tokens":100,"output_tokens":40,"timestamp_ms":2000}}),
+            serde_json::json!({"SegmentFinished":{"segment_id":"s1","status":"succeeded","input_tokens":100,"output_tokens":40,"timestamp_ms":3000}}),
+            serde_json::json!({"TranslationFinished":{"elapsed_ms":120000,"timestamp_ms":121000}}),
+            serde_json::json!({"JobCreated":{"timestamp_ms":1000000}}),
+            serde_json::json!({"SegmentFinished":{"segment_id":"s1","status":"succeeded","input_tokens":13,"output_tokens":5,"timestamp_ms":1020000}}),
+        ]);
+
+        assert_eq!(summary.elapsed_ms, Some(20000));
+        assert_eq!(summary.request_count, 0);
+        assert_eq!(summary.p50_latency_ms, None);
+        assert_eq!(summary.p95_latency_ms, None);
+        assert_eq!(summary.input_tokens, 13);
+        assert_eq!(summary.output_tokens, 5);
+        assert_eq!(
+            serde_json::to_value(summary).unwrap()["blocks_per_minute"],
+            3.0
+        );
+    }
+
+    #[test]
+    fn throughput_counts_unique_work_completions_like_live_progress() {
+        let mut events = vec![serde_json::json!({"JobCreated":{"timestamp_ms":1000}})];
+        for (id, status) in [
+            ("s1", "retry_pending"),
+            ("s1", "succeeded"),
+            ("s1", "succeeded"),
+            ("s2", "retry_pending"),
+            ("s3", "needs_review"),
+            ("s4", "failed"),
+            ("s5", "skipped_cached"),
+            ("s6", "succeeded"),
+            ("s6", "retry_pending"),
+            ("s7", "queued"),
+            ("s8", "unknown_status"),
+        ] {
+            events.push(serde_json::json!({"SegmentFinished":{"segment_id":id,"status":status,"timestamp_ms":2000}}));
+        }
+        events.push(
+            serde_json::json!({"SegmentFinished":{"status":"succeeded","timestamp_ms":3000}}),
+        );
+        events.push(
+            serde_json::json!({"TranslationFinished":{"elapsed_ms":60000,"timestamp_ms":61000}}),
+        );
+
+        let summary = summary_from_values(&events);
+        assert_eq!(
+            serde_json::to_value(summary).unwrap()["blocks_per_minute"],
+            4.0
+        );
+    }
+
+    #[test]
+    fn cached_only_run_has_zero_work_throughput() {
+        let summary = summary_from_values(&[
+            serde_json::json!({"JobCreated":{"timestamp_ms":1000}}),
+            serde_json::json!({"SegmentFinished":{"segment_id":"cached","status":"skipped_cached","timestamp_ms":2000}}),
+            serde_json::json!({"TranslationFinished":{"elapsed_ms":1000,"timestamp_ms":2000}}),
+        ]);
+
+        assert_eq!(summary.segments_per_minute, Some(0.0));
+    }
+
+    #[test]
+    fn legacy_log_without_job_boundary_keeps_whole_stream() {
+        let summary = summary_from_values(&[
+            serde_json::json!({"SegmentFinished":{"segment_id":"s1","status":"succeeded","input_tokens":11,"output_tokens":3,"timestamp_ms":1000}}),
+            serde_json::json!({"SegmentFinished":{"segment_id":"s2","status":"succeeded","input_tokens":13,"output_tokens":5,"timestamp_ms":121000}}),
+        ]);
+
+        assert_eq!(summary.elapsed_ms, Some(120000));
+        assert_eq!(summary.input_tokens, 24);
+        assert_eq!(summary.output_tokens, 8);
+        assert_eq!(
+            serde_json::to_value(summary).unwrap()["blocks_per_minute"],
+            1.0
+        );
+    }
+
+    fn summary_from_values(events: &[serde_json::Value]) -> RunPerformanceSummary {
+        let path = temp_path("run-performance.jsonl");
+        let jsonl = events
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, jsonl).unwrap();
+        let summary = performance_summary_from_events(&path).unwrap().unwrap();
+        let _ = fs::remove_file(path);
+        summary
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {

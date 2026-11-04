@@ -87,7 +87,7 @@ fn reflow_epub_staged(
     let result = with_output_writer(input, output, options, staged_file);
     match result {
         Ok(report) => {
-            if let Err(error) = commit_staged_output("reflowed", &staged, output) {
+            if let Err(error) = commit_staged_output(&staged, output) {
                 let _ = fs::remove_file(&staged);
                 return Err(error);
             }
@@ -1610,6 +1610,39 @@ mod tests {
         assert!(!output.exists(), "no output may be committed on rejection");
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn excessive_expansion_is_rejected_without_replacing_the_existing_output() {
+        // One mebibyte of a single repeated byte deflates far beyond the
+        // per-entry compression ratio ceiling.
+        let input = create_minimal_epub(&format!("<p>{}</p>", "x".repeat(1024 * 1024)));
+        let output = unique_temp_path("bookforge-reflow-bounded", "epub");
+        fs::write(&output, b"existing output").expect("existing output should write");
+
+        for dry_run in [true, false] {
+            let error = reflow_epub(
+                &input,
+                &output,
+                &ReflowOptions {
+                    dry_run,
+                    ..ReflowOptions::default()
+                },
+            )
+            .expect_err("reflow must enforce the shared expansion limit");
+            assert!(
+                error.to_string().contains("compression ratio limit"),
+                "dry_run={dry_run}: {error}"
+            );
+            assert_eq!(
+                fs::read(&output).expect("existing output should remain"),
+                b"existing output",
+                "dry_run={dry_run}: a rejected reflow must not touch the output"
+            );
+        }
+
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
     }
 
     #[test]

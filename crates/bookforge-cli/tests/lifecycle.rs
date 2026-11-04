@@ -1597,10 +1597,11 @@ fn cli_status_after_translate_reports_succeeded_job() {
     assert!(stdout.contains(&format!("Job: {}", run.job_id)));
     assert!(stdout.contains("Status: succeeded"));
     assert!(stdout.contains("Segments:"));
+    assert!(stdout.contains("Tokens (latest saved checkpoints):"));
     assert!(stdout.contains("Output:"));
     assert!(stdout.contains("Event log:"));
     assert!(stdout.contains("Report:"));
-    assert!(stdout.contains("Performance:"));
+    assert!(stdout.contains("Performance (latest run):"));
 }
 
 #[test]
@@ -2171,6 +2172,124 @@ fn cli_pause_and_resume_live_mock_run() {
     );
     assert_no_duplicate_segments(&segment_finished_ids(&final_events));
     assert!(output.exists(), "resumed live run should write output");
+}
+
+/// A plain `resume` must not start a second worker beside a live one: it is
+/// refused before it changes the saved output, event log or job state.
+#[test]
+fn cli_resume_rejects_a_live_worker_before_changing_output_or_dispatching() {
+    let temp = tempfile::tempdir().unwrap();
+    let events = temp.path().join("live-events.jsonl");
+    let output = temp.path().join("out.epub");
+    let release = temp.path().join("mock-release");
+    let mut child = spawn_gated_mock_translate(&temp, &events, &output, &release);
+    let job_id = wait_for_job_id_in_events(&events, &mut child);
+    wait_for_first_batch_request(&events, &mut child);
+    let replacement_output = temp.path().join("unwanted.epub");
+    let resume_events = temp.path().join("unwanted-events.jsonl");
+    bookforge()
+        .current_dir(temp.path())
+        .timeout(Duration::from_secs(30))
+        .args([
+            "resume",
+            &job_id,
+            "--ui",
+            "quiet",
+            "--output",
+            replacement_output.to_str().unwrap(),
+            "--progress-jsonl",
+            resume_events.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already has an active worker"));
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).unwrap();
+    assert_eq!(store.get_job(&job_id).unwrap().unwrap().output_path, output);
+    drop(store);
+    assert!(
+        !resume_events.exists(),
+        "a rejected resume must not start a pipeline"
+    );
+    assert_eq!(batch_request_started_count(&read_jsonl_lenient(&events)), 1);
+    fs::write(&release, "release").unwrap();
+    assert!(
+        wait_for_child_exit(&mut child, Duration::from_secs(60))
+            .expect("translate child should exit")
+            .success()
+    );
+    assert!(!replacement_output.exists());
+}
+
+/// A resume rejected by its preflight (here an incompatible checkpoint
+/// contract) leaves the stopped job, its saved paths and its pending control
+/// command exactly as they were; a compatible resume then consumes them.
+#[test]
+fn cli_rejected_resume_preserves_stopped_job_paths_and_control() {
+    let temp = tempfile::tempdir().unwrap();
+    let run = translate_quiet(&temp, "mock-prefix-target");
+    let store = JobStore::open(temp.path().join(".bookforge/jobs.sqlite")).unwrap();
+    let original = store
+        .load_job_config_snapshot(&run.job_id)
+        .unwrap()
+        .unwrap();
+    let mut incompatible = original.clone();
+    incompatible.cache_namespace = "obsolete-contract".to_string();
+    store
+        .update_job_config_snapshot(&run.job_id, &incompatible)
+        .unwrap();
+    let segment_id = store.segment_records(&run.job_id).unwrap()[0].id.clone();
+    store
+        .mark_segment_failed(&run.job_id, &segment_id, "retry fixture")
+        .unwrap();
+    store.mark_job_stopped(&run.job_id).unwrap();
+    let control = control_path(&temp, &run.job_id);
+    write_control_file(&control, ControlCommand::Stop).unwrap();
+    let job_before = store.get_job(&run.job_id).unwrap().unwrap();
+    let blocks_before = store.load_block_translations(&run.job_id).unwrap();
+    let alternate_output = temp.path().join("alternate.epub");
+    let alternate_events = temp.path().join("alternate-events.jsonl");
+
+    bookforge()
+        .current_dir(temp.path())
+        .args(["resume", &run.job_id, "--ui", "quiet", "--output"])
+        .arg(&alternate_output)
+        .arg("--progress-jsonl")
+        .arg(&alternate_events)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("resume cache namespace mismatch"));
+
+    let job = store.get_job(&run.job_id).unwrap().unwrap();
+    assert_eq!(job.status, "stopped");
+    assert_eq!(job.output_path, job_before.output_path);
+    assert_eq!(job.events_path, job_before.events_path);
+    assert_eq!(read_control_file(&control).unwrap(), ControlCommand::Stop);
+    assert!(!alternate_output.exists());
+    assert_eq!(
+        store.load_block_translations(&run.job_id).unwrap(),
+        blocks_before
+    );
+    assert_eq!(
+        fs::read_to_string(&alternate_events)
+            .unwrap_or_default()
+            .matches("RequestStarted")
+            .count(),
+        0
+    );
+
+    store
+        .update_job_config_snapshot(&run.job_id, &original)
+        .unwrap();
+    bookforge()
+        .current_dir(temp.path())
+        .args(["resume", &run.job_id, "--ui", "quiet"])
+        .assert()
+        .success();
+    assert_eq!(
+        store.get_job(&run.job_id).unwrap().unwrap().status,
+        "succeeded"
+    );
+    assert!(!control.exists());
 }
 
 /// A parked run must still honour a stop.
@@ -3447,6 +3566,10 @@ fn cli_review_generates_artifacts_and_ingest_flags_marks_retry() {
         .and_then(|value| value.as_u64())
         .expect("total input tokens should exist");
     assert_eq!(total_input, sum_input);
+    assert_eq!(
+        review_json.pointer("/totals/usage_scope"),
+        Some(&serde_json::json!("latest_saved_checkpoints"))
+    );
     assert!(
         fs::read_to_string(&review_html_path)
             .expect("review HTML should read")

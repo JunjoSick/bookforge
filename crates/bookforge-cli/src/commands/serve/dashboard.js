@@ -44,8 +44,11 @@ function elapsedSecs(s) {
     return (s.last_timestamp_ms - s.first_timestamp_ms) / 1000;
   return 0;
 }
-function segPerMin(s) { const e = elapsedSecs(s); return e > 0 ? (s.done_segments || 0) / e * 60 : 0; }
-function etaSecs(s) { const r = Math.max(0, (s.total_segments || 0) - (s.done_segments || 0)); const pm = segPerMin(s); return pm > 0 ? r / (pm / 60) : 0; }
+// Rate and ETA describe this invocation's fresh work only: cache hits and
+// checkpoints restored by a resume are progress, not throughput.
+function runCompleted(s) { return s.run_completed_segments ?? Math.max(0, (s.done_segments || 0) - (s.cached || 0)); }
+function segPerMin(s) { const e = elapsedSecs(s); return e > 0 ? runCompleted(s) / e * 60 : 0; }
+function etaSecs(s) { const total = s.run_total_segments ?? Math.max(0, (s.total_segments || 0) - (s.cached || 0)); const r = Math.max(0, total - runCompleted(s)); const pm = segPerMin(s); return !s.finished && pm > 0 ? r / (pm / 60) : 0; }
 function fmtCost(v) { return v == null ? "n/a" : "$" + Number(v).toFixed(2); }
 
 const QUALITY = [
@@ -1036,6 +1039,7 @@ function fmtEvent(ev) {
     case "StageFinished": body = `stage complete: ${v.stage}`; break;
     case "SegmentationFinished": body = `segmented into ${v.segment_count} segments`; break;
     case "CacheScanFinished": body = `cache scan: ${v.hits} hits / ${v.misses} misses`; break;
+    case "ProgressRestored": body = `restored progress: ${v.succeeded} ok, ${v.cached} cached, ${v.needs_review} review, ${v.failed} failed`; break;
     case "JobPaused": body = `paused`; cls="warn"; break;
     case "JobResumed": body = `resumed`; cls="good"; break;
     case "CheckpointFlushed": body = `checkpoint flushed (${v.flushed_count})`; break;
@@ -1317,7 +1321,8 @@ function drawReview() {
   }
   $("#stage").innerHTML = `<div class="review">
     <div class="rev-list"><div class="lh"><div class="t">${esc(shorten(title, 32))}</div>
-        <div class="m">${langs} · ${segs.length} segments · ${fmtCost(doc.totals && doc.totals.estimated_cost_usd)}</div>
+        <div class="m">${langs} · ${segs.length} segments</div>
+        <div class="m" title="Latest saved checkpoints at primary model rates, including fallback results. Excludes replaced checkpoints and separate QA/double-check calls.">Saved checkpoints: ${fmtCost(doc.totals && doc.totals.estimated_cost_usd)}</div>
         <div class="rev-filters">${filters.map(([f, l]) => `<div class="rev-filter ${R.filter === f ? "on" : ""}" onclick="bfReviewFilter('${f}')">${esc(l)}</div>`).join("")}</div></div>
       <div class="rev-rows scr">${rows}</div></div>
     <div class="rev-main">${main}</div></div>`;
