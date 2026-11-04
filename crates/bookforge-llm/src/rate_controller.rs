@@ -20,7 +20,6 @@ pub struct RateControllerConfig {
     pub stable_success_threshold: f64,
     pub rate_limit_cut_factor: f64,
     pub timeout_cut_factor: f64,
-    pub high_latency_cut_factor: f64,
 }
 
 impl RateControllerConfig {
@@ -38,7 +37,6 @@ impl RateControllerConfig {
             stable_success_threshold: 0.98,
             rate_limit_cut_factor: 0.50,
             timeout_cut_factor: 0.75,
-            high_latency_cut_factor: 0.85,
         }
     }
 }
@@ -155,19 +153,10 @@ impl ProviderRateController {
                     CutKind::Generic,
                 );
             }
-            RequestStatus::Ok => {
-                if self.rolling_p95_locked(&state) > self.config.target_p95_latency_ms {
-                    self.cut_locked_with_cooldown(
-                        &mut state,
-                        self.config.high_latency_cut_factor,
-                        "high_latency",
-                        self.config.generic_decrease_interval,
-                        CutKind::Generic,
-                    );
-                } else {
-                    self.grow_if_stable_locked(&mut state);
-                }
-            }
+            // A slow success is not congestion: large translation batches can
+            // legitimately take minutes. High latency only holds growth back
+            // (see `grow_if_stable_locked`); it never cuts concurrency.
+            RequestStatus::Ok => self.grow_if_stable_locked(&mut state),
             RequestStatus::InvalidJson | RequestStatus::Truncated | RequestStatus::OtherError => {}
         }
     }
@@ -268,7 +257,6 @@ mod tests {
                 stable_success_threshold: 0.98,
                 rate_limit_cut_factor: 0.50,
                 timeout_cut_factor: 0.75,
-                high_latency_cut_factor: 0.85,
             },
         )
     }
@@ -295,12 +283,26 @@ mod tests {
     }
 
     #[test]
-    fn rate_controller_reduces_on_high_p95() {
+    fn successful_large_batches_do_not_reduce_concurrency() {
         let controller = controller(8);
         for _ in 0..4 {
             controller.observe(RequestStatus::Ok, 2_000);
         }
-        assert_eq!(controller.current(), 6);
+        assert_eq!(controller.current(), 8);
+    }
+
+    #[test]
+    fn slow_successes_hold_growth_until_the_latency_window_recovers() {
+        let controller = controller(4);
+        for _ in 0..4 {
+            controller.observe(RequestStatus::Ok, 2_000);
+        }
+        for _ in 0..3 {
+            controller.observe(RequestStatus::Ok, 100);
+        }
+        assert_eq!(controller.current(), 4);
+        controller.observe(RequestStatus::Ok, 100);
+        assert_eq!(controller.current(), 5);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# translate_batch_marker_safe.v3.md
+# translate_batch_marker_safe.v4.md
 
 ## System
 
@@ -35,9 +35,12 @@ Rules:
 - Markers may move position only when target-language grammar requires it.
 - Preserve protected spans exactly — copy them character-for-character.
 - Preserve meaning, tone, register, and authorial style.
-- Translate the human-readable prose between/around markers naturally.
+- Translate all human-readable prose, including the text inside markers, once.
+- Keep bibliographic identifiers and cited work titles as written unless explicit glossary/title guidance supplies a translation. Translate ordinary quoted prose and surrounding commentary.
+- Preserve deliberate source repetition; do not add repeated words, sentences, or neighboring items.
+- Use prior context for consistency only; do not include it in the output.
 
-Markers are the <mN>...</mN> and <rN/> tags and their content inside them.
+Markers are the <mN>, </mN> and <rN/> tags. The text inside a marker pair is prose and is translated.
 For example, given the source:
   <m1>Hello <r1/> world</m1>
 The translation must keep:

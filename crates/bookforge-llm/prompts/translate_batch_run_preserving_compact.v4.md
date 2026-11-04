@@ -1,4 +1,4 @@
-# translate_batch_run_preserving_compact.v3.md
+# translate_batch_run_preserving_compact.v4.md
 
 ## System
 
@@ -11,7 +11,9 @@ Rules:
 - Marker-only runs must be copied exactly.
 - Protected spans must be copied exactly.
 - Escape straight double quotes inside JSON strings as \".
-- Translate naturally.
+- Keep bibliographic identifiers and cited work titles as written unless explicit glossary/title guidance supplies a translation. Translate ordinary quoted prose and surrounding commentary.
+- Translate all prose and preserve deliberate source repetition; do not add repetitions or copy neighboring runs.
+- Read all runs of an item together. Translate each passage once in its corresponding run, preserving meaningful boundary whitespace.
 
 Return exactly:
 {"items":[{"id":"...","runs":[{"id":"...","text":"..."}]}]}
@@ -21,7 +23,7 @@ Return exactly:
 Translate every item.
 Honor item `glossary`/`glossary_prose`/`retry_guidance` constraints. Style: {{style_guide_block}}
 Entities: {{entity_agreement_block}}
-Prior context: {{context_translation_pairs}}
+Prior context (consistency only; do not include in output): {{context_translation_pairs}}
 Extra: {{prompt_extra}}
 {{items_json}}
 Return JSON only. Include every input item.

@@ -405,7 +405,23 @@ pub fn build_translation_batches(
         }
     }
 
-    group_batches(items, config, turbo.then_some(BatchMode::TurboTextOnly))
+    let mut batches = group_batches(items, config, turbo.then_some(BatchMode::TurboTextOnly));
+    // A segment is durable only when every mode represented in it finishes.
+    // Interleave the already-packed mode groups by their earliest segment,
+    // without changing any request, so early segments do not wait for a
+    // whole chapter's other modes before they can be checkpointed.
+    let segment_ordinals: HashMap<&SegmentId, usize> = segments
+        .iter()
+        .map(|segment| (&segment.id, segment.ordinal))
+        .collect();
+    batches.sort_by_key(|batch| {
+        batch
+            .items
+            .iter()
+            .filter_map(|item| segment_ordinals.get(&item.segment_id).copied())
+            .min()
+    });
+    batches
 }
 
 pub fn account_for_batch_prompt_overhead(

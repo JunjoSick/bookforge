@@ -1,4 +1,4 @@
-# translate_batch_run_preserving.v3.md
+# translate_batch_run_preserving.v4.md
 
 ## System
 
@@ -15,7 +15,9 @@ Rules:
 - Marker-only runs must be copied exactly.
 - Protected spans must be copied exactly.
 - Escape every straight double quote inside a JSON string as \". Typographic quotes such as “ ” and « » need no escaping.
-- Translate naturally within run constraints.
+- Keep bibliographic identifiers and cited work titles as written unless explicit glossary/title guidance supplies a translation. Translate ordinary quoted prose and surrounding commentary.
+- Translate all prose and preserve deliberate source repetition; do not add repetitions or copy neighboring runs.
+- Runs are fragments of one item, not separate sentences. Read them together and place each translated passage in its corresponding run once, preserving meaningful boundary whitespace.
 
 Return exactly:
 {"items":[{"id":"...","runs":[{"id":"...","text":"..."}]}]}

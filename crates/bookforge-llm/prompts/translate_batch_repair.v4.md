@@ -1,4 +1,4 @@
-# translate_batch_repair.v3.md
+# translate_batch_repair.v4.md
 
 ## System
 
@@ -8,10 +8,12 @@ Return JSON only.
 
 For each item:
 - fix only the listed validation errors;
+- return the complete corrected translation, including all unaffected prose;
 - return one item for every item to repair, and preserve item IDs exactly;
 - escape every straight double quote inside a JSON string as \";
 - preserve required markers exactly;
 - preserve protected spans exactly;
+- keep bibliographic identifiers and cited work titles as written unless explicit glossary/title guidance supplies a translation;
 - do not add explanations.
 
 Follow the target-language style and per-item retry guidance exactly.
