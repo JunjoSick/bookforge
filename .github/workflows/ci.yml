@@ -109,7 +109,9 @@ jobs:
 
   clippy-macos:
     name: clippy (macos)
-    runs-on: macos-14
+    # Keep this on the image the release builds Apple Silicon on
+    # (dist-workspace.toml, github-custom-runners).
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
