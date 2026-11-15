@@ -142,3 +142,22 @@ deliberate `zip 6.0` security bump).
   is sufficient for a workspace this size).
 - Reducing edition to 2021 (no benefit; would just be churn).
 - Pinning transitive dep versions to dodge 1.88 (rejected, see §3).
+
+## Addendum, 2026-11-15: the floor moves to 1.89
+
+RUSTSEC-2026-0459 (CVE-2026-119375) is against the SQLite that
+`libsqlite3-sys` bundles: a database opened with a crafted `-wal` file of a
+different page size can return uninitialized memory. BookForge opens job
+stores that users move between machines and share, so the exposure is real,
+if local. The fix is SQLite 3.54, which first ships with `rusqlite` 0.41, and
+`rusqlite` 0.41 declares Rust 1.89.
+
+This is option (b) in section 6: the floor moves to what the dependency
+requires. An exception in the audit was rejected because release binaries
+would keep shipping the vulnerable SQLite. Rust 1.89 was released in August
+2025, so it still clears the six-month rule this audit set. A source build on
+a distribution toolchain that is exactly 1.88 now needs `rustup`; the prebuilt
+installers are unaffected.
+
+The `msrv` CI job, the release gate and the required status check are now
+`msrv (1.89.0)`. The Dependabot hold on `rusqlite` is removed.

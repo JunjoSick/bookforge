@@ -133,7 +133,7 @@ mkalert() {
 all_pass() {
   local started="$1" completed="$2" sha="$3" id=100
   local names=( \
-    'fmt' 'clippy' 'test' 'test (windows-msvc)' 'clippy (macos)' 'msrv (1.88.0)' \
+    'fmt' 'clippy' 'test' 'test (windows-msvc)' 'clippy (macos)' 'msrv (1.89.0)' \
     'corpus (small)' 'RustSec advisory audit' 'CodeQL (Rust)' 'CodeQL' )
   local out="[]" name
   for name in "${names[@]}"; do

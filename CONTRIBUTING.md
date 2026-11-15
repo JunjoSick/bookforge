@@ -68,7 +68,7 @@ baseline. Verify the active host with `rustc -vV` before diagnosing a project
 build failure.
 
 CI builds with `RUSTFLAGS=-D warnings` on the exact Rust version in
-`RUST_TOOLCHAIN` (`.github/workflows/ci.yml`); only the `msrv` job uses 1.88.
+`RUST_TOOLCHAIN` (`.github/workflows/ci.yml`); only the `msrv` job uses 1.89.
 Run your checks on that version, for example
 `RUSTUP_TOOLCHAIN=<version> bash scripts/verify.sh full`: an older or newer
 local stable can disagree with CI in either direction. Raise the pin in its own

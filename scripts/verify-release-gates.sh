@@ -31,7 +31,7 @@ required_checks=(
   "test"
   "test (windows-msvc)"
   "clippy (macos)"
-  "msrv (1.88.0)"
+  "msrv (1.89.0)"
   "corpus (small)"
   "RustSec advisory audit"
   "CodeQL (Rust)"

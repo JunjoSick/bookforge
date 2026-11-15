@@ -247,7 +247,7 @@ fn assert_concurrent_upserts_are_serialized(kind: Upsert) {
         });
         second
             .conn
-            .borrow()
+            .borrow_mut()
             .busy_handler(Some(hold_first_busy_wait))
             .unwrap();
         let result = kind.write(&second, 2);

@@ -4,7 +4,7 @@
 
 Use the declared Node version (`.nvmrc`, currently 22), Rust stable with
 rustfmt and Clippy, and the committed Cargo/npm lockfiles. CI separately checks
-Rust 1.88 MSRV and Windows MSVC. `bash scripts/qa-doctor.sh` reports prerequisites;
+Rust 1.89 MSRV and Windows MSVC. `bash scripts/qa-doctor.sh` reports prerequisites;
 it does not install software or change system permissions. Install browser QA with:
 
 ```bash

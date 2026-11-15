@@ -134,7 +134,7 @@ impl Drop for AdaptivePermit {
 /// `AtomicUsize::fetch_update` with the orderings every caller here uses.
 ///
 /// Rust 1.99 deprecates `fetch_update` in favor of `try_update`, but
-/// `try_update` is unstable on the 1.88 MSRV, so the deprecated method stays
+/// `try_update` is unstable on the 1.89 MSRV, so the deprecated method stays
 /// behind this single allow until the MSRV can use the new name.
 #[allow(deprecated)]
 fn fetch_update(
