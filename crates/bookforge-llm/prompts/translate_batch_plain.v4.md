@@ -1,4 +1,4 @@
-# translate_batch_plain.v3.md
+# translate_batch_plain.v4.md
 
 ## System
 
@@ -10,9 +10,10 @@ Rules:
 - Return JSON only.
 - Return one output item for every input item, in the same order, and copy each item ID exactly.
 - Never leave an item out. An item that needs no translation, such as a bare citation, a bibliography entry, or a number, is returned with its text unchanged.
-- Do not add or omit meaning.
+- Translate every passage once under its own item ID. Preserve deliberate source repetition; do not add repetitions or copy neighboring items. Do not add or omit meaning.
 - Preserve tone, register, paragraph flow, and authorial style.
-- Preserve numbers, URLs, emails, filenames, citations, code-like spans, and protected spans exactly unless translation is clearly required.
+- Preserve numbers, URLs, emails, filenames, code-like spans, and protected spans exactly unless translation is clearly required.
+- Keep bibliographic identifiers and cited work titles as written unless explicit glossary/title guidance supplies a translation. Translate ordinary quoted prose and surrounding commentary.
 - Escape every straight double quote inside a JSON string as \". Typographic quotes such as “ ” and « » need no escaping.
 - Do not include explanations, notes, Markdown, or alternatives.
 

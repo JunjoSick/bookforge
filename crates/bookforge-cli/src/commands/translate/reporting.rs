@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bookforge_core::{
     RunConfigSnapshot,
     config::TranslationConfig,
@@ -59,6 +59,25 @@ pub(crate) fn print_run_summary(
     println!("Review: bookforge review {review_job_id} --open");
 }
 
+/// Write the output EPUB; if that fails, mark the job failed (keeping every
+/// segment checkpoint) so it does not report success without an output.
+pub(crate) fn rebuild_epub_for_job(
+    store: &JobStore,
+    job: &JobRecord,
+    book: &bookforge_core::ir::Book,
+    translations: &[BlockTranslation],
+    output: &std::path::Path,
+    options: &RebuildOptions,
+) -> Result<()> {
+    if let Err(error) = rebuild_epub_with_options(book, translations, output, options) {
+        store.mark_job_failed(&job.id).with_context(|| {
+            format!("EPUB rebuild failed ({error}); could not persist the failed job status")
+        })?;
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn print_summary_rebuild_and_report(
     store: &JobStore,
@@ -74,7 +93,14 @@ pub fn print_summary_rebuild_and_report(
     print_stdout: bool,
 ) -> Result<()> {
     let block_translations = block_translations(translations);
-    rebuild_epub_with_options(book, &block_translations, &config.output, rebuild_options)?;
+    rebuild_epub_for_job(
+        store,
+        job,
+        book,
+        &block_translations,
+        &config.output,
+        rebuild_options,
+    )?;
     let mut validation_failure = None;
     if validate_output || strict_epubcheck {
         let validation_path = validate::default_report_path(&config.output);

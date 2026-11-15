@@ -1,10 +1,12 @@
-# translate_batch_repair_compact.v3.md
+# translate_batch_repair_compact.v4.md
 
 ## System
 
 You are correcting rejected translations from {{source_language}} into {{target_language}}. Return JSON only.
 
 For each item: fix the listed validation errors, preserve item IDs, required markers, and protected spans. Return every item, and escape straight double quotes inside JSON strings as \".
+Return the complete corrected translation for each item, including all unaffected prose.
+Keep bibliographic identifiers and cited work titles as written unless explicit glossary/title guidance supplies a translation. Translate ordinary quoted prose and surrounding commentary.
 
 Follow the target-language style and per-item retry guidance exactly.
 

@@ -84,6 +84,10 @@ pub enum PromptVersion {
     /// matching translations produced under the old v2-era batch prompt
     /// text.
     BatchV3,
+    /// Batch prompts preserve cited work titles unless guidance supplies a
+    /// translation, translate prose inside markers once without added
+    /// repetition, and ask repairs for the complete corrected text.
+    BatchV4,
 }
 
 impl PromptVersion {
@@ -91,6 +95,7 @@ impl PromptVersion {
         match self {
             PromptVersion::V2 => "v2",
             PromptVersion::BatchV3 => "batch_v3",
+            PromptVersion::BatchV4 => "batch_v4",
         }
     }
 }
@@ -155,6 +160,7 @@ impl TranslationProfile {
                     max_idle_per_host: 32,
                 },
                 qa: QaRunConfig {
+                    max_output_tokens: None,
                     concurrency: 4,
                     batch_target_tokens: 4_000,
                     model: None,
@@ -209,6 +215,7 @@ impl TranslationProfile {
                     max_idle_per_host: 32,
                 },
                 qa: QaRunConfig {
+                    max_output_tokens: None,
                     concurrency: 8,
                     batch_target_tokens: 8_000,
                     model: None,
@@ -263,6 +270,7 @@ impl TranslationProfile {
                     max_idle_per_host: 32,
                 },
                 qa: QaRunConfig {
+                    max_output_tokens: None,
                     concurrency: 16,
                     batch_target_tokens: 12_000,
                     model: None,
@@ -317,6 +325,7 @@ impl TranslationProfile {
                     max_idle_per_host: 8,
                 },
                 qa: QaRunConfig {
+                    max_output_tokens: None,
                     concurrency: 1,
                     batch_target_tokens: 4_000,
                     model: None,
@@ -371,6 +380,7 @@ impl TranslationProfile {
                     max_idle_per_host: 64,
                 },
                 qa: QaRunConfig {
+                    max_output_tokens: None,
                     concurrency: 16,
                     batch_target_tokens: 16_000,
                     model: None,
@@ -425,6 +435,7 @@ impl TranslationProfile {
                     max_idle_per_host: 64,
                 },
                 qa: QaRunConfig {
+                    max_output_tokens: None,
                     concurrency: 4,
                     batch_target_tokens: 4_000,
                     model: None,
@@ -535,6 +546,8 @@ pub struct BatchConfig {
 pub struct QaRunConfig {
     pub concurrency: usize,
     pub batch_target_tokens: usize,
+    /// Cap for each QA response; `None` uses the 8,192-token default.
+    pub max_output_tokens: Option<u32>,
     pub model: Option<String>,
     pub provider: Option<String>,
     pub base_url: Option<String>,

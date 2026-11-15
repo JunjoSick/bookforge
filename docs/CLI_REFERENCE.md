@@ -290,8 +290,11 @@ one concrete risk signal:
 - the deterministic translation pass left the segment in `needs_review`;
 - the translation/source character ratio is outside `0.75..=1.5`;
 - translation used the run-preserving template;
-- the source carries at least four protected spans; or
-- inline marker IDs, shapes, block placement, or syntax changed.
+- the source carries at least four protected spans;
+- inline marker IDs, shapes, block placement, or syntax changed; or
+- a source number (such as a date) is missing after decimal-format
+  normalization. This asks for contextual review, not rejection: a year can be
+  written in words. Localized decimals alone do not select a segment.
 
 The signals are additive. Routine successful prose near a 1:1 character ratio,
 using the normal template and without marker changes, is not selected. In one
@@ -303,6 +306,8 @@ Failed, queued, and retry-pending segments are not sent to the reviewer, and an
 empty translation is never submitted even if its status is otherwise eligible.
 
 `--qa-max-output-tokens <TOKENS>` caps each QA response and defaults to `8192`.
+The cap is saved with the job and reused on resume when the flag is omitted;
+older jobs without a saved cap use the default.
 The value must be at least `1`. If a batched response reaches that limit or ends
 as incomplete JSON, BookForge retries by bisecting the batch. One segment is the
 floor: if that request is still truncated, QA records a `qa_request_failed`

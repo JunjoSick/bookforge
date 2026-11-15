@@ -180,7 +180,7 @@ pub(super) async fn run_mock_translation_with_store(
             provider,
             model,
             prompt_version: if settings.batch.enabled {
-                PromptVersion::BatchV3.as_str()
+                PromptVersion::BatchV4.as_str()
             } else {
                 PromptVersion::V2.as_str()
             },
@@ -289,7 +289,7 @@ pub(super) async fn run_openai_compatible_translation_with_store(
             provider,
             model,
             prompt_version: if settings.batch.enabled {
-                PromptVersion::BatchV3.as_str()
+                PromptVersion::BatchV4.as_str()
             } else {
                 PromptVersion::V2.as_str()
             },

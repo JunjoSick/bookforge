@@ -180,20 +180,20 @@ const RUN_PRESERVING_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/translate_run_preserving.v2.md");
 const QA_TEMPLATE_SOURCE: &str = include_str!("../prompts/qa_segment.v1.md");
 
-const BATCH_PLAIN_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_plain.v3.md");
+const BATCH_PLAIN_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_plain.v4.md");
 const BATCH_MARKER_SAFE_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_marker_safe.v3.md");
+    include_str!("../prompts/translate_batch_marker_safe.v4.md");
 const BATCH_RUN_PRESERVING_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_run_preserving.v3.md");
-const BATCH_REPAIR_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_repair.v3.md");
+    include_str!("../prompts/translate_batch_run_preserving.v4.md");
+const BATCH_REPAIR_TEMPLATE_SOURCE: &str = include_str!("../prompts/translate_batch_repair.v4.md");
 const BATCH_PLAIN_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_plain_compact.v3.md");
+    include_str!("../prompts/translate_batch_plain_compact.v4.md");
 const BATCH_MARKER_SAFE_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_marker_safe_compact.v3.md");
+    include_str!("../prompts/translate_batch_marker_safe_compact.v4.md");
 const BATCH_RUN_PRESERVING_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_run_preserving_compact.v3.md");
+    include_str!("../prompts/translate_batch_run_preserving_compact.v4.md");
 const BATCH_REPAIR_COMPACT_TEMPLATE_SOURCE: &str =
-    include_str!("../prompts/translate_batch_repair_compact.v3.md");
+    include_str!("../prompts/translate_batch_repair_compact.v4.md");
 const QA_BATCH_TEMPLATE_SOURCE: &str = include_str!("../prompts/qa_batch.v1.md");
 const DOUBLE_CHECK_BATCH_TEMPLATE_SOURCE: &str =
     include_str!("../prompts/double_check_batch.v1.md");
@@ -241,44 +241,44 @@ impl PromptLibrary {
             .expect("embedded QA template must parse");
 
         let batch_plain =
-            PromptTemplate::parse("translate_batch_plain", "v3", BATCH_PLAIN_TEMPLATE_SOURCE)
+            PromptTemplate::parse("translate_batch_plain", "v4", BATCH_PLAIN_TEMPLATE_SOURCE)
                 .expect("embedded batch plain template must parse");
         let batch_marker_safe = PromptTemplate::parse(
             "translate_batch_marker_safe",
-            "v3",
+            "v4",
             BATCH_MARKER_SAFE_TEMPLATE_SOURCE,
         )
         .expect("embedded batch marker-safe template must parse");
         let batch_run_preserving = PromptTemplate::parse(
             "translate_batch_run_preserving",
-            "v3",
+            "v4",
             BATCH_RUN_PRESERVING_TEMPLATE_SOURCE,
         )
         .expect("embedded batch run-preserving template must parse");
         let batch_repair =
-            PromptTemplate::parse("translate_batch_repair", "v3", BATCH_REPAIR_TEMPLATE_SOURCE)
+            PromptTemplate::parse("translate_batch_repair", "v4", BATCH_REPAIR_TEMPLATE_SOURCE)
                 .expect("embedded batch repair template must parse");
         let batch_plain_compact = PromptTemplate::parse(
             "translate_batch_plain_compact",
-            "v3",
+            "v4",
             BATCH_PLAIN_COMPACT_TEMPLATE_SOURCE,
         )
         .expect("embedded batch plain compact template must parse");
         let batch_marker_safe_compact = PromptTemplate::parse(
             "translate_batch_marker_safe_compact",
-            "v3",
+            "v4",
             BATCH_MARKER_SAFE_COMPACT_TEMPLATE_SOURCE,
         )
         .expect("embedded batch marker-safe compact template must parse");
         let batch_run_preserving_compact = PromptTemplate::parse(
             "translate_batch_run_preserving_compact",
-            "v3",
+            "v4",
             BATCH_RUN_PRESERVING_COMPACT_TEMPLATE_SOURCE,
         )
         .expect("embedded batch run-preserving compact template must parse");
         let batch_repair_compact = PromptTemplate::parse(
             "translate_batch_repair_compact",
-            "v3",
+            "v4",
             BATCH_REPAIR_COMPACT_TEMPLATE_SOURCE,
         )
         .expect("embedded batch repair compact template must parse");
@@ -477,24 +477,25 @@ mod tests {
     }
 
     #[test]
-    fn batch_prompt_templates_are_versioned_v3_for_retry_guidance() {
-        // The six batch translate templates (plain / marker-safe /
-        // run-preserving, and their compact variants) gained a per-item
-        // `retry_guidance` field and moved from v2 to v3 so the cross-job
-        // translation cache (keyed on segments.prompt_version) does not
-        // serve up translations produced under the old prompt text.
-        // Repair prompts also use v3 because they now receive target-language
-        // style and per-item retry guidance.
+    fn batch_prompt_versions_match_the_current_cache_contract() {
+        // v4 changed batch policy (cited titles, repetition, prose inside
+        // markers, complete repairs). The cross-job cache is keyed on
+        // segments.prompt_version, so the core tag moves in lockstep and v3
+        // output is never reused under v4 templates.
+        assert_eq!(
+            bookforge_core::config::PromptVersion::BatchV4.as_str(),
+            "batch_v4"
+        );
         let library = PromptLibrary::embedded();
-        assert_eq!(library.batch_plain.version, "v3");
-        assert_eq!(library.batch_marker_safe.version, "v3");
-        assert_eq!(library.batch_run_preserving.version, "v3");
-        assert_eq!(library.batch_plain_compact.version, "v3");
-        assert_eq!(library.batch_marker_safe_compact.version, "v3");
-        assert_eq!(library.batch_run_preserving_compact.version, "v3");
+        assert_eq!(library.batch_plain.version, "v4");
+        assert_eq!(library.batch_marker_safe.version, "v4");
+        assert_eq!(library.batch_run_preserving.version, "v4");
+        assert_eq!(library.batch_plain_compact.version, "v4");
+        assert_eq!(library.batch_marker_safe_compact.version, "v4");
+        assert_eq!(library.batch_run_preserving_compact.version, "v4");
 
-        assert_eq!(library.batch_repair.version, "v3");
-        assert_eq!(library.batch_repair_compact.version, "v3");
+        assert_eq!(library.batch_repair.version, "v4");
+        assert_eq!(library.batch_repair_compact.version, "v4");
         assert_eq!(library.plain.version, "v2");
         assert_eq!(library.marker_safe.version, "v2");
         assert_eq!(library.run_preserving.version, "v2");

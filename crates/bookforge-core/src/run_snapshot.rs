@@ -317,6 +317,9 @@ pub struct ProviderRuntimeConfigSnapshot {
 pub struct QaRunConfigSnapshot {
     pub concurrency: usize,
     pub batch_target_tokens: usize,
+    /// Saved QA response cap; absent in snapshots written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     pub model: Option<String>,
     pub provider: Option<String>,
     pub base_url: Option<String>,
@@ -375,6 +378,7 @@ impl ResolvedRunSettingsSnapshot {
             qa: QaRunConfigSnapshot {
                 concurrency: settings.qa.concurrency,
                 batch_target_tokens: settings.qa.batch_target_tokens,
+                max_output_tokens: settings.qa.max_output_tokens,
                 model: settings.qa.model.clone(),
                 provider: settings.qa.provider.clone(),
                 base_url: settings.qa.base_url.clone(),
@@ -432,6 +436,7 @@ impl ResolvedRunSettingsSnapshot {
             qa: QaRunConfig {
                 concurrency: self.qa.concurrency,
                 batch_target_tokens: self.qa.batch_target_tokens,
+                max_output_tokens: self.qa.max_output_tokens,
                 model: self.qa.model.clone(),
                 provider: self.qa.provider.clone(),
                 base_url: self.qa.base_url.clone(),
@@ -455,6 +460,28 @@ impl ResolvedRunSettingsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qa_output_cap_survives_snapshot_and_older_snapshots_remain_readable() {
+        let mut settings = crate::config::TranslationProfile::V1Fast.resolve();
+        settings.qa.max_output_tokens = Some(137);
+        let snapshot = ResolvedRunSettingsSnapshot::from_settings(&settings);
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        let restored: ResolvedRunSettingsSnapshot = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored.to_settings().qa.max_output_tokens, Some(137));
+
+        value["qa"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_output_tokens");
+        let legacy: ResolvedRunSettingsSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.to_settings().qa.max_output_tokens, None);
+        assert!(
+            serde_json::to_value(legacy).unwrap()["qa"]
+                .get("max_output_tokens")
+                .is_none()
+        );
+    }
 
     #[test]
     fn cache_policy_conservative_is_unknown_strictness() {
@@ -552,6 +579,7 @@ mod tests {
                 retry_failed_only: true,
                 adaptive_concurrency: true,
                 qa: QaRunConfigSnapshot {
+                    max_output_tokens: None,
                     concurrency: 8,
                     batch_target_tokens: 8_000,
                     model: None,

@@ -1916,63 +1916,59 @@ mod tests {
     /// max_tokens=1, warning flagged, and no error/400-chase behavior.
     #[tokio::test]
     async fn collapsed_budget_request_still_proceeds_with_floored_limit() {
-        let (response, wire_body, budget_flagged) = retry_transient_transport(|| {
-            use tokio::io::AsyncWriteExt;
-            async move {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .expect("test listener should bind");
-                let addr = listener.local_addr().unwrap();
-                let server_handle = tokio::spawn(async move {
-                    let Ok((mut stream, _)) = listener.accept().await else {
-                        return None;
-                    };
-                    let inbound = read_mock_request(&mut stream).await;
-                    let _ = stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
-                        )
-                        .await;
-                    let payload = json!({
-                        "choices": [
-                            {"message": {"content": "ok"}, "finish_reason": "stop"}
-                        ],
-                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-                    });
-                    let _ = stream.write_all(payload.to_string().as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                    Some(inbound)
-                });
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let (inbound_tx, inbound_rx) = tokio::sync::oneshot::channel();
+        let server_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("test connection");
+            let inbound = read_mock_request(&mut stream).await;
+            let _ = inbound_tx.send(inbound);
+            let payload = json!({
+                "choices": [
+                    {"message": {"content": "ok"}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })
+            .to_string();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(payload.as_bytes()).await;
+            // Keep the socket until the client is done: an immediate close
+            // can reset a Windows loopback connection before it reads.
+            stream
+        });
 
-                let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
-                    base_url: format!("http://{addr}"),
-                    // Local providers intentionally permit an absent API key.
-                    api_key_env: "OLLAMA_API_KEY".to_string(),
-                    model: "test-model".to_string(),
-                    timeout_seconds: 10,
-                    provider_max_attempts: 1,
-                    thinking_disabled: true,
-                    retry_after_policy: RetryAfterPolicy::None,
-                    max_backoff_seconds: 1,
-                    max_idle_per_host: 1,
-                    json_mode: bookforge_core::JsonMode::PromptOnly,
-                })
-                .expect("offline provider config should be valid");
-                let mut request = offline_request();
-                request.max_output_tokens = Some(0);
-                // A floored budget completes normally instead of erroring.
-                let response = provider.complete(request).await?;
-                let inbound = server_handle
-                    .await
-                    .expect("mock server joins")
-                    .expect("mock server should capture the inbound request");
-                let budget_flagged =
-                    provider.collapsed_budget_warning_emitted.load(Ordering::Relaxed);
-                Ok((response, inbound, budget_flagged))
-            }
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://{addr}"),
+            // Local providers intentionally permit an absent API key.
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            model: "test-model".to_string(),
+            timeout_seconds: 10,
+            provider_max_attempts: 1,
+            thinking_disabled: true,
+            retry_after_policy: RetryAfterPolicy::None,
+            max_backoff_seconds: 1,
+            max_idle_per_host: 1,
+            json_mode: bookforge_core::JsonMode::PromptOnly,
         })
-        .await
-        .expect("floored budget scenario should succeed without transport flake");
+        .expect("offline provider config should be valid");
+        let mut request = offline_request();
+        request.max_output_tokens = Some(0);
+        // A floored budget completes normally instead of erroring.
+        let response = provider.complete(request).await;
+        server_handle.abort();
+        let _ = server_handle.await;
+        let response = response.expect("floored budget request should complete");
+        let wire_body = inbound_rx.await.expect("mock server captures the request");
+        let budget_flagged = provider
+            .collapsed_budget_warning_emitted
+            .load(Ordering::Relaxed);
 
         // The run proceeded: the endpoint answered, nothing chased a 400.
         assert_eq!(response.content, "ok");
@@ -2429,124 +2425,56 @@ mod tests {
         assert!(!is_retryable_status(404));
     }
 
-    /// Windows loopback connections intermittently reset or truncate under
-    /// heavy thread churn, and a fast mock server can finish streaming before
-    /// a loaded client trips its own byte limit (surfacing as a chunk-decode
-    /// error instead of the limit error). These are environmental, so
-    /// transport-level failures get a few whole-scenario retries before the
-    /// test treats them as a real regression.
-    fn is_transient_transport_error(error: &LlmError) -> bool {
-        let mut detail = error.to_string().to_ascii_lowercase();
-        let mut source = std::error::Error::source(error);
-        while let Some(error) = source {
-            detail.push_str("; ");
-            detail.push_str(&error.to_string().to_ascii_lowercase());
-            if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
-                detail.push_str(&format!(
-                    " os-code={}",
-                    io_error.raw_os_error().unwrap_or(0)
-                ));
-            }
-            source = error.source();
-        }
-        // reqwest hides the OS code behind Debug-only formatting, so also
-        // scan the debug representation for the well-known Winsock codes.
-        detail.push_str(&format!("{error:?}").to_ascii_lowercase());
-        detail.contains("connection reset")
-            || detail.contains("forcibly closed")
-            || detail.contains("os-code=10054")
-            || detail.contains("broken pipe")
-            || detail.contains("10038")
-            || detail.contains("error decoding response body")
-    }
-
-    async fn retry_transient_transport<T, F, Fut>(
-        mut attempt: F,
-    ) -> std::result::Result<T, LlmError>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = std::result::Result<T, LlmError>>,
-    {
-        let mut last = None;
-        for index in 0..5 {
-            if index > 0 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            match attempt().await {
-                Ok(value) => return Ok(value),
-                Err(error) if is_transient_transport_error(&error) => last = Some(error),
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last.expect("a retried transport error must be recorded"))
-    }
-
     #[tokio::test]
     async fn oversized_provider_response_body_is_rejected_while_streaming() {
-        // Each scenario attempt gets its own listener and one-shot server so
-        // a retried attempt never connects to an already-consumed server.
-        let error = retry_transient_transport(|| {
-            async move {
-                use tokio::io::AsyncWriteExt;
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .expect("test listener should bind");
-                let addr = listener.local_addr().unwrap();
-                let server_handle = tokio::spawn(async move {
-                    let Ok((mut stream, _)) = listener.accept().await else {
-                        return;
-                    };
-                    let _ = read_mock_request(&mut stream).await;
-                    let _ = stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                        )
-                        .await;
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("test connection");
+            let _ = read_mock_request(&mut stream).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await;
 
-                    let chunk = vec![b'x'; 64 * 1024];
-                    let chunk_header = format!("{:X}\r\n", chunk.len());
-                    for _ in 0..=(MAX_PROVIDER_RESPONSE_BODY_BYTES / chunk.len()) {
-                        if stream.write_all(chunk_header.as_bytes()).await.is_err()
-                            || stream.write_all(&chunk).await.is_err()
-                            || stream.write_all(b"\r\n").await.is_err()
-                        {
-                            break;
-                        }
-                    }
-                    let _ = stream.write_all(b"0\r\n\r\n").await;
-                    let _ = stream.shutdown().await;
-                });
-
-                let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
-                    base_url: format!("http://{addr}"),
-                    // Local providers intentionally permit an absent API key.
-                    api_key_env: "OLLAMA_API_KEY".to_string(),
-                    model: "test-model".to_string(),
-                    timeout_seconds: 10,
-                    provider_max_attempts: 1,
-                    thinking_disabled: true,
-                    retry_after_policy: RetryAfterPolicy::None,
-                    max_backoff_seconds: 1,
-                    max_idle_per_host: 1,
-                    json_mode: bookforge_core::JsonMode::PromptOnly,
-                })
-                .unwrap();
-                let outcome = provider
-                    .complete(CompletionRequest {
-                        system: "translate".to_string(),
-                        user: "hello".to_string(),
-                        response_format: ResponseFormat::Json,
-                        temperature: 0.2,
-                        max_output_tokens: Some(256),
-                        metadata: RequestMetadata::default(),
-                    })
-                    .await;
-                server_handle.abort();
-                outcome
+            let chunk = vec![b'x'; 64 * 1024];
+            let chunk_header = format!("{:X}\r\n", chunk.len());
+            for _ in 0..=(MAX_PROVIDER_RESPONSE_BODY_BYTES / chunk.len()) {
+                if stream.write_all(chunk_header.as_bytes()).await.is_err()
+                    || stream.write_all(&chunk).await.is_err()
+                    || stream.write_all(b"\r\n").await.is_err()
+                {
+                    break;
+                }
             }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+            // Keep queued chunks alive until the client reaches its size
+            // guard; an immediate close can reset unread bytes.
+            stream
+        });
+
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://{addr}"),
+            // Local providers intentionally permit an absent API key.
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            model: "test-model".to_string(),
+            timeout_seconds: 10,
+            provider_max_attempts: 1,
+            thinking_disabled: true,
+            retry_after_policy: RetryAfterPolicy::None,
+            max_backoff_seconds: 1,
+            max_idle_per_host: 1,
+            json_mode: bookforge_core::JsonMode::PromptOnly,
         })
-        .await
-        .expect_err("oversized response must be rejected");
+        .unwrap();
+        let outcome = provider.complete(offline_request()).await;
+        server_handle.abort();
+        let _ = server_handle.await;
+        let error = outcome.expect_err("oversized response must be rejected");
 
         assert!(
             error.to_string().contains(&format!(
@@ -2650,21 +2578,23 @@ mod tests {
                 return;
             };
             let _ = read_mock_request(&mut stream).await;
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
-                )
-                .await;
-            // A "legitimate" generation that takes 3s against a 2s preset.
-            tokio::time::sleep(Duration::from_secs(3)).await;
             let payload = json!({
                 "choices": [
                     {"message": {"content": "ok"}, "finish_reason": "stop"}
                 ],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-            });
-            let _ = stream.write_all(payload.to_string().as_bytes()).await;
-            let _ = stream.shutdown().await;
+            })
+            .to_string();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            // A "legitimate" generation that takes 3s against a 2s preset.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let _ = stream.write_all(payload.as_bytes()).await;
+            // Keep the socket until the client is done reading.
+            std::future::pending::<()>().await;
         });
 
         let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
@@ -2704,96 +2634,77 @@ mod tests {
     /// when the server returns 400, and does NOT consume a provider attempt.
     #[tokio::test]
     async fn json_mode_auto_fallback_works_with_one_provider_attempt() {
+        use tokio::io::AsyncWriteExt;
         // We need to override reading of the API key env var.
         // Use a well-known env var name; the actual value is unused by
         // the test server, but the provider MUST be able to read it.
         unsafe { std::env::set_var("BOOKFORGE_TEST_JSON_FALLBACK_KEY", "test") };
 
-        // Each scenario attempt gets its own listener, request counter, and
-        // provider so a retried attempt always observes the full
-        // 400-then-200 sequence instead of continuing a previous attempt's
-        // server-side state.
-        let (_response, fallback_disabled, received) = retry_transient_transport(|| {
-            let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            async move {
-                use tokio::io::AsyncWriteExt;
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .expect("test listener should bind");
-                let port = listener.local_addr().unwrap().port();
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let port = listener.local_addr().unwrap().port();
 
-                // Server: returns 400 on the first request (simulating
-                // unsupported response_format), then 200 with valid JSON.
-                let server_count = request_count.clone();
-                let server_handle = tokio::spawn(async move {
-                    loop {
-                        let Ok((mut stream, _)) = listener.accept().await else {
-                            break;
-                        };
-                        let cnt =
-                            server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        // Read the request so the client doesn't stall
-                        let _ = read_mock_request(&mut stream).await;
+        // Server: returns 400 on the first request (simulating
+        // unsupported response_format), then 200 with valid JSON.
+        let server_count = request_count.clone();
+        let server_handle = tokio::spawn(async move {
+            // Retain answered sockets while accepting the fallback request.
+            let mut completed_streams = Vec::new();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let cnt = server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Read the request so the client doesn't stall
+                let _ = read_mock_request(&mut stream).await;
 
-                        if cnt == 0 {
-                            // First attempt: 400 — unsupported response_format
-                            let body =
-                                br#"{"error":{"message":"response_format is not supported"}}"#;
-                            let header = format!(
-                                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                body.len()
-                            );
-                            let _ = stream.write_all(header.as_bytes()).await;
-                            let _ = stream.write_all(body).await;
-                        } else {
-                            // Second attempt: 200 OK with valid translation
-                            let body = br#"{"choices":[{"message":{"content":"{\"translation\":\"Ciao\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#;
-                            let header = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                body.len()
-                            );
-                            let _ = stream.write_all(header.as_bytes()).await;
-                            let _ = stream.write_all(body).await;
-                        }
-                        let _ = stream.shutdown().await;
-                    }
-                });
-
-                let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
-                    base_url: format!("http://127.0.0.1:{port}"),
-                    api_key_env: "BOOKFORGE_TEST_JSON_FALLBACK_KEY".to_string(),
-                    model: "test-model".to_string(),
-                    timeout_seconds: 10,
-                    provider_max_attempts: 1,
-                    thinking_disabled: true,
-                    retry_after_policy: RetryAfterPolicy::None,
-                    max_backoff_seconds: 30,
-                    max_idle_per_host: 32,
-                    json_mode: bookforge_core::JsonMode::Auto,
-                })
-                .unwrap();
-
-                let outcome = provider
-                    .complete(CompletionRequest {
-                        system: "translate".to_string(),
-                        user: "hello".to_string(),
-                        response_format: ResponseFormat::Json,
-                        temperature: 0.2,
-                        max_output_tokens: Some(256),
-                        metadata: RequestMetadata::default(),
-                    })
-                    .await;
-                let disabled = !provider
-                    .response_format_supported
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let received = request_count.load(std::sync::atomic::Ordering::SeqCst);
-                server_handle.abort();
-                let response = outcome?;
-                Ok((response, disabled, received))
+                if cnt == 0 {
+                    // First attempt: 400 — unsupported response_format
+                    let body = br#"{"error":{"message":"response_format is not supported"}}"#;
+                    let header = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                } else {
+                    // Second attempt: 200 OK with valid translation
+                    let body = br#"{"choices":[{"message":{"content":"{\"translation\":\"Ciao\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                }
+                completed_streams.push(stream);
             }
+        });
+
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            api_key_env: "BOOKFORGE_TEST_JSON_FALLBACK_KEY".to_string(),
+            model: "test-model".to_string(),
+            timeout_seconds: 10,
+            provider_max_attempts: 1,
+            thinking_disabled: true,
+            retry_after_policy: RetryAfterPolicy::None,
+            max_backoff_seconds: 30,
+            max_idle_per_host: 32,
+            json_mode: bookforge_core::JsonMode::Auto,
         })
-        .await
-        .expect("json_mode_auto_fallback should succeed after 400 fallback");
+        .unwrap();
+
+        let outcome = provider.complete(offline_request()).await;
+        let fallback_disabled = !provider
+            .response_format_supported
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let received = request_count.load(std::sync::atomic::Ordering::SeqCst);
+        server_handle.abort();
+        let _ = server_handle.await;
+        outcome.expect("json_mode_auto_fallback should succeed after 400 fallback");
 
         // Server should have received 2 requests (first 400, second 200)
         assert_eq!(
@@ -2823,6 +2734,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server_count = request_count.clone();
         let server_handle = tokio::spawn(async move {
+            // Retain answered sockets until the client finishes retrying.
+            let mut completed_streams = Vec::new();
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
@@ -2836,7 +2749,7 @@ mod tests {
                 );
                 let _ = stream.write_all(header.as_bytes()).await;
                 let _ = stream.write_all(body).await;
-                let _ = stream.shutdown().await;
+                completed_streams.push(stream);
             }
         });
 

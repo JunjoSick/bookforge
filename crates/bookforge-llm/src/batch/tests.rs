@@ -149,6 +149,117 @@ fn plain_blocks_batch_together() {
 }
 
 #[test]
+fn mixed_modes_interleave_to_finish_earlier_segments_without_extra_batches() {
+    let segments = (0..4)
+        .map(|index| {
+            make_segment_in_section(
+                &format!("seg{index}"),
+                "sec",
+                index,
+                vec![
+                    plain_block(&format!("Plain {index}")),
+                    plain_block(&format!("<m1>Marked {index}</m1>")),
+                ],
+                vec![],
+            )
+        })
+        .collect::<Vec<_>>();
+    let config = BatchConfig {
+        enabled: true,
+        target_tokens: 1000,
+        max_items: 2,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &config, TranslationProfile::Balanced);
+    assert_eq!(batches.len(), 4);
+    assert!(batches.iter().all(|batch| batch.items.len() == 2));
+    assert_eq!(
+        batches.iter().map(|batch| batch.mode).collect::<Vec<_>>(),
+        vec![
+            BatchMode::Plain,
+            BatchMode::MarkerSafe,
+            BatchMode::Plain,
+            BatchMode::MarkerSafe
+        ]
+    );
+    let first_pair = batches[..2]
+        .iter()
+        .flat_map(|batch| &batch.items)
+        .map(|item| item.segment_id.0.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(first_pair, vec!["seg0", "seg1", "seg0", "seg1"]);
+}
+
+#[tokio::test]
+async fn adaptive_permit_wait_obeys_pause_resume_and_stop() {
+    for resume in [false, true] {
+        let segments = vec![make_segment("seg", vec![plain_block("Alpha")], vec![])];
+        let batches = build_translation_batches(
+            &segments,
+            &BatchConfig {
+                enabled: true,
+                target_tokens: 1000,
+                max_items: 1,
+                adaptive_sizing: false,
+                split_on_json_failure: true,
+                repair_invalid_items: true,
+            },
+            TranslationProfile::Balanced,
+        );
+        let controller = Arc::new(ProviderRateController::new(
+            Arc::new(AdaptiveLimiter::new(1, 1)),
+            crate::RateControllerConfig::for_target(1),
+        ));
+        let held = controller.acquire().await.unwrap();
+        let signal = PauseSignal::new();
+        let mut config = test_run_config();
+        config.pause_signal = Some(signal.clone());
+        let run = translate_batches_with_callback(
+            crate::MockProvider::new(crate::MockMode::PrefixTarget, "Italian"),
+            batches,
+            &segments,
+            &config,
+            Arc::new(TelemetryLog::new()),
+            Some(controller),
+            None,
+            Arc::new(bookforge_core::NullProgressSink),
+            None,
+            |_| Ok(()),
+        );
+        tokio::pin!(run);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut run)
+                .await
+                .is_err()
+        );
+        signal.pause();
+        if resume {
+            drop(held);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut run)
+                    .await
+                    .is_err(),
+                "acquiring a permit must not bypass a pause"
+            );
+            signal.resume();
+        } else {
+            // Stop must not wait for this permit's owner to finish.
+            signal.stop();
+        }
+        let translations = tokio::time::timeout(Duration::from_secs(1), &mut run)
+            .await
+            .expect("batch wait should respond to resume or stop")
+            .unwrap();
+        assert_eq!(translations.len(), usize::from(resume));
+        if resume {
+            assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+        }
+    }
+}
+
+#[test]
 fn expected_output_bound_is_opt_in_and_only_splits_the_oversized_batch() {
     let oversized = make_segment_in_section(
         "oversized",
@@ -3287,6 +3398,54 @@ async fn connect_errors_are_retried_even_when_one_attempt_is_configured() {
 
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     assert_eq!(translations[0].status, SegmentStatus::Succeeded);
+}
+
+#[tokio::test]
+async fn repeated_batch_requests_count_each_retry_once() {
+    let segments = vec![make_segment("seg1", vec![plain_block("Hello")], vec![])];
+    let cfg = BatchConfig {
+        enabled: true,
+        target_tokens: 1000,
+        max_items: 1,
+        adaptive_sizing: false,
+        split_on_json_failure: true,
+        repair_invalid_items: true,
+    };
+    let batches = build_translation_batches(&segments, &cfg, TranslationProfile::Balanced);
+    let provider = Arc::new(AlwaysTransientProvider::new());
+    let telemetry = Arc::new(TelemetryLog::new());
+    let mut config = test_run_config();
+    config.scheduler.max_attempts = 3;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        translate_batches_with_callback(
+            provider.clone(),
+            batches,
+            &segments,
+            &config,
+            telemetry.clone(),
+            None,
+            None,
+            Arc::new(bookforge_core::NullProgressSink),
+            None,
+            |_| Ok(()),
+        ),
+    )
+    .await
+    .expect("transient retries must be capped")
+    .expect("batch run should return needs-review translations");
+
+    assert_eq!(provider.calls(), 3);
+    let metrics = telemetry.snapshot();
+    // Three requests are two retries; cumulative counts would sum to three.
+    assert_eq!(
+        metrics
+            .iter()
+            .map(|metric| metric.retry_count)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 1]
+    );
+    assert!(metrics.iter().all(|metric| metric.status_code == Some(503)));
 }
 
 #[tokio::test]
