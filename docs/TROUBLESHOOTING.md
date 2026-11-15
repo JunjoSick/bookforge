@@ -31,7 +31,7 @@ When running from a source checkout, use:
 cargo run -p bookforge-cli -- --version
 ```
 
-Building from source requires Rust 1.88 or newer. The prebuilt installers do
+Building from source requires Rust 1.89 or newer. The prebuilt installers do
 not require Rust, Cargo, Git, Python, or Node.
 
 ## The dashboard does not open

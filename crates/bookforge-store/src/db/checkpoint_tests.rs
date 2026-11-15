@@ -506,7 +506,7 @@ fn checkpoints_preserve_a_correction_committed_while_waiting_for_the_write_lock(
             let store = JobStore::open(&worker_db).unwrap();
             store
                 .conn
-                .borrow()
+                .borrow_mut()
                 .busy_handler(Some(race_busy_handler))
                 .unwrap();
             save_checkpoint(&store, &job_id, kind)

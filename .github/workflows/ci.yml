@@ -109,7 +109,9 @@ jobs:
 
   clippy-macos:
     name: clippy (macos)
-    runs-on: macos-14
+    # Keep this on the image the release builds Apple Silicon on
+    # (dist-workspace.toml, github-custom-runners).
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -127,7 +129,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   msrv:
-    name: msrv (1.88.0)
+    name: msrv (1.89.0)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -135,12 +137,12 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: 1.88.0
+          toolchain: 1.89.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: msrv-1.88
+          key: msrv-1.89
       # Verifies the rust-version pin in Cargo.toml. If this job fails, either
-      # the codebase started using an API newer than 1.88 or a dependency's
+      # the codebase started using an API newer than 1.89 or a dependency's
       # transitive MSRV climbed. See docs/msrv-audit.md before raising the floor.
       - run: cargo check --workspace --all-targets --locked
 
